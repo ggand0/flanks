@@ -1,5 +1,6 @@
 mod camera;
 mod movement;
+mod orders;
 mod overlay;
 mod render_units;
 mod spatial;
@@ -24,6 +25,7 @@ fn main() {
             terrain::TerrainPlugin,
             units::UnitsPlugin,
             movement::MovementPlugin,
+            orders::OrdersPlugin,
             render_units::UnitRenderPlugin,
             camera::RtsCameraPlugin,
             overlay::OverlayPlugin,

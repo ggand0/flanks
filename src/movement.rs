@@ -7,6 +7,7 @@ use bevy::prelude::*;
 use bevy::tasks::ComputeTaskPool;
 use std::time::Instant;
 
+use crate::orders::Groups;
 use crate::spatial::SpatialGrid;
 use crate::terrain::Terrain;
 use crate::units::{UNIT_HALF_HEIGHT, Units};
@@ -31,12 +32,8 @@ const MAX_ACCEL: f32 = 50.0;
 const CORR_GAIN: f32 = 0.5;
 const CORR_MAX: f32 = 0.2;
 /// Units slow down proportionally inside this distance to the target.
-const ARRIVE_RADIUS: f32 = 60.0;
+const ARRIVE_RADIUS: f32 = 35.0;
 const CHUNK: usize = 2048;
-
-/// Shared goal point, moving so the swarm keeps flowing.
-#[derive(Resource, Default)]
-pub struct MoveTarget(pub Vec2);
 
 #[derive(Resource, Default)]
 pub struct SimStats {
@@ -56,26 +53,18 @@ pub struct MovementPlugin;
 
 impl Plugin for MovementPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<MoveTarget>()
-            .init_resource::<SimStats>()
+        app.init_resource::<SimStats>()
             .insert_resource(DebugViz(true))
             .init_resource::<SpatialGrid>()
-            .add_systems(FixedUpdate, (update_targets, step_sim).chain())
-            .add_systems(Update, (toggle_debug_viz, draw_debug_gizmos));
+            .add_systems(FixedUpdate, step_sim)
+            .add_systems(Update, toggle_debug_viz);
     }
 }
 
-fn update_targets(time: Res<Time>, mut target: ResMut<MoveTarget>) {
-    // Slow lissajous sweep, peak speed comparable to unit speed so the
-    // swarm can actually catch up and flow around it.
-    let t = time.elapsed_secs() * 0.05;
-    target.0 = Vec2::new((t * 1.0).cos() * 160.0, (t * 1.7).sin() * 110.0);
-}
-
-fn step_sim(
+pub fn step_sim(
     mut units: ResMut<Units>,
     mut grid: ResMut<SpatialGrid>,
-    target: Res<MoveTarget>,
+    groups: Res<Groups>,
     terrain: Res<Terrain>,
     time: Res<Time>,
     mut stats: ResMut<SimStats>,
@@ -87,7 +76,7 @@ fn step_sim(
         pos_prev,
         vel,
         speed,
-        team,
+        group,
         ..
     } = &mut *units;
     if pos.is_empty() {
@@ -106,8 +95,9 @@ fn step_sim(
     let terrain = &*terrain;
     let pos_prev = &pos_prev[..];
     let speed = &speed[..];
-    let _ = team;
-    let goal = target.0;
+    let group = &group[..];
+    let orders: Vec<Option<Vec2>> = groups.list.iter().map(|g| g.order).collect();
+    let orders = &orders[..];
     let bounds_min = terrain.min() + 4.0;
     let bounds_max = terrain.max() - 4.0;
 
@@ -120,18 +110,19 @@ fn step_sim(
                     let i = start + j;
                     let p = pos_prev[i].xz();
 
-                    let to_goal = goal - p;
-                    let dist = to_goal.length();
-                    // Slope penalty: steep ground is slow ground.
-                    let slope = terrain.slope_at(p.x, p.y);
-                    let slope_mult = 1.0 / (1.0 + 3.0 * slope * slope);
-                    let desired_speed =
-                        speed[i] * slope_mult * (dist / ARRIVE_RADIUS).min(1.0);
-                    let mut desired = if dist > 1e-3 {
-                        to_goal * (desired_speed / dist)
-                    } else {
-                        Vec2::ZERO
-                    };
+                    let mut desired = Vec2::ZERO;
+                    if let Some(goal) = orders[group[i] as usize] {
+                        let to_goal = goal - p;
+                        let dist = to_goal.length();
+                        // Slope penalty: steep ground is slow ground.
+                        let slope = terrain.slope_at(p.x, p.y);
+                        let slope_mult = 1.0 / (1.0 + 3.0 * slope * slope);
+                        let desired_speed =
+                            speed[i] * slope_mult * (dist / ARRIVE_RADIUS).min(1.0);
+                        if dist > 1e-3 {
+                            desired = to_goal * (desired_speed / dist);
+                        }
+                    }
 
                     let mut push = Vec2::ZERO;
                     let mut corr = Vec2::ZERO;
@@ -245,16 +236,3 @@ fn toggle_debug_viz(keys: Res<ButtonInput<KeyCode>>, mut viz: ResMut<DebugViz>) 
     }
 }
 
-fn draw_debug_gizmos(viz: Res<DebugViz>, target: Res<MoveTarget>, mut gizmos: Gizmos) {
-    if !viz.0 {
-        return;
-    }
-    let color = Color::srgb(1.0, 0.95, 0.3);
-    let center = Vec3::new(target.0.x, 0.5, target.0.y);
-    gizmos.circle(
-        Isometry3d::new(center, Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2)),
-        4.0,
-        color,
-    );
-    gizmos.line(center - Vec3::Y * 0.5, center + Vec3::Y * 12.0, color);
-}

@@ -104,9 +104,11 @@ fn setup_unit_mesh(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
 }
 
 /// Copy the SoA sim state into the per-instance buffer (main world side),
-/// interpolating between the last two fixed ticks.
+/// interpolating between the last two fixed ticks. Selected units get a
+/// highlight tint.
 fn sync_instance_data(
     units: Res<Units>,
+    selection: Res<crate::orders::Selection>,
     fixed_time: Res<Time<Fixed>>,
     mut query: Query<&mut InstanceMaterialData>,
 ) {
@@ -114,13 +116,21 @@ fn sync_instance_data(
         return;
     };
     let alpha = fixed_time.overstep_fraction();
+    const HIGHLIGHT: [f32; 4] = [1.0, 1.0, 0.55, 1.0];
+    let has_sel = selection.mask.len() == units.len();
     data.clear();
     data.reserve(units.len());
     for i in 0..units.len() {
+        let mut color = units.color[i];
+        if has_sel && selection.mask[i] {
+            for c in 0..3 {
+                color[c] = color[c] * 0.35 + HIGHLIGHT[c] * 0.65;
+            }
+        }
         data.push(InstanceData {
             position: units.pos_prev[i].lerp(units.pos[i], alpha),
             scale: 1.0,
-            color: units.color[i],
+            color,
         });
     }
 }

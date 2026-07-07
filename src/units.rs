@@ -17,6 +17,8 @@ pub struct Units {
     /// Per-unit max speed (small variation breaks lockstep patterns).
     pub speed: Vec<f32>,
     pub team: Vec<u8>,
+    /// Index into `Groups::list`.
+    pub group: Vec<u32>,
     /// Base render color (team color with per-unit variation baked in).
     pub color: Vec<[f32; 4]>,
 }
@@ -78,6 +80,7 @@ fn spawn_armies(mut units: ResMut<Units>, terrain: Res<crate::terrain::Terrain>)
                 units.vel.push(Vec3::ZERO);
                 units.speed.push(9.0 * (0.9 + 0.2 * hash01(i.wrapping_mul(7) + 5)));
                 units.team.push(team);
+                units.group.push(team as u32);
 
                 // Per-unit tonal variation so a block of 50k doesn't read as a flat texture.
                 let tone = 0.85 + 0.3 * hash01(i.wrapping_mul(3));

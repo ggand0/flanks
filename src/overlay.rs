@@ -5,6 +5,7 @@ use bevy::prelude::*;
 use bevy::render::diagnostic::RenderDiagnosticsPlugin;
 
 use crate::movement::SimStats;
+use crate::orders::{Groups, Selection};
 use crate::units::Units;
 
 #[derive(Component)]
@@ -45,6 +46,8 @@ fn update_overlay(
     diagnostics: Res<DiagnosticsStore>,
     units: Res<Units>,
     stats: Res<SimStats>,
+    groups: Res<Groups>,
+    selection: Res<Selection>,
     mut query: Query<&mut Text, With<OverlayText>>,
     time: Res<Time>,
     mut log_timer: Local<f32>,
@@ -60,10 +63,12 @@ fn update_overlay(
 
     for mut text in &mut query {
         text.0 = format!(
-            "{fps:>5.0} fps  {frame_ms:.2} ms\n{} units, 1 unit draw call\nsim tick: grid {:.2} ms, step {:.2} ms",
+            "{fps:>5.0} fps  {frame_ms:.2} ms\n{} units, 1 unit draw call\nsim tick: grid {:.2} ms, step {:.2} ms\n{} groups, {} selected",
             units.len(),
             stats.grid_ms,
             stats.step_ms,
+            groups.list.len(),
+            selection.count,
         );
     }
 
