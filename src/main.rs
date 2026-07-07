@@ -42,6 +42,7 @@ fn setup_world(mut commands: Commands) {
             shadow_maps_enabled: false,
             ..default()
         },
-        Transform::from_rotation(Quat::from_euler(EulerRot::YXZ, 0.6, -1.1, 0.0)),
+        // Lowish sun: flat-shaded relief needs directional contrast.
+        Transform::from_rotation(Quat::from_euler(EulerRot::YXZ, 0.7, -0.75, 0.0)),
     ));
 }

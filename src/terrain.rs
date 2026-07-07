@@ -200,13 +200,19 @@ fn generate_terrain(mut commands: Commands) {
     for z in 0..VERTS_Z {
         for x in 0..VERTS_X {
             let p = origin + Vec2::new(x as f32, z as f32) * CELL;
-            let mut h = fbm(p / 220.0) * 11.0;
-            // Flatten the central battlefield so the armies start on
-            // walkable ground; hills dominate the outskirts.
-            let center_dist = (p.length() - 220.0).max(0.0) / 200.0;
-            h *= 0.25 + 0.75 * center_dist.min(1.0);
-            // Bias up so the flat center sits in the grass band, not the dirt.
-            heights[z * VERTS_X + x] = h + 1.4;
+            // Large rolling landforms + medium detail + ridged peaks.
+            let base = fbm(p / 320.0) * 22.0;
+            let detail = fbm(p / 90.0 + Vec2::splat(37.7)) * 4.5;
+            let r = 1.0 - fbm(p / 260.0 + Vec2::splat(91.3)).abs().min(1.0);
+            let ridged = r * r * 16.0;
+            let mut h = base + detail + ridged;
+            // Soften (not flatten) the central battlefield: rolling and
+            // readable in the middle, dramatic on the outskirts.
+            let center_dist = (p.length() - 140.0).max(0.0) / 260.0;
+            h *= 0.35 + 0.65 * center_dist.min(1.0);
+            // Bias up so the battlefield sits in the grass bands; dirt only
+            // in real hollows and crater floors.
+            heights[z * VERTS_X + x] = h + 2.6;
         }
     }
     commands.insert_resource(Terrain {
@@ -244,20 +250,22 @@ fn spawn_chunks(
 }
 
 fn band_color(h: f32, slope: f32) -> [f32; 4] {
-    let c = if slope > 0.55 {
+    let c = if slope > 0.75 {
         Color::srgb(0.46, 0.42, 0.36) // scree on steep faces
     } else if h < -2.5 {
         Color::srgb(0.33, 0.25, 0.17) // crater floor / deep dirt
     } else if h < 0.0 {
         Color::srgb(0.43, 0.34, 0.22) // dirt
-    } else if h < 3.5 {
+    } else if h < 5.0 {
         Color::srgb(0.34, 0.43, 0.22) // low grass
-    } else if h < 7.0 {
+    } else if h < 11.0 {
         Color::srgb(0.42, 0.50, 0.26) // grass
-    } else if h < 10.5 {
+    } else if h < 17.0 {
         Color::srgb(0.52, 0.52, 0.33) // dry highland
+    } else if h < 24.0 {
+        Color::srgb(0.52, 0.48, 0.42) // rock
     } else {
-        Color::srgb(0.56, 0.54, 0.46) // rock
+        Color::srgb(0.78, 0.79, 0.82) // snowcap
     };
     c.to_linear().to_f32_array()
 }
