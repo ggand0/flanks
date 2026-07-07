@@ -98,6 +98,39 @@ pub fn step_sim(
     let group = &group[..];
     let orders: Vec<Option<Vec2>> = groups.list.iter().map(|g| g.order).collect();
     let orders = &orders[..];
+    // Flattened per-group frontline snapshot for the parallel loop.
+    struct FrontSnap {
+        engaged: bool,
+        facing: Vec2,
+        axis: Vec2,
+        centroid: Vec2,
+        half_width: f32,
+        max_depth: f32,
+        start: usize,
+    }
+    let mut curve_buf: Vec<Vec2> = Vec::new();
+    let snaps: Vec<FrontSnap> = groups
+        .list
+        .iter()
+        .map(|g| {
+            let start = curve_buf.len();
+            let engaged = g.engaged && !g.front.is_empty();
+            if engaged {
+                curve_buf.extend_from_slice(&g.front);
+            }
+            FrontSnap {
+                engaged,
+                facing: g.facing,
+                axis: g.axis,
+                centroid: g.centroid,
+                half_width: g.half_width,
+                max_depth: g.max_depth,
+                start,
+            }
+        })
+        .collect();
+    let curve_buf = &curve_buf[..];
+    let snaps = &snaps[..];
     let bounds_min = terrain.min() + 4.0;
     let bounds_max = terrain.max() - 4.0;
 
@@ -110,8 +143,31 @@ pub fn step_sim(
                     let i = start + j;
                     let p = pos_prev[i].xz();
 
+                    let gi = group[i] as usize;
+                    let s = &snaps[gi];
                     let mut desired = Vec2::ZERO;
-                    if let Some(goal) = orders[group[i] as usize] {
+                    if s.engaged {
+                        // Slot steering: project onto the group's lateral
+                        // axis, sample the front curve there, hold station
+                        // behind it. The continuous forward pull + crowd
+                        // yield produce ranks; deep units become reserve.
+                        let u = (p - s.centroid)
+                            .dot(s.axis)
+                            .clamp(-s.half_width, s.half_width);
+                        let kf = (u / (2.0 * s.half_width) + 0.5)
+                            * (crate::frontline::K_SAMPLES - 1) as f32;
+                        let k0 = (kf as usize).min(crate::frontline::K_SAMPLES - 2);
+                        let fp = curve_buf[s.start + k0]
+                            .lerp(curve_buf[s.start + k0 + 1], kf - k0 as f32);
+                        let depth = (fp - p).dot(s.facing);
+                        let td = (depth * 0.85).clamp(0.7, s.max_depth);
+                        let target = fp - s.facing * td;
+                        let to_t = target - p;
+                        let dist = to_t.length();
+                        if dist > 1e-3 {
+                            desired = to_t * ((speed[i] * (dist / 6.0).min(1.0)) / dist);
+                        }
+                    } else if let Some(goal) = orders[gi] {
                         let to_goal = goal - p;
                         let dist = to_goal.length();
                         // Slope penalty: steep ground is slow ground.

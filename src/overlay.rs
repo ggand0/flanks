@@ -63,11 +63,12 @@ fn update_overlay(
 
     for mut text in &mut query {
         text.0 = format!(
-            "{fps:>5.0} fps  {frame_ms:.2} ms\n{} units, 1 unit draw call\nsim tick: grid {:.2} ms, step {:.2} ms\n{} groups, {} selected",
+            "{fps:>5.0} fps  {frame_ms:.2} ms\n{} units, 1 unit draw call\nsim tick: grid {:.2} ms, step {:.2} ms\n{} groups ({} engaged), {} selected",
             units.len(),
             stats.grid_ms,
             stats.step_ms,
             groups.list.len(),
+            groups.list.iter().filter(|g| g.engaged).count(),
             selection.count,
         );
     }

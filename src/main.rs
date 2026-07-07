@@ -1,4 +1,5 @@
 mod camera;
+mod frontline;
 mod movement;
 mod orders;
 mod overlay;
@@ -26,6 +27,7 @@ fn main() {
             units::UnitsPlugin,
             movement::MovementPlugin,
             orders::OrdersPlugin,
+            frontline::FrontlinePlugin,
             render_units::UnitRenderPlugin,
             camera::RtsCameraPlugin,
             overlay::OverlayPlugin,

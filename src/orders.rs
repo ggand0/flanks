@@ -18,11 +18,48 @@ const SELECT_RADIUS: f32 = 14.0;
 /// Groups whose centroid gets this close to their order target go idle.
 const ARRIVE_CLEAR: f32 = 18.0;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Stance {
+    /// Wide and shallow.
+    Hold,
+    /// Narrow and deep.
+    Column,
+}
+
 pub struct GroupData {
     pub team: u8,
     /// Attack-move target on the ground plane; None = hold.
     pub order: Option<Vec2>,
     pub count: usize,
+    pub stance: Stance,
+    // --- frontline state, refreshed every fixed tick ---
+    pub centroid: Vec2,
+    pub facing: Vec2,
+    /// Lateral axis (perp of facing); front curve is parameterized along it.
+    pub axis: Vec2,
+    pub half_width: f32,
+    pub max_depth: f32,
+    pub engaged: bool,
+    /// Front curve samples, world space (empty when not engaged).
+    pub front: Vec<Vec2>,
+}
+
+impl GroupData {
+    pub fn new(team: u8, count: usize) -> Self {
+        Self {
+            team,
+            order: None,
+            count,
+            stance: Stance::Hold,
+            centroid: Vec2::ZERO,
+            facing: Vec2::ZERO,
+            axis: Vec2::X,
+            half_width: 0.0,
+            max_depth: 0.0,
+            engaged: false,
+            front: Vec::new(),
+        }
+    }
 }
 
 #[derive(Resource, Default)]
@@ -50,23 +87,22 @@ impl Plugin for OrdersPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(Groups {
             list: vec![
-                GroupData {
-                    team: 0,
-                    order: None,
-                    count: crate::units::UNITS_PER_TEAM,
-                },
-                GroupData {
-                    team: 1,
-                    order: None,
-                    count: crate::units::UNITS_PER_TEAM,
-                },
+                GroupData::new(0, crate::units::UNITS_PER_TEAM),
+                GroupData::new(1, crate::units::UNITS_PER_TEAM),
             ],
         })
         .init_resource::<Selection>()
         .init_resource::<DragLine>()
         .add_systems(
             Update,
-            (drag_select, issue_order, cut_key, test_orders_script, draw_order_gizmos),
+            (
+                drag_select,
+                issue_order,
+                cut_key,
+                stance_key,
+                test_orders_script,
+                draw_order_gizmos,
+            ),
         )
         .add_systems(FixedUpdate, clear_arrived_orders.after(crate::movement::step_sim));
     }
@@ -197,7 +233,11 @@ fn select_along_line(line: &[Vec2], units: &Units, selection: &mut Selection) {
 
 /// Move the selection's units into a fresh group. Returns its index, or the
 /// existing group index if the selection is exactly one whole group.
-fn split_selection(units: &mut Units, groups: &mut Groups, selection: &Selection) -> Option<u32> {
+pub fn split_selection(
+    units: &mut Units,
+    groups: &mut Groups,
+    selection: &Selection,
+) -> Option<u32> {
     if selection.count == 0 {
         return None;
     }
@@ -219,11 +259,7 @@ fn split_selection(units: &mut Units, groups: &mut Groups, selection: &Selection
     }
 
     let new_idx = groups.list.len() as u32;
-    groups.list.push(GroupData {
-        team: PLAYER_TEAM,
-        order: None,
-        count: selection.count,
-    });
+    groups.list.push(GroupData::new(PLAYER_TEAM, selection.count));
     for i in 0..units.len() {
         if selection.mask[i] {
             groups.list[units.group[i] as usize].count -= 1;
@@ -273,23 +309,48 @@ fn cut_key(
     }
 }
 
-/// Groups whose centroid reached their target go back to hold.
-pub fn clear_arrived_orders(units: Res<Units>, mut groups: ResMut<Groups>) {
-    let n_groups = groups.list.len();
-    let mut sums = vec![Vec2::ZERO; n_groups];
-    let mut counts = vec![0u32; n_groups];
-    for i in 0..units.len() {
-        let g = units.group[i] as usize;
-        sums[g] += Vec2::new(units.pos[i].x, units.pos[i].z);
-        counts[g] += 1;
-    }
+/// Groups whose centroid reached their target go back to hold. Uses the
+/// centroid refreshed by the frontline pass each tick.
+pub fn clear_arrived_orders(mut groups: ResMut<Groups>) {
     for (g, group) in groups.list.iter_mut().enumerate() {
         if let Some(t) = group.order
-            && counts[g] > 0
-            && (sums[g] / counts[g] as f32).distance(t) < ARRIVE_CLEAR
+            && group.count > 0
+            && !group.engaged
+            && group.centroid.distance(t) < ARRIVE_CLEAR
         {
             group.order = None;
             info!("group {g} arrived, holding");
+        }
+    }
+}
+
+/// F: toggle stance of every group that has selected units.
+fn stance_key(
+    keys: Res<ButtonInput<KeyCode>>,
+    units: Res<Units>,
+    mut groups: ResMut<Groups>,
+    selection: Res<Selection>,
+) {
+    if !keys.just_pressed(KeyCode::KeyF) || selection.count == 0 {
+        return;
+    }
+    let mut touched = vec![false; groups.list.len()];
+    for i in 0..units.len() {
+        if selection.mask.get(i).copied().unwrap_or(false) {
+            touched[units.group[i] as usize] = true;
+        }
+    }
+    for (g, t) in touched.iter().enumerate() {
+        if *t {
+            let group = &mut groups.list[g];
+            group.stance = match group.stance {
+                Stance::Hold => Stance::Column,
+                Stance::Column => Stance::Hold,
+            };
+            info!(
+                "group {g} stance -> {}",
+                if group.stance == Stance::Hold { "hold line" } else { "column" }
+            );
         }
     }
 }
