@@ -164,6 +164,8 @@ fn update_frontlines(
         counts[g] += 1;
     }
 
+    // First per-group pass: centroid + facing + axis (needed before we can
+    // measure lateral spread).
     for (g, group) in groups.list.iter_mut().enumerate() {
         group.count = counts[g];
         if counts[g] == 0 {
@@ -175,9 +177,18 @@ fn update_frontlines(
         let enemy = 1 - group.team as usize;
 
         // Facing: order direction wins; otherwise toward enemy mass.
-        let facing = match group.order {
+        // Temporally smoothed — the raw density gradient jitters and a
+        // twitching facing makes the whole curve swing around.
+        let raw = match group.order {
             Some(t) => (t - group.centroid).normalize_or_zero(),
             None => field.grad(enemy, group.centroid).normalize_or_zero(),
+        };
+        let facing = if raw == Vec2::ZERO {
+            group.facing
+        } else if group.facing == Vec2::ZERO {
+            raw
+        } else {
+            group.facing.lerp(raw, 0.2).normalize_or_zero()
         };
         if facing == Vec2::ZERO {
             group.engaged = false;
@@ -186,13 +197,40 @@ fn update_frontlines(
         }
         group.facing = facing;
         group.axis = Vec2::new(-facing.y, facing.x);
+    }
 
+    // Second unit pass: lateral spread (variance of projection onto each
+    // group's axis). The curve must hug the actual mass — a width derived
+    // from unit count alone paints phantom front lines over empty ground.
+    let mut u2 = vec![0.0f32; n];
+    for i in 0..units.len() {
+        let g = units.group[i] as usize;
+        let group = &groups.list[g];
+        if group.count == 0 {
+            continue;
+        }
+        let u = (Vec2::new(units.pos[i].x, units.pos[i].z) - group.centroid).dot(group.axis);
+        u2[g] += u * u;
+    }
+
+    for (g, group) in groups.list.iter_mut().enumerate() {
+        if group.count == 0 {
+            continue;
+        }
+        let enemy = 1 - group.team as usize;
+        let facing = group.facing;
+        if facing == Vec2::ZERO {
+            continue;
+        }
+        let spread = (u2[g] / group.count as f32).sqrt();
         let rows = match group.stance {
             Stance::Hold => 10.0,
             Stance::Column => 50.0,
         };
-        group.half_width =
-            ((group.count as f32 / rows) * SLOT_SPACING * 0.5).clamp(8.0, 400.0);
+        // Stance width is the ceiling the group grows toward; +20 m margin
+        // past the current spread lets it actually widen over time.
+        let stance_hw = ((group.count as f32 / rows) * SLOT_SPACING * 0.5).max(8.0);
+        group.half_width = (2.2 * spread + 20.0).min(stance_hw).clamp(8.0, 400.0);
         group.max_depth = rows * SLOT_SPACING * 1.5;
 
         // Engaged when enemy influence is present at or ahead of the mass.
