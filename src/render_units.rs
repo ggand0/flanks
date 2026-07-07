@@ -95,7 +95,7 @@ impl Plugin for UnitRenderPlugin {
 fn setup_unit_mesh(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
     // Slightly taller than wide: reads as a soldier, not a bead.
     commands.spawn((
-        Mesh3d(meshes.add(Cuboid::new(0.7, 0.9, 0.7))),
+        Mesh3d(meshes.add(Cuboid::new(0.62, 0.9, 0.62))),
         InstanceMaterialData::default(),
         // Instance positions are not the entity's transform; built-in frustum
         // culling would cull all 100k units at once, so disable it.
@@ -103,16 +103,22 @@ fn setup_unit_mesh(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
     ));
 }
 
-/// Copy the SoA sim state into the per-instance buffer (main world side).
-fn sync_instance_data(units: Res<Units>, mut query: Query<&mut InstanceMaterialData>) {
+/// Copy the SoA sim state into the per-instance buffer (main world side),
+/// interpolating between the last two fixed ticks.
+fn sync_instance_data(
+    units: Res<Units>,
+    fixed_time: Res<Time<Fixed>>,
+    mut query: Query<&mut InstanceMaterialData>,
+) {
     let Ok(mut data) = query.single_mut() else {
         return;
     };
+    let alpha = fixed_time.overstep_fraction();
     data.clear();
     data.reserve(units.len());
     for i in 0..units.len() {
         data.push(InstanceData {
-            position: units.pos[i],
+            position: units.pos_prev[i].lerp(units.pos[i], alpha),
             scale: 1.0,
             color: units.color[i],
         });

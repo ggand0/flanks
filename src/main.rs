@@ -1,6 +1,8 @@
 mod camera;
+mod movement;
 mod overlay;
 mod render_units;
+mod spatial;
 mod units;
 
 use bevy::prelude::*;
@@ -19,10 +21,12 @@ fn main() {
         }))
         .add_plugins((
             units::UnitsPlugin,
+            movement::MovementPlugin,
             render_units::UnitRenderPlugin,
             camera::RtsCameraPlugin,
             overlay::OverlayPlugin,
         ))
+        .insert_resource(Time::<Fixed>::from_hz(30.0))
         .insert_resource(ClearColor(Color::srgb(0.62, 0.70, 0.78)))
         .add_systems(Startup, setup_world)
         .run();

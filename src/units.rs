@@ -11,6 +11,11 @@ pub const UNIT_HALF_HEIGHT: f32 = 0.45;
 #[derive(Resource, Default)]
 pub struct Units {
     pub pos: Vec<Vec3>,
+    /// Position at the previous fixed tick; rendering lerps prev -> pos.
+    pub pos_prev: Vec<Vec3>,
+    pub vel: Vec<Vec3>,
+    /// Per-unit max speed (small variation breaks lockstep patterns).
+    pub speed: Vec<f32>,
     pub team: Vec<u8>,
     /// Base render color (team color with per-unit variation baked in).
     pub color: Vec<[f32; 4]>,
@@ -66,7 +71,11 @@ fn spawn_armies(mut units: ResMut<Units>) {
                 let jz = hash01(i.wrapping_mul(3) + 2) - 0.5;
                 let x = (col as f32 - (COLS - 1) as f32 / 2.0) * SPACING + jx * 0.6;
                 let z = dir * (GAP / 2.0 + row as f32 * SPACING) + jz * 0.6;
-                units.pos.push(Vec3::new(x, UNIT_HALF_HEIGHT, z));
+                let p = Vec3::new(x, UNIT_HALF_HEIGHT, z);
+                units.pos.push(p);
+                units.pos_prev.push(p);
+                units.vel.push(Vec3::ZERO);
+                units.speed.push(9.0 * (0.9 + 0.2 * hash01(i.wrapping_mul(7) + 5)));
                 units.team.push(team);
 
                 // Per-unit tonal variation so a block of 50k doesn't read as a flat texture.

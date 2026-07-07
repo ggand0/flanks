@@ -4,6 +4,7 @@ use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy::prelude::*;
 use bevy::render::diagnostic::RenderDiagnosticsPlugin;
 
+use crate::movement::SimStats;
 use crate::units::Units;
 
 #[derive(Component)]
@@ -43,6 +44,7 @@ fn spawn_overlay(mut commands: Commands) {
 fn update_overlay(
     diagnostics: Res<DiagnosticsStore>,
     units: Res<Units>,
+    stats: Res<SimStats>,
     mut query: Query<&mut Text, With<OverlayText>>,
     time: Res<Time>,
     mut log_timer: Local<f32>,
@@ -58,8 +60,10 @@ fn update_overlay(
 
     for mut text in &mut query {
         text.0 = format!(
-            "{fps:>5.0} fps  {frame_ms:.2} ms\n{} units, 1 unit draw call",
-            units.len()
+            "{fps:>5.0} fps  {frame_ms:.2} ms\n{} units, 1 unit draw call\nsim tick: grid {:.2} ms, step {:.2} ms",
+            units.len(),
+            stats.grid_ms,
+            stats.step_ms,
         );
     }
 
@@ -68,7 +72,12 @@ fn update_overlay(
     *log_timer += time.delta_secs();
     if *log_timer >= 2.0 {
         *log_timer = 0.0;
-        info!("fps: {fps:.0} ({frame_ms:.2} ms), units: {}", units.len());
+        info!(
+            "fps: {fps:.0} ({frame_ms:.2} ms), units: {}, nn min/avg: {:.2}/{:.2}",
+            units.len(),
+            stats.nn_min,
+            stats.nn_avg
+        );
         for diag in diagnostics.iter() {
             let path = diag.path().as_str();
             if path.starts_with("render/") && path.ends_with("elapsed_gpu") {

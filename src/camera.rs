@@ -30,7 +30,11 @@ fn spawn_camera(mut commands: Commands) {
             focus: Vec3::ZERO,
             yaw: 0.0,
             pitch: 0.9,
-            distance: 280.0,
+            // Overridable for screenshot-based debugging without input injection.
+            distance: std::env::var("FL_CAM_DIST")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(280.0),
         },
     ));
 }
