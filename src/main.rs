@@ -3,6 +3,7 @@ mod movement;
 mod overlay;
 mod render_units;
 mod spatial;
+mod terrain;
 mod units;
 
 use bevy::prelude::*;
@@ -20,6 +21,7 @@ fn main() {
             ..default()
         }))
         .add_plugins((
+            terrain::TerrainPlugin,
             units::UnitsPlugin,
             movement::MovementPlugin,
             render_units::UnitRenderPlugin,
@@ -32,21 +34,8 @@ fn main() {
         .run();
 }
 
-/// Ground plane and sun. The plane is a placeholder until M3 terrain.
-fn setup_world(
-    mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-) {
-    commands.spawn((
-        Mesh3d(meshes.add(Plane3d::default().mesh().size(3000.0, 3000.0))),
-        MeshMaterial3d(materials.add(StandardMaterial {
-            base_color: Color::srgb(0.30, 0.38, 0.26),
-            perceptual_roughness: 1.0,
-            ..default()
-        })),
-    ));
-
+/// Sun; terrain chunks come from TerrainPlugin.
+fn setup_world(mut commands: Commands) {
     commands.spawn((
         DirectionalLight {
             illuminance: 8_000.0,

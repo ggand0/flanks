@@ -8,6 +8,7 @@ use bevy::tasks::ComputeTaskPool;
 use std::time::Instant;
 
 use crate::spatial::SpatialGrid;
+use crate::terrain::Terrain;
 use crate::units::{UNIT_HALF_HEIGHT, Units};
 
 const SEP_RADIUS: f32 = 1.4;
@@ -75,6 +76,7 @@ fn step_sim(
     mut units: ResMut<Units>,
     mut grid: ResMut<SpatialGrid>,
     target: Res<MoveTarget>,
+    terrain: Res<Terrain>,
     time: Res<Time>,
     mut stats: ResMut<SimStats>,
     mut tick: Local<u32>,
@@ -101,10 +103,13 @@ fn step_sim(
     stats.grid_ms = (t1 - t0).as_secs_f32() * 1000.0;
 
     let grid = &*grid;
+    let terrain = &*terrain;
     let pos_prev = &pos_prev[..];
     let speed = &speed[..];
     let _ = team;
     let goal = target.0;
+    let bounds_min = terrain.min() + 4.0;
+    let bounds_max = terrain.max() - 4.0;
 
     ComputeTaskPool::get().scope(|scope| {
         for (ci, (p_chunk, v_chunk)) in pos.chunks_mut(CHUNK).zip(vel.chunks_mut(CHUNK)).enumerate()
@@ -117,7 +122,11 @@ fn step_sim(
 
                     let to_goal = goal - p;
                     let dist = to_goal.length();
-                    let desired_speed = speed[i] * (dist / ARRIVE_RADIUS).min(1.0);
+                    // Slope penalty: steep ground is slow ground.
+                    let slope = terrain.slope_at(p.x, p.y);
+                    let slope_mult = 1.0 / (1.0 + 3.0 * slope * slope);
+                    let desired_speed =
+                        speed[i] * slope_mult * (dist / ARRIVE_RADIUS).min(1.0);
                     let mut desired = if dist > 1e-3 {
                         to_goal * (desired_speed / dist)
                     } else {
@@ -185,10 +194,14 @@ fn step_sim(
                     }
 
                     v_chunk[j] = Vec3::new(new_v.x, 0.0, new_v.y);
+                    let nx = (pos_prev[i].x + new_v.x * dt + corr.x)
+                        .clamp(bounds_min.x, bounds_max.x);
+                    let nz = (pos_prev[i].z + new_v.y * dt + corr.y)
+                        .clamp(bounds_min.y, bounds_max.y);
                     p_chunk[j] = Vec3::new(
-                        pos_prev[i].x + new_v.x * dt + corr.x,
-                        UNIT_HALF_HEIGHT,
-                        pos_prev[i].z + new_v.y * dt + corr.y,
+                        nx,
+                        terrain.height_at(nx, nz) + UNIT_HALF_HEIGHT,
+                        nz,
                     );
                 }
             });

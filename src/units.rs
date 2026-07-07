@@ -36,8 +36,9 @@ impl Plugin for UnitsPlugin {
     }
 }
 
-/// Cheap deterministic hash -> [0, 1). Used for spawn jitter and color variation.
-fn hash01(mut x: u32) -> f32 {
+/// Cheap deterministic hash -> [0, 1). Used for spawn jitter, color variation,
+/// terrain noise.
+pub fn hash01(mut x: u32) -> f32 {
     x ^= x >> 16;
     x = x.wrapping_mul(0x7feb_352d);
     x ^= x >> 15;
@@ -46,7 +47,7 @@ fn hash01(mut x: u32) -> f32 {
     (x >> 8) as f32 / 16_777_216.0
 }
 
-fn spawn_armies(mut units: ResMut<Units>) {
+fn spawn_armies(mut units: ResMut<Units>, terrain: Res<crate::terrain::Terrain>) {
     const COLS: usize = 500;
     const ROWS: usize = UNITS_PER_TEAM / COLS;
     const SPACING: f32 = 1.4;
@@ -71,7 +72,7 @@ fn spawn_armies(mut units: ResMut<Units>) {
                 let jz = hash01(i.wrapping_mul(3) + 2) - 0.5;
                 let x = (col as f32 - (COLS - 1) as f32 / 2.0) * SPACING + jx * 0.6;
                 let z = dir * (GAP / 2.0 + row as f32 * SPACING) + jz * 0.6;
-                let p = Vec3::new(x, UNIT_HALF_HEIGHT, z);
+                let p = Vec3::new(x, terrain.height_at(x, z) + UNIT_HALF_HEIGHT, z);
                 units.pos.push(p);
                 units.pos_prev.push(p);
                 units.vel.push(Vec3::ZERO);

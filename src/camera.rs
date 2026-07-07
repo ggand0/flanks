@@ -89,10 +89,18 @@ fn control_camera(
     }
 }
 
-fn apply_camera_transform(mut query: Query<(&RtsCamera, &mut Transform)>) {
-    let Ok((cam, mut transform)) = query.single_mut() else {
+fn apply_camera_transform(
+    mut query: Query<(&mut RtsCamera, &mut Transform)>,
+    terrain: Res<crate::terrain::Terrain>,
+) {
+    let Ok((mut cam, mut transform)) = query.single_mut() else {
         return;
     };
+    let min = terrain.min();
+    let max = terrain.max();
+    cam.focus.x = cam.focus.x.clamp(min.x, max.x);
+    cam.focus.z = cam.focus.z.clamp(min.y, max.y);
+    cam.focus.y = terrain.height_at(cam.focus.x, cam.focus.z);
     let rot = Quat::from_euler(EulerRot::YXZ, cam.yaw, -cam.pitch, 0.0);
     let offset = rot * Vec3::new(0.0, 0.0, cam.distance);
     *transform = Transform::from_translation(cam.focus + offset).looking_at(cam.focus, Vec3::Y);
