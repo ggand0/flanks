@@ -32,16 +32,10 @@ pub struct GroupData {
     pub order: Option<Vec2>,
     pub count: usize,
     pub stance: Stance,
-    // --- frontline state, refreshed every fixed tick ---
+    // --- refreshed every fixed tick by the frontline pass ---
     pub centroid: Vec2,
-    pub facing: Vec2,
-    /// Lateral axis (perp of facing); front curve is parameterized along it.
-    pub axis: Vec2,
-    pub half_width: f32,
     pub max_depth: f32,
     pub engaged: bool,
-    /// Front curve samples, world space (empty when not engaged).
-    pub front: Vec<Vec2>,
 }
 
 impl GroupData {
@@ -52,12 +46,8 @@ impl GroupData {
             count,
             stance: Stance::Hold,
             centroid: Vec2::ZERO,
-            facing: Vec2::ZERO,
-            axis: Vec2::X,
-            half_width: 0.0,
-            max_depth: 0.0,
+            max_depth: 15.0,
             engaged: false,
-            front: Vec::new(),
         }
     }
 }

@@ -1,20 +1,19 @@
-//! Frontline solver. Runs on a coarse (8 m) blurred density grid per team,
-//! entirely in 2D, once per fixed tick:
+//! Frontline solver, v2: ONE line per battle.
 //!
-//! 1. Splat unit positions into per-team density fields, box-blur them.
-//! 2. Per group: centroid, facing (order direction, else enemy-density
-//!    gradient), engaged test (enemy density probe ahead).
-//! 3. Engaged groups extract a front curve: K rays marched along facing to
-//!    the point where enemy influence balances friendly influence.
-//! 4. Same-team engaged groups are sorted laterally and their adjacent
-//!    curve endpoints are blended together so the combined front connects.
-//!
-//! Units of engaged groups steer to the curve (movement.rs): each unit
-//! projects onto the group's lateral axis, samples the curve there, and
-//! holds station `clamp(depth·0.85, 0.7, max_depth)` behind it — the
-//! continuous forward pull plus crowd yield produces ranks and reserves.
+//! Per fixed tick, on a coarse 8 m grid:
+//! 1. Splat + blur per-team density fields.
+//! 2. phi = blue − orange. THE front is the phi = 0 contour, extracted by
+//!    marching squares, restricted to cells where BOTH teams are present.
+//!    Both teams share the same line — where the masses balance.
+//! 3. Multi-source BFS from the contour: every nearby cell learns its
+//!    nearest front point + the front normal there.
+//! 4. Units within ENGAGE_DIST of the front hold station behind their
+//!    nearest front point (depth capped by group stance); everyone else
+//!    follows group orders. Local superiority moves phi's zero — pressure
+//!    stays emergent.
 
 use bevy::prelude::*;
+use std::collections::VecDeque;
 
 use crate::movement::DebugViz;
 use crate::orders::{Groups, Stance};
@@ -22,16 +21,11 @@ use crate::terrain::Terrain;
 use crate::units::Units;
 
 pub const FIELD_CELL: f32 = 8.0;
-pub const K_SAMPLES: usize = 48;
-/// Blurred density (units per cell) above which enemy presence counts.
-const ENGAGE_T: f32 = 1.5;
+/// Units this close to the front adopt line behavior.
+pub const ENGAGE_DIST: f32 = 60.0;
+/// Both teams' blurred density must exceed this for a cell to be "contact".
+const CONTACT_T: f32 = 0.35;
 const SLOT_SPACING: f32 = 1.05;
-/// Ray march range relative to each curve sample's base point.
-const MARCH_BACK: f32 = -24.0;
-const MARCH_FWD: f32 = 72.0;
-const MARCH_STEP: f32 = 3.0;
-/// Curve advance when a ray finds no contact (leading-edge default).
-const DEFAULT_ADV: f32 = 14.0;
 
 #[derive(Resource)]
 pub struct InfluenceField {
@@ -41,6 +35,14 @@ pub struct InfluenceField {
     /// Blurred per-team density, units per cell.
     d: [Vec<f32>; 2],
     scratch: Vec<f32>,
+    /// Front contour segments (world space), for gizmos.
+    pub segments: Vec<(Vec2, Vec2)>,
+    /// Per cell: distance to nearest front point (f32::MAX = far).
+    pub dist: Vec<f32>,
+    /// Per cell: nearest front point.
+    pub front_pt: Vec<Vec2>,
+    /// Per cell: front normal there, oriented toward the team-0 side.
+    pub normal: Vec<Vec2>,
 }
 
 impl InfluenceField {
@@ -53,35 +55,45 @@ impl InfluenceField {
             h,
             d: [vec![0.0; w * h], vec![0.0; w * h]],
             scratch: vec![0.0; w * h],
+            segments: Vec::new(),
+            dist: vec![f32::MAX; w * h],
+            front_pt: vec![Vec2::ZERO; w * h],
+            normal: vec![Vec2::ZERO; w * h],
         }
     }
 
     #[inline]
-    pub fn sample(&self, team: usize, p: Vec2) -> f32 {
+    pub fn cell_index(&self, p: Vec2) -> usize {
         let g = (p - self.origin) / FIELD_CELL;
-        let gx = g.x.clamp(0.0, (self.w - 2) as f32);
-        let gz = g.y.clamp(0.0, (self.h - 2) as f32);
-        let (x0, z0) = (gx as usize, gz as usize);
-        let (fx, fz) = (gx - x0 as f32, gz - z0 as f32);
-        let d = &self.d[team];
-        let i = z0 * self.w + x0;
-        d[i] * (1.0 - fx) * (1.0 - fz)
-            + d[i + 1] * fx * (1.0 - fz)
-            + d[i + self.w] * (1.0 - fx) * fz
-            + d[i + self.w + 1] * fx * fz
+        let x = (g.x.round().max(0.0) as usize).min(self.w - 1);
+        let z = (g.y.round().max(0.0) as usize).min(self.h - 1);
+        z * self.w + x
     }
 
-    /// Gradient of a team's density (points toward increasing density).
     #[inline]
-    pub fn grad(&self, team: usize, p: Vec2) -> Vec2 {
-        const E: f32 = FIELD_CELL;
-        Vec2::new(
-            self.sample(team, p + Vec2::new(E, 0.0)) - self.sample(team, p - Vec2::new(E, 0.0)),
-            self.sample(team, p + Vec2::new(0.0, E)) - self.sample(team, p - Vec2::new(0.0, E)),
-        ) / (2.0 * E)
+    fn grid_world(&self, x: usize, z: usize) -> Vec2 {
+        self.origin + Vec2::new(x as f32, z as f32) * FIELD_CELL
     }
 
-    fn rebuild(&mut self, units: &Units) {
+    #[inline]
+    fn phi(&self, i: usize) -> f32 {
+        self.d[0][i] - self.d[1][i]
+    }
+
+    /// Normalized gradient of phi at a grid point (toward team-0 excess).
+    fn phi_grad(&self, x: usize, z: usize) -> Vec2 {
+        let xm = x.saturating_sub(1);
+        let xp = (x + 1).min(self.w - 1);
+        let zm = z.saturating_sub(1);
+        let zp = (z + 1).min(self.h - 1);
+        Vec2::new(
+            self.phi(z * self.w + xp) - self.phi(z * self.w + xm),
+            self.phi(zp * self.w + x) - self.phi(zm * self.w + x),
+        )
+        .normalize_or_zero()
+    }
+
+    fn rebuild_density(&mut self, units: &Units) {
         self.d[0].fill(0.0);
         self.d[1].fill(0.0);
         for i in 0..units.len() {
@@ -118,21 +130,130 @@ impl InfluenceField {
             }
         }
     }
-}
 
-/// Endpoint links between adjacent group fronts (for gizmos).
-#[derive(Resource, Default)]
-pub struct FrontLinks(pub Vec<(Vec2, Vec2)>);
+    /// Marching squares on phi = 0, masked to contact cells.
+    fn extract_contour(&mut self) {
+        self.segments.clear();
+        for z in 0..self.h - 1 {
+            for x in 0..self.w - 1 {
+                let i00 = z * self.w + x;
+                let i10 = i00 + 1;
+                let i01 = i00 + self.w;
+                let i11 = i01 + 1;
+                // Contact: both teams present at any corner of this square.
+                let contact = [i00, i10, i01, i11]
+                    .iter()
+                    .any(|&i| self.d[0][i].min(self.d[1][i]) > CONTACT_T);
+                if !contact {
+                    continue;
+                }
+                let f = [self.phi(i00), self.phi(i10), self.phi(i11), self.phi(i01)];
+                let mut case = 0usize;
+                for (b, v) in f.iter().enumerate() {
+                    if *v >= 0.0 {
+                        case |= 1 << b;
+                    }
+                }
+                if case == 0 || case == 15 {
+                    continue;
+                }
+                // Corner positions (00,10,11,01 clockwise-ish).
+                let p = [
+                    self.grid_world(x, z),
+                    self.grid_world(x + 1, z),
+                    self.grid_world(x + 1, z + 1),
+                    self.grid_world(x, z + 1),
+                ];
+                // Edge interpolators: edge k joins corner k and (k+1)%4.
+                let edge = |k: usize| -> Vec2 {
+                    let (a, b) = (k, (k + 1) % 4);
+                    let t = f[a] / (f[a] - f[b]);
+                    p[a].lerp(p[b], t.clamp(0.0, 1.0))
+                };
+                // Segment table (pairs of edges), ambiguous cases split arbitrarily.
+                const TABLE: [&[(usize, usize)]; 16] = [
+                    &[],
+                    &[(3, 0)],
+                    &[(0, 1)],
+                    &[(3, 1)],
+                    &[(1, 2)],
+                    &[(3, 0), (1, 2)],
+                    &[(0, 2)],
+                    &[(3, 2)],
+                    &[(2, 3)],
+                    &[(2, 0)],
+                    &[(0, 1), (2, 3)],
+                    &[(2, 1)],
+                    &[(1, 3)],
+                    &[(1, 0)],
+                    &[(0, 3)],
+                    &[],
+                ];
+                for &(e0, e1) in TABLE[case] {
+                    self.segments.push((edge(e0), edge(e1)));
+                }
+            }
+        }
+    }
+
+    /// Multi-source BFS from the contour: nearest front point + normal per
+    /// cell, out to ENGAGE_DIST (+ margin).
+    fn propagate_front(&mut self) {
+        self.dist.fill(f32::MAX);
+        let mut queue: VecDeque<usize> = VecDeque::new();
+        let segs = std::mem::take(&mut self.segments);
+        for (a, b) in &segs {
+            for pt in [*a, *b, (*a + *b) * 0.5] {
+                let ci = self.cell_index(pt);
+                let (x, z) = (ci % self.w, ci / self.w);
+                let n = self.phi_grad(x, z);
+                let d = self.grid_world(x, z).distance(pt);
+                if d < self.dist[ci] {
+                    self.dist[ci] = d;
+                    self.front_pt[ci] = pt;
+                    self.normal[ci] = n;
+                    queue.push_back(ci);
+                }
+            }
+        }
+        self.segments = segs;
+        let limit = ENGAGE_DIST + 2.0 * FIELD_CELL;
+        while let Some(ci) = queue.pop_front() {
+            let (x, z) = (ci % self.w, ci / self.w);
+            let fp = self.front_pt[ci];
+            let n = self.normal[ci];
+            for dz in -1i32..=1 {
+                for dx in -1i32..=1 {
+                    if dx == 0 && dz == 0 {
+                        continue;
+                    }
+                    let nx = x as i32 + dx;
+                    let nz = z as i32 + dz;
+                    if nx < 0 || nz < 0 || nx >= self.w as i32 || nz >= self.h as i32 {
+                        continue;
+                    }
+                    let nci = nz as usize * self.w + nx as usize;
+                    let d = self.grid_world(nx as usize, nz as usize).distance(fp);
+                    if d < self.dist[nci] && d < limit {
+                        self.dist[nci] = d;
+                        self.front_pt[nci] = fp;
+                        self.normal[nci] = n;
+                        queue.push_back(nci);
+                    }
+                }
+            }
+        }
+    }
+}
 
 pub struct FrontlinePlugin;
 
 impl Plugin for FrontlinePlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<FrontLinks>()
-            .add_systems(Startup, init_field)
+        app.add_systems(Startup, init_field)
             .add_systems(
                 FixedUpdate,
-                (update_field, update_frontlines)
+                (update_field, update_groups)
                     .chain()
                     .before(crate::movement::step_sim),
             )
@@ -145,16 +266,13 @@ fn init_field(mut commands: Commands, terrain: Res<Terrain>) {
 }
 
 fn update_field(mut field: ResMut<InfluenceField>, units: Res<Units>) {
-    field.rebuild(&units);
+    field.rebuild_density(&units);
+    field.extract_contour();
+    field.propagate_front();
 }
 
-fn update_frontlines(
-    units: Res<Units>,
-    mut groups: ResMut<Groups>,
-    field: Res<InfluenceField>,
-    mut links: ResMut<FrontLinks>,
-) {
-    // Refresh centroids and counts.
+/// Refresh group centroids, engagement, and stance depth.
+fn update_groups(units: Res<Units>, mut groups: ResMut<Groups>, field: Res<InfluenceField>) {
     let n = groups.list.len();
     let mut sums = vec![Vec2::ZERO; n];
     let mut counts = vec![0usize; n];
@@ -163,179 +281,25 @@ fn update_frontlines(
         sums[g] += Vec2::new(units.pos[i].x, units.pos[i].z);
         counts[g] += 1;
     }
-
-    // First per-group pass: centroid + facing + axis (needed before we can
-    // measure lateral spread).
     for (g, group) in groups.list.iter_mut().enumerate() {
         group.count = counts[g];
         if counts[g] == 0 {
             group.engaged = false;
-            group.front.clear();
             continue;
         }
         group.centroid = sums[g] / counts[g] as f32;
-        let enemy = 1 - group.team as usize;
-
-        // Facing: order direction wins; otherwise toward enemy mass.
-        // Temporally smoothed — the raw density gradient jitters and a
-        // twitching facing makes the whole curve swing around.
-        let raw = match group.order {
-            Some(t) => (t - group.centroid).normalize_or_zero(),
-            None => field.grad(enemy, group.centroid).normalize_or_zero(),
-        };
-        let facing = if raw == Vec2::ZERO {
-            group.facing
-        } else if group.facing == Vec2::ZERO {
-            raw
-        } else {
-            group.facing.lerp(raw, 0.2).normalize_or_zero()
-        };
-        if facing == Vec2::ZERO {
-            group.engaged = false;
-            group.front.clear();
-            continue;
-        }
-        group.facing = facing;
-        group.axis = Vec2::new(-facing.y, facing.x);
-    }
-
-    // Second unit pass: lateral spread (variance of projection onto each
-    // group's axis). The curve must hug the actual mass — a width derived
-    // from unit count alone paints phantom front lines over empty ground.
-    let mut u2 = vec![0.0f32; n];
-    for i in 0..units.len() {
-        let g = units.group[i] as usize;
-        let group = &groups.list[g];
-        if group.count == 0 {
-            continue;
-        }
-        let u = (Vec2::new(units.pos[i].x, units.pos[i].z) - group.centroid).dot(group.axis);
-        u2[g] += u * u;
-    }
-
-    for (g, group) in groups.list.iter_mut().enumerate() {
-        if group.count == 0 {
-            continue;
-        }
-        let enemy = 1 - group.team as usize;
-        let facing = group.facing;
-        if facing == Vec2::ZERO {
-            continue;
-        }
-        let spread = (u2[g] / group.count as f32).sqrt();
+        group.engaged = field.dist[field.cell_index(group.centroid)] < ENGAGE_DIST;
         let rows = match group.stance {
             Stance::Hold => 10.0,
             Stance::Column => 50.0,
         };
-        // Stance width is the ceiling the group grows toward; +20 m margin
-        // past the current spread lets it actually widen over time.
-        let stance_hw = ((group.count as f32 / rows) * SLOT_SPACING * 0.5).max(8.0);
-        group.half_width = (2.2 * spread + 20.0).min(stance_hw).clamp(8.0, 400.0);
         group.max_depth = rows * SLOT_SPACING * 1.5;
-
-        // Engaged when enemy influence is present at or ahead of the mass.
-        let ahead = group.centroid + facing * 30.0;
-        group.engaged = field.sample(enemy, group.centroid).max(field.sample(enemy, ahead))
-            > ENGAGE_T;
-        if !group.engaged {
-            group.front.clear();
-            continue;
-        }
-
-        // Extract the front curve: per lateral sample, march toward the
-        // enemy until their influence balances ours.
-        group.front.resize(K_SAMPLES, Vec2::ZERO);
-        for k in 0..K_SAMPLES {
-            let u = (k as f32 / (K_SAMPLES - 1) as f32 - 0.5) * 2.0 * group.half_width;
-            let base = group.centroid + group.axis * u;
-            let mut pt = base + facing * DEFAULT_ADV;
-            let mut t = MARCH_BACK;
-            while t < MARCH_FWD {
-                let p = base + facing * t;
-                let e = field.sample(enemy, p);
-                if e > ENGAGE_T && e >= field.sample(group.team as usize, p) {
-                    pt = p;
-                    break;
-                }
-                t += MARCH_STEP;
-            }
-            group.front[k] = pt;
-        }
-        // Lateral smoothing.
-        for _ in 0..2 {
-            for k in 1..K_SAMPLES - 1 {
-                group.front[k] =
-                    (group.front[k - 1] + group.front[k] * 2.0 + group.front[k + 1]) / 4.0;
-            }
-        }
-    }
-
-    // Neighbor links: per team, sort engaged groups laterally and blend
-    // adjacent curve endpoints together so the combined front connects.
-    links.0.clear();
-    for team in 0..2u8 {
-        let mut idx: Vec<usize> = (0..groups.list.len())
-            .filter(|&g| groups.list[g].team == team && groups.list[g].engaged)
-            .collect();
-        if idx.len() < 2 {
-            continue;
-        }
-        // Team lateral axis: perp of average facing.
-        let avg_facing: Vec2 = idx
-            .iter()
-            .map(|&g| groups.list[g].facing)
-            .sum::<Vec2>()
-            .normalize_or_zero();
-        let lateral = Vec2::new(-avg_facing.y, avg_facing.x);
-        idx.sort_by(|&a, &b| {
-            let pa = groups.list[a].centroid.dot(lateral);
-            let pb = groups.list[b].centroid.dot(lateral);
-            pa.partial_cmp(&pb).unwrap()
-        });
-        for w in idx.windows(2) {
-            let (a, b) = (w[0], w[1]);
-            // Closest endpoint pair between the two curves.
-            let ends_a = [0, K_SAMPLES - 1];
-            let ends_b = [0, K_SAMPLES - 1];
-            let (mut best, mut ea, mut eb) = (f32::MAX, 0, 0);
-            for &i in &ends_a {
-                for &j in &ends_b {
-                    let d2 = groups.list[a].front[i].distance_squared(groups.list[b].front[j]);
-                    if d2 < best {
-                        best = d2;
-                        ea = i;
-                        eb = j;
-                    }
-                }
-            }
-            // Only stitch fronts that are reasonably close.
-            if best > 120.0 * 120.0 {
-                continue;
-            }
-            let m = (groups.list[a].front[ea] + groups.list[b].front[eb]) * 0.5;
-            blend_end(&mut groups.list[a].front, ea, m);
-            blend_end(&mut groups.list[b].front, eb, m);
-            links
-                .0
-                .push((groups.list[a].front[ea], groups.list[b].front[eb]));
-        }
-    }
-}
-
-/// Pull the outermost samples of a curve end toward `m` with falloff.
-fn blend_end(front: &mut [Vec2], end: usize, m: Vec2) {
-    const REACH: usize = 6;
-    for j in 0..REACH.min(front.len()) {
-        let w = (1.0 - j as f32 / REACH as f32) * 0.6;
-        let k = if end == 0 { j } else { front.len() - 1 - j };
-        front[k] = front[k].lerp(m, w);
     }
 }
 
 fn draw_front_gizmos(
     viz: Res<DebugViz>,
-    groups: Res<Groups>,
-    links: Res<FrontLinks>,
+    field: Res<InfluenceField>,
     terrain: Res<Terrain>,
     mut gizmos: Gizmos,
 ) {
@@ -343,19 +307,8 @@ fn draw_front_gizmos(
         return;
     }
     let lift = |p: Vec2| Vec3::new(p.x, terrain.height_at(p.x, p.y) + 1.5, p.y);
-    for group in &groups.list {
-        if !group.engaged || group.front.is_empty() {
-            continue;
-        }
-        let color = if group.team == 0 {
-            Color::srgb(0.2, 0.9, 1.0)
-        } else {
-            Color::srgb(1.0, 0.5, 0.1)
-        };
-        gizmos.linestrip(group.front.iter().map(|p| lift(*p)), color);
-    }
-    for (a, b) in &links.0 {
-        gizmos.line(lift(*a), lift(*b), Color::srgb(0.9, 0.9, 0.9));
+    for (a, b) in &field.segments {
+        gizmos.line(lift(*a), lift(*b), Color::srgb(1.0, 0.95, 0.35));
     }
 }
 
