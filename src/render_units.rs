@@ -1,0 +1,339 @@
+//! Custom instanced rendering for units: one draw call for all 100k cubes.
+//! Adapted from bevy 0.19's `shader_advanced/custom_shader_instancing` example.
+//! Per-instance data is copied from the `Units` SoA buffers each frame and
+//! uploaded as an instance-rate vertex buffer.
+
+use bevy::core_pipeline::core_3d::TransparentSortingInfo3d;
+use bevy::pbr::{
+    self, MeshInputUniform, MeshPipelineSystems, MeshUniform, SetMeshViewBindingArrayBindGroup,
+    ViewKeyCache,
+};
+use bevy::{
+    camera::visibility::NoFrustumCulling,
+    core_pipeline::core_3d::Transparent3d,
+    ecs::{
+        query::QueryItem,
+        system::{SystemParamItem, lifetimeless::*},
+    },
+    mesh::{MeshVertexBufferLayoutRef, VertexBufferLayout},
+    pbr::{
+        MeshPipeline, MeshPipelineKey, RenderMeshInstances, SetMeshBindGroup, SetMeshViewBindGroup,
+    },
+    prelude::*,
+    render::{
+        Render, RenderApp, RenderStartup, RenderSystems,
+        batching::gpu_preprocessing::BatchedInstanceBuffers,
+        extract_component::{ExtractComponent, ExtractComponentPlugin},
+        mesh::{RenderMesh, RenderMeshBufferInfo, allocator::MeshAllocator},
+        render_asset::RenderAssets,
+        render_phase::{
+            AddRenderCommand, DrawFunctions, PhaseItem, PhaseItemExtraIndex, RenderCommand,
+            RenderCommandResult, SetItemPipeline, TrackedRenderPass, ViewSortedRenderPhases,
+        },
+        render_resource::*,
+        renderer::RenderDevice,
+        sync_component::SyncComponent,
+        sync_world::MainEntity,
+        view::ExtractedView,
+    },
+};
+use bevy::asset::{embedded_asset, load_embedded_asset};
+use bytemuck::{Pod, Zeroable};
+
+use crate::units::Units;
+
+#[derive(Clone, Copy, Pod, Zeroable)]
+#[repr(C)]
+pub struct InstanceData {
+    pub position: Vec3,
+    pub scale: f32,
+    pub color: [f32; 4],
+}
+
+#[derive(Component, Deref, DerefMut, Default)]
+pub struct InstanceMaterialData(pub Vec<InstanceData>);
+
+impl SyncComponent for InstanceMaterialData {
+    type Target = Self;
+}
+
+impl ExtractComponent for InstanceMaterialData {
+    type QueryData = &'static InstanceMaterialData;
+    type QueryFilter = ();
+    type Out = Self;
+
+    fn extract_component(item: QueryItem<'_, '_, Self::QueryData>) -> Option<Self> {
+        Some(InstanceMaterialData(item.0.clone()))
+    }
+}
+
+pub struct UnitRenderPlugin;
+
+impl Plugin for UnitRenderPlugin {
+    fn build(&self, app: &mut App) {
+        embedded_asset!(app, "shaders/unit_instancing.wgsl");
+        app.add_plugins(ExtractComponentPlugin::<InstanceMaterialData>::default())
+            .add_systems(Startup, setup_unit_mesh)
+            .add_systems(Update, sync_instance_data);
+        app.sub_app_mut(RenderApp)
+            .add_render_command::<Transparent3d, DrawCustom>()
+            .init_resource::<SpecializedMeshPipelines<CustomPipeline>>()
+            .add_systems(
+                RenderStartup,
+                init_custom_pipeline.after(MeshPipelineSystems),
+            )
+            .add_systems(
+                Render,
+                (
+                    queue_custom.in_set(RenderSystems::QueueMeshes),
+                    prepare_instance_buffers.in_set(RenderSystems::PrepareResources),
+                ),
+            );
+    }
+}
+
+fn setup_unit_mesh(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
+    // Slightly taller than wide: reads as a soldier, not a bead.
+    commands.spawn((
+        Mesh3d(meshes.add(Cuboid::new(0.7, 0.9, 0.7))),
+        InstanceMaterialData::default(),
+        // Instance positions are not the entity's transform; built-in frustum
+        // culling would cull all 100k units at once, so disable it.
+        NoFrustumCulling,
+    ));
+}
+
+/// Copy the SoA sim state into the per-instance buffer (main world side).
+fn sync_instance_data(units: Res<Units>, mut query: Query<&mut InstanceMaterialData>) {
+    let Ok(mut data) = query.single_mut() else {
+        return;
+    };
+    data.clear();
+    data.reserve(units.len());
+    for i in 0..units.len() {
+        data.push(InstanceData {
+            position: units.pos[i],
+            scale: 1.0,
+            color: units.color[i],
+        });
+    }
+}
+
+fn queue_custom(
+    transparent_3d_draw_functions: Res<DrawFunctions<Transparent3d>>,
+    custom_pipeline: Res<CustomPipeline>,
+    mut pipelines: ResMut<SpecializedMeshPipelines<CustomPipeline>>,
+    pipeline_cache: Res<PipelineCache>,
+    meshes: Res<RenderAssets<RenderMesh>>,
+    render_mesh_instances: Res<RenderMeshInstances>,
+    maybe_batched_instance_buffers: Option<
+        Res<BatchedInstanceBuffers<MeshUniform, MeshInputUniform>>,
+    >,
+    material_meshes: Query<(Entity, &MainEntity), With<InstanceMaterialData>>,
+    mut transparent_render_phases: ResMut<ViewSortedRenderPhases<Transparent3d>>,
+    views: Query<&ExtractedView>,
+    view_key_cache: Res<ViewKeyCache>,
+) {
+    let draw_custom = transparent_3d_draw_functions.read().id::<DrawCustom>();
+
+    for view in &views {
+        let Some(transparent_phase) = transparent_render_phases.get_mut(&view.retained_view_entity)
+        else {
+            continue;
+        };
+
+        let Some(&view_key) = view_key_cache.get(&view.retained_view_entity) else {
+            continue;
+        };
+
+        for (entity, main_entity) in &material_meshes {
+            let Some(mesh_instance) = render_mesh_instances.render_mesh_queue_data(*main_entity)
+            else {
+                continue;
+            };
+            let Some(mesh) = meshes.get(mesh_instance.mesh_asset_id()) else {
+                continue;
+            };
+            let key = view_key
+                | MeshPipelineKey::from_primitive_topology_and_strip_index(
+                    mesh.primitive_topology(),
+                    mesh.index_format(),
+                );
+            let pipeline = pipelines
+                .specialize(&pipeline_cache, &custom_pipeline, key, &mesh.layout)
+                .unwrap();
+            transparent_phase.add_retained(Transparent3d {
+                sorting_info: TransparentSortingInfo3d::Sorted {
+                    mesh_center: pbr::get_mesh_instance_world_from_local(
+                        *main_entity,
+                        mesh_instance.current_uniform_index,
+                        &render_mesh_instances,
+                        maybe_batched_instance_buffers.as_deref(),
+                    )
+                    .transform_point3(
+                        meshes
+                            .get(mesh_instance.mesh_asset_id())
+                            .unwrap()
+                            .aabb_center,
+                    ),
+                    depth_bias: 0.0,
+                },
+                entity: (entity, *main_entity),
+                pipeline,
+                draw_function: draw_custom,
+                distance: 0.0,
+                batch_range: 0..1,
+                extra_index: PhaseItemExtraIndex::None,
+                indexed: true,
+            });
+        }
+    }
+}
+
+#[derive(Component)]
+struct InstanceBuffer {
+    buffer: Buffer,
+    length: usize,
+}
+
+fn prepare_instance_buffers(
+    mut commands: Commands,
+    query: Query<(Entity, &InstanceMaterialData)>,
+    render_device: Res<RenderDevice>,
+) {
+    for (entity, instance_data) in &query {
+        let buffer = render_device.create_buffer_with_data(&BufferInitDescriptor {
+            label: Some("unit instance buffer"),
+            contents: bytemuck::cast_slice(instance_data.as_slice()),
+            usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+        });
+        commands.entity(entity).insert(InstanceBuffer {
+            buffer,
+            length: instance_data.len(),
+        });
+    }
+}
+
+#[derive(Resource)]
+struct CustomPipeline {
+    shader: Handle<Shader>,
+    mesh_pipeline: MeshPipeline,
+}
+
+fn init_custom_pipeline(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    mesh_pipeline: Res<MeshPipeline>,
+) {
+    commands.insert_resource(CustomPipeline {
+        shader: load_embedded_asset!(asset_server.as_ref(), "shaders/unit_instancing.wgsl"),
+        mesh_pipeline: mesh_pipeline.clone(),
+    });
+}
+
+impl SpecializedMeshPipeline for CustomPipeline {
+    type Key = MeshPipelineKey;
+
+    fn specialize(
+        &self,
+        key: Self::Key,
+        layout: &MeshVertexBufferLayoutRef,
+    ) -> Result<RenderPipelineDescriptor, SpecializedMeshPipelineError> {
+        let mut descriptor = self.mesh_pipeline.specialize(key, layout)?;
+
+        descriptor.vertex.shader = self.shader.clone();
+        descriptor.vertex.buffers.push(VertexBufferLayout {
+            array_stride: size_of::<InstanceData>() as u64,
+            step_mode: VertexStepMode::Instance,
+            attributes: vec![
+                VertexAttribute {
+                    format: VertexFormat::Float32x4,
+                    offset: 0,
+                    shader_location: 3, // 0-2 are Position, Normal, UV
+                },
+                VertexAttribute {
+                    format: VertexFormat::Float32x4,
+                    offset: VertexFormat::Float32x4.size(),
+                    shader_location: 4,
+                },
+            ],
+        });
+        descriptor.fragment.as_mut().unwrap().shader = self.shader.clone();
+        Ok(descriptor)
+    }
+}
+
+type DrawCustom = (
+    SetItemPipeline,
+    SetMeshViewBindGroup<0>,
+    SetMeshViewBindingArrayBindGroup<1>,
+    SetMeshBindGroup<2>,
+    DrawMeshInstanced,
+);
+
+struct DrawMeshInstanced;
+
+impl<P: PhaseItem> RenderCommand<P> for DrawMeshInstanced {
+    type Param = (
+        SRes<RenderAssets<RenderMesh>>,
+        SRes<RenderMeshInstances>,
+        SRes<MeshAllocator>,
+    );
+    type ViewQuery = ();
+    type ItemQuery = Read<InstanceBuffer>;
+
+    #[inline]
+    fn render<'w>(
+        item: &P,
+        _view: (),
+        instance_buffer: Option<&'w InstanceBuffer>,
+        (meshes, render_mesh_instances, mesh_allocator): SystemParamItem<'w, '_, Self::Param>,
+        pass: &mut TrackedRenderPass<'w>,
+    ) -> RenderCommandResult {
+        // A borrow check workaround.
+        let mesh_allocator = mesh_allocator.into_inner();
+
+        let Some(mesh_instance) = render_mesh_instances.render_mesh_queue_data(item.main_entity())
+        else {
+            return RenderCommandResult::Skip;
+        };
+        let Some(gpu_mesh) = meshes.into_inner().get(mesh_instance.mesh_asset_id()) else {
+            return RenderCommandResult::Skip;
+        };
+        let Some(instance_buffer) = instance_buffer else {
+            return RenderCommandResult::Skip;
+        };
+        let Some(vertex_buffer_slice) =
+            mesh_allocator.mesh_vertex_slice(&mesh_instance.mesh_asset_id())
+        else {
+            return RenderCommandResult::Skip;
+        };
+
+        pass.set_vertex_buffer(0, vertex_buffer_slice.buffer.slice(..));
+        pass.set_vertex_buffer(1, instance_buffer.buffer.slice(..));
+
+        match &gpu_mesh.buffer_info {
+            RenderMeshBufferInfo::Indexed {
+                index_format,
+                count,
+            } => {
+                let Some(index_buffer_slice) =
+                    mesh_allocator.mesh_index_slice(&mesh_instance.mesh_asset_id())
+                else {
+                    return RenderCommandResult::Skip;
+                };
+
+                pass.set_index_buffer(index_buffer_slice.buffer.slice(..), *index_format);
+                pass.draw_indexed(
+                    index_buffer_slice.range.start..(index_buffer_slice.range.start + count),
+                    vertex_buffer_slice.range.start as i32,
+                    0..instance_buffer.length as u32,
+                );
+            }
+            RenderMeshBufferInfo::NonIndexed => {
+                pass.draw(vertex_buffer_slice.range, 0..instance_buffer.length as u32);
+            }
+        }
+        RenderCommandResult::Success
+    }
+}
