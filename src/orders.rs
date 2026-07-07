@@ -119,12 +119,38 @@ fn drag_select(
     }
 }
 
+/// A stroke whose endpoints nearly meet is treated as a closed loop.
+fn stroke_is_closed(line: &[Vec2]) -> bool {
+    if line.len() < 3 {
+        return false;
+    }
+    let path_len: f32 = line.windows(2).map(|w| w[0].distance(w[1])).sum();
+    line[0].distance(*line.last().unwrap()) < (path_len * 0.15).clamp(10.0, 40.0)
+}
+
+/// Even-odd crossing test against the stroke polygon (closing edge implied).
+fn point_in_poly(p: Vec2, poly: &[Vec2]) -> bool {
+    let mut inside = false;
+    let mut j = poly.len() - 1;
+    for i in 0..poly.len() {
+        let (a, b) = (poly[i], poly[j]);
+        if (a.y > p.y) != (b.y > p.y) {
+            let x = a.x + (p.y - a.y) / (b.y - a.y) * (b.x - a.x);
+            if p.x < x {
+                inside = !inside;
+            }
+        }
+        j = i;
+    }
+    inside
+}
+
 fn select_along_line(line: &[Vec2], units: &Units, selection: &mut Selection) {
     selection.mask.clear();
     selection.mask.resize(units.len(), false);
     selection.count = 0;
 
-    // Bounding box early-out around the whole line.
+    // Bounding box early-out around the whole stroke.
     let mut lo = Vec2::splat(f32::MAX);
     let mut hi = Vec2::splat(f32::MIN);
     for p in line {
@@ -134,6 +160,9 @@ fn select_along_line(line: &[Vec2], units: &Units, selection: &mut Selection) {
     lo -= SELECT_RADIUS;
     hi += SELECT_RADIUS;
 
+    // War-of-Dots style: an enclosing stroke selects everything inside the
+    // loop, in addition to units near the stroke itself.
+    let closed = stroke_is_closed(line);
     let r2 = SELECT_RADIUS * SELECT_RADIUS;
     for i in 0..units.len() {
         if units.team[i] != PLAYER_TEAM {
@@ -143,21 +172,23 @@ fn select_along_line(line: &[Vec2], units: &Units, selection: &mut Selection) {
         if p.x < lo.x || p.x > hi.x || p.y < lo.y || p.y > hi.y {
             continue;
         }
-        let mut best = f32::MAX;
-        if line.len() == 1 {
-            best = p.distance_squared(line[0]);
-        } else {
-            for w in line.windows(2) {
-                let (a, b) = (w[0], w[1]);
-                let ab = b - a;
-                let t = ((p - a).dot(ab) / ab.length_squared().max(1e-6)).clamp(0.0, 1.0);
-                best = best.min(p.distance_squared(a + ab * t));
-                if best < r2 {
-                    break;
+        let mut hit = closed && point_in_poly(p, line);
+        if !hit {
+            if line.len() == 1 {
+                hit = p.distance_squared(line[0]) < r2;
+            } else {
+                for w in line.windows(2) {
+                    let (a, b) = (w[0], w[1]);
+                    let ab = b - a;
+                    let t = ((p - a).dot(ab) / ab.length_squared().max(1e-6)).clamp(0.0, 1.0);
+                    if p.distance_squared(a + ab * t) < r2 {
+                        hit = true;
+                        break;
+                    }
                 }
             }
         }
-        if best < r2 {
+        if hit {
             selection.mask[i] = true;
             selection.count += 1;
         }
@@ -273,14 +304,19 @@ fn draw_order_gizmos(
     if !viz.0 {
         return;
     }
-    // Selection line being drawn.
+    // Selection line being drawn; when the stroke would close into a loop,
+    // show the implied closing edge.
     if drag.active && drag.points.len() > 1 {
-        let pts: Vec<Vec3> = drag
-            .points
-            .iter()
-            .map(|p| Vec3::new(p.x, terrain.height_at(p.x, p.y) + 1.0, p.y))
-            .collect();
+        let lift = |p: &Vec2| Vec3::new(p.x, terrain.height_at(p.x, p.y) + 1.0, p.y);
+        let pts: Vec<Vec3> = drag.points.iter().map(lift).collect();
         gizmos.linestrip(pts, Color::srgb(0.95, 0.95, 0.4));
+        if stroke_is_closed(&drag.points) {
+            gizmos.line(
+                lift(drag.points.last().unwrap()),
+                lift(&drag.points[0]),
+                Color::srgb(0.5, 1.0, 0.5),
+            );
+        }
     }
     // Order targets.
     for group in &groups.list {
@@ -316,20 +352,26 @@ fn test_orders_script(
     let t = time.elapsed_secs();
     match *stage {
         0 if t > 5.0 => {
-            // Disc selection inside the blue army.
-            selection.mask.clear();
-            selection.mask.resize(units.len(), false);
-            selection.count = 0;
+            // Enclosure selection: a circular stroke inside the blue army
+            // (exercises the closed-loop polygon path end to end).
             let center = Vec2::new(-150.0, -90.0);
-            for i in 0..units.len() {
-                if units.team[i] == PLAYER_TEAM
-                    && Vec2::new(units.pos[i].x, units.pos[i].z).distance(center) < 45.0
-                {
-                    selection.mask[i] = true;
-                    selection.count += 1;
-                }
-            }
-            info!("[test] selected {} units", selection.count);
+            let stroke: Vec<Vec2> = (0..28)
+                .map(|k| {
+                    let a = k as f32 / 28.0 * std::f32::consts::TAU;
+                    center + Vec2::new(a.cos(), a.sin()) * 45.0
+                })
+                .collect();
+            select_along_line(&stroke, &units, &mut selection);
+            let brute = (0..units.len())
+                .filter(|&i| {
+                    units.team[i] == PLAYER_TEAM
+                        && Vec2::new(units.pos[i].x, units.pos[i].z).distance(center) < 45.0
+                })
+                .count();
+            info!(
+                "[test] enclosure selected {} units (>= {brute} strictly inside)",
+                selection.count
+            );
             if let Some(g) = split_selection(&mut units, &mut groups, &selection) {
                 groups.list[g as usize].order = Some(Vec2::new(220.0, 160.0));
                 info!("[test] cut group {g}, ordered across the map");
