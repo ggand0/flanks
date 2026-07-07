@@ -320,11 +320,32 @@ fn test_front_script(
     mut groups: ResMut<Groups>,
     mut selection: ResMut<crate::orders::Selection>,
     mut stage: Local<u32>,
+    mut next_reorder: Local<f32>,
 ) {
     if std::env::var("FL_TEST_FRONT").is_err() {
         return;
     }
     let t = time.elapsed_secs();
+
+    // Stand-in for player/AI: idle unengaged groups re-target the enemy
+    // mass every 15 s so remnant pockets hunt each other down.
+    if *stage >= 1 && t > *next_reorder {
+        *next_reorder = t + 15.0;
+        let mut sums = [Vec2::ZERO; 2];
+        let mut counts = [0usize; 2];
+        for i in 0..units.len() {
+            let tm = units.team[i] as usize;
+            sums[tm] += Vec2::new(units.pos[i].x, units.pos[i].z);
+            counts[tm] += 1;
+        }
+        for group in &mut groups.list {
+            let enemy = 1 - group.team as usize;
+            if group.count > 0 && !group.engaged && counts[enemy] > 0 {
+                group.order = Some(sums[enemy] / counts[enemy] as f32);
+            }
+        }
+    }
+
     match *stage {
         0 if t > 3.0 => {
             groups.list[0].order = Some(Vec2::new(0.0, 40.0));

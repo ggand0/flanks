@@ -14,6 +14,11 @@ use crate::units::{UNIT_HALF_HEIGHT, Units};
 
 const SEP_RADIUS: f32 = 1.4;
 const SEP_STRENGTH: f32 = 60.0;
+/// Melee reach. Wider than the separation standoff (~1.4 m) so front rows
+/// actually fight across the gap; the grid query widens automatically.
+const MELEE_RANGE: f32 = 1.7;
+/// At most this many attackers hurt one unit per tick.
+const MAX_ATTACKERS: u32 = 4;
 /// Cap on summed separation push to avoid explosive forces deep in a crowd.
 const SEP_PUSH_MAX: f32 = 2.5;
 /// Below this distance repulsion ramps up hard (cubes are 0.62 wide).
@@ -35,6 +40,23 @@ const CORR_MAX: f32 = 0.2;
 const ARRIVE_RADIUS: f32 = 35.0;
 const CHUNK: usize = 2048;
 
+/// Damage per attacker per second. FL_DPS overrides (fast test battles).
+#[derive(Resource)]
+pub struct CombatTuning {
+    pub dps: f32,
+}
+
+impl Default for CombatTuning {
+    fn default() -> Self {
+        Self {
+            dps: std::env::var("FL_DPS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(18.0),
+        }
+    }
+}
+
 #[derive(Resource, Default)]
 pub struct SimStats {
     pub grid_ms: f32,
@@ -54,6 +76,7 @@ pub struct MovementPlugin;
 impl Plugin for MovementPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<SimStats>()
+            .init_resource::<CombatTuning>()
             .insert_resource(DebugViz(true))
             .init_resource::<SpatialGrid>()
             .add_systems(FixedUpdate, step_sim)
@@ -67,6 +90,7 @@ pub fn step_sim(
     groups: Res<Groups>,
     field: Res<crate::frontline::InfluenceField>,
     terrain: Res<Terrain>,
+    tuning: Res<CombatTuning>,
     time: Res<Time>,
     mut stats: ResMut<SimStats>,
     mut tick: Local<u32>,
@@ -79,6 +103,7 @@ pub fn step_sim(
         speed,
         team,
         group,
+        hp,
         ..
     } = &mut *units;
     if pos.is_empty() {
@@ -107,8 +132,14 @@ pub fn step_sim(
     let bounds_min = terrain.min() + 4.0;
     let bounds_max = terrain.max() - 4.0;
 
+    let dps = tuning.dps;
+    let tick_seed = tick.wrapping_mul(0x9E37_79B1);
     ComputeTaskPool::get().scope(|scope| {
-        for (ci, (p_chunk, v_chunk)) in pos.chunks_mut(CHUNK).zip(vel.chunks_mut(CHUNK)).enumerate()
+        for (ci, ((p_chunk, v_chunk), hp_chunk)) in pos
+            .chunks_mut(CHUNK)
+            .zip(vel.chunks_mut(CHUNK))
+            .zip(hp.chunks_mut(CHUNK))
+            .enumerate()
         {
             let start = ci * CHUNK;
             scope.spawn(async move {
@@ -157,13 +188,17 @@ pub fn step_sim(
                     let mut push = Vec2::ZERO;
                     let mut corr = Vec2::ZERO;
                     let mut crowd = 0.0f32;
-                    grid.for_each_candidate(p, SEP_RADIUS, |o| {
+                    let mut attackers = 0u32;
+                    grid.for_each_candidate(p, MELEE_RANGE, |o| {
                         let o = o as usize;
                         if o == i {
                             return;
                         }
                         let d = p - pos_prev[o].xz();
                         let d2 = d.length_squared();
+                        if team[o] != team[i] && d2 < MELEE_RANGE * MELEE_RANGE {
+                            attackers += 1;
+                        }
                         if d2 < SEP_RADIUS * SEP_RADIUS && d2 > 1e-8 {
                             let len = d2.sqrt();
                             let w = 1.0 - len / SEP_RADIUS;
@@ -212,6 +247,13 @@ pub fn step_sim(
                         if into > 0.0 {
                             new_v += cn * into;
                         }
+                    }
+
+                    // Melee: damage received from enemies in reach, small
+                    // per-tick randomization. Gather form — no write races.
+                    if attackers > 0 {
+                        let r = 0.7 + 0.6 * crate::units::hash01(tick_seed ^ (i as u32));
+                        hp_chunk[j] -= attackers.min(MAX_ATTACKERS) as f32 * dps * dt * r;
                     }
 
                     v_chunk[j] = Vec3::new(new_v.x, 0.0, new_v.y);

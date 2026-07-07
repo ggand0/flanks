@@ -4,6 +4,7 @@ use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy::prelude::*;
 use bevy::render::diagnostic::RenderDiagnosticsPlugin;
 
+use crate::combat::CombatStats;
 use crate::movement::SimStats;
 use crate::orders::{Groups, Selection};
 use crate::units::Units;
@@ -48,6 +49,7 @@ fn update_overlay(
     stats: Res<SimStats>,
     groups: Res<Groups>,
     selection: Res<Selection>,
+    combat: Res<CombatStats>,
     mut query: Query<&mut Text, With<OverlayText>>,
     time: Res<Time>,
     mut log_timer: Local<f32>,
@@ -63,13 +65,17 @@ fn update_overlay(
 
     for mut text in &mut query {
         text.0 = format!(
-            "{fps:>5.0} fps  {frame_ms:.2} ms\n{} units, 1 unit draw call\nsim tick: grid {:.2} ms, step {:.2} ms\n{} groups ({} engaged), {} selected",
+            "{fps:>5.0} fps  {frame_ms:.2} ms\n{} units, 1 unit draw call\nsim tick: grid {:.2} ms, step {:.2} ms\n{} groups ({} engaged), {} selected\nblue {} ({} lost)  orange {} ({} lost)",
             units.len(),
             stats.grid_ms,
             stats.step_ms,
             groups.list.len(),
             groups.list.iter().filter(|g| g.engaged).count(),
             selection.count,
+            combat.alive[0],
+            combat.kills[0],
+            combat.alive[1],
+            combat.kills[1],
         );
     }
 
@@ -79,8 +85,10 @@ fn update_overlay(
     if *log_timer >= 2.0 {
         *log_timer = 0.0;
         info!(
-            "fps: {fps:.0} ({frame_ms:.2} ms), units: {}, nn min/avg: {:.2}/{:.2}",
+            "fps: {fps:.0} ({frame_ms:.2} ms), units: {} (blue {} / orange {}), nn min/avg: {:.2}/{:.2}",
             units.len(),
+            combat.alive[0],
+            combat.alive[1],
             stats.nn_min,
             stats.nn_avg
         );
