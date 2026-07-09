@@ -67,11 +67,9 @@ fn update_overlay(
 
     for mut text in &mut query {
         text.0 = format!(
-            "{fps:>5.0} fps  {frame_ms:.2} ms\n{} units, drawn {} ({} near / {} far)\nsim tick: grid {:.2} ms, step {:.2} ms\n{} groups ({} engaged), {} selected\nblue {} ({} lost)  orange {} ({} lost)",
+            "{fps:>5.0} fps  {frame_ms:.2} ms\n{} units, drawn {} (frustum culled)\nsim tick: grid {:.2} ms, step {:.2} ms\n{} groups ({} engaged), {} selected\nblue {} ({} lost)  orange {} ({} lost)",
             units.len(),
-            render_counts.near + render_counts.far,
-            render_counts.near,
-            render_counts.far,
+            render_counts.drawn,
             stats.grid_ms,
             stats.step_ms,
             groups.list.len(),

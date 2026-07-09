@@ -40,23 +40,14 @@ use bytemuck::{Pod, Zeroable};
 
 use crate::units::Units;
 
-/// Instances farther than this from the camera go in the far-LOD bucket.
-const LOD_DISTANCE: f32 = 300.0;
 /// Bounding-sphere radius for per-instance frustum culling: cube diagonal
 /// plus a generous margin so nothing pops inside the screen edge.
 const CULL_RADIUS: f32 = 2.5;
 
-/// Which LOD bucket an instance entity renders (0 = near, 1 = far).
-/// Far bucket currently uses the same cube; the mesh slot is the point —
-/// cheaper LOD meshes and per-type meshes drop in here later.
-#[derive(Component)]
-pub struct UnitLod(pub u8);
-
 /// Instances drawn this frame after culling (overlay diagnostics).
 #[derive(Resource, Default)]
 pub struct RenderCounts {
-    pub near: usize,
-    pub far: usize,
+    pub drawn: usize,
     pub total: usize,
 }
 
@@ -132,64 +123,46 @@ impl Plugin for UnitRenderPlugin {
 }
 
 fn setup_unit_mesh(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
-    // One instance entity per LOD bucket. Slightly taller than wide: reads
-    // as a soldier, not a bead. Far mesh is identical for now — the slot
-    // exists so cheaper LOD / per-type meshes drop in without infra work.
+    // Slightly taller than wide: reads as a soldier, not a bead.
     // Instance positions are not the entity's transform; built-in frustum
     // culling would cull all instances at once, so it stays disabled and
     // we cull per-instance in sync_instance_data.
-    for lod in 0..2u8 {
-        commands.spawn((
-            Mesh3d(meshes.add(Cuboid::new(0.62, 0.9, 0.62))),
-            InstanceMaterialData::default(),
-            UnitLod(lod),
-            NoFrustumCulling,
-        ));
-    }
+    commands.spawn((
+        Mesh3d(meshes.add(Cuboid::new(0.62, 0.9, 0.62))),
+        InstanceMaterialData::default(),
+        NoFrustumCulling,
+    ));
 }
 
-/// Copy the SoA sim state into the per-instance buffers (main world side):
-/// interpolate between fixed ticks, frustum-cull per instance, split into
-/// near/far LOD buckets, tint the selection.
+/// Copy the SoA sim state into the instance buffer (main world side):
+/// interpolate between fixed ticks, frustum-cull per instance, tint the
+/// selection. Culling is strictly visibility: a unit is skipped only when
+/// its bounding sphere is outside the camera frustum.
 fn sync_instance_data(
     units: Res<Units>,
     selection: Res<crate::orders::Selection>,
     fixed_time: Res<Time<Fixed>>,
     camera: Query<(&Projection, &Transform), With<Camera3d>>,
-    mut query: Query<(&mut InstanceMaterialData, &UnitLod)>,
+    mut query: Query<&mut InstanceMaterialData>,
     mut counts: ResMut<RenderCounts>,
 ) {
     let _span = info_span!("sync_instances").entered();
     let Ok((projection, cam_tf)) = camera.single() else {
         return;
     };
-    // Fresh frustum from THIS frame's camera state (camera has no parent,
-    // so Transform is authoritative).
-    let clip_from_world =
-        projection.get_clip_from_view() * cam_tf.to_matrix().inverse();
-    let frustum = Frustum(ViewFrustum::from_clip_from_world(&clip_from_world));
-    let cull = std::env::var("FL_NO_CULL").is_err();
-    let cam_pos = cam_tf.translation;
-    let alpha = fixed_time.overstep_fraction();
-
-    let mut near = None;
-    let mut far = None;
-    for (data, lod) in &mut query {
-        if lod.0 == 0 {
-            near = Some(data);
-        } else {
-            far = Some(data);
-        }
-    }
-    let (Some(mut near), Some(mut far)) = (near, far) else {
+    let Ok(mut data) = query.single_mut() else {
         return;
     };
-    near.clear();
-    far.clear();
+    // Fresh frustum from THIS frame's camera state (camera has no parent,
+    // so Transform is authoritative).
+    let clip_from_world = projection.get_clip_from_view() * cam_tf.to_matrix().inverse();
+    let frustum = Frustum(ViewFrustum::from_clip_from_world(&clip_from_world));
+    let cull = std::env::var("FL_NO_CULL").is_err();
+    let alpha = fixed_time.overstep_fraction();
 
+    data.clear();
     const HIGHLIGHT: [f32; 4] = [1.0, 1.0, 0.55, 1.0];
     let has_sel = selection.mask.len() == units.len();
-    let lod_d2 = LOD_DISTANCE * LOD_DISTANCE;
     for i in 0..units.len() {
         let position = units.pos_prev[i].lerp(units.pos[i], alpha);
         let sphere = Sphere {
@@ -207,19 +180,13 @@ fn sync_instance_data(
                 color[c] = color[c] * 0.35 + HIGHLIGHT[c] * 0.65;
             }
         }
-        let instance = InstanceData {
+        data.push(InstanceData {
             position,
             scale: 1.0,
             color,
-        };
-        if position.distance_squared(cam_pos) < lod_d2 {
-            near.push(instance);
-        } else {
-            far.push(instance);
-        }
+        });
     }
-    counts.near = near.len();
-    counts.far = far.len();
+    counts.drawn = data.len();
     counts.total = units.len();
 }
 
