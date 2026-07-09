@@ -8,8 +8,9 @@ use crate::orders::Selection;
 use crate::terrain::Terrain;
 use crate::units::{Units, hash01};
 
-/// Fraction of kills that leave a crater.
-const CRATER_CHANCE: f32 = 0.004;
+/// Fraction of kills that leave a crater. Disabled (owner call) — deaths
+/// don't blow holes in the ground; craters return with explosives/artillery.
+const CRATER_CHANCE: f32 = 0.0;
 /// Remesh guard: max craters carved per tick.
 const CRATERS_PER_TICK: usize = 2;
 

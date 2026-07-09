@@ -24,7 +24,9 @@ pub const FIELD_CELL: f32 = 8.0;
 /// Units this close to the front adopt line behavior.
 pub const ENGAGE_DIST: f32 = 60.0;
 /// Both teams' blurred density must exceed this for a cell to be "contact".
-const CONTACT_T: f32 = 0.35;
+/// Low on purpose: the line must form while approaching armies are still
+/// ~20-30 m apart, so they lock onto it instead of charging through.
+const CONTACT_T: f32 = 0.12;
 const SLOT_SPACING: f32 = 1.05;
 
 #[derive(Resource)]
@@ -103,7 +105,7 @@ impl InfluenceField {
             self.d[units.team[i] as usize][z * self.w + x] += 1.0;
         }
         for team in 0..2 {
-            for _ in 0..2 {
+            for _ in 0..3 {
                 self.blur_pass(team);
             }
         }
