@@ -16,9 +16,6 @@ pub fn units_per_team() -> usize {
     })
 }
 
-/// Half the height of a unit cube; units sit on the ground at this Y.
-pub const UNIT_HALF_HEIGHT: f32 = 0.45;
-
 /// All per-unit state, structure-of-arrays.
 #[derive(Resource, Default)]
 pub struct Units {
@@ -29,10 +26,15 @@ pub struct Units {
     /// Per-unit max speed (small variation breaks lockstep patterns).
     pub speed: Vec<f32>,
     pub team: Vec<u8>,
+    /// Unit type: index into `unit_types::TYPES` (also the render bucket).
+    pub kind: Vec<u8>,
+    /// Smoothed facing angle around Y (0 = +Z); sim-owned, render-consumed.
+    pub yaw: Vec<f32>,
     /// Index into `Groups::list`.
     pub group: Vec<u32>,
     pub hp: Vec<f32>,
     /// Base render color (team color with per-unit variation baked in).
+    /// Alpha carries a stable per-unit anim seed, not opacity.
     pub color: Vec<[f32; 4]>,
 }
 
@@ -78,29 +80,53 @@ fn spawn_armies(mut units: ResMut<Units>, terrain: Res<crate::terrain::Terrain>)
     units.team.reserve(n);
     units.color.reserve(n);
 
+    let rows = per_team.div_ceil(COLS);
+    let heavy_rows = (rows as f32 * heavy_frac()).round() as usize;
     for team in 0..2u8 {
         let dir = if team == 0 { -1.0 } else { 1.0 };
         for k in 0..per_team {
             let row = k / COLS;
             let col = k % COLS;
             let i = (team as usize * per_team + k) as u32;
+            // Heavies hold the front rows (nearest the gap).
+            let kind = if row < heavy_rows {
+                crate::unit_types::KIND_HEAVY
+            } else {
+                crate::unit_types::KIND_LIGHT
+            };
+            let params = &crate::unit_types::TYPES[kind as usize];
             let jx = hash01(i.wrapping_mul(3) + 1) - 0.5;
             let jz = hash01(i.wrapping_mul(3) + 2) - 0.5;
             let x = (col as f32 - (COLS - 1) as f32 / 2.0) * SPACING + jx * 0.6;
             let z = dir * (GAP / 2.0 + row as f32 * SPACING) + jz * 0.6;
-            let p = Vec3::new(x, terrain.height_at(x, z) + UNIT_HALF_HEIGHT, z);
+            let p = Vec3::new(x, terrain.height_at(x, z) + params.half_height, z);
             units.pos.push(p);
             units.pos_prev.push(p);
             units.vel.push(Vec3::ZERO);
-            units.speed.push(9.0 * (0.9 + 0.2 * hash01(i.wrapping_mul(7) + 5)));
+            units
+                .speed
+                .push(params.speed * (0.9 + 0.2 * hash01(i.wrapping_mul(7) + 5)));
             units.team.push(team);
+            units.kind.push(kind);
+            // Face the enemy at spawn (0 = +Z).
+            units.yaw.push(if team == 0 { 0.0 } else { std::f32::consts::PI });
             units.group.push(team as u32);
-            units.hp.push(100.0);
+            units.hp.push(params.hp);
 
             // Per-unit tonal variation so a block of 50k doesn't read as a flat texture.
             let tone = 0.85 + 0.3 * hash01(i.wrapping_mul(3));
             let c = team_colors[team as usize] * tone;
-            units.color.push([c.x, c.y, c.z, 1.0]);
+            // Alpha = stable anim seed (walk-bob phase offset), not opacity.
+            units.color.push([c.x, c.y, c.z, hash01(i.wrapping_mul(11) + 7)]);
         }
     }
+}
+
+/// Fraction of each army spawned as heavy infantry (front rows).
+/// FL_HEAVY_FRAC overrides; the real per-regiment mix lands with regiments.
+fn heavy_frac() -> f32 {
+    std::env::var("FL_HEAVY_FRAC")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.4)
 }

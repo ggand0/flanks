@@ -7,6 +7,8 @@ mod overlay;
 mod render_units;
 mod spatial;
 mod terrain;
+mod unit_meshes;
+mod unit_types;
 mod units;
 
 use bevy::prelude::*;

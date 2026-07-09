@@ -60,24 +60,28 @@ pub struct RenderCounts {
 pub struct InstanceData {
     pub position: Vec3,
     pub scale: f32,
+    /// rgb = team color; a = stable per-unit anim seed (NOT opacity).
     pub color: [f32; 4],
+    /// x = yaw, y = move amount 0..1 (walk bob/lean),
+    /// z = lunge 0..1 (attack), w = fx: [0,1) hit flash, [1,2] death.
+    pub anim: [f32; 4],
 }
 
 #[derive(Component, Deref, DerefMut, Default)]
 pub struct InstanceMaterialData(pub Vec<InstanceData>);
 
-/// One instanced draw per bucket. Buckets are keyed by team today; the
-/// unit-type milestone swaps the key to unit type (one mesh per type).
+/// One instanced draw per bucket. Buckets are keyed by unit kind: one
+/// low-poly mesh per kind, team identity stays per-instance color.
 #[derive(Component)]
 pub struct InstanceBucket(pub usize);
 
 /// Number of instance buckets (== instance entities == draw calls).
-pub const NUM_BUCKETS: usize = 2;
+pub const NUM_BUCKETS: usize = crate::unit_types::NUM_KINDS;
 
 /// Which bucket a unit renders in.
 #[inline]
 fn bucket_of(units: &Units, i: usize) -> usize {
-    units.team[i] as usize
+    units.kind[i] as usize
 }
 
 impl SyncComponent for InstanceMaterialData {
@@ -141,15 +145,10 @@ impl Plugin for UnitRenderPlugin {
 }
 
 fn setup_unit_mesh(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
-    // Slightly taller than wide: reads as a soldier, not a bead.
-    // Instance positions are not the entity's transform; built-in frustum
-    // culling would cull all instances at once, so it stays disabled and
-    // we cull per-instance in sync_instance_data.
-    //
-    // One instance entity per bucket, each with its OWN mesh asset (the
-    // meshes are identical cubes today; per-type meshes plug in here).
-    // Distinct assets also exercise the mesh-allocator slab offsets: both
-    // cubes land in one vertex slab at different base offsets.
+    // One instance entity per unit kind, each with its own code-built
+    // low-poly mesh. Instance positions are not the entity's transform;
+    // built-in frustum culling would cull all instances at once, so it
+    // stays disabled and we cull per-instance in sync_instance_data.
     //
     // NoAutomaticBatching is REQUIRED, not an optimization toggle: these
     // entities compare batch-equal (same pipeline, draw function, material
@@ -157,9 +156,13 @@ fn setup_unit_mesh(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
     // `SortedRenderPhase::render_range` skips every item after the first —
     // its draw function never runs and that bucket's units silently vanish
     // (the "LOD far bucket invisible" bug, devlog 0013).
-    for bucket in 0..NUM_BUCKETS {
+    let kind_meshes = [
+        crate::unit_meshes::build_knight(),
+        crate::unit_meshes::build_man_at_arms(),
+    ];
+    for (bucket, mesh) in kind_meshes.into_iter().enumerate() {
         commands.spawn((
-            Mesh3d(meshes.add(Cuboid::new(0.62, 0.9, 0.62))),
+            Mesh3d(meshes.add(mesh)),
             InstanceMaterialData::default(),
             InstanceBucket(bucket),
             NoFrustumCulling,
@@ -246,10 +249,14 @@ fn sync_instance_data(
                             color[c] = color[c] * 0.35 + HIGHLIGHT[c] * 0.65;
                         }
                     }
+                    let move_amount =
+                        (units.vel[i].length() / units.speed[i].max(0.01)).clamp(0.0, 1.0);
                     chunk_scratch[bucket_of(units, i)].push(InstanceData {
                         position,
                         scale: 1.0,
                         color,
+                        // lunge / fx wired up with the swing-combat kernel.
+                        anim: [units.yaw[i], move_amount, 0.0, 0.0],
                     });
                 }
             });
@@ -428,6 +435,11 @@ impl SpecializedMeshPipeline for CustomPipeline {
                     format: VertexFormat::Float32x4,
                     offset: VertexFormat::Float32x4.size(),
                     shader_location: 4,
+                },
+                VertexAttribute {
+                    format: VertexFormat::Float32x4,
+                    offset: VertexFormat::Float32x4.size() * 2,
+                    shader_location: 5,
                 },
             ],
         });

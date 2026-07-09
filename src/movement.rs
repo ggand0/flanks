@@ -10,7 +10,8 @@ use std::time::Instant;
 use crate::orders::Groups;
 use crate::spatial::SpatialGrid;
 use crate::terrain::Terrain;
-use crate::units::{UNIT_HALF_HEIGHT, Units};
+use crate::unit_types::TYPES;
+use crate::units::Units;
 
 const SEP_RADIUS: f32 = 1.4;
 const SEP_STRENGTH: f32 = 60.0;
@@ -32,6 +33,8 @@ const CROWD_SLOW: f32 = 1.2;
 const CROWD_STOP: f32 = 2.5;
 const STEER_GAIN: f32 = 3.0;
 const MAX_ACCEL: f32 = 50.0;
+/// Facing turn rate (rad/s toward the movement direction).
+const YAW_RATE: f32 = 10.0;
 /// Positional overlap resolution: fraction of pair overlap corrected per
 /// tick per unit, and the per-tick cap on total correction distance.
 const CORR_GAIN: f32 = 0.5;
@@ -106,6 +109,8 @@ pub fn step_sim(
         vel,
         speed,
         team,
+        kind,
+        yaw,
         group,
         hp,
         ..
@@ -130,6 +135,7 @@ pub fn step_sim(
     let pos_prev = &pos_prev[..];
     let speed = &speed[..];
     let team = &team[..];
+    let kind = &kind[..];
     let group = &group[..];
     let orders: Vec<Option<Vec2>> = groups.list.iter().map(|g| g.order).collect();
     let orders = &orders[..];
@@ -140,10 +146,11 @@ pub fn step_sim(
     let tick_seed = tick.wrapping_mul(0x9E37_79B1);
     let integrate_span = info_span!("integrate").entered();
     ComputeTaskPool::get().scope(|scope| {
-        for (ci, ((p_chunk, v_chunk), hp_chunk)) in pos
+        for (ci, (((p_chunk, v_chunk), hp_chunk), yaw_chunk)) in pos
             .chunks_mut(CHUNK)
             .zip(vel.chunks_mut(CHUNK))
             .zip(hp.chunks_mut(CHUNK))
+            .zip(yaw.chunks_mut(CHUNK))
             .enumerate()
         {
             let start = ci * CHUNK;
@@ -244,6 +251,16 @@ pub fn step_sim(
                         hp_chunk[j] -= attackers.min(MAX_ATTACKERS) as f32 * dps * dt * r;
                     }
 
+                    // Face the movement direction (combat facing lands with
+                    // the swing kernel), turning at YAW_RATE with wrap.
+                    if new_v.length_squared() > 0.25 {
+                        let target_yaw = new_v.x.atan2(new_v.y);
+                        let diff = (target_yaw - yaw_chunk[j] + std::f32::consts::PI)
+                            .rem_euclid(std::f32::consts::TAU)
+                            - std::f32::consts::PI;
+                        yaw_chunk[j] += diff * (YAW_RATE * dt).min(1.0);
+                    }
+
                     v_chunk[j] = Vec3::new(new_v.x, 0.0, new_v.y);
                     let nx = (pos_prev[i].x + new_v.x * dt + corr.x)
                         .clamp(bounds_min.x, bounds_max.x);
@@ -251,7 +268,7 @@ pub fn step_sim(
                         .clamp(bounds_min.y, bounds_max.y);
                     p_chunk[j] = Vec3::new(
                         nx,
-                        terrain.height_at(nx, nz) + UNIT_HALF_HEIGHT,
+                        terrain.height_at(nx, nz) + TYPES[kind[i] as usize].half_height,
                         nz,
                     );
                 }
