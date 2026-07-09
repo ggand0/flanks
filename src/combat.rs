@@ -4,7 +4,6 @@
 
 use bevy::prelude::*;
 
-use crate::orders::Selection;
 use crate::terrain::Terrain;
 use crate::units::{Units, hash01};
 
@@ -35,15 +34,10 @@ impl Plugin for CombatPlugin {
 
 fn process_deaths(
     mut units: ResMut<Units>,
-    mut selection: ResMut<Selection>,
     mut terrain: ResMut<Terrain>,
     mut stats: ResMut<CombatStats>,
 ) {
     let _span = info_span!("process_deaths").entered();
-    if selection.mask.len() != units.len() {
-        selection.mask.clear();
-        selection.count = 0;
-    }
     let mut craters: Vec<(Vec2, f32)> = Vec::new();
     let mut i = 0;
     while i < units.len() {
@@ -76,9 +70,7 @@ fn process_deaths(
         units.swing_t.swap_remove(i);
         units.flash.swap_remove(i);
         units.death_t.swap_remove(i);
-        if !selection.mask.is_empty() && selection.mask.swap_remove(i) {
-            selection.count -= 1;
-        }
+        units.home.swap_remove(i);
     }
     for (c, r) in craters {
         terrain.carve_crater(c, r, r * 0.4);

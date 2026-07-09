@@ -1,10 +1,12 @@
-//! Groups, selection, and player orders.
+//! Regiments (groups), selection, and player orders.
 //!
-//! Selection: hold LMB and draw a line over the field; friendly (blue) units
-//! within SELECT_RADIUS of the projected polyline become the selection.
-//! Right-click: attack-move the selection (a strict subset of a group is
-//! split off into its own group for now — M5 replaces this with attached
-//! salients). C: cut the selection into a new group without ordering it.
+//! A group IS a regiment: a permanent block of units sharing an order,
+//! kind, and (later) morale. Selection: hold LMB and draw a line/loop over
+//! the field; regiments with enough units near the stroke are selected.
+//! Right-click: attack-move — each selected regiment's ORDER is the target
+//! translated by its offset from the selection centroid, so a group move
+//! preserves the army's arrangement. Units translate the regiment order by
+//! their own `home` offset (block moves, never converges).
 
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
@@ -28,10 +30,18 @@ pub enum Stance {
 
 pub struct GroupData {
     pub team: u8,
-    /// Attack-move target on the ground plane; None = hold.
+    /// Regiments are homogeneous; index into `unit_types::TYPES`.
+    pub kind: u8,
+    /// Attack-move target on the ground plane; None = hold at anchor.
     pub order: Option<Vec2>,
+    /// Regiment reference point: units hold at `anchor + home`. Updated to
+    /// the order target on arrival.
+    pub anchor: Vec2,
     pub count: usize,
-    /// Currently inert; formation shapes return with the TW-style branch.
+    /// Strength at spawn (casualty fraction for morale, next milestone).
+    #[allow(dead_code)]
+    pub initial_count: usize,
+    /// Currently inert; formation shapes return with rigid formations.
     pub stance: Stance,
     // --- refreshed every fixed tick by the frontline pass ---
     pub centroid: Vec2,
@@ -39,13 +49,16 @@ pub struct GroupData {
 }
 
 impl GroupData {
-    pub fn new(team: u8, count: usize) -> Self {
+    pub fn new(team: u8, kind: u8, anchor: Vec2, count: usize) -> Self {
         Self {
             team,
+            kind,
             order: None,
+            anchor,
             count,
+            initial_count: count,
             stance: Stance::Hold,
-            centroid: Vec2::ZERO,
+            centroid: anchor,
             engaged: false,
         }
     }
@@ -56,11 +69,11 @@ pub struct Groups {
     pub list: Vec<GroupData>,
 }
 
-/// Per-unit selection mask (player team only) + cached count.
+/// Selected regiments (player team only) + cached unit total.
 #[derive(Resource, Default)]
 pub struct Selection {
-    pub mask: Vec<bool>,
-    pub count: usize,
+    pub regiments: Vec<bool>,
+    pub count_units: usize,
 }
 
 /// In-progress drag: projected ground points of the selection line.
@@ -74,26 +87,23 @@ pub struct OrdersPlugin;
 
 impl Plugin for OrdersPlugin {
     fn build(&self, app: &mut App) {
-        app.insert_resource(Groups {
-            list: vec![
-                GroupData::new(0, crate::units::units_per_team()),
-                GroupData::new(1, crate::units::units_per_team()),
-            ],
-        })
-        .init_resource::<Selection>()
-        .init_resource::<DragLine>()
-        .add_systems(
-            Update,
-            (
-                drag_select,
-                issue_order,
-                cut_key,
-                stance_key,
-                test_orders_script,
-                draw_order_gizmos,
-            ),
-        )
-        .add_systems(FixedUpdate, clear_arrived_orders.after(crate::movement::step_sim));
+        // Groups start empty; the regiment spawn (regiments.rs) fills the
+        // list once at startup and it stays FIXED for the whole battle —
+        // stable indices are what make `units.group` a permanent regiment id.
+        app.init_resource::<Groups>()
+            .init_resource::<Selection>()
+            .init_resource::<DragLine>()
+            .add_systems(
+                Update,
+                (
+                    drag_select,
+                    issue_order,
+                    stance_key,
+                    test_orders_script,
+                    draw_order_gizmos,
+                ),
+            )
+            .add_systems(FixedUpdate, clear_arrived_orders.after(crate::movement::step_sim));
     }
 }
 
@@ -108,12 +118,14 @@ fn cursor_ground_point(
     terrain.raycast(ray).map(|hit| Vec2::new(hit.x, hit.z))
 }
 
+#[allow(clippy::too_many_arguments)] // bevy system params
 fn drag_select(
     buttons: Res<ButtonInput<MouseButton>>,
     window: Query<&Window, With<PrimaryWindow>>,
     camera: Query<(&Camera, &GlobalTransform)>,
     terrain: Res<Terrain>,
     units: Res<Units>,
+    groups: Res<Groups>,
     mut drag: ResMut<DragLine>,
     mut selection: ResMut<Selection>,
 ) {
@@ -139,8 +151,12 @@ fn drag_select(
         if drag.points.is_empty() {
             return;
         }
-        select_along_line(&drag.points, &units, &mut selection);
-        info!("selected {} units", selection.count);
+        select_along_line(&drag.points, &units, &groups, &mut selection);
+        info!(
+            "selected {} regiments ({} units)",
+            selection.regiments.iter().filter(|s| **s).count(),
+            selection.count_units
+        );
     }
 }
 
@@ -170,10 +186,19 @@ fn point_in_poly(p: Vec2, poly: &[Vec2]) -> bool {
     inside
 }
 
-fn select_along_line(line: &[Vec2], units: &Units, selection: &mut Selection) {
-    selection.mask.clear();
-    selection.mask.resize(units.len(), false);
-    selection.count = 0;
+/// Per-unit stroke hits, promoted to whole regiments: a regiment is
+/// selected when enough of its units are near the stroke (a sloppy lasso
+/// edge shouldn't grab a neighboring regiment).
+pub fn select_along_line(
+    line: &[Vec2],
+    units: &Units,
+    groups: &Groups,
+    selection: &mut Selection,
+) {
+    selection.regiments.clear();
+    selection.regiments.resize(groups.list.len(), false);
+    selection.count_units = 0;
+    let mut hits = vec![0usize; groups.list.len()];
 
     // Bounding box early-out around the whole stroke.
     let mut lo = Vec2::splat(f32::MAX);
@@ -190,7 +215,7 @@ fn select_along_line(line: &[Vec2], units: &Units, selection: &mut Selection) {
     let closed = stroke_is_closed(line);
     let r2 = SELECT_RADIUS * SELECT_RADIUS;
     for i in 0..units.len() {
-        if units.team[i] != PLAYER_TEAM {
+        if units.team[i] != PLAYER_TEAM || units.death_t[i] > 0 {
             continue;
         }
         let p = Vec2::new(units.pos[i].x, units.pos[i].z);
@@ -214,49 +239,37 @@ fn select_along_line(line: &[Vec2], units: &Units, selection: &mut Selection) {
             }
         }
         if hit {
-            selection.mask[i] = true;
-            selection.count += 1;
+            hits[units.group[i] as usize] += 1;
+        }
+    }
+
+    // Promote unit hits to whole regiments.
+    for (g, group) in groups.list.iter().enumerate() {
+        if group.team != PLAYER_TEAM || group.count == 0 {
+            continue;
+        }
+        let threshold = 8.max(group.count * 3 / 100);
+        if hits[g] >= threshold.min(group.count) {
+            selection.regiments[g] = true;
+            selection.count_units += group.count;
         }
     }
 }
 
-/// Move the selection's units into a fresh group. Returns its index, or the
-/// existing group index if the selection is exactly one whole group.
-pub fn split_selection(
-    units: &mut Units,
-    groups: &mut Groups,
-    selection: &Selection,
-) -> Option<u32> {
-    if selection.count == 0 {
-        return None;
+/// Attack-move `selected` regiments so the formation ARRANGEMENT is
+/// preserved: each regiment's order is the target translated by its offset
+/// from the selection centroid. Shared by the RMB handler, test scripts,
+/// and (later) the AI.
+pub fn order_regiments(groups: &mut Groups, selected: &[usize], target: Vec2) {
+    if selected.is_empty() {
+        return;
     }
-    // Selection == entire single group? Then no split needed.
-    let first_group = units
-        .group
-        .iter()
-        .zip(&selection.mask)
-        .find(|(_, s)| **s)
-        .map(|(g, _)| *g)?;
-    let whole = selection.count == groups.list[first_group as usize].count
-        && units
-            .group
-            .iter()
-            .zip(&selection.mask)
-            .all(|(g, s)| !*s || *g == first_group);
-    if whole {
-        return Some(first_group);
+    let centroid: Vec2 =
+        selected.iter().map(|&g| groups.list[g].centroid).sum::<Vec2>() / selected.len() as f32;
+    for &g in selected {
+        let group = &mut groups.list[g];
+        group.order = Some(target + (group.centroid - centroid));
     }
-
-    let new_idx = groups.list.len() as u32;
-    groups.list.push(GroupData::new(PLAYER_TEAM, selection.count));
-    for i in 0..units.len() {
-        if selection.mask[i] {
-            groups.list[units.group[i] as usize].count -= 1;
-            units.group[i] = new_idx;
-        }
-    }
-    info!("split {} units into group {}", selection.count, new_idx);
-    Some(new_idx)
 }
 
 fn issue_order(
@@ -264,11 +277,10 @@ fn issue_order(
     window: Query<&Window, With<PrimaryWindow>>,
     camera: Query<(&Camera, &GlobalTransform)>,
     terrain: Res<Terrain>,
-    mut units: ResMut<Units>,
     mut groups: ResMut<Groups>,
     selection: Res<Selection>,
 ) {
-    if !buttons.just_pressed(MouseButton::Right) || selection.count == 0 {
+    if !buttons.just_pressed(MouseButton::Right) || selection.count_units == 0 {
         return;
     }
     let Ok(window) = window.single() else { return };
@@ -278,28 +290,26 @@ fn issue_order(
     let Some(target) = cursor_ground_point(window, camera, cam_tf, &terrain) else {
         return;
     };
-    if let Some(g) = split_selection(&mut units, &mut groups, &selection) {
-        groups.list[g as usize].order = Some(target);
-        info!(
-            "group {g} ({} units) attack-move to ({:.0}, {:.0})",
-            groups.list[g as usize].count, target.x, target.y
-        );
-    }
+    let selected: Vec<usize> = selection
+        .regiments
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| **s)
+        .map(|(g, _)| g)
+        .collect();
+    order_regiments(&mut groups, &selected, target);
+    info!(
+        "{} regiments ({} units) attack-move to ({:.0}, {:.0})",
+        selected.len(),
+        selection.count_units,
+        target.x,
+        target.y
+    );
 }
 
-fn cut_key(
-    keys: Res<ButtonInput<KeyCode>>,
-    mut units: ResMut<Units>,
-    mut groups: ResMut<Groups>,
-    selection: Res<Selection>,
-) {
-    if keys.just_pressed(KeyCode::KeyC) {
-        split_selection(&mut units, &mut groups, &selection);
-    }
-}
-
-/// Groups whose centroid reached their target go back to hold. Uses the
-/// centroid refreshed by the frontline pass each tick.
+/// Groups whose centroid reached their target go back to hold there: the
+/// order point becomes the new anchor (holding is a standing order). Uses
+/// the centroid refreshed by the frontline pass each tick.
 pub fn clear_arrived_orders(mut groups: ResMut<Groups>) {
     for (g, group) in groups.list.iter_mut().enumerate() {
         if let Some(t) = group.order
@@ -307,37 +317,32 @@ pub fn clear_arrived_orders(mut groups: ResMut<Groups>) {
             && !group.engaged
             && group.centroid.distance(t) < ARRIVE_CLEAR
         {
+            group.anchor = t;
             group.order = None;
-            info!("group {g} arrived, holding");
+            info!("regiment {g} arrived, holding");
         }
     }
 }
 
-/// F: toggle stance of every group that has selected units.
+/// F: toggle stance of every selected regiment (still inert; formation
+/// shapes arrive with rigid formations).
 fn stance_key(
     keys: Res<ButtonInput<KeyCode>>,
-    units: Res<Units>,
     mut groups: ResMut<Groups>,
     selection: Res<Selection>,
 ) {
-    if !keys.just_pressed(KeyCode::KeyF) || selection.count == 0 {
+    if !keys.just_pressed(KeyCode::KeyF) || selection.count_units == 0 {
         return;
     }
-    let mut touched = vec![false; groups.list.len()];
-    for i in 0..units.len() {
-        if selection.mask.get(i).copied().unwrap_or(false) {
-            touched[units.group[i] as usize] = true;
-        }
-    }
-    for (g, t) in touched.iter().enumerate() {
-        if *t {
+    for (g, sel) in selection.regiments.iter().enumerate() {
+        if *sel {
             let group = &mut groups.list[g];
             group.stance = match group.stance {
                 Stance::Hold => Stance::Column,
                 Stance::Column => Stance::Hold,
             };
             info!(
-                "group {g} stance -> {}",
+                "regiment {g} stance -> {}",
                 if group.stance == Stance::Hold { "hold line" } else { "column" }
             );
         }
@@ -387,14 +392,41 @@ fn draw_order_gizmos(
     }
 }
 
-/// FL_TEST_ORDERS=1: scripted carve-out — select a disc of blue units, cut,
-/// send them across the map; order the rest of the army elsewhere later.
+/// RMS spread of a regiment's living units around its centroid — the
+/// block-coherence metric for the orders test.
+fn regiment_spread(units: &Units, g: u32) -> f32 {
+    let (mut sum, mut c, mut centroid) = (0.0f32, 0usize, Vec2::ZERO);
+    for i in 0..units.len() {
+        if units.group[i] == g && units.death_t[i] == 0 {
+            centroid += Vec2::new(units.pos[i].x, units.pos[i].z);
+            c += 1;
+        }
+    }
+    if c == 0 {
+        return 0.0;
+    }
+    centroid /= c as f32;
+    for i in 0..units.len() {
+        if units.group[i] == g && units.death_t[i] == 0 {
+            sum += Vec2::new(units.pos[i].x, units.pos[i].z).distance_squared(centroid);
+        }
+    }
+    (sum / c as f32).sqrt()
+}
+
+/// FL_TEST_ORDERS=1: regiment cohesion + arrangement-preserving group
+/// moves. Stage 0: enclosure-select regiments (exercises the promote
+/// path), long-march ONE regiment 350 m and compare its RMS spread on
+/// arrival (acceptance: < 1.5x). Stage 1: group-move several regiments
+/// and log how well their relative arrangement survived.
 fn test_orders_script(
     time: Res<Time>,
-    mut units: ResMut<Units>,
+    units: Res<Units>,
     mut groups: ResMut<Groups>,
     mut selection: ResMut<Selection>,
     mut stage: Local<u32>,
+    mut watch: Local<Option<(u32, f32)>>,
+    mut arrangement: Local<Vec<(usize, Vec2)>>,
 ) {
     if std::env::var("FL_TEST_ORDERS").is_err() {
         return;
@@ -402,8 +434,8 @@ fn test_orders_script(
     let t = time.elapsed_secs();
     match *stage {
         0 if t > 5.0 => {
-            // Enclosure selection: a circular stroke inside the blue army
-            // (exercises the closed-loop polygon path end to end).
+            // Enclosure stroke around a spot inside the blue army: must
+            // promote to whole regiments.
             let center = Vec2::new(-150.0, -90.0);
             let stroke: Vec<Vec2> = (0..28)
                 .map(|k| {
@@ -411,42 +443,81 @@ fn test_orders_script(
                     center + Vec2::new(a.cos(), a.sin()) * 45.0
                 })
                 .collect();
-            select_along_line(&stroke, &units, &mut selection);
-            let brute = (0..units.len())
-                .filter(|&i| {
-                    units.team[i] == PLAYER_TEAM
-                        && Vec2::new(units.pos[i].x, units.pos[i].z).distance(center) < 45.0
-                })
-                .count();
+            select_along_line(&stroke, &units, &groups, &mut selection);
             info!(
-                "[test] enclosure selected {} units (>= {brute} strictly inside)",
-                selection.count
+                "[test] enclosure selected {} regiments ({} units)",
+                selection.regiments.iter().filter(|s| **s).count(),
+                selection.count_units
             );
-            if let Some(g) = split_selection(&mut units, &mut groups, &selection) {
-                groups.list[g as usize].order = Some(Vec2::new(220.0, 160.0));
-                info!("[test] cut group {g}, ordered across the map");
-            }
+            // Long-march the blue regiment nearest the enclosure center.
+            let g = groups
+                .list
+                .iter()
+                .enumerate()
+                .filter(|(_, gr)| gr.team == PLAYER_TEAM && gr.count > 0)
+                .min_by(|a, b| {
+                    a.1.centroid
+                        .distance_squared(center)
+                        .total_cmp(&b.1.centroid.distance_squared(center))
+                })
+                .map(|(g, _)| g as u32)
+                .unwrap();
+            let spread = regiment_spread(&units, g);
+            groups.list[g as usize].order =
+                Some(groups.list[g as usize].centroid + Vec2::new(350.0, 60.0));
+            *watch = Some((g, spread));
+            info!("[test] regiment {g} long-march ordered, spread at departure {spread:.1} m");
+            selection.regiments.fill(false);
+            selection.count_units = 0;
             *stage = 1;
         }
-        1 if t > 20.0 => {
-            // Send the rest of the blue army west, staying on its own side.
-            selection.mask.clear();
-            selection.mask.resize(units.len(), false);
-            selection.count = 0;
-            for i in 0..units.len() {
-                if units.group[i] == 0 {
-                    selection.mask[i] = true;
-                    selection.count += 1;
-                }
+        1 => {
+            if let Some((g, spread0)) = *watch
+                && groups.list[g as usize].order.is_none()
+            {
+                let spread = regiment_spread(&units, g);
+                info!(
+                    "[test] regiment {g} arrived: spread {spread:.1} m vs {spread0:.1} m at departure (ratio {:.2})",
+                    spread / spread0.max(0.01)
+                );
+                *stage = 2;
             }
-            if let Some(g) = split_selection(&mut units, &mut groups, &selection) {
-                groups.list[g as usize].order = Some(Vec2::new(-330.0, -120.0));
-                info!("[test] main army (group {g}) ordered to the west hills");
-            }
-            // Deselect so screenshots show team colors again.
-            selection.mask.fill(false);
-            selection.count = 0;
-            *stage = 2;
+        }
+        2 if t > 45.0 => {
+            // Group-move: order several blue regiments as one formation.
+            let selected: Vec<usize> = groups
+                .list
+                .iter()
+                .enumerate()
+                .filter(|(_, gr)| gr.team == PLAYER_TEAM && gr.count > 0 && gr.order.is_none())
+                .take(10)
+                .map(|(g, _)| g)
+                .collect();
+            let centroid: Vec2 = selected.iter().map(|&g| groups.list[g].centroid).sum::<Vec2>()
+                / selected.len().max(1) as f32;
+            *arrangement = selected
+                .iter()
+                .map(|&g| (g, groups.list[g].centroid - centroid))
+                .collect();
+            order_regiments(&mut groups, &selected, centroid + Vec2::new(-120.0, -100.0));
+            info!("[test] group-move: {} regiments as one formation", selected.len());
+            *stage = 3;
+        }
+        3 if !arrangement.is_empty()
+            && arrangement.iter().all(|(g, _)| groups.list[*g].order.is_none()) =>
+        {
+            let centroid: Vec2 = arrangement
+                .iter()
+                .map(|(g, _)| groups.list[*g].centroid)
+                .sum::<Vec2>()
+                / arrangement.len() as f32;
+            let err: f32 = arrangement
+                .iter()
+                .map(|(g, off)| (groups.list[*g].centroid - centroid).distance(*off))
+                .sum::<f32>()
+                / arrangement.len() as f32;
+            info!("[test] group-move arrived: mean arrangement error {err:.1} m");
+            *stage = 4;
         }
         _ => {}
     }

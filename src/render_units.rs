@@ -212,7 +212,7 @@ fn sync_instance_data(
     let alpha = fixed_time.overstep_fraction();
 
     const HIGHLIGHT: [f32; 4] = [1.0, 1.0, 0.55, 1.0];
-    let has_sel = selection.mask.len() == units.len();
+    let has_sel = selection.regiments.iter().any(|s| *s);
 
     // Parallel cull + bucket build into per-chunk scratch, then one memcpy
     // concat per bucket. The scratch vecs keep their allocations across
@@ -244,7 +244,13 @@ fn sync_instance_data(
                         continue;
                     }
                     let mut color = units.color[i];
-                    if has_sel && selection.mask[i] {
+                    if has_sel
+                        && selection
+                            .regiments
+                            .get(units.group[i] as usize)
+                            .copied()
+                            .unwrap_or(false)
+                    {
                         for c in 0..3 {
                             color[c] = color[c] * 0.35 + HIGHLIGHT[c] * 0.65;
                         }

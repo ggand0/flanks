@@ -136,6 +136,7 @@ pub fn step_sim(
         swing_t,
         flash,
         death_t,
+        home,
         ..
     } = &mut *units;
     if pos.is_empty() {
@@ -160,8 +161,11 @@ pub fn step_sim(
     let team = &team[..];
     let kind = &kind[..];
     let group = &group[..];
+    let home = &home[..];
     let orders: Vec<Option<Vec2>> = groups.list.iter().map(|g| g.order).collect();
     let orders = &orders[..];
+    let anchors: Vec<Vec2> = groups.list.iter().map(|g| g.anchor).collect();
+    let anchors = &anchors[..];
     let bounds_min = terrain.min() + 4.0;
     let bounds_max = terrain.max() - 4.0;
 
@@ -205,24 +209,37 @@ pub fn step_sim(
                         dt_chunk[j] -= 1;
                     }
 
-                    // Units move ONLY under orders, straight toward the
-                    // ordered point. No order = stand fast (separation
-                    // still shoves, melee still defends). Enemy contact is
-                    // pure physics: cross-team separation blocks, crowd
-                    // yield stops the shove, combat thins the block. The
-                    // "front line" is just where that collision happens.
+                    // Units move ONLY under orders. A regiment order is one
+                    // point rigidly translated by each unit's `home` offset
+                    // (the block moves; it never converges). No order =
+                    // hold at the anchor — a standing order: units drift
+                    // back to their slot at reduced gain inside the block.
+                    // Enemy contact is pure physics: cross-team separation
+                    // blocks, crowd yield stops the shove, combat thins the
+                    // block. The "front line" is where that collision is.
                     let gi = group[i] as usize;
                     let mut desired = Vec2::ZERO;
-                    if !dying && let Some(goal) = orders[gi] {
+                    if !dying {
+                        let holding = orders[gi].is_none();
+                        let goal = orders[gi].unwrap_or(anchors[gi]) + home[i];
                         let to_goal = goal - p;
                         let dist = to_goal.length();
-                        // Slope penalty: steep ground is slow ground.
-                        let slope = terrain.slope_at(p.x, p.y);
-                        let slope_mult = 1.0 / (1.0 + 3.0 * slope * slope);
-                        let desired_speed =
-                            speed[i] * slope_mult * (dist / ARRIVE_RADIUS).min(1.0);
-                        if dist > 1e-3 {
-                            desired = to_goal * (desired_speed / dist);
+                        // Hold deadzone: parked units don't jitter around
+                        // their slot point.
+                        if !(holding && dist < 1.5) {
+                            // Slope penalty: steep ground is slow ground.
+                            let slope = terrain.slope_at(p.x, p.y);
+                            let slope_mult = 1.0 / (1.0 + 3.0 * slope * slope);
+                            let (gain, arrive) = if holding {
+                                (0.4, 10.0)
+                            } else {
+                                (1.0, ARRIVE_RADIUS)
+                            };
+                            let desired_speed =
+                                speed[i] * slope_mult * gain * (dist / arrive).min(1.0);
+                            if dist > 1e-3 {
+                                desired = to_goal * (desired_speed / dist);
+                            }
                         }
                     }
 

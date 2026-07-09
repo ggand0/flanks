@@ -276,13 +276,13 @@ fn draw_front_gizmos(
     }
 }
 
-/// FL_TEST_FRONT=1: march the armies into each other to form a battle line,
-/// then cut a disc out of blue and push it through as a salient.
+/// FL_TEST_FRONT=1: march both armies of regiments into contact to form a
+/// battle line, hold one regiment unordered near the front (drift watch),
+/// then push it through the line as a salient.
 fn test_front_script(
     time: Res<Time>,
-    mut units: ResMut<Units>,
+    units: Res<Units>,
     mut groups: ResMut<Groups>,
-    mut selection: ResMut<crate::orders::Selection>,
     mut stage: Local<u32>,
     mut next_reorder: Local<f32>,
     mut watch: Local<Option<(u32, Vec2)>>,
@@ -292,23 +292,26 @@ fn test_front_script(
     }
     let t = time.elapsed_secs();
 
-    // Stand-in for player/AI: idle unengaged groups re-target the enemy
+    // Stand-in for player/AI: idle unengaged regiments re-target the enemy
     // mass every 15 s so remnant pockets hunt each other down.
     if *stage >= 1 && t > *next_reorder {
         *next_reorder = t + 15.0;
         let mut sums = [Vec2::ZERO; 2];
         let mut counts = [0usize; 2];
         for i in 0..units.len() {
+            if units.death_t[i] > 0 {
+                continue;
+            }
             let tm = units.team[i] as usize;
             sums[tm] += Vec2::new(units.pos[i].x, units.pos[i].z);
             counts[tm] += 1;
         }
         for (g, group) in groups.list.iter_mut().enumerate() {
             if watch.is_some_and(|(w, _)| w as usize == g) {
-                continue; // drift-watch group must stay unordered
+                continue; // drift-watch regiment must stay unordered
             }
             let enemy = 1 - group.team as usize;
-            if group.count > 0 && !group.engaged && counts[enemy] > 0 {
+            if group.count > 0 && !group.engaged && group.order.is_none() && counts[enemy] > 0 {
                 group.order = Some(sums[enemy] / counts[enemy] as f32);
             }
         }
@@ -316,45 +319,45 @@ fn test_front_script(
 
     match *stage {
         0 if t > 3.0 => {
-            groups.list[0].order = Some(Vec2::new(0.0, 40.0));
-            groups.list[1].order = Some(Vec2::new(0.0, -40.0));
-            info!("[front-test] armies ordered into contact");
+            // Every regiment advances straight across the gap; blocks keep
+            // their x, fronts collide near z = 0.
+            for group in groups.list.iter_mut() {
+                let dir: f32 = if group.team == 0 { 1.0 } else { -1.0 };
+                group.order = Some(Vec2::new(group.anchor.x, dir * 10.0));
+            }
+            info!("[front-test] all regiments ordered into contact");
             *stage = 1;
         }
         1 if t > 35.0 => {
-            // Cut a group right behind the active front, NO order: it must
-            // stand fast (units move only when commanded).
-            selection.mask.clear();
-            selection.mask.resize(units.len(), false);
-            selection.count = 0;
-            let center = Vec2::new(40.0, -60.0);
-            for i in 0..units.len() {
-                if units.team[i] == 0
-                    && Vec2::new(units.pos[i].x, units.pos[i].z).distance(center) < 40.0
-                {
-                    selection.mask[i] = true;
-                    selection.count += 1;
-                }
+            // Hold the blue regiment nearest a spot behind the front, NO
+            // order: it must stand fast (units move only when commanded).
+            let spot = Vec2::new(40.0, -60.0);
+            if let Some((g, _)) = groups
+                .list
+                .iter()
+                .enumerate()
+                .filter(|(_, gr)| gr.team == 0 && gr.count > 0)
+                .min_by(|a, b| {
+                    a.1.centroid
+                        .distance_squared(spot)
+                        .total_cmp(&b.1.centroid.distance_squared(spot))
+                })
+            {
+                let group = &mut groups.list[g];
+                group.anchor = group.centroid;
+                group.order = None;
+                *watch = Some((g as u32, group.centroid));
+                info!("[front-test] regiment {g} held near the front, NO order — watching drift");
             }
-            if let Some(g) = crate::orders::split_selection(&mut units, &mut groups, &selection) {
-                groups.list[g as usize].order = None;
-                *watch = Some((g, groups.list[g as usize].centroid));
-                info!(
-                    "[front-test] cut group {g} ({} units) near the front, NO order — watching drift",
-                    groups.list[g as usize].count
-                );
-            }
-            selection.mask.fill(false);
-            selection.count = 0;
             *stage = 2;
         }
         2 if t > 55.0 => {
             if let Some((g, start)) = *watch {
                 let drift = groups.list[g as usize].centroid.distance(start);
-                info!("[front-test] unordered group {g} drift over 20s: {drift:.2} m");
+                info!("[front-test] held regiment {g} drift over 20s: {drift:.2} m");
                 // Now push it through the line as a salient.
                 groups.list[g as usize].order = Some(Vec2::new(40.0, 120.0));
-                info!("[front-test] salient group {g} ordered through the line");
+                info!("[front-test] salient regiment {g} ordered through the line");
             }
             *stage = 3;
         }

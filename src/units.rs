@@ -48,6 +48,10 @@ pub struct Units {
     /// 0 = alive. Set to DEATH_TICKS on death; corpse plays its anim and is
     /// swap-removed when it reaches 1.
     pub death_t: Vec<u8>,
+    /// Offset from the regiment anchor: a regiment order is the SAME point
+    /// for the whole block, rigidly translated per unit by this offset.
+    /// Captured at spawn (loose); rigid formations will write slot offsets.
+    pub home: Vec<Vec2>,
 }
 
 /// Swing states (the `swing` column).
@@ -66,7 +70,6 @@ pub struct UnitsPlugin;
 impl Plugin for UnitsPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<Units>()
-            .add_systems(Startup, spawn_armies)
             .add_systems(Update, surround_test_log);
     }
 }
@@ -108,7 +111,8 @@ pub fn hash01(mut x: u32) -> f32 {
     (x >> 8) as f32 / 16_777_216.0
 }
 
-/// Append one fully-initialized unit to every SoA column.
+/// Append one fully-initialized unit to every SoA column. `anchor` is the
+/// unit's regiment anchor; the spawn offset from it becomes `home`.
 #[allow(clippy::too_many_arguments)] // spawn-time plumbing, all scalars
 pub fn push_unit(
     units: &mut Units,
@@ -119,6 +123,7 @@ pub fn push_unit(
     group: u32,
     x: f32,
     z: f32,
+    anchor: Vec2,
 ) {
     const TEAM_COLORS: [Vec3; 2] = [
         Vec3::new(0.20, 0.45, 0.85), // blue
@@ -153,49 +158,7 @@ pub fn push_unit(
         .push((params.cooldown_ticks as f32 * hash01(seed.wrapping_mul(13) + 9)) as u8);
     units.flash.push(0);
     units.death_t.push(0);
-}
-
-fn spawn_armies(
-    mut units: ResMut<Units>,
-    terrain: Res<crate::terrain::Terrain>,
-    mut groups: ResMut<crate::orders::Groups>,
-) {
-    const COLS: usize = 500;
-    const SPACING: f32 = 1.4;
-    const GAP: f32 = 60.0; // no-man's land between the two armies
-
-    if std::env::var("FL_TEST_SURROUND").is_ok() {
-        spawn_surround_test(&mut units, &terrain, &mut groups);
-        return;
-    }
-
-    let per_team = units_per_team();
-    let n = per_team * 2;
-    units.pos.reserve(n);
-    units.team.reserve(n);
-    units.color.reserve(n);
-
-    let rows = per_team.div_ceil(COLS);
-    let heavy_rows = (rows as f32 * heavy_frac()).round() as usize;
-    for team in 0..2u8 {
-        let dir = if team == 0 { -1.0 } else { 1.0 };
-        for k in 0..per_team {
-            let row = k / COLS;
-            let col = k % COLS;
-            let i = (team as usize * per_team + k) as u32;
-            // Heavies hold the front rows (nearest the gap).
-            let kind = if row < heavy_rows {
-                crate::unit_types::KIND_HEAVY
-            } else {
-                crate::unit_types::KIND_LIGHT
-            };
-            let jx = hash01(i.wrapping_mul(3) + 1) - 0.5;
-            let jz = hash01(i.wrapping_mul(3) + 2) - 0.5;
-            let x = (col as f32 - (COLS - 1) as f32 / 2.0) * SPACING + jx * 0.6;
-            let z = dir * (GAP / 2.0 + row as f32 * SPACING) + jz * 0.6;
-            push_unit(&mut units, &terrain, i, team, kind, team as u32, x, z);
-        }
-    }
+    units.home.push(Vec2::new(x, z) - anchor);
 }
 
 /// FL_TEST_SURROUND: two equal blue detachments of light infantry, one
@@ -203,61 +166,75 @@ fn spawn_armies(
 /// odds. The surrounded pocket must die per-capita faster — that is the
 /// acceptance test for swing combat (the old gather model traded 1:1).
 /// Region split for bookkeeping: pocket at x = -200, line at x = +200.
-/// Orange groups get press orders (units advance only under orders).
-fn spawn_surround_test(
+/// Orange groups get press orders (units advance only under orders). A
+/// block order translates a formation (it never converges one), so the
+/// encirclement is four arc regiments each ordered inward past the pocket.
+pub fn spawn_surround_test(
     units: &mut Units,
     terrain: &crate::terrain::Terrain,
     groups: &mut crate::orders::Groups,
 ) {
     use crate::orders::GroupData;
     use crate::unit_types::KIND_LIGHT;
+    let pocket_c = Vec2::new(-200.0, 0.0);
     let mut seed = 1u32;
-    let mut disc = |units: &mut Units,
-                    team: u8,
-                    group: u32,
-                    cx: f32,
-                    cz: f32,
-                    r0: f32,
-                    r1: f32,
-                    n: usize| {
-        for _ in 0..n {
+    let mut list: Vec<GroupData> = Vec::new();
+
+    // Blue pocket (group 0): disc, holds.
+    list.push(GroupData::new(0, KIND_LIGHT, pocket_c, 500));
+    for _ in 0..500 {
+        seed = seed.wrapping_add(1);
+        let a = hash01(seed.wrapping_mul(3) + 1) * std::f32::consts::TAU;
+        let r = 13.0 * hash01(seed.wrapping_mul(3) + 2).sqrt();
+        let (x, z) = (pocket_c.x + r * a.cos(), pocket_c.y + r * a.sin());
+        push_unit(units, terrain, seed, 0, KIND_LIGHT, 0, x, z, pocket_c);
+    }
+    // Orange annulus: four arc regiments (groups 1-4), each pressing its
+    // anchor to the pocket center.
+    for q in 0..4u32 {
+        let a0 = q as f32 * std::f32::consts::FRAC_PI_2;
+        let mid = a0 + std::f32::consts::FRAC_PI_4;
+        let anchor = pocket_c + Vec2::new(mid.cos(), mid.sin()) * 20.5;
+        let g = list.len() as u32;
+        let mut gd = GroupData::new(1, KIND_LIGHT, anchor, 500);
+        gd.order = Some(pocket_c);
+        list.push(gd);
+        for _ in 0..500 {
             seed = seed.wrapping_add(1);
-            let a = hash01(seed.wrapping_mul(3) + 1) * std::f32::consts::TAU;
-            let r = (r0 * r0 + (r1 * r1 - r0 * r0) * hash01(seed.wrapping_mul(3) + 2)).sqrt();
-            let (x, z) = (cx + r * a.cos(), cz + r * a.sin());
-            push_unit(units, terrain, seed, team, KIND_LIGHT, group, x, z);
+            let a = a0 + hash01(seed.wrapping_mul(3) + 1) * std::f32::consts::FRAC_PI_2;
+            let rr = 14.0f32 * 14.0
+                + (27.0f32 * 27.0 - 14.0 * 14.0) * hash01(seed.wrapping_mul(3) + 2);
+            let r = rr.sqrt();
+            let (x, z) = (pocket_c.x + r * a.cos(), pocket_c.y + r * a.sin());
+            push_unit(units, terrain, seed, 1, KIND_LIGHT, g, x, z, anchor);
+        }
+    }
+    // Line fight: blue block (group 5) holds; orange block (group 6)
+    // presses 27 m south through it.
+    let blue_anchor = Vec2::new(200.0, -6.0);
+    let orange_anchor = Vec2::new(200.0, 21.0);
+    let block = |units: &mut Units,
+                 seed: &mut u32,
+                     team: u8,
+                     group: u32,
+                     anchor: Vec2,
+                     depth: f32,
+                     n: usize| {
+        for _ in 0..n {
+            *seed = seed.wrapping_add(1);
+            let x = 200.0 + (hash01(seed.wrapping_mul(3) + 1) - 0.5) * 60.0;
+            let z = anchor.y + (hash01(seed.wrapping_mul(3) + 2) - 0.5) * depth;
+            push_unit(units, terrain, *seed, team, KIND_LIGHT, group, x, z, anchor);
         }
     };
-    // Pocket: 500 blue in a disc, 2000 orange in the surrounding annulus.
-    disc(units, 0, 0, -200.0, 0.0, 0.0, 13.0, 500);
-    disc(units, 1, 1, -200.0, 0.0, 14.0, 27.0, 2000);
-    // Line: 500 blue vs 2000 orange, meeting only along one front.
-    let mut block =
-        |units: &mut Units, team: u8, group: u32, cz: f32, depth: f32, n: usize| {
-            for _ in 0..n {
-                seed = seed.wrapping_add(1);
-                let x = 200.0 + (hash01(seed.wrapping_mul(3) + 1) - 0.5) * 60.0;
-                let z = cz + (hash01(seed.wrapping_mul(3) + 2) - 0.5) * depth;
-                push_unit(units, terrain, seed, team, KIND_LIGHT, group, x, z);
-            }
-        };
-    block(units, 0, 0, -6.0, 10.0, 500);
-    block(units, 1, 2, 21.0, 40.0, 2000);
+    list.push(GroupData::new(0, KIND_LIGHT, blue_anchor, 500));
+    block(units, &mut seed, 0, 5, blue_anchor, 10.0, 500);
+    let mut press = GroupData::new(1, KIND_LIGHT, orange_anchor, 2000);
+    // Press to CONTACT, not through: the fight must stay frontal (the
+    // pocket is the surrounded case; this is the control).
+    press.order = Some(Vec2::new(orange_anchor.x, 13.0));
+    list.push(press);
+    block(units, &mut seed, 1, 6, orange_anchor, 40.0, 2000);
 
-    // Group 0: all blue, stands fast. Groups 1/2: orange, ordered to press
-    // into their blue opponents so melee stays joined as ranks thin.
-    let mut pocket_press = GroupData::new(1, 2000);
-    pocket_press.order = Some(Vec2::new(-200.0, 0.0));
-    let mut line_press = GroupData::new(1, 2000);
-    line_press.order = Some(Vec2::new(200.0, -6.0));
-    groups.list = vec![GroupData::new(0, 1000), pocket_press, line_press];
-}
-
-/// Fraction of each army spawned as heavy infantry (front rows).
-/// FL_HEAVY_FRAC overrides; the real per-regiment mix lands with regiments.
-fn heavy_frac() -> f32 {
-    std::env::var("FL_HEAVY_FRAC")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0.4)
+    groups.list = list;
 }

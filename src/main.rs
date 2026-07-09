@@ -4,6 +4,7 @@ mod frontline;
 mod movement;
 mod orders;
 mod overlay;
+mod regiments;
 mod render_units;
 mod spatial;
 mod terrain;
@@ -28,6 +29,7 @@ fn main() {
         .add_plugins((
             terrain::TerrainPlugin,
             units::UnitsPlugin,
+            regiments::RegimentsPlugin,
             movement::MovementPlugin,
             orders::OrdersPlugin,
             frontline::FrontlinePlugin,

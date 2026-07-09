@@ -84,7 +84,7 @@ fn update_overlay(
             render_counts.sync_ms,
             groups.list.len(),
             groups.list.iter().filter(|g| g.engaged).count(),
-            selection.count,
+            selection.count_units,
             combat.alive[0],
             combat.kills[0],
             combat.alive[1],
