@@ -143,19 +143,12 @@ fn update_morale(
 }
 
 fn reg_size() -> usize {
-    std::env::var("FL_REG_SIZE")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1000)
-        .max(50)
+    crate::util::env_or("FL_REG_SIZE", 1000_usize).max(50)
 }
 
 /// Fraction of each army's regiments that are heavy infantry (front ranks).
 fn heavy_frac() -> f32 {
-    std::env::var("FL_HEAVY_FRAC")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0.4)
+    crate::util::env_or("FL_HEAVY_FRAC", 0.4)
 }
 
 /// Spawn one regiment block (units + GroupData). `dir` faces the enemy

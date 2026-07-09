@@ -8,12 +8,7 @@ use bevy::prelude::*;
 /// rows fall off the terrain edge.
 pub fn units_per_team() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("FL_UNITS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(100_000)
-    })
+    *N.get_or_init(|| crate::util::env_or("FL_UNITS", 100_000))
 }
 
 /// All per-unit state, structure-of-arrays.

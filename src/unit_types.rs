@@ -7,8 +7,6 @@ pub const KIND_HEAVY: u8 = 0;
 pub const KIND_LIGHT: u8 = 1;
 pub const NUM_KINDS: usize = 2;
 
-// Combat fields become live with the swing-timer kernel (MVP PR2).
-#[allow(dead_code)]
 pub struct UnitTypeParams {
     pub hp: f32,
     /// Damage per landed swing (FL_COMBAT_SCALE multiplies).

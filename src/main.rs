@@ -12,6 +12,7 @@ mod terrain;
 mod unit_meshes;
 mod unit_types;
 mod units;
+mod util;
 
 use bevy::prelude::*;
 use bevy::window::PresentMode;

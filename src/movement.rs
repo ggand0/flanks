@@ -47,12 +47,7 @@ pub struct CombatScale(pub f32);
 
 impl Default for CombatScale {
     fn default() -> Self {
-        Self(
-            std::env::var("FL_COMBAT_SCALE")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(1.0),
-        )
+        Self(crate::util::env_or("FL_COMBAT_SCALE", 1.0))
     }
 }
 

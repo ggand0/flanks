@@ -31,14 +31,8 @@ fn spawn_camera(mut commands: Commands) {
             yaw: 0.0,
             // Overridable for screenshot-based debugging without input
             // injection (pitch in radians, 0.25..1.45).
-            pitch: std::env::var("FL_CAM_PITCH")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0.9),
-            distance: std::env::var("FL_CAM_DIST")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(280.0),
+            pitch: crate::util::env_or("FL_CAM_PITCH", 0.9),
+            distance: crate::util::env_or("FL_CAM_DIST", 280.0),
         },
     ));
 }
