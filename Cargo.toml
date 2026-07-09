@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-bevy = "0.19"
+# mp3: the generated battle audio is mp3 (bevy default is vorbis-only).
+bevy = { version = "0.19", features = ["mp3"] }
 bytemuck = { version = "1", features = ["derive"] }
 
 [features]
