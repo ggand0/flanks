@@ -44,6 +44,7 @@ fn spawn_overlay(mut commands: Commands) {
     ));
 }
 
+#[allow(clippy::too_many_arguments)] // bevy system params
 fn update_overlay(
     diagnostics: Res<DiagnosticsStore>,
     units: Res<Units>,
@@ -97,10 +98,11 @@ fn update_overlay(
         );
         for diag in diagnostics.iter() {
             let path = diag.path().as_str();
-            if path.starts_with("render/") && path.ends_with("elapsed_gpu") {
-                if let Some(v) = diag.smoothed() {
-                    info!("  gpu {path}: {v:.2} ms");
-                }
+            if path.starts_with("render/")
+                && path.ends_with("elapsed_gpu")
+                && let Some(v) = diag.smoothed()
+            {
+                info!("  gpu {path}: {v:.2} ms");
             }
         }
     }

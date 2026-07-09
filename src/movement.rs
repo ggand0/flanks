@@ -84,6 +84,7 @@ impl Plugin for MovementPlugin {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // bevy system params
 pub fn step_sim(
     mut units: ResMut<Units>,
     mut grid: ResMut<SpatialGrid>,
@@ -258,7 +259,7 @@ pub fn step_sim(
 
     // Overlap audit over the full population, every 60 ticks (~2 s).
     *tick = tick.wrapping_add(1);
-    if *tick % 60 == 0 {
+    if (*tick).is_multiple_of(60) {
         let _span = info_span!("nn_audit").entered();
         let mut min_d2 = f32::MAX;
         let mut sum_d = 0.0f64;

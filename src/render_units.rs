@@ -145,6 +145,7 @@ fn sync_instance_data(
     camera: Query<(&Projection, &Transform), With<Camera3d>>,
     mut query: Query<&mut InstanceMaterialData>,
     mut counts: ResMut<RenderCounts>,
+    mut no_cull: Local<Option<bool>>,
 ) {
     let _span = info_span!("sync_instances").entered();
     let Ok((projection, cam_tf)) = camera.single() else {
@@ -157,7 +158,7 @@ fn sync_instance_data(
     // so Transform is authoritative).
     let clip_from_world = projection.get_clip_from_view() * cam_tf.to_matrix().inverse();
     let frustum = Frustum(ViewFrustum::from_clip_from_world(&clip_from_world));
-    let cull = std::env::var("FL_NO_CULL").is_err();
+    let cull = !*no_cull.get_or_insert_with(|| std::env::var("FL_NO_CULL").is_ok());
     let alpha = fixed_time.overstep_fraction();
 
     data.clear();
@@ -190,6 +191,7 @@ fn sync_instance_data(
     counts.total = units.len();
 }
 
+#[allow(clippy::too_many_arguments)] // bevy system params
 fn queue_custom(
     transparent_3d_draw_functions: Res<DrawFunctions<Transparent3d>>,
     custom_pipeline: Res<CustomPipeline>,
