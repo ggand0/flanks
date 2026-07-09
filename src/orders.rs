@@ -20,14 +20,6 @@ const SELECT_RADIUS: f32 = 14.0;
 /// Groups whose centroid gets this close to their order target go idle.
 const ARRIVE_CLEAR: f32 = 18.0;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Stance {
-    /// Wide and shallow.
-    Hold,
-    /// Narrow and deep.
-    Column,
-}
-
 /// Regiment morale state.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum RegState {
@@ -58,8 +50,6 @@ pub struct GroupData {
     pub count: usize,
     /// Strength at spawn (casualty fraction for morale).
     pub initial_count: usize,
-    /// Currently inert; formation shapes return with rigid formations.
-    pub stance: Stance,
     // --- refreshed every fixed tick by the frontline pass ---
     pub centroid: Vec2,
     pub engaged: bool,
@@ -79,7 +69,6 @@ impl GroupData {
             anchor,
             count,
             initial_count: count,
-            stance: Stance::Hold,
             centroid: anchor,
             engaged: false,
             morale: 100.0,
@@ -123,7 +112,6 @@ impl Plugin for OrdersPlugin {
                 (
                     drag_select,
                     issue_order,
-                    stance_key,
                     test_orders_script,
                     draw_order_gizmos,
                 ),
@@ -351,31 +339,6 @@ pub fn clear_arrived_orders(mut groups: ResMut<Groups>) {
             group.anchor = t;
             group.order = None;
             info!("regiment {g} arrived, holding");
-        }
-    }
-}
-
-/// F: toggle stance of every selected regiment (still inert; formation
-/// shapes arrive with rigid formations).
-fn stance_key(
-    keys: Res<ButtonInput<KeyCode>>,
-    mut groups: ResMut<Groups>,
-    selection: Res<Selection>,
-) {
-    if !keys.just_pressed(KeyCode::KeyF) || selection.count_units == 0 {
-        return;
-    }
-    for (g, sel) in selection.regiments.iter().enumerate() {
-        if *sel {
-            let group = &mut groups.list[g];
-            group.stance = match group.stance {
-                Stance::Hold => Stance::Column,
-                Stance::Column => Stance::Hold,
-            };
-            info!(
-                "regiment {g} stance -> {}",
-                if group.stance == Stance::Hold { "hold line" } else { "column" }
-            );
         }
     }
 }

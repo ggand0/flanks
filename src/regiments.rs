@@ -24,7 +24,7 @@ impl Plugin for RegimentsPlugin {
     fn build(&self, app: &mut App) {
         // Terrain resource is created in PreStartup (generate_terrain).
         app.add_systems(Startup, spawn_battle)
-            .add_systems(Update, rout_test_log)
+            .add_systems(Update, (rout_test_log, restart_key))
             .add_systems(
                 FixedUpdate,
                 update_morale
@@ -188,12 +188,38 @@ fn spawn_regiment(
 }
 
 fn spawn_battle(mut units: ResMut<Units>, terrain: Res<Terrain>, mut groups: ResMut<Groups>) {
+    do_spawn_battle(&mut units, &terrain, &mut groups);
+}
+
+/// R: restart the battle from scratch (fresh armies, cleared stats).
+#[allow(clippy::too_many_arguments)] // bevy system params
+fn restart_key(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut units: ResMut<Units>,
+    terrain: Res<Terrain>,
+    mut groups: ResMut<Groups>,
+    mut stats: ResMut<crate::combat::CombatStats>,
+    mut selection: ResMut<crate::orders::Selection>,
+    mut outcome: ResMut<crate::ai::BattleOutcome>,
+) {
+    if !keys.just_pressed(KeyCode::KeyR) {
+        return;
+    }
+    *units = Units::default();
+    *stats = crate::combat::CombatStats::default();
+    *selection = crate::orders::Selection::default();
+    outcome.0 = None;
+    do_spawn_battle(&mut units, &terrain, &mut groups);
+    info!("battle restarted");
+}
+
+fn do_spawn_battle(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
     if std::env::var("FL_TEST_SURROUND").is_ok() {
-        crate::units::spawn_surround_test(&mut units, &terrain, &mut groups);
+        crate::units::spawn_surround_test(units, terrain, groups);
         return;
     }
     if std::env::var("FL_TEST_ROUT").is_ok() {
-        spawn_rout_test(&mut units, &terrain, &mut groups);
+        spawn_rout_test(units, terrain, groups);
         return;
     }
 
@@ -240,7 +266,7 @@ fn spawn_battle(mut units: ResMut<Units>, terrain: Res<Terrain>, mut groups: Res
             let z0 = dir * (ARMY_GAP / 2.0 + block_d / 2.0 + rank as f32 * (block_d + REG_GAP));
             let anchor = Vec2::new(x0, z0);
             let kind = if r < n_heavy { KIND_HEAVY } else { KIND_LIGHT };
-            spawn_regiment(&mut units, &terrain, &mut list, team, kind, anchor, size, dir);
+            spawn_regiment(units, terrain, &mut list, team, kind, anchor, size, dir);
         }
     }
     let heavies = list.iter().filter(|g| g.kind == KIND_HEAVY).count();

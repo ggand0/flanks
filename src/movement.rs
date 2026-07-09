@@ -257,9 +257,10 @@ pub fn step_sim(
                     }
 
                     // Fused neighbor scan: separation physics + nearest
-                    // living enemy in reach (swing targeting). Kept
-                    // branch-light and side-effect-free per candidate —
-                    // the future SIMD kernel depends on that shape.
+                    // living enemy in reach (swing targeting). Scalar over
+                    // cache-ordered SortedUnits — an 8-wide SIMD variant
+                    // measured slower here (devlog 0020): candidate runs
+                    // are too short for lane occupancy.
                     let mut push = Vec2::ZERO;
                     let mut corr = Vec2::ZERO;
                     let mut crowd = 0.0f32;

@@ -2,10 +2,17 @@
 //! tick with a parallel counting sort. Cell size ~2x unit radius so range
 //! queries only touch a 3x3 cell neighborhood.
 //!
-//! The rebuild also emits `sorted`: per-unit (position, team, index) packed
+//! The rebuild also emits `sorted`: per-unit (position, meta, index) packed
 //! in grid-cell order. Neighbor queries iterate it LINEARLY — the hot
 //! integrate loop reads contiguous memory instead of gathering pos/team
 //! through random unit indices (the cache misses dominated the old cost).
+//!
+//! NOTE (devlog 0020): an 8-wide SIMD variant of this layout (split x/z/meta
+//! lane arrays + f32x8 kernel) was built and measured SLOWER overall — the
+//! candidate runs are too short (~3-15 units) for lane occupancy, and the
+//! split arrays cost extra cache lines on the short-run majority. Don't
+//! retry without an AoSoA block layout and vectorizing the rest of the
+//! integrate body too.
 
 use bevy::prelude::*;
 use bevy::tasks::ComputeTaskPool;
@@ -163,7 +170,7 @@ impl SpatialGrid {
 
     /// Visit all units in cells overlapping the disc at `center` with
     /// `radius` (candidates only — caller does the distance test). Units
-    /// arrive as contiguous `SortedUnit`s: position + team + index without
+    /// arrive as contiguous `SortedUnit`s: position + meta + index without
     /// touching the SoA arrays.
     #[inline]
     pub fn for_each_candidate(&self, center: Vec2, radius: f32, mut f: impl FnMut(&SortedUnit)) {
