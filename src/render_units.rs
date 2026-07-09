@@ -51,6 +51,8 @@ pub struct RenderCounts {
     pub total: usize,
     /// Per-bucket drawn counts (bucket = team today, unit type later).
     pub bucket_drawn: Vec<usize>,
+    /// Cost of sync_instance_data this frame (cull + bucket build).
+    pub sync_ms: f32,
 }
 
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -170,6 +172,10 @@ fn setup_unit_mesh(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
 /// interpolate between fixed ticks, frustum-cull per instance, tint the
 /// selection. Culling is strictly visibility: a unit is skipped only when
 /// its bounding sphere is outside the camera frustum.
+/// Units per parallel sync chunk.
+const SYNC_CHUNK: usize = 16_384;
+
+#[allow(clippy::too_many_arguments)] // bevy system params
 fn sync_instance_data(
     units: Res<Units>,
     selection: Res<crate::orders::Selection>,
@@ -178,8 +184,10 @@ fn sync_instance_data(
     mut query: Query<(&InstanceBucket, &mut InstanceMaterialData)>,
     mut counts: ResMut<RenderCounts>,
     mut no_cull: Local<Option<bool>>,
+    mut scratch: Local<Vec<[Vec<InstanceData>; NUM_BUCKETS]>>,
 ) {
     let _span = info_span!("sync_instances").entered();
+    let t0 = std::time::Instant::now();
     let Ok((projection, cam_tf)) = camera.single() else {
         return;
     };
@@ -193,9 +201,6 @@ fn sync_instance_data(
     }
     buckets.sort_unstable_by_key(|(id, _)| *id);
     debug_assert!(buckets.iter().enumerate().all(|(i, (id, _))| i == *id));
-    for (_, data) in &mut buckets {
-        data.clear();
-    }
     // Fresh frustum from THIS frame's camera state (camera has no parent,
     // so Transform is authoritative).
     let clip_from_world = projection.get_clip_from_view() * cam_tf.to_matrix().inverse();
@@ -205,28 +210,56 @@ fn sync_instance_data(
 
     const HIGHLIGHT: [f32; 4] = [1.0, 1.0, 0.55, 1.0];
     let has_sel = selection.mask.len() == units.len();
-    for i in 0..units.len() {
-        let position = units.pos_prev[i].lerp(units.pos[i], alpha);
-        let sphere = Sphere {
-            center: position.into(),
-            radius: CULL_RADIUS,
-        };
-        // intersect_far = false: skip the far-plane test so distant vistas
-        // keep their units.
-        if cull && !frustum.intersects_sphere(&sphere, false) {
-            continue;
+
+    // Parallel cull + bucket build into per-chunk scratch, then one memcpy
+    // concat per bucket. The scratch vecs keep their allocations across
+    // frames (Local).
+    let n_chunks = units.len().div_ceil(SYNC_CHUNK);
+    if scratch.len() < n_chunks {
+        scratch.resize_with(n_chunks, Default::default);
+    }
+    let units = &*units;
+    let selection = &*selection;
+    let frustum = &frustum;
+    bevy::tasks::ComputeTaskPool::get().scope(|scope| {
+        for (ci, chunk_scratch) in scratch.iter_mut().enumerate().take(n_chunks) {
+            scope.spawn(async move {
+                for vec in chunk_scratch.iter_mut() {
+                    vec.clear();
+                }
+                let start = ci * SYNC_CHUNK;
+                let end = (start + SYNC_CHUNK).min(units.len());
+                for i in start..end {
+                    let position = units.pos_prev[i].lerp(units.pos[i], alpha);
+                    let sphere = Sphere {
+                        center: position.into(),
+                        radius: CULL_RADIUS,
+                    };
+                    // intersect_far = false: skip the far-plane test so
+                    // distant vistas keep their units.
+                    if cull && !frustum.intersects_sphere(&sphere, false) {
+                        continue;
+                    }
+                    let mut color = units.color[i];
+                    if has_sel && selection.mask[i] {
+                        for c in 0..3 {
+                            color[c] = color[c] * 0.35 + HIGHLIGHT[c] * 0.65;
+                        }
+                    }
+                    chunk_scratch[bucket_of(units, i)].push(InstanceData {
+                        position,
+                        scale: 1.0,
+                        color,
+                    });
+                }
+            });
         }
-        let mut color = units.color[i];
-        if has_sel && selection.mask[i] {
-            for c in 0..3 {
-                color[c] = color[c] * 0.35 + HIGHLIGHT[c] * 0.65;
-            }
+    });
+    for (b, (_, data)) in buckets.iter_mut().enumerate() {
+        data.clear();
+        for chunk_scratch in scratch.iter().take(n_chunks) {
+            data.extend_from_slice(&chunk_scratch[b]);
         }
-        buckets[bucket_of(&units, i)].1.push(InstanceData {
-            position,
-            scale: 1.0,
-            color,
-        });
     }
     counts.drawn = buckets.iter().map(|(_, d)| d.len()).sum();
     counts.total = units.len();
@@ -234,6 +267,7 @@ fn sync_instance_data(
     counts
         .bucket_drawn
         .extend(buckets.iter().map(|(_, d)| d.len()));
+    counts.sync_ms = t0.elapsed().as_secs_f32() * 1000.0;
 }
 
 #[allow(clippy::too_many_arguments)] // bevy system params

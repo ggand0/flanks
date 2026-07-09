@@ -61,6 +61,10 @@ impl Default for CombatTuning {
 pub struct SimStats {
     pub grid_ms: f32,
     pub step_ms: f32,
+    /// Density splat + blur + contour (frontline.rs), per tick.
+    pub field_ms: f32,
+    /// Last nn_audit sweep cost (runs every ~2 s).
+    pub audit_ms: f32,
     /// Smallest nearest-neighbor distance across all units (sampled every
     /// couple of seconds). Cube width is 0.62 — below that means overlap.
     pub nn_min: f32,
@@ -116,7 +120,7 @@ pub fn step_sim(
     let t0 = Instant::now();
     {
         let _span = info_span!("grid_rebuild").entered();
-        grid.rebuild(pos_prev);
+        grid.rebuild(pos_prev, team);
     }
     let t1 = Instant::now();
     stats.grid_ms = (t1 - t0).as_secs_f32() * 1000.0;
@@ -173,14 +177,14 @@ pub fn step_sim(
                     let mut corr = Vec2::ZERO;
                     let mut crowd = 0.0f32;
                     let mut attackers = 0u32;
+                    let my_team = team[i] as u32;
                     grid.for_each_candidate(p, MELEE_RANGE, |o| {
-                        let o = o as usize;
-                        if o == i {
+                        if o.idx as usize == i {
                             return;
                         }
-                        let d = p - pos_prev[o].xz();
+                        let d = p - o.xz();
                         let d2 = d.length_squared();
-                        if team[o] != team[i] && d2 < MELEE_RANGE * MELEE_RANGE {
+                        if o.team != my_team && d2 < MELEE_RANGE * MELEE_RANGE {
                             attackers += 1;
                         }
                         if d2 < SEP_RADIUS * SEP_RADIUS && d2 > 1e-8 {
@@ -258,33 +262,47 @@ pub fn step_sim(
     stats.step_ms = t1.elapsed().as_secs_f32() * 1000.0;
 
     // Overlap audit over the full population, every 60 ticks (~2 s).
+    // Parallel over chunks; each task returns (min_d2, sum_d, counted).
     *tick = tick.wrapping_add(1);
     if (*tick).is_multiple_of(60) {
         let _span = info_span!("nn_audit").entered();
-        let mut min_d2 = f32::MAX;
-        let mut sum_d = 0.0f64;
-        let mut counted = 0u64;
-        for (i, p) in pos_prev.iter().enumerate() {
-            let p2 = p.xz();
-            let mut best = f32::MAX;
-            grid.for_each_candidate(p2, SEP_RADIUS, |o| {
-                let o = o as usize;
-                if o != i {
-                    best = best.min(p2.distance_squared(pos_prev[o].xz()));
-                }
-            });
-            if best < f32::MAX {
-                min_d2 = min_d2.min(best);
-                sum_d += best.sqrt() as f64;
-                counted += 1;
+        let audit_t0 = Instant::now();
+        let partials: Vec<(f32, f64, u64)> = ComputeTaskPool::get().scope(|scope| {
+            for (ci, chunk) in pos_prev.chunks(CHUNK * 8).enumerate() {
+                let start = ci * CHUNK * 8;
+                scope.spawn(async move {
+                    let mut min_d2 = f32::MAX;
+                    let mut sum_d = 0.0f64;
+                    let mut counted = 0u64;
+                    for (j, p) in chunk.iter().enumerate() {
+                        let i = start + j;
+                        let p2 = p.xz();
+                        let mut best = f32::MAX;
+                        grid.for_each_candidate(p2, SEP_RADIUS, |o| {
+                            if o.idx as usize != i {
+                                best = best.min(p2.distance_squared(o.xz()));
+                            }
+                        });
+                        if best < f32::MAX {
+                            min_d2 = min_d2.min(best);
+                            sum_d += best.sqrt() as f64;
+                            counted += 1;
+                        }
+                    }
+                    (min_d2, sum_d, counted)
+                });
             }
-        }
+        });
+        let min_d2 = partials.iter().fold(f32::MAX, |m, p| m.min(p.0));
+        let sum_d: f64 = partials.iter().map(|p| p.1).sum();
+        let counted: u64 = partials.iter().map(|p| p.2).sum();
         stats.nn_min = min_d2.sqrt();
         stats.nn_avg = if counted > 0 {
             (sum_d / counted as f64) as f32
         } else {
             0.0
         };
+        stats.audit_ms = audit_t0.elapsed().as_secs_f32() * 1000.0;
     }
 }
 

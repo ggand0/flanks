@@ -1,31 +1,64 @@
 //! Uniform spatial hash grid over the unit positions, rebuilt every fixed
-//! tick with a counting sort. Cell size ~2x unit radius so range queries
-//! only touch a 3x3 cell neighborhood.
+//! tick with a parallel counting sort. Cell size ~2x unit radius so range
+//! queries only touch a 3x3 cell neighborhood.
+//!
+//! The rebuild also emits `sorted`: per-unit (position, team, index) packed
+//! in grid-cell order. Neighbor queries iterate it LINEARLY — the hot
+//! integrate loop reads contiguous memory instead of gathering pos/team
+//! through random unit indices (the cache misses dominated the old cost).
 
 use bevy::prelude::*;
+use bevy::tasks::ComputeTaskPool;
 
 pub const CELL_SIZE: f32 = 1.5;
 /// Grid never exceeds this many cells per axis (memory guard).
 const MAX_DIM: usize = 2048;
+/// Units per parallel rebuild chunk.
+const REBUILD_CHUNK: usize = 32_768;
+
+/// One unit in grid order: everything a neighbor query needs, in 16 bytes.
+#[derive(Clone, Copy, Default)]
+pub struct SortedUnit {
+    pub x: f32,
+    pub z: f32,
+    pub idx: u32,
+    pub team: u32,
+}
+
+impl SortedUnit {
+    #[inline]
+    pub fn xz(&self) -> Vec2 {
+        Vec2::new(self.x, self.z)
+    }
+}
+
+/// Raw-pointer wrapper so scatter tasks can write disjoint slots of one
+/// output slice. SAFETY: only used with counting-sort offsets, which
+/// partition [0, n) — each slot is written by exactly one task.
+struct SharedOut(*mut SortedUnit);
+unsafe impl Send for SharedOut {}
+unsafe impl Sync for SharedOut {}
 
 #[derive(Resource, Default)]
 pub struct SpatialGrid {
     origin: Vec2,
     dims: (usize, usize),
-    /// Prefix sums: units of cell c are entries[starts[c]..starts[c + 1]].
+    /// Prefix sums: units of cell c are sorted[starts[c]..starts[c + 1]].
     starts: Vec<u32>,
-    /// Unit indices grouped by cell.
-    entries: Vec<u32>,
-    /// Scratch: write cursor per cell during scatter.
-    cursor: Vec<u32>,
+    /// Units in cell order (the counting-sort payload).
+    sorted: Vec<SortedUnit>,
+    /// Scratch: per-unit cell index from the count pass.
+    cell_of: Vec<u32>,
+    /// Scratch: per-chunk histogram / write cursors.
+    hists: Vec<Vec<u32>>,
 }
 
 impl SpatialGrid {
-    pub fn rebuild(&mut self, positions: &[Vec3]) {
+    pub fn rebuild(&mut self, positions: &[Vec3], teams: &[u8]) {
         let n = positions.len();
-        self.entries.resize(n, 0);
         if n == 0 {
             self.dims = (0, 0);
+            self.sorted.clear();
             return;
         }
 
@@ -41,48 +74,90 @@ impl SpatialGrid {
             ((span.x / CELL_SIZE) as usize + 1).min(MAX_DIM),
             ((span.y / CELL_SIZE) as usize + 1).min(MAX_DIM),
         );
-
         let cells = self.dims.0 * self.dims.1;
+        let (origin, dims) = (self.origin, self.dims);
+
+        let n_chunks = n.div_ceil(REBUILD_CHUNK);
+        self.cell_of.resize(n, 0);
+        self.hists.resize(n_chunks, Vec::new());
+
+        // Count pass: per-chunk histograms + cached per-unit cell index.
+        ComputeTaskPool::get().scope(|scope| {
+            for (pos_chunk, (cell_chunk, hist)) in positions
+                .chunks(REBUILD_CHUNK)
+                .zip(self.cell_of.chunks_mut(REBUILD_CHUNK).zip(&mut self.hists))
+            {
+                scope.spawn(async move {
+                    hist.clear();
+                    hist.resize(cells, 0);
+                    for (j, p) in pos_chunk.iter().enumerate() {
+                        let c = cell_index_for(origin, dims, Vec2::new(p.x, p.z));
+                        cell_chunk[j] = c as u32;
+                        hist[c] += 1;
+                    }
+                });
+            }
+        });
+
+        // Merge: rewrite each chunk histogram into that chunk's write
+        // cursors, and build the cell prefix sums. Deterministic layout:
+        // cell-major, chunk order within a cell.
         self.starts.clear();
         self.starts.resize(cells + 1, 0);
-
-        // Count per cell (starts shifted by one so the prefix sum lands right).
-        for p in positions {
-            let c = self.cell_index(Vec2::new(p.x, p.z));
-            self.starts[c + 1] += 1;
-        }
+        let mut acc = 0u32;
         for c in 0..cells {
-            self.starts[c + 1] += self.starts[c];
+            for hist in &mut self.hists {
+                let cnt = hist[c];
+                hist[c] = acc;
+                acc += cnt;
+            }
+            self.starts[c + 1] = acc;
         }
-        // Scatter.
-        self.cursor.clear();
-        self.cursor.extend_from_slice(&self.starts[..cells]);
-        for (i, p) in positions.iter().enumerate() {
-            let c = self.cell_index(Vec2::new(p.x, p.z));
-            self.entries[self.cursor[c] as usize] = i as u32;
-            self.cursor[c] += 1;
-        }
+
+        // Scatter pass: chunks write their units to precomputed disjoint
+        // offsets. SAFETY (SharedOut): the merged cursors partition [0, n),
+        // so every slot of `sorted` is written exactly once, by one task.
+        self.sorted.resize(n, SortedUnit::default());
+        let out = SharedOut(self.sorted.as_mut_ptr());
+        let out = &out;
+        ComputeTaskPool::get().scope(|scope| {
+            for (t, (pos_chunk, (cell_chunk, hist))) in positions
+                .chunks(REBUILD_CHUNK)
+                .zip(self.cell_of.chunks(REBUILD_CHUNK).zip(&mut self.hists))
+                .enumerate()
+            {
+                let start = t * REBUILD_CHUNK;
+                scope.spawn(async move {
+                    for (j, p) in pos_chunk.iter().enumerate() {
+                        let i = start + j;
+                        let c = cell_chunk[j] as usize;
+                        let k = hist[c] as usize;
+                        hist[c] += 1;
+                        unsafe {
+                            *out.0.add(k) = SortedUnit {
+                                x: p.x,
+                                z: p.z,
+                                idx: i as u32,
+                                team: teams[i] as u32,
+                            };
+                        }
+                    }
+                });
+            }
+        });
     }
 
     #[inline]
     fn cell_coords(&self, p: Vec2) -> (usize, usize) {
-        let g = (p - self.origin) / CELL_SIZE;
-        (
-            (g.x as usize).min(self.dims.0 - 1),
-            (g.y as usize).min(self.dims.1 - 1),
-        )
+        cell_coords_for(self.origin, self.dims, p)
     }
 
+    /// Visit all units in cells overlapping the disc at `center` with
+    /// `radius` (candidates only — caller does the distance test). Units
+    /// arrive as contiguous `SortedUnit`s: position + team + index without
+    /// touching the SoA arrays.
     #[inline]
-    fn cell_index(&self, p: Vec2) -> usize {
-        let (cx, cy) = self.cell_coords(p);
-        cy * self.dims.0 + cx
-    }
-
-    /// Visit indices of all units in cells overlapping the disc at `center`
-    /// with `radius` (candidates only — caller does the distance test).
-    #[inline]
-    pub fn for_each_candidate(&self, center: Vec2, radius: f32, mut f: impl FnMut(u32)) {
+    pub fn for_each_candidate(&self, center: Vec2, radius: f32, mut f: impl FnMut(&SortedUnit)) {
         if self.dims.0 == 0 {
             return;
         }
@@ -92,12 +167,26 @@ impl SpatialGrid {
             let row = cy * self.dims.0;
             let s = self.starts[row + cx0] as usize;
             let e = self.starts[row + cx1 + 1] as usize;
-            // Cells in a row are contiguous in `entries` only per cell, but
-            // consecutive cells share boundaries, so [s, e) covers exactly
-            // cells cx0..=cx1 of this row.
-            for &idx in &self.entries[s..e] {
-                f(idx);
+            // Consecutive cells of a row are adjacent in `sorted`, so [s, e)
+            // covers exactly cells cx0..=cx1 of this row, linearly.
+            for u in &self.sorted[s..e] {
+                f(u);
             }
         }
     }
+}
+
+#[inline]
+fn cell_coords_for(origin: Vec2, dims: (usize, usize), p: Vec2) -> (usize, usize) {
+    let g = (p - origin) / CELL_SIZE;
+    (
+        (g.x as usize).min(dims.0 - 1),
+        (g.y as usize).min(dims.1 - 1),
+    )
+}
+
+#[inline]
+fn cell_index_for(origin: Vec2, dims: (usize, usize), p: Vec2) -> usize {
+    let (cx, cy) = cell_coords_for(origin, dims, p);
+    cy * dims.0 + cx
 }

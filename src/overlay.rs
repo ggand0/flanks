@@ -68,7 +68,7 @@ fn update_overlay(
 
     for mut text in &mut query {
         text.0 = format!(
-            "{fps:>5.0} fps  {frame_ms:.2} ms\n{} units, drawn {} [{}] (frustum culled)\nsim tick: grid {:.2} ms, step {:.2} ms\n{} groups ({} engaged), {} selected\nblue {} ({} lost)  orange {} ({} lost)",
+            "{fps:>5.0} fps  {frame_ms:.2} ms\n{} units, drawn {} [{}] (frustum culled)\nsim tick: grid {:.2} ms, step {:.2} ms, field {:.2} ms, audit {:.2} ms | sync {:.2} ms\n{} groups ({} engaged), {} selected\nblue {} ({} lost)  orange {} ({} lost)",
             units.len(),
             render_counts.drawn,
             render_counts
@@ -79,6 +79,9 @@ fn update_overlay(
                 .join("/"),
             stats.grid_ms,
             stats.step_ms,
+            stats.field_ms,
+            stats.audit_ms,
+            render_counts.sync_ms,
             groups.list.len(),
             groups.list.iter().filter(|g| g.engaged).count(),
             selection.count,
@@ -95,10 +98,15 @@ fn update_overlay(
     if *log_timer >= 2.0 {
         *log_timer = 0.0;
         info!(
-            "fps: {fps:.0} ({frame_ms:.2} ms), units: {} (blue {} / orange {}), drawn: {} [{}], nn min/avg: {:.2}/{:.2}",
+            "fps: {fps:.0} ({frame_ms:.2} ms), units: {} (blue {} / orange {}), sim: grid {:.2} step {:.2} field {:.2} audit {:.2} sync {:.2}, drawn: {} [{}], nn min/avg: {:.2}/{:.2}",
             units.len(),
             combat.alive[0],
             combat.alive[1],
+            stats.grid_ms,
+            stats.step_ms,
+            stats.field_ms,
+            stats.audit_ms,
+            render_counts.sync_ms,
             render_counts.drawn,
             render_counts
                 .bucket_drawn

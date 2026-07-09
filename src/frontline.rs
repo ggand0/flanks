@@ -31,6 +31,8 @@ pub struct InfluenceField {
     /// Blurred per-team density, units per cell.
     d: [Vec<f32>; 2],
     scratch: Vec<f32>,
+    /// Per-chunk splat accumulators for the parallel density rebuild.
+    splat_scratch: Vec<[Vec<f32>; 2]>,
     /// Front contour segments (world space), for gizmos.
     pub segments: Vec<(Vec2, Vec2)>,
 }
@@ -45,6 +47,7 @@ impl InfluenceField {
             h,
             d: [vec![0.0; w * h], vec![0.0; w * h]],
             scratch: vec![0.0; w * h],
+            splat_scratch: Vec::new(),
             segments: Vec::new(),
         }
     }
@@ -73,15 +76,39 @@ impl InfluenceField {
     }
 
     fn rebuild_density(&mut self, units: &Units) {
-        self.d[0].fill(0.0);
-        self.d[1].fill(0.0);
-        for i in 0..units.len() {
-            let g = (Vec2::new(units.pos[i].x, units.pos[i].z) - self.origin) / FIELD_CELL;
-            let x = (g.x as usize).min(self.w - 1);
-            let z = (g.y as usize).min(self.h - 1);
-            self.d[units.team[i] as usize][z * self.w + x] += 1.0;
-        }
+        // Parallel splat into per-chunk fields, then a linear merge; the
+        // blur passes stay serial (the field is only ~12k cells).
+        const CHUNK: usize = 16_384;
+        let n_chunks = units.len().div_ceil(CHUNK);
+        let (w, h, origin) = (self.w, self.h, self.origin);
+        let cells = w * h;
+        self.splat_scratch
+            .resize_with(n_chunks.max(self.splat_scratch.len()), Default::default);
+        bevy::tasks::ComputeTaskPool::get().scope(|scope| {
+            for (ci, chunk_fields) in self.splat_scratch.iter_mut().enumerate().take(n_chunks) {
+                scope.spawn(async move {
+                    for f in chunk_fields.iter_mut() {
+                        f.clear();
+                        f.resize(cells, 0.0);
+                    }
+                    let start = ci * CHUNK;
+                    let end = (start + CHUNK).min(units.len());
+                    for i in start..end {
+                        let g = (Vec2::new(units.pos[i].x, units.pos[i].z) - origin) / FIELD_CELL;
+                        let x = (g.x as usize).min(w - 1);
+                        let z = (g.y as usize).min(h - 1);
+                        chunk_fields[units.team[i] as usize][z * w + x] += 1.0;
+                    }
+                });
+            }
+        });
         for team in 0..2 {
+            self.d[team].fill(0.0);
+            for chunk_fields in self.splat_scratch.iter().take(n_chunks) {
+                for (dst, src) in self.d[team].iter_mut().zip(&chunk_fields[team]) {
+                    *dst += *src;
+                }
+            }
             for _ in 0..3 {
                 self.blur_pass(team);
             }
@@ -196,13 +223,21 @@ fn init_field(mut commands: Commands, terrain: Res<Terrain>) {
     commands.insert_resource(InfluenceField::new(terrain.min(), terrain.max()));
 }
 
-fn update_field(mut field: ResMut<InfluenceField>, units: Res<Units>) {
+fn update_field(
+    mut field: ResMut<InfluenceField>,
+    units: Res<Units>,
+    mut stats: ResMut<crate::movement::SimStats>,
+) {
+    let t0 = std::time::Instant::now();
     {
         let _span = info_span!("density_field").entered();
         field.rebuild_density(&units);
     }
-    let _span = info_span!("contour").entered();
-    field.extract_contour();
+    {
+        let _span = info_span!("contour").entered();
+        field.extract_contour();
+    }
+    stats.field_ms = t0.elapsed().as_secs_f32() * 1000.0;
 }
 
 /// Refresh group centroids and contact flags (bookkeeping only).
