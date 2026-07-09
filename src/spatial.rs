@@ -2,10 +2,17 @@
 //! tick with a parallel counting sort. Cell size ~2x unit radius so range
 //! queries only touch a 3x3 cell neighborhood.
 //!
-//! The rebuild also emits `sorted`: per-unit (position, team, index) packed
+//! The rebuild also emits `sorted`: per-unit (position, meta, index) packed
 //! in grid-cell order. Neighbor queries iterate it LINEARLY — the hot
 //! integrate loop reads contiguous memory instead of gathering pos/team
 //! through random unit indices (the cache misses dominated the old cost).
+//!
+//! NOTE (devlog 0020): an 8-wide SIMD variant of this layout (split x/z/meta
+//! lane arrays + f32x8 kernel) was built and measured SLOWER overall — the
+//! candidate runs are too short (~3-15 units) for lane occupancy, and the
+//! split arrays cost extra cache lines on the short-run majority. Don't
+//! retry without an AoSoA block layout and vectorizing the rest of the
+//! integrate body too.
 
 use bevy::prelude::*;
 use bevy::tasks::ComputeTaskPool;
@@ -16,13 +23,19 @@ const MAX_DIM: usize = 2048;
 /// Units per parallel rebuild chunk.
 const REBUILD_CHUNK: usize = 32_768;
 
+/// Meta bits carried by each sorted unit.
+pub const META_TEAM: u32 = 1 << 0;
+pub const META_KIND: u32 = 1 << 1;
+pub const META_DYING: u32 = 1 << 2;
+
 /// One unit in grid order: everything a neighbor query needs, in 16 bytes.
 #[derive(Clone, Copy, Default)]
 pub struct SortedUnit {
     pub x: f32,
     pub z: f32,
     pub idx: u32,
-    pub team: u32,
+    /// META_* bit flags (team, kind, dying).
+    pub meta: u32,
 }
 
 impl SortedUnit {
@@ -54,7 +67,7 @@ pub struct SpatialGrid {
 }
 
 impl SpatialGrid {
-    pub fn rebuild(&mut self, positions: &[Vec3], teams: &[u8]) {
+    pub fn rebuild(&mut self, positions: &[Vec3], teams: &[u8], kinds: &[u8], death_t: &[u8]) {
         let n = positions.len();
         if n == 0 {
             self.dims = (0, 0);
@@ -133,12 +146,15 @@ impl SpatialGrid {
                         let c = cell_chunk[j] as usize;
                         let k = hist[c] as usize;
                         hist[c] += 1;
+                        let meta = ((teams[i] as u32) * META_TEAM)
+                            | ((kinds[i] as u32) * META_KIND)
+                            | (((death_t[i] > 0) as u32) * META_DYING);
                         unsafe {
                             *out.0.add(k) = SortedUnit {
                                 x: p.x,
                                 z: p.z,
                                 idx: i as u32,
-                                team: teams[i] as u32,
+                                meta,
                             };
                         }
                     }
@@ -154,7 +170,7 @@ impl SpatialGrid {
 
     /// Visit all units in cells overlapping the disc at `center` with
     /// `radius` (candidates only — caller does the distance test). Units
-    /// arrive as contiguous `SortedUnit`s: position + team + index without
+    /// arrive as contiguous `SortedUnit`s: position + meta + index without
     /// touching the SoA arrays.
     #[inline]
     pub fn for_each_candidate(&self, center: Vec2, radius: f32, mut f: impl FnMut(&SortedUnit)) {

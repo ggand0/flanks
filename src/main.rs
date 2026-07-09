@@ -1,13 +1,18 @@
+mod ai;
 mod camera;
 mod combat;
 mod frontline;
 mod movement;
 mod orders;
 mod overlay;
+mod regiments;
 mod render_units;
 mod spatial;
 mod terrain;
+mod unit_meshes;
+mod unit_types;
 mod units;
+mod util;
 
 use bevy::prelude::*;
 use bevy::window::PresentMode;
@@ -26,6 +31,8 @@ fn main() {
         .add_plugins((
             terrain::TerrainPlugin,
             units::UnitsPlugin,
+            regiments::RegimentsPlugin,
+            ai::AiPlugin,
             movement::MovementPlugin,
             orders::OrdersPlugin,
             frontline::FrontlinePlugin,
