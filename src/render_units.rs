@@ -35,15 +35,16 @@ use bevy::{
 };
 use bevy::asset::{embedded_asset, load_embedded_asset};
 use bevy::camera::primitives::{Frustum, Sphere};
+use bevy::math::primitives::ViewFrustum;
 use bytemuck::{Pod, Zeroable};
 
 use crate::units::Units;
 
 /// Instances farther than this from the camera go in the far-LOD bucket.
 const LOD_DISTANCE: f32 = 300.0;
-/// Bounding-sphere radius for per-instance frustum culling (covers the
-/// cube diagonal plus interpolation slop).
-const CULL_RADIUS: f32 = 1.3;
+/// Bounding-sphere radius for per-instance frustum culling: cube diagonal
+/// plus a generous margin so nothing pops inside the screen edge.
+const CULL_RADIUS: f32 = 2.5;
 
 /// Which LOD bucket an instance entity renders (0 = near, 1 = far).
 /// Far bucket currently uses the same cube; the mesh slot is the point —
@@ -105,7 +106,13 @@ impl Plugin for UnitRenderPlugin {
         app.add_plugins(SyncComponentPlugin::<InstanceMaterialData>::default())
             .init_resource::<RenderCounts>()
             .add_systems(Startup, setup_unit_mesh)
-            .add_systems(Update, sync_instance_data);
+            // Must run after the camera moves: culling builds a FRESH
+            // frustum from this frame's camera transform (the Frustum
+            // component is one frame stale — visible pop while panning).
+            .add_systems(
+                Update,
+                sync_instance_data.after(crate::camera::apply_camera_transform),
+            );
         app.sub_app_mut(RenderApp)
             .add_systems(ExtractSchedule, extract_instance_data)
             .add_render_command::<Transparent3d, DrawCustom>()
@@ -148,15 +155,21 @@ fn sync_instance_data(
     units: Res<Units>,
     selection: Res<crate::orders::Selection>,
     fixed_time: Res<Time<Fixed>>,
-    camera: Query<(&Frustum, &GlobalTransform), With<Camera3d>>,
+    camera: Query<(&Projection, &Transform), With<Camera3d>>,
     mut query: Query<(&mut InstanceMaterialData, &UnitLod)>,
     mut counts: ResMut<RenderCounts>,
 ) {
     let _span = info_span!("sync_instances").entered();
-    let Ok((frustum, cam_tf)) = camera.single() else {
+    let Ok((projection, cam_tf)) = camera.single() else {
         return;
     };
-    let cam_pos = cam_tf.translation();
+    // Fresh frustum from THIS frame's camera state (camera has no parent,
+    // so Transform is authoritative).
+    let clip_from_world =
+        projection.get_clip_from_view() * cam_tf.to_matrix().inverse();
+    let frustum = Frustum(ViewFrustum::from_clip_from_world(&clip_from_world));
+    let cull = std::env::var("FL_NO_CULL").is_err();
+    let cam_pos = cam_tf.translation;
     let alpha = fixed_time.overstep_fraction();
 
     let mut near = None;
@@ -185,7 +198,7 @@ fn sync_instance_data(
         };
         // intersect_far = false: skip the far-plane test so distant vistas
         // keep their units.
-        if !frustum.intersects_sphere(&sphere, false) {
+        if cull && !frustum.intersects_sphere(&sphere, false) {
             continue;
         }
         let mut color = units.color[i];

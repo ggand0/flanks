@@ -89,7 +89,7 @@ fn control_camera(
     }
 }
 
-fn apply_camera_transform(
+pub fn apply_camera_transform(
     mut query: Query<(&mut RtsCamera, &mut Transform)>,
     terrain: Res<crate::terrain::Terrain>,
 ) {
