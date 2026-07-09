@@ -31,10 +31,10 @@ pub struct GroupData {
     /// Attack-move target on the ground plane; None = hold.
     pub order: Option<Vec2>,
     pub count: usize,
+    /// Currently inert; formation shapes return with the TW-style branch.
     pub stance: Stance,
     // --- refreshed every fixed tick by the frontline pass ---
     pub centroid: Vec2,
-    pub max_depth: f32,
     pub engaged: bool,
 }
 
@@ -46,7 +46,6 @@ impl GroupData {
             count,
             stance: Stance::Hold,
             centroid: Vec2::ZERO,
-            max_depth: 15.0,
             engaged: false,
         }
     }

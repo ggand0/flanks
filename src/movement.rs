@@ -88,7 +88,6 @@ pub fn step_sim(
     mut units: ResMut<Units>,
     mut grid: ResMut<SpatialGrid>,
     groups: Res<Groups>,
-    field: Res<crate::frontline::InfluenceField>,
     terrain: Res<Terrain>,
     tuning: Res<CombatTuning>,
     time: Res<Time>,
@@ -126,9 +125,6 @@ pub fn step_sim(
     let group = &group[..];
     let orders: Vec<Option<Vec2>> = groups.list.iter().map(|g| g.order).collect();
     let orders = &orders[..];
-    let depths: Vec<f32> = groups.list.iter().map(|g| g.max_depth).collect();
-    let depths = &depths[..];
-    let front = &*field;
     let bounds_min = terrain.min() + 4.0;
     let bounds_max = terrain.max() - 4.0;
 
@@ -147,32 +143,15 @@ pub fn step_sim(
                     let i = start + j;
                     let p = pos_prev[i].xz();
 
+                    // Units move ONLY under orders, straight toward the
+                    // ordered point. No order = stand fast (separation
+                    // still shoves, melee still defends). Enemy contact is
+                    // pure physics: cross-team separation blocks, crowd
+                    // yield stops the shove, combat thins the block. The
+                    // "front line" is just where that collision happens.
                     let gi = group[i] as usize;
-                    let ci = front.cell_index(p);
                     let mut desired = Vec2::ZERO;
-                    let mut on_line = false;
-                    if front.dist[ci] < crate::frontline::ENGAGE_DIST {
-                        // Hold station behind the nearest point of THE front
-                        // (shared phi=0 contour). own_dir points to our side
-                        // of the line; depth capped by group stance. The
-                        // constant gentle forward pull + crowd yield produce
-                        // ranks and reserves.
-                        let n = front.normal[ci];
-                        if n != Vec2::ZERO {
-                            on_line = true;
-                            let fp = front.front_pt[ci];
-                            let own_dir = if team[i] == 0 { n } else { -n };
-                            let depth = (p - fp).dot(own_dir);
-                            let td = (depth * 0.85).clamp(0.7, depths[gi]);
-                            let target = fp + own_dir * td;
-                            let to_t = target - p;
-                            let dist = to_t.length();
-                            if dist > 1e-3 {
-                                desired = to_t * ((speed[i] * (dist / 6.0).min(1.0)) / dist);
-                            }
-                        }
-                    }
-                    if !on_line && let Some(goal) = orders[gi] {
+                    if let Some(goal) = orders[gi] {
                         let to_goal = goal - p;
                         let dist = to_goal.length();
                         // Slope penalty: steep ground is slow ground.

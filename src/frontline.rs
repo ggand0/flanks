@@ -1,33 +1,27 @@
-//! Frontline solver, v2: ONE line per battle.
+//! Frontline VISUALIZATION. The "front line" is not a mechanic: it is a
+//! readout of where the two masses physically collide. Units never steer by
+//! it — movement is orders + collision (movement.rs).
 //!
-//! Per fixed tick, on a coarse 8 m grid:
-//! 1. Splat + blur per-team density fields.
-//! 2. phi = blue − orange. THE front is the phi = 0 contour, extracted by
-//!    marching squares, restricted to cells where BOTH teams are present.
-//!    Both teams share the same line — where the masses balance.
-//! 3. Multi-source BFS from the contour: every nearby cell learns its
-//!    nearest front point + the front normal there.
-//! 4. Units within ENGAGE_DIST of the front hold station behind their
-//!    nearest front point (depth capped by group stance); everyone else
-//!    follows group orders. Local superiority moves phi's zero — pressure
-//!    stays emergent.
+//! Per fixed tick, on a coarse 8 m grid: splat + blur per-team density,
+//! then marching-squares the phi = 0 contour of phi = blue − orange,
+//! restricted to cells where both teams are present. Drawn as gizmos.
+//! The density field also answers "is this group in contact?" for
+//! order-arrival bookkeeping.
 
 use bevy::prelude::*;
-use std::collections::VecDeque;
 
 use crate::movement::DebugViz;
-use crate::orders::{Groups, Stance};
+use crate::orders::Groups;
 use crate::terrain::Terrain;
 use crate::units::Units;
 
 pub const FIELD_CELL: f32 = 8.0;
-/// Units this close to the front adopt line behavior.
-pub const ENGAGE_DIST: f32 = 60.0;
-/// Both teams' blurred density must exceed this for a cell to be "contact".
-/// Low on purpose: the line must form while approaching armies are still
-/// ~20-30 m apart, so they lock onto it instead of charging through.
-const CONTACT_T: f32 = 0.12;
-const SLOT_SPACING: f32 = 1.05;
+/// Both teams' blurred density must exceed this for a cell to be "contact":
+/// the drawn line only exists where masses genuinely collide.
+const CONTACT_T: f32 = 0.5;
+/// Enemy blurred density at a group's centroid above which it counts as
+/// engaged (keeps its order pressing instead of "arriving").
+const ENGAGED_T: f32 = 0.8;
 
 #[derive(Resource)]
 pub struct InfluenceField {
@@ -39,12 +33,6 @@ pub struct InfluenceField {
     scratch: Vec<f32>,
     /// Front contour segments (world space), for gizmos.
     pub segments: Vec<(Vec2, Vec2)>,
-    /// Per cell: distance to nearest front point (f32::MAX = far).
-    pub dist: Vec<f32>,
-    /// Per cell: nearest front point.
-    pub front_pt: Vec<Vec2>,
-    /// Per cell: front normal there, oriented toward the team-0 side.
-    pub normal: Vec<Vec2>,
 }
 
 impl InfluenceField {
@@ -58,18 +46,20 @@ impl InfluenceField {
             d: [vec![0.0; w * h], vec![0.0; w * h]],
             scratch: vec![0.0; w * h],
             segments: Vec::new(),
-            dist: vec![f32::MAX; w * h],
-            front_pt: vec![Vec2::ZERO; w * h],
-            normal: vec![Vec2::ZERO; w * h],
         }
     }
 
     #[inline]
-    pub fn cell_index(&self, p: Vec2) -> usize {
+    fn cell_index(&self, p: Vec2) -> usize {
         let g = (p - self.origin) / FIELD_CELL;
         let x = (g.x.round().max(0.0) as usize).min(self.w - 1);
         let z = (g.y.round().max(0.0) as usize).min(self.h - 1);
         z * self.w + x
+    }
+
+    /// Blurred density of a team at a point (nearest cell).
+    pub fn density(&self, team: u8, p: Vec2) -> f32 {
+        self.d[team as usize][self.cell_index(p)]
     }
 
     #[inline]
@@ -80,19 +70,6 @@ impl InfluenceField {
     #[inline]
     fn phi(&self, i: usize) -> f32 {
         self.d[0][i] - self.d[1][i]
-    }
-
-    /// Normalized gradient of phi at a grid point (toward team-0 excess).
-    fn phi_grad(&self, x: usize, z: usize) -> Vec2 {
-        let xm = x.saturating_sub(1);
-        let xp = (x + 1).min(self.w - 1);
-        let zm = z.saturating_sub(1);
-        let zp = (z + 1).min(self.h - 1);
-        Vec2::new(
-            self.phi(z * self.w + xp) - self.phi(z * self.w + xm),
-            self.phi(zp * self.w + x) - self.phi(zm * self.w + x),
-        )
-        .normalize_or_zero()
     }
 
     fn rebuild_density(&mut self, units: &Units) {
@@ -198,54 +175,6 @@ impl InfluenceField {
         }
     }
 
-    /// Multi-source BFS from the contour: nearest front point + normal per
-    /// cell, out to ENGAGE_DIST (+ margin).
-    fn propagate_front(&mut self) {
-        self.dist.fill(f32::MAX);
-        let mut queue: VecDeque<usize> = VecDeque::new();
-        let segs = std::mem::take(&mut self.segments);
-        for (a, b) in &segs {
-            for pt in [*a, *b, (*a + *b) * 0.5] {
-                let ci = self.cell_index(pt);
-                let (x, z) = (ci % self.w, ci / self.w);
-                let n = self.phi_grad(x, z);
-                let d = self.grid_world(x, z).distance(pt);
-                if d < self.dist[ci] {
-                    self.dist[ci] = d;
-                    self.front_pt[ci] = pt;
-                    self.normal[ci] = n;
-                    queue.push_back(ci);
-                }
-            }
-        }
-        self.segments = segs;
-        let limit = ENGAGE_DIST + 2.0 * FIELD_CELL;
-        while let Some(ci) = queue.pop_front() {
-            let (x, z) = (ci % self.w, ci / self.w);
-            let fp = self.front_pt[ci];
-            let n = self.normal[ci];
-            for dz in -1i32..=1 {
-                for dx in -1i32..=1 {
-                    if dx == 0 && dz == 0 {
-                        continue;
-                    }
-                    let nx = x as i32 + dx;
-                    let nz = z as i32 + dz;
-                    if nx < 0 || nz < 0 || nx >= self.w as i32 || nz >= self.h as i32 {
-                        continue;
-                    }
-                    let nci = nz as usize * self.w + nx as usize;
-                    let d = self.grid_world(nx as usize, nz as usize).distance(fp);
-                    if d < self.dist[nci] && d < limit {
-                        self.dist[nci] = d;
-                        self.front_pt[nci] = fp;
-                        self.normal[nci] = n;
-                        queue.push_back(nci);
-                    }
-                }
-            }
-        }
-    }
 }
 
 pub struct FrontlinePlugin;
@@ -270,10 +199,9 @@ fn init_field(mut commands: Commands, terrain: Res<Terrain>) {
 fn update_field(mut field: ResMut<InfluenceField>, units: Res<Units>) {
     field.rebuild_density(&units);
     field.extract_contour();
-    field.propagate_front();
 }
 
-/// Refresh group centroids, engagement, and stance depth.
+/// Refresh group centroids and contact flags (bookkeeping only).
 fn update_groups(units: Res<Units>, mut groups: ResMut<Groups>, field: Res<InfluenceField>) {
     let n = groups.list.len();
     let mut sums = vec![Vec2::ZERO; n];
@@ -290,12 +218,7 @@ fn update_groups(units: Res<Units>, mut groups: ResMut<Groups>, field: Res<Influ
             continue;
         }
         group.centroid = sums[g] / counts[g] as f32;
-        group.engaged = field.dist[field.cell_index(group.centroid)] < ENGAGE_DIST;
-        let rows = match group.stance {
-            Stance::Hold => 10.0,
-            Stance::Column => 50.0,
-        };
-        group.max_depth = rows * SLOT_SPACING * 1.5;
+        group.engaged = field.density(1 - group.team, group.centroid) > ENGAGED_T;
     }
 }
 
@@ -323,6 +246,7 @@ fn test_front_script(
     mut selection: ResMut<crate::orders::Selection>,
     mut stage: Local<u32>,
     mut next_reorder: Local<f32>,
+    mut watch: Local<Option<(u32, Vec2)>>,
 ) {
     if std::env::var("FL_TEST_FRONT").is_err() {
         return;
@@ -340,7 +264,10 @@ fn test_front_script(
             sums[tm] += Vec2::new(units.pos[i].x, units.pos[i].z);
             counts[tm] += 1;
         }
-        for group in &mut groups.list {
+        for (g, group) in groups.list.iter_mut().enumerate() {
+            if watch.is_some_and(|(w, _)| w as usize == g) {
+                continue; // drift-watch group must stay unordered
+            }
             let enemy = 1 - group.team as usize;
             if group.count > 0 && !group.engaged && counts[enemy] > 0 {
                 group.order = Some(sums[enemy] / counts[enemy] as f32);
@@ -356,7 +283,8 @@ fn test_front_script(
             *stage = 1;
         }
         1 if t > 35.0 => {
-            // Carve a salient force out of the blue rear.
+            // Cut a group right behind the active front, NO order: it must
+            // stand fast (units move only when commanded).
             selection.mask.clear();
             selection.mask.resize(units.len(), false);
             selection.count = 0;
@@ -370,15 +298,26 @@ fn test_front_script(
                 }
             }
             if let Some(g) = crate::orders::split_selection(&mut units, &mut groups, &selection) {
-                groups.list[g as usize].order = Some(Vec2::new(40.0, 120.0));
+                groups.list[g as usize].order = None;
+                *watch = Some((g, groups.list[g as usize].centroid));
                 info!(
-                    "[front-test] salient group {g} ({} units) ordered through the line",
+                    "[front-test] cut group {g} ({} units) near the front, NO order — watching drift",
                     groups.list[g as usize].count
                 );
             }
             selection.mask.fill(false);
             selection.count = 0;
             *stage = 2;
+        }
+        2 if t > 55.0 => {
+            if let Some((g, start)) = *watch {
+                let drift = groups.list[g as usize].centroid.distance(start);
+                info!("[front-test] unordered group {g} drift over 20s: {drift:.2} m");
+                // Now push it through the line as a salient.
+                groups.list[g as usize].order = Some(Vec2::new(40.0, 120.0));
+                info!("[front-test] salient group {g} ordered through the line");
+            }
+            *stage = 3;
         }
         _ => {}
     }
