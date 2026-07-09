@@ -7,6 +7,7 @@ use bevy::render::diagnostic::RenderDiagnosticsPlugin;
 use crate::combat::CombatStats;
 use crate::movement::SimStats;
 use crate::orders::{Groups, Selection};
+use crate::render_units::RenderCounts;
 use crate::units::Units;
 
 #[derive(Component)]
@@ -43,6 +44,7 @@ fn spawn_overlay(mut commands: Commands) {
     ));
 }
 
+#[allow(clippy::too_many_arguments)] // bevy system params
 fn update_overlay(
     diagnostics: Res<DiagnosticsStore>,
     units: Res<Units>,
@@ -50,6 +52,7 @@ fn update_overlay(
     groups: Res<Groups>,
     selection: Res<Selection>,
     combat: Res<CombatStats>,
+    render_counts: Res<RenderCounts>,
     mut query: Query<&mut Text, With<OverlayText>>,
     time: Res<Time>,
     mut log_timer: Local<f32>,
@@ -65,8 +68,9 @@ fn update_overlay(
 
     for mut text in &mut query {
         text.0 = format!(
-            "{fps:>5.0} fps  {frame_ms:.2} ms\n{} units, 1 unit draw call\nsim tick: grid {:.2} ms, step {:.2} ms\n{} groups ({} engaged), {} selected\nblue {} ({} lost)  orange {} ({} lost)",
+            "{fps:>5.0} fps  {frame_ms:.2} ms\n{} units, drawn {} (frustum culled)\nsim tick: grid {:.2} ms, step {:.2} ms\n{} groups ({} engaged), {} selected\nblue {} ({} lost)  orange {} ({} lost)",
             units.len(),
+            render_counts.drawn,
             stats.grid_ms,
             stats.step_ms,
             groups.list.len(),
@@ -94,10 +98,11 @@ fn update_overlay(
         );
         for diag in diagnostics.iter() {
             let path = diag.path().as_str();
-            if path.starts_with("render/") && path.ends_with("elapsed_gpu") {
-                if let Some(v) = diag.smoothed() {
-                    info!("  gpu {path}: {v:.2} ms");
-                }
+            if path.starts_with("render/")
+                && path.ends_with("elapsed_gpu")
+                && let Some(v) = diag.smoothed()
+            {
+                info!("  gpu {path}: {v:.2} ms");
             }
         }
     }

@@ -84,6 +84,7 @@ impl Plugin for MovementPlugin {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // bevy system params
 pub fn step_sim(
     mut units: ResMut<Units>,
     mut grid: ResMut<SpatialGrid>,
@@ -113,7 +114,10 @@ pub fn step_sim(
     std::mem::swap(pos, pos_prev);
 
     let t0 = Instant::now();
-    grid.rebuild(pos_prev);
+    {
+        let _span = info_span!("grid_rebuild").entered();
+        grid.rebuild(pos_prev);
+    }
     let t1 = Instant::now();
     stats.grid_ms = (t1 - t0).as_secs_f32() * 1000.0;
 
@@ -130,6 +134,7 @@ pub fn step_sim(
 
     let dps = tuning.dps;
     let tick_seed = tick.wrapping_mul(0x9E37_79B1);
+    let integrate_span = info_span!("integrate").entered();
     ComputeTaskPool::get().scope(|scope| {
         for (ci, ((p_chunk, v_chunk), hp_chunk)) in pos
             .chunks_mut(CHUNK)
@@ -249,11 +254,13 @@ pub fn step_sim(
             });
         }
     });
+    drop(integrate_span);
     stats.step_ms = t1.elapsed().as_secs_f32() * 1000.0;
 
     // Overlap audit over the full population, every 60 ticks (~2 s).
     *tick = tick.wrapping_add(1);
-    if *tick % 60 == 0 {
+    if (*tick).is_multiple_of(60) {
+        let _span = info_span!("nn_audit").entered();
         let mut min_d2 = f32::MAX;
         let mut sum_d = 0.0f64;
         let mut counted = 0u64;

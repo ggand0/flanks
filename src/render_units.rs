@@ -11,19 +11,15 @@ use bevy::pbr::{
 use bevy::{
     camera::visibility::NoFrustumCulling,
     core_pipeline::core_3d::Transparent3d,
-    ecs::{
-        query::QueryItem,
-        system::{SystemParamItem, lifetimeless::*},
-    },
+    ecs::system::{SystemParamItem, lifetimeless::*},
     mesh::{MeshVertexBufferLayoutRef, VertexBufferLayout},
     pbr::{
         MeshPipeline, MeshPipelineKey, RenderMeshInstances, SetMeshBindGroup, SetMeshViewBindGroup,
     },
     prelude::*,
     render::{
-        Render, RenderApp, RenderStartup, RenderSystems,
+        Extract, ExtractSchedule, Render, RenderApp, RenderStartup, RenderSystems,
         batching::gpu_preprocessing::BatchedInstanceBuffers,
-        extract_component::{ExtractComponent, ExtractComponentPlugin},
         mesh::{RenderMesh, RenderMeshBufferInfo, allocator::MeshAllocator},
         render_asset::RenderAssets,
         render_phase::{
@@ -31,16 +27,29 @@ use bevy::{
             RenderCommandResult, SetItemPipeline, TrackedRenderPass, ViewSortedRenderPhases,
         },
         render_resource::*,
-        renderer::RenderDevice,
-        sync_component::SyncComponent,
-        sync_world::MainEntity,
+        renderer::{RenderDevice, RenderQueue},
+        sync_component::{SyncComponent, SyncComponentPlugin},
+        sync_world::{MainEntity, RenderEntity},
         view::ExtractedView,
     },
 };
 use bevy::asset::{embedded_asset, load_embedded_asset};
+use bevy::camera::primitives::{Frustum, Sphere};
+use bevy::math::primitives::ViewFrustum;
 use bytemuck::{Pod, Zeroable};
 
 use crate::units::Units;
+
+/// Bounding-sphere radius for per-instance frustum culling: cube diagonal
+/// plus a generous margin so nothing pops inside the screen edge.
+const CULL_RADIUS: f32 = 2.5;
+
+/// Instances drawn this frame after culling (overlay diagnostics).
+#[derive(Resource, Default)]
+pub struct RenderCounts {
+    pub drawn: usize,
+    pub total: usize,
+}
 
 #[derive(Clone, Copy, Pod, Zeroable)]
 #[repr(C)]
@@ -57,13 +66,24 @@ impl SyncComponent for InstanceMaterialData {
     type Target = Self;
 }
 
-impl ExtractComponent for InstanceMaterialData {
-    type QueryData = &'static InstanceMaterialData;
-    type QueryFilter = ();
-    type Out = Self;
+/// Render-world copy of the instance data. Persistent component: the Vec's
+/// allocation is reused every frame (extraction copies into it, no clone).
+#[derive(Component, Default)]
+struct ExtractedInstances(Vec<InstanceData>);
 
-    fn extract_component(item: QueryItem<'_, '_, Self::QueryData>) -> Option<Self> {
-        Some(InstanceMaterialData(item.0.clone()))
+fn extract_instance_data(
+    main_entities: Extract<Query<(&RenderEntity, &InstanceMaterialData)>>,
+    mut extracted: Query<&mut ExtractedInstances>,
+    mut commands: Commands,
+) {
+    for (render_entity, data) in &main_entities {
+        let e = render_entity.id();
+        if let Ok(mut ex) = extracted.get_mut(e) {
+            ex.0.clear();
+            ex.0.extend_from_slice(&data.0);
+        } else {
+            commands.entity(e).insert(ExtractedInstances(data.0.clone()));
+        }
     }
 }
 
@@ -72,10 +92,20 @@ pub struct UnitRenderPlugin;
 impl Plugin for UnitRenderPlugin {
     fn build(&self, app: &mut App) {
         embedded_asset!(app, "shaders/unit_instancing.wgsl");
-        app.add_plugins(ExtractComponentPlugin::<InstanceMaterialData>::default())
+        // Registers the SyncToRenderWorld requirement so instance entities
+        // get a render-world twin (ExtractComponentPlugin used to do this).
+        app.add_plugins(SyncComponentPlugin::<InstanceMaterialData>::default())
+            .init_resource::<RenderCounts>()
             .add_systems(Startup, setup_unit_mesh)
-            .add_systems(Update, sync_instance_data);
+            // Must run after the camera moves: culling builds a FRESH
+            // frustum from this frame's camera transform (the Frustum
+            // component is one frame stale — visible pop while panning).
+            .add_systems(
+                Update,
+                sync_instance_data.after(crate::camera::apply_camera_transform),
+            );
         app.sub_app_mut(RenderApp)
+            .add_systems(ExtractSchedule, extract_instance_data)
             .add_render_command::<Transparent3d, DrawCustom>()
             .init_resource::<SpecializedMeshPipelines<CustomPipeline>>()
             .add_systems(
@@ -94,33 +124,57 @@ impl Plugin for UnitRenderPlugin {
 
 fn setup_unit_mesh(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
     // Slightly taller than wide: reads as a soldier, not a bead.
+    // Instance positions are not the entity's transform; built-in frustum
+    // culling would cull all instances at once, so it stays disabled and
+    // we cull per-instance in sync_instance_data.
     commands.spawn((
         Mesh3d(meshes.add(Cuboid::new(0.62, 0.9, 0.62))),
         InstanceMaterialData::default(),
-        // Instance positions are not the entity's transform; built-in frustum
-        // culling would cull all 100k units at once, so disable it.
         NoFrustumCulling,
     ));
 }
 
-/// Copy the SoA sim state into the per-instance buffer (main world side),
-/// interpolating between the last two fixed ticks. Selected units get a
-/// highlight tint.
+/// Copy the SoA sim state into the instance buffer (main world side):
+/// interpolate between fixed ticks, frustum-cull per instance, tint the
+/// selection. Culling is strictly visibility: a unit is skipped only when
+/// its bounding sphere is outside the camera frustum.
 fn sync_instance_data(
     units: Res<Units>,
     selection: Res<crate::orders::Selection>,
     fixed_time: Res<Time<Fixed>>,
+    camera: Query<(&Projection, &Transform), With<Camera3d>>,
     mut query: Query<&mut InstanceMaterialData>,
+    mut counts: ResMut<RenderCounts>,
+    mut no_cull: Local<Option<bool>>,
 ) {
+    let _span = info_span!("sync_instances").entered();
+    let Ok((projection, cam_tf)) = camera.single() else {
+        return;
+    };
     let Ok(mut data) = query.single_mut() else {
         return;
     };
+    // Fresh frustum from THIS frame's camera state (camera has no parent,
+    // so Transform is authoritative).
+    let clip_from_world = projection.get_clip_from_view() * cam_tf.to_matrix().inverse();
+    let frustum = Frustum(ViewFrustum::from_clip_from_world(&clip_from_world));
+    let cull = !*no_cull.get_or_insert_with(|| std::env::var("FL_NO_CULL").is_ok());
     let alpha = fixed_time.overstep_fraction();
+
+    data.clear();
     const HIGHLIGHT: [f32; 4] = [1.0, 1.0, 0.55, 1.0];
     let has_sel = selection.mask.len() == units.len();
-    data.clear();
-    data.reserve(units.len());
     for i in 0..units.len() {
+        let position = units.pos_prev[i].lerp(units.pos[i], alpha);
+        let sphere = Sphere {
+            center: position.into(),
+            radius: CULL_RADIUS,
+        };
+        // intersect_far = false: skip the far-plane test so distant vistas
+        // keep their units.
+        if cull && !frustum.intersects_sphere(&sphere, false) {
+            continue;
+        }
         let mut color = units.color[i];
         if has_sel && selection.mask[i] {
             for c in 0..3 {
@@ -128,13 +182,16 @@ fn sync_instance_data(
             }
         }
         data.push(InstanceData {
-            position: units.pos_prev[i].lerp(units.pos[i], alpha),
+            position,
             scale: 1.0,
             color,
         });
     }
+    counts.drawn = data.len();
+    counts.total = units.len();
 }
 
+#[allow(clippy::too_many_arguments)] // bevy system params
 fn queue_custom(
     transparent_3d_draw_functions: Res<DrawFunctions<Transparent3d>>,
     custom_pipeline: Res<CustomPipeline>,
@@ -145,7 +202,7 @@ fn queue_custom(
     maybe_batched_instance_buffers: Option<
         Res<BatchedInstanceBuffers<MeshUniform, MeshInputUniform>>,
     >,
-    material_meshes: Query<(Entity, &MainEntity), With<InstanceMaterialData>>,
+    material_meshes: Query<(Entity, &MainEntity), With<ExtractedInstances>>,
     mut transparent_render_phases: ResMut<ViewSortedRenderPhases<Transparent3d>>,
     views: Query<&ExtractedView>,
     view_key_cache: Res<ViewKeyCache>,
@@ -210,23 +267,44 @@ fn queue_custom(
 struct InstanceBuffer {
     buffer: Buffer,
     length: usize,
+    capacity: usize,
 }
 
+/// Persistent GPU buffer per instance entity: written in place each frame,
+/// reallocated (with slack) only on growth past capacity.
 fn prepare_instance_buffers(
     mut commands: Commands,
-    query: Query<(Entity, &InstanceMaterialData)>,
+    mut query: Query<(Entity, &ExtractedInstances, Option<&mut InstanceBuffer>)>,
     render_device: Res<RenderDevice>,
+    queue: Res<RenderQueue>,
 ) {
-    for (entity, instance_data) in &query {
-        let buffer = render_device.create_buffer_with_data(&BufferInitDescriptor {
-            label: Some("unit instance buffer"),
-            contents: bytemuck::cast_slice(instance_data.as_slice()),
-            usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
-        });
-        commands.entity(entity).insert(InstanceBuffer {
-            buffer,
-            length: instance_data.len(),
-        });
+    for (entity, instances, existing) in &mut query {
+        let n = instances.0.len();
+        match existing {
+            Some(mut buf) if buf.capacity >= n => {
+                if n > 0 {
+                    queue.write_buffer(&buf.buffer, 0, bytemuck::cast_slice(&instances.0));
+                }
+                buf.length = n;
+            }
+            _ => {
+                let capacity = (n + n / 2).max(1024);
+                let buffer = render_device.create_buffer(&BufferDescriptor {
+                    label: Some("unit instance buffer"),
+                    size: (capacity * size_of::<InstanceData>()) as u64,
+                    usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                if n > 0 {
+                    queue.write_buffer(&buffer, 0, bytemuck::cast_slice(&instances.0));
+                }
+                commands.entity(entity).insert(InstanceBuffer {
+                    buffer,
+                    length: n,
+                    capacity,
+                });
+            }
+        }
     }
 }
 

@@ -39,6 +39,7 @@ fn process_deaths(
     mut terrain: ResMut<Terrain>,
     mut stats: ResMut<CombatStats>,
 ) {
+    let _span = info_span!("process_deaths").entered();
     if selection.mask.len() != units.len() {
         selection.mask.clear();
         selection.count = 0;
