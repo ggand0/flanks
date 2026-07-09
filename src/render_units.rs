@@ -11,19 +11,15 @@ use bevy::pbr::{
 use bevy::{
     camera::visibility::NoFrustumCulling,
     core_pipeline::core_3d::Transparent3d,
-    ecs::{
-        query::QueryItem,
-        system::{SystemParamItem, lifetimeless::*},
-    },
+    ecs::system::{SystemParamItem, lifetimeless::*},
     mesh::{MeshVertexBufferLayoutRef, VertexBufferLayout},
     pbr::{
         MeshPipeline, MeshPipelineKey, RenderMeshInstances, SetMeshBindGroup, SetMeshViewBindGroup,
     },
     prelude::*,
     render::{
-        Render, RenderApp, RenderStartup, RenderSystems,
+        Extract, ExtractSchedule, Render, RenderApp, RenderStartup, RenderSystems,
         batching::gpu_preprocessing::BatchedInstanceBuffers,
-        extract_component::{ExtractComponent, ExtractComponentPlugin},
         mesh::{RenderMesh, RenderMeshBufferInfo, allocator::MeshAllocator},
         render_asset::RenderAssets,
         render_phase::{
@@ -31,9 +27,9 @@ use bevy::{
             RenderCommandResult, SetItemPipeline, TrackedRenderPass, ViewSortedRenderPhases,
         },
         render_resource::*,
-        renderer::RenderDevice,
-        sync_component::SyncComponent,
-        sync_world::MainEntity,
+        renderer::{RenderDevice, RenderQueue},
+        sync_component::{SyncComponent, SyncComponentPlugin},
+        sync_world::{MainEntity, RenderEntity},
         view::ExtractedView,
     },
 };
@@ -57,13 +53,24 @@ impl SyncComponent for InstanceMaterialData {
     type Target = Self;
 }
 
-impl ExtractComponent for InstanceMaterialData {
-    type QueryData = &'static InstanceMaterialData;
-    type QueryFilter = ();
-    type Out = Self;
+/// Render-world copy of the instance data. Persistent component: the Vec's
+/// allocation is reused every frame (extraction copies into it, no clone).
+#[derive(Component, Default)]
+struct ExtractedInstances(Vec<InstanceData>);
 
-    fn extract_component(item: QueryItem<'_, '_, Self::QueryData>) -> Option<Self> {
-        Some(InstanceMaterialData(item.0.clone()))
+fn extract_instance_data(
+    main_entities: Extract<Query<(&RenderEntity, &InstanceMaterialData)>>,
+    mut extracted: Query<&mut ExtractedInstances>,
+    mut commands: Commands,
+) {
+    for (render_entity, data) in &main_entities {
+        let e = render_entity.id();
+        if let Ok(mut ex) = extracted.get_mut(e) {
+            ex.0.clear();
+            ex.0.extend_from_slice(&data.0);
+        } else {
+            commands.entity(e).insert(ExtractedInstances(data.0.clone()));
+        }
     }
 }
 
@@ -72,10 +79,13 @@ pub struct UnitRenderPlugin;
 impl Plugin for UnitRenderPlugin {
     fn build(&self, app: &mut App) {
         embedded_asset!(app, "shaders/unit_instancing.wgsl");
-        app.add_plugins(ExtractComponentPlugin::<InstanceMaterialData>::default())
+        // Registers the SyncToRenderWorld requirement so instance entities
+        // get a render-world twin (ExtractComponentPlugin used to do this).
+        app.add_plugins(SyncComponentPlugin::<InstanceMaterialData>::default())
             .add_systems(Startup, setup_unit_mesh)
             .add_systems(Update, sync_instance_data);
         app.sub_app_mut(RenderApp)
+            .add_systems(ExtractSchedule, extract_instance_data)
             .add_render_command::<Transparent3d, DrawCustom>()
             .init_resource::<SpecializedMeshPipelines<CustomPipeline>>()
             .add_systems(
@@ -145,7 +155,7 @@ fn queue_custom(
     maybe_batched_instance_buffers: Option<
         Res<BatchedInstanceBuffers<MeshUniform, MeshInputUniform>>,
     >,
-    material_meshes: Query<(Entity, &MainEntity), With<InstanceMaterialData>>,
+    material_meshes: Query<(Entity, &MainEntity), With<ExtractedInstances>>,
     mut transparent_render_phases: ResMut<ViewSortedRenderPhases<Transparent3d>>,
     views: Query<&ExtractedView>,
     view_key_cache: Res<ViewKeyCache>,
@@ -210,23 +220,44 @@ fn queue_custom(
 struct InstanceBuffer {
     buffer: Buffer,
     length: usize,
+    capacity: usize,
 }
 
+/// Persistent GPU buffer per instance entity: written in place each frame,
+/// reallocated (with slack) only on growth past capacity.
 fn prepare_instance_buffers(
     mut commands: Commands,
-    query: Query<(Entity, &InstanceMaterialData)>,
+    mut query: Query<(Entity, &ExtractedInstances, Option<&mut InstanceBuffer>)>,
     render_device: Res<RenderDevice>,
+    queue: Res<RenderQueue>,
 ) {
-    for (entity, instance_data) in &query {
-        let buffer = render_device.create_buffer_with_data(&BufferInitDescriptor {
-            label: Some("unit instance buffer"),
-            contents: bytemuck::cast_slice(instance_data.as_slice()),
-            usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
-        });
-        commands.entity(entity).insert(InstanceBuffer {
-            buffer,
-            length: instance_data.len(),
-        });
+    for (entity, instances, existing) in &mut query {
+        let n = instances.0.len();
+        match existing {
+            Some(mut buf) if buf.capacity >= n => {
+                if n > 0 {
+                    queue.write_buffer(&buf.buffer, 0, bytemuck::cast_slice(&instances.0));
+                }
+                buf.length = n;
+            }
+            _ => {
+                let capacity = (n + n / 2).max(1024);
+                let buffer = render_device.create_buffer(&BufferDescriptor {
+                    label: Some("unit instance buffer"),
+                    size: (capacity * size_of::<InstanceData>()) as u64,
+                    usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                if n > 0 {
+                    queue.write_buffer(&buffer, 0, bytemuck::cast_slice(&instances.0));
+                }
+                commands.entity(entity).insert(InstanceBuffer {
+                    buffer,
+                    length: n,
+                    capacity,
+                });
+            }
+        }
     }
 }
 
