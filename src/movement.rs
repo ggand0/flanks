@@ -35,8 +35,10 @@ const MAX_ACCEL: f32 = 50.0;
 const YAW_RATE: f32 = 10.0;
 /// Positional overlap resolution: fraction of pair overlap corrected per
 /// tick per unit, and the per-tick cap on total correction distance.
-const CORR_GAIN: f32 = 0.5;
-const CORR_MAX: f32 = 0.2;
+/// UNDER-relaxed on purpose: resolving overlap over ~3-4 ticks reads as
+/// bodies settling; resolving it in 1-2 reads as twitching.
+const CORR_GAIN: f32 = 0.3;
+const CORR_MAX: f32 = 0.1;
 /// Units slow down proportionally inside this distance to the target.
 const ARRIVE_RADIUS: f32 = 35.0;
 const CHUNK: usize = 2048;
@@ -364,8 +366,13 @@ pub fn step_sim(
                             }
                         }
                     }
-                    let corr_len2 = corr.length_squared();
-                    if corr_len2 > CORR_MAX * CORR_MAX {
+                    let mut corr_len2 = corr.length_squared();
+                    if corr_len2 < 1e-4 {
+                        // Sub-centimeter corrections are settle noise, not
+                        // overlap: applying them is pure micro-twitch.
+                        corr = Vec2::ZERO;
+                        corr_len2 = 0.0;
+                    } else if corr_len2 > CORR_MAX * CORR_MAX {
                         corr *= CORR_MAX / corr_len2.sqrt();
                     }
                     let push_len = push.length();
@@ -383,21 +390,32 @@ pub fn step_sim(
                     // steering; it bypasses the jam yield on purpose so
                     // front lines stay joined instead of settling at the
                     // separation standoff just outside sword range.
+                    // Close toward the LOCKED swing target when there is
+                    // one — the per-tick nearest enemy flips in a clog and
+                    // flip-flopping the close direction reads as twitch.
                     if !dying && !routed && best_idx != u32::MAX {
-                        let to_enemy = pos_prev[best_idx as usize].xz() - p;
+                        let close_to = if sw_chunk[j] != crate::units::SWING_READY
+                            && (tgt_chunk[j] as usize) < pos_prev.len()
+                        {
+                            tgt_chunk[j]
+                        } else {
+                            best_idx
+                        };
+                        let to_enemy = pos_prev[close_to as usize].xz() - p;
                         let dist = to_enemy.length();
-                        if dist > 1.2 {
+                        if dist > 1.2 && dist < QUERY_RADIUS + 1.0 {
                             let urge = ((dist - 1.2) / 0.8).clamp(0.0, 1.0);
                             desired += to_enemy * (speed[i] * 0.35 * urge / dist);
                         }
                     }
 
                     let v = v_chunk[j].xz();
-                    // Jammed units shove with less authority: the same
-                    // separation impulse that keeps free units apart turns
-                    // into bang-bang oscillation when everyone is wedged.
+                    // Jammed units stop shoving entirely: at full jam the
+                    // crowd is quasi-static and overlap resolution is
+                    // purely positional — force-based separation in a
+                    // wedged mass only produces bang-bang oscillation.
                     let mut accel =
-                        (desired - v) * STEER_GAIN + push * (SEP_STRENGTH * (1.0 - 0.6 * jam));
+                        (desired - v) * STEER_GAIN + push * (SEP_STRENGTH * (1.0 - jam));
                     let a2 = accel.length_squared();
                     if a2 > MAX_ACCEL * MAX_ACCEL {
                         accel *= MAX_ACCEL / a2.sqrt();
@@ -406,7 +424,7 @@ pub fn step_sim(
                     let mut new_v = v + accel * dt;
                     // Viscous damping in the press: bleeds the spring energy
                     // that otherwise ping-pongs between neighbors every tick.
-                    new_v *= 1.0 - 0.25 * jam;
+                    new_v *= 1.0 - 0.4 * jam;
                     let vmax = speed[i] * 1.15; // slight overspeed under crowd pressure
                     let v2 = new_v.length_squared();
                     if v2 > vmax * vmax {
