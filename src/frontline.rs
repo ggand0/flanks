@@ -197,7 +197,11 @@ fn init_field(mut commands: Commands, terrain: Res<Terrain>) {
 }
 
 fn update_field(mut field: ResMut<InfluenceField>, units: Res<Units>) {
-    field.rebuild_density(&units);
+    {
+        let _span = info_span!("density_field").entered();
+        field.rebuild_density(&units);
+    }
+    let _span = info_span!("contour").entered();
     field.extract_contour();
 }
 

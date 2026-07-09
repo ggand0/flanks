@@ -7,6 +7,11 @@ edition = "2024"
 bevy = "0.19"
 bytemuck = { version = "1", features = ["derive"] }
 
+[features]
+# Profiling: `cargo run --profile opt-dev --features tracy`, then attach
+# the Tracy UI. Enables bevy's per-system spans + our manual sim spans.
+tracy = ["bevy/trace_tracy"]
+
 # Bevy-recommended dev profile: fast recompiles for our code, optimized deps.
 [profile.dev]
 opt-level = 1
