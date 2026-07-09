@@ -27,7 +27,11 @@ fn spawn_camera(mut commands: Commands) {
         // Required: the unit renderer issues direct (non-indirect) draws.
         NoIndirectDrawing,
         RtsCamera {
-            focus: Vec3::ZERO,
+            focus: Vec3::new(
+                crate::util::env_or("FL_CAM_X", 0.0),
+                0.0,
+                crate::util::env_or("FL_CAM_Z", 0.0),
+            ),
             yaw: 0.0,
             // Overridable for screenshot-based debugging without input
             // injection (pitch in radians, 0.25..1.45).

@@ -78,6 +78,7 @@ fn process_deaths(
         units.team.swap_remove(i);
         units.kind.swap_remove(i);
         units.yaw.swap_remove(i);
+        units.yaw_prev.swap_remove(i);
         units.group.swap_remove(i);
         units.color.swap_remove(i);
         units.hp.swap_remove(i);

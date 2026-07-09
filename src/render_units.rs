@@ -265,8 +265,18 @@ fn sync_instance_data(
                             color[c] = color[c] * 0.35 + HIGHLIGHT[c] * 0.65;
                         }
                     }
-                    let move_amount =
+                    // Deadband + smoothstep: crowd-jitter velocities must
+                    // not flicker the walk cycle on and off every frame.
+                    let speed_ratio =
                         (units.vel[i].length() / units.speed[i].max(0.01)).clamp(0.0, 1.0);
+                    let t = ((speed_ratio - 0.12) / (0.45 - 0.12)).clamp(0.0, 1.0);
+                    let move_amount = t * t * (3.0 - 2.0 * t);
+                    // Facing interpolates like position (wrap-aware), so
+                    // per-tick yaw updates don't snap at render rates.
+                    let dy = (units.yaw[i] - units.yaw_prev[i] + std::f32::consts::PI)
+                        .rem_euclid(std::f32::consts::TAU)
+                        - std::f32::consts::PI;
+                    let yaw = units.yaw_prev[i] + dy * alpha;
                     // Attack lunge ramps up quadratically over the wind-up
                     // and snaps back on the strike (chunky, readable).
                     let lunge = if units.swing[i] == crate::units::SWING_WINDUP {
@@ -287,7 +297,7 @@ fn sync_instance_data(
                         position,
                         scale: 1.0,
                         color,
-                        anim: [units.yaw[i], move_amount, lunge, fx],
+                        anim: [yaw, move_amount, lunge, fx],
                     });
                 }
             });

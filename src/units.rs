@@ -25,6 +25,8 @@ pub struct Units {
     pub kind: Vec<u8>,
     /// Smoothed facing angle around Y (0 = +Z); sim-owned, render-consumed.
     pub yaw: Vec<f32>,
+    /// Facing at the previous fixed tick; rendering lerps yaw_prev -> yaw.
+    pub yaw_prev: Vec<f32>,
     /// Index into `Groups::list`.
     pub group: Vec<u32>,
     pub hp: Vec<f32>,
@@ -135,7 +137,9 @@ pub fn push_unit(
     units.team.push(team);
     units.kind.push(kind);
     // Face the enemy at spawn (0 = +Z).
-    units.yaw.push(if team == 0 { 0.0 } else { std::f32::consts::PI });
+    let spawn_yaw = if team == 0 { 0.0 } else { std::f32::consts::PI };
+    units.yaw.push(spawn_yaw);
+    units.yaw_prev.push(spawn_yaw);
     units.group.push(group);
     units.hp.push(params.hp);
 

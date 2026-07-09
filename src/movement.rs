@@ -20,9 +20,9 @@ const SEP_STRENGTH: f32 = 60.0;
 const QUERY_RADIUS: f32 = 2.0;
 /// Cap on summed separation push to avoid explosive forces deep in a crowd.
 const SEP_PUSH_MAX: f32 = 2.5;
-/// Below this distance repulsion ramps up hard (cubes are 0.62 wide).
+/// Below this distance overlap is resolved positionally (bodies are
+/// ~0.6 m wide).
 const HARD_RADIUS: f32 = 0.9;
-const HARD_BOOST: f32 = 4.0;
 /// Crowd-density yield: goal drive fades to zero between these two local
 /// density values. Scalar density can't cancel out the way opposing push
 /// vectors do, so this is what stops a goal-seeking crowd from compressing
@@ -78,6 +78,9 @@ pub struct SimStats {
     pub audit_ms: f32,
     /// Landed-swing events this tick (damage apply pass).
     pub events: usize,
+    /// Mean per-tick displacement in meters (audit cadence). The twitch
+    /// metric: a static line should sit near zero, a marching unit ~0.3.
+    pub move_avg: f32,
     /// Smallest nearest-neighbor distance across all units (sampled every
     /// couple of seconds). Cube width is 0.62 — below that means overlap.
     pub nn_min: f32,
@@ -124,6 +127,7 @@ pub fn step_sim(
         team,
         kind,
         yaw,
+        yaw_prev,
         group,
         hp,
         target,
@@ -178,6 +182,7 @@ pub fn step_sim(
             .chunks_mut(CHUNK)
             .zip(vel.chunks_mut(CHUNK))
             .zip(yaw.chunks_mut(CHUNK))
+            .zip(yaw_prev.chunks_mut(CHUNK))
             .zip(target.chunks_mut(CHUNK))
             .zip(swing.chunks_mut(CHUNK))
             .zip(swing_t.chunks_mut(CHUNK))
@@ -186,8 +191,8 @@ pub fn step_sim(
             .zip(&mut damage.0)
             .enumerate()
         {
-            let ((((((((p_chunk, v_chunk), yaw_chunk), tgt_chunk), sw_chunk), swt_chunk),
-                fl_chunk), dt_chunk), events) = chunk;
+            let (((((((((p_chunk, v_chunk), yaw_chunk), yawp_chunk), tgt_chunk), sw_chunk),
+                swt_chunk), fl_chunk), dt_chunk), events) = chunk;
             let start = ci * CHUNK;
             scope.spawn(async move {
                 events.clear();
@@ -289,14 +294,15 @@ pub fn step_sim(
                             let mw = 2.0 * o_mass / (my_mass + o_mass);
                             let len = d2.sqrt();
                             let w = 1.0 - len / SEP_RADIUS;
-                            let mut wk = w * mw;
                             if len < HARD_RADIUS {
-                                wk += (HARD_RADIUS - len) * HARD_BOOST * mw;
-                                // Direct positional resolution of the overlap;
-                                // forces alone respond too slowly.
+                                // Overlap is resolved POSITIONALLY only.
+                                // (There used to be a hard force boost here
+                                // too — two solvers fighting over the same
+                                // overlap made packed crowds oscillate at
+                                // the accel cap: the every-frame twitch.)
                                 corr += d * ((HARD_RADIUS - len) * CORR_GAIN * mw / len);
                             }
-                            push += d * (wk / len);
+                            push += d * (w * mw / len);
                             crowd += w;
                         }
                     });
@@ -366,18 +372,41 @@ pub fn step_sim(
                     if push_len > SEP_PUSH_MAX {
                         push *= SEP_PUSH_MAX / push_len;
                     }
-                    // Yield in dense crowds: goal drive fades out entirely so
-                    // the mass can't keep compressing itself.
-                    desired *= ((CROWD_STOP - crowd) / (CROWD_STOP - CROWD_SLOW)).clamp(0.0, 1.0);
+                    // Yield in dense crowds: goal drive fades out entirely
+                    // so the mass can't keep compressing itself; `jam` (0 =
+                    // free, 1 = packed) also damps the response below.
+                    let jam = ((crowd - CROWD_SLOW) / (CROWD_STOP - CROWD_SLOW)).clamp(0.0, 1.0);
+                    desired *= 1.0 - jam;
+                    // Fighters close the last meter to swing range. Only
+                    // active when an enemy is ALREADY in reach — this is
+                    // combat execution (like the wind-up foot plant), not
+                    // steering; it bypasses the jam yield on purpose so
+                    // front lines stay joined instead of settling at the
+                    // separation standoff just outside sword range.
+                    if !dying && !routed && best_idx != u32::MAX {
+                        let to_enemy = pos_prev[best_idx as usize].xz() - p;
+                        let dist = to_enemy.length();
+                        if dist > 1.2 {
+                            let urge = ((dist - 1.2) / 0.8).clamp(0.0, 1.0);
+                            desired += to_enemy * (speed[i] * 0.35 * urge / dist);
+                        }
+                    }
 
                     let v = v_chunk[j].xz();
-                    let mut accel = (desired - v) * STEER_GAIN + push * SEP_STRENGTH;
+                    // Jammed units shove with less authority: the same
+                    // separation impulse that keeps free units apart turns
+                    // into bang-bang oscillation when everyone is wedged.
+                    let mut accel =
+                        (desired - v) * STEER_GAIN + push * (SEP_STRENGTH * (1.0 - 0.6 * jam));
                     let a2 = accel.length_squared();
                     if a2 > MAX_ACCEL * MAX_ACCEL {
                         accel *= MAX_ACCEL / a2.sqrt();
                     }
 
                     let mut new_v = v + accel * dt;
+                    // Viscous damping in the press: bleeds the spring energy
+                    // that otherwise ping-pongs between neighbors every tick.
+                    new_v *= 1.0 - 0.25 * jam;
                     let vmax = speed[i] * 1.15; // slight overspeed under crowd pressure
                     let v2 = new_v.length_squared();
                     if v2 > vmax * vmax {
@@ -394,13 +423,27 @@ pub fn step_sim(
                         }
                     }
 
-                    // Face the combat target when winding up, else the
-                    // movement direction, turning at YAW_RATE with wrap.
+                    // Facing priority: locked wind-up target > nearest
+                    // enemy in reach > movement direction. Fighters keep
+                    // eyes on the enemy even while the crowd shoves them;
+                    // only routing/unengaged units face their velocity.
+                    // yaw_prev snapshots the pre-update angle so the
+                    // renderer can interpolate (yaw stepped once per tick
+                    // otherwise — visible facing snaps at high fps).
+                    yawp_chunk[j] = yaw_chunk[j];
                     let face_dir = match face_target {
                         Some(t) => t - p,
+                        None if !routed && best_idx != u32::MAX => {
+                            pos_prev[best_idx as usize].xz() - p
+                        }
                         None => new_v,
                     };
-                    if !dying && face_dir.length_squared() > 0.25 {
+                    let min_len2 = if face_target.is_some() || best_idx != u32::MAX {
+                        1e-4 // enemies can be close; still face them
+                    } else {
+                        0.25 // velocity facing ignores micro-drift
+                    };
+                    if !dying && face_dir.length_squared() > min_len2 {
                         let target_yaw = face_dir.x.atan2(face_dir.y);
                         let diff = (target_yaw - yaw_chunk[j] + std::f32::consts::PI)
                             .rem_euclid(std::f32::consts::TAU)
@@ -458,22 +501,26 @@ pub fn step_sim(
         }
     }
 
-    // Overlap audit over the full population, every 60 ticks (~2 s).
-    // Parallel over chunks; each task returns (min_d2, sum_d, counted).
+    // Overlap + movement audit over the full population, every 60 ticks
+    // (~2 s). Parallel over chunks; each task returns
+    // (min_d2, sum_d, counted, sum_displacement).
     *tick = tick.wrapping_add(1);
     if (*tick).is_multiple_of(60) {
         let _span = info_span!("nn_audit").entered();
         let audit_t0 = Instant::now();
-        let partials: Vec<(f32, f64, u64)> = ComputeTaskPool::get().scope(|scope| {
+        let pos_now = &pos[..];
+        let partials: Vec<(f32, f64, u64, f64)> = ComputeTaskPool::get().scope(|scope| {
             for (ci, chunk) in pos_prev.chunks(CHUNK * 8).enumerate() {
                 let start = ci * CHUNK * 8;
                 scope.spawn(async move {
                     let mut min_d2 = f32::MAX;
                     let mut sum_d = 0.0f64;
                     let mut counted = 0u64;
+                    let mut sum_disp = 0.0f64;
                     for (j, p) in chunk.iter().enumerate() {
                         let i = start + j;
                         let p2 = p.xz();
+                        sum_disp += p2.distance(pos_now[i].xz()) as f64;
                         let mut best = f32::MAX;
                         grid.for_each_candidate(p2, SEP_RADIUS, |o| {
                             if o.idx as usize != i {
@@ -486,19 +533,21 @@ pub fn step_sim(
                             counted += 1;
                         }
                     }
-                    (min_d2, sum_d, counted)
+                    (min_d2, sum_d, counted, sum_disp)
                 });
             }
         });
         let min_d2 = partials.iter().fold(f32::MAX, |m, p| m.min(p.0));
         let sum_d: f64 = partials.iter().map(|p| p.1).sum();
         let counted: u64 = partials.iter().map(|p| p.2).sum();
+        let sum_disp: f64 = partials.iter().map(|p| p.3).sum();
         stats.nn_min = min_d2.sqrt();
         stats.nn_avg = if counted > 0 {
             (sum_d / counted as f64) as f32
         } else {
             0.0
         };
+        stats.move_avg = (sum_disp / pos_prev.len().max(1) as f64) as f32;
         stats.audit_ms = audit_t0.elapsed().as_secs_f32() * 1000.0;
     }
 }

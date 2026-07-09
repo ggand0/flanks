@@ -108,7 +108,7 @@ fn update_overlay(
     if *log_timer >= 2.0 {
         *log_timer = 0.0;
         info!(
-            "fps: {fps:.0} ({frame_ms:.2} ms), units: {} (blue {} / orange {}), sim: grid {:.2} step {:.2} field {:.2} audit {:.2} sync {:.2}, hits/tick: {}, drawn: {} [{}], nn min/avg: {:.2}/{:.2}",
+            "fps: {fps:.0} ({frame_ms:.2} ms), units: {} (blue {} / orange {}), sim: grid {:.2} step {:.2} field {:.2} audit {:.2} sync {:.2}, hits/tick: {}, drawn: {} [{}], nn min/avg: {:.2}/{:.2}, move avg: {:.3} m/tick",
             units.len(),
             combat.alive[0],
             combat.alive[1],
@@ -126,7 +126,8 @@ fn update_overlay(
                 .collect::<Vec<_>>()
                 .join("/"),
             stats.nn_min,
-            stats.nn_avg
+            stats.nn_avg,
+            stats.move_avg
         );
         for diag in diagnostics.iter() {
             let path = diag.path().as_str();
