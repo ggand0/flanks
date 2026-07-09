@@ -219,3 +219,6 @@ __marimo__/
 
 # local devlogs (not committed)
 devlogs/
+
+# local scratch (not committed)
+tmp/
