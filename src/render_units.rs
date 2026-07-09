@@ -19,7 +19,7 @@ use bevy::{
     prelude::*,
     render::{
         Extract, ExtractSchedule, Render, RenderApp, RenderStartup, RenderSystems,
-        batching::gpu_preprocessing::BatchedInstanceBuffers,
+        batching::{NoAutomaticBatching, gpu_preprocessing::BatchedInstanceBuffers},
         mesh::{RenderMesh, RenderMeshBufferInfo, allocator::MeshAllocator},
         render_asset::RenderAssets,
         render_phase::{
@@ -49,6 +49,8 @@ const CULL_RADIUS: f32 = 2.5;
 pub struct RenderCounts {
     pub drawn: usize,
     pub total: usize,
+    /// Per-bucket drawn counts (bucket = team today, unit type later).
+    pub bucket_drawn: Vec<usize>,
 }
 
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -61,6 +63,20 @@ pub struct InstanceData {
 
 #[derive(Component, Deref, DerefMut, Default)]
 pub struct InstanceMaterialData(pub Vec<InstanceData>);
+
+/// One instanced draw per bucket. Buckets are keyed by team today; the
+/// unit-type milestone swaps the key to unit type (one mesh per type).
+#[derive(Component)]
+pub struct InstanceBucket(pub usize);
+
+/// Number of instance buckets (== instance entities == draw calls).
+pub const NUM_BUCKETS: usize = 2;
+
+/// Which bucket a unit renders in.
+#[inline]
+fn bucket_of(units: &Units, i: usize) -> usize {
+    units.team[i] as usize
+}
 
 impl SyncComponent for InstanceMaterialData {
     type Target = Self;
@@ -127,11 +143,27 @@ fn setup_unit_mesh(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
     // Instance positions are not the entity's transform; built-in frustum
     // culling would cull all instances at once, so it stays disabled and
     // we cull per-instance in sync_instance_data.
-    commands.spawn((
-        Mesh3d(meshes.add(Cuboid::new(0.62, 0.9, 0.62))),
-        InstanceMaterialData::default(),
-        NoFrustumCulling,
-    ));
+    //
+    // One instance entity per bucket, each with its OWN mesh asset (the
+    // meshes are identical cubes today; per-type meshes plug in here).
+    // Distinct assets also exercise the mesh-allocator slab offsets: both
+    // cubes land in one vertex slab at different base offsets.
+    //
+    // NoAutomaticBatching is REQUIRED, not an optimization toggle: these
+    // entities compare batch-equal (same pipeline, draw function, material
+    // slot), so bevy's sorted-phase batcher merges their phase items and
+    // `SortedRenderPhase::render_range` skips every item after the first —
+    // its draw function never runs and that bucket's units silently vanish
+    // (the "LOD far bucket invisible" bug, devlog 0013).
+    for bucket in 0..NUM_BUCKETS {
+        commands.spawn((
+            Mesh3d(meshes.add(Cuboid::new(0.62, 0.9, 0.62))),
+            InstanceMaterialData::default(),
+            InstanceBucket(bucket),
+            NoFrustumCulling,
+            NoAutomaticBatching,
+        ));
+    }
 }
 
 /// Copy the SoA sim state into the instance buffer (main world side):
@@ -143,7 +175,7 @@ fn sync_instance_data(
     selection: Res<crate::orders::Selection>,
     fixed_time: Res<Time<Fixed>>,
     camera: Query<(&Projection, &Transform), With<Camera3d>>,
-    mut query: Query<&mut InstanceMaterialData>,
+    mut query: Query<(&InstanceBucket, &mut InstanceMaterialData)>,
     mut counts: ResMut<RenderCounts>,
     mut no_cull: Local<Option<bool>>,
 ) {
@@ -151,9 +183,19 @@ fn sync_instance_data(
     let Ok((projection, cam_tf)) = camera.single() else {
         return;
     };
-    let Ok(mut data) = query.single_mut() else {
-        return;
-    };
+    // Bucket id -> instance vec, indexable during the unit sweep.
+    let mut buckets: Vec<(usize, Mut<InstanceMaterialData>)> = query
+        .iter_mut()
+        .map(|(bucket, data)| (bucket.0, data))
+        .collect();
+    if buckets.len() != NUM_BUCKETS {
+        return; // instance entities not spawned yet
+    }
+    buckets.sort_unstable_by_key(|(id, _)| *id);
+    debug_assert!(buckets.iter().enumerate().all(|(i, (id, _))| i == *id));
+    for (_, data) in &mut buckets {
+        data.clear();
+    }
     // Fresh frustum from THIS frame's camera state (camera has no parent,
     // so Transform is authoritative).
     let clip_from_world = projection.get_clip_from_view() * cam_tf.to_matrix().inverse();
@@ -161,7 +203,6 @@ fn sync_instance_data(
     let cull = !*no_cull.get_or_insert_with(|| std::env::var("FL_NO_CULL").is_ok());
     let alpha = fixed_time.overstep_fraction();
 
-    data.clear();
     const HIGHLIGHT: [f32; 4] = [1.0, 1.0, 0.55, 1.0];
     let has_sel = selection.mask.len() == units.len();
     for i in 0..units.len() {
@@ -181,14 +222,18 @@ fn sync_instance_data(
                 color[c] = color[c] * 0.35 + HIGHLIGHT[c] * 0.65;
             }
         }
-        data.push(InstanceData {
+        buckets[bucket_of(&units, i)].1.push(InstanceData {
             position,
             scale: 1.0,
             color,
         });
     }
-    counts.drawn = data.len();
+    counts.drawn = buckets.iter().map(|(_, d)| d.len()).sum();
     counts.total = units.len();
+    counts.bucket_drawn.clear();
+    counts
+        .bucket_drawn
+        .extend(buckets.iter().map(|(_, d)| d.len()));
 }
 
 #[allow(clippy::too_many_arguments)] // bevy system params

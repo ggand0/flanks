@@ -68,9 +68,15 @@ fn update_overlay(
 
     for mut text in &mut query {
         text.0 = format!(
-            "{fps:>5.0} fps  {frame_ms:.2} ms\n{} units, drawn {} (frustum culled)\nsim tick: grid {:.2} ms, step {:.2} ms\n{} groups ({} engaged), {} selected\nblue {} ({} lost)  orange {} ({} lost)",
+            "{fps:>5.0} fps  {frame_ms:.2} ms\n{} units, drawn {} [{}] (frustum culled)\nsim tick: grid {:.2} ms, step {:.2} ms\n{} groups ({} engaged), {} selected\nblue {} ({} lost)  orange {} ({} lost)",
             units.len(),
             render_counts.drawn,
+            render_counts
+                .bucket_drawn
+                .iter()
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join("/"),
             stats.grid_ms,
             stats.step_ms,
             groups.list.len(),
@@ -89,10 +95,17 @@ fn update_overlay(
     if *log_timer >= 2.0 {
         *log_timer = 0.0;
         info!(
-            "fps: {fps:.0} ({frame_ms:.2} ms), units: {} (blue {} / orange {}), nn min/avg: {:.2}/{:.2}",
+            "fps: {fps:.0} ({frame_ms:.2} ms), units: {} (blue {} / orange {}), drawn: {} [{}], nn min/avg: {:.2}/{:.2}",
             units.len(),
             combat.alive[0],
             combat.alive[1],
+            render_counts.drawn,
+            render_counts
+                .bucket_drawn
+                .iter()
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join("/"),
             stats.nn_min,
             stats.nn_avg
         );
