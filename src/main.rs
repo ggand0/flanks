@@ -1,3 +1,4 @@
+mod ai;
 mod camera;
 mod combat;
 mod frontline;
@@ -30,6 +31,7 @@ fn main() {
             terrain::TerrainPlugin,
             units::UnitsPlugin,
             regiments::RegimentsPlugin,
+            ai::AiPlugin,
             movement::MovementPlugin,
             orders::OrdersPlugin,
             frontline::FrontlinePlugin,

@@ -53,6 +53,7 @@ fn update_overlay(
     selection: Res<Selection>,
     combat: Res<CombatStats>,
     render_counts: Res<RenderCounts>,
+    outcome: Res<crate::ai::BattleOutcome>,
     mut query: Query<&mut Text, With<OverlayText>>,
     time: Res<Time>,
     mut log_timer: Local<f32>,
@@ -66,9 +67,15 @@ fn update_overlay(
         .and_then(|d| d.smoothed())
         .unwrap_or(0.0);
 
+    let banner = match outcome.0 {
+        Some(0) => "\n=== VICTORY: the enemy army is broken ===",
+        Some(1) => "\n=== DEFEAT: your army is broken ===",
+        Some(2) => "\n=== MUTUAL DESTRUCTION ===",
+        _ => "",
+    };
     for mut text in &mut query {
         text.0 = format!(
-            "{fps:>5.0} fps  {frame_ms:.2} ms\n{} units, drawn {} [{}] (frustum culled)\nsim tick: grid {:.2} ms, step {:.2} ms, field {:.2} ms, audit {:.2} ms | sync {:.2} ms\n{} groups ({} engaged, {} broken), {} selected\nblue {} ({} lost, {} fled)  orange {} ({} lost, {} fled)",
+            "{fps:>5.0} fps  {frame_ms:.2} ms\n{} units, drawn {} [{}] (frustum culled)\nsim tick: grid {:.2} ms, step {:.2} ms, field {:.2} ms, audit {:.2} ms | sync {:.2} ms\n{} groups ({} engaged, {} broken), {} selected\nblue {} ({} lost, {} fled)  orange {} ({} lost, {} fled){banner}",
             units.len(),
             render_counts.drawn,
             render_counts
