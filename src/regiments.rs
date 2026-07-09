@@ -194,6 +194,7 @@ fn restart_key(
     mut stats: ResMut<crate::combat::CombatStats>,
     mut selection: ResMut<crate::orders::Selection>,
     mut outcome: ResMut<crate::ai::BattleOutcome>,
+    mut corpses: ResMut<crate::render_units::Corpses>,
 ) {
     if !keys.just_pressed(KeyCode::KeyR) {
         return;
@@ -202,6 +203,7 @@ fn restart_key(
     *stats = crate::combat::CombatStats::default();
     *selection = crate::orders::Selection::default();
     outcome.0 = None;
+    corpses.clear();
     do_spawn_battle(&mut units, &terrain, &mut groups);
     info!("battle restarted");
 }

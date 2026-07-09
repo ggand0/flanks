@@ -43,6 +43,11 @@ const CORR_MAX: f32 = 0.1;
 const ARRIVE_RADIUS: f32 = 35.0;
 const CHUNK: usize = 2048;
 
+/// Speed fraction above which a newly started swing counts as a charge.
+const CHARGE_SPEED_FRAC: f32 = 0.6;
+/// Damage multiplier for charging hits (momentum bonus).
+const CHARGE_MULT: f32 = 1.75;
+
 /// Global damage multiplier. FL_COMBAT_SCALE overrides (fast test battles).
 #[derive(Resource)]
 pub struct CombatScale(pub f32);
@@ -313,7 +318,7 @@ pub fn step_sim(
                     // row; damage goes through the chunk event buffer.
                     let mut face_target = None;
                     if !dying {
-                        match sw_chunk[j] {
+                        match sw_chunk[j] & crate::units::SWING_STATE_MASK {
                             crate::units::SWING_WINDUP => {
                                 // Feet planted while winding up.
                                 desired *= 0.25;
@@ -328,10 +333,16 @@ pub fn step_sim(
                                     // or dead target is a whiff.
                                     let jit =
                                         0.85 + 0.3 * crate::units::hash01(tick_seed ^ (i as u32));
+                                    let charge =
+                                        if sw_chunk[j] & crate::units::SWING_CHARGE != 0 {
+                                            CHARGE_MULT
+                                        } else {
+                                            1.0
+                                        };
                                     events.push(DamageEvent {
                                         victim: tgt_chunk[j],
                                         attacker: i as u32,
-                                        dmg: params.damage * combat_scale * jit,
+                                        dmg: params.damage * combat_scale * jit * charge,
                                     });
                                     sw_chunk[j] = crate::units::SWING_RECOVER;
                                     let cjit = 0.75
@@ -360,7 +371,16 @@ pub fn step_sim(
                                 let chosen = if sticky { prev_target } else { best_idx };
                                 if chosen != u32::MAX && !routed {
                                     tgt_chunk[j] = chosen;
-                                    sw_chunk[j] = crate::units::SWING_WINDUP;
+                                    // Arriving at speed = a charging blow:
+                                    // momentum converts to damage + a bigger
+                                    // lunge (render reads the flag).
+                                    let v2 = v_chunk[j].xz().length_squared();
+                                    let cs = speed[i] * CHARGE_SPEED_FRAC;
+                                    sw_chunk[j] = if v2 > cs * cs {
+                                        crate::units::SWING_WINDUP | crate::units::SWING_CHARGE
+                                    } else {
+                                        crate::units::SWING_WINDUP
+                                    };
                                     swt_chunk[j] = params.windup_ticks;
                                 }
                             }

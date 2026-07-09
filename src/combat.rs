@@ -34,11 +34,13 @@ impl Plugin for CombatPlugin {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // bevy system params
 fn process_deaths(
     mut units: ResMut<Units>,
     mut terrain: ResMut<Terrain>,
     mut stats: ResMut<CombatStats>,
     groups: Res<crate::orders::Groups>,
+    mut corpses: ResMut<crate::render_units::Corpses>,
 ) {
     let _span = info_span!("process_deaths").entered();
     let (edge_min, edge_max) = (terrain.min().y + 8.0, terrain.max().y - 8.0);
@@ -63,6 +65,20 @@ fn process_deaths(
         }
         if fled {
             stats.fled[team] += 1;
+        }
+        if dead {
+            // Leave the body where it fell, frozen in its final topple
+            // pose (fx = 2.0 is the shader's fully-dead state). Escaped
+            // units leave nothing.
+            corpses.push(
+                units.kind[i] as usize,
+                crate::render_units::InstanceData {
+                    position: units.pos[i],
+                    scale: 1.0,
+                    color: units.color[i],
+                    anim: [units.yaw[i], 0.0, 0.0, 2.0],
+                },
+            );
         }
         let seed = stats.kills[team] as u32 ^ ((team as u32) << 30);
         if dead && craters.len() < CRATERS_PER_TICK && hash01(seed) < CRATER_CHANCE {

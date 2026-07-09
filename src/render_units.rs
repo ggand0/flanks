@@ -75,6 +75,60 @@ pub struct InstanceMaterialData(pub Vec<InstanceData>);
 #[derive(Component)]
 pub struct InstanceBucket(pub usize);
 
+/// Static instance bucket for fallen soldiers (one per kind). Not part of
+/// the live sync — refreshed only when `Corpses` changes.
+#[derive(Component)]
+pub struct CorpseBucket(pub usize);
+
+/// Per-kind corpse cap (ring-buffered: oldest bodies fade from the field).
+pub const CORPSE_CAP: usize = 25_000;
+
+/// Fallen soldiers left where they died: their final topple pose, frozen.
+/// Fed by the death sweep, drawn as static instance buckets, never
+/// simulated — the battlefield keeps the story of where the lines stood.
+#[derive(Resource, Default)]
+pub struct Corpses {
+    data: [Vec<InstanceData>; crate::unit_types::NUM_KINDS],
+    cursor: [usize; crate::unit_types::NUM_KINDS],
+    dirty: bool,
+}
+
+impl Corpses {
+    pub fn push(&mut self, kind: usize, inst: InstanceData) {
+        let v = &mut self.data[kind];
+        if v.len() < CORPSE_CAP {
+            v.push(inst);
+        } else {
+            v[self.cursor[kind]] = inst;
+            self.cursor[kind] = (self.cursor[kind] + 1) % CORPSE_CAP;
+        }
+        self.dirty = true;
+    }
+
+    pub fn clear(&mut self) {
+        for v in &mut self.data {
+            v.clear();
+        }
+        self.cursor = [0; crate::unit_types::NUM_KINDS];
+        self.dirty = true;
+    }
+}
+
+/// Copy corpse data into the corpse buckets when it changed.
+fn sync_corpses(
+    mut corpses: ResMut<Corpses>,
+    mut query: Query<(&CorpseBucket, &mut InstanceMaterialData)>,
+) {
+    if !corpses.dirty {
+        return;
+    }
+    corpses.dirty = false;
+    for (bucket, mut data) in &mut query {
+        data.0.clear();
+        data.0.extend_from_slice(&corpses.data[bucket.0]);
+    }
+}
+
 /// Number of instance buckets (== instance entities == draw calls).
 pub const NUM_BUCKETS: usize = crate::unit_types::NUM_KINDS;
 
@@ -118,13 +172,17 @@ impl Plugin for UnitRenderPlugin {
         // get a render-world twin (ExtractComponentPlugin used to do this).
         app.add_plugins(SyncComponentPlugin::<InstanceMaterialData>::default())
             .init_resource::<RenderCounts>()
+            .init_resource::<Corpses>()
             .add_systems(Startup, setup_unit_mesh)
             // Must run after the camera moves: culling builds a FRESH
             // frustum from this frame's camera transform (the Frustum
             // component is one frame stale — visible pop while panning).
             .add_systems(
                 Update,
-                sync_instance_data.after(crate::camera::apply_camera_transform),
+                (
+                    sync_instance_data.after(crate::camera::apply_camera_transform),
+                    sync_corpses,
+                ),
             );
         app.sub_app_mut(RenderApp)
             .add_systems(ExtractSchedule, extract_instance_data)
@@ -161,10 +219,19 @@ fn setup_unit_mesh(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
         crate::unit_meshes::build_man_at_arms(),
     ];
     for (bucket, mesh) in kind_meshes.into_iter().enumerate() {
+        let handle = meshes.add(mesh);
         commands.spawn((
-            Mesh3d(meshes.add(mesh)),
+            Mesh3d(handle.clone()),
             InstanceMaterialData::default(),
             InstanceBucket(bucket),
+            NoFrustumCulling,
+            NoAutomaticBatching,
+        ));
+        // Matching corpse bucket: same mesh, static instance list.
+        commands.spawn((
+            Mesh3d(handle),
+            InstanceMaterialData::default(),
+            CorpseBucket(bucket),
             NoFrustumCulling,
             NoAutomaticBatching,
         ));
@@ -279,11 +346,17 @@ fn sync_instance_data(
                     let yaw = units.yaw_prev[i] + dy * alpha;
                     // Attack lunge ramps up quadratically over the wind-up
                     // and snaps back on the strike (chunky, readable).
-                    let lunge = if units.swing[i] == crate::units::SWING_WINDUP {
+                    // Charging blows lunge harder (arm angles saturate in
+                    // the shader; the extra goes into body lean).
+                    let sw = units.swing[i];
+                    let lunge = if sw & crate::units::SWING_STATE_MASK
+                        == crate::units::SWING_WINDUP
+                    {
                         let w = crate::unit_types::TYPES[units.kind[i] as usize].windup_ticks
                             as f32;
                         let t = (w - units.swing_t[i] as f32) / w.max(1.0);
-                        t * t
+                        let amp = if sw & crate::units::SWING_CHARGE != 0 { 1.35 } else { 1.0 };
+                        t * t * amp
                     } else {
                         0.0
                     };

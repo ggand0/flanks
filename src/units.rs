@@ -51,10 +51,14 @@ pub struct Units {
     pub home: Vec<Vec2>,
 }
 
-/// Swing states (the `swing` column).
+/// Swing states (the `swing` column, low bits) + the charge flag bit.
 pub const SWING_READY: u8 = 0;
 pub const SWING_WINDUP: u8 = 1;
 pub const SWING_RECOVER: u8 = 2;
+pub const SWING_STATE_MASK: u8 = 3;
+/// Set when the swing was started at charging speed: bonus damage and a
+/// bigger lunge — momentum matters (cavalry-less charge bonus for now).
+pub const SWING_CHARGE: u8 = 4;
 
 impl Units {
     pub fn len(&self) -> usize {
