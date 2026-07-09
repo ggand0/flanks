@@ -76,8 +76,8 @@ impl Plugin for OrdersPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(Groups {
             list: vec![
-                GroupData::new(0, crate::units::UNITS_PER_TEAM),
-                GroupData::new(1, crate::units::UNITS_PER_TEAM),
+                GroupData::new(0, crate::units::units_per_team()),
+                GroupData::new(1, crate::units::units_per_team()),
             ],
         })
         .init_resource::<Selection>()

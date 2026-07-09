@@ -2,7 +2,18 @@
 
 use bevy::prelude::*;
 
-pub const UNITS_PER_TEAM: usize = 50_000;
+/// Units per team. `FL_UNITS` overrides (e.g. FL_UNITS=100000 -> 200k
+/// total). At 500 spawn columns the formation depth caps out around
+/// 125k/team before rows fall off the terrain edge.
+pub fn units_per_team() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("FL_UNITS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(50_000)
+    })
+}
 
 /// Half the height of a unit cube; units sit on the ground at this Y.
 pub const UNIT_HALF_HEIGHT: f32 = 0.45;
@@ -52,7 +63,6 @@ pub fn hash01(mut x: u32) -> f32 {
 
 fn spawn_armies(mut units: ResMut<Units>, terrain: Res<crate::terrain::Terrain>) {
     const COLS: usize = 500;
-    const ROWS: usize = UNITS_PER_TEAM / COLS;
     const SPACING: f32 = 1.4;
     const GAP: f32 = 60.0; // no-man's land between the two armies
 
@@ -61,34 +71,35 @@ fn spawn_armies(mut units: ResMut<Units>, terrain: Res<crate::terrain::Terrain>)
         Vec3::new(0.90, 0.40, 0.15), // orange
     ];
 
-    let n = UNITS_PER_TEAM * 2;
+    let per_team = units_per_team();
+    let n = per_team * 2;
     units.pos.reserve(n);
     units.team.reserve(n);
     units.color.reserve(n);
 
     for team in 0..2u8 {
         let dir = if team == 0 { -1.0 } else { 1.0 };
-        for row in 0..ROWS {
-            for col in 0..COLS {
-                let i = (team as usize * UNITS_PER_TEAM + row * COLS + col) as u32;
-                let jx = hash01(i.wrapping_mul(3) + 1) - 0.5;
-                let jz = hash01(i.wrapping_mul(3) + 2) - 0.5;
-                let x = (col as f32 - (COLS - 1) as f32 / 2.0) * SPACING + jx * 0.6;
-                let z = dir * (GAP / 2.0 + row as f32 * SPACING) + jz * 0.6;
-                let p = Vec3::new(x, terrain.height_at(x, z) + UNIT_HALF_HEIGHT, z);
-                units.pos.push(p);
-                units.pos_prev.push(p);
-                units.vel.push(Vec3::ZERO);
-                units.speed.push(9.0 * (0.9 + 0.2 * hash01(i.wrapping_mul(7) + 5)));
-                units.team.push(team);
-                units.group.push(team as u32);
-                units.hp.push(100.0);
+        for k in 0..per_team {
+            let row = k / COLS;
+            let col = k % COLS;
+            let i = (team as usize * per_team + k) as u32;
+            let jx = hash01(i.wrapping_mul(3) + 1) - 0.5;
+            let jz = hash01(i.wrapping_mul(3) + 2) - 0.5;
+            let x = (col as f32 - (COLS - 1) as f32 / 2.0) * SPACING + jx * 0.6;
+            let z = dir * (GAP / 2.0 + row as f32 * SPACING) + jz * 0.6;
+            let p = Vec3::new(x, terrain.height_at(x, z) + UNIT_HALF_HEIGHT, z);
+            units.pos.push(p);
+            units.pos_prev.push(p);
+            units.vel.push(Vec3::ZERO);
+            units.speed.push(9.0 * (0.9 + 0.2 * hash01(i.wrapping_mul(7) + 5)));
+            units.team.push(team);
+            units.group.push(team as u32);
+            units.hp.push(100.0);
 
-                // Per-unit tonal variation so a block of 50k doesn't read as a flat texture.
-                let tone = 0.85 + 0.3 * hash01(i.wrapping_mul(3));
-                let c = team_colors[team as usize] * tone;
-                units.color.push([c.x, c.y, c.z, 1.0]);
-            }
+            // Per-unit tonal variation so a block of 50k doesn't read as a flat texture.
+            let tone = 0.85 + 0.3 * hash01(i.wrapping_mul(3));
+            let c = team_colors[team as usize] * tone;
+            units.color.push([c.x, c.y, c.z, 1.0]);
         }
     }
 }
