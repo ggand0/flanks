@@ -28,6 +28,24 @@ pub enum Stance {
     Column,
 }
 
+/// Regiment morale state.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum RegState {
+    Steady,
+    /// Broken: uncontrollable, flees toward its own map edge. `since` is
+    /// the morale-system tick the break happened on (rally timing).
+    Routing { since: u32 },
+    /// Too depleted to ever rally; flees until despawn.
+    Shattered,
+}
+
+impl RegState {
+    #[inline]
+    pub fn is_broken(&self) -> bool {
+        !matches!(self, RegState::Steady)
+    }
+}
+
 pub struct GroupData {
     pub team: u8,
     /// Regiments are homogeneous; index into `unit_types::TYPES`.
@@ -38,14 +56,18 @@ pub struct GroupData {
     /// the order target on arrival.
     pub anchor: Vec2,
     pub count: usize,
-    /// Strength at spawn (casualty fraction for morale, next milestone).
-    #[allow(dead_code)]
+    /// Strength at spawn (casualty fraction for morale).
     pub initial_count: usize,
     /// Currently inert; formation shapes return with rigid formations.
     pub stance: Stance,
     // --- refreshed every fixed tick by the frontline pass ---
     pub centroid: Vec2,
     pub engaged: bool,
+    // --- morale (regiments.rs updates per tick) ---
+    pub morale: f32,
+    pub state: RegState,
+    /// Deaths since the last morale tick (tallied by the damage apply pass).
+    pub recent_deaths: u32,
 }
 
 impl GroupData {
@@ -60,6 +82,9 @@ impl GroupData {
             stance: Stance::Hold,
             centroid: anchor,
             engaged: false,
+            morale: 100.0,
+            state: RegState::Steady,
+            recent_deaths: 0,
         }
     }
 }
@@ -261,12 +286,18 @@ pub fn select_along_line(
 /// from the selection centroid. Shared by the RMB handler, test scripts,
 /// and (later) the AI.
 pub fn order_regiments(groups: &mut Groups, selected: &[usize], target: Vec2) {
+    // Broken regiments are uncontrollable.
+    let selected: Vec<usize> = selected
+        .iter()
+        .copied()
+        .filter(|&g| !groups.list[g].state.is_broken())
+        .collect();
     if selected.is_empty() {
         return;
     }
     let centroid: Vec2 =
         selected.iter().map(|&g| groups.list[g].centroid).sum::<Vec2>() / selected.len() as f32;
-    for &g in selected {
+    for &g in &selected {
         let group = &mut groups.list[g];
         group.order = Some(target + (group.centroid - centroid));
     }

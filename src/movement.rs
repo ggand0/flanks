@@ -113,7 +113,7 @@ pub fn step_sim(
     mut grid: ResMut<SpatialGrid>,
     mut damage: ResMut<DamageBuffers>,
     mut cstats: ResMut<crate::combat::CombatStats>,
-    groups: Res<Groups>,
+    mut groups: ResMut<Groups>,
     terrain: Res<Terrain>,
     scale: Res<CombatScale>,
     time: Res<Time>,
@@ -166,6 +166,8 @@ pub fn step_sim(
     let orders = &orders[..];
     let anchors: Vec<Vec2> = groups.list.iter().map(|g| g.anchor).collect();
     let anchors = &anchors[..];
+    let broken: Vec<bool> = groups.list.iter().map(|g| g.state.is_broken()).collect();
+    let broken = &broken[..];
     let bounds_min = terrain.min() + 4.0;
     let bounds_max = terrain.max() - 4.0;
 
@@ -218,8 +220,19 @@ pub fn step_sim(
                     // blocks, crowd yield stops the shove, combat thins the
                     // block. The "front line" is where that collision is.
                     let gi = group[i] as usize;
+                    let routed = broken[gi];
                     let mut desired = Vec2::ZERO;
-                    if !dying {
+                    if !dying && routed {
+                        // Broken: flee at full speed toward the own map
+                        // edge with a per-unit lateral scatter. Still gets
+                        // hit — pursuit pays.
+                        let flee_z: f32 = if team[i] == 0 { -1.0 } else { 1.0 };
+                        let lat = (crate::units::hash01((i as u32).wrapping_mul(17) + 3) - 0.5)
+                            * 0.7;
+                        let dir = Vec2::new(lat, flee_z).normalize_or_zero();
+                        let slope = terrain.slope_at(p.x, p.y);
+                        desired = dir * speed[i] / (1.0 + 3.0 * slope * slope);
+                    } else if !dying {
                         let holding = orders[gi].is_none();
                         let goal = orders[gi].unwrap_or(anchors[gi]) + home[i];
                         let to_goal = goal - p;
@@ -337,9 +350,11 @@ pub fn step_sim(
                             _ => {
                                 // Ready: pick a target from the scan. Stick
                                 // with the previous one when still in reach
-                                // (duels), else nearest.
+                                // (duels), else nearest. Routing units never
+                                // start attacks (they still defend nothing —
+                                // pursuit is free hits).
                                 let chosen = if sticky { prev_target } else { best_idx };
-                                if chosen != u32::MAX {
+                                if chosen != u32::MAX && !routed {
                                     tgt_chunk[j] = chosen;
                                     sw_chunk[j] = crate::units::SWING_WINDUP;
                                     swt_chunk[j] = params.windup_ticks;
@@ -441,6 +456,7 @@ pub fn step_sim(
                     death_t[v] = DEATH_TICKS;
                     // kills[] counts losses OF that team (overlay semantics).
                     cstats.kills[team[v] as usize] += 1;
+                    groups.list[group[v] as usize].recent_deaths += 1;
                 }
             }
         }

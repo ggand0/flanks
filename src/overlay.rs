@@ -68,7 +68,7 @@ fn update_overlay(
 
     for mut text in &mut query {
         text.0 = format!(
-            "{fps:>5.0} fps  {frame_ms:.2} ms\n{} units, drawn {} [{}] (frustum culled)\nsim tick: grid {:.2} ms, step {:.2} ms, field {:.2} ms, audit {:.2} ms | sync {:.2} ms\n{} groups ({} engaged), {} selected\nblue {} ({} lost)  orange {} ({} lost)",
+            "{fps:>5.0} fps  {frame_ms:.2} ms\n{} units, drawn {} [{}] (frustum culled)\nsim tick: grid {:.2} ms, step {:.2} ms, field {:.2} ms, audit {:.2} ms | sync {:.2} ms\n{} groups ({} engaged, {} broken), {} selected\nblue {} ({} lost, {} fled)  orange {} ({} lost, {} fled)",
             units.len(),
             render_counts.drawn,
             render_counts
@@ -84,11 +84,14 @@ fn update_overlay(
             render_counts.sync_ms,
             groups.list.len(),
             groups.list.iter().filter(|g| g.engaged).count(),
+            groups.list.iter().filter(|g| g.state.is_broken()).count(),
             selection.count_units,
             combat.alive[0],
             combat.kills[0],
+            combat.fled[0],
             combat.alive[1],
             combat.kills[1],
+            combat.fled[1],
         );
     }
 

@@ -182,6 +182,7 @@ const SYNC_CHUNK: usize = 16_384;
 fn sync_instance_data(
     units: Res<Units>,
     selection: Res<crate::orders::Selection>,
+    groups: Res<crate::orders::Groups>,
     fixed_time: Res<Time<Fixed>>,
     camera: Query<(&Projection, &Transform), With<Camera3d>>,
     mut query: Query<(&InstanceBucket, &mut InstanceMaterialData)>,
@@ -213,6 +214,9 @@ fn sync_instance_data(
 
     const HIGHLIGHT: [f32; 4] = [1.0, 1.0, 0.55, 1.0];
     let has_sel = selection.regiments.iter().any(|s| *s);
+    // Broken regiments render desaturated (no extra instance data needed).
+    let broken: Vec<bool> = groups.list.iter().map(|g| g.state.is_broken()).collect();
+    let broken = &broken[..];
 
     // Parallel cull + bucket build into per-chunk scratch, then one memcpy
     // concat per bucket. The scratch vecs keep their allocations across
@@ -244,7 +248,13 @@ fn sync_instance_data(
                         continue;
                     }
                     let mut color = units.color[i];
-                    if has_sel
+                    if broken.get(units.group[i] as usize).copied().unwrap_or(false) {
+                        let gray =
+                            0.299 * color[0] + 0.587 * color[1] + 0.114 * color[2];
+                        for c in color.iter_mut().take(3) {
+                            *c = *c * 0.55 + gray * 0.45;
+                        }
+                    } else if has_sel
                         && selection
                             .regiments
                             .get(units.group[i] as usize)
