@@ -47,12 +47,13 @@ fn process_deaths(
     let mut craters: Vec<(Vec2, f32)> = Vec::new();
     let mut i = 0;
     while i < units.len() {
-        if units.hp[i] > 0.0 {
+        // Kills are counted at the hp<=0 transition (damage apply pass);
+        // the sweep only removes corpses whose death anim has played out.
+        if units.death_t[i] != 1 {
             i += 1;
             continue;
         }
         let team = units.team[i] as usize;
-        stats.kills[team] += 1;
         let seed = stats.kills[team] as u32 ^ ((team as u32) << 30);
         if craters.len() < CRATERS_PER_TICK && hash01(seed) < CRATER_CHANCE {
             craters.push((
@@ -70,6 +71,11 @@ fn process_deaths(
         units.group.swap_remove(i);
         units.color.swap_remove(i);
         units.hp.swap_remove(i);
+        units.target.swap_remove(i);
+        units.swing.swap_remove(i);
+        units.swing_t.swap_remove(i);
+        units.flash.swap_remove(i);
+        units.death_t.swap_remove(i);
         if !selection.mask.is_empty() && selection.mask.swap_remove(i) {
             selection.count -= 1;
         }
@@ -79,7 +85,9 @@ fn process_deaths(
     }
 
     stats.alive = [0, 0];
-    for &t in &units.team {
-        stats.alive[t as usize] += 1;
+    for (&t, &d) in units.team.iter().zip(&units.death_t) {
+        if d == 0 {
+            stats.alive[t as usize] += 1;
+        }
     }
 }

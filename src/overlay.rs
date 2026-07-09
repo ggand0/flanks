@@ -98,7 +98,7 @@ fn update_overlay(
     if *log_timer >= 2.0 {
         *log_timer = 0.0;
         info!(
-            "fps: {fps:.0} ({frame_ms:.2} ms), units: {} (blue {} / orange {}), sim: grid {:.2} step {:.2} field {:.2} audit {:.2} sync {:.2}, drawn: {} [{}], nn min/avg: {:.2}/{:.2}",
+            "fps: {fps:.0} ({frame_ms:.2} ms), units: {} (blue {} / orange {}), sim: grid {:.2} step {:.2} field {:.2} audit {:.2} sync {:.2}, hits/tick: {}, drawn: {} [{}], nn min/avg: {:.2}/{:.2}",
             units.len(),
             combat.alive[0],
             combat.alive[1],
@@ -107,6 +107,7 @@ fn update_overlay(
             stats.field_ms,
             stats.audit_ms,
             render_counts.sync_ms,
+            stats.events,
             render_counts.drawn,
             render_counts
                 .bucket_drawn

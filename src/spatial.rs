@@ -16,13 +16,19 @@ const MAX_DIM: usize = 2048;
 /// Units per parallel rebuild chunk.
 const REBUILD_CHUNK: usize = 32_768;
 
+/// Meta bits carried by each sorted unit.
+pub const META_TEAM: u32 = 1 << 0;
+pub const META_KIND: u32 = 1 << 1;
+pub const META_DYING: u32 = 1 << 2;
+
 /// One unit in grid order: everything a neighbor query needs, in 16 bytes.
 #[derive(Clone, Copy, Default)]
 pub struct SortedUnit {
     pub x: f32,
     pub z: f32,
     pub idx: u32,
-    pub team: u32,
+    /// META_* bit flags (team, kind, dying).
+    pub meta: u32,
 }
 
 impl SortedUnit {
@@ -54,7 +60,7 @@ pub struct SpatialGrid {
 }
 
 impl SpatialGrid {
-    pub fn rebuild(&mut self, positions: &[Vec3], teams: &[u8]) {
+    pub fn rebuild(&mut self, positions: &[Vec3], teams: &[u8], kinds: &[u8], death_t: &[u8]) {
         let n = positions.len();
         if n == 0 {
             self.dims = (0, 0);
@@ -133,12 +139,15 @@ impl SpatialGrid {
                         let c = cell_chunk[j] as usize;
                         let k = hist[c] as usize;
                         hist[c] += 1;
+                        let meta = ((teams[i] as u32) * META_TEAM)
+                            | ((kinds[i] as u32) * META_KIND)
+                            | (((death_t[i] > 0) as u32) * META_DYING);
                         unsafe {
                             *out.0.add(k) = SortedUnit {
                                 x: p.x,
                                 z: p.z,
                                 idx: i as u32,
-                                team: teams[i] as u32,
+                                meta,
                             };
                         }
                     }

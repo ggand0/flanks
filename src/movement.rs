@@ -15,11 +15,9 @@ use crate::units::Units;
 
 const SEP_RADIUS: f32 = 1.4;
 const SEP_STRENGTH: f32 = 60.0;
-/// Melee reach. Wider than the separation standoff (~1.4 m) so front rows
-/// actually fight across the gap; the grid query widens automatically.
-const MELEE_RANGE: f32 = 1.7;
-/// At most this many attackers hurt one unit per tick.
-const MAX_ATTACKERS: u32 = 4;
+/// Neighbor query radius: must cover both separation and the longest
+/// melee reach in `unit_types::TYPES`.
+const QUERY_RADIUS: f32 = 2.0;
 /// Cap on summed separation push to avoid explosive forces deep in a crowd.
 const SEP_PUSH_MAX: f32 = 2.5;
 /// Below this distance repulsion ramps up hard (cubes are 0.62 wide).
@@ -43,22 +41,37 @@ const CORR_MAX: f32 = 0.2;
 const ARRIVE_RADIUS: f32 = 35.0;
 const CHUNK: usize = 2048;
 
-/// Damage per attacker per second. FL_DPS overrides (fast test battles).
+/// Global damage multiplier. FL_COMBAT_SCALE overrides (fast test battles).
 #[derive(Resource)]
-pub struct CombatTuning {
-    pub dps: f32,
-}
+pub struct CombatScale(pub f32);
 
-impl Default for CombatTuning {
+impl Default for CombatScale {
     fn default() -> Self {
-        Self {
-            dps: std::env::var("FL_DPS")
+        Self(
+            std::env::var("FL_COMBAT_SCALE")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(18.0),
-        }
+                .unwrap_or(1.0),
+        )
     }
 }
+
+/// A landed swing, resolved after the parallel integrate: chunks emit into
+/// their own buffer (no write races), then a serial pass applies damage.
+pub struct DamageEvent {
+    pub victim: u32,
+    pub attacker: u32,
+    pub dmg: f32,
+}
+
+/// One event buffer per integrate chunk; allocations persist across ticks.
+#[derive(Resource, Default)]
+pub struct DamageBuffers(pub Vec<Vec<DamageEvent>>);
+
+/// Ticks a corpse persists (death anim) before swap-removal.
+pub const DEATH_TICKS: u8 = 18;
+/// Ticks of hit flash after taking damage.
+const FLASH_TICKS: u8 = 4;
 
 #[derive(Resource, Default)]
 pub struct SimStats {
@@ -68,6 +81,8 @@ pub struct SimStats {
     pub field_ms: f32,
     /// Last nn_audit sweep cost (runs every ~2 s).
     pub audit_ms: f32,
+    /// Landed-swing events this tick (damage apply pass).
+    pub events: usize,
     /// Smallest nearest-neighbor distance across all units (sampled every
     /// couple of seconds). Cube width is 0.62 — below that means overlap.
     pub nn_min: f32,
@@ -83,7 +98,8 @@ pub struct MovementPlugin;
 impl Plugin for MovementPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<SimStats>()
-            .init_resource::<CombatTuning>()
+            .init_resource::<CombatScale>()
+            .init_resource::<DamageBuffers>()
             .insert_resource(DebugViz(true))
             .init_resource::<SpatialGrid>()
             .add_systems(FixedUpdate, step_sim)
@@ -95,9 +111,11 @@ impl Plugin for MovementPlugin {
 pub fn step_sim(
     mut units: ResMut<Units>,
     mut grid: ResMut<SpatialGrid>,
+    mut damage: ResMut<DamageBuffers>,
+    mut cstats: ResMut<crate::combat::CombatStats>,
     groups: Res<Groups>,
     terrain: Res<Terrain>,
-    tuning: Res<CombatTuning>,
+    scale: Res<CombatScale>,
     time: Res<Time>,
     mut stats: ResMut<SimStats>,
     mut tick: Local<u32>,
@@ -113,6 +131,11 @@ pub fn step_sim(
         yaw,
         group,
         hp,
+        target,
+        swing,
+        swing_t,
+        flash,
+        death_t,
         ..
     } = &mut *units;
     if pos.is_empty() {
@@ -125,7 +148,7 @@ pub fn step_sim(
     let t0 = Instant::now();
     {
         let _span = info_span!("grid_rebuild").entered();
-        grid.rebuild(pos_prev, team);
+        grid.rebuild(pos_prev, team, kind, death_t);
     }
     let t1 = Instant::now();
     stats.grid_ms = (t1 - t0).as_secs_f32() * 1000.0;
@@ -142,22 +165,45 @@ pub fn step_sim(
     let bounds_min = terrain.min() + 4.0;
     let bounds_max = terrain.max() - 4.0;
 
-    let dps = tuning.dps;
+    let combat_scale = scale.0;
+    let n_chunks = pos.len().div_ceil(CHUNK);
+    if damage.0.len() < n_chunks {
+        damage.0.resize_with(n_chunks, Vec::new);
+    }
     let tick_seed = tick.wrapping_mul(0x9E37_79B1);
     let integrate_span = info_span!("integrate").entered();
     ComputeTaskPool::get().scope(|scope| {
-        for (ci, (((p_chunk, v_chunk), hp_chunk), yaw_chunk)) in pos
+        for (ci, chunk) in pos
             .chunks_mut(CHUNK)
             .zip(vel.chunks_mut(CHUNK))
-            .zip(hp.chunks_mut(CHUNK))
             .zip(yaw.chunks_mut(CHUNK))
+            .zip(target.chunks_mut(CHUNK))
+            .zip(swing.chunks_mut(CHUNK))
+            .zip(swing_t.chunks_mut(CHUNK))
+            .zip(flash.chunks_mut(CHUNK))
+            .zip(death_t.chunks_mut(CHUNK))
+            .zip(&mut damage.0)
             .enumerate()
         {
+            let ((((((((p_chunk, v_chunk), yaw_chunk), tgt_chunk), sw_chunk), swt_chunk),
+                fl_chunk), dt_chunk), events) = chunk;
             let start = ci * CHUNK;
             scope.spawn(async move {
+                events.clear();
                 for j in 0..p_chunk.len() {
                     let i = start + j;
                     let p = pos_prev[i].xz();
+                    let my_kind = kind[i] as usize;
+                    let params = &TYPES[my_kind];
+                    let dying = dt_chunk[j] > 0;
+
+                    // Hit flash decays here (set by the serial apply pass).
+                    fl_chunk[j] = fl_chunk[j].saturating_sub(1);
+                    // Corpses play out their death anim: no orders, no
+                    // combat; they stay as an obstacle until swept.
+                    if dying && dt_chunk[j] > 1 {
+                        dt_chunk[j] -= 1;
+                    }
 
                     // Units move ONLY under orders, straight toward the
                     // ordered point. No order = stand fast (separation
@@ -167,7 +213,7 @@ pub fn step_sim(
                     // "front line" is just where that collision happens.
                     let gi = group[i] as usize;
                     let mut desired = Vec2::ZERO;
-                    if let Some(goal) = orders[gi] {
+                    if !dying && let Some(goal) = orders[gi] {
                         let to_goal = goal - p;
                         let dist = to_goal.length();
                         // Slope penalty: steep ground is slow ground.
@@ -180,34 +226,110 @@ pub fn step_sim(
                         }
                     }
 
+                    // Fused neighbor scan: separation physics + nearest
+                    // living enemy in reach (swing targeting). Kept
+                    // branch-light and side-effect-free per candidate —
+                    // the future SIMD kernel depends on that shape.
                     let mut push = Vec2::ZERO;
                     let mut corr = Vec2::ZERO;
                     let mut crowd = 0.0f32;
-                    let mut attackers = 0u32;
-                    let my_team = team[i] as u32;
-                    grid.for_each_candidate(p, MELEE_RANGE, |o| {
+                    let my_team_bit = (team[i] as u32) * crate::spatial::META_TEAM;
+                    let my_mass = params.mass;
+                    let reach2 = params.reach * params.reach;
+                    let prev_target = tgt_chunk[j];
+                    let mut best_d2 = f32::MAX;
+                    let mut best_idx = u32::MAX;
+                    let mut sticky = false;
+                    grid.for_each_candidate(p, QUERY_RADIUS, |o| {
                         if o.idx as usize == i {
                             return;
                         }
                         let d = p - o.xz();
                         let d2 = d.length_squared();
-                        if o.team != my_team && d2 < MELEE_RANGE * MELEE_RANGE {
-                            attackers += 1;
+                        let enemy = (o.meta & crate::spatial::META_TEAM) != my_team_bit
+                            && (o.meta & crate::spatial::META_DYING) == 0;
+                        if enemy && d2 < reach2 {
+                            sticky |= o.idx == prev_target;
+                            if d2 < best_d2 {
+                                best_d2 = d2;
+                                best_idx = o.idx;
+                            }
                         }
                         if d2 < SEP_RADIUS * SEP_RADIUS && d2 > 1e-8 {
+                            // Mass-weighted: heavies shove lights aside.
+                            let o_mass = TYPES[((o.meta & crate::spatial::META_KIND) != 0)
+                                as usize]
+                                .mass;
+                            let mw = 2.0 * o_mass / (my_mass + o_mass);
                             let len = d2.sqrt();
                             let w = 1.0 - len / SEP_RADIUS;
-                            let mut wk = w;
+                            let mut wk = w * mw;
                             if len < HARD_RADIUS {
-                                wk += (HARD_RADIUS - len) * HARD_BOOST;
+                                wk += (HARD_RADIUS - len) * HARD_BOOST * mw;
                                 // Direct positional resolution of the overlap;
                                 // forces alone respond too slowly.
-                                corr += d * ((HARD_RADIUS - len) * CORR_GAIN / len);
+                                corr += d * ((HARD_RADIUS - len) * CORR_GAIN * mw / len);
                             }
                             push += d * (wk / len);
                             crowd += w;
                         }
                     });
+
+                    // Swing state machine. All writes are to this unit's own
+                    // row; damage goes through the chunk event buffer.
+                    let mut face_target = None;
+                    if !dying {
+                        match sw_chunk[j] {
+                            crate::units::SWING_WINDUP => {
+                                // Feet planted while winding up.
+                                desired *= 0.25;
+                                let t = tgt_chunk[j] as usize;
+                                if t < pos_prev.len() {
+                                    face_target = Some(pos_prev[t].xz());
+                                }
+                                if swt_chunk[j] == 0 {
+                                    // Strike lands; validity (still alive,
+                                    // still in reach, still an enemy) is
+                                    // checked in the apply pass — a dodged
+                                    // or dead target is a whiff.
+                                    let jit =
+                                        0.85 + 0.3 * crate::units::hash01(tick_seed ^ (i as u32));
+                                    events.push(DamageEvent {
+                                        victim: tgt_chunk[j],
+                                        attacker: i as u32,
+                                        dmg: params.damage * combat_scale * jit,
+                                    });
+                                    sw_chunk[j] = crate::units::SWING_RECOVER;
+                                    let cjit = 0.75
+                                        + 0.5
+                                            * crate::units::hash01(
+                                                tick_seed ^ (i as u32).wrapping_mul(0x9E37),
+                                            );
+                                    swt_chunk[j] = (params.cooldown_ticks as f32 * cjit) as u8;
+                                } else {
+                                    swt_chunk[j] -= 1;
+                                }
+                            }
+                            crate::units::SWING_RECOVER => {
+                                if swt_chunk[j] == 0 {
+                                    sw_chunk[j] = crate::units::SWING_READY;
+                                } else {
+                                    swt_chunk[j] -= 1;
+                                }
+                            }
+                            _ => {
+                                // Ready: pick a target from the scan. Stick
+                                // with the previous one when still in reach
+                                // (duels), else nearest.
+                                let chosen = if sticky { prev_target } else { best_idx };
+                                if chosen != u32::MAX {
+                                    tgt_chunk[j] = chosen;
+                                    sw_chunk[j] = crate::units::SWING_WINDUP;
+                                    swt_chunk[j] = params.windup_ticks;
+                                }
+                            }
+                        }
+                    }
                     let corr_len2 = corr.length_squared();
                     if corr_len2 > CORR_MAX * CORR_MAX {
                         corr *= CORR_MAX / corr_len2.sqrt();
@@ -244,17 +366,14 @@ pub fn step_sim(
                         }
                     }
 
-                    // Melee: damage received from enemies in reach, small
-                    // per-tick randomization. Gather form — no write races.
-                    if attackers > 0 {
-                        let r = 0.7 + 0.6 * crate::units::hash01(tick_seed ^ (i as u32));
-                        hp_chunk[j] -= attackers.min(MAX_ATTACKERS) as f32 * dps * dt * r;
-                    }
-
-                    // Face the movement direction (combat facing lands with
-                    // the swing kernel), turning at YAW_RATE with wrap.
-                    if new_v.length_squared() > 0.25 {
-                        let target_yaw = new_v.x.atan2(new_v.y);
+                    // Face the combat target when winding up, else the
+                    // movement direction, turning at YAW_RATE with wrap.
+                    let face_dir = match face_target {
+                        Some(t) => t - p,
+                        None => new_v,
+                    };
+                    if !dying && face_dir.length_squared() > 0.25 {
+                        let target_yaw = face_dir.x.atan2(face_dir.y);
                         let diff = (target_yaw - yaw_chunk[j] + std::f32::consts::PI)
                             .rem_euclid(std::f32::consts::TAU)
                             - std::f32::consts::PI;
@@ -277,6 +396,38 @@ pub fn step_sim(
     });
     drop(integrate_span);
     stats.step_ms = t1.elapsed().as_secs_f32() * 1000.0;
+
+    // Serial damage apply: deterministic (chunk order), race-free, and the
+    // single place where hp transitions to death. A swing whiffs when its
+    // victim died mid-wind-up, changed team slot via swap-remove, or slipped
+    // out of reach — checked here, where all columns are whole again.
+    {
+        let _span = info_span!("damage_apply").entered();
+        stats.events = 0;
+        for buf in &mut damage.0 {
+            stats.events += buf.len();
+            for ev in buf.drain(..) {
+                let (v, a) = (ev.victim as usize, ev.attacker as usize);
+                if v >= hp.len() || a >= hp.len() {
+                    continue;
+                }
+                if hp[v] <= 0.0 || death_t[v] > 0 || team[v] == team[a] {
+                    continue;
+                }
+                let reach = TYPES[kind[a] as usize].reach * 1.15;
+                if pos_prev[v].xz().distance_squared(pos_prev[a].xz()) > reach * reach {
+                    continue;
+                }
+                hp[v] -= ev.dmg;
+                flash[v] = FLASH_TICKS;
+                if hp[v] <= 0.0 {
+                    death_t[v] = DEATH_TICKS;
+                    // kills[] counts losses OF that team (overlay semantics).
+                    cstats.kills[team[v] as usize] += 1;
+                }
+            }
+        }
+    }
 
     // Overlap audit over the full population, every 60 ticks (~2 s).
     // Parallel over chunks; each task returns (min_d2, sum_d, counted).

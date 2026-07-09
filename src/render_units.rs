@@ -251,12 +251,27 @@ fn sync_instance_data(
                     }
                     let move_amount =
                         (units.vel[i].length() / units.speed[i].max(0.01)).clamp(0.0, 1.0);
+                    // Attack lunge ramps up quadratically over the wind-up
+                    // and snaps back on the strike (chunky, readable).
+                    let lunge = if units.swing[i] == crate::units::SWING_WINDUP {
+                        let w = crate::unit_types::TYPES[units.kind[i] as usize].windup_ticks
+                            as f32;
+                        let t = (w - units.swing_t[i] as f32) / w.max(1.0);
+                        t * t
+                    } else {
+                        0.0
+                    };
+                    // fx: [0,1) hit flash, [1,2] death progress.
+                    let fx = if units.death_t[i] > 0 {
+                        2.0 - units.death_t[i] as f32 / crate::movement::DEATH_TICKS as f32
+                    } else {
+                        units.flash[i] as f32 * 0.25
+                    };
                     chunk_scratch[bucket_of(units, i)].push(InstanceData {
                         position,
                         scale: 1.0,
                         color,
-                        // lunge / fx wired up with the swing-combat kernel.
-                        anim: [units.yaw[i], move_amount, 0.0, 0.0],
+                        anim: [units.yaw[i], move_amount, lunge, fx],
                     });
                 }
             });
