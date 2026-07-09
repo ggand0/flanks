@@ -39,10 +39,10 @@ impl Plugin for RegimentsPlugin {
 /// ~35% losses alone break a regiment.
 const MORALE_CASUALTY: f32 = 280.0;
 /// Drain per second when locally outnumbered >2:1 (density ratio).
-const MORALE_OUTNUMBERED: f32 = 5.0;
+const MORALE_OUTNUMBERED: f32 = 3.0;
 /// Drain per second per routing friendly regiment within RALLY_R (capped).
-const MORALE_ROUT_NEIGHBOR: f32 = 6.0;
-const MORALE_ROUT_CAP: f32 = 18.0;
+const MORALE_ROUT_NEIGHBOR: f32 = 2.5;
+const MORALE_ROUT_CAP: f32 = 7.5;
 /// Recovery per second when unengaged and undisturbed.
 const MORALE_RECOVERY: f32 = 3.0;
 /// Routing-neighbor / rally-safety radius.
@@ -87,11 +87,18 @@ fn update_morale(
                 // Fresh casualties.
                 drain +=
                     MORALE_CASUALTY * g.recent_deaths as f32 / g.initial_count as f32 * resist;
+                // Psychological pressure scales with DEPLETION: a fresh
+                // regiment shrugs off routing neighbors and bad odds; a
+                // bleeding one panics. Without this, full-strength
+                // regiments cascade-rout off contagion alone.
+                let frac = g.count as f32 / g.initial_count as f32;
+                let depletion = (1.4 - 1.2 * frac).clamp(0.15, 1.4);
                 // Locally outnumbered (blurred density ratio at centroid).
                 let own = field.density(g.team, g.centroid);
                 let enemy = field.density(1 - g.team, g.centroid);
+                let mut pressure = 0.0;
                 if enemy / (own + 0.1) > 2.0 {
-                    drain += MORALE_OUTNUMBERED * resist * dt;
+                    pressure += MORALE_OUTNUMBERED * resist;
                 }
                 // Routing friendlies nearby shake resolve.
                 let rout_drain = routing_centroids
@@ -99,7 +106,8 @@ fn update_morale(
                     .filter(|(t, c)| *t == g.team && c.distance(g.centroid) < NEIGHBOR_R)
                     .count() as f32
                     * MORALE_ROUT_NEIGHBOR;
-                drain += rout_drain.min(MORALE_ROUT_CAP) * dt;
+                pressure += rout_drain.min(MORALE_ROUT_CAP);
+                drain += pressure * depletion * dt;
 
                 if drain > 0.0 {
                     g.morale -= drain;

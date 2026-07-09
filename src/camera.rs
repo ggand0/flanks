@@ -29,8 +29,12 @@ fn spawn_camera(mut commands: Commands) {
         RtsCamera {
             focus: Vec3::ZERO,
             yaw: 0.0,
-            pitch: 0.9,
-            // Overridable for screenshot-based debugging without input injection.
+            // Overridable for screenshot-based debugging without input
+            // injection (pitch in radians, 0.25..1.45).
+            pitch: std::env::var("FL_CAM_PITCH")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.9),
             distance: std::env::var("FL_CAM_DIST")
                 .ok()
                 .and_then(|v| v.parse().ok())

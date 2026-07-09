@@ -457,20 +457,22 @@ impl SpecializedMeshPipeline for CustomPipeline {
             array_stride: size_of::<InstanceData>() as u64,
             step_mode: VertexStepMode::Instance,
             attributes: vec![
+                // Locations 8-10: clear of bevy's mesh attributes
+                // (0 position, 1 normal, 2 uv, 5 vertex color, 6-7 joints).
                 VertexAttribute {
                     format: VertexFormat::Float32x4,
                     offset: 0,
-                    shader_location: 3, // 0-2 are Position, Normal, UV
+                    shader_location: 8,
                 },
                 VertexAttribute {
                     format: VertexFormat::Float32x4,
                     offset: VertexFormat::Float32x4.size(),
-                    shader_location: 4,
+                    shader_location: 9,
                 },
                 VertexAttribute {
                     format: VertexFormat::Float32x4,
                     offset: VertexFormat::Float32x4.size() * 2,
-                    shader_location: 5,
+                    shader_location: 10,
                 },
             ],
         });
