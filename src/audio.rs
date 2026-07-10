@@ -39,6 +39,9 @@ impl Plugin for BattleAudioPlugin {
 struct AudioBank {
     clang: Vec<Handle<AudioSource>>,
     shield: Vec<Handle<AudioSource>>,
+    /// Flesh/armor damage connects (blunt, spear, sword) — mixed into the
+    /// hit pool at low probability so not every hit rings like a bell.
+    damage: Vec<Handle<AudioSource>>,
     death: Vec<Handle<AudioSource>>,
     vox_rout: Vec<Handle<AudioSource>>,
     vox_rally: Vec<Handle<AudioSource>>,
@@ -66,14 +69,23 @@ fn setup_audio(mut commands: Commands, assets: Res<AssetServer>) {
     };
 
     commands.insert_resource(AudioBank {
+        // Owner-preferred second batch (sfx_new/) over the first clangs.
         clang: load_set(&[
-            "sfx_clang_01",
-            "sfx_clang_02",
-            "sfx_clang_03",
-            "sfx_clang_04",
-            "sfx_clang_05",
+            "sfx_new/sword_clang_06",
+            "sfx_new/sword_clang_07",
+            "sfx_new/sword_clang_08",
+            "sfx_new/sword_clang_09",
+            "sfx_new/armor_clang_01",
+            "sfx_new/armor_clang_02",
         ]),
         shield: load_set(&["sfx_shield_01", "sfx_shield_02", "sfx_shield_03"]),
+        damage: load_set(&[
+            "sfx_new/sfx_blunt_damage_01",
+            "sfx_new/sfx_blunt_damage_02",
+            "sfx_new/sfx_spear_damage_01",
+            "sfx_new/sfx_sword_damage_01",
+            "sfx_new/sfx_sword_damage_02",
+        ]),
         death: load_set(&[
             "sfx_death_01",
             "sfx_death_02",
@@ -82,11 +94,16 @@ fn setup_audio(mut commands: Commands, assets: Res<AssetServer>) {
             "sfx_death_05",
         ]),
         vox_rout: load_set(&["vox_rout_01", "vox_rout_02", "vox_rout_03"]),
-        vox_rally: load_set(&["vox_rally_01", "vox_rally_02"]),
-        vox_warcry: Vec::new(),
+        vox_rally: load_set(&[
+            "vox_rally_01",
+            "vox_rally_02",
+            "sfx_new/vox_rally_03",
+            "sfx_new/vox_rally_04_celebrate",
+        ]),
+        vox_warcry: load_set(&["sfx_new/vox_warcry_01", "sfx_new/vox_warcry_02"]),
         horn_charge: load_set(&["sig_horn_charge", "sig_horn_charge_02"]),
-        horn_rout: assets.load("sig_horn_rout_01.mp3"),
-        ui_select: assets.load("ui_select.mp3"),
+        horn_rout: assets.load("sfx_new/sig_horn_rout.mp3"),
+        ui_select: assets.load("sfx_new/ui_select.mp3"),
         sting_victory: assets.load("sting_victory.mp3"),
         sting_defeat: assets.load("sting_defeat.mp3"),
     });
@@ -146,12 +163,18 @@ fn update_beds(
     };
     let hits = (stats.events as f32 / 40.0).clamp(0.0, 1.0);
 
+    // Zoomed out you should hear the DIN of battle, not individual steel:
+    // the close-melee layer fades toward the mid/far beds with distance.
+    let zoom_att = zoom_attenuation(cam.distance);
+
     let m = master();
     let target = |bed: &Bed| -> f32 {
         match bed {
             Bed::Far => 0.22 * ((engaged_total as f32) / 8.0).clamp(0.0, 1.0) * m,
             Bed::Mid => 0.45 * ((engaged_near as f32) / 5.0).clamp(0.0, 1.0) * prox.sqrt() * m,
-            Bed::Close => 0.75 * prox * prox * (0.25 + 0.75 * hits) * m,
+            Bed::Close => {
+                0.60 * prox * prox * (0.25 + 0.75 * hits) * (0.35 + 0.65 * zoom_att) * m
+            }
             Bed::Drums => {
                 if marching_own {
                     0.30 * m
@@ -168,6 +191,14 @@ fn update_beds(
         let v = cur + (target(bed) - cur) * blend;
         sink.set_volume(Volume::Linear(v));
     }
+}
+
+/// Poor-man's proximity: how "inside the battle" the camera is by zoom.
+/// 1.0 at RTS close-up (<= 90 m), fading to a floor when surveying the
+/// whole map. Real per-source spatial audio is a future item; this alone
+/// stops individual clangs/screams from following you to max zoom.
+fn zoom_attenuation(cam_distance: f32) -> f32 {
+    (90.0 / cam_distance.max(90.0)).clamp(0.12, 1.0)
 }
 
 /// Spawn a fire-and-forget one-shot with volume/pitch jitter.
@@ -221,15 +252,22 @@ fn combat_one_shots(
         (1.0 - min_dist / hear).clamp(0.0, 1.0)
     };
 
-    // Clang budget: fraction of actual hits, close-up only.
-    *clang_acc += stats.events as f32 * 30.0 * time.delta_secs() * 0.02 * prox * prox;
+    let zoom_att = zoom_attenuation(cam.distance);
+
+    // Clang budget: fraction of actual hits, close-up only — both the
+    // RATE and the volume fall away as the camera zooms out.
+    *clang_acc +=
+        stats.events as f32 * 30.0 * time.delta_secs() * 0.02 * prox * prox * zoom_att;
     let mut n = (*clang_acc).floor() as u32;
     *clang_acc -= n as f32;
     n = n.min(2); // hard cap per frame
     for k in 0..n {
         let seed = frame.wrapping_mul(31) ^ k;
-        let set = if hash01(seed ^ 0xA5) < 0.3 {
+        let r = hash01(seed ^ 0xA5);
+        let set = if r < 0.2 {
             &bank.shield
+        } else if r < 0.4 {
+            &bank.damage
         } else {
             &bank.clang
         };
@@ -237,26 +275,27 @@ fn combat_one_shots(
             one_shot(
                 &mut commands,
                 h,
-                0.35 + 0.25 * hash01(seed ^ 0x11),
+                (0.16 + 0.10 * hash01(seed ^ 0x11)) * zoom_att,
                 0.92 + 0.16 * hash01(seed ^ 0x22),
             );
         }
     }
 
-    // Death screams: on kill deltas, rate-limited, close-up only.
+    // Death screams: on kill deltas, rate-limited, and strictly a
+    // close-up sound — a scream you can pick out from a hilltop is wrong.
     *death_cooldown -= time.delta_secs();
     let kills: u64 = combat.kills[0] + combat.kills[1];
-    if kills > *prev_kills && *death_cooldown <= 0.0 && prox > 0.2 {
+    if kills > *prev_kills && *death_cooldown <= 0.0 && prox > 0.25 && zoom_att > 0.35 {
         let seed = frame.wrapping_mul(97);
         if let Some(h) = pick(&bank.death, seed) {
             one_shot(
                 &mut commands,
                 h,
-                (0.30 + 0.20 * hash01(seed ^ 0x33)) * prox,
+                (0.18 + 0.12 * hash01(seed ^ 0x33)) * prox * zoom_att,
                 0.9 + 0.2 * hash01(seed ^ 0x44),
             );
         }
-        *death_cooldown = 0.35 + 0.4 * hash01(seed ^ 0x55);
+        *death_cooldown = 0.5 + 0.5 * hash01(seed ^ 0x55);
     }
     *prev_kills = kills;
 }
