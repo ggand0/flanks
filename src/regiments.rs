@@ -61,9 +61,11 @@ pub struct MoraleReadout(pub Vec<MoraleFactors>);
 
 // --- Morale tuning ---
 /// Morale lost per (fraction of initial strength) of fresh casualties:
-/// ~50% losses alone break a light regiment (~83% a heavy at 0.6
-/// resist). Owner pacing: routs were coming too fast at 280.
-const MORALE_CASUALTY: f32 = 200.0;
+/// ~67% losses alone break a light regiment; a heavy (0.6 resist) can
+/// NOT be broken by casualties alone — it holds until flanked or the
+/// line collapses around it. Owner pacing rounds: 280 ("10 s routs")
+/// -> 200 ("routing at 500 men left is shameful") -> 150.
+const MORALE_CASUALTY: f32 = 150.0;
 /// Drain per second when locally outnumbered >3:1 (density ratio).
 /// Deliberately minor — a soldier can't count the battlefield (owner
 /// direction); FLANKS break formations, not headcounts.
