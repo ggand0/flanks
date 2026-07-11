@@ -366,11 +366,12 @@ fn sync_instance_data(
                     // flicker the walk cycle on and off every frame.
                     let step = units.pos[i] - units.pos_prev[i];
                     let disp = Vec2::new(step.x, step.z).length() * inv_dt;
-                    let speed_ratio = (disp / units.speed[i].max(0.01)).clamp(0.0, 1.0);
-                    // Band starts just above crowd jitter (~0.005 ratio):
-                    // slow press shoves (0.2-0.7 m/s) must animate, they
-                    // read as ice-skating otherwise.
-                    let t = ((speed_ratio - 0.03) / (0.35 - 0.03)).clamp(0.0, 1.0);
+                    // ABSOLUTE band (m/s), not per-kind speed ratio: press
+                    // shoves are 0.2-0.7 m/s regardless of kind, and a
+                    // ratio band gave fast lights a higher slide threshold
+                    // than heavies. Floor sits above crowd jitter
+                    // (~0.03 m/s); full stride by ~3 m/s.
+                    let t = ((disp - 0.2) / (3.0 - 0.2)).clamp(0.0, 1.0);
                     let move_amount = t * t * (3.0 - 2.0 * t);
                     // Facing interpolates like position (wrap-aware), so
                     // per-tick yaw updates don't snap at render rates.
