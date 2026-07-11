@@ -20,8 +20,9 @@ pub const FIELD_CELL: f32 = 8.0;
 /// the drawn line only exists where masses genuinely collide.
 const CONTACT_T: f32 = 0.5;
 /// Attack orders enter the charge phase (war cry, sprint pose) inside
-/// this distance to the target regiment's centroid.
-const CHARGE_RANGE: f32 = 60.0;
+/// this distance to the target regiment's centroid. Pub: the audio war
+/// cry keys off the same range.
+pub const CHARGE_RANGE: f32 = 60.0;
 /// Ticks `engaged` stays on after the last soldier's wind-up — bridges
 /// the recover/ready gaps between swing cycles (~1.5 s at 30 Hz).
 const ENGAGE_HOLD_TICKS: u8 = 45;
