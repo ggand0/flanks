@@ -249,6 +249,7 @@ const SYNC_CHUNK: usize = 16_384;
 fn sync_instance_data(
     units: Res<Units>,
     selection: Res<crate::orders::Selection>,
+    hover: Res<crate::orders::Hover>,
     groups: Res<crate::orders::Groups>,
     fixed_time: Res<Time<Fixed>>,
     camera: Query<(&Projection, &Transform), With<Camera3d>>,
@@ -280,7 +281,10 @@ fn sync_instance_data(
     let alpha = fixed_time.overstep_fraction();
 
     const HIGHLIGHT: [f32; 4] = [1.0, 1.0, 0.55, 1.0];
+    // Attack-preview tint: the enemy regiment a right-click would target.
+    const HOSTILE: [f32; 4] = [1.0, 0.30, 0.22, 1.0];
     let has_sel = selection.regiments.iter().any(|s| *s);
+    let hover_enemy = hover.enemy;
     // Broken regiments render desaturated (no extra instance data needed).
     let broken: Vec<bool> = groups.list.iter().map(|g| g.state.is_broken()).collect();
     let broken = &broken[..];
@@ -348,6 +352,10 @@ fn sync_instance_data(
                     {
                         for c in 0..3 {
                             color[c] = color[c] * 0.35 + HIGHLIGHT[c] * 0.65;
+                        }
+                    } else if hover_enemy == Some(units.group[i]) {
+                        for c in 0..3 {
+                            color[c] = color[c] * 0.45 + HOSTILE[c] * 0.55;
                         }
                     }
                     // Walk amount from ACTUAL per-tick displacement, not

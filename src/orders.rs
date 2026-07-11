@@ -144,10 +144,12 @@ impl Plugin for OrdersPlugin {
         app.init_resource::<Groups>()
             .init_resource::<Selection>()
             .init_resource::<DragLine>()
+            .init_resource::<Hover>()
             .add_systems(
                 Update,
                 (
                     drag_select,
+                    update_hover,
                     issue_order,
                     test_orders_script,
                     draw_order_gizmos,
@@ -338,18 +340,51 @@ pub fn attack_regiments(groups: &mut Groups, selected: &[usize], target: u32) {
     }
 }
 
-/// Enemy regiment under a ground click, if any: nearest live non-player
-/// regiment whose centroid is within the pick radius.
-fn enemy_regiment_at(groups: &Groups, p: Vec2) -> Option<u32> {
+/// Regiment under a ground point, if any: nearest live regiment of the
+/// wanted side whose centroid is within the pick radius.
+fn regiment_at(groups: &Groups, p: Vec2, enemy: bool) -> Option<u32> {
     groups
         .list
         .iter()
         .enumerate()
-        .filter(|(_, g)| g.team != PLAYER_TEAM && g.count > 0)
+        .filter(|(_, g)| (g.team != PLAYER_TEAM) == enemy && g.count > 0)
         .map(|(g, gd)| (g, gd.centroid.distance(p)))
         .filter(|(_, d)| *d < ATTACK_PICK_RADIUS)
         .min_by(|a, b| a.1.total_cmp(&b.1))
         .map(|(g, _)| g as u32)
+}
+
+fn enemy_regiment_at(groups: &Groups, p: Vec2) -> Option<u32> {
+    regiment_at(groups, p, true)
+}
+
+/// Regiments under the cursor this frame. `enemy` doubles as the
+/// attack-order preview: it is what a right-click would target (same
+/// pick logic), so the render tint and the inspect panel key off it.
+#[derive(Resource, Default)]
+pub struct Hover {
+    pub enemy: Option<u32>,
+    pub own: Option<u32>,
+}
+
+fn update_hover(
+    window: Query<&Window, With<PrimaryWindow>>,
+    camera: Query<(&Camera, &GlobalTransform)>,
+    terrain: Res<Terrain>,
+    groups: Res<Groups>,
+    mut hover: ResMut<Hover>,
+) {
+    hover.enemy = None;
+    hover.own = None;
+    let Ok(window) = window.single() else { return };
+    let Ok((camera, cam_tf)) = camera.single() else {
+        return;
+    };
+    let Some(p) = cursor_ground_point(window, camera, cam_tf, &terrain) else {
+        return;
+    };
+    hover.enemy = regiment_at(&groups, p, true);
+    hover.own = regiment_at(&groups, p, false);
 }
 
 fn issue_order(
