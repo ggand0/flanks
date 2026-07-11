@@ -38,8 +38,26 @@ impl Plugin for RegimentsPlugin {
 /// Morale lost per (fraction of initial strength) of fresh casualties:
 /// ~35% losses alone break a regiment.
 const MORALE_CASUALTY: f32 = 280.0;
-/// Drain per second when locally outnumbered >2:1 (density ratio).
-const MORALE_OUTNUMBERED: f32 = 3.0;
+/// Drain per second when locally outnumbered >3:1 (density ratio).
+/// Deliberately minor — a soldier can't count the battlefield (owner
+/// direction); FLANKS break formations, not headcounts.
+const MORALE_OUTNUMBERED: f32 = 1.5;
+/// Peak drain per second when fully surrounded. Scales with how much of
+/// the compass around the regiment holds enemy mass beyond a normal
+/// frontal arc — the dominant psychological factor.
+const MORALE_FLANKED: f32 = 6.0;
+/// Radius of the 8-probe flank ring around the centroid.
+const FLANK_RING_R: f32 = 22.0;
+/// Enemy blurred density at a ring probe below which a sector can't be
+/// hostile regardless of ratio (noise floor).
+const FLANK_T: f32 = 0.6;
+/// A sector is hostile only when enemy density exceeds OWN density by
+/// this factor there — probes landing inside our own block or the
+/// front-line mixing zone must not count (a frontal press ≠ a flank).
+const FLANK_DOMINANCE: f32 = 1.2;
+/// Psychological-pressure damping per steady friendly regiment within
+/// NEIGHBOR_R (up to 3 counted): allies in view stiffen the line.
+const MORALE_SUPPORT: f32 = 0.35;
 /// Drain per second per routing friendly regiment within RALLY_R (capped).
 const MORALE_ROUT_NEIGHBOR: f32 = 2.5;
 const MORALE_ROUT_CAP: f32 = 7.5;
@@ -65,13 +83,20 @@ fn update_morale(
     *tick += 1;
     let dt = time.delta_secs();
 
-    // Snapshot routing centroids for the neighbor drain (state from last
-    // tick is fine — morale contagion is not latency-sensitive).
+    // Snapshot routing/steady centroids for the neighbor terms (state
+    // from last tick is fine — morale contagion is not latency-sensitive).
     let routing_centroids: Vec<(u8, Vec2)> = groups
         .list
         .iter()
         .filter(|g| g.state.is_broken() && g.count > 0)
         .map(|g| (g.team, g.centroid))
+        .collect();
+    let steady_centroids: Vec<(usize, u8, Vec2)> = groups
+        .list
+        .iter()
+        .enumerate()
+        .filter(|(_, g)| !g.state.is_broken() && g.count > 0)
+        .map(|(i, g)| (i, g.team, g.centroid))
         .collect();
 
     for (gi, g) in groups.list.iter_mut().enumerate() {
@@ -93,13 +118,41 @@ fn update_morale(
                 // regiments cascade-rout off contagion alone.
                 let frac = g.count as f32 / g.initial_count as f32;
                 let depletion = (1.4 - 1.2 * frac).clamp(0.15, 1.4);
-                // Locally outnumbered (blurred density ratio at centroid).
+                let mut pressure = 0.0;
+                // Locally outnumbered (blurred density ratio at centroid):
+                // minor and hard to trigger — a clogged line is NOT panic.
                 let own = field.density(g.team, g.centroid);
                 let enemy = field.density(1 - g.team, g.centroid);
-                let mut pressure = 0.0;
-                if enemy / (own + 0.1) > 2.0 {
-                    pressure += MORALE_OUTNUMBERED * resist;
+                if enemy / (own + 0.1) > 3.0 {
+                    pressure += MORALE_OUTNUMBERED;
                 }
+                // Outflanked — the main killer. 8 probes on a ring around
+                // the centroid; a sector is hostile only where enemy mass
+                // DOMINATES own mass (see FLANK_DOMINANCE — absolute
+                // density alone made every line fight read as encircled).
+                // The largest hostile-free arc is the safe side: a full
+                // frontal contact (3 adjacent sectors) scores exactly 0,
+                // a pincer ~0.4, encirclement 1.
+                let mut hostile = [false; 8];
+                for (k, h) in hostile.iter_mut().enumerate() {
+                    let a = k as f32 / 8.0 * std::f32::consts::TAU;
+                    let p = g.centroid + Vec2::new(a.cos(), a.sin()) * FLANK_RING_R;
+                    let e = field.density(1 - g.team, p);
+                    *h = e > FLANK_T && e > field.density(g.team, p) * FLANK_DOMINANCE;
+                }
+                let mut safe_run = 0usize;
+                let mut run = 0usize;
+                for k in 0..16 {
+                    if hostile[k % 8] {
+                        run = 0;
+                    } else {
+                        run += 1;
+                        safe_run = safe_run.max(run);
+                    }
+                }
+                let safe_arc = safe_run.min(8) as f32 * 45.0;
+                let flanked = ((225.0 - safe_arc) / 225.0).clamp(0.0, 1.0);
+                pressure += MORALE_FLANKED * flanked;
                 // Routing friendlies nearby shake resolve.
                 let rout_drain = routing_centroids
                     .iter()
@@ -107,6 +160,17 @@ fn update_morale(
                     .count() as f32
                     * MORALE_ROUT_NEIGHBOR;
                 pressure += rout_drain.min(MORALE_ROUT_CAP);
+                // Steady friends in view stiffen the line; kind resist
+                // (heavies steadier) applies to ALL psychological terms.
+                // Casualties stay undamped — dead men are dead men.
+                let friends = steady_centroids
+                    .iter()
+                    .filter(|(i, t, c)| {
+                        *i != gi && *t == g.team && c.distance(g.centroid) < NEIGHBOR_R
+                    })
+                    .count()
+                    .min(3) as f32;
+                pressure *= resist / (1.0 + MORALE_SUPPORT * friends);
                 drain += pressure * depletion * dt;
 
                 if drain > 0.0 {
@@ -265,10 +329,12 @@ fn do_spawn_battle(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
         }
     }
     let heavies = list.iter().filter(|g| g.kind == KIND_HEAVY).count();
+    let blue = list.iter().filter(|g| g.team == 0).count();
     info!(
-        "spawned {} regiments ({} heavy) x {} units per team ({} total units)",
-        n_regs,
-        heavies / 2,
+        "spawned {} vs {} regiments ({} heavy) x {} units ({} total units)",
+        blue,
+        list.len() - blue,
+        heavies,
         size,
         units.len()
     );
