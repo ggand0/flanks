@@ -23,7 +23,8 @@ pub struct RegimentsPlugin;
 impl Plugin for RegimentsPlugin {
     fn build(&self, app: &mut App) {
         // Terrain resource is created in PreStartup (generate_terrain).
-        app.add_systems(Startup, spawn_battle)
+        app.init_resource::<MoraleReadout>()
+            .add_systems(Startup, spawn_battle)
             .add_systems(Update, (rout_test_log, restart_key))
             .add_systems(
                 FixedUpdate,
@@ -34,10 +35,35 @@ impl Plugin for RegimentsPlugin {
     }
 }
 
+/// Per-regiment morale drain contributions (morale/s, after all
+/// multipliers) from the last tick — feeds the inspect panel so the
+/// player can SEE why a regiment is wavering.
+#[derive(Clone, Copy, Default)]
+pub struct MoraleFactors {
+    /// Casualty drain, smoothed over ~1 s (raw per-tick spikes are
+    /// unreadable).
+    pub casualties: f32,
+    pub outnumbered: f32,
+    pub flanked: f32,
+    /// Raw 0..1 surround fraction behind `flanked`.
+    pub flanked01: f32,
+    pub contagion: f32,
+    /// Steady friendly regiments counted for support (0..=3).
+    pub friends: u32,
+    /// Combined resist/support multiplier applied to psychological terms.
+    pub psych_mult: f32,
+    pub depletion: f32,
+    pub recovering: bool,
+}
+
+#[derive(Resource, Default)]
+pub struct MoraleReadout(pub Vec<MoraleFactors>);
+
 // --- Morale tuning ---
 /// Morale lost per (fraction of initial strength) of fresh casualties:
-/// ~35% losses alone break a regiment.
-const MORALE_CASUALTY: f32 = 280.0;
+/// ~50% losses alone break a light regiment (~83% a heavy at 0.6
+/// resist). Owner pacing: routs were coming too fast at 280.
+const MORALE_CASUALTY: f32 = 200.0;
 /// Drain per second when locally outnumbered >3:1 (density ratio).
 /// Deliberately minor — a soldier can't count the battlefield (owner
 /// direction); FLANKS break formations, not headcounts.
@@ -59,8 +85,8 @@ const FLANK_DOMINANCE: f32 = 1.2;
 /// NEIGHBOR_R (up to 3 counted): allies in view stiffen the line.
 const MORALE_SUPPORT: f32 = 0.35;
 /// Drain per second per routing friendly regiment within RALLY_R (capped).
-const MORALE_ROUT_NEIGHBOR: f32 = 2.5;
-const MORALE_ROUT_CAP: f32 = 7.5;
+const MORALE_ROUT_NEIGHBOR: f32 = 2.0;
+const MORALE_ROUT_CAP: f32 = 6.0;
 /// Recovery per second when unengaged and undisturbed.
 const MORALE_RECOVERY: f32 = 3.0;
 /// Routing-neighbor / rally-safety radius.
@@ -78,10 +104,12 @@ fn update_morale(
     mut groups: ResMut<Groups>,
     field: Res<InfluenceField>,
     time: Res<Time>,
+    mut readout: ResMut<MoraleReadout>,
     mut tick: Local<u32>,
 ) {
     *tick += 1;
     let dt = time.delta_secs();
+    readout.0.resize(groups.list.len(), MoraleFactors::default());
 
     // Snapshot routing/steady centroids for the neighbor terms (state
     // from last tick is fine — morale contagion is not latency-sensitive).
@@ -110,8 +138,9 @@ fn update_morale(
             RegState::Steady => {
                 let mut drain = 0.0;
                 // Fresh casualties.
-                drain +=
+                let casualty_drain =
                     MORALE_CASUALTY * g.recent_deaths as f32 / g.initial_count as f32 * resist;
+                drain += casualty_drain;
                 // Psychological pressure scales with DEPLETION: a fresh
                 // regiment shrugs off routing neighbors and bad odds; a
                 // bleeding one panics. Without this, full-strength
@@ -123,7 +152,8 @@ fn update_morale(
                 // minor and hard to trigger — a clogged line is NOT panic.
                 let own = field.density(g.team, g.centroid);
                 let enemy = field.density(1 - g.team, g.centroid);
-                if enemy / (own + 0.1) > 3.0 {
+                let outnumbered = enemy / (own + 0.1) > 3.0;
+                if outnumbered {
                     pressure += MORALE_OUTNUMBERED;
                 }
                 // Outflanked — the main killer. 8 probes on a ring around
@@ -170,14 +200,32 @@ fn update_morale(
                     })
                     .count()
                     .min(3) as f32;
-                pressure *= resist / (1.0 + MORALE_SUPPORT * friends);
+                let psych_mult = resist / (1.0 + MORALE_SUPPORT * friends);
+                pressure *= psych_mult;
                 drain += pressure * depletion * dt;
 
+                let recovering = drain <= 0.0 && !g.engaged;
                 if drain > 0.0 {
                     g.morale -= drain;
                 } else if !g.engaged {
                     g.morale = (g.morale + MORALE_RECOVERY * dt).min(100.0);
                 }
+
+                // Inspect-panel readout: per-second rates after all
+                // multipliers; casualty rate smoothed over ~1 s.
+                let f = &mut readout.0[gi];
+                let k = (dt / 1.0).min(1.0);
+                let cas_rate = if dt > 0.0 { casualty_drain / dt } else { 0.0 };
+                f.casualties += (cas_rate - f.casualties) * k;
+                let m = psych_mult * depletion;
+                f.outnumbered = if outnumbered { MORALE_OUTNUMBERED * m } else { 0.0 };
+                f.flanked = MORALE_FLANKED * flanked * m;
+                f.flanked01 = flanked;
+                f.contagion = rout_drain.min(MORALE_ROUT_CAP) * m;
+                f.friends = friends as u32;
+                f.psych_mult = psych_mult;
+                f.depletion = depletion;
+                f.recovering = recovering;
                 if g.morale <= 0.0 {
                     g.state = RegState::Routing { since: *tick };
                     g.order = None;
@@ -185,6 +233,7 @@ fn update_morale(
                 }
             }
             RegState::Routing { since } => {
+                readout.0[gi] = MoraleFactors::default();
                 if (g.count as f32) < g.initial_count as f32 * SHATTER_FRAC {
                     g.state = RegState::Shattered;
                     info!("regiment {gi} shatters");
@@ -200,7 +249,9 @@ fn update_morale(
                     }
                 }
             }
-            RegState::Shattered => {}
+            RegState::Shattered => {
+                readout.0[gi] = MoraleFactors::default();
+            }
         }
         g.recent_deaths = 0;
     }
