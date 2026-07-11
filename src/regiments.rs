@@ -287,7 +287,7 @@ fn spawn_rout_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
         let anchor = Vec2::new(x, z);
         spawn_regiment(units, terrain, &mut list, 1, KIND_LIGHT, anchor, 1000, 1.0);
         let g = list.len() - 1;
-        list[g].order = Some(Vec2::new(tx, blue.y));
+        list[g].order = Some(crate::orders::Order::Move(Vec2::new(tx, blue.y)));
     }
     groups.list = list;
     info!("[rout-test] 1 blue vs 3 converging orange regiments");

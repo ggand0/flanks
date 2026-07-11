@@ -168,7 +168,9 @@ pub fn step_sim(
     let kind = &kind[..];
     let group = &group[..];
     let home = &home[..];
-    let orders: Vec<Option<Vec2>> = groups.list.iter().map(|g| g.order).collect();
+    // Orders resolved to this tick's destination (attack orders chase
+    // their target regiment's current centroid).
+    let orders: Vec<Option<Vec2>> = (0..groups.list.len()).map(|g| groups.goal(g)).collect();
     let orders = &orders[..];
     let anchors: Vec<Vec2> = groups.list.iter().map(|g| g.anchor).collect();
     let anchors = &anchors[..];

@@ -284,6 +284,23 @@ fn sync_instance_data(
     // Broken regiments render desaturated (no extra instance data needed).
     let broken: Vec<bool> = groups.list.iter().map(|g| g.state.is_broken()).collect();
     let broken = &broken[..];
+    // Battle stance (negative lunge band): 0.5 = blade leveled (engaged,
+    // or hunting under an attack order), 1.0 = charging (adds the sprint
+    // lean/stride). Plain moves carry the blade lowered.
+    let stance: Vec<f32> = groups
+        .list
+        .iter()
+        .map(|g| {
+            if g.charging {
+                1.0
+            } else if g.engaged || matches!(g.order, Some(crate::orders::Order::Attack(_))) {
+                0.5
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    let stance = &stance[..];
 
     // Parallel cull + bucket build into per-chunk scratch, then one memcpy
     // concat per bucket. The scratch vecs keep their allocations across
@@ -355,8 +372,16 @@ fn sync_instance_data(
                         let w = crate::unit_types::TYPES[units.kind[i] as usize].windup_ticks
                             as f32;
                         let t = (w - units.swing_t[i] as f32) / w.max(1.0);
-                        let amp = if sw & crate::units::SWING_CHARGE != 0 { 1.35 } else { 1.0 };
-                        t * t * amp
+                        let charge = sw & crate::units::SWING_CHARGE != 0;
+                        let amp = if charge { 1.35 } else { 1.0 };
+                        // A charging swing raises from the leveled run-in
+                        // point instead of dipping the blade first (0.18
+                        // puts the raise curve at the charge point angle).
+                        if charge { (t * t * amp).max(0.18) } else { t * t * amp }
+                    } else if units.death_t[i] == 0 {
+                        // Negative lunge = battle stance amount, scaled by
+                        // the walk cycle so jammed stragglers don't posture.
+                        -move_amount * stance.get(units.group[i] as usize).copied().unwrap_or(0.0)
                     } else {
                         0.0
                     };

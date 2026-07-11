@@ -14,7 +14,8 @@ struct Vertex {
     @location(8) i_pos_scale: vec4<f32>,
     // rgb = team color, a = stable per-unit anim seed (not opacity).
     @location(9) i_color: vec4<f32>,
-    // x = yaw, y = move amount 0..1, z = lunge 0..1 (wind-up progress),
+    // x = yaw, y = move amount 0..1, z = lunge: 0..1 wind-up progress,
+    // negative = battle-stance amount (-0.5 blade leveled, -1 charging),
     // w = fx: [0,1) hit-flash intensity, [1,2] = 1 + death progress.
     @location(10) i_anim: vec4<f32>,
 };
@@ -46,7 +47,12 @@ fn pitch_normal(n: vec3<f32>, ang: f32) -> vec3<f32> {
 fn vertex(vertex: Vertex) -> VertexOutput {
     let yaw = vertex.i_anim.x;
     let moving = vertex.i_anim.y;
-    let lunge = vertex.i_anim.z;
+    let lunge = max(vertex.i_anim.z, 0.0);
+    // Negative lunge band: 0..0.5 ramps into battle stance (blade
+    // leveled), 0.5..1 adds the charge sprint (lean, stride, bob).
+    let band = max(-vertex.i_anim.z, 0.0);
+    let stance = smoothstep(0.0, 0.5, band);
+    let sprint = smoothstep(0.5, 1.0, band);
     let fx = vertex.i_anim.w;
     let seed = vertex.i_color.a;
     let part = vertex.part_pivot.x;
@@ -59,9 +65,9 @@ fn vertex(vertex: Vertex) -> VertexOutput {
 
     // --- Part animation (rotations around the part pivot) ---
     if part > 1.5 {
-        // Legs: opposite-phase walk swing.
+        // Legs: opposite-phase walk swing, harder stride on the charge.
         let side = select(1.0, -1.0, part > 2.5);
-        let ang = 0.55 * moving * sin(phase) * side;
+        let ang = 0.55 * (1.0 + 0.35 * sprint) * moving * sin(phase) * side;
         local = pitch_about(local, pivot, ang);
         normal = pitch_normal(normal, ang);
     } else if part > 0.5 {
@@ -72,14 +78,18 @@ fn vertex(vertex: Vertex) -> VertexOutput {
         let chop = smoothstep(0.85, 1.0, lunge);
         // Idle/walk sway when not attacking.
         let sway = 0.18 * moving * sin(phase + 3.1415) * (1.0 - raise);
-        let ang = 1.9 * raise - 2.5 * chop + sway;
+        // Ordinary moves carry the blade lowered at the side; battle
+        // stance levels it at the enemy (slightly above horizontal).
+        let carry = mix(-0.55, 0.25, stance) * moving * (1.0 - raise);
+        let ang = 1.9 * raise - 2.5 * chop + sway + carry;
         local = pitch_about(local, pivot, ang);
         normal = pitch_normal(normal, ang);
     }
 
-    // Walk bob + slight forward lean; lunge adds body punch.
-    let bob = 0.05 * moving * sin(phase * 2.0);
-    let lean = (0.10 * moving + 0.30 * lunge) * clamp(local.y + 0.5, 0.0, 1.5);
+    // Walk bob + slight forward lean; lunge adds body punch, charging
+    // adds a sprint lean and a heavier bob.
+    let bob = 0.05 * (1.0 + 0.4 * sprint) * moving * sin(phase * 2.0);
+    let lean = (0.10 * moving + 0.30 * lunge + 0.24 * sprint) * clamp(local.y + 0.5, 0.0, 1.5);
     local.z += lean * 0.3;
 
     // Death: topple forward around the feet and sink slightly.

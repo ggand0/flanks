@@ -177,7 +177,7 @@ pub fn spawn_surround_test(
     terrain: &crate::terrain::Terrain,
     groups: &mut crate::orders::Groups,
 ) {
-    use crate::orders::GroupData;
+    use crate::orders::{GroupData, Order};
     use crate::unit_types::KIND_LIGHT;
     let pocket_c = Vec2::new(-200.0, 0.0);
     let mut seed = 1u32;
@@ -200,7 +200,7 @@ pub fn spawn_surround_test(
         let anchor = pocket_c + Vec2::new(mid.cos(), mid.sin()) * 20.5;
         let g = list.len() as u32;
         let mut gd = GroupData::new(1, KIND_LIGHT, anchor, 500);
-        gd.order = Some(pocket_c);
+        gd.order = Some(Order::Move(pocket_c));
         list.push(gd);
         for _ in 0..500 {
             seed = seed.wrapping_add(1);
@@ -235,7 +235,7 @@ pub fn spawn_surround_test(
     let mut press = GroupData::new(1, KIND_LIGHT, orange_anchor, 2000);
     // Press to CONTACT, not through: the fight must stay frontal (the
     // pocket is the surrounded case; this is the control).
-    press.order = Some(Vec2::new(orange_anchor.x, 13.0));
+    press.order = Some(Order::Move(Vec2::new(orange_anchor.x, 13.0)));
     list.push(press);
     block(units, &mut seed, 1, 6, orange_anchor, 40.0, 2000);
 

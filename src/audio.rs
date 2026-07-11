@@ -45,7 +45,7 @@ struct AudioBank {
     death: Vec<Handle<AudioSource>>,
     vox_rout: Vec<Handle<AudioSource>>,
     vox_rally: Vec<Handle<AudioSource>>,
-    /// Empty until vox_warcry assets exist (see audio-plan retry notes).
+    /// Played once per regiment charge (the latched `charging` state).
     vox_warcry: Vec<Handle<AudioSource>>,
     horn_charge: Vec<Handle<AudioSource>>,
     horn_rout: Handle<AudioSource>,
@@ -300,8 +300,9 @@ fn combat_one_shots(
     *prev_kills = kills;
 }
 
-/// Discrete cues: selection click, charge horn on new orders, war cries on
-/// first contact, rout/rally vox + horn, victory/defeat stings.
+/// Discrete cues: selection click, charge horn on new orders, sustained
+/// war cries while regiments charge home, rout/rally vox + horn,
+/// victory/defeat stings.
 #[allow(clippy::too_many_arguments)] // bevy system params
 fn event_cues(
     mut commands: Commands,
@@ -309,11 +310,11 @@ fn event_cues(
     groups: Res<Groups>,
     selection: Res<Selection>,
     outcome: Res<crate::ai::BattleOutcome>,
+    camera: Query<&RtsCamera>,
     time: Res<Time>,
     mut prev_sel: Local<usize>,
     mut prev_orders: Local<Vec<bool>>,
     mut prev_state: Local<Vec<u8>>,
-    mut prev_engaged: Local<Vec<bool>>,
     mut prev_outcome: Local<bool>,
     mut horn_gate: Local<f32>,
     mut vox_gate: Local<f32>,
@@ -325,7 +326,6 @@ fn event_cues(
     let n = groups.list.len();
     prev_orders.resize(n, false);
     prev_state.resize(n, 0);
-    prev_engaged.resize(n, false);
 
     // Selection click on a changed non-empty selection.
     if selection.count_units > 0 && selection.count_units != *prev_sel {
@@ -337,7 +337,16 @@ fn event_cues(
     let mut new_break_own = false;
     let mut new_break_any = false;
     let mut new_rally = false;
-    let mut new_contact = false;
+    // Nearest charging regiment to the camera focus: the war cry is a
+    // SUSTAINED roar (re-fired on the vox gate) for as long as a charge
+    // is running near you — a single onset clip died seconds before the
+    // impact it was announcing.
+    let mut charge_dist = f32::MAX;
+    let focus = camera
+        .single()
+        .map(|c| Vec2::new(c.focus.x, c.focus.z))
+        .unwrap_or_default();
+    let hear = camera.single().map(|c| 220.0 + c.distance * 0.5).unwrap_or(220.0);
     for (g, gd) in groups.list.iter().enumerate() {
         let has_order = gd.order.is_some();
         if gd.team == 0 && has_order && !prev_orders[g] && !gd.state.is_broken() {
@@ -361,10 +370,9 @@ fn event_cues(
         }
         prev_state[g] = state;
 
-        if gd.engaged && !prev_engaged[g] && gd.count > 0 {
-            new_contact = true;
+        if gd.charging && gd.count > 0 {
+            charge_dist = charge_dist.min(gd.centroid.distance(focus));
         }
-        prev_engaged[g] = gd.engaged;
     }
 
     let seed = frame.wrapping_mul(211);
@@ -389,11 +397,23 @@ fn event_cues(
                 one_shot(&mut commands, h, 0.5, 1.0);
             }
             *vox_gate = 1.5;
-        } else if new_contact {
-            if let Some(h) = pick(&bank.vox_warcry, seed ^ 0x88) {
-                one_shot(&mut commands, h, 0.55, 1.0);
+        } else {
+            // Rolling war cry: one clip per gate window while any charge
+            // runs within earshot, volume by proximity. The ~3 s clips on
+            // a 2.5 s gate overlap into a continuous roar that starts at
+            // the charge latch and dies at contact.
+            let prox = (1.0 - charge_dist / hear).clamp(0.0, 1.0);
+            if prox > 0.05 {
+                if let Some(h) = pick(&bank.vox_warcry, seed ^ 0x88) {
+                    one_shot(
+                        &mut commands,
+                        h,
+                        0.55 * (0.25 + 0.75 * prox),
+                        0.94 + 0.12 * hash01(seed ^ 0x99),
+                    );
+                }
+                *vox_gate = 2.5;
             }
-            *vox_gate = 1.2;
         }
     }
 
