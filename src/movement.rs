@@ -43,6 +43,15 @@ const CORR_MAX: f32 = 0.1;
 const ARRIVE_RADIUS: f32 = 35.0;
 const CHUNK: usize = 2048;
 
+/// Routing units flee at this fraction of their speed: fleeing at
+/// exactly max speed made pursuit a zero-kill treadmill.
+const ROUT_FLEE_FRAC: f32 = 0.9;
+/// Sparse-fight acquisition radius. Two depleted formations interleave
+/// with gaps wider than QUERY_RADIUS and the fight stalls (hits/tick 0
+/// with both sides standing at "the front"). Pressing units whose normal
+/// scan finds no enemy look this far on a staggered 1-in-8-tick cadence
+/// and lock a closing target; swings still require reach.
+const WIDE_ACQUIRE_R: f32 = 4.0;
 /// Speed fraction above which a newly started swing counts as a charge.
 const CHARGE_SPEED_FRAC: f32 = 0.6;
 /// Damage multiplier for charging hits (momentum bonus).
@@ -176,6 +185,15 @@ pub fn step_sim(
     let anchors = &anchors[..];
     let broken: Vec<bool> = groups.list.iter().map(|g| g.state.is_broken()).collect();
     let broken = &broken[..];
+    // Regiments in combat-watch range of an enemy (sparse-fight
+    // acquisition): order type is irrelevant — a Move-order fight that
+    // went sparse stalls exactly the same way.
+    let press: Vec<bool> = groups
+        .list
+        .iter()
+        .map(|g| g.enemy_near || g.engaged)
+        .collect();
+    let press = &press[..];
     let bounds_min = terrain.min() + 4.0;
     let bounds_max = terrain.max() - 4.0;
 
@@ -232,15 +250,17 @@ pub fn step_sim(
                     let routed = broken[gi];
                     let mut desired = Vec2::ZERO;
                     if !dying && routed {
-                        // Broken: flee at full speed toward the own map
-                        // edge with a per-unit lateral scatter. Still gets
-                        // hit — pursuit pays.
+                        // Broken: flee toward the own map edge with a
+                        // per-unit lateral scatter — slightly SLOWER than
+                        // formed pursuers (0.9x): fleeing at exactly max
+                        // speed made pursuit a zero-kill treadmill (gap
+                        // frozen forever, counts flat for 30-45 s).
                         let flee_z: f32 = if team[i] == 0 { -1.0 } else { 1.0 };
                         let lat = (crate::units::hash01((i as u32).wrapping_mul(17) + 3) - 0.5)
                             * 0.7;
                         let dir = Vec2::new(lat, flee_z).normalize_or_zero();
                         let slope = terrain.slope_at(p.x, p.y);
-                        desired = dir * speed[i] / (1.0 + 3.0 * slope * slope);
+                        desired = dir * speed[i] * ROUT_FLEE_FRAC / (1.0 + 3.0 * slope * slope);
                     } else if !dying {
                         let holding = orders[gi].is_none();
                         let goal = orders[gi].unwrap_or(anchors[gi]) + home[i];
@@ -316,15 +336,50 @@ pub fn step_sim(
                         }
                     });
 
+                    // Sparse-fight acquisition (see WIDE_ACQUIRE_R): a
+                    // pressing unit with an empty scan and open space
+                    // around it memoizes a farther enemy in `target` so
+                    // the closing drive below can restore contact. Gated
+                    // hard (press + no near enemy + low crowd + 1/8
+                    // cadence) to stay off the 200k hot path.
+                    if best_idx == u32::MAX
+                        && !dying
+                        && !routed
+                        && press[gi]
+                        && crowd < CROWD_SLOW
+                        && (i as u32).wrapping_add(tick_seed) % 8 == 0
+                    {
+                        let mut far_d2 = WIDE_ACQUIRE_R * WIDE_ACQUIRE_R;
+                        grid.for_each_candidate(p, WIDE_ACQUIRE_R, |o| {
+                            let enemy = (o.meta & crate::spatial::META_TEAM) != my_team_bit
+                                && (o.meta & crate::spatial::META_DYING) == 0;
+                            if enemy {
+                                let d2 = (p - o.xz()).length_squared();
+                                if d2 < far_d2 {
+                                    far_d2 = d2;
+                                    tgt_chunk[j] = o.idx;
+                                }
+                            }
+                        });
+                    }
+
                     // Swing state machine. All writes are to this unit's own
                     // row; damage goes through the chunk event buffer.
                     let mut face_target = None;
                     if !dying {
                         match sw_chunk[j] & crate::units::SWING_STATE_MASK {
                             crate::units::SWING_WINDUP => {
-                                // Feet planted while winding up.
-                                desired *= 0.25;
+                                // Feet planted while winding up — EXCEPT
+                                // against a routing target: the cut-down
+                                // happens at a run, or the runner is 3 m
+                                // gone by the strike tick and every blow
+                                // whiffs (the pursuit treadmill).
                                 let t = tgt_chunk[j] as usize;
+                                let target_routed =
+                                    t < pos_prev.len() && broken[group[t] as usize];
+                                if !target_routed {
+                                    desired *= 0.25;
+                                }
                                 if t < pos_prev.len() {
                                     face_target = Some(pos_prev[t].xz());
                                 }
@@ -415,17 +470,33 @@ pub fn step_sim(
                     // Close toward the LOCKED swing target when there is
                     // one — the per-tick nearest enemy flips in a clog and
                     // flip-flopping the close direction reads as twitch.
-                    if !dying && !routed && best_idx != u32::MAX {
-                        let close_to = if sw_chunk[j] != crate::units::SWING_READY
-                            && (tgt_chunk[j] as usize) < pos_prev.len()
-                        {
-                            tgt_chunk[j]
-                        } else {
-                            best_idx
-                        };
+                    // Falls back to the far-acquisition memo in `target`
+                    // when the near scan is empty AND the unit is in open
+                    // space — in a dense press the memo would let second
+                    // ranks drive through the jam and compress the crowd
+                    // (nn regression). The memo may be stale after death
+                    // sweeps reindex, so it is validated as "some enemy
+                    // within closing range" — a legitimate closing target
+                    // regardless of identity.
+                    let close_to = if sw_chunk[j] != crate::units::SWING_READY
+                        && (tgt_chunk[j] as usize) < pos_prev.len()
+                    {
+                        tgt_chunk[j]
+                    } else if best_idx != u32::MAX {
+                        best_idx
+                    } else if crowd < CROWD_SLOW {
+                        tgt_chunk[j]
+                    } else {
+                        u32::MAX
+                    };
+                    if !dying
+                        && !routed
+                        && (close_to as usize) < pos_prev.len()
+                        && team[close_to as usize] != team[i]
+                    {
                         let to_enemy = pos_prev[close_to as usize].xz() - p;
                         let dist = to_enemy.length();
-                        if dist > 1.2 && dist < QUERY_RADIUS + 1.0 {
+                        if dist > 1.2 && dist < WIDE_ACQUIRE_R + 1.0 {
                             let urge = ((dist - 1.2) / 0.8).clamp(0.0, 1.0);
                             desired += to_enemy * (speed[i] * 0.35 * urge / dist);
                         }

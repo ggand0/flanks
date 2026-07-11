@@ -26,6 +26,9 @@ pub const CHARGE_RANGE: f32 = 60.0;
 /// Ticks `engaged` stays on after the last soldier's wind-up — bridges
 /// the recover/ready gaps between swing cycles (~1.5 s at 30 Hz).
 const ENGAGE_HOLD_TICKS: u8 = 45;
+/// Enemy regiment centroid within this range flags `enemy_near`: the
+/// regiment's units run the sparse-fight wide acquisition.
+const ENEMY_NEAR_R: f32 = 60.0;
 
 #[derive(Resource)]
 pub struct InfluenceField {
@@ -270,6 +273,7 @@ fn update_groups(units: Res<Units>, mut groups: ResMut<Groups>) {
         .zip(&counts)
         .map(|(s, c)| if *c > 0 { *s / *c as f32 } else { Vec2::ZERO })
         .collect();
+    let teams: Vec<u8> = groups.list.iter().map(|g| g.team).collect();
 
     for (g, group) in groups.list.iter_mut().enumerate() {
         group.count = counts[g];
@@ -280,6 +284,12 @@ fn update_groups(units: Res<Units>, mut groups: ResMut<Groups>) {
             continue;
         }
         group.centroid = cents[g];
+        group.enemy_near = (0..n).any(|t| {
+            t != g
+                && counts[t] > 0
+                && teams[t] != group.team
+                && cents[t].distance_squared(group.centroid) < ENEMY_NEAR_R * ENEMY_NEAR_R
+        });
 
         if fighting[g] {
             group.engage_hold = ENGAGE_HOLD_TICKS;

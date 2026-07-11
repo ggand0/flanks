@@ -367,7 +367,10 @@ fn sync_instance_data(
                     let step = units.pos[i] - units.pos_prev[i];
                     let disp = Vec2::new(step.x, step.z).length() * inv_dt;
                     let speed_ratio = (disp / units.speed[i].max(0.01)).clamp(0.0, 1.0);
-                    let t = ((speed_ratio - 0.12) / (0.45 - 0.12)).clamp(0.0, 1.0);
+                    // Band starts just above crowd jitter (~0.005 ratio):
+                    // slow press shoves (0.2-0.7 m/s) must animate, they
+                    // read as ice-skating otherwise.
+                    let t = ((speed_ratio - 0.03) / (0.35 - 0.03)).clamp(0.0, 1.0);
                     let move_amount = t * t * (3.0 - 2.0 * t);
                     // Facing interpolates like position (wrap-aware), so
                     // per-tick yaw updates don't snap at render rates.

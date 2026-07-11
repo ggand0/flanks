@@ -74,6 +74,10 @@ pub struct GroupData {
     /// In the charge phase: attack order, inside charge range of the
     /// target, not yet in contact. Drives the war cry + sprint pose.
     pub charging: bool,
+    /// An enemy regiment's centroid is within combat-watch range: units
+    /// of this regiment scan wider for adjacent enemies (sparse-fight
+    /// acquisition, movement.rs).
+    pub enemy_near: bool,
     // --- morale (regiments.rs updates per tick) ---
     pub morale: f32,
     pub state: RegState,
@@ -94,6 +98,7 @@ impl GroupData {
             engaged: false,
             engage_hold: 0,
             charging: false,
+            enemy_near: false,
             morale: 100.0,
             state: RegState::Steady,
             recent_deaths: 0,
