@@ -312,6 +312,7 @@ fn sync_instance_data(
     let units = &*units;
     let selection = &*selection;
     let frustum = &frustum;
+    let inv_dt = 1.0 / fixed_time.timestep().as_secs_f32().max(1e-6);
     bevy::tasks::ComputeTaskPool::get().scope(|scope| {
         for (ci, chunk_scratch) in scratch.iter_mut().enumerate().take(n_chunks) {
             scope.spawn(async move {
@@ -349,10 +350,15 @@ fn sync_instance_data(
                             color[c] = color[c] * 0.35 + HIGHLIGHT[c] * 0.65;
                         }
                     }
-                    // Deadband + smoothstep: crowd-jitter velocities must
-                    // not flicker the walk cycle on and off every frame.
-                    let speed_ratio =
-                        (units.vel[i].length() / units.speed[i].max(0.01)).clamp(0.0, 1.0);
+                    // Walk amount from ACTUAL per-tick displacement, not
+                    // velocity: press shoves move bodies through positional
+                    // corrections that never enter `vel` (and kill it), so
+                    // vel-driven legs froze while the body slid. Deadband +
+                    // smoothstep: crowd jitter (~0.001 m/tick) must not
+                    // flicker the walk cycle on and off every frame.
+                    let step = units.pos[i] - units.pos_prev[i];
+                    let disp = Vec2::new(step.x, step.z).length() * inv_dt;
+                    let speed_ratio = (disp / units.speed[i].max(0.01)).clamp(0.0, 1.0);
                     let t = ((speed_ratio - 0.12) / (0.45 - 0.12)).clamp(0.0, 1.0);
                     let move_amount = t * t * (3.0 - 2.0 * t);
                     // Facing interpolates like position (wrap-aware), so
