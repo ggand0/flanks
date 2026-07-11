@@ -322,6 +322,7 @@ struct CueState {
 /// Discrete cues: selection click, charge horn on new orders, war cry
 /// acknowledgment on attack orders, sustained war cries while regiments
 /// charge home, rout/rally vox + horn, victory/defeat stings.
+#[allow(clippy::too_many_arguments)] // bevy system params
 fn event_cues(
     mut commands: Commands,
     bank: Res<AudioBank>,

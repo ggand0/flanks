@@ -347,7 +347,7 @@ pub fn step_sim(
                         && !routed
                         && press[gi]
                         && crowd < CROWD_SLOW
-                        && (i as u32).wrapping_add(tick_seed) % 8 == 0
+                        && (i as u32).wrapping_add(tick_seed).is_multiple_of(8)
                     {
                         let mut far_d2 = WIDE_ACQUIRE_R * WIDE_ACQUIRE_R;
                         grid.for_each_candidate(p, WIDE_ACQUIRE_R, |o| {
