@@ -259,6 +259,7 @@ fn sync_instance_data(
     mut no_cull: Local<Option<bool>>,
     mut scratch: Local<Vec<[Vec<InstanceData>; NUM_BUCKETS]>>,
     mut walk_ema: Local<Vec<f32>>,
+    mut band_ema: Local<Vec<f32>>,
 ) {
     let _span = info_span!("sync_instances").entered();
     let t0 = std::time::Instant::now();
@@ -310,9 +311,20 @@ fn sync_instance_data(
         })
         .collect();
     let stance = &stance[..];
-    // Victory cheer (rides the positive band as style digit 3 — a
-    // celebrating regiment has no one left to swing at).
-    let celebrating: Vec<bool> = groups.list.iter().map(|g| g.celebrate > 0).collect();
+    // Victory cheer progress 0..1 (-1 = not celebrating). Rides the
+    // positive band as 6 + progress so the shader can ease in/out — a
+    // celebrating regiment has no one left to swing at.
+    let celebrating: Vec<f32> = groups
+        .list
+        .iter()
+        .map(|g| {
+            if g.celebrate > 0 {
+                1.0 - g.celebrate as f32 / crate::frontline::CELEBRATE_TICKS as f32
+            } else {
+                -1.0
+            }
+        })
+        .collect();
     let celebrating = &celebrating[..];
 
     // Parallel cull + bucket build into per-chunk scratch, then one memcpy
@@ -332,11 +344,15 @@ fn sync_instance_data(
     // shuffle on death-sweep swap-removes — a one-frame inherited value
     // is invisible.
     walk_ema.resize(units.len(), 0.0);
+    band_ema.resize(units.len(), 0.0);
     let ema_k = (time.delta_secs() / 0.25).min(1.0);
+    // Stance tiers are per-regiment and snap; the POSE blends (~0.35 s).
+    let band_k = (time.delta_secs() / 0.35).min(1.0);
     bevy::tasks::ComputeTaskPool::get().scope(|scope| {
-        for (ci, (chunk_scratch, ema_chunk)) in scratch
+        for (ci, ((chunk_scratch, ema_chunk), band_chunk)) in scratch
             .iter_mut()
             .zip(walk_ema.chunks_mut(SYNC_CHUNK))
+            .zip(band_ema.chunks_mut(SYNC_CHUNK))
             .enumerate()
             .take(n_chunks)
         {
@@ -356,6 +372,9 @@ fn sync_instance_data(
                     let disp = Vec2::new(step.x, step.z).length() * inv_dt;
                     let ema = &mut ema_chunk[i - start];
                     *ema += (disp - *ema) * ema_k;
+                    let tier = stance.get(units.group[i] as usize).copied().unwrap_or(0.0);
+                    let band = &mut band_chunk[i - start];
+                    *band += (tier - *band) * band_k;
 
                     let position = units.pos_prev[i].lerp(units.pos[i], alpha);
                     let sphere = Sphere {
@@ -433,14 +452,18 @@ fn sync_instance_data(
                             as f32;
                         style * 2.0 + lunge
                     } else if units.death_t[i] == 0
-                        && celebrating.get(units.group[i] as usize).copied().unwrap_or(false)
+                        && celebrating
+                            .get(units.group[i] as usize)
+                            .copied()
+                            .unwrap_or(-1.0)
+                            >= 0.0
                     {
-                        6.0
+                        6.0 + celebrating[units.group[i] as usize]
                     } else if units.death_t[i] == 0 {
-                        // Negative lunge = battle stance amount (NOT walk
-                        // scaled: standing units need it for the taunt;
-                        // the shader gates the sprint lean by walk).
-                        -stance.get(units.group[i] as usize).copied().unwrap_or(0.0)
+                        // Negative lunge = SMOOTHED battle stance (the
+                        // regiment tier snaps; a pose must not — owner:
+                        // one-frame stance changes aren't immersive).
+                        -band_chunk[i - start]
                     } else {
                         0.0
                     };

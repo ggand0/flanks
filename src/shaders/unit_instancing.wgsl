@@ -26,6 +26,11 @@ struct VertexOutput {
     @location(0) color: vec4<f32>,
 };
 
+// Standing brace pose (split legs, crouch, raised guard): benched by
+// the owner ("weird") but kept — set to 1.0 to re-enable. Standing
+// units near an enemy hold the plain forward point instead.
+const BRACE_ON: f32 = 0.0;
+
 fn rot_y(p: vec3<f32>, c: f32, s: f32) -> vec3<f32> {
     return vec3<f32>(p.x * c + p.z * s, p.y, -p.x * s + p.z * c);
 }
@@ -54,7 +59,12 @@ fn vertex(vertex: Vertex) -> VertexOutput {
     let zpos = max(vertex.i_anim.z, 0.0);
     let style = floor(zpos * 0.5 + 0.001);
     let lunge = zpos - style * 2.0;
-    let celebrate = step(5.0, zpos);
+    // Cheer: z = 6 + progress. Ease in over the first ~8% and back out
+    // over the last ~10% — poses must never snap in one frame.
+    let cele_t = clamp(zpos - 6.0, 0.0, 1.0);
+    let celebrate = step(5.0, zpos)
+        * smoothstep(0.0, 0.08, cele_t)
+        * (1.0 - smoothstep(0.90, 1.0, cele_t));
     // Negative z band: 0.25 = enemy in watch range (brace when
     // standing), 0.5 = fighting but wavering (brace, no taunt),
     // 0.65 = fighting confident (taunts), 1 = charging (sprint).
@@ -72,8 +82,12 @@ fn vertex(vertex: Vertex) -> VertexOutput {
     // ~half the line braces (per-unit pick); the rest keep the plain
     // standing point, so a waiting line mixes both poses.
     let bracer = step(0.45, fract(seed * 3.77));
-    let brace =
-        bracer * ready * (1.0 - moving) * (1.0 - smoothstep(0.0, 0.05, lunge)) * (1.0 - celebrate);
+    let brace = BRACE_ON
+        * bracer
+        * ready
+        * (1.0 - moving)
+        * (1.0 - smoothstep(0.0, 0.05, lunge))
+        * (1.0 - celebrate);
 
     var local = vertex.position;
     var normal = vertex.normal;
@@ -115,9 +129,9 @@ fn vertex(vertex: Vertex) -> VertexOutput {
         // Style picked per SWING by the sim (swing bits): 0 = stab,
         // 1 = classic swing, 2 = slash (benched).
         var ang = 0.0;
-        if celebrate > 0.5 {
+        if celebrate > 0.001 {
             // Victory cheer: blade pumped skyward, bouncing with the hop.
-            ang = 1.75 + 0.35 * sin(globals.time * 9.0 + seed * 6.2831853);
+            ang = celebrate * (1.75 + 0.35 * sin(globals.time * 9.0 + seed * 6.2831853));
         } else if style < 0.5 {
             // Stab: draw the arm back, then thrust the blade forward
             // near-level. Translation happens in local space (pre-yaw).

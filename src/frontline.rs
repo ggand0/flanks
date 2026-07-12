@@ -30,8 +30,8 @@ const ENGAGE_HOLD_TICKS: u8 = 45;
 /// regiment's units run the sparse-fight wide acquisition.
 const ENEMY_NEAR_R: f32 = 60.0;
 /// Victory-cheer length (~5 s at 30 Hz) after the last nearby unbroken
-/// enemy regiment routs or dies.
-const CELEBRATE_TICKS: u16 = 150;
+/// enemy regiment routs or dies. Pub: render encodes cheer progress.
+pub const CELEBRATE_TICKS: u16 = 150;
 
 #[derive(Resource)]
 pub struct InfluenceField {
