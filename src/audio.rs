@@ -45,11 +45,18 @@ struct AudioBank {
     death: Vec<Handle<AudioSource>>,
     vox_rout: Vec<Handle<AudioSource>>,
     vox_rally: Vec<Handle<AudioSource>>,
+    /// Victory cheer when an ENEMY regiment breaks (owner: the
+    /// _celebrate takes are "we broke them", not rally-from-rout).
+    vox_cheer: Vec<Handle<AudioSource>>,
     /// Played once per regiment charge (the latched `charging` state).
     vox_warcry: Vec<Handle<AudioSource>>,
     horn_charge: Vec<Handle<AudioSource>>,
     horn_rout: Handle<AudioSource>,
     ui_select: Handle<AudioSource>,
+    /// Click feedback for a move order (quieter than select per owner).
+    ui_order: Handle<AudioSource>,
+    /// Click feedback for an attack order on an enemy regiment.
+    ui_attack: Handle<AudioSource>,
     sting_victory: Handle<AudioSource>,
     sting_defeat: Handle<AudioSource>,
 }
@@ -61,6 +68,8 @@ enum Bed {
     Mid,
     Close,
     Drums,
+    /// Massed boots (freesound loop) — plays with the drums on the march.
+    March,
 }
 
 fn setup_audio(mut commands: Commands, assets: Res<AssetServer>) {
@@ -94,17 +103,18 @@ fn setup_audio(mut commands: Commands, assets: Res<AssetServer>) {
             "sfx_death_05",
         ]),
         vox_rout: load_set(&["vox_rout_01", "vox_rout_02", "vox_rout_03"]),
-        vox_rally: load_set(&[
-            "vox_rally_01",
-            "vox_rally_02",
-            "sfx_new/vox_rally_03",
+        vox_rally: load_set(&["vox_rally_01", "vox_rally_02"]),
+        vox_cheer: load_set(&[
+            "sfx_new/vox_rally_03_celebrate",
             "sfx_new/vox_rally_04_celebrate",
         ]),
         // Owner benched vox_warcry_02 — 01 only for now.
         vox_warcry: load_set(&["sfx_new/vox_warcry_01"]),
         horn_charge: load_set(&["sig_horn_charge", "sig_horn_charge_02"]),
         horn_rout: assets.load("sfx_new/sig_horn_rout.mp3"),
-        ui_select: assets.load("sfx_new/ui_select.mp3"),
+        ui_select: assets.load("sfx_new/ui_select1.mp3"),
+        ui_order: assets.load("sfx_new/ui_order0.mp3"),
+        ui_attack: assets.load("sfx_new/ui_attack.mp3"),
         sting_victory: assets.load("sting_victory.mp3"),
         sting_defeat: assets.load("sting_defeat.mp3"),
     });
@@ -122,6 +132,7 @@ fn setup_audio(mut commands: Commands, assets: Res<AssetServer>) {
     commands.spawn((bed("bed_battle_mid0"), Bed::Mid));
     commands.spawn((bed("bed_melee_close0"), Bed::Close));
     commands.spawn((bed("sig_drums_march"), Bed::Drums));
+    commands.spawn((bed("sfx_new/bed_march_freesound_loop_14.5s"), Bed::March));
 }
 
 /// Crossfade the beds from battle state around the camera focus.
@@ -179,6 +190,13 @@ fn update_beds(
             Bed::Drums => {
                 if marching_own {
                     0.30 * m
+                } else {
+                    0.0
+                }
+            }
+            Bed::March => {
+                if marching_own {
+                    0.28 * m
                 } else {
                     0.0
                 }
@@ -306,12 +324,12 @@ fn combat_one_shots(
 #[derive(Default)]
 struct CueState {
     prev_sel: usize,
-    prev_orders: Vec<bool>,
+    /// Last tick's order per regiment (edge = order CHANGED, so
+    /// re-orders click and horn too).
+    prev_order: Vec<Option<Order>>,
     prev_state: Vec<u8>,
     /// Last tick's per-regiment "attack target within charge range".
     prev_cry: Vec<bool>,
-    /// Last tick's attack target per regiment (u32::MAX = none).
-    prev_attack: Vec<u32>,
     roar_budget: u32,
     prev_outcome: bool,
     horn_gate: f32,
@@ -337,10 +355,9 @@ fn event_cues(
     st.horn_gate -= time.delta_secs();
     st.vox_gate -= time.delta_secs();
     let n = groups.list.len();
-    st.prev_orders.resize(n, false);
+    st.prev_order.resize(n, None);
     st.prev_state.resize(n, 0);
     st.prev_cry.resize(n, false);
-    st.prev_attack.resize(n, u32::MAX);
 
     // Selection click on a changed non-empty selection.
     if selection.count_units > 0 && selection.count_units != st.prev_sel {
@@ -348,8 +365,10 @@ fn event_cues(
     }
     st.prev_sel = selection.count_units;
 
-    let mut new_own_order = false;
+    let mut new_own_move = false;
+    let mut new_own_attack = false;
     let mut new_break_own = false;
+    let mut new_break_enemy = false;
     let mut new_break_any = false;
     let mut new_rally = false;
     // War cry rule (ONE rule): a regiment cries when "attack target
@@ -369,11 +388,22 @@ fn event_cues(
         .unwrap_or_default();
     let hear = camera.single().map(|c| 220.0 + c.distance * 0.5).unwrap_or(220.0);
     for (g, gd) in groups.list.iter().enumerate() {
-        let has_order = gd.order.is_some();
-        if gd.team == 0 && has_order && !st.prev_orders[g] && !gd.state.is_broken() {
-            new_own_order = true;
+        let prev_atk = match st.prev_order[g] {
+            Some(Order::Attack(t)) => t,
+            _ => u32::MAX,
+        };
+        if gd.team == 0
+            && gd.order != st.prev_order[g]
+            && gd.count > 0
+            && !gd.state.is_broken()
+        {
+            match gd.order {
+                Some(Order::Attack(_)) => new_own_attack = true,
+                Some(Order::Move(_)) => new_own_move = true,
+                None => {}
+            }
         }
-        st.prev_orders[g] = has_order;
+        st.prev_order[g] = gd.order;
 
         let state = match gd.state {
             RegState::Steady => 0u8,
@@ -384,6 +414,8 @@ fn event_cues(
             new_break_any = true;
             if gd.team == 0 {
                 new_break_own = true;
+            } else {
+                new_break_enemy = true;
             }
         }
         if state == 0 && st.prev_state[g] == 1 {
@@ -406,11 +438,10 @@ fn event_cues(
             _ => (u32::MAX, false),
         };
         let cry = in_range && gd.count > 0 && !gd.state.is_broken();
-        if cry && (!st.prev_cry[g] || atk != st.prev_attack[g]) {
+        if cry && (!st.prev_cry[g] || atk != prev_atk) {
             cry_dist = cry_dist.min(gd.centroid.distance(focus));
         }
         st.prev_cry[g] = cry;
-        st.prev_attack[g] = atk;
     }
 
     let seed = st.frame.wrapping_mul(211);
@@ -429,7 +460,15 @@ fn event_cues(
         }
     }
 
-    if new_own_order && st.horn_gate <= 0.0 {
+    // Order-click feedback: immediate and ungated, like the selection
+    // click — this is UI, not battlefield sound.
+    if new_own_attack {
+        one_shot(&mut commands, bank.ui_attack.clone(), 0.45, 1.0);
+    }
+    if new_own_move {
+        one_shot(&mut commands, bank.ui_order.clone(), 0.35, 1.0);
+    }
+    if (new_own_attack || new_own_move) && st.horn_gate <= 0.0 {
         if let Some(h) = pick(&bank.horn_charge, seed) {
             one_shot(&mut commands, h, 0.55, 1.0);
         }
@@ -443,6 +482,12 @@ fn event_cues(
             }
             if new_break_own {
                 one_shot(&mut commands, bank.horn_rout.clone(), 0.5, 1.0);
+            }
+            // Victors roar over the enemy's panic (TW moment).
+            if new_break_enemy
+                && let Some(h) = pick(&bank.vox_cheer, seed ^ 0xBB)
+            {
+                one_shot(&mut commands, h, 0.5, 1.0);
             }
             st.vox_gate = 1.5;
         } else if new_rally {
