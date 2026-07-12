@@ -251,12 +251,14 @@ fn sync_instance_data(
     selection: Res<crate::orders::Selection>,
     hover: Res<crate::orders::Hover>,
     groups: Res<crate::orders::Groups>,
+    time: Res<Time>,
     fixed_time: Res<Time<Fixed>>,
     camera: Query<(&Projection, &Transform), With<Camera3d>>,
     mut query: Query<(&InstanceBucket, &mut InstanceMaterialData)>,
     mut counts: ResMut<RenderCounts>,
     mut no_cull: Local<Option<bool>>,
     mut scratch: Local<Vec<[Vec<InstanceData>; NUM_BUCKETS]>>,
+    mut walk_ema: Local<Vec<f32>>,
 ) {
     let _span = info_span!("sync_instances").entered();
     let t0 = std::time::Instant::now();
@@ -317,8 +319,20 @@ fn sync_instance_data(
     let selection = &*selection;
     let frustum = &frustum;
     let inv_dt = 1.0 / fixed_time.timestep().as_secs_f32().max(1e-6);
+    // Per-unit walk-signal smoothing (~0.25 s): positional-correction
+    // shoves arrive in single-tick bursts; unsmoothed they strobe the
+    // walk cycle on/off, which reads as sliding with a twitch. Indices
+    // shuffle on death-sweep swap-removes — a one-frame inherited value
+    // is invisible.
+    walk_ema.resize(units.len(), 0.0);
+    let ema_k = (time.delta_secs() / 0.25).min(1.0);
     bevy::tasks::ComputeTaskPool::get().scope(|scope| {
-        for (ci, chunk_scratch) in scratch.iter_mut().enumerate().take(n_chunks) {
+        for (ci, (chunk_scratch, ema_chunk)) in scratch
+            .iter_mut()
+            .zip(walk_ema.chunks_mut(SYNC_CHUNK))
+            .enumerate()
+            .take(n_chunks)
+        {
             scope.spawn(async move {
                 for vec in chunk_scratch.iter_mut() {
                     vec.clear();
@@ -326,6 +340,16 @@ fn sync_instance_data(
                 let start = ci * SYNC_CHUNK;
                 let end = (start + SYNC_CHUNK).min(units.len());
                 for i in start..end {
+                    // Walk signal: smoothed ACTUAL per-tick displacement.
+                    // Velocity misses positional-correction shoves (which
+                    // also kill vel), raw displacement strobes on bursty
+                    // corr chains. Updated before the cull so units
+                    // re-entering the frustum have a live value.
+                    let step = units.pos[i] - units.pos_prev[i];
+                    let disp = Vec2::new(step.x, step.z).length() * inv_dt;
+                    let ema = &mut ema_chunk[i - start];
+                    *ema += (disp - *ema) * ema_k;
+
                     let position = units.pos_prev[i].lerp(units.pos[i], alpha);
                     let sphere = Sphere {
                         center: position.into(),
@@ -364,14 +388,12 @@ fn sync_instance_data(
                     // vel-driven legs froze while the body slid. Deadband +
                     // smoothstep: crowd jitter (~0.001 m/tick) must not
                     // flicker the walk cycle on and off every frame.
-                    let step = units.pos[i] - units.pos_prev[i];
-                    let disp = Vec2::new(step.x, step.z).length() * inv_dt;
-                    // ABSOLUTE band (m/s), not per-kind speed ratio: press
-                    // shoves are 0.2-0.7 m/s regardless of kind, and a
-                    // ratio band gave fast lights a higher slide threshold
-                    // than heavies. Floor sits above crowd jitter
-                    // (~0.03 m/s); full stride by ~3 m/s.
-                    let t = ((disp - 0.2) / (3.0 - 0.2)).clamp(0.0, 1.0);
+                    // ABSOLUTE band (m/s), not per-kind speed ratio — press
+                    // shoves are 0.2-0.7 m/s regardless of kind. Floor
+                    // 0.06 = 2x crowd jitter (0.03, the 0021 metric);
+                    // saturates by 1.2 m/s so slow shoves get VISIBLE leg
+                    // articulation instead of a 10% wiggle.
+                    let t = ((*ema - 0.06) / (1.2 - 0.06)).clamp(0.0, 1.0);
                     let move_amount = t * t * (3.0 - 2.0 * t);
                     // Facing interpolates like position (wrap-aware), so
                     // per-tick yaw updates don't snap at render rates.
