@@ -64,6 +64,9 @@ fn vertex(vertex: Vertex) -> VertexOutput {
     let confident = smoothstep(0.55, 0.65, band);
     let sprint = smoothstep(0.7, 1.0, band);
     let fx = vertex.i_anim.w;
+    let seed = vertex.i_color.a;
+    let part = vertex.part_pivot.x;
+    let pivot = vertex.part_pivot.y;
     // Brace: standing, enemy near/engaged, not attacking — a planted
     // fight stance (split legs, crouch, blade at ready guard). Only
     // ~half the line braces (per-unit pick); the rest keep the plain
@@ -71,9 +74,6 @@ fn vertex(vertex: Vertex) -> VertexOutput {
     let bracer = step(0.45, fract(seed * 3.77));
     let brace =
         bracer * ready * (1.0 - moving) * (1.0 - smoothstep(0.0, 0.05, lunge)) * (1.0 - celebrate);
-    let seed = vertex.i_color.a;
-    let part = vertex.part_pivot.x;
-    let pivot = vertex.part_pivot.y;
 
     var local = vertex.position;
     var normal = vertex.normal;
