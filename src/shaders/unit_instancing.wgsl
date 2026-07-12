@@ -54,15 +54,16 @@ fn vertex(vertex: Vertex) -> VertexOutput {
     let style = floor(zpos * 0.5 + 0.001);
     let lunge = zpos - style * 2.0;
     // Negative z band: 0.25 = enemy in watch range (brace when
-    // standing), 0.5 = battle stance (blade leveled), 1 = charging
-    // (sprint lean, stride, bob).
+    // standing), 0.5 = fighting but wavering (brace, no taunt),
+    // 0.65 = fighting confident (taunts), 1 = charging (sprint).
     let band = max(-vertex.i_anim.z, 0.0);
     let ready = smoothstep(0.05, 0.25, band);
     let stance = smoothstep(0.25, 0.5, band);
-    let sprint = smoothstep(0.5, 1.0, band);
+    let confident = smoothstep(0.55, 0.65, band);
+    let sprint = smoothstep(0.7, 1.0, band);
     let fx = vertex.i_anim.w;
     // Brace: standing, enemy near/engaged, not attacking — a planted
-    // fight stance (split legs, slight crouch, blade up at ready).
+    // fight stance (split legs, crouch, blade at guard or point).
     let brace = ready * (1.0 - moving) * (1.0 - smoothstep(0.0, 0.05, lunge));
     let seed = vertex.i_color.a;
     let part = vertex.part_pivot.x;
@@ -79,7 +80,7 @@ fn vertex(vertex: Vertex) -> VertexOutput {
         // bracing splits the stance (one foot planted forward).
         let side = select(1.0, -1.0, part > 2.5);
         let ang = 0.55 * (1.0 + 0.35 * sprint) * moving * sin(phase) * side
-            + 0.24 * brace * side;
+            + 0.32 * brace * side;
         local = pitch_about(local, pivot, ang);
         normal = pitch_normal(normal, ang);
     } else if part > 0.5 {
@@ -94,22 +95,26 @@ fn vertex(vertex: Vertex) -> VertexOutput {
         // Ordinary moves carry the blade lowered at the side; battle
         // stance levels it at the enemy (slightly above horizontal).
         let carry = mix(-0.55, 0.25, stance) * moving * (1.0 - raise);
-        // Taunt: STANDING units of a fighting regiment pump the blade
-        // skyward for ~1.5 s every ~7 s, staggered per unit by seed —
-        // the rear ranks jeer while the front works.
+        // Taunt: STANDING units of a CONFIDENT fighting regiment pump
+        // the blade skyward for ~1.5 s every ~7 s, staggered per unit —
+        // the rear ranks jeer while the front works. Wavering regiments
+        // (morale low) stop jeering and just hold the brace.
         let tc = fract(globals.time / 7.3 + seed * 5.13);
         let tpulse = smoothstep(0.02, 0.12, tc) * (1.0 - smoothstep(0.24, 0.34, tc));
-        let taunt = tpulse * stance * (1.0 - moving) * (1.0 - smoothstep(0.0, 0.05, lunge));
+        let taunt = tpulse * confident * (1.0 - moving) * (1.0 - smoothstep(0.0, 0.05, lunge));
         let ang_taunt = taunt * (1.7 + 0.22 * sin(globals.time * 16.0));
 
         // Style picked per SWING by the sim (swing bits): 0 = stab,
-        // 1 = slash. (The overhead chop was retired — owner.)
+        // 1 = classic swing, 2 = slash (benched).
         var ang = 0.0;
         if style < 0.5 {
             // Stab: draw the arm back, then thrust the blade forward
             // near-level. Translation happens in local space (pre-yaw).
             ang = 0.55 * raise - 0.45 * chop;
             local.z += -0.30 * raise + 1.05 * chop;
+        } else if style < 1.5 {
+            // The classic swing: raise up/back, fast chop.
+            ang = 1.9 * raise - 2.5 * chop;
         } else {
             // Slash: horizontal sweep around the body axis — wind back,
             // cut across.
@@ -120,8 +125,11 @@ fn vertex(vertex: Vertex) -> VertexOutput {
             normal = rot_y(normal, yc, ys);
             ang = 0.5 * raise - 0.3 * chop;
         }
-        // Brace lifts the blade to a ready guard above the level point.
-        ang += sway + carry + ang_taunt + 0.35 * brace;
+        // Brace arm: per-unit mix of the forward POINT (the owner's
+        // favorite stance) and a raised guard — a braced line reads as
+        // a wall of mixed points and guards.
+        let guard = mix(0.08, 0.5, step(0.5, fract(seed * 3.77)));
+        ang += sway + carry + ang_taunt + guard * brace;
         local = pitch_about(local, pivot, ang);
         normal = pitch_normal(normal, ang);
     }
@@ -171,7 +179,7 @@ fn vertex(vertex: Vertex) -> VertexOutput {
 
     let position = local * vertex.i_pos_scale.w
         + vertex.i_pos_scale.xyz
-        + vec3<f32>(0.0, bob - 0.15 * death - 0.05 * brace, 0.0);
+        + vec3<f32>(0.0, bob - 0.15 * death - 0.07 * brace, 0.0);
 
     var out: VertexOutput;
     // Instance entity sits at the origin with identity transform, so passing

@@ -57,7 +57,8 @@ pub const SWING_WINDUP: u8 = 1;
 pub const SWING_RECOVER: u8 = 2;
 pub const SWING_STATE_MASK: u8 = 3;
 /// Attack style for the CURRENT swing (bits 3-4, set at wind-up start,
-/// wiped with the state): 0 = stab, 1 = slash. Render-only variety.
+/// wiped with the state): 0 = stab, 1 = classic swing, 2 = slash
+/// (benched). Render-only variety.
 pub const SWING_STYLE_SHIFT: u8 = 3;
 pub const SWING_STYLE_MASK: u8 = 0b11 << SWING_STYLE_SHIFT;
 /// Set when the swing was started at charging speed: bonus damage and a

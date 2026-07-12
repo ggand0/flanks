@@ -437,13 +437,12 @@ pub fn step_sim(
                                     let v2 = v_chunk[j].xz().length_squared();
                                     let cs = speed[i] * CHARGE_SPEED_FRAC;
                                     // Attack style for this swing (render
-                                    // variety only). TEMP: stabs only while
-                                    // the owner evaluates the pose; the
-                                    // commented pick mixes stab/slash.
-                                    let style = 0u8;
-                                    // let style = (crate::units::hash01(
-                                    //     tick_seed ^ (i as u32).wrapping_mul(0x51ED),
-                                    // ) * 2.0) as u8;
+                                    // variety only): 0 = stab, 1 = the
+                                    // classic swing. (2 = slash exists in
+                                    // the shader, benched by owner.)
+                                    let style = (crate::units::hash01(
+                                        tick_seed ^ (i as u32).wrapping_mul(0x51ED),
+                                    ) * 2.0) as u8;
                                     let style = style << crate::units::SWING_STYLE_SHIFT;
                                     sw_chunk[j] = if v2 > cs * cs {
                                         crate::units::SWING_WINDUP

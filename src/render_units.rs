@@ -291,9 +291,9 @@ fn sync_instance_data(
     let broken: Vec<bool> = groups.list.iter().map(|g| g.state.is_broken()).collect();
     let broken = &broken[..];
     // Battle stance (negative lunge band): 0.25 = enemy in watch range
-    // (standing units brace), 0.5 = blade leveled (engaged / attack
-    // order), 1.0 = charging (adds sprint lean/stride). Plain moves
-    // carry the blade lowered.
+    // (standing units brace), 0.5 = fighting but WAVERING (morale low —
+    // braces, no taunts), 0.65 = fighting confident (taunts allowed),
+    // 1.0 = charging (sprint lean/stride). Plain moves carry lowered.
     let stance: Vec<f32> = groups
         .list
         .iter()
@@ -301,7 +301,7 @@ fn sync_instance_data(
             if g.charging {
                 1.0
             } else if g.engaged || matches!(g.order, Some(crate::orders::Order::Attack(_))) {
-                0.5
+                if g.morale > 50.0 { 0.65 } else { 0.5 }
             } else if g.enemy_near {
                 0.25
             } else {
