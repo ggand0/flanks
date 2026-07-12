@@ -245,6 +245,16 @@ fn setup_unit_mesh(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
 /// Units per parallel sync chunk.
 const SYNC_CHUNK: usize = 16_384;
 
+/// Anim z-channel encoding — the ONE authoritative map (keep in sync
+/// with unit_instancing.wgsl, which decodes it):
+///   z > 0, < CELEBRATE_BASE: attack = style * 2 + wind-up progress
+///     (style 0 stab, 1 classic swing, 2 slash/benched);
+///   z >= CELEBRATE_BASE: victory cheer, fraction = progress 0..1;
+///   z < 0: stance-band magnitude — tiers 0.25 enemy-near, 0.5 fighting
+///     wavering, 0.65 fighting confident, 1.0 charging — smoothed per
+///     unit (~0.35 s) before emission so poses never snap.
+const CELEBRATE_BASE: f32 = 6.0;
+
 #[allow(clippy::too_many_arguments)] // bevy system params
 fn sync_instance_data(
     units: Res<Units>,
@@ -458,7 +468,7 @@ fn sync_instance_data(
                             .unwrap_or(-1.0)
                             >= 0.0
                     {
-                        6.0 + celebrating[units.group[i] as usize]
+                        CELEBRATE_BASE + celebrating[units.group[i] as usize]
                     } else if units.death_t[i] == 0 {
                         // Negative lunge = SMOOTHED battle stance (the
                         // regiment tier snaps; a pose must not — owner:

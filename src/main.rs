@@ -4,6 +4,7 @@ mod banners;
 mod camera;
 mod combat;
 mod frontline;
+mod morale;
 mod movement;
 mod orders;
 mod overlay;
@@ -43,6 +44,7 @@ fn main() {
             terrain::TerrainPlugin,
             units::UnitsPlugin,
             regiments::RegimentsPlugin,
+            morale::MoralePlugin,
             ai::AiPlugin,
             banners::BannersPlugin,
             audio::BattleAudioPlugin,

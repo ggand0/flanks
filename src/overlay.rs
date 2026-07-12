@@ -7,7 +7,7 @@ use bevy::render::diagnostic::RenderDiagnosticsPlugin;
 use crate::combat::CombatStats;
 use crate::movement::SimStats;
 use crate::orders::{Groups, RegState, Selection};
-use crate::regiments::MoraleReadout;
+use crate::morale::MoraleReadout;
 use crate::render_units::RenderCounts;
 use crate::units::Units;
 

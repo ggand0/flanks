@@ -33,8 +33,13 @@ pub struct Units {
     /// Base render color (team color with per-unit variation baked in).
     /// Alpha carries a stable per-unit anim seed, not opacity.
     pub color: Vec<[f32; 4]>,
-    /// Current melee target (unit index); `u32::MAX` = none. Only trusted
-    /// within a swing cycle — validated through the grid and at hit time.
+    /// Combat memo (unit index; `u32::MAX` = none): the melee target
+    /// while a swing is in flight, and the sparse-fight closing memo
+    /// otherwise (movement.rs wide acquisition). NEVER cleared, and
+    /// death-sweep swap-removes reindex units, so it can point at an
+    /// arbitrary unit later — every consumer MUST validate on use
+    /// (swings re-check at hit time; the closing drive checks team and
+    /// distance). Do not read it as "current enemy" anywhere else.
     pub target: Vec<u32>,
     /// Swing state: 0 = Ready, 1 = WindUp, 2 = Recover.
     pub swing: Vec<u8>,
