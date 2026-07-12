@@ -139,6 +139,10 @@ struct DragLine {
     active: bool,
 }
 
+/// Ctrl+1..9 stores the current selection mask; 1..9 recalls it.
+#[derive(Resource, Default)]
+pub struct ControlGroups(pub Vec<Vec<bool>>);
+
 pub struct OrdersPlugin;
 
 impl Plugin for OrdersPlugin {
@@ -150,12 +154,15 @@ impl Plugin for OrdersPlugin {
             .init_resource::<Selection>()
             .init_resource::<DragLine>()
             .init_resource::<Hover>()
+            .init_resource::<ControlGroups>()
             .add_systems(
                 Update,
                 (
                     drag_select,
                     update_hover,
                     issue_order,
+                    halt_key,
+                    control_group_keys,
                     test_orders_script,
                     draw_order_gizmos,
                 ),
@@ -432,6 +439,79 @@ fn issue_order(
             selection.count_units,
             target.x,
             target.y
+        );
+    }
+}
+
+/// S with a selection = HALT: drop orders and hold in place (the anchor
+/// moves to the current centroid so the block stands where it is).
+/// Without a selection, S stays camera pan (camera.rs checks).
+fn halt_key(
+    keys: Res<ButtonInput<KeyCode>>,
+    selection: Res<Selection>,
+    mut groups: ResMut<Groups>,
+) {
+    if !keys.just_pressed(KeyCode::KeyS) || selection.count_units == 0 {
+        return;
+    }
+    let mut halted = 0;
+    for (g, sel) in selection.regiments.iter().enumerate() {
+        let group = &mut groups.list[g];
+        if *sel && group.count > 0 && !group.state.is_broken() {
+            group.anchor = group.centroid;
+            group.order = None;
+            halted += 1;
+        }
+    }
+    if halted > 0 {
+        info!("HALT: {halted} regiments hold");
+    }
+}
+
+/// Ctrl+digit assigns the current selection to a slot; a bare digit
+/// recalls it (dead regiments drop out naturally via count checks).
+fn control_group_keys(
+    keys: Res<ButtonInput<KeyCode>>,
+    groups: Res<Groups>,
+    mut cg: ResMut<ControlGroups>,
+    mut selection: ResMut<Selection>,
+) {
+    const DIGITS: [KeyCode; 9] = [
+        KeyCode::Digit1,
+        KeyCode::Digit2,
+        KeyCode::Digit3,
+        KeyCode::Digit4,
+        KeyCode::Digit5,
+        KeyCode::Digit6,
+        KeyCode::Digit7,
+        KeyCode::Digit8,
+        KeyCode::Digit9,
+    ];
+    let Some(slot) = DIGITS.iter().position(|k| keys.just_pressed(*k)) else {
+        return;
+    };
+    cg.0.resize(9, Vec::new());
+    let ctrl =
+        keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
+    if ctrl {
+        if selection.count_units > 0 {
+            cg.0[slot] = selection.regiments.clone();
+            info!("control group {} assigned", slot + 1);
+        }
+    } else if !cg.0[slot].is_empty() {
+        selection.regiments = cg.0[slot].clone();
+        selection.regiments.resize(groups.list.len(), false);
+        selection.count_units = selection
+            .regiments
+            .iter()
+            .enumerate()
+            .filter(|(g, s)| **s && groups.list[*g].team == PLAYER_TEAM)
+            .map(|(g, _)| groups.list[g].count)
+            .sum();
+        info!(
+            "control group {} recalled ({} units)",
+            slot + 1,
+            selection.count_units
         );
     }
 }
