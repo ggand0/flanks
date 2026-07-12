@@ -338,7 +338,6 @@ fn do_spawn_battle(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
     let per_team = units_per_team();
     let size = reg_size();
     let n_regs = (per_team / size).max(1);
-    let n_heavy = (n_regs as f32 * heavy_frac()).round() as usize;
 
     // Block geometry: wider than deep (~2.2:1).
     let cols = ((size as f32 * 2.2).sqrt().ceil() as usize).max(1);
@@ -368,6 +367,14 @@ fn do_spawn_battle(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
     let mut list: Vec<GroupData> = Vec::with_capacity(n_regs * 2);
 
     for team in 0..2u8 {
+        // FL_ENEMY_REGS caps the enemy regiment count (sandbox
+        // asymmetry, e.g. 5v4 so one player regiment stays unchased).
+        let n_regs = if team == 1 {
+            crate::util::env_or("FL_ENEMY_REGS", n_regs).clamp(1, n_regs)
+        } else {
+            n_regs
+        };
+        let n_heavy = (n_regs as f32 * heavy_frac()).round() as usize;
         let dir: f32 = if team == 0 { -1.0 } else { 1.0 };
         for r in 0..n_regs {
             let rank = r / per_rank;

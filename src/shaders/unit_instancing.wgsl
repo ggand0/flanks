@@ -30,6 +30,9 @@ struct VertexOutput {
 // the owner ("weird") but kept — set to 1.0 to re-enable. Standing
 // units near an enemy hold the plain forward point instead.
 const BRACE_ON: f32 = 0.0;
+// Rear-rank taunt: benched pending an owner rework ("something is
+// making me uncomfortable") — set to 1.0 to re-enable.
+const TAUNT_ON: f32 = 0.0;
 
 fn rot_y(p: vec3<f32>, c: f32, s: f32) -> vec3<f32> {
     return vec3<f32>(p.x * c + p.z * s, p.y, -p.x * s + p.z * c);
@@ -123,7 +126,8 @@ fn vertex(vertex: Vertex) -> VertexOutput {
         // (morale low) stop jeering and just hold the brace.
         let tc = fract(globals.time / 7.3 + seed * 5.13);
         let tpulse = smoothstep(0.02, 0.12, tc) * (1.0 - smoothstep(0.24, 0.34, tc));
-        let taunt = tpulse * confident * (1.0 - moving) * (1.0 - smoothstep(0.0, 0.05, lunge));
+        let taunt =
+            TAUNT_ON * tpulse * confident * (1.0 - moving) * (1.0 - smoothstep(0.0, 0.05, lunge));
         let ang_taunt = taunt * (1.7 + 0.22 * sin(globals.time * 16.0));
 
         // Style picked per SWING by the sim (swing bits): 0 = stab,
