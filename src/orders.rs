@@ -81,6 +81,11 @@ pub struct GroupData {
     /// Normalized direction to the nearest enemy regiment (ZERO when
     /// none in watch range): standing units face it (brace facing).
     pub threat_dir: Vec2,
+    /// An UNBROKEN enemy regiment is within watch range. The falling
+    /// edge (last nearby foe routed or wiped) triggers the cheer.
+    pub hostile_near: bool,
+    /// Victory-cheer ticks remaining (render-only celebration).
+    pub celebrate: u16,
     // --- morale (regiments.rs updates per tick) ---
     pub morale: f32,
     pub state: RegState,
@@ -103,6 +108,8 @@ impl GroupData {
             charging: false,
             enemy_near: false,
             threat_dir: Vec2::ZERO,
+            hostile_near: false,
+            celebrate: 0,
             morale: 100.0,
             state: RegState::Steady,
             recent_deaths: 0,

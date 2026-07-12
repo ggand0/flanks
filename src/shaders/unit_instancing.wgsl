@@ -49,10 +49,12 @@ fn vertex(vertex: Vertex) -> VertexOutput {
     let yaw = vertex.i_anim.x;
     let moving = vertex.i_anim.y;
     // Positive z: attack progress. The 2s digit is the swing STYLE
-    // (0 = stab, 1 = slash), the remainder is lunge 0..~1.35.
+    // (0 = stab, 1 = classic swing, 2 = slash), remainder = lunge
+    // 0..~1.35. z >= 6 = victory cheer (no one left to swing at).
     let zpos = max(vertex.i_anim.z, 0.0);
     let style = floor(zpos * 0.5 + 0.001);
     let lunge = zpos - style * 2.0;
+    let celebrate = step(5.0, zpos);
     // Negative z band: 0.25 = enemy in watch range (brace when
     // standing), 0.5 = fighting but wavering (brace, no taunt),
     // 0.65 = fighting confident (taunts), 1 = charging (sprint).
@@ -63,8 +65,12 @@ fn vertex(vertex: Vertex) -> VertexOutput {
     let sprint = smoothstep(0.7, 1.0, band);
     let fx = vertex.i_anim.w;
     // Brace: standing, enemy near/engaged, not attacking — a planted
-    // fight stance (split legs, crouch, blade at guard or point).
-    let brace = ready * (1.0 - moving) * (1.0 - smoothstep(0.0, 0.05, lunge));
+    // fight stance (split legs, crouch, blade at ready guard). Only
+    // ~half the line braces (per-unit pick); the rest keep the plain
+    // standing point, so a waiting line mixes both poses.
+    let bracer = step(0.45, fract(seed * 3.77));
+    let brace =
+        bracer * ready * (1.0 - moving) * (1.0 - smoothstep(0.0, 0.05, lunge)) * (1.0 - celebrate);
     let seed = vertex.i_color.a;
     let part = vertex.part_pivot.x;
     let pivot = vertex.part_pivot.y;
@@ -93,8 +99,10 @@ fn vertex(vertex: Vertex) -> VertexOutput {
         // Idle/walk sway when not attacking.
         let sway = 0.18 * moving * sin(phase + 3.1415) * (1.0 - raise);
         // Ordinary moves carry the blade lowered at the side; battle
-        // stance levels it at the enemy (slightly above horizontal).
-        let carry = mix(-0.55, 0.25, stance) * moving * (1.0 - raise);
+        // stance levels it at the enemy (slightly above horizontal),
+        // and even a watch-range advance (`ready`) brings it most of
+        // the way up — the braced walk.
+        let carry = mix(-0.55, 0.25, max(stance, ready * 0.75)) * moving * (1.0 - raise);
         // Taunt: STANDING units of a CONFIDENT fighting regiment pump
         // the blade skyward for ~1.5 s every ~7 s, staggered per unit —
         // the rear ranks jeer while the front works. Wavering regiments
@@ -107,7 +115,10 @@ fn vertex(vertex: Vertex) -> VertexOutput {
         // Style picked per SWING by the sim (swing bits): 0 = stab,
         // 1 = classic swing, 2 = slash (benched).
         var ang = 0.0;
-        if style < 0.5 {
+        if celebrate > 0.5 {
+            // Victory cheer: blade pumped skyward, bouncing with the hop.
+            ang = 1.75 + 0.35 * sin(globals.time * 9.0 + seed * 6.2831853);
+        } else if style < 0.5 {
             // Stab: draw the arm back, then thrust the blade forward
             // near-level. Translation happens in local space (pre-yaw).
             ang = 0.55 * raise - 0.45 * chop;
@@ -125,11 +136,9 @@ fn vertex(vertex: Vertex) -> VertexOutput {
             normal = rot_y(normal, yc, ys);
             ang = 0.5 * raise - 0.3 * chop;
         }
-        // Brace arm: per-unit mix of the forward POINT (the owner's
-        // favorite stance) and a raised guard — a braced line reads as
-        // a wall of mixed points and guards.
-        let guard = mix(0.08, 0.5, step(0.5, fract(seed * 3.77)));
-        ang += sway + carry + ang_taunt + guard * brace;
+        // Braced units hold a proper ready guard; the non-bracers of
+        // the line keep the plain forward point (ang 0 standing).
+        ang += sway + carry + ang_taunt + 0.6 * brace;
         local = pitch_about(local, pivot, ang);
         normal = pitch_normal(normal, ang);
     }
@@ -177,9 +186,12 @@ fn vertex(vertex: Vertex) -> VertexOutput {
     local = rot_y(local, c, s);
     normal = rot_y(normal, c, s);
 
+    // Cheer hop: celebrating units bounce; braced-walk adds a slight
+    // crouch on the advance too.
+    let hop = 0.06 * celebrate * max(sin(globals.time * 9.0 + seed * 6.2831853), 0.0);
     let position = local * vertex.i_pos_scale.w
         + vertex.i_pos_scale.xyz
-        + vec3<f32>(0.0, bob - 0.15 * death - 0.07 * brace, 0.0);
+        + vec3<f32>(0.0, bob - 0.15 * death - 0.07 * brace - 0.03 * ready * moving + hop, 0.0);
 
     var out: VertexOutput;
     // Instance entity sits at the origin with identity transform, so passing

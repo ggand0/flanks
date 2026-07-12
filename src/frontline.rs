@@ -29,6 +29,9 @@ const ENGAGE_HOLD_TICKS: u8 = 45;
 /// Enemy regiment centroid within this range flags `enemy_near`: the
 /// regiment's units run the sparse-fight wide acquisition.
 const ENEMY_NEAR_R: f32 = 60.0;
+/// Victory-cheer length (~5 s at 30 Hz) after the last nearby unbroken
+/// enemy regiment routs or dies.
+const CELEBRATE_TICKS: u16 = 150;
 
 #[derive(Resource)]
 pub struct InfluenceField {
@@ -274,6 +277,7 @@ fn update_groups(units: Res<Units>, mut groups: ResMut<Groups>) {
         .map(|(s, c)| if *c > 0 { *s / *c as f32 } else { Vec2::ZERO })
         .collect();
     let teams: Vec<u8> = groups.list.iter().map(|g| g.team).collect();
+    let broken: Vec<bool> = groups.list.iter().map(|g| g.state.is_broken()).collect();
 
     for (g, group) in groups.list.iter_mut().enumerate() {
         group.count = counts[g];
@@ -286,6 +290,7 @@ fn update_groups(units: Res<Units>, mut groups: ResMut<Groups>) {
         group.centroid = cents[g];
         let mut nearest_d2 = ENEMY_NEAR_R * ENEMY_NEAR_R;
         let mut threat = Vec2::ZERO;
+        let mut hostile = false;
         for t in 0..n {
             if t != g && counts[t] > 0 && teams[t] != group.team {
                 let d2 = cents[t].distance_squared(group.centroid);
@@ -293,10 +298,25 @@ fn update_groups(units: Res<Units>, mut groups: ResMut<Groups>) {
                     nearest_d2 = d2;
                     threat = cents[t] - group.centroid;
                 }
+                if d2 < ENEMY_NEAR_R * ENEMY_NEAR_R && !broken[t] {
+                    hostile = true;
+                }
             }
         }
         group.enemy_near = threat != Vec2::ZERO;
         group.threat_dir = threat.normalize_or_zero();
+        // Victory cheer: the last UNBROKEN enemy regiment nearby routed
+        // or died — the line roars (render-only, ~5 s).
+        if group.hostile_near && !hostile && !group.state.is_broken() {
+            group.celebrate = CELEBRATE_TICKS;
+            info!("regiment {g} CHEERS");
+        }
+        if hostile || group.state.is_broken() {
+            group.celebrate = 0;
+        } else {
+            group.celebrate = group.celebrate.saturating_sub(1);
+        }
+        group.hostile_near = hostile;
 
         if fighting[g] {
             group.engage_hold = ENGAGE_HOLD_TICKS;

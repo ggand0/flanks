@@ -310,6 +310,10 @@ fn sync_instance_data(
         })
         .collect();
     let stance = &stance[..];
+    // Victory cheer (rides the positive band as style digit 3 — a
+    // celebrating regiment has no one left to swing at).
+    let celebrating: Vec<bool> = groups.list.iter().map(|g| g.celebrate > 0).collect();
+    let celebrating = &celebrating[..];
 
     // Parallel cull + bucket build into per-chunk scratch, then one memcpy
     // concat per bucket. The scratch vecs keep their allocations across
@@ -428,6 +432,10 @@ fn sync_instance_data(
                             >> crate::units::SWING_STYLE_SHIFT)
                             as f32;
                         style * 2.0 + lunge
+                    } else if units.death_t[i] == 0
+                        && celebrating.get(units.group[i] as usize).copied().unwrap_or(false)
+                    {
+                        6.0
                     } else if units.death_t[i] == 0 {
                         // Negative lunge = battle stance amount (NOT walk
                         // scaled: standing units need it for the taunt;
