@@ -14,8 +14,9 @@ struct Vertex {
     @location(8) i_pos_scale: vec4<f32>,
     // rgb = team color, a = stable per-unit anim seed (not opacity).
     @location(9) i_color: vec4<f32>,
-    // x = yaw, y = move amount 0..1, z = lunge: 0..1 wind-up progress,
-    // negative = battle-stance amount (-0.5 blade leveled, -1 charging),
+    // x = yaw, y = move amount 0..1. z positive = attack: style*2 +
+    // wind-up progress (style 0 stab, 1 slash); z negative = stance
+    // band (-0.25 enemy near, -0.5 blade leveled, -1 charging).
     // w = fx: [0,1) hit-flash intensity, [1,2] = 1 + death progress.
     @location(10) i_anim: vec4<f32>,
 };
@@ -47,13 +48,22 @@ fn pitch_normal(n: vec3<f32>, ang: f32) -> vec3<f32> {
 fn vertex(vertex: Vertex) -> VertexOutput {
     let yaw = vertex.i_anim.x;
     let moving = vertex.i_anim.y;
-    let lunge = max(vertex.i_anim.z, 0.0);
-    // Negative lunge band: 0..0.5 ramps into battle stance (blade
-    // leveled), 0.5..1 adds the charge sprint (lean, stride, bob).
+    // Positive z: attack progress. The 2s digit is the swing STYLE
+    // (0 = stab, 1 = slash), the remainder is lunge 0..~1.35.
+    let zpos = max(vertex.i_anim.z, 0.0);
+    let style = floor(zpos * 0.5 + 0.001);
+    let lunge = zpos - style * 2.0;
+    // Negative z band: 0.25 = enemy in watch range (brace when
+    // standing), 0.5 = battle stance (blade leveled), 1 = charging
+    // (sprint lean, stride, bob).
     let band = max(-vertex.i_anim.z, 0.0);
-    let stance = smoothstep(0.0, 0.5, band);
+    let ready = smoothstep(0.05, 0.25, band);
+    let stance = smoothstep(0.25, 0.5, band);
     let sprint = smoothstep(0.5, 1.0, band);
     let fx = vertex.i_anim.w;
+    // Brace: standing, enemy near/engaged, not attacking — a planted
+    // fight stance (split legs, slight crouch, blade up at ready).
+    let brace = ready * (1.0 - moving) * (1.0 - smoothstep(0.0, 0.05, lunge));
     let seed = vertex.i_color.a;
     let part = vertex.part_pivot.x;
     let pivot = vertex.part_pivot.y;
@@ -65,9 +75,11 @@ fn vertex(vertex: Vertex) -> VertexOutput {
 
     // --- Part animation (rotations around the part pivot) ---
     if part > 1.5 {
-        // Legs: opposite-phase walk swing, harder stride on the charge.
+        // Legs: opposite-phase walk swing, harder stride on the charge;
+        // bracing splits the stance (one foot planted forward).
         let side = select(1.0, -1.0, part > 2.5);
-        let ang = 0.55 * (1.0 + 0.35 * sprint) * moving * sin(phase) * side;
+        let ang = 0.55 * (1.0 + 0.35 * sprint) * moving * sin(phase) * side
+            + 0.24 * brace * side;
         local = pitch_about(local, pivot, ang);
         normal = pitch_normal(normal, ang);
     } else if part > 0.5 {
@@ -90,12 +102,10 @@ fn vertex(vertex: Vertex) -> VertexOutput {
         let taunt = tpulse * stance * (1.0 - moving) * (1.0 - smoothstep(0.0, 0.05, lunge));
         let ang_taunt = taunt * (1.7 + 0.22 * sin(globals.time * 16.0));
 
-        let style = fract(seed * 7.31);
+        // Style picked per SWING by the sim (swing bits): 0 = stab,
+        // 1 = slash. (The overhead chop was retired — owner.)
         var ang = 0.0;
-        if style < 0.40 {
-            // Overhead chop (the original swing).
-            ang = 1.9 * raise - 2.5 * chop;
-        } else if style < 0.75 {
+        if style < 0.5 {
             // Stab: draw the arm back, then thrust the blade forward
             // near-level. Translation happens in local space (pre-yaw).
             ang = 0.55 * raise - 0.45 * chop;
@@ -110,7 +120,8 @@ fn vertex(vertex: Vertex) -> VertexOutput {
             normal = rot_y(normal, yc, ys);
             ang = 0.5 * raise - 0.3 * chop;
         }
-        ang += sway + carry + ang_taunt;
+        // Brace lifts the blade to a ready guard above the level point.
+        ang += sway + carry + ang_taunt + 0.35 * brace;
         local = pitch_about(local, pivot, ang);
         normal = pitch_normal(normal, ang);
     }
@@ -160,7 +171,7 @@ fn vertex(vertex: Vertex) -> VertexOutput {
 
     let position = local * vertex.i_pos_scale.w
         + vertex.i_pos_scale.xyz
-        + vec3<f32>(0.0, bob - 0.15 * death, 0.0);
+        + vec3<f32>(0.0, bob - 0.15 * death - 0.05 * brace, 0.0);
 
     var out: VertexOutput;
     // Instance entity sits at the origin with identity transform, so passing

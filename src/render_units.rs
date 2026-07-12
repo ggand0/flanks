@@ -290,9 +290,10 @@ fn sync_instance_data(
     // Broken regiments render desaturated (no extra instance data needed).
     let broken: Vec<bool> = groups.list.iter().map(|g| g.state.is_broken()).collect();
     let broken = &broken[..];
-    // Battle stance (negative lunge band): 0.5 = blade leveled (engaged,
-    // or hunting under an attack order), 1.0 = charging (adds the sprint
-    // lean/stride). Plain moves carry the blade lowered.
+    // Battle stance (negative lunge band): 0.25 = enemy in watch range
+    // (standing units brace), 0.5 = blade leveled (engaged / attack
+    // order), 1.0 = charging (adds sprint lean/stride). Plain moves
+    // carry the blade lowered.
     let stance: Vec<f32> = groups
         .list
         .iter()
@@ -301,6 +302,8 @@ fn sync_instance_data(
                 1.0
             } else if g.engaged || matches!(g.order, Some(crate::orders::Order::Attack(_))) {
                 0.5
+            } else if g.enemy_near {
+                0.25
             } else {
                 0.0
             }
@@ -417,7 +420,14 @@ fn sync_instance_data(
                         // A charging swing raises from the leveled run-in
                         // point instead of dipping the blade first (0.18
                         // puts the raise curve at the charge point angle).
-                        if charge { (t * t * amp).max(0.18) } else { t * t * amp }
+                        let lunge =
+                            if charge { (t * t * amp).max(0.18) } else { t * t * amp };
+                        // Style (stab/slash, picked at wind-up start)
+                        // rides the 2s digit of the positive band.
+                        let style = ((sw & crate::units::SWING_STYLE_MASK)
+                            >> crate::units::SWING_STYLE_SHIFT)
+                            as f32;
+                        style * 2.0 + lunge
                     } else if units.death_t[i] == 0 {
                         // Negative lunge = battle stance amount (NOT walk
                         // scaled: standing units need it for the taunt;

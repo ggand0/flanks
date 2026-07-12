@@ -76,8 +76,11 @@ pub struct GroupData {
     pub charging: bool,
     /// An enemy regiment's centroid is within combat-watch range: units
     /// of this regiment scan wider for adjacent enemies (sparse-fight
-    /// acquisition, movement.rs).
+    /// acquisition, movement.rs) and brace when standing.
     pub enemy_near: bool,
+    /// Normalized direction to the nearest enemy regiment (ZERO when
+    /// none in watch range): standing units face it (brace facing).
+    pub threat_dir: Vec2,
     // --- morale (regiments.rs updates per tick) ---
     pub morale: f32,
     pub state: RegState,
@@ -99,6 +102,7 @@ impl GroupData {
             engage_hold: 0,
             charging: false,
             enemy_near: false,
+            threat_dir: Vec2::ZERO,
             morale: 100.0,
             state: RegState::Steady,
             recent_deaths: 0,
@@ -443,15 +447,15 @@ fn issue_order(
     }
 }
 
-/// S with a selection = HALT: drop orders and hold in place (the anchor
-/// moves to the current centroid so the block stands where it is).
-/// Without a selection, S stays camera pan (camera.rs checks).
+/// Backspace = HALT the selection (TW keybind): drop orders and hold in
+/// place (the anchor moves to the current centroid so the block stands
+/// where it is). S stays camera pan.
 fn halt_key(
     keys: Res<ButtonInput<KeyCode>>,
     selection: Res<Selection>,
     mut groups: ResMut<Groups>,
 ) {
-    if !keys.just_pressed(KeyCode::KeyS) || selection.count_units == 0 {
+    if !keys.just_pressed(KeyCode::Backspace) || selection.count_units == 0 {
         return;
     }
     let mut halted = 0;

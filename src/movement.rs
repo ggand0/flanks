@@ -194,6 +194,9 @@ pub fn step_sim(
         .map(|g| g.enemy_near || g.engaged)
         .collect();
     let press = &press[..];
+    // Direction to the nearest enemy regiment (brace facing).
+    let threat: Vec<Vec2> = groups.list.iter().map(|g| g.threat_dir).collect();
+    let threat = &threat[..];
     let bounds_min = terrain.min() + 4.0;
     let bounds_max = terrain.max() - 4.0;
 
@@ -433,10 +436,21 @@ pub fn step_sim(
                                     // lunge (render reads the flag).
                                     let v2 = v_chunk[j].xz().length_squared();
                                     let cs = speed[i] * CHARGE_SPEED_FRAC;
+                                    // Attack style for this swing (render
+                                    // variety only). TEMP: stabs only while
+                                    // the owner evaluates the pose; the
+                                    // commented pick mixes stab/slash.
+                                    let style = 0u8;
+                                    // let style = (crate::units::hash01(
+                                    //     tick_seed ^ (i as u32).wrapping_mul(0x51ED),
+                                    // ) * 2.0) as u8;
+                                    let style = style << crate::units::SWING_STYLE_SHIFT;
                                     sw_chunk[j] = if v2 > cs * cs {
-                                        crate::units::SWING_WINDUP | crate::units::SWING_CHARGE
-                                    } else {
                                         crate::units::SWING_WINDUP
+                                            | crate::units::SWING_CHARGE
+                                            | style
+                                    } else {
+                                        crate::units::SWING_WINDUP | style
                                     };
                                     swt_chunk[j] = params.windup_ticks;
                                 }
@@ -546,6 +560,15 @@ pub fn step_sim(
                         Some(t) => t - p,
                         None if !routed && best_idx != u32::MAX => {
                             pos_prev[best_idx as usize].xz() - p
+                        }
+                        // Standing watch: near-stationary units of a
+                        // regiment with enemy mass nearby turn toward it
+                        // (brace facing) instead of keeping a stale yaw.
+                        None if !routed
+                            && new_v.length_squared() < 0.25
+                            && threat[gi] != Vec2::ZERO =>
+                        {
+                            threat[gi]
                         }
                         None => new_v,
                     };

@@ -1,6 +1,6 @@
 //! RTS camera: WASD + screen-edge pan, smoothed scroll zoom,
-//! middle-drag rotate. S pans only while nothing is selected (with a
-//! selection it is the halt order, orders.rs).
+//! middle-drag rotate. Keyboard pan takes priority over edge pan (a
+//! cursor parked at the bottom edge must not cancel W).
 
 use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll, MouseScrollUnit};
 use bevy::prelude::*;
@@ -59,7 +59,6 @@ fn control_camera(
     motion: Res<AccumulatedMouseMotion>,
     scroll: Res<AccumulatedMouseScroll>,
     window: Query<&Window, With<PrimaryWindow>>,
-    selection: Res<crate::orders::Selection>,
     time: Res<Time>,
     mut query: Query<&mut RtsCamera>,
 ) {
@@ -67,13 +66,12 @@ fn control_camera(
         return;
     };
 
-    // Pan in the camera's yaw frame, speed scales with zoom. S is the
-    // HALT order while regiments are selected (orders.rs).
+    // Pan in the camera's yaw frame, speed scales with zoom.
     let mut pan = Vec2::ZERO;
     if keys.pressed(KeyCode::KeyW) {
         pan.y -= 1.0;
     }
-    if keys.pressed(KeyCode::KeyS) && selection.count_units == 0 {
+    if keys.pressed(KeyCode::KeyS) {
         pan.y += 1.0;
     }
     if keys.pressed(KeyCode::KeyA) {
@@ -82,8 +80,10 @@ fn control_camera(
     if keys.pressed(KeyCode::KeyD) {
         pan.x += 1.0;
     }
-    // Screen-edge pan (only while the cursor is inside the window).
-    if let Ok(win) = window.single()
+    // Screen-edge pan — only when no key pan is active (opposing inputs
+    // must not cancel) and the cursor is inside the window.
+    if pan == Vec2::ZERO
+        && let Ok(win) = window.single()
         && let Some(c) = win.cursor_position()
     {
         let (w, h) = (win.width(), win.height());
