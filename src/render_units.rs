@@ -419,9 +419,10 @@ fn sync_instance_data(
                         // puts the raise curve at the charge point angle).
                         if charge { (t * t * amp).max(0.18) } else { t * t * amp }
                     } else if units.death_t[i] == 0 {
-                        // Negative lunge = battle stance amount, scaled by
-                        // the walk cycle so jammed stragglers don't posture.
-                        -move_amount * stance.get(units.group[i] as usize).copied().unwrap_or(0.0)
+                        // Negative lunge = battle stance amount (NOT walk
+                        // scaled: standing units need it for the taunt;
+                        // the shader gates the sprint lean by walk).
+                        -stance.get(units.group[i] as usize).copied().unwrap_or(0.0)
                     } else {
                         0.0
                     };

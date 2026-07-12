@@ -71,9 +71,10 @@ fn vertex(vertex: Vertex) -> VertexOutput {
         local = pitch_about(local, pivot, ang);
         normal = pitch_normal(normal, ang);
     } else if part > 0.5 {
-        // Sword arm: raise the blade up/back through the wind-up, then a
-        // fast chop over the last stretch so the blade lands exactly when
-        // the damage event fires (lunge hits 1.0 at the strike tick).
+        // Sword arm. Three per-unit attack styles (stable seed pick), all
+        // timed so the blow lands exactly when the damage event fires
+        // (lunge hits 1.0 at the strike tick): overhead chop, forward
+        // stab, horizontal slash.
         let raise = smoothstep(0.0, 0.8, lunge);
         let chop = smoothstep(0.85, 1.0, lunge);
         // Idle/walk sway when not attacking.
@@ -81,27 +82,74 @@ fn vertex(vertex: Vertex) -> VertexOutput {
         // Ordinary moves carry the blade lowered at the side; battle
         // stance levels it at the enemy (slightly above horizontal).
         let carry = mix(-0.55, 0.25, stance) * moving * (1.0 - raise);
-        let ang = 1.9 * raise - 2.5 * chop + sway + carry;
+        // Taunt: STANDING units of a fighting regiment pump the blade
+        // skyward for ~1.5 s every ~7 s, staggered per unit by seed —
+        // the rear ranks jeer while the front works.
+        let tc = fract(globals.time / 7.3 + seed * 5.13);
+        let tpulse = smoothstep(0.02, 0.12, tc) * (1.0 - smoothstep(0.24, 0.34, tc));
+        let taunt = tpulse * stance * (1.0 - moving) * (1.0 - smoothstep(0.0, 0.05, lunge));
+        let ang_taunt = taunt * (1.7 + 0.22 * sin(globals.time * 16.0));
+
+        let style = fract(seed * 7.31);
+        var ang = 0.0;
+        if style < 0.40 {
+            // Overhead chop (the original swing).
+            ang = 1.9 * raise - 2.5 * chop;
+        } else if style < 0.75 {
+            // Stab: draw the arm back, then thrust the blade forward
+            // near-level. Translation happens in local space (pre-yaw).
+            ang = 0.55 * raise - 0.45 * chop;
+            local.z += -0.30 * raise + 1.05 * chop;
+        } else {
+            // Slash: horizontal sweep around the body axis — wind back,
+            // cut across.
+            let yawoff = -1.1 * raise + 2.3 * chop;
+            let yc = cos(yawoff);
+            let ys = sin(yawoff);
+            local = rot_y(local, yc, ys);
+            normal = rot_y(normal, yc, ys);
+            ang = 0.5 * raise - 0.3 * chop;
+        }
+        ang += sway + carry + ang_taunt;
         local = pitch_about(local, pivot, ang);
         normal = pitch_normal(normal, ang);
     }
 
     // Walk bob + slight forward lean; lunge adds body punch, charging
-    // adds a sprint lean and a heavier bob.
+    // adds a sprint lean and a heavier bob. Sprint lean is walk-gated
+    // (the stance band is no longer walk-scaled) so jammed stragglers
+    // don't posture.
     let bob = 0.05 * (1.0 + 0.4 * sprint) * moving * sin(phase * 2.0);
-    let lean = (0.10 * moving + 0.30 * lunge + 0.24 * sprint) * clamp(local.y + 0.5, 0.0, 1.5);
+    let lean = (0.10 * moving + 0.30 * lunge + 0.24 * sprint * (0.25 + 0.75 * moving))
+        * clamp(local.y + 0.5, 0.0, 1.5);
     local.z += lean * 0.3;
 
-    // Death: topple forward around the feet and sink slightly.
+    // Death: topple around the feet and sink slightly. Fall direction
+    // varies per unit (seed): forward, backward, or to either side —
+    // corpses keep their seed, so the pose persists on the ground.
     let death = clamp(fx - 1.0, 0.0, 1.0);
     if death > 0.0 {
-        let ang = death * 1.45; // ~83 degrees
-        let ca = cos(ang);
-        let sa = sin(ang);
-        // Rotate around the X axis at foot height (local ~ -0.5).
+        let dvar = fract(seed * 13.73);
         let fy = local.y + 0.5;
-        local = vec3<f32>(local.x, fy * ca - local.z * sa - 0.5, fy * sa + local.z * ca);
-        normal = vec3<f32>(normal.x, normal.y * ca - normal.z * sa, normal.y * sa + normal.z * ca);
+        if dvar < 0.62 {
+            // Forward (most common) or backward topple about X.
+            let dir = select(1.0, -0.9, dvar > 0.45);
+            let ang = dir * death * 1.45;
+            let ca = cos(ang);
+            let sa = sin(ang);
+            local = vec3<f32>(local.x, fy * ca - local.z * sa - 0.5, fy * sa + local.z * ca);
+            normal =
+                vec3<f32>(normal.x, normal.y * ca - normal.z * sa, normal.y * sa + normal.z * ca);
+        } else {
+            // Sideways collapse about Z (either side).
+            let dir = select(1.0, -1.0, dvar < 0.81);
+            let ang = dir * death * 1.4;
+            let ca = cos(ang);
+            let sa = sin(ang);
+            local = vec3<f32>(local.x * ca + fy * sa, fy * ca - local.x * sa - 0.5, local.z);
+            normal =
+                vec3<f32>(normal.x * ca + normal.y * sa, normal.y * ca - normal.x * sa, normal.z);
+        }
     }
 
     // Face yaw (0 = +Z): rotate position and normal.
