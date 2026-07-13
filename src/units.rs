@@ -25,14 +25,21 @@ pub struct Units {
     pub kind: Vec<u8>,
     /// Smoothed facing angle around Y (0 = +Z); sim-owned, render-consumed.
     pub yaw: Vec<f32>,
+    /// Facing at the previous fixed tick; rendering lerps yaw_prev -> yaw.
+    pub yaw_prev: Vec<f32>,
     /// Index into `Groups::list`.
     pub group: Vec<u32>,
     pub hp: Vec<f32>,
     /// Base render color (team color with per-unit variation baked in).
     /// Alpha carries a stable per-unit anim seed, not opacity.
     pub color: Vec<[f32; 4]>,
-    /// Current melee target (unit index); `u32::MAX` = none. Only trusted
-    /// within a swing cycle — validated through the grid and at hit time.
+    /// Combat memo (unit index; `u32::MAX` = none): the melee target
+    /// while a swing is in flight, and the sparse-fight closing memo
+    /// otherwise (movement.rs wide acquisition). NEVER cleared, and
+    /// death-sweep swap-removes reindex units, so it can point at an
+    /// arbitrary unit later — every consumer MUST validate on use
+    /// (swings re-check at hit time; the closing drive checks team and
+    /// distance). Do not read it as "current enemy" anywhere else.
     pub target: Vec<u32>,
     /// Swing state: 0 = Ready, 1 = WindUp, 2 = Recover.
     pub swing: Vec<u8>,
@@ -49,10 +56,19 @@ pub struct Units {
     pub home: Vec<Vec2>,
 }
 
-/// Swing states (the `swing` column).
+/// Swing states (the `swing` column, low bits) + the charge flag bit.
 pub const SWING_READY: u8 = 0;
 pub const SWING_WINDUP: u8 = 1;
 pub const SWING_RECOVER: u8 = 2;
+pub const SWING_STATE_MASK: u8 = 3;
+/// Attack style for the CURRENT swing (bits 3-4, set at wind-up start,
+/// wiped with the state): 0 = stab, 1 = classic swing, 2 = slash
+/// (benched). Render-only variety.
+pub const SWING_STYLE_SHIFT: u8 = 3;
+pub const SWING_STYLE_MASK: u8 = 0b11 << SWING_STYLE_SHIFT;
+/// Set when the swing was started at charging speed: bonus damage and a
+/// bigger lunge — momentum matters (cavalry-less charge bonus for now).
+pub const SWING_CHARGE: u8 = 4;
 
 impl Units {
     pub fn len(&self) -> usize {
@@ -135,7 +151,9 @@ pub fn push_unit(
     units.team.push(team);
     units.kind.push(kind);
     // Face the enemy at spawn (0 = +Z).
-    units.yaw.push(if team == 0 { 0.0 } else { std::f32::consts::PI });
+    let spawn_yaw = if team == 0 { 0.0 } else { std::f32::consts::PI };
+    units.yaw.push(spawn_yaw);
+    units.yaw_prev.push(spawn_yaw);
     units.group.push(group);
     units.hp.push(params.hp);
 
@@ -169,7 +187,7 @@ pub fn spawn_surround_test(
     terrain: &crate::terrain::Terrain,
     groups: &mut crate::orders::Groups,
 ) {
-    use crate::orders::GroupData;
+    use crate::orders::{GroupData, Order};
     use crate::unit_types::KIND_LIGHT;
     let pocket_c = Vec2::new(-200.0, 0.0);
     let mut seed = 1u32;
@@ -192,7 +210,7 @@ pub fn spawn_surround_test(
         let anchor = pocket_c + Vec2::new(mid.cos(), mid.sin()) * 20.5;
         let g = list.len() as u32;
         let mut gd = GroupData::new(1, KIND_LIGHT, anchor, 500);
-        gd.order = Some(pocket_c);
+        gd.order = Some(Order::Move(pocket_c));
         list.push(gd);
         for _ in 0..500 {
             seed = seed.wrapping_add(1);
@@ -227,7 +245,7 @@ pub fn spawn_surround_test(
     let mut press = GroupData::new(1, KIND_LIGHT, orange_anchor, 2000);
     // Press to CONTACT, not through: the fight must stay frontal (the
     // pocket is the surrounded case; this is the control).
-    press.order = Some(Vec2::new(orange_anchor.x, 13.0));
+    press.order = Some(Order::Move(Vec2::new(orange_anchor.x, 13.0)));
     list.push(press);
     block(units, &mut seed, 1, 6, orange_anchor, 40.0, 2000);
 

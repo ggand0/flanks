@@ -1,7 +1,10 @@
 mod ai;
+mod audio;
+mod banners;
 mod camera;
 mod combat;
 mod frontline;
+mod morale;
 mod movement;
 mod orders;
 mod overlay;
@@ -19,20 +22,32 @@ use bevy::window::PresentMode;
 
 fn main() {
     App::new()
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window {
-                title: "frontline".into(),
-                // Uncapped so the FPS overlay shows real headroom.
-                present_mode: PresentMode::AutoNoVsync,
-                ..default()
-            }),
-            ..default()
-        }))
+        .add_plugins(
+            DefaultPlugins
+                .set(WindowPlugin {
+                    primary_window: Some(Window {
+                        title: "frontline".into(),
+                        // Uncapped so the FPS overlay shows real headroom.
+                        present_mode: PresentMode::AutoNoVsync,
+                        ..default()
+                    }),
+                    ..default()
+                })
+                // Resolve assets/ from the repo regardless of how the
+                // binary is launched (cargo run vs ./target/...).
+                .set(AssetPlugin {
+                    file_path: concat!(env!("CARGO_MANIFEST_DIR"), "/assets").into(),
+                    ..default()
+                }),
+        )
         .add_plugins((
             terrain::TerrainPlugin,
             units::UnitsPlugin,
             regiments::RegimentsPlugin,
+            morale::MoralePlugin,
             ai::AiPlugin,
+            banners::BannersPlugin,
+            audio::BattleAudioPlugin,
             movement::MovementPlugin,
             orders::OrdersPlugin,
             frontline::FrontlinePlugin,

@@ -19,9 +19,19 @@ pub const FIELD_CELL: f32 = 8.0;
 /// Both teams' blurred density must exceed this for a cell to be "contact":
 /// the drawn line only exists where masses genuinely collide.
 const CONTACT_T: f32 = 0.5;
-/// Enemy blurred density at a group's centroid above which it counts as
-/// engaged (keeps its order pressing instead of "arriving").
-const ENGAGED_T: f32 = 0.8;
+/// Attack orders enter the charge phase (war cry, sprint pose) inside
+/// this distance to the target regiment's centroid. Pub: the audio war
+/// cry keys off the same range.
+pub const CHARGE_RANGE: f32 = 60.0;
+/// Ticks `engaged` stays on after the last soldier's wind-up — bridges
+/// the recover/ready gaps between swing cycles (~1.5 s at 30 Hz).
+const ENGAGE_HOLD_TICKS: u8 = 45;
+/// Enemy regiment centroid within this range flags `enemy_near`: the
+/// regiment's units run the sparse-fight wide acquisition.
+const ENEMY_NEAR_R: f32 = 60.0;
+/// Victory-cheer length (~5 s at 30 Hz) after the last nearby unbroken
+/// enemy regiment routs or dies. Pub: render encodes cheer progress.
+pub const CELEBRATE_TICKS: u16 = 150;
 
 #[derive(Resource)]
 pub struct InfluenceField {
@@ -240,24 +250,106 @@ fn update_field(
     stats.field_ms = t0.elapsed().as_secs_f32() * 1000.0;
 }
 
-/// Refresh group centroids and contact flags (bookkeeping only).
-fn update_groups(units: Res<Units>, mut groups: ResMut<Groups>, field: Res<InfluenceField>) {
+/// Refresh group centroids, contact flags, and charge state (bookkeeping
+/// only — nothing here steers units).
+fn update_groups(units: Res<Units>, mut groups: ResMut<Groups>) {
     let n = groups.list.len();
     let mut sums = vec![Vec2::ZERO; n];
     let mut counts = vec![0usize; n];
+    let mut fighting = vec![false; n];
     for i in 0..units.len() {
         let g = units.group[i] as usize;
         sums[g] += Vec2::new(units.pos[i].x, units.pos[i].z);
         counts[g] += 1;
+        // Ground-truth contact: a unit in WIND-UP has an enemy in reach
+        // and is striking. TW rule — one soldier fighting engages the
+        // regiment. (`target` is stale outside a swing cycle and `swing`
+        // spawns in Recover for strike staggering — neither is usable.)
+        if units.death_t[i] == 0
+            && units.swing[i] & crate::units::SWING_STATE_MASK == crate::units::SWING_WINDUP
+        {
+            fighting[g] = true;
+        }
     }
+    let cents: Vec<Vec2> = sums
+        .iter()
+        .zip(&counts)
+        .map(|(s, c)| if *c > 0 { *s / *c as f32 } else { Vec2::ZERO })
+        .collect();
+    let teams: Vec<u8> = groups.list.iter().map(|g| g.team).collect();
+    let broken: Vec<bool> = groups.list.iter().map(|g| g.state.is_broken()).collect();
+
     for (g, group) in groups.list.iter_mut().enumerate() {
         group.count = counts[g];
         if counts[g] == 0 {
             group.engaged = false;
+            group.engage_hold = 0;
+            group.charging = false;
             continue;
         }
-        group.centroid = sums[g] / counts[g] as f32;
-        group.engaged = field.density(1 - group.team, group.centroid) > ENGAGED_T;
+        group.centroid = cents[g];
+        let mut nearest_d2 = ENEMY_NEAR_R * ENEMY_NEAR_R;
+        let mut threat = Vec2::ZERO;
+        let mut hostile = false;
+        for t in 0..n {
+            if t != g && counts[t] > 0 && teams[t] != group.team {
+                let d2 = cents[t].distance_squared(group.centroid);
+                if d2 < nearest_d2 {
+                    nearest_d2 = d2;
+                    threat = cents[t] - group.centroid;
+                }
+                if d2 < ENEMY_NEAR_R * ENEMY_NEAR_R && !broken[t] {
+                    hostile = true;
+                }
+            }
+        }
+        group.enemy_near = threat != Vec2::ZERO;
+        group.threat_dir = threat.normalize_or_zero();
+        // Victory cheer: the last UNBROKEN enemy regiment nearby routed
+        // or died — the line roars (render-only, ~5 s).
+        if group.hostile_near && !hostile && !group.state.is_broken() {
+            group.celebrate = CELEBRATE_TICKS;
+            info!("regiment {g} CHEERS");
+        }
+        if hostile || group.state.is_broken() {
+            group.celebrate = 0;
+        } else {
+            group.celebrate = group.celebrate.saturating_sub(1);
+        }
+        group.hostile_near = hostile;
+
+        if fighting[g] {
+            group.engage_hold = ENGAGE_HOLD_TICKS;
+        } else {
+            group.engage_hold = group.engage_hold.saturating_sub(1);
+        }
+        let engaged = group.engage_hold > 0;
+        if engaged != group.engaged {
+            info!(
+                "regiment {g} {}",
+                if engaged { "ENGAGED" } else { "DISENGAGED" }
+            );
+        }
+        group.engaged = engaged;
+
+        // Charge phase: explicit attack order, inside charge range of the
+        // target, not yet in contact. Pure predicate — no latch, nothing
+        // inferred from density or speed.
+        let charging = if engaged || group.state.is_broken() {
+            false
+        } else if let Some(crate::orders::Order::Attack(t)) = group.order {
+            let t = t as usize;
+            counts[t] > 0 && cents[t].distance(group.centroid) < CHARGE_RANGE
+        } else {
+            false
+        };
+        if charging != group.charging {
+            info!(
+                "regiment {g} {}",
+                if charging { "CHARGES" } else { "CHARGE ENDS" }
+            );
+        }
+        group.charging = charging;
     }
 }
 
@@ -281,7 +373,6 @@ fn draw_front_gizmos(
 /// then push it through the line as a salient.
 fn test_front_script(
     time: Res<Time>,
-    units: Res<Units>,
     mut groups: ResMut<Groups>,
     mut stage: Local<u32>,
     mut next_reorder: Local<f32>,
@@ -292,27 +383,35 @@ fn test_front_script(
     }
     let t = time.elapsed_secs();
 
-    // Stand-in for player/AI: idle unengaged regiments re-target the enemy
-    // mass every 15 s so remnant pockets hunt each other down.
+    // Stand-in for player/AI: idle unengaged regiments ATTACK their
+    // nearest enemy regiment every 15 s so remnant pockets hunt each
+    // other down (also exercises attack orders + charge phase).
     if *stage >= 1 && t > *next_reorder {
         *next_reorder = t + 15.0;
-        let mut sums = [Vec2::ZERO; 2];
-        let mut counts = [0usize; 2];
-        for i in 0..units.len() {
-            if units.death_t[i] > 0 {
-                continue;
-            }
-            let tm = units.team[i] as usize;
-            sums[tm] += Vec2::new(units.pos[i].x, units.pos[i].z);
-            counts[tm] += 1;
-        }
+        let snapshot: Vec<(u8, usize, Vec2)> = groups
+            .list
+            .iter()
+            .map(|g| (g.team, g.count, g.centroid))
+            .collect();
         for (g, group) in groups.list.iter_mut().enumerate() {
             if watch.is_some_and(|(w, _)| w as usize == g) {
                 continue; // drift-watch regiment must stay unordered
             }
-            let enemy = 1 - group.team as usize;
-            if group.count > 0 && !group.engaged && group.order.is_none() && counts[enemy] > 0 {
-                group.order = Some(sums[enemy] / counts[enemy] as f32);
+            if group.count == 0 || group.engaged || group.order.is_some() {
+                continue;
+            }
+            let nearest = snapshot
+                .iter()
+                .enumerate()
+                .filter(|(_, (team, count, _))| *team != group.team && *count > 0)
+                .min_by(|a, b| {
+                    a.1 .2
+                        .distance_squared(group.centroid)
+                        .total_cmp(&b.1 .2.distance_squared(group.centroid))
+                })
+                .map(|(t, _)| t as u32);
+            if let Some(t) = nearest {
+                group.order = Some(crate::orders::Order::Attack(t));
             }
         }
     }
@@ -323,7 +422,7 @@ fn test_front_script(
             // their x, fronts collide near z = 0.
             for group in groups.list.iter_mut() {
                 let dir: f32 = if group.team == 0 { 1.0 } else { -1.0 };
-                group.order = Some(Vec2::new(group.anchor.x, dir * 10.0));
+                group.order = Some(crate::orders::Order::Move(Vec2::new(group.anchor.x, dir * 10.0)));
             }
             info!("[front-test] all regiments ordered into contact");
             *stage = 1;
@@ -356,7 +455,8 @@ fn test_front_script(
                 let drift = groups.list[g as usize].centroid.distance(start);
                 info!("[front-test] held regiment {g} drift over 20s: {drift:.2} m");
                 // Now push it through the line as a salient.
-                groups.list[g as usize].order = Some(Vec2::new(40.0, 120.0));
+                groups.list[g as usize].order =
+                    Some(crate::orders::Order::Move(Vec2::new(40.0, 120.0)));
                 info!("[front-test] salient regiment {g} ordered through the line");
             }
             *stage = 3;

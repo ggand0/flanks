@@ -14,7 +14,9 @@ struct Vertex {
     @location(8) i_pos_scale: vec4<f32>,
     // rgb = team color, a = stable per-unit anim seed (not opacity).
     @location(9) i_color: vec4<f32>,
-    // x = yaw, y = move amount 0..1, z = lunge 0..1 (wind-up progress),
+    // x = yaw, y = move amount 0..1. z positive = attack: style*2 +
+    // wind-up progress (style 0 stab, 1 slash); z negative = stance
+    // band (-0.25 enemy near, -0.5 blade leveled, -1 charging).
     // w = fx: [0,1) hit-flash intensity, [1,2] = 1 + death progress.
     @location(10) i_anim: vec4<f32>,
 };
@@ -23,6 +25,14 @@ struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) color: vec4<f32>,
 };
+
+// Standing brace pose (split legs, crouch, raised guard): benched by
+// the owner ("weird") but kept — set to 1.0 to re-enable. Standing
+// units near an enemy hold the plain forward point instead.
+const BRACE_ON: f32 = 0.0;
+// Rear-rank taunt: benched pending an owner rework ("something is
+// making me uncomfortable") — set to 1.0 to re-enable.
+const TAUNT_ON: f32 = 0.0;
 
 fn rot_y(p: vec3<f32>, c: f32, s: f32) -> vec3<f32> {
     return vec3<f32>(p.x * c + p.z * s, p.y, -p.x * s + p.z * c);
@@ -46,11 +56,41 @@ fn pitch_normal(n: vec3<f32>, ang: f32) -> vec3<f32> {
 fn vertex(vertex: Vertex) -> VertexOutput {
     let yaw = vertex.i_anim.x;
     let moving = vertex.i_anim.y;
-    let lunge = vertex.i_anim.z;
+    // Positive z: attack progress. The 2s digit is the swing STYLE
+    // (0 = stab, 1 = classic swing, 2 = slash), remainder = lunge
+    // 0..~1.35. z >= 6 = victory cheer (no one left to swing at).
+    let zpos = max(vertex.i_anim.z, 0.0);
+    let style = floor(zpos * 0.5 + 0.001);
+    let lunge = zpos - style * 2.0;
+    // Cheer: z = 6 + progress. Ease in over the first ~8% and back out
+    // over the last ~10% — poses must never snap in one frame.
+    let cele_t = clamp(zpos - 6.0, 0.0, 1.0);
+    let celebrate = step(5.0, zpos)
+        * smoothstep(0.0, 0.08, cele_t)
+        * (1.0 - smoothstep(0.90, 1.0, cele_t));
+    // Negative z band: 0.25 = enemy in watch range (brace when
+    // standing), 0.5 = fighting but wavering (brace, no taunt),
+    // 0.65 = fighting confident (taunts), 1 = charging (sprint).
+    let band = max(-vertex.i_anim.z, 0.0);
+    let ready = smoothstep(0.05, 0.25, band);
+    let stance = smoothstep(0.25, 0.5, band);
+    let confident = smoothstep(0.55, 0.65, band);
+    let sprint = smoothstep(0.7, 1.0, band);
     let fx = vertex.i_anim.w;
     let seed = vertex.i_color.a;
     let part = vertex.part_pivot.x;
     let pivot = vertex.part_pivot.y;
+    // Brace: standing, enemy near/engaged, not attacking — a planted
+    // fight stance (split legs, crouch, blade at ready guard). Only
+    // ~half the line braces (per-unit pick); the rest keep the plain
+    // standing point, so a waiting line mixes both poses.
+    let bracer = step(0.45, fract(seed * 3.77));
+    let brace = BRACE_ON
+        * bracer
+        * ready
+        * (1.0 - moving)
+        * (1.0 - smoothstep(0.0, 0.05, lunge))
+        * (1.0 - celebrate);
 
     var local = vertex.position;
     var normal = vertex.normal;
@@ -59,39 +99,103 @@ fn vertex(vertex: Vertex) -> VertexOutput {
 
     // --- Part animation (rotations around the part pivot) ---
     if part > 1.5 {
-        // Legs: opposite-phase walk swing.
+        // Legs: opposite-phase walk swing, harder stride on the charge;
+        // bracing splits the stance (one foot planted forward).
         let side = select(1.0, -1.0, part > 2.5);
-        let ang = 0.55 * moving * sin(phase) * side;
+        let ang = 0.55 * (1.0 + 0.35 * sprint) * moving * sin(phase) * side
+            + 0.32 * brace * side;
         local = pitch_about(local, pivot, ang);
         normal = pitch_normal(normal, ang);
     } else if part > 0.5 {
-        // Sword arm: raise the blade up/back through the wind-up, then a
-        // fast chop over the last stretch so the blade lands exactly when
-        // the damage event fires (lunge hits 1.0 at the strike tick).
+        // Sword arm. Three per-unit attack styles (stable seed pick), all
+        // timed so the blow lands exactly when the damage event fires
+        // (lunge hits 1.0 at the strike tick): overhead chop, forward
+        // stab, horizontal slash.
         let raise = smoothstep(0.0, 0.8, lunge);
         let chop = smoothstep(0.85, 1.0, lunge);
         // Idle/walk sway when not attacking.
         let sway = 0.18 * moving * sin(phase + 3.1415) * (1.0 - raise);
-        let ang = 1.9 * raise - 2.5 * chop + sway;
+        // Ordinary moves carry the blade lowered at the side; battle
+        // stance levels it at the enemy (slightly above horizontal),
+        // and even a watch-range advance (`ready`) brings it most of
+        // the way up — the braced walk.
+        let carry = mix(-0.55, 0.25, max(stance, ready * 0.75)) * moving * (1.0 - raise);
+        // Taunt: STANDING units of a CONFIDENT fighting regiment pump
+        // the blade skyward for ~1.5 s every ~7 s, staggered per unit —
+        // the rear ranks jeer while the front works. Wavering regiments
+        // (morale low) stop jeering and just hold the brace.
+        let tc = fract(globals.time / 7.3 + seed * 5.13);
+        let tpulse = smoothstep(0.02, 0.12, tc) * (1.0 - smoothstep(0.24, 0.34, tc));
+        let taunt =
+            TAUNT_ON * tpulse * confident * (1.0 - moving) * (1.0 - smoothstep(0.0, 0.05, lunge));
+        let ang_taunt = taunt * (1.7 + 0.22 * sin(globals.time * 16.0));
+
+        // Style picked per SWING by the sim (swing bits): 0 = stab,
+        // 1 = classic swing, 2 = slash (benched).
+        var ang = 0.0;
+        if celebrate > 0.001 {
+            // Victory cheer: blade pumped skyward, bouncing with the hop.
+            ang = celebrate * (1.75 + 0.35 * sin(globals.time * 9.0 + seed * 6.2831853));
+        } else if style < 0.5 {
+            // Stab: draw the arm back, then thrust the blade forward
+            // near-level. Translation happens in local space (pre-yaw).
+            ang = 0.55 * raise - 0.45 * chop;
+            local.z += -0.30 * raise + 1.05 * chop;
+        } else if style < 1.5 {
+            // The classic swing: raise up/back, fast chop.
+            ang = 1.9 * raise - 2.5 * chop;
+        } else {
+            // Slash: horizontal sweep around the body axis — wind back,
+            // cut across.
+            let yawoff = -1.1 * raise + 2.3 * chop;
+            let yc = cos(yawoff);
+            let ys = sin(yawoff);
+            local = rot_y(local, yc, ys);
+            normal = rot_y(normal, yc, ys);
+            ang = 0.5 * raise - 0.3 * chop;
+        }
+        // Braced units hold a proper ready guard; the non-bracers of
+        // the line keep the plain forward point (ang 0 standing).
+        ang += sway + carry + ang_taunt + 0.6 * brace;
         local = pitch_about(local, pivot, ang);
         normal = pitch_normal(normal, ang);
     }
 
-    // Walk bob + slight forward lean; lunge adds body punch.
-    let bob = 0.05 * moving * sin(phase * 2.0);
-    let lean = (0.10 * moving + 0.30 * lunge) * clamp(local.y + 0.5, 0.0, 1.5);
+    // Walk bob + slight forward lean; lunge adds body punch, charging
+    // adds a sprint lean and a heavier bob. Sprint lean is walk-gated
+    // (the stance band is no longer walk-scaled) so jammed stragglers
+    // don't posture.
+    let bob = 0.05 * (1.0 + 0.4 * sprint) * moving * sin(phase * 2.0);
+    let lean = (0.10 * moving + 0.30 * lunge + 0.24 * sprint * (0.25 + 0.75 * moving))
+        * clamp(local.y + 0.5, 0.0, 1.5);
     local.z += lean * 0.3;
 
-    // Death: topple forward around the feet and sink slightly.
+    // Death: topple around the feet and sink slightly. Fall direction
+    // varies per unit (seed): forward, backward, or to either side —
+    // corpses keep their seed, so the pose persists on the ground.
     let death = clamp(fx - 1.0, 0.0, 1.0);
     if death > 0.0 {
-        let ang = death * 1.45; // ~83 degrees
-        let ca = cos(ang);
-        let sa = sin(ang);
-        // Rotate around the X axis at foot height (local ~ -0.5).
+        let dvar = fract(seed * 13.73);
         let fy = local.y + 0.5;
-        local = vec3<f32>(local.x, fy * ca - local.z * sa - 0.5, fy * sa + local.z * ca);
-        normal = vec3<f32>(normal.x, normal.y * ca - normal.z * sa, normal.y * sa + normal.z * ca);
+        if dvar < 0.62 {
+            // Forward (most common) or backward topple about X.
+            let dir = select(1.0, -0.9, dvar > 0.45);
+            let ang = dir * death * 1.45;
+            let ca = cos(ang);
+            let sa = sin(ang);
+            local = vec3<f32>(local.x, fy * ca - local.z * sa - 0.5, fy * sa + local.z * ca);
+            normal =
+                vec3<f32>(normal.x, normal.y * ca - normal.z * sa, normal.y * sa + normal.z * ca);
+        } else {
+            // Sideways collapse about Z (either side).
+            let dir = select(1.0, -1.0, dvar < 0.81);
+            let ang = dir * death * 1.4;
+            let ca = cos(ang);
+            let sa = sin(ang);
+            local = vec3<f32>(local.x * ca + fy * sa, fy * ca - local.x * sa - 0.5, local.z);
+            normal =
+                vec3<f32>(normal.x * ca + normal.y * sa, normal.y * ca - normal.x * sa, normal.z);
+        }
     }
 
     // Face yaw (0 = +Z): rotate position and normal.
@@ -100,9 +204,12 @@ fn vertex(vertex: Vertex) -> VertexOutput {
     local = rot_y(local, c, s);
     normal = rot_y(normal, c, s);
 
+    // Cheer hop: celebrating units bounce; braced-walk adds a slight
+    // crouch on the advance too.
+    let hop = 0.06 * celebrate * max(sin(globals.time * 9.0 + seed * 6.2831853), 0.0);
     let position = local * vertex.i_pos_scale.w
         + vertex.i_pos_scale.xyz
-        + vec3<f32>(0.0, bob - 0.15 * death, 0.0);
+        + vec3<f32>(0.0, bob - 0.15 * death - 0.07 * brace - 0.03 * ready * moving + hop, 0.0);
 
     var out: VertexOutput;
     // Instance entity sits at the origin with identity transform, so passing

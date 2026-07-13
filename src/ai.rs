@@ -111,8 +111,7 @@ fn ai_think(
         };
         targets[g] = Some(best);
         load[best] += 1;
-        let dest = groups.list[best].centroid;
-        groups.list[g].order = Some(dest);
+        groups.list[g].order = Some(crate::orders::Order::Attack(best as u32));
     }
 }
 

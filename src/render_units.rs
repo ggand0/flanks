@@ -75,6 +75,60 @@ pub struct InstanceMaterialData(pub Vec<InstanceData>);
 #[derive(Component)]
 pub struct InstanceBucket(pub usize);
 
+/// Static instance bucket for fallen soldiers (one per kind). Not part of
+/// the live sync — refreshed only when `Corpses` changes.
+#[derive(Component)]
+pub struct CorpseBucket(pub usize);
+
+/// Per-kind corpse cap (ring-buffered: oldest bodies fade from the field).
+pub const CORPSE_CAP: usize = 25_000;
+
+/// Fallen soldiers left where they died: their final topple pose, frozen.
+/// Fed by the death sweep, drawn as static instance buckets, never
+/// simulated — the battlefield keeps the story of where the lines stood.
+#[derive(Resource, Default)]
+pub struct Corpses {
+    data: [Vec<InstanceData>; crate::unit_types::NUM_KINDS],
+    cursor: [usize; crate::unit_types::NUM_KINDS],
+    dirty: bool,
+}
+
+impl Corpses {
+    pub fn push(&mut self, kind: usize, inst: InstanceData) {
+        let v = &mut self.data[kind];
+        if v.len() < CORPSE_CAP {
+            v.push(inst);
+        } else {
+            v[self.cursor[kind]] = inst;
+            self.cursor[kind] = (self.cursor[kind] + 1) % CORPSE_CAP;
+        }
+        self.dirty = true;
+    }
+
+    pub fn clear(&mut self) {
+        for v in &mut self.data {
+            v.clear();
+        }
+        self.cursor = [0; crate::unit_types::NUM_KINDS];
+        self.dirty = true;
+    }
+}
+
+/// Copy corpse data into the corpse buckets when it changed.
+fn sync_corpses(
+    mut corpses: ResMut<Corpses>,
+    mut query: Query<(&CorpseBucket, &mut InstanceMaterialData)>,
+) {
+    if !corpses.dirty {
+        return;
+    }
+    corpses.dirty = false;
+    for (bucket, mut data) in &mut query {
+        data.0.clear();
+        data.0.extend_from_slice(&corpses.data[bucket.0]);
+    }
+}
+
 /// Number of instance buckets (== instance entities == draw calls).
 pub const NUM_BUCKETS: usize = crate::unit_types::NUM_KINDS;
 
@@ -118,13 +172,17 @@ impl Plugin for UnitRenderPlugin {
         // get a render-world twin (ExtractComponentPlugin used to do this).
         app.add_plugins(SyncComponentPlugin::<InstanceMaterialData>::default())
             .init_resource::<RenderCounts>()
+            .init_resource::<Corpses>()
             .add_systems(Startup, setup_unit_mesh)
             // Must run after the camera moves: culling builds a FRESH
             // frustum from this frame's camera transform (the Frustum
             // component is one frame stale — visible pop while panning).
             .add_systems(
                 Update,
-                sync_instance_data.after(crate::camera::apply_camera_transform),
+                (
+                    sync_instance_data.after(crate::camera::apply_camera_transform),
+                    sync_corpses,
+                ),
             );
         app.sub_app_mut(RenderApp)
             .add_systems(ExtractSchedule, extract_instance_data)
@@ -161,10 +219,19 @@ fn setup_unit_mesh(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
         crate::unit_meshes::build_man_at_arms(),
     ];
     for (bucket, mesh) in kind_meshes.into_iter().enumerate() {
+        let handle = meshes.add(mesh);
         commands.spawn((
-            Mesh3d(meshes.add(mesh)),
+            Mesh3d(handle.clone()),
             InstanceMaterialData::default(),
             InstanceBucket(bucket),
+            NoFrustumCulling,
+            NoAutomaticBatching,
+        ));
+        // Matching corpse bucket: same mesh, static instance list.
+        commands.spawn((
+            Mesh3d(handle),
+            InstanceMaterialData::default(),
+            CorpseBucket(bucket),
             NoFrustumCulling,
             NoAutomaticBatching,
         ));
@@ -178,17 +245,31 @@ fn setup_unit_mesh(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
 /// Units per parallel sync chunk.
 const SYNC_CHUNK: usize = 16_384;
 
+/// Anim z-channel encoding — the ONE authoritative map (keep in sync
+/// with unit_instancing.wgsl, which decodes it):
+///   z > 0, < CELEBRATE_BASE: attack = style * 2 + wind-up progress
+///     (style 0 stab, 1 classic swing, 2 slash/benched);
+///   z >= CELEBRATE_BASE: victory cheer, fraction = progress 0..1;
+///   z < 0: stance-band magnitude — tiers 0.25 enemy-near, 0.5 fighting
+///     wavering, 0.65 fighting confident, 1.0 charging — smoothed per
+///     unit (~0.35 s) before emission so poses never snap.
+const CELEBRATE_BASE: f32 = 6.0;
+
 #[allow(clippy::too_many_arguments)] // bevy system params
 fn sync_instance_data(
     units: Res<Units>,
     selection: Res<crate::orders::Selection>,
+    hover: Res<crate::orders::Hover>,
     groups: Res<crate::orders::Groups>,
+    time: Res<Time>,
     fixed_time: Res<Time<Fixed>>,
     camera: Query<(&Projection, &Transform), With<Camera3d>>,
     mut query: Query<(&InstanceBucket, &mut InstanceMaterialData)>,
     mut counts: ResMut<RenderCounts>,
     mut no_cull: Local<Option<bool>>,
     mut scratch: Local<Vec<[Vec<InstanceData>; NUM_BUCKETS]>>,
+    mut walk_ema: Local<Vec<f32>>,
+    mut band_ema: Local<Vec<f32>>,
 ) {
     let _span = info_span!("sync_instances").entered();
     let t0 = std::time::Instant::now();
@@ -213,10 +294,48 @@ fn sync_instance_data(
     let alpha = fixed_time.overstep_fraction();
 
     const HIGHLIGHT: [f32; 4] = [1.0, 1.0, 0.55, 1.0];
+    // Attack-preview tint: the enemy regiment a right-click would target.
+    const HOSTILE: [f32; 4] = [1.0, 0.30, 0.22, 1.0];
     let has_sel = selection.regiments.iter().any(|s| *s);
+    let hover_enemy = hover.enemy;
     // Broken regiments render desaturated (no extra instance data needed).
     let broken: Vec<bool> = groups.list.iter().map(|g| g.state.is_broken()).collect();
     let broken = &broken[..];
+    // Battle stance (negative lunge band): 0.25 = enemy in watch range
+    // (standing units brace), 0.5 = fighting but WAVERING (morale low —
+    // braces, no taunts), 0.65 = fighting confident (taunts allowed),
+    // 1.0 = charging (sprint lean/stride). Plain moves carry lowered.
+    let stance: Vec<f32> = groups
+        .list
+        .iter()
+        .map(|g| {
+            if g.charging {
+                1.0
+            } else if g.engaged || matches!(g.order, Some(crate::orders::Order::Attack(_))) {
+                if g.morale > 50.0 { 0.65 } else { 0.5 }
+            } else if g.enemy_near {
+                0.25
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    let stance = &stance[..];
+    // Victory cheer progress 0..1 (-1 = not celebrating). Rides the
+    // positive band as 6 + progress so the shader can ease in/out — a
+    // celebrating regiment has no one left to swing at.
+    let celebrating: Vec<f32> = groups
+        .list
+        .iter()
+        .map(|g| {
+            if g.celebrate > 0 {
+                1.0 - g.celebrate as f32 / crate::frontline::CELEBRATE_TICKS as f32
+            } else {
+                -1.0
+            }
+        })
+        .collect();
+    let celebrating = &celebrating[..];
 
     // Parallel cull + bucket build into per-chunk scratch, then one memcpy
     // concat per bucket. The scratch vecs keep their allocations across
@@ -228,8 +347,25 @@ fn sync_instance_data(
     let units = &*units;
     let selection = &*selection;
     let frustum = &frustum;
+    let inv_dt = 1.0 / fixed_time.timestep().as_secs_f32().max(1e-6);
+    // Per-unit walk-signal smoothing (~0.25 s): positional-correction
+    // shoves arrive in single-tick bursts; unsmoothed they strobe the
+    // walk cycle on/off, which reads as sliding with a twitch. Indices
+    // shuffle on death-sweep swap-removes — a one-frame inherited value
+    // is invisible.
+    walk_ema.resize(units.len(), 0.0);
+    band_ema.resize(units.len(), 0.0);
+    let ema_k = (time.delta_secs() / 0.25).min(1.0);
+    // Stance tiers are per-regiment and snap; the POSE blends (~0.35 s).
+    let band_k = (time.delta_secs() / 0.35).min(1.0);
     bevy::tasks::ComputeTaskPool::get().scope(|scope| {
-        for (ci, chunk_scratch) in scratch.iter_mut().enumerate().take(n_chunks) {
+        for (ci, ((chunk_scratch, ema_chunk), band_chunk)) in scratch
+            .iter_mut()
+            .zip(walk_ema.chunks_mut(SYNC_CHUNK))
+            .zip(band_ema.chunks_mut(SYNC_CHUNK))
+            .enumerate()
+            .take(n_chunks)
+        {
             scope.spawn(async move {
                 for vec in chunk_scratch.iter_mut() {
                     vec.clear();
@@ -237,6 +373,19 @@ fn sync_instance_data(
                 let start = ci * SYNC_CHUNK;
                 let end = (start + SYNC_CHUNK).min(units.len());
                 for i in start..end {
+                    // Walk signal: smoothed ACTUAL per-tick displacement.
+                    // Velocity misses positional-correction shoves (which
+                    // also kill vel), raw displacement strobes on bursty
+                    // corr chains. Updated before the cull so units
+                    // re-entering the frustum have a live value.
+                    let step = units.pos[i] - units.pos_prev[i];
+                    let disp = Vec2::new(step.x, step.z).length() * inv_dt;
+                    let ema = &mut ema_chunk[i - start];
+                    *ema += (disp - *ema) * ema_k;
+                    let tier = stance.get(units.group[i] as usize).copied().unwrap_or(0.0);
+                    let band = &mut band_chunk[i - start];
+                    *band += (tier - *band) * band_k;
+
                     let position = units.pos_prev[i].lerp(units.pos[i], alpha);
                     let sphere = Sphere {
                         center: position.into(),
@@ -264,16 +413,67 @@ fn sync_instance_data(
                         for c in 0..3 {
                             color[c] = color[c] * 0.35 + HIGHLIGHT[c] * 0.65;
                         }
+                    } else if hover_enemy == Some(units.group[i]) {
+                        for c in 0..3 {
+                            color[c] = color[c] * 0.45 + HOSTILE[c] * 0.55;
+                        }
                     }
-                    let move_amount =
-                        (units.vel[i].length() / units.speed[i].max(0.01)).clamp(0.0, 1.0);
+                    // Walk amount from ACTUAL per-tick displacement, not
+                    // velocity: press shoves move bodies through positional
+                    // corrections that never enter `vel` (and kill it), so
+                    // vel-driven legs froze while the body slid. Deadband +
+                    // smoothstep: crowd jitter (~0.001 m/tick) must not
+                    // flicker the walk cycle on and off every frame.
+                    // ABSOLUTE band (m/s), not per-kind speed ratio — press
+                    // shoves are 0.2-0.7 m/s regardless of kind. Floor
+                    // 0.06 = 2x crowd jitter (0.03, the 0021 metric);
+                    // saturates by 1.2 m/s so slow shoves get VISIBLE leg
+                    // articulation instead of a 10% wiggle.
+                    let t = ((*ema - 0.06) / (1.2 - 0.06)).clamp(0.0, 1.0);
+                    let move_amount = t * t * (3.0 - 2.0 * t);
+                    // Facing interpolates like position (wrap-aware), so
+                    // per-tick yaw updates don't snap at render rates.
+                    let dy = (units.yaw[i] - units.yaw_prev[i] + std::f32::consts::PI)
+                        .rem_euclid(std::f32::consts::TAU)
+                        - std::f32::consts::PI;
+                    let yaw = units.yaw_prev[i] + dy * alpha;
                     // Attack lunge ramps up quadratically over the wind-up
                     // and snaps back on the strike (chunky, readable).
-                    let lunge = if units.swing[i] == crate::units::SWING_WINDUP {
+                    // Charging blows lunge harder (arm angles saturate in
+                    // the shader; the extra goes into body lean).
+                    let sw = units.swing[i];
+                    let lunge = if sw & crate::units::SWING_STATE_MASK
+                        == crate::units::SWING_WINDUP
+                    {
                         let w = crate::unit_types::TYPES[units.kind[i] as usize].windup_ticks
                             as f32;
                         let t = (w - units.swing_t[i] as f32) / w.max(1.0);
-                        t * t
+                        let charge = sw & crate::units::SWING_CHARGE != 0;
+                        let amp = if charge { 1.35 } else { 1.0 };
+                        // A charging swing raises from the leveled run-in
+                        // point instead of dipping the blade first (0.18
+                        // puts the raise curve at the charge point angle).
+                        let lunge =
+                            if charge { (t * t * amp).max(0.18) } else { t * t * amp };
+                        // Style (stab/slash, picked at wind-up start)
+                        // rides the 2s digit of the positive band.
+                        let style = ((sw & crate::units::SWING_STYLE_MASK)
+                            >> crate::units::SWING_STYLE_SHIFT)
+                            as f32;
+                        style * 2.0 + lunge
+                    } else if units.death_t[i] == 0
+                        && celebrating
+                            .get(units.group[i] as usize)
+                            .copied()
+                            .unwrap_or(-1.0)
+                            >= 0.0
+                    {
+                        CELEBRATE_BASE + celebrating[units.group[i] as usize]
+                    } else if units.death_t[i] == 0 {
+                        // Negative lunge = SMOOTHED battle stance (the
+                        // regiment tier snaps; a pose must not — owner:
+                        // one-frame stance changes aren't immersive).
+                        -band_chunk[i - start]
                     } else {
                         0.0
                     };
@@ -287,7 +487,7 @@ fn sync_instance_data(
                         position,
                         scale: 1.0,
                         color,
-                        anim: [units.yaw[i], move_amount, lunge, fx],
+                        anim: [yaw, move_amount, lunge, fx],
                     });
                 }
             });

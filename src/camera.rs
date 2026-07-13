@@ -1,8 +1,16 @@
-//! RTS camera: WASD pan, scroll zoom, middle-drag rotate.
+//! RTS camera: WASD + screen-edge pan, smoothed scroll zoom,
+//! middle-drag rotate. Keyboard pan takes priority over edge pan (a
+//! cursor parked at the bottom edge must not cancel W).
 
 use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll, MouseScrollUnit};
 use bevy::prelude::*;
 use bevy::render::view::NoIndirectDrawing;
+use bevy::window::PrimaryWindow;
+
+/// Cursor within this many pixels of a window edge pans the camera.
+const EDGE_PAN_PX: f32 = 12.0;
+/// Zoom smoothing time constant (seconds to ~2/3 of the way).
+const ZOOM_SMOOTH: f32 = 0.12;
 
 #[derive(Component)]
 pub struct RtsCamera {
@@ -10,6 +18,8 @@ pub struct RtsCamera {
     pub yaw: f32,
     pub pitch: f32,
     pub distance: f32,
+    /// Scroll adjusts this; `distance` chases it (smooth zoom).
+    pub target_distance: f32,
 }
 
 pub struct RtsCameraPlugin;
@@ -27,21 +37,28 @@ fn spawn_camera(mut commands: Commands) {
         // Required: the unit renderer issues direct (non-indirect) draws.
         NoIndirectDrawing,
         RtsCamera {
-            focus: Vec3::ZERO,
+            focus: Vec3::new(
+                crate::util::env_or("FL_CAM_X", 0.0),
+                0.0,
+                crate::util::env_or("FL_CAM_Z", 0.0),
+            ),
             yaw: 0.0,
             // Overridable for screenshot-based debugging without input
             // injection (pitch in radians, 0.25..1.45).
             pitch: crate::util::env_or("FL_CAM_PITCH", 0.9),
             distance: crate::util::env_or("FL_CAM_DIST", 280.0),
+            target_distance: crate::util::env_or("FL_CAM_DIST", 280.0),
         },
     ));
 }
 
+#[allow(clippy::too_many_arguments)] // bevy system params
 fn control_camera(
     keys: Res<ButtonInput<KeyCode>>,
     buttons: Res<ButtonInput<MouseButton>>,
     motion: Res<AccumulatedMouseMotion>,
     scroll: Res<AccumulatedMouseScroll>,
+    window: Query<&Window, With<PrimaryWindow>>,
     time: Res<Time>,
     mut query: Query<&mut RtsCamera>,
 ) {
@@ -63,7 +80,26 @@ fn control_camera(
     if keys.pressed(KeyCode::KeyD) {
         pan.x += 1.0;
     }
+    // Screen-edge pan — only when no key pan is active (opposing inputs
+    // must not cancel) and the cursor is inside the window.
+    if pan == Vec2::ZERO
+        && let Ok(win) = window.single()
+        && let Some(c) = win.cursor_position()
+    {
+        let (w, h) = (win.width(), win.height());
+        if c.x < EDGE_PAN_PX {
+            pan.x -= 1.0;
+        } else if c.x > w - EDGE_PAN_PX {
+            pan.x += 1.0;
+        }
+        if c.y < EDGE_PAN_PX {
+            pan.y -= 1.0;
+        } else if c.y > h - EDGE_PAN_PX {
+            pan.y += 1.0;
+        }
+    }
     if pan != Vec2::ZERO {
+        let pan = pan.clamp_length_max(1.0);
         let speed = cam.distance * 0.9 * time.delta_secs();
         let (sin_yaw, cos_yaw) = cam.yaw.sin_cos();
         let forward = Vec3::new(-sin_yaw, 0.0, -cos_yaw);
@@ -78,8 +114,12 @@ fn control_camera(
         MouseScrollUnit::Pixel => scroll.delta.y / 50.0,
     };
     if scroll_lines != 0.0 {
-        cam.distance = (cam.distance * 0.9f32.powf(scroll_lines)).clamp(15.0, 900.0);
+        cam.target_distance =
+            (cam.target_distance * 0.9f32.powf(scroll_lines)).clamp(15.0, 900.0);
     }
+    // Smooth zoom: distance chases the scroll target.
+    let blend = (time.delta_secs() / ZOOM_SMOOTH).min(1.0);
+    cam.distance += (cam.target_distance - cam.distance) * blend;
 
     if buttons.pressed(MouseButton::Middle) && motion.delta != Vec2::ZERO {
         cam.yaw -= motion.delta.x * 0.005;

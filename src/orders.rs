@@ -19,6 +19,19 @@ pub const PLAYER_TEAM: u8 = 0;
 const SELECT_RADIUS: f32 = 14.0;
 /// Groups whose centroid gets this close to their order target go idle.
 const ARRIVE_CLEAR: f32 = 18.0;
+/// Right-clicking within this range of an enemy regiment's centroid is an
+/// attack order on that regiment (else it's a move order to the point).
+const ATTACK_PICK_RADIUS: f32 = 20.0;
+
+/// A regiment order, TW-style: move orders target ground and end on
+/// arrival; attack orders hunt a specific enemy regiment (the destination
+/// re-resolves to its centroid every tick) and end when it's wiped.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Order {
+    Move(Vec2),
+    /// Index into `Groups::list`.
+    Attack(u32),
+}
 
 /// Regiment morale state.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -42,8 +55,8 @@ pub struct GroupData {
     pub team: u8,
     /// Regiments are homogeneous; index into `unit_types::TYPES`.
     pub kind: u8,
-    /// Attack-move target on the ground plane; None = hold at anchor.
-    pub order: Option<Vec2>,
+    /// Current order; None = hold at anchor.
+    pub order: Option<Order>,
     /// Regiment reference point: units hold at `anchor + home`. Updated to
     /// the order target on arrival.
     pub anchor: Vec2,
@@ -52,7 +65,27 @@ pub struct GroupData {
     pub initial_count: usize,
     // --- refreshed every fixed tick by the frontline pass ---
     pub centroid: Vec2,
+    /// TW rule: one soldier of the regiment fighting = the whole regiment
+    /// is engaged (ground truth from per-unit melee state, with a short
+    /// hold to bridge swing-cycle gaps).
     pub engaged: bool,
+    /// Ticks of `engaged` left since the last soldier fought.
+    pub engage_hold: u8,
+    /// In the charge phase: attack order, inside charge range of the
+    /// target, not yet in contact. Drives the war cry + sprint pose.
+    pub charging: bool,
+    /// An enemy regiment's centroid is within combat-watch range: units
+    /// of this regiment scan wider for adjacent enemies (sparse-fight
+    /// acquisition, movement.rs) and brace when standing.
+    pub enemy_near: bool,
+    /// Normalized direction to the nearest enemy regiment (ZERO when
+    /// none in watch range): standing units face it (brace facing).
+    pub threat_dir: Vec2,
+    /// An UNBROKEN enemy regiment is within watch range. The falling
+    /// edge (last nearby foe routed or wiped) triggers the cheer.
+    pub hostile_near: bool,
+    /// Victory-cheer ticks remaining (render-only celebration).
+    pub celebrate: u16,
     // --- morale (regiments.rs updates per tick) ---
     pub morale: f32,
     pub state: RegState,
@@ -71,6 +104,12 @@ impl GroupData {
             initial_count: count,
             centroid: anchor,
             engaged: false,
+            engage_hold: 0,
+            charging: false,
+            enemy_near: false,
+            threat_dir: Vec2::ZERO,
+            hostile_near: false,
+            celebrate: 0,
             morale: 100.0,
             state: RegState::Steady,
             recent_deaths: 0,
@@ -81,6 +120,20 @@ impl GroupData {
 #[derive(Resource, Default)]
 pub struct Groups {
     pub list: Vec<GroupData>,
+}
+
+impl Groups {
+    /// A group's order destination this tick: Move goes to the point,
+    /// Attack chases the target regiment's current centroid.
+    pub fn goal(&self, g: usize) -> Option<Vec2> {
+        match self.list[g].order? {
+            Order::Move(p) => Some(p),
+            Order::Attack(t) => {
+                let t = &self.list[t as usize];
+                (t.count > 0).then_some(t.centroid)
+            }
+        }
+    }
 }
 
 /// Selected regiments (player team only) + cached unit total.
@@ -97,6 +150,10 @@ struct DragLine {
     active: bool,
 }
 
+/// Ctrl+1..9 stores the current selection mask; 1..9 recalls it.
+#[derive(Resource, Default)]
+pub struct ControlGroups(pub Vec<Vec<bool>>);
+
 pub struct OrdersPlugin;
 
 impl Plugin for OrdersPlugin {
@@ -107,11 +164,16 @@ impl Plugin for OrdersPlugin {
         app.init_resource::<Groups>()
             .init_resource::<Selection>()
             .init_resource::<DragLine>()
+            .init_resource::<Hover>()
+            .init_resource::<ControlGroups>()
             .add_systems(
                 Update,
                 (
                     drag_select,
+                    update_hover,
                     issue_order,
+                    halt_key,
+                    control_group_keys,
                     test_orders_script,
                     draw_order_gizmos,
                 ),
@@ -287,8 +349,65 @@ pub fn order_regiments(groups: &mut Groups, selected: &[usize], target: Vec2) {
         selected.iter().map(|&g| groups.list[g].centroid).sum::<Vec2>() / selected.len() as f32;
     for &g in &selected {
         let group = &mut groups.list[g];
-        group.order = Some(target + (group.centroid - centroid));
+        group.order = Some(Order::Move(target + (group.centroid - centroid)));
     }
+}
+
+/// Attack-order `selected` regiments at one enemy regiment: everyone hunts
+/// the same target (TW behavior — no arrangement translation).
+pub fn attack_regiments(groups: &mut Groups, selected: &[usize], target: u32) {
+    for &g in selected {
+        if !groups.list[g].state.is_broken() {
+            groups.list[g].order = Some(Order::Attack(target));
+        }
+    }
+}
+
+/// Regiment under a ground point, if any: nearest live regiment of the
+/// wanted side whose centroid is within the pick radius.
+fn regiment_at(groups: &Groups, p: Vec2, enemy: bool) -> Option<u32> {
+    groups
+        .list
+        .iter()
+        .enumerate()
+        .filter(|(_, g)| (g.team != PLAYER_TEAM) == enemy && g.count > 0)
+        .map(|(g, gd)| (g, gd.centroid.distance(p)))
+        .filter(|(_, d)| *d < ATTACK_PICK_RADIUS)
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(g, _)| g as u32)
+}
+
+fn enemy_regiment_at(groups: &Groups, p: Vec2) -> Option<u32> {
+    regiment_at(groups, p, true)
+}
+
+/// Regiments under the cursor this frame. `enemy` doubles as the
+/// attack-order preview: it is what a right-click would target (same
+/// pick logic), so the render tint and the inspect panel key off it.
+#[derive(Resource, Default)]
+pub struct Hover {
+    pub enemy: Option<u32>,
+    pub own: Option<u32>,
+}
+
+fn update_hover(
+    window: Query<&Window, With<PrimaryWindow>>,
+    camera: Query<(&Camera, &GlobalTransform)>,
+    terrain: Res<Terrain>,
+    groups: Res<Groups>,
+    mut hover: ResMut<Hover>,
+) {
+    hover.enemy = None;
+    hover.own = None;
+    let Ok(window) = window.single() else { return };
+    let Ok((camera, cam_tf)) = camera.single() else {
+        return;
+    };
+    let Some(p) = cursor_ground_point(window, camera, cam_tf, &terrain) else {
+        return;
+    };
+    hover.enemy = regiment_at(&groups, p, true);
+    hover.own = regiment_at(&groups, p, false);
 }
 
 fn issue_order(
@@ -316,29 +435,122 @@ fn issue_order(
         .filter(|(_, s)| **s)
         .map(|(g, _)| g)
         .collect();
-    order_regiments(&mut groups, &selected, target);
-    info!(
-        "{} regiments ({} units) attack-move to ({:.0}, {:.0})",
-        selected.len(),
-        selection.count_units,
-        target.x,
-        target.y
-    );
+    if let Some(t) = enemy_regiment_at(&groups, target) {
+        attack_regiments(&mut groups, &selected, t);
+        info!(
+            "{} regiments ({} units) ATTACK regiment {t}",
+            selected.len(),
+            selection.count_units,
+        );
+    } else {
+        order_regiments(&mut groups, &selected, target);
+        info!(
+            "{} regiments ({} units) move to ({:.0}, {:.0})",
+            selected.len(),
+            selection.count_units,
+            target.x,
+            target.y
+        );
+    }
 }
 
-/// Groups whose centroid reached their target go back to hold there: the
-/// order point becomes the new anchor (holding is a standing order). Uses
-/// the centroid refreshed by the frontline pass each tick.
-pub fn clear_arrived_orders(mut groups: ResMut<Groups>) {
-    for (g, group) in groups.list.iter_mut().enumerate() {
-        if let Some(t) = group.order
-            && group.count > 0
-            && !group.engaged
-            && group.centroid.distance(t) < ARRIVE_CLEAR
-        {
-            group.anchor = t;
+/// Backspace = HALT the selection (TW keybind): drop orders and hold in
+/// place (the anchor moves to the current centroid so the block stands
+/// where it is). S stays camera pan.
+fn halt_key(
+    keys: Res<ButtonInput<KeyCode>>,
+    selection: Res<Selection>,
+    mut groups: ResMut<Groups>,
+) {
+    if !keys.just_pressed(KeyCode::Backspace) || selection.count_units == 0 {
+        return;
+    }
+    let mut halted = 0;
+    for (g, sel) in selection.regiments.iter().enumerate() {
+        let group = &mut groups.list[g];
+        if *sel && group.count > 0 && !group.state.is_broken() {
+            group.anchor = group.centroid;
             group.order = None;
-            info!("regiment {g} arrived, holding");
+            halted += 1;
+        }
+    }
+    if halted > 0 {
+        info!("HALT: {halted} regiments hold");
+    }
+}
+
+/// Ctrl+digit assigns the current selection to a slot; a bare digit
+/// recalls it (dead regiments drop out naturally via count checks).
+fn control_group_keys(
+    keys: Res<ButtonInput<KeyCode>>,
+    groups: Res<Groups>,
+    mut cg: ResMut<ControlGroups>,
+    mut selection: ResMut<Selection>,
+) {
+    const DIGITS: [KeyCode; 9] = [
+        KeyCode::Digit1,
+        KeyCode::Digit2,
+        KeyCode::Digit3,
+        KeyCode::Digit4,
+        KeyCode::Digit5,
+        KeyCode::Digit6,
+        KeyCode::Digit7,
+        KeyCode::Digit8,
+        KeyCode::Digit9,
+    ];
+    let Some(slot) = DIGITS.iter().position(|k| keys.just_pressed(*k)) else {
+        return;
+    };
+    cg.0.resize(9, Vec::new());
+    let ctrl =
+        keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
+    if ctrl {
+        if selection.count_units > 0 {
+            cg.0[slot] = selection.regiments.clone();
+            info!("control group {} assigned", slot + 1);
+        }
+    } else if !cg.0[slot].is_empty() {
+        selection.regiments = cg.0[slot].clone();
+        selection.regiments.resize(groups.list.len(), false);
+        selection.count_units = selection
+            .regiments
+            .iter()
+            .enumerate()
+            .filter(|(g, s)| **s && groups.list[*g].team == PLAYER_TEAM)
+            .map(|(g, _)| groups.list[g].count)
+            .sum();
+        info!(
+            "control group {} recalled ({} units)",
+            slot + 1,
+            selection.count_units
+        );
+    }
+}
+
+/// Order lifecycle. Move: ends on arrival — the order point becomes the
+/// new anchor (holding is a standing order). Attack: never "arrives", it
+/// ends when the target regiment is wiped (hold in place there). Uses the
+/// centroid refreshed by the frontline pass each tick.
+pub fn clear_arrived_orders(mut groups: ResMut<Groups>) {
+    let counts: Vec<usize> = groups.list.iter().map(|g| g.count).collect();
+    for (g, group) in groups.list.iter_mut().enumerate() {
+        match group.order {
+            Some(Order::Move(t)) => {
+                if group.count > 0
+                    && !group.engaged
+                    && group.centroid.distance(t) < ARRIVE_CLEAR
+                {
+                    group.anchor = t;
+                    group.order = None;
+                    info!("regiment {g} arrived, holding");
+                }
+            }
+            Some(Order::Attack(t)) if counts[t as usize] == 0 => {
+                group.anchor = group.centroid;
+                group.order = None;
+                info!("regiment {g} attack target {t} destroyed, holding");
+            }
+            _ => {}
         }
     }
 }
@@ -350,6 +562,25 @@ fn draw_order_gizmos(
     terrain: Res<Terrain>,
     mut gizmos: Gizmos,
 ) {
+    // Attack indicators are player-facing UI (not debug viz): a red marker
+    // hangs over every regiment the player is attacking.
+    let mut marked = vec![false; groups.list.len()];
+    for group in &groups.list {
+        if group.team == PLAYER_TEAM
+            && let Some(Order::Attack(t)) = group.order
+        {
+            marked[t as usize] = true;
+        }
+    }
+    for (t, m) in marked.iter().enumerate() {
+        if !*m || groups.list[t].count == 0 {
+            continue;
+        }
+        let c = groups.list[t].centroid;
+        let top = Vec3::new(c.x, terrain.height_at(c.x, c.y) + 15.0, c.y);
+        gizmos.arrow(top, top - Vec3::Y * 4.5, Color::srgb(1.0, 0.25, 0.2));
+    }
+
     if !viz.0 {
         return;
     }
@@ -367,9 +598,9 @@ fn draw_order_gizmos(
             );
         }
     }
-    // Order targets.
+    // Move-order targets (attack orders have the marker above).
     for group in &groups.list {
-        if let Some(t) = group.order {
+        if let Some(Order::Move(t)) = group.order {
             let base = Vec3::new(t.x, terrain.height_at(t.x, t.y) + 0.5, t.y);
             let color = if group.team == 0 {
                 Color::srgb(0.4, 0.8, 1.0)
@@ -458,7 +689,7 @@ fn test_orders_script(
                 .unwrap();
             let spread = regiment_spread(&units, g);
             groups.list[g as usize].order =
-                Some(groups.list[g as usize].centroid + Vec2::new(350.0, 60.0));
+                Some(Order::Move(groups.list[g as usize].centroid + Vec2::new(350.0, 60.0)));
             *watch = Some((g, spread));
             info!("[test] regiment {g} long-march ordered, spread at departure {spread:.1} m");
             selection.regiments.fill(false);

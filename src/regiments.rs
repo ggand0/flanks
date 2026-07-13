@@ -5,10 +5,9 @@
 
 use bevy::prelude::*;
 
-use crate::frontline::InfluenceField;
 use crate::orders::{GroupData, Groups, RegState};
 use crate::terrain::Terrain;
-use crate::unit_types::{KIND_HEAVY, KIND_LIGHT, TYPES};
+use crate::unit_types::{KIND_HEAVY, KIND_LIGHT};
 use crate::units::{Units, hash01, push_unit, units_per_team};
 
 /// Unit spacing inside a regiment block.
@@ -23,122 +22,9 @@ pub struct RegimentsPlugin;
 impl Plugin for RegimentsPlugin {
     fn build(&self, app: &mut App) {
         // Terrain resource is created in PreStartup (generate_terrain).
+        // Morale lives in crate::morale (MoralePlugin).
         app.add_systems(Startup, spawn_battle)
-            .add_systems(Update, (rout_test_log, restart_key))
-            .add_systems(
-                FixedUpdate,
-                update_morale
-                    .after(crate::movement::step_sim)
-                    .before(crate::orders::clear_arrived_orders),
-            );
-    }
-}
-
-// --- Morale tuning ---
-/// Morale lost per (fraction of initial strength) of fresh casualties:
-/// ~35% losses alone break a regiment.
-const MORALE_CASUALTY: f32 = 280.0;
-/// Drain per second when locally outnumbered >2:1 (density ratio).
-const MORALE_OUTNUMBERED: f32 = 3.0;
-/// Drain per second per routing friendly regiment within RALLY_R (capped).
-const MORALE_ROUT_NEIGHBOR: f32 = 2.5;
-const MORALE_ROUT_CAP: f32 = 7.5;
-/// Recovery per second when unengaged and undisturbed.
-const MORALE_RECOVERY: f32 = 3.0;
-/// Routing-neighbor / rally-safety radius.
-const NEIGHBOR_R: f32 = 60.0;
-/// Broken regiments below this fraction of initial strength shatter.
-const SHATTER_FRAC: f32 = 0.15;
-/// Seconds routing before a rally roll is allowed.
-const RALLY_DELAY: f32 = 8.0;
-/// Rally chance per second once allowed and safe.
-const RALLY_CHANCE: f32 = 0.02;
-
-/// Per-tick regiment morale update (serial; ~200 rows). Runs after the
-/// damage apply pass so `recent_deaths` is this tick's tally.
-fn update_morale(
-    mut groups: ResMut<Groups>,
-    field: Res<InfluenceField>,
-    time: Res<Time>,
-    mut tick: Local<u32>,
-) {
-    *tick += 1;
-    let dt = time.delta_secs();
-
-    // Snapshot routing centroids for the neighbor drain (state from last
-    // tick is fine — morale contagion is not latency-sensitive).
-    let routing_centroids: Vec<(u8, Vec2)> = groups
-        .list
-        .iter()
-        .filter(|g| g.state.is_broken() && g.count > 0)
-        .map(|g| (g.team, g.centroid))
-        .collect();
-
-    for (gi, g) in groups.list.iter_mut().enumerate() {
-        if g.count == 0 {
-            g.recent_deaths = 0;
-            continue;
-        }
-        let resist = TYPES[g.kind as usize].morale_resist;
-
-        match g.state {
-            RegState::Steady => {
-                let mut drain = 0.0;
-                // Fresh casualties.
-                drain +=
-                    MORALE_CASUALTY * g.recent_deaths as f32 / g.initial_count as f32 * resist;
-                // Psychological pressure scales with DEPLETION: a fresh
-                // regiment shrugs off routing neighbors and bad odds; a
-                // bleeding one panics. Without this, full-strength
-                // regiments cascade-rout off contagion alone.
-                let frac = g.count as f32 / g.initial_count as f32;
-                let depletion = (1.4 - 1.2 * frac).clamp(0.15, 1.4);
-                // Locally outnumbered (blurred density ratio at centroid).
-                let own = field.density(g.team, g.centroid);
-                let enemy = field.density(1 - g.team, g.centroid);
-                let mut pressure = 0.0;
-                if enemy / (own + 0.1) > 2.0 {
-                    pressure += MORALE_OUTNUMBERED * resist;
-                }
-                // Routing friendlies nearby shake resolve.
-                let rout_drain = routing_centroids
-                    .iter()
-                    .filter(|(t, c)| *t == g.team && c.distance(g.centroid) < NEIGHBOR_R)
-                    .count() as f32
-                    * MORALE_ROUT_NEIGHBOR;
-                pressure += rout_drain.min(MORALE_ROUT_CAP);
-                drain += pressure * depletion * dt;
-
-                if drain > 0.0 {
-                    g.morale -= drain;
-                } else if !g.engaged {
-                    g.morale = (g.morale + MORALE_RECOVERY * dt).min(100.0);
-                }
-                if g.morale <= 0.0 {
-                    g.state = RegState::Routing { since: *tick };
-                    g.order = None;
-                    info!("regiment {gi} BREAKS ({} of {} left)", g.count, g.initial_count);
-                }
-            }
-            RegState::Routing { since } => {
-                if (g.count as f32) < g.initial_count as f32 * SHATTER_FRAC {
-                    g.state = RegState::Shattered;
-                    info!("regiment {gi} shatters");
-                } else if (*tick - since) as f32 * dt > RALLY_DELAY {
-                    // Rally only when clear of enemies.
-                    let enemy = field.density(1 - g.team, g.centroid);
-                    let roll = hash01(tick.wrapping_mul(0x9E37_79B1) ^ (gi as u32) << 8);
-                    if enemy < 0.1 && roll < RALLY_CHANCE * dt {
-                        g.state = RegState::Steady;
-                        g.morale = 40.0;
-                        g.anchor = g.centroid;
-                        info!("regiment {gi} rallies ({} left)", g.count);
-                    }
-                }
-            }
-            RegState::Shattered => {}
-        }
-        g.recent_deaths = 0;
+            .add_systems(Update, (rout_test_log, restart_key));
     }
 }
 
@@ -194,6 +80,7 @@ fn restart_key(
     mut stats: ResMut<crate::combat::CombatStats>,
     mut selection: ResMut<crate::orders::Selection>,
     mut outcome: ResMut<crate::ai::BattleOutcome>,
+    mut corpses: ResMut<crate::render_units::Corpses>,
 ) {
     if !keys.just_pressed(KeyCode::KeyR) {
         return;
@@ -202,6 +89,7 @@ fn restart_key(
     *stats = crate::combat::CombatStats::default();
     *selection = crate::orders::Selection::default();
     outcome.0 = None;
+    corpses.clear();
     do_spawn_battle(&mut units, &terrain, &mut groups);
     info!("battle restarted");
 }
@@ -219,7 +107,6 @@ fn do_spawn_battle(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
     let per_team = units_per_team();
     let size = reg_size();
     let n_regs = (per_team / size).max(1);
-    let n_heavy = (n_regs as f32 * heavy_frac()).round() as usize;
 
     // Block geometry: wider than deep (~2.2:1).
     let cols = ((size as f32 * 2.2).sqrt().ceil() as usize).max(1);
@@ -249,6 +136,14 @@ fn do_spawn_battle(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
     let mut list: Vec<GroupData> = Vec::with_capacity(n_regs * 2);
 
     for team in 0..2u8 {
+        // FL_ENEMY_REGS caps the enemy regiment count (sandbox
+        // asymmetry, e.g. 5v4 so one player regiment stays unchased).
+        let n_regs = if team == 1 {
+            crate::util::env_or("FL_ENEMY_REGS", n_regs).clamp(1, n_regs)
+        } else {
+            n_regs
+        };
+        let n_heavy = (n_regs as f32 * heavy_frac()).round() as usize;
         let dir: f32 = if team == 0 { -1.0 } else { 1.0 };
         for r in 0..n_regs {
             let rank = r / per_rank;
@@ -263,10 +158,12 @@ fn do_spawn_battle(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
         }
     }
     let heavies = list.iter().filter(|g| g.kind == KIND_HEAVY).count();
+    let blue = list.iter().filter(|g| g.team == 0).count();
     info!(
-        "spawned {} regiments ({} heavy) x {} units per team ({} total units)",
-        n_regs,
-        heavies / 2,
+        "spawned {} vs {} regiments ({} heavy) x {} units ({} total units)",
+        blue,
+        list.len() - blue,
+        heavies,
         size,
         units.len()
     );
@@ -285,7 +182,7 @@ fn spawn_rout_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
         let anchor = Vec2::new(x, z);
         spawn_regiment(units, terrain, &mut list, 1, KIND_LIGHT, anchor, 1000, 1.0);
         let g = list.len() - 1;
-        list[g].order = Some(Vec2::new(tx, blue.y));
+        list[g].order = Some(crate::orders::Order::Move(Vec2::new(tx, blue.y)));
     }
     groups.list = list;
     info!("[rout-test] 1 blue vs 3 converging orange regiments");

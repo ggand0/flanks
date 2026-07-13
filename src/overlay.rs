@@ -6,12 +6,20 @@ use bevy::render::diagnostic::RenderDiagnosticsPlugin;
 
 use crate::combat::CombatStats;
 use crate::movement::SimStats;
-use crate::orders::{Groups, Selection};
+use crate::orders::{Groups, RegState, Selection};
+use crate::morale::MoraleReadout;
 use crate::render_units::RenderCounts;
 use crate::units::Units;
 
 #[derive(Component)]
 struct OverlayText;
+
+/// TW-style regiment plaque (bottom-right): name, strength, morale, and
+/// the live morale factor breakdown from `MoraleReadout`.
+#[derive(Component)]
+struct InspectPanel;
+#[derive(Component)]
+struct InspectText;
 
 pub struct OverlayPlugin;
 
@@ -21,8 +29,8 @@ impl Plugin for OverlayPlugin {
             FrameTimeDiagnosticsPlugin::default(),
             RenderDiagnosticsPlugin,
         ))
-            .add_systems(Startup, spawn_overlay)
-            .add_systems(Update, update_overlay);
+            .add_systems(Startup, (spawn_overlay, spawn_inspect_panel))
+            .add_systems(Update, (update_overlay, update_inspect_panel));
     }
 }
 
@@ -42,6 +50,97 @@ fn spawn_overlay(mut commands: Commands) {
         },
         OverlayText,
     ));
+}
+
+fn spawn_inspect_panel(mut commands: Commands) {
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                right: Val::Px(10.0),
+                bottom: Val::Px(10.0),
+                padding: UiRect::all(Val::Px(10.0)),
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.07, 0.08, 0.10, 0.88)),
+            Visibility::Hidden,
+            InspectPanel,
+        ))
+        .with_children(|p| {
+            p.spawn((
+                Text::new(""),
+                TextFont {
+                    font_size: FontSize::Px(15.0),
+                    ..default()
+                },
+                TextColor(Color::srgb(0.92, 0.92, 0.85)),
+                InspectText,
+            ));
+        });
+}
+
+/// Show the hovered regiment (enemy first — it doubles as the attack
+/// preview), else a lone selected regiment, else hide.
+fn update_inspect_panel(
+    hover: Res<crate::orders::Hover>,
+    selection: Res<Selection>,
+    groups: Res<Groups>,
+    readout: Res<MoraleReadout>,
+    mut panel: Query<&mut Visibility, With<InspectPanel>>,
+    mut text: Query<&mut Text, With<InspectText>>,
+) {
+    let Ok(mut vis) = panel.single_mut() else { return };
+    let Ok(mut text) = text.single_mut() else { return };
+    let single_sel = (selection.regiments.iter().filter(|s| **s).count() == 1)
+        .then(|| selection.regiments.iter().position(|s| *s).unwrap() as u32);
+    let Some(g) = hover.enemy.or(hover.own).or(single_sel) else {
+        *vis = Visibility::Hidden;
+        return;
+    };
+    let g = g as usize;
+    let Some(gd) = groups.list.get(g).filter(|gd| gd.count > 0) else {
+        *vis = Visibility::Hidden;
+        return;
+    };
+    *vis = Visibility::Visible;
+
+    let kind = if gd.kind == crate::unit_types::KIND_HEAVY {
+        "Heavy Knights"
+    } else {
+        "Men-at-Arms"
+    };
+    let team = if gd.team == 0 { "blue" } else { "orange" };
+    let state = match gd.state {
+        RegState::Steady if gd.charging => "STEADY - CHARGING",
+        RegState::Steady if gd.engaged => "STEADY - engaged",
+        RegState::Steady => "STEADY",
+        RegState::Routing { .. } => "ROUTING",
+        RegState::Shattered => "SHATTERED",
+    };
+    let mut s = format!(
+        "{kind} {g} ({team})\n{}/{} men    morale {:>3.0}    {state}\n",
+        gd.count,
+        gd.initial_count,
+        gd.morale.clamp(0.0, 100.0),
+    );
+    if matches!(gd.state, RegState::Steady) {
+        let f = readout.0.get(g).copied().unwrap_or_default();
+        s += &format!(
+            "casualties      -{:.1}/s\nflanked {:>3.0}%    -{:.1}/s\noutnumbered     -{:.1}/s\nrout nearby     -{:.1}/s\nallies x{}   psych x{:.2}   depletion x{:.2}",
+            f.casualties,
+            f.flanked01 * 100.0,
+            f.flanked,
+            f.outnumbered,
+            f.contagion,
+            f.friends,
+            f.psych_mult,
+            f.depletion,
+        );
+        if f.recovering {
+            s += "\nrecovering      +3.0/s";
+        }
+    }
+    text.0 = s;
 }
 
 #[allow(clippy::too_many_arguments)] // bevy system params
@@ -108,7 +207,7 @@ fn update_overlay(
     if *log_timer >= 2.0 {
         *log_timer = 0.0;
         info!(
-            "fps: {fps:.0} ({frame_ms:.2} ms), units: {} (blue {} / orange {}), sim: grid {:.2} step {:.2} field {:.2} audit {:.2} sync {:.2}, hits/tick: {}, drawn: {} [{}], nn min/avg: {:.2}/{:.2}",
+            "fps: {fps:.0} ({frame_ms:.2} ms), units: {} (blue {} / orange {}), sim: grid {:.2} step {:.2} field {:.2} audit {:.2} sync {:.2}, hits/tick: {}, drawn: {} [{}], nn min/avg: {:.2}/{:.2}, move avg: {:.3} m/tick",
             units.len(),
             combat.alive[0],
             combat.alive[1],
@@ -126,7 +225,8 @@ fn update_overlay(
                 .collect::<Vec<_>>()
                 .join("/"),
             stats.nn_min,
-            stats.nn_avg
+            stats.nn_avg,
+            stats.move_avg
         );
         for diag in diagnostics.iter() {
             let path = diag.path().as_str();
