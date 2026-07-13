@@ -14,8 +14,13 @@ use crate::units::{Units, hash01, push_unit, units_per_team};
 const SPACING: f32 = 1.4;
 /// Gap between regiment blocks.
 const REG_GAP: f32 = 10.0;
-/// No-man's land between the two armies.
-const ARMY_GAP: f32 = 60.0;
+/// No-man's land between the two armies. FL_ARMY_GAP overrides — small
+/// sandbox battles (e.g. FL_UNITS=5000 FL_ENEMY_REGS=4) want 250+ m of
+/// maneuvering room for flank and rear charges; the 200k default keeps
+/// the short march.
+fn army_gap() -> f32 {
+    crate::util::env_or("FL_ARMY_GAP", 60.0)
+}
 
 pub struct RegimentsPlugin;
 
@@ -136,7 +141,8 @@ fn do_spawn_battle(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
     // and stacked rows would squash onto the boundary line). If the army
     // needs more ranks than fit, widen the ranks and shrink the x pitch.
     let usable_w = (terrain.max().x - terrain.min().x) - 60.0;
-    let usable_d = terrain.max().y - 8.0 - ARMY_GAP / 2.0;
+    let army_gap = army_gap();
+    let usable_d = terrain.max().y - 8.0 - army_gap / 2.0;
     let max_ranks = (((usable_d - block_d) / (block_d + REG_GAP)).floor() as usize + 1).max(1);
     let per_rank = ((usable_w / (block_w + REG_GAP)).floor() as usize)
         .max(n_regs.div_ceil(max_ranks))
@@ -169,7 +175,7 @@ fn do_spawn_battle(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
             // This rank's regiment count (last rank may be partial) — center it.
             let in_rank = per_rank.min(n_regs - rank * per_rank);
             let x0 = (file as f32 - (in_rank - 1) as f32 / 2.0) * pitch_x;
-            let z0 = dir * (ARMY_GAP / 2.0 + block_d / 2.0 + rank as f32 * (block_d + REG_GAP));
+            let z0 = dir * (army_gap / 2.0 + block_d / 2.0 + rank as f32 * (block_d + REG_GAP));
             let anchor = Vec2::new(x0, z0);
             // Heavies lead, spears back them, lights fill the rear ranks.
             let kind = if r < n_heavy {
