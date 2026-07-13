@@ -7,7 +7,7 @@
 //! the selection centroid, so a group move preserves the army's
 //! arrangement. Right-click DRAG (M2TW): paint the new front line on the
 //! ground — regiments divide the drawn width, set their files to fill it,
-//! and face perpendicular to it, away from where they stand; soft slot
+//! and face perpendicular to it, toward the enemy army's side; soft slot
 //! markers preview the placement until release. Units translate the
 //! regiment order by their own `home` offset (block moves, never
 //! converges).
@@ -283,8 +283,11 @@ fn enemy_regiment_at(groups: &Groups, p: Vec2) -> Option<u32> {
 
 /// Lay `selected` regiments out along the ground line a -> b: the drawn
 /// width is divided by strength, files fill each share, and every block
-/// faces perpendicular to the line, AWAY from where the selection stands
-/// (troops walk up to the drawn line and face past it). Regiments keep
+/// faces perpendicular to the line, toward the ENEMY army's side of it —
+/// a drawn battle line faces the enemy no matter which hand drew it.
+/// Fallback when there is no enemy signal (none left alive, or the enemy
+/// is dead-parallel to the line): face away from where the selection
+/// stands (troops walk up to the line and face past it). Regiments keep
 /// their left-to-right order along the line to minimize crossing.
 fn line_layout(groups: &Groups, selected: &[usize], a: Vec2, b: Vec2) -> Vec<LinePlacement> {
     let picked: Vec<usize> = selected
@@ -304,7 +307,32 @@ fn line_layout(groups: &Groups, selected: &[usize], a: Vec2, b: Vec2) -> Vec<Lin
         picked.iter().map(|&g| groups.list[g].centroid).sum::<Vec2>() / picked.len() as f32;
     let perp = Vec2::new(-dir.y, dir.x);
     let mid = (a + b) * 0.5;
-    let fwd = if perp.dot(mid - mean) >= 0.0 { perp } else { -perp };
+    // Which side of the line does the enemy stand on? Strength-weighted
+    // enemy centroid so a routed straggler can't flip the line. The old
+    // rule (away from the selection) broke on the common gesture of
+    // dressing a line in place: with the line ON the selection the side
+    // signal was noise, and the tie fell to the raw drag perpendicular —
+    // facing followed the drag hand, backward for half of all drags.
+    let team = groups.list[picked[0]].team;
+    let mut enemy_sum = Vec2::ZERO;
+    let mut enemy_weight = 0.0f32;
+    for gd in &groups.list {
+        if gd.team != team && gd.count > 0 && !gd.state.is_broken() {
+            enemy_sum += gd.centroid * gd.count as f32;
+            enemy_weight += gd.count as f32;
+        }
+    }
+    let enemy_side = if enemy_weight > 0.0 {
+        perp.dot(enemy_sum / enemy_weight - mid)
+    } else {
+        0.0
+    };
+    let side = if enemy_side.abs() > 1.0 {
+        enemy_side
+    } else {
+        perp.dot(mid - mean)
+    };
+    let fwd = if side >= 0.0 { perp } else { -perp };
     let facing = facing_of(fwd);
 
     // Keep current left-to-right order along the line.
