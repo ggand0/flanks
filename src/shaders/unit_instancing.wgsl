@@ -20,6 +20,10 @@ struct Vertex {
     // band (-0.25 enemy near, -0.5 blade leveled, -1 charging).
     // w = fx: [0,1) hit-flash intensity, [1,2] = 1 + death progress.
     @location(10) i_anim: vec4<f32>,
+    // Regiment pose signals (smoothed per unit CPU-side): x = march-in-
+    // step 0..1, y = wall 0..1 (shieldwall/spearwall by bucket),
+    // z = regiment walk-phase offset, w = spare.
+    @location(11) i_anim2: vec4<f32>,
 };
 
 struct VertexOutput {
@@ -96,12 +100,31 @@ fn vertex(vertex: Vertex) -> VertexOutput {
     var local = vertex.position;
     var normal = vertex.normal;
 
+    let march = vertex.i_anim2.x;
+    let wall = vertex.i_anim2.y;
     let phase = globals.time * 9.0 + seed * 6.2831853;
+    // March-in-step: the whole regiment walks on ONE phase (offset per
+    // regiment so neighboring blocks aren't synced with each other). The
+    // walk oscillators mix toward it; everything else stays per-unit.
+    let phase_reg = globals.time * 9.0 + vertex.i_anim2.z;
+    let walk_s = mix(sin(phase), sin(phase_reg), march);
+    let walk_s2 = mix(sin(phase * 2.0), sin(phase_reg * 2.0), march);
 
     // --- Part animation (rotations around the part pivot) ---
     if part > 4.5 {
-        // Shield arm: carried at the side. (Shieldwall raise arrives with
-        // the wall instance signal.)
+        // Shield arm: carried at the side; the wall signal swings it
+        // around the body to FACE THE FRONT and lifts it into a guard —
+        // a shieldwall is a wall of team color from the enemy's side.
+        // (Spear bucket: same fronting reads as the spearwall's off-hand
+        // cover behind the leveled spears.)
+        if wall > 0.001 {
+            let ang = 1.05 * wall;
+            let c2 = cos(ang);
+            let s2 = sin(ang);
+            local = rot_y(local, c2, s2);
+            normal = rot_y(normal, c2, s2);
+            local.y += 0.10 * wall;
+        }
     } else if part > 3.5 {
         // Spear arm: the shaft is carried VERTICAL. Battle stance (or a
         // watch-range advance) levels the point at the enemy — a line of
@@ -109,7 +132,8 @@ fn vertex(vertex: Vertex) -> VertexOutput {
         // leveled shaft forward. Charging carries it leveled too.
         let raise = smoothstep(0.0, 0.8, lunge);
         let chop = smoothstep(0.85, 1.0, lunge);
-        let level = max(max(stance, ready * 0.75), max(sprint, raise));
+        // Spearwall: points come down and STAY down, even standing idle.
+        let level = max(max(stance, ready * 0.75), max(max(sprint, raise), wall));
         // Slight walk sway while the spear is upright; vertical pump on
         // a victory cheer.
         var ang = -1.42 * level * (1.0 - celebrate)
@@ -122,10 +146,11 @@ fn vertex(vertex: Vertex) -> VertexOutput {
         local.z += -0.30 * raise + 1.15 * chop;
     } else if part > 1.5 {
         // Legs: opposite-phase walk swing, harder stride on the charge;
-        // bracing splits the stance (one foot planted forward).
+        // bracing or a wall stance splits the legs (one foot planted).
         let side = select(1.0, -1.0, part > 2.5);
-        let ang = 0.55 * (1.0 + 0.35 * sprint) * moving * sin(phase) * side
-            + 0.32 * brace * side;
+        let ang = 0.55 * (1.0 + 0.35 * sprint) * moving * walk_s * side
+            + 0.32 * brace * side
+            + 0.22 * wall * (1.0 - moving) * side;
         local = pitch_about(local, pivot, ang);
         normal = pitch_normal(normal, ang);
     } else if part > 0.5 {
@@ -187,7 +212,7 @@ fn vertex(vertex: Vertex) -> VertexOutput {
     // adds a sprint lean and a heavier bob. Sprint lean is walk-gated
     // (the stance band is no longer walk-scaled) so jammed stragglers
     // don't posture.
-    let bob = 0.05 * (1.0 + 0.4 * sprint) * moving * sin(phase * 2.0);
+    let bob = 0.05 * (1.0 + 0.4 * sprint) * moving * walk_s2;
     let lean = (0.10 * moving + 0.30 * lunge + 0.24 * sprint * (0.25 + 0.75 * moving))
         * clamp(local.y + 0.5, 0.0, 1.5);
     local.z += lean * 0.3;
@@ -229,9 +254,14 @@ fn vertex(vertex: Vertex) -> VertexOutput {
     // Cheer hop: celebrating units bounce; braced-walk adds a slight
     // crouch on the advance too.
     let hop = 0.06 * celebrate * max(sin(globals.time * 9.0 + seed * 6.2831853), 0.0);
+    // Wall stance carries a slight crouch (the planted, braced line).
     let position = local * vertex.i_pos_scale.w
         + vertex.i_pos_scale.xyz
-        + vec3<f32>(0.0, bob - 0.15 * death - 0.07 * brace - 0.03 * ready * moving + hop, 0.0);
+        + vec3<f32>(
+            0.0,
+            bob - 0.15 * death - 0.07 * brace - 0.03 * ready * moving - 0.05 * wall + hop,
+            0.0,
+        );
 
     var out: VertexOutput;
     // Instance entity sits at the origin with identity transform, so passing

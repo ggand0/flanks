@@ -77,6 +77,7 @@ fn process_deaths(
                     scale: 1.0,
                     color: units.color[i],
                     anim: [units.yaw[i], 0.0, 0.0, 2.0],
+                    anim2: [0.0; 4],
                 },
             );
         }
