@@ -10,7 +10,7 @@ use std::time::Instant;
 use crate::orders::Groups;
 use crate::spatial::SpatialGrid;
 use crate::terrain::Terrain;
-use crate::unit_types::TYPES;
+use crate::unit_types::{BASE_DMG, FACTOR_CLAMP, FACTOR_MULT, TYPES};
 use crate::units::Units;
 
 const SEP_RADIUS: f32 = 1.4;
@@ -54,10 +54,9 @@ const ROUT_FLEE_FRAC: f32 = 0.9;
 /// and lock a closing target; swings still require reach.
 const WIDE_ACQUIRE_R: f32 = 4.0;
 /// Speed fraction above which a newly started swing counts as a charge.
+/// The momentum bonus (attacker's charge_bonus attack points) resolves in
+/// the damage pass — a braced SPEARWALL nullifies it (points beat momentum).
 const CHARGE_SPEED_FRAC: f32 = 0.6;
-/// Damage multiplier for charging hits (momentum bonus). Applied in the
-/// damage pass — a braced SPEARWALL nullifies it (points beat momentum).
-const CHARGE_MULT: f32 = 1.75;
 /// A regiment in its charge phase runs the last stretch home.
 const CHARGE_SPEED_BOOST: f32 = 1.15;
 /// Walls advance at a deliberate pace — breaking into a run breaks the wall.
@@ -66,12 +65,16 @@ const WALL_SPEED_FRAC: f32 = 0.72;
 /// wall stance: shoulder to shoulder. Without this the physics pushes a
 /// wall back out to normal spacing and the tight slots never happen.
 const WALL_SEP_RADIUS: f32 = 1.05;
-/// Shieldwall: shields catch a share of every incoming blow.
-const SHIELDWALL_ABSORB: f32 = 0.7;
-/// Shieldwall trades some offense for the cover (arms stay behind shields).
-const SHIELDWALL_DMG_OUT: f32 = 0.9;
+/// Shieldwall: locked shields count double where the shield covers
+/// (front + left — a shieldwall still has no back), at some offense.
+const SHIELDWALL_SHIELD_PTS: f32 = 2.0;
+/// Shieldwall trades attack points for the cover (arms stay behind shields).
+const SHIELDWALL_ATK_PTS: f32 = -1.0;
 /// Spearwall: set spears strike harder (the wall of points does the work).
-const SPEARWALL_DMG_OUT: f32 = 1.25;
+const SPEARWALL_ATK_PTS: f32 = 2.0;
+/// Sector test at damage apply: cos(60 deg). Front = attack direction
+/// within 60 deg of the victim's facing; rear = beyond 120 deg; else side.
+const SECTOR_COS_60: f32 = 0.5;
 
 /// Global damage multiplier. FL_COMBAT_SCALE overrides (fast test battles).
 #[derive(Resource)]
@@ -88,16 +91,40 @@ impl Default for CombatScale {
 pub struct DamageEvent {
     pub victim: u32,
     pub attacker: u32,
-    pub dmg: f32,
-    /// Swing started at charging speed: the momentum bonus is applied at
-    /// damage time, where the VICTIM's wall state is known (a braced
-    /// spearwall cancels it).
+    /// Per-swing damage jitter (0.85-1.15); everything else — stats,
+    /// attack sector, wall stances, the charge bonus — resolves in the
+    /// apply pass, where both sides' state is known (a braced spearwall
+    /// cancels the charge; the victim's yaw decides front/side/rear).
+    pub jit: f32,
+    /// Swing started at charging speed (momentum bonus).
     pub charge: bool,
 }
 
 /// One event buffer per integrate chunk; allocations persist across ticks.
 #[derive(Resource, Default)]
 pub struct DamageBuffers(pub Vec<Vec<DamageEvent>>);
+
+/// FL_TEST_DIR bookkeeping: hits on team-0 victims bucketed by attack
+/// sector, filled by the damage apply pass, logged from regiments.rs.
+#[derive(Resource)]
+pub struct DirTestStats {
+    /// Indexed front / side / rear.
+    pub kills: [u64; 3],
+    pub hits: [u64; 3],
+    pub dmg: [f64; 3],
+    pub enabled: bool,
+}
+
+impl Default for DirTestStats {
+    fn default() -> Self {
+        Self {
+            kills: [0; 3],
+            hits: [0; 3],
+            dmg: [0.0; 3],
+            enabled: std::env::var("FL_TEST_DIR").is_ok(),
+        }
+    }
+}
 
 /// Ticks a corpse persists (death anim) before swap-removal.
 pub const DEATH_TICKS: u8 = 18;
@@ -134,6 +161,7 @@ impl Plugin for MovementPlugin {
         app.init_resource::<SimStats>()
             .init_resource::<CombatScale>()
             .init_resource::<DamageBuffers>()
+            .init_resource::<DirTestStats>()
             .insert_resource(DebugViz(true))
             .init_resource::<SpatialGrid>()
             .add_systems(FixedUpdate, step_sim)
@@ -154,6 +182,7 @@ pub fn step_sim(
     mut stats: ResMut<SimStats>,
     mut tick: Local<u32>,
     mut wall_flags: Local<Vec<bool>>,
+    mut dir_stats: ResMut<DirTestStats>,
 ) {
     let dt = time.delta_secs();
     let Units {
@@ -467,18 +496,10 @@ pub fn step_sim(
                                     // or dead target is a whiff.
                                     let jit =
                                         0.85 + 0.3 * crate::units::hash01(tick_seed ^ (i as u32));
-                                    // Own wall stance shapes the blow;
-                                    // the charge bonus resolves at apply
-                                    // time against the victim's stance.
-                                    let wall_out = match wall[gi] {
-                                        1 => SHIELDWALL_DMG_OUT,
-                                        2 => SPEARWALL_DMG_OUT,
-                                        _ => 1.0,
-                                    };
                                     events.push(DamageEvent {
                                         victim: tgt_chunk[j],
                                         attacker: i as u32,
-                                        dmg: params.damage * combat_scale * jit * wall_out,
+                                        jit,
                                         charge: sw_chunk[j] & crate::units::SWING_CHARGE != 0,
                                     });
                                     sw_chunk[j] = crate::units::SWING_RECOVER;
@@ -721,28 +742,72 @@ pub fn step_sim(
                 if hp[v] <= 0.0 || death_t[v] > 0 || team[v] == team[a] {
                     continue;
                 }
-                let reach = TYPES[kind[a] as usize].reach * 1.15;
+                let pa = &TYPES[kind[a] as usize];
+                let reach = pa.reach * 1.15;
                 if pos_prev[v].xz().distance_squared(pos_prev[a].xz()) > reach * reach {
                     continue;
                 }
-                // Victim stance: a braced spearwall nullifies the charge
-                // momentum bonus (points beat momentum); a shieldwall
-                // catches part of every blow.
-                let mut dmg = ev.dmg;
+                // M2TW directional resolution. Sector of the blow against
+                // the victim's facing: defence skill counts vs front and
+                // side but NOT rear; the shield covers front + LEFT side
+                // only (shield arm); armour counts from everywhere, halved
+                // by armour-piercing weapons. A soldier struck from behind
+                // loses skill+shield entirely — facing is the defensive
+                // resource, and rear charges kill before morale even moves.
+                let pv = &TYPES[kind[v] as usize];
+                let fwd = Vec2::new(yaw[v].sin(), yaw[v].cos());
+                let dir = (pos_prev[a].xz() - pos_prev[v].xz()).normalize_or_zero();
+                let along = fwd.dot(dir);
+                let rear = along < -SECTOR_COS_60;
+                let front = along >= SECTOR_COS_60;
+                // Victim's left in the xz plane (facing +Z -> left = +X).
+                let left_side = !front && !rear && dir.dot(Vec2::new(fwd.y, -fwd.x)) > 0.0;
+
+                // Wall stances are stat points now: a shieldwall doubles
+                // down on cover (only where the shield counts — it still
+                // has no back), a braced spearwall strikes harder, and a
+                // braced spearwall VICTIM nullifies the attacker's charge
+                // momentum (points beat momentum).
+                let a_wall = wall[group[a] as usize];
                 let v_wall = wall[group[v] as usize];
+                let mut attack = pa.attack
+                    + match a_wall {
+                        1 => SHIELDWALL_ATK_PTS,
+                        2 => SPEARWALL_ATK_PTS,
+                        _ => 0.0,
+                    };
                 if ev.charge && v_wall != 2 {
-                    dmg *= CHARGE_MULT;
+                    attack += pa.charge_bonus;
                 }
-                if v_wall == 1 {
-                    dmg *= SHIELDWALL_ABSORB;
-                }
+                let skill = if rear { 0.0 } else { pv.defence_skill };
+                let shield = if front || left_side {
+                    pv.shield + if v_wall == 1 { SHIELDWALL_SHIELD_PTS } else { 0.0 }
+                } else {
+                    0.0
+                };
+                let armour = if pa.ap { pv.armour * 0.5 } else { pv.armour };
+                let factor =
+                    (attack - (skill + armour + shield)).clamp(-FACTOR_CLAMP, FACTOR_CLAMP);
+                let dmg = BASE_DMG[pa.weapon as usize]
+                    * FACTOR_MULT.powf(factor)
+                    * ev.jit
+                    * combat_scale;
                 hp[v] -= dmg;
                 flash[v] = FLASH_TICKS;
-                if hp[v] <= 0.0 {
+                let died = hp[v] <= 0.0;
+                if died {
                     death_t[v] = DEATH_TICKS;
                     // kills[] counts losses OF that team (overlay semantics).
                     cstats.kills[team[v] as usize] += 1;
                     groups.list[group[v] as usize].recent_deaths += 1;
+                }
+                if dir_stats.enabled && team[v] == 0 {
+                    let s = if front { 0 } else if !rear { 1 } else { 2 };
+                    dir_stats.hits[s] += 1;
+                    dir_stats.dmg[s] += dmg as f64;
+                    if died {
+                        dir_stats.kills[s] += 1;
+                    }
                 }
             }
         }

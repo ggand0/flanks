@@ -40,7 +40,14 @@ impl Plugin for AiPlugin {
 fn scripts_active() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        ["FL_TEST_FRONT", "FL_TEST_ORDERS", "FL_TEST_SURROUND", "FL_TEST_ROUT", "FL_TEST_FORM"]
+        [
+            "FL_TEST_FRONT",
+            "FL_TEST_ORDERS",
+            "FL_TEST_SURROUND",
+            "FL_TEST_ROUT",
+            "FL_TEST_FORM",
+            "FL_TEST_DIR",
+        ]
             .iter()
             .any(|k| std::env::var(k).is_ok())
     })

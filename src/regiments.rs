@@ -24,7 +24,7 @@ impl Plugin for RegimentsPlugin {
         // Terrain resource is created in PreStartup (generate_terrain).
         // Morale lives in crate::morale (MoralePlugin).
         app.add_systems(Startup, spawn_battle)
-            .add_systems(Update, (rout_test_log, restart_key));
+            .add_systems(Update, (rout_test_log, dir_test_log, restart_key));
     }
 }
 
@@ -114,6 +114,10 @@ fn do_spawn_battle(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
     }
     if std::env::var("FL_TEST_ROUT").is_ok() {
         spawn_rout_test(units, terrain, groups);
+        return;
+    }
+    if std::env::var("FL_TEST_DIR").is_ok() {
+        spawn_dir_test(units, terrain, groups);
         return;
     }
 
@@ -209,6 +213,78 @@ fn spawn_rout_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
     }
     groups.list = list;
     info!("[rout-test] 1 blue vs 3 converging orange regiments");
+}
+
+/// FL_TEST_DIR: the directional-defense acceptance. Two hammer-and-anvil
+/// pairs of light infantry, victims on HOLD facing +Z. Each victim is
+/// pinned frontally by a near attacker; a farther second attacker arrives
+/// ~2.5 s later — from the LEFT side in the control pair (the shield arm:
+/// factor-identical to frontal) and from the REAR in the test pair (skill
+/// and shield gone). The damage pass buckets every hit on a blue victim by
+/// its actual sector at hit time (movement.rs DirTestStats). Acceptance:
+/// rear-sector kills (one feeding regiment) >= front-sector kills (TWO
+/// feeding regiments), i.e. per-attacker rear kill rate >= 2x frontal.
+fn spawn_dir_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
+    let mut list = Vec::new();
+    for (cx, rear) in [(-250.0, false), (250.0, true)] {
+        spawn_regiment(units, terrain, &mut list, 0, KIND_LIGHT, Vec2::new(cx, 0.0), 500, -1.0);
+        let v = list.len() - 1;
+        list[v].hold = true;
+        let a2 = if rear {
+            Vec2::new(cx, -55.0)
+        } else {
+            Vec2::new(cx + 55.0, 0.0)
+        };
+        for anchor in [Vec2::new(cx, 35.0), a2] {
+            spawn_regiment(units, terrain, &mut list, 1, KIND_LIGHT, anchor, 500, 1.0);
+            let g = list.len() - 1;
+            list[g].order = Some(crate::orders::Order::Move(Vec2::new(cx, 0.0)));
+            list[g].auto_order = true;
+        }
+    }
+    groups.list = list;
+    info!("[dir-test] control pair (front+left) at x=-250, test pair (front+rear) at x=+250");
+}
+
+/// FL_TEST_DIR bookkeeping: sector-bucketed kills/damage + per-pair victim
+/// survival, every 2 s.
+#[allow(clippy::too_many_arguments)] // bevy system params
+fn dir_test_log(
+    dir_stats: Res<crate::movement::DirTestStats>,
+    units: Res<Units>,
+    time: Res<Time>,
+    mut next: Local<f32>,
+) {
+    if !dir_stats.enabled || units.len() == 0 {
+        return;
+    }
+    let t = time.elapsed_secs();
+    if t < *next {
+        return;
+    }
+    *next = t + 2.0;
+    let (mut ctl, mut test) = (0usize, 0usize);
+    for i in 0..units.len() {
+        if units.team[i] == 0 && units.death_t[i] == 0 {
+            if units.pos[i].x < 0.0 {
+                ctl += 1;
+            } else {
+                test += 1;
+            }
+        }
+    }
+    let k = &dir_stats.kills;
+    let per_hit = |s: usize| dir_stats.dmg[s] / dir_stats.hits[s].max(1) as f64;
+    info!(
+        "[dir-test] t={t:.0}s kills by sector: front {} side {} rear {} \
+         (dmg/hit {:.1}/{:.1}/{:.1}); victims alive: control {ctl}/500, test {test}/500",
+        k[0],
+        k[1],
+        k[2],
+        per_hit(0),
+        per_hit(1),
+        per_hit(2),
+    );
 }
 
 /// FL_TEST_ROUT bookkeeping: blue regiment morale/state timeline.
