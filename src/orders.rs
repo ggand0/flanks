@@ -1,27 +1,39 @@
-//! Regiments (groups), selection, and player orders.
+//! Regiments (groups) and player orders. Selection/hover/control groups
+//! live in selection.rs (re-exported here — consumers keep their paths).
 //!
 //! A group IS a regiment: a permanent block of units sharing an order,
-//! kind, and (later) morale. Selection: hold LMB and draw a line/loop over
-//! the field; regiments with enough units near the stroke are selected.
-//! Right-click: attack-move — each selected regiment's ORDER is the target
-//! translated by its offset from the selection centroid, so a group move
-//! preserves the army's arrangement. Units translate the regiment order by
-//! their own `home` offset (block moves, never converges).
+//! kind, formation, and morale. Right-click CLICK: attack-move — each
+//! selected regiment's ORDER is the target translated by its offset from
+//! the selection centroid, so a group move preserves the army's
+//! arrangement. Right-click DRAG (M2TW): paint the new front line on the
+//! ground — regiments divide the drawn width, set their files to fill it,
+//! and face perpendicular to it, away from where they stand; soft slot
+//! markers preview the placement until release. Units translate the
+//! regiment order by their own `home` offset (block moves, never
+//! converges).
 
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 
-use crate::movement::DebugViz;
+use crate::formation::{FormShape, facing_dir, facing_of, slot_offsets};
+use crate::selection::cursor_ground_point;
+pub use crate::selection::{Hover, Selection, select_along_line};
 use crate::terrain::Terrain;
 use crate::units::Units;
 
 pub const PLAYER_TEAM: u8 = 0;
-const SELECT_RADIUS: f32 = 14.0;
 /// Groups whose centroid gets this close to their order target go idle.
 const ARRIVE_CLEAR: f32 = 18.0;
 /// Right-clicking within this range of an enemy regiment's centroid is an
 /// attack order on that regiment (else it's a move order to the point).
-const ATTACK_PICK_RADIUS: f32 = 20.0;
+pub const ATTACK_PICK_RADIUS: f32 = 20.0;
+/// RMB travel on the ground beyond this is a formation drag, not a click.
+const ORDER_DRAG_MIN: f32 = 5.0;
+/// Gap left between regiments sharing a drawn line.
+const LINE_REG_GAP: f32 = 3.0;
+/// Per-soldier preview circles are drawn up to this many total units;
+/// bigger selections preview as block outlines (gizmo budget).
+const PREVIEW_CIRCLE_CAP: usize = 3000;
 
 /// A regiment order, TW-style: move orders target ground and end on
 /// arrival; attack orders hunt a specific enemy regiment (the destination
@@ -104,7 +116,7 @@ pub struct GroupData {
     pub hostile_near: bool,
     /// Victory-cheer ticks remaining (render-only celebration).
     pub celebrate: u16,
-    // --- morale (regiments.rs updates per tick) ---
+    // --- morale (morale.rs updates per tick) ---
     pub morale: f32,
     pub state: RegState,
     /// Deaths since the last morale tick (tallied by the damage apply pass).
@@ -164,23 +176,25 @@ impl Groups {
     }
 }
 
-/// Selected regiments (player team only) + cached unit total.
-#[derive(Resource, Default)]
-pub struct Selection {
-    pub regiments: Vec<bool>,
-    pub count_units: usize,
+/// One regiment's placement on a drawn order line.
+struct LinePlacement {
+    g: usize,
+    /// Block CENTER (the Move target; the front rank sits on the line).
+    anchor: Vec2,
+    facing: f32,
+    files: u32,
 }
 
-/// In-progress drag: projected ground points of the selection line.
+/// RMB press/drag state for order issuing.
 #[derive(Resource, Default)]
-struct DragLine {
-    points: Vec<Vec2>,
+struct OrderDrag {
+    /// Ground point at RMB press (None = no press in flight).
+    start: Option<Vec2>,
+    cur: Vec2,
+    /// Travel exceeded ORDER_DRAG_MIN: this is a formation drag.
     active: bool,
+    layout: Vec<LinePlacement>,
 }
-
-/// Ctrl+1..9 stores the current selection mask; 1..9 recalls it.
-#[derive(Resource, Default)]
-pub struct ControlGroups(pub Vec<Vec<bool>>);
 
 pub struct OrdersPlugin;
 
@@ -190,18 +204,12 @@ impl Plugin for OrdersPlugin {
         // list once at startup and it stays FIXED for the whole battle —
         // stable indices are what make `units.group` a permanent regiment id.
         app.init_resource::<Groups>()
-            .init_resource::<Selection>()
-            .init_resource::<DragLine>()
-            .init_resource::<Hover>()
-            .init_resource::<ControlGroups>()
+            .init_resource::<OrderDrag>()
             .add_systems(
                 Update,
                 (
-                    drag_select,
-                    update_hover,
-                    issue_order,
+                    (issue_order, draw_order_preview).chain(),
                     halt_key,
-                    control_group_keys,
                     test_orders_script,
                     draw_order_gizmos,
                 ),
@@ -210,159 +218,10 @@ impl Plugin for OrdersPlugin {
     }
 }
 
-fn cursor_ground_point(
-    window: &Window,
-    camera: &Camera,
-    cam_tf: &GlobalTransform,
-    terrain: &Terrain,
-) -> Option<Vec2> {
-    let cursor = window.cursor_position()?;
-    let ray = camera.viewport_to_world(cam_tf, cursor).ok()?;
-    terrain.raycast(ray).map(|hit| Vec2::new(hit.x, hit.z))
-}
-
-#[allow(clippy::too_many_arguments)] // bevy system params
-fn drag_select(
-    buttons: Res<ButtonInput<MouseButton>>,
-    window: Query<&Window, With<PrimaryWindow>>,
-    camera: Query<(&Camera, &GlobalTransform)>,
-    terrain: Res<Terrain>,
-    units: Res<Units>,
-    groups: Res<Groups>,
-    mut drag: ResMut<DragLine>,
-    mut selection: ResMut<Selection>,
-) {
-    let Ok(window) = window.single() else { return };
-    let Ok((camera, cam_tf)) = camera.single() else {
-        return;
-    };
-
-    if buttons.just_pressed(MouseButton::Left) {
-        drag.points.clear();
-        drag.active = true;
-    }
-    if drag.active
-        && buttons.pressed(MouseButton::Left)
-        && let Some(p) = cursor_ground_point(window, camera, cam_tf, &terrain)
-        && drag.points.last().is_none_or(|l| l.distance(p) > 3.0)
-    {
-        drag.points.push(p);
-    }
-
-    if drag.active && buttons.just_released(MouseButton::Left) {
-        drag.active = false;
-        if drag.points.is_empty() {
-            return;
-        }
-        select_along_line(&drag.points, &units, &groups, &mut selection);
-        info!(
-            "selected {} regiments ({} units)",
-            selection.regiments.iter().filter(|s| **s).count(),
-            selection.count_units
-        );
-    }
-}
-
-/// A stroke whose endpoints nearly meet is treated as a closed loop.
-fn stroke_is_closed(line: &[Vec2]) -> bool {
-    if line.len() < 3 {
-        return false;
-    }
-    let path_len: f32 = line.windows(2).map(|w| w[0].distance(w[1])).sum();
-    line[0].distance(*line.last().unwrap()) < (path_len * 0.15).clamp(10.0, 40.0)
-}
-
-/// Even-odd crossing test against the stroke polygon (closing edge implied).
-fn point_in_poly(p: Vec2, poly: &[Vec2]) -> bool {
-    let mut inside = false;
-    let mut j = poly.len() - 1;
-    for i in 0..poly.len() {
-        let (a, b) = (poly[i], poly[j]);
-        if (a.y > p.y) != (b.y > p.y) {
-            let x = a.x + (p.y - a.y) / (b.y - a.y) * (b.x - a.x);
-            if p.x < x {
-                inside = !inside;
-            }
-        }
-        j = i;
-    }
-    inside
-}
-
-/// Per-unit stroke hits, promoted to whole regiments: a regiment is
-/// selected when enough of its units are near the stroke (a sloppy lasso
-/// edge shouldn't grab a neighboring regiment).
-pub fn select_along_line(
-    line: &[Vec2],
-    units: &Units,
-    groups: &Groups,
-    selection: &mut Selection,
-) {
-    selection.regiments.clear();
-    selection.regiments.resize(groups.list.len(), false);
-    selection.count_units = 0;
-    let mut hits = vec![0usize; groups.list.len()];
-
-    // Bounding box early-out around the whole stroke.
-    let mut lo = Vec2::splat(f32::MAX);
-    let mut hi = Vec2::splat(f32::MIN);
-    for p in line {
-        lo = lo.min(*p);
-        hi = hi.max(*p);
-    }
-    lo -= SELECT_RADIUS;
-    hi += SELECT_RADIUS;
-
-    // War-of-Dots style: an enclosing stroke selects everything inside the
-    // loop, in addition to units near the stroke itself.
-    let closed = stroke_is_closed(line);
-    let r2 = SELECT_RADIUS * SELECT_RADIUS;
-    for i in 0..units.len() {
-        if units.team[i] != PLAYER_TEAM || units.death_t[i] > 0 {
-            continue;
-        }
-        let p = Vec2::new(units.pos[i].x, units.pos[i].z);
-        if p.x < lo.x || p.x > hi.x || p.y < lo.y || p.y > hi.y {
-            continue;
-        }
-        let mut hit = closed && point_in_poly(p, line);
-        if !hit {
-            if line.len() == 1 {
-                hit = p.distance_squared(line[0]) < r2;
-            } else {
-                for w in line.windows(2) {
-                    let (a, b) = (w[0], w[1]);
-                    let ab = b - a;
-                    let t = ((p - a).dot(ab) / ab.length_squared().max(1e-6)).clamp(0.0, 1.0);
-                    if p.distance_squared(a + ab * t) < r2 {
-                        hit = true;
-                        break;
-                    }
-                }
-            }
-        }
-        if hit {
-            hits[units.group[i] as usize] += 1;
-        }
-    }
-
-    // Promote unit hits to whole regiments.
-    for (g, group) in groups.list.iter().enumerate() {
-        if group.team != PLAYER_TEAM || group.count == 0 {
-            continue;
-        }
-        let threshold = 8.max(group.count * 3 / 100);
-        if hits[g] >= threshold.min(group.count) {
-            selection.regiments[g] = true;
-            selection.count_units += group.count;
-        }
-    }
-}
-
 /// Attack-move `selected` regiments so the formation ARRANGEMENT is
 /// preserved: each regiment's order is the target translated by its offset
-/// from the selection centroid. Shared by the RMB handler, test scripts,
-/// and (later) the AI.
+/// from the selection centroid. Shared by the RMB click handler, test
+/// scripts, and (later) the AI.
 pub fn order_regiments(groups: &mut Groups, selected: &[usize], target: Vec2) {
     // Broken regiments are uncontrollable.
     let selected: Vec<usize> = selected
@@ -382,8 +241,8 @@ pub fn order_regiments(groups: &mut Groups, selected: &[usize], target: Vec2) {
         group.auto_order = false;
         // March facing the way we're going: the front rank leads.
         let dir = dest - group.centroid;
-        if group.shape == crate::formation::FormShape::Rect && dir.length() > 1.0 {
-            group.facing = crate::formation::facing_of(dir);
+        if group.shape == FormShape::Rect && dir.length() > 1.0 {
+            group.facing = facing_of(dir);
             group.reform = true;
         }
     }
@@ -401,60 +260,101 @@ pub fn attack_regiments(groups: &mut Groups, selected: &[usize], target: u32) {
         group.order = Some(Order::Attack(target));
         group.auto_order = false;
         let dir = target_c - group.centroid;
-        if group.shape == crate::formation::FormShape::Rect && dir.length() > 1.0 {
-            group.facing = crate::formation::facing_of(dir);
+        if group.shape == FormShape::Rect && dir.length() > 1.0 {
+            group.facing = facing_of(dir);
             group.reform = true;
         }
     }
 }
 
-/// Regiment under a ground point, if any: nearest live regiment of the
-/// wanted side whose centroid is within the pick radius.
-fn regiment_at(groups: &Groups, p: Vec2, enemy: bool) -> Option<u32> {
-    groups
-        .list
-        .iter()
-        .enumerate()
-        .filter(|(_, g)| (g.team != PLAYER_TEAM) == enemy && g.count > 0)
-        .map(|(g, gd)| (g, gd.centroid.distance(p)))
-        .filter(|(_, d)| *d < ATTACK_PICK_RADIUS)
-        .min_by(|a, b| a.1.total_cmp(&b.1))
-        .map(|(g, _)| g as u32)
-}
-
 fn enemy_regiment_at(groups: &Groups, p: Vec2) -> Option<u32> {
-    regiment_at(groups, p, true)
+    crate::selection::regiment_at(groups, p, true)
 }
 
-/// Regiments under the cursor this frame. `enemy` doubles as the
-/// attack-order preview: it is what a right-click would target (same
-/// pick logic), so the render tint and the inspect panel key off it.
-#[derive(Resource, Default)]
-pub struct Hover {
-    pub enemy: Option<u32>,
-    pub own: Option<u32>,
+/// Lay `selected` regiments out along the ground line a -> b: the drawn
+/// width is divided by strength, files fill each share, and every block
+/// faces perpendicular to the line, AWAY from where the selection stands
+/// (troops walk up to the drawn line and face past it). Regiments keep
+/// their left-to-right order along the line to minimize crossing.
+fn line_layout(groups: &Groups, selected: &[usize], a: Vec2, b: Vec2) -> Vec<LinePlacement> {
+    let picked: Vec<usize> = selected
+        .iter()
+        .copied()
+        .filter(|&g| {
+            let gd = &groups.list[g];
+            gd.count > 0 && !gd.state.is_broken()
+        })
+        .collect();
+    if picked.is_empty() {
+        return Vec::new();
+    }
+    let len = a.distance(b);
+    let dir = (b - a) / len.max(1e-3);
+    let mean: Vec2 =
+        picked.iter().map(|&g| groups.list[g].centroid).sum::<Vec2>() / picked.len() as f32;
+    let perp = Vec2::new(-dir.y, dir.x);
+    let mid = (a + b) * 0.5;
+    let fwd = if perp.dot(mid - mean) >= 0.0 { perp } else { -perp };
+    let facing = facing_of(fwd);
+
+    // Keep current left-to-right order along the line.
+    let mut segs: Vec<(usize, f32)> = picked
+        .iter()
+        .map(|&g| (g, (groups.list[g].centroid - a).dot(dir)))
+        .collect();
+    segs.sort_unstable_by(|x, y| x.1.total_cmp(&y.1));
+
+    let total: usize = picked.iter().map(|&g| groups.list[g].count).sum();
+    let mut placements = Vec::with_capacity(segs.len());
+    let mut off = 0.0;
+    for (g, _) in segs {
+        let gd = &groups.list[g];
+        let share = len * gd.count as f32 / total as f32;
+        let pitch = gd.spacing.pitch();
+        let files = (((share - LINE_REG_GAP) / pitch.x).floor() as u32)
+            .clamp(1, gd.count as u32);
+        let ranks = (gd.count as u32).div_ceil(files);
+        // Front rank ON the drawn line; the block center sits behind it.
+        let line_pos = a + dir * (off + share * 0.5);
+        let anchor = line_pos - fwd * ((ranks - 1) as f32 * 0.5 * pitch.y);
+        placements.push(LinePlacement { g, anchor, facing, files });
+        off += share;
+    }
+    placements
 }
 
-fn update_hover(
-    window: Query<&Window, With<PrimaryWindow>>,
-    camera: Query<(&Camera, &GlobalTransform)>,
-    terrain: Res<Terrain>,
-    groups: Res<Groups>,
-    mut hover: ResMut<Hover>,
-) {
-    hover.enemy = None;
-    hover.own = None;
-    let Ok(window) = window.single() else { return };
-    let Ok((camera, cam_tf)) = camera.single() else {
-        return;
-    };
-    let Some(p) = cursor_ground_point(window, camera, cam_tf, &terrain) else {
-        return;
-    };
-    hover.enemy = regiment_at(&groups, p, true);
-    hover.own = regiment_at(&groups, p, false);
+fn apply_line_order(groups: &mut Groups, layout: Vec<LinePlacement>, a: Vec2, b: Vec2) {
+    let n = layout.len();
+    let facing = layout.first().map(|p| p.facing).unwrap_or(0.0);
+    for p in layout {
+        let gd = &mut groups.list[p.g];
+        gd.facing = p.facing;
+        gd.files = p.files;
+        gd.shape = FormShape::Rect;
+        gd.order = Some(Order::Move(p.anchor));
+        gd.auto_order = false;
+        gd.reform = true;
+    }
+    info!(
+        "line order: {n} regiments across {:.0} m, facing {facing:.2} rad",
+        a.distance(b),
+    );
 }
 
+/// Drive the full drag-order path programmatically (the FL_TEST_FORM
+/// script uses this — one code path for the mouse and the test).
+pub fn line_order(groups: &mut Groups, selected: &[usize], a: Vec2, b: Vec2) {
+    let layout = line_layout(groups, selected, a, b);
+    if !layout.is_empty() {
+        apply_line_order(groups, layout, a, b);
+    }
+}
+
+/// RMB order issuing: press -> (optional drag with live preview) ->
+/// release. A short click keeps the classic behavior (attack the regiment
+/// under the cursor, else arrangement-preserving group move); a drag
+/// beyond ORDER_DRAG_MIN paints the new front line.
+#[allow(clippy::too_many_arguments)] // bevy system params
 fn issue_order(
     buttons: Res<ButtonInput<MouseButton>>,
     window: Query<&Window, With<PrimaryWindow>>,
@@ -462,17 +362,19 @@ fn issue_order(
     terrain: Res<Terrain>,
     mut groups: ResMut<Groups>,
     selection: Res<Selection>,
+    mut drag: ResMut<OrderDrag>,
 ) {
-    if !buttons.just_pressed(MouseButton::Right) || selection.count_units == 0 {
+    if selection.count_units == 0 {
+        drag.start = None;
+        drag.active = false;
+        drag.layout.clear();
         return;
     }
     let Ok(window) = window.single() else { return };
     let Ok((camera, cam_tf)) = camera.single() else {
         return;
     };
-    let Some(target) = cursor_ground_point(window, camera, cam_tf, &terrain) else {
-        return;
-    };
+    let ground = cursor_ground_point(window, camera, cam_tf, &terrain);
     let selected: Vec<usize> = selection
         .regiments
         .iter()
@@ -480,7 +382,31 @@ fn issue_order(
         .filter(|(_, s)| **s)
         .map(|(g, _)| g)
         .collect();
-    if let Some(t) = enemy_regiment_at(&groups, target) {
+
+    if buttons.just_pressed(MouseButton::Right) {
+        drag.start = ground;
+        drag.active = false;
+        drag.layout.clear();
+    }
+    if buttons.pressed(MouseButton::Right)
+        && let (Some(start), Some(cur)) = (drag.start, ground)
+    {
+        drag.cur = cur;
+        if !drag.active && start.distance(cur) >= ORDER_DRAG_MIN {
+            drag.active = true;
+        }
+        if drag.active {
+            drag.layout = line_layout(&groups, &selected, start, cur);
+        }
+    }
+    if !buttons.just_released(MouseButton::Right) {
+        return;
+    }
+    let Some(start) = drag.start.take() else { return };
+
+    if drag.active && !drag.layout.is_empty() {
+        apply_line_order(&mut groups, std::mem::take(&mut drag.layout), start, drag.cur);
+    } else if let Some(t) = enemy_regiment_at(&groups, start) {
         attack_regiments(&mut groups, &selected, t);
         info!(
             "{} regiments ({} units) ATTACK regiment {t}",
@@ -488,14 +414,78 @@ fn issue_order(
             selection.count_units,
         );
     } else {
-        order_regiments(&mut groups, &selected, target);
+        order_regiments(&mut groups, &selected, start);
         info!(
             "{} regiments ({} units) move to ({:.0}, {:.0})",
             selected.len(),
             selection.count_units,
-            target.x,
-            target.y
+            start.x,
+            start.y
         );
+    }
+    drag.active = false;
+    drag.layout.clear();
+}
+
+/// Placement preview while a formation drag is in flight: the drawn line
+/// plus a soft green marker per soldier slot (block outlines above the
+/// gizmo budget), so the player can tune width and facing before letting
+/// go. Player-facing UI — not gated by the debug-viz toggle.
+fn draw_order_preview(
+    drag: Res<OrderDrag>,
+    groups: Res<Groups>,
+    terrain: Res<Terrain>,
+    mut gizmos: Gizmos,
+) {
+    if !drag.active || drag.layout.is_empty() {
+        return;
+    }
+    let start = drag.start.unwrap_or(drag.cur);
+    let lift = |p: Vec2, up: f32| Vec3::new(p.x, terrain.height_at(p.x, p.y) + up, p.y);
+    // The pleasant kind of green.
+    let line_col = Color::srgba(0.75, 0.95, 0.6, 0.9);
+    let slot_col = Color::srgba(0.55, 0.92, 0.62, 0.75);
+
+    gizmos.line(lift(start, 0.4), lift(drag.cur, 0.4), line_col);
+
+    let total: usize = drag.layout.iter().map(|p| groups.list[p.g].count).sum();
+    for p in &drag.layout {
+        let gd = &groups.list[p.g];
+        let fwd = facing_dir(p.facing);
+        let right = Vec2::new(fwd.y, -fwd.x);
+        let pitch = gd.spacing.pitch();
+        let world = |off: Vec2| p.anchor + right * off.x + fwd * off.y;
+
+        if total <= PREVIEW_CIRCLE_CAP {
+            for off in slot_offsets(gd.count, p.files as usize, pitch) {
+                gizmos.circle(
+                    Isometry3d::new(
+                        lift(world(off), 0.25),
+                        Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2),
+                    ),
+                    0.42,
+                    slot_col,
+                );
+            }
+        } else {
+            // Block outline: cheap stand-in when the selection is huge.
+            let ranks = (gd.count as u32).div_ceil(p.files) as f32;
+            let hw = p.files as f32 * pitch.x * 0.5;
+            let hd = ranks * pitch.y * 0.5;
+            let c = [
+                world(Vec2::new(-hw, hd)),
+                world(Vec2::new(hw, hd)),
+                world(Vec2::new(hw, -hd)),
+                world(Vec2::new(-hw, -hd)),
+            ];
+            for k in 0..4 {
+                gizmos.line(lift(c[k], 0.3), lift(c[(k + 1) % 4], 0.3), slot_col);
+            }
+        }
+        // Facing arrow off the front rank.
+        let ranks = (gd.count as u32).div_ceil(p.files) as f32;
+        let front = p.anchor + fwd * ((ranks - 1.0) * 0.5 * pitch.y + 1.2);
+        gizmos.arrow(lift(front, 0.6), lift(front + fwd * 3.5, 0.6), line_col);
     }
 }
 
@@ -521,54 +511,6 @@ fn halt_key(
     }
     if halted > 0 {
         info!("HALT: {halted} regiments hold");
-    }
-}
-
-/// Ctrl+digit assigns the current selection to a slot; a bare digit
-/// recalls it (dead regiments drop out naturally via count checks).
-fn control_group_keys(
-    keys: Res<ButtonInput<KeyCode>>,
-    groups: Res<Groups>,
-    mut cg: ResMut<ControlGroups>,
-    mut selection: ResMut<Selection>,
-) {
-    const DIGITS: [KeyCode; 9] = [
-        KeyCode::Digit1,
-        KeyCode::Digit2,
-        KeyCode::Digit3,
-        KeyCode::Digit4,
-        KeyCode::Digit5,
-        KeyCode::Digit6,
-        KeyCode::Digit7,
-        KeyCode::Digit8,
-        KeyCode::Digit9,
-    ];
-    let Some(slot) = DIGITS.iter().position(|k| keys.just_pressed(*k)) else {
-        return;
-    };
-    cg.0.resize(9, Vec::new());
-    let ctrl =
-        keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
-    if ctrl {
-        if selection.count_units > 0 {
-            cg.0[slot] = selection.regiments.clone();
-            info!("control group {} assigned", slot + 1);
-        }
-    } else if !cg.0[slot].is_empty() {
-        selection.regiments = cg.0[slot].clone();
-        selection.regiments.resize(groups.list.len(), false);
-        selection.count_units = selection
-            .regiments
-            .iter()
-            .enumerate()
-            .filter(|(g, s)| **s && groups.list[*g].team == PLAYER_TEAM)
-            .map(|(g, _)| groups.list[g].count)
-            .sum();
-        info!(
-            "control group {} recalled ({} units)",
-            slot + 1,
-            selection.count_units
-        );
     }
 }
 
@@ -601,8 +543,7 @@ pub fn clear_arrived_orders(mut groups: ResMut<Groups>) {
 }
 
 fn draw_order_gizmos(
-    viz: Res<DebugViz>,
-    drag: Res<DragLine>,
+    viz: Res<crate::movement::DebugViz>,
     groups: Res<Groups>,
     terrain: Res<Terrain>,
     mut gizmos: Gizmos,
@@ -628,20 +569,6 @@ fn draw_order_gizmos(
 
     if !viz.0 {
         return;
-    }
-    // Selection line being drawn; when the stroke would close into a loop,
-    // show the implied closing edge.
-    if drag.active && drag.points.len() > 1 {
-        let lift = |p: &Vec2| Vec3::new(p.x, terrain.height_at(p.x, p.y) + 1.0, p.y);
-        let pts: Vec<Vec3> = drag.points.iter().map(lift).collect();
-        gizmos.linestrip(pts, Color::srgb(0.95, 0.95, 0.4));
-        if stroke_is_closed(&drag.points) {
-            gizmos.line(
-                lift(drag.points.last().unwrap()),
-                lift(&drag.points[0]),
-                Color::srgb(0.5, 1.0, 0.5),
-            );
-        }
     }
     // Move-order targets (attack orders have the marker above).
     for group in &groups.list {

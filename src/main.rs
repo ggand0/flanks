@@ -11,6 +11,7 @@ mod orders;
 mod overlay;
 mod regiments;
 mod render_units;
+mod selection;
 mod spatial;
 mod terrain;
 mod unit_meshes;
@@ -50,7 +51,10 @@ fn main() {
             banners::BannersPlugin,
             audio::BattleAudioPlugin,
             movement::MovementPlugin,
+        ))
+        .add_plugins((
             orders::OrdersPlugin,
+            selection::SelectionPlugin,
             formation::FormationPlugin,
             frontline::FrontlinePlugin,
             combat::CombatPlugin,

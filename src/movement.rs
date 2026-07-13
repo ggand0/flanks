@@ -62,6 +62,10 @@ const CHARGE_MULT: f32 = 1.75;
 const CHARGE_SPEED_BOOST: f32 = 1.15;
 /// Walls advance at a deliberate pace — breaking into a run breaks the wall.
 const WALL_SPEED_FRAC: f32 = 0.72;
+/// Separation rest distance between two SAME-TEAM units who are both in a
+/// wall stance: shoulder to shoulder. Without this the physics pushes a
+/// wall back out to normal spacing and the tight slots never happen.
+const WALL_SEP_RADIUS: f32 = 1.05;
 /// Shieldwall: shields catch a share of every incoming blow.
 const SHIELDWALL_ABSORB: f32 = 0.7;
 /// Shieldwall trades some offense for the cover (arms stay behind shields).
@@ -149,6 +153,7 @@ pub fn step_sim(
     time: Res<Time>,
     mut stats: ResMut<SimStats>,
     mut tick: Local<u32>,
+    mut wall_flags: Local<Vec<bool>>,
 ) {
     let dt = time.delta_secs();
     let Units {
@@ -177,10 +182,20 @@ pub fn step_sim(
     // pos_prev becomes the state at tick start; pos is fully rewritten below.
     std::mem::swap(pos, pos_prev);
 
+    // Per-unit wall flag for the grid meta (same-team wall pairs pack
+    // tighter in the separation below).
+    let group_wall: Vec<bool> = groups
+        .list
+        .iter()
+        .map(|g| crate::formation::wall_kind(g) != 0)
+        .collect();
+    wall_flags.clear();
+    wall_flags.extend(group.iter().map(|&g| group_wall[g as usize]));
+
     let t0 = Instant::now();
     {
         let _span = info_span!("grid_rebuild").entered();
-        grid.rebuild(pos_prev, team, kind, death_t);
+        grid.rebuild(pos_prev, team, kind, death_t, &wall_flags);
     }
     let t1 = Instant::now();
     stats.grid_ms = (t1 - t0).as_secs_f32() * 1000.0;
@@ -299,13 +314,17 @@ pub fn step_sim(
                         let to_goal = goal - p;
                         let dist = to_goal.length();
                         // Hold deadzone: parked units don't jitter around
-                        // their slot point.
-                        if !(holding && dist < 1.5) {
+                        // their slot point. 0.7 m (was 1.5 when homes were
+                        // jittered spawn offsets): rigid slots sit exactly
+                        // at the separation rest distance, so a dressed
+                        // rank is force-free and can afford tight tolerance
+                        // — with 1.5 the ranks never finished dressing.
+                        if !(holding && dist < 0.7) {
                             // Slope penalty: steep ground is slow ground.
                             let slope = terrain.slope_at(p.x, p.y);
                             let slope_mult = 1.0 / (1.0 + 3.0 * slope * slope);
                             let (gain, arrive) = if holding {
-                                (0.4, 10.0)
+                                (0.6, 10.0)
                             } else {
                                 (1.0, ARRIVE_RADIUS)
                             };
@@ -326,6 +345,7 @@ pub fn step_sim(
                     let mut corr = Vec2::ZERO;
                     let mut crowd = 0.0f32;
                     let my_team_bit = (team[i] as u32) * crate::spatial::META_TEAM;
+                    let my_wall = wall[gi] != 0;
                     let my_mass = params.mass;
                     let reach2 = params.reach * params.reach;
                     let prev_target = tgt_chunk[j];
@@ -347,12 +367,23 @@ pub fn step_sim(
                                 best_idx = o.idx;
                             }
                         }
-                        if d2 < SEP_RADIUS * SEP_RADIUS && d2 > 1e-8 {
+                        // Two same-team units both in a wall stance rest
+                        // shoulder to shoulder (symmetric predicate: both
+                        // sides compute the same radius).
+                        let sep_r = if my_wall
+                            && (o.meta & crate::spatial::META_WALL) != 0
+                            && (o.meta & crate::spatial::META_TEAM) == my_team_bit
+                        {
+                            WALL_SEP_RADIUS
+                        } else {
+                            SEP_RADIUS
+                        };
+                        if d2 < sep_r * sep_r && d2 > 1e-8 {
                             // Mass-weighted: heavies shove lights aside.
                             let o_mass = TYPES[crate::spatial::meta_kind(o.meta)].mass;
                             let mw = 2.0 * o_mass / (my_mass + o_mass);
                             let len = d2.sqrt();
-                            let w = 1.0 - len / SEP_RADIUS;
+                            let w = 1.0 - len / sep_r;
                             if len < HARD_RADIUS {
                                 // Overlap is resolved POSITIONALLY only.
                                 // (There used to be a hard force boost here

@@ -29,6 +29,10 @@ pub const META_TEAM: u32 = 1 << 0;
 pub const META_KIND_SHIFT: u32 = 1;
 pub const META_KIND: u32 = 0b11 << META_KIND_SHIFT;
 pub const META_DYING: u32 = 1 << 3;
+/// Unit's regiment is in a wall stance: same-team wall pairs pack to a
+/// tighter separation rest distance (a shieldwall the physics would
+/// otherwise push back out to normal spacing).
+pub const META_WALL: u32 = 1 << 4;
 
 /// The kind field of a `SortedUnit::meta` (index into `unit_types::TYPES`).
 #[inline]
@@ -75,7 +79,14 @@ pub struct SpatialGrid {
 }
 
 impl SpatialGrid {
-    pub fn rebuild(&mut self, positions: &[Vec3], teams: &[u8], kinds: &[u8], death_t: &[u8]) {
+    pub fn rebuild(
+        &mut self,
+        positions: &[Vec3],
+        teams: &[u8],
+        kinds: &[u8],
+        death_t: &[u8],
+        walled: &[bool],
+    ) {
         let n = positions.len();
         if n == 0 {
             self.dims = (0, 0);
@@ -156,7 +167,8 @@ impl SpatialGrid {
                         hist[c] += 1;
                         let meta = ((teams[i] as u32) * META_TEAM)
                             | ((kinds[i] as u32) << META_KIND_SHIFT)
-                            | (((death_t[i] > 0) as u32) * META_DYING);
+                            | (((death_t[i] > 0) as u32) * META_DYING)
+                            | ((walled[i] as u32) * META_WALL);
                         unsafe {
                             *out.0.add(k) = SortedUnit {
                                 x: p.x,
