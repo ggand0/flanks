@@ -233,6 +233,22 @@ pub fn step_sim(
     // Direction to the nearest enemy regiment (brace facing).
     let threat: Vec<Vec2> = groups.list.iter().map(|g| g.threat_dir).collect();
     let threat = &threat[..];
+    // Formation facing for standing units (ZERO = no claim): a formed
+    // regiment DRESSES to its ordered facing when nothing is nearer to
+    // worry about — without this, units kept the yaw of their last
+    // march step and a drag-ordered line stood looking sideways.
+    let form_face: Vec<Vec2> = groups
+        .list
+        .iter()
+        .map(|g| {
+            if g.shape == crate::formation::FormShape::Rect && !g.state.is_broken() {
+                crate::formation::facing_dir(g.facing)
+            } else {
+                Vec2::ZERO
+            }
+        })
+        .collect();
+    let form_face = &form_face[..];
     // Wall stance per regiment (0 none / 1 shieldwall / 2 spearwall):
     // slower advance, damage model tweaks in the events + apply pass.
     let wall: Vec<u8> = groups.list.iter().map(crate::formation::wall_kind).collect();
@@ -647,6 +663,14 @@ pub fn step_sim(
                             && threat[gi] != Vec2::ZERO =>
                         {
                             threat[gi]
+                        }
+                        // Standing at ease in formation: dress to the
+                        // regiment's ordered facing (the drag direction).
+                        None if !routed
+                            && new_v.length_squared() < 0.25
+                            && form_face[gi] != Vec2::ZERO =>
+                        {
+                            form_face[gi]
                         }
                         None => new_v,
                     };

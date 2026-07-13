@@ -281,11 +281,24 @@ fn test_form_script(
             for &g in watch.iter() {
                 let gd = &groups.list[g];
                 let err = slot_error(&units, &groups, g);
+                // Mean angular error of unit yaw vs the ordered facing:
+                // a settled formation must LOOK the way it was told to.
+                let (mut yerr, mut n) = (0.0f32, 0usize);
+                for i in 0..units.len() {
+                    if units.group[i] as usize == g && units.death_t[i] == 0 {
+                        let d = (units.yaw[i] - gd.facing + std::f32::consts::PI)
+                            .rem_euclid(std::f32::consts::TAU)
+                            - std::f32::consts::PI;
+                        yerr += d.abs();
+                        n += 1;
+                    }
+                }
+                let yerr = if n > 0 { yerr / n as f32 } else { 0.0 };
                 info!(
-                    "[form-test] regiment {g} settled: slot err {err:.2} m ({} men, files {}) -> {}",
+                    "[form-test] regiment {g} settled: slot err {err:.2} m, facing err {yerr:.2} rad ({} men, files {}) -> {}",
                     gd.count,
                     gd.files,
-                    if err < 1.5 { "OK" } else { "FAIL" }
+                    if err < 1.5 && yerr < 0.3 { "OK" } else { "FAIL" }
                 );
             }
             // Spacing modes: wall on the first, loose on the second.
