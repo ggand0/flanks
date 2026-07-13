@@ -257,10 +257,21 @@ fn update_groups(units: Res<Units>, mut groups: ResMut<Groups>) {
     let mut sums = vec![Vec2::ZERO; n];
     let mut counts = vec![0usize; n];
     let mut fighting = vec![false; n];
+    // Disorder measures SHAPE coherence, not travel: deviation from the
+    // slot relative to the regiment's own centroid (last tick's — 33 ms
+    // stale is nothing at 2 s smoothing). A rigid march scores ~0; a
+    // block churned up by melee scores meters.
+    let prev_cents: Vec<Vec2> = groups.list.iter().map(|g| g.centroid).collect();
+    let prev_bias: Vec<Vec2> = groups.list.iter().map(|g| g.home_bias).collect();
+    let mut slot_err = vec![0.0f32; n];
+    let mut sum_home = vec![Vec2::ZERO; n];
     for i in 0..units.len() {
         let g = units.group[i] as usize;
-        sums[g] += Vec2::new(units.pos[i].x, units.pos[i].z);
+        let p = Vec2::new(units.pos[i].x, units.pos[i].z);
+        sums[g] += p;
         counts[g] += 1;
+        sum_home[g] += units.home[i];
+        slot_err[g] += (p - prev_cents[g] - units.home[i] + prev_bias[g]).length();
         // Ground-truth contact: a unit in WIND-UP has an enemy in reach
         // and is striking. TW rule — one soldier fighting engages the
         // regiment. (`target` is stale outside a swing cycle and `swing`
@@ -288,6 +299,15 @@ fn update_groups(units: Res<Units>, mut groups: ResMut<Groups>) {
             continue;
         }
         group.centroid = cents[g];
+        group.home_bias = sum_home[g] / counts[g] as f32;
+        // Formation disorder: how far the regiment stands from its slots,
+        // smoothed ~2 s. Only Rect makes the discipline claim.
+        let err = if group.shape == crate::formation::FormShape::Rect {
+            slot_err[g] / counts[g] as f32
+        } else {
+            0.0
+        };
+        group.disorder += (err - group.disorder) / 60.0;
         let mut nearest_d2 = ENEMY_NEAR_R * ENEMY_NEAR_R;
         let mut threat = Vec2::ZERO;
         let mut hostile = false;

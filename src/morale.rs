@@ -42,6 +42,8 @@ pub struct MoraleFactors {
     /// Raw 0..1 surround fraction behind `flanked`.
     pub flanked01: f32,
     pub contagion: f32,
+    /// Fighting in disarray (formation disorder past the free band).
+    pub disorder: f32,
     /// Steady friendly regiments counted for support (0..=3).
     pub friends: u32,
     /// Combined resist/support multiplier applied to psychological terms.
@@ -83,6 +85,16 @@ const MORALE_SUPPORT: f32 = 0.35;
 /// Drain per second per routing friendly regiment within RALLY_R (capped).
 const MORALE_ROUT_NEIGHBOR: f32 = 2.0;
 const MORALE_ROUT_CAP: f32 = 6.0;
+/// Peak drain per second for fighting in complete disarray. Disorder is
+/// the mean slot deviation (GroupData::disorder); the drain ramps over
+/// DISORDER_FREE..DISORDER_FULL meters and only while ENGAGED — a
+/// scattered regiment dressing its ranks in peace is fine, the same
+/// scatter in melee is how formations die.
+const MORALE_DISORDER: f32 = 3.5;
+const DISORDER_FREE: f32 = 2.0;
+const DISORDER_FULL: f32 = 7.0;
+/// Psychological damping while in a wall stance: braced men stand.
+const WALL_STEADY: f32 = 0.85;
 /// Recovery per second when unengaged and undisturbed.
 const MORALE_RECOVERY: f32 = 3.0;
 /// Routing-neighbor / rally-safety radius.
@@ -186,6 +198,14 @@ fn update_morale(
                     .count() as f32
                     * MORALE_ROUT_NEIGHBOR;
                 pressure += rout_drain.min(MORALE_ROUT_CAP);
+                // Fighting in disarray: the formation-shape drain.
+                let disorder01 = if g.engaged {
+                    ((g.disorder - DISORDER_FREE) / (DISORDER_FULL - DISORDER_FREE))
+                        .clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                pressure += MORALE_DISORDER * disorder01;
                 // Steady friends in view stiffen the line; kind resist
                 // (heavies steadier) applies to ALL psychological terms.
                 // Casualties stay undamped — dead men are dead men.
@@ -196,7 +216,13 @@ fn update_morale(
                     })
                     .count()
                     .min(3) as f32;
-                let psych_mult = resist / (1.0 + MORALE_SUPPORT * friends);
+                // Braced walls stand steadier under every fear.
+                let wall_mult = if crate::formation::wall_kind(g) != 0 {
+                    WALL_STEADY
+                } else {
+                    1.0
+                };
+                let psych_mult = resist * wall_mult / (1.0 + MORALE_SUPPORT * friends);
                 pressure *= psych_mult;
                 drain += pressure * depletion * dt;
 
@@ -218,6 +244,7 @@ fn update_morale(
                 f.flanked = MORALE_FLANKED * flanked * m;
                 f.flanked01 = flanked;
                 f.contagion = rout_drain.min(MORALE_ROUT_CAP) * m;
+                f.disorder = MORALE_DISORDER * disorder01 * m;
                 f.friends = friends as u32;
                 f.psych_mult = psych_mult;
                 f.depletion = depletion;

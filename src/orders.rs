@@ -93,6 +93,14 @@ pub struct GroupData {
     pub reform: bool,
     /// Living strength when slots were last written (close-ranks trigger).
     pub count_at_reform: usize,
+    /// Mean distance of living units to their slot (m), smoothed ~2 s
+    /// (update_groups). A formation fighting in disarray bleeds morale;
+    /// zero for Blob (a mob makes no discipline claim).
+    pub disorder: f32,
+    /// Mean `home` of living units last tick (update_groups): casualties
+    /// skew the living slots' center away from the anchor, and disorder
+    /// must not count that skew as chaos.
+    pub home_bias: Vec2,
     // --- refreshed every fixed tick by the frontline pass ---
     pub centroid: Vec2,
     /// TW rule: one soldier of the regiment fighting = the whole regiment
@@ -142,6 +150,8 @@ impl GroupData {
             hold: false,
             reform: false,
             count_at_reform: count,
+            disorder: 0.0,
+            home_bias: Vec2::ZERO,
             centroid: anchor,
             engaged: false,
             engage_hold: 0,
