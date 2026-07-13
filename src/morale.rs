@@ -241,6 +241,10 @@ fn update_morale(
                         g.state = RegState::Steady;
                         g.morale = 40.0;
                         g.anchor = g.centroid;
+                        // Re-dress the ranks where the rout ended, facing
+                        // back the way they fled from.
+                        g.facing = if g.team == 0 { 0.0 } else { std::f32::consts::PI };
+                        g.reform = true;
                         info!("regiment {gi} rallies ({} left)", g.count);
                     }
                 }

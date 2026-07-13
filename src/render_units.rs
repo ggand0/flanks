@@ -217,6 +217,7 @@ fn setup_unit_mesh(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
     let kind_meshes = [
         crate::unit_meshes::build_knight(),
         crate::unit_meshes::build_man_at_arms(),
+        crate::unit_meshes::build_spearman(),
     ];
     for (bucket, mesh) in kind_meshes.into_iter().enumerate() {
         let handle = meshes.add(mesh);

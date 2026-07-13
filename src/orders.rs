@@ -57,12 +57,30 @@ pub struct GroupData {
     pub kind: u8,
     /// Current order; None = hold at anchor.
     pub order: Option<Order>,
+    /// Set when the current order was issued by at-ease auto-engagement
+    /// or a script, not the player: UI click feedback stays silent.
+    pub auto_order: bool,
     /// Regiment reference point: units hold at `anchor + home`. Updated to
     /// the order target on arrival.
     pub anchor: Vec2,
     pub count: usize,
     /// Strength at spawn (casualty fraction for morale).
     pub initial_count: usize,
+    // --- formation (formation.rs consumes; slots land in `units.home`) ---
+    pub shape: crate::formation::FormShape,
+    pub spacing: crate::formation::FormSpacing,
+    /// Formation facing (unit yaw convention, 0 = +Z). Baked into the slot
+    /// offsets on reform; meaningless for Blob.
+    pub facing: f32,
+    /// Grid width in files (soldiers per rank). 0 = auto on first reform.
+    pub files: u32,
+    /// Hold position (defend mode): never auto-engage, never chase — at
+    /// ease (false, default) idle regiments engage enemies that come near.
+    pub hold: bool,
+    /// Request: rewrite this regiment's slots before the next sim tick.
+    pub reform: bool,
+    /// Living strength when slots were last written (close-ranks trigger).
+    pub count_at_reform: usize,
     // --- refreshed every fixed tick by the frontline pass ---
     pub centroid: Vec2,
     /// TW rule: one soldier of the regiment fighting = the whole regiment
@@ -99,9 +117,19 @@ impl GroupData {
             team,
             kind,
             order: None,
+            auto_order: false,
             anchor,
             count,
             initial_count: count,
+            // Blob preserves hand-built spawn geometry (tests); the battle
+            // spawn switches to Rect and forms slots explicitly.
+            shape: crate::formation::FormShape::Blob,
+            spacing: crate::formation::FormSpacing::Normal,
+            facing: if team == 0 { 0.0 } else { std::f32::consts::PI },
+            files: 0,
+            hold: false,
+            reform: false,
+            count_at_reform: count,
             centroid: anchor,
             engaged: false,
             engage_hold: 0,
@@ -349,16 +377,33 @@ pub fn order_regiments(groups: &mut Groups, selected: &[usize], target: Vec2) {
         selected.iter().map(|&g| groups.list[g].centroid).sum::<Vec2>() / selected.len() as f32;
     for &g in &selected {
         let group = &mut groups.list[g];
-        group.order = Some(Order::Move(target + (group.centroid - centroid)));
+        let dest = target + (group.centroid - centroid);
+        group.order = Some(Order::Move(dest));
+        group.auto_order = false;
+        // March facing the way we're going: the front rank leads.
+        let dir = dest - group.centroid;
+        if group.shape == crate::formation::FormShape::Rect && dir.length() > 1.0 {
+            group.facing = crate::formation::facing_of(dir);
+            group.reform = true;
+        }
     }
 }
 
 /// Attack-order `selected` regiments at one enemy regiment: everyone hunts
 /// the same target (TW behavior — no arrangement translation).
 pub fn attack_regiments(groups: &mut Groups, selected: &[usize], target: u32) {
+    let target_c = groups.list[target as usize].centroid;
     for &g in selected {
-        if !groups.list[g].state.is_broken() {
-            groups.list[g].order = Some(Order::Attack(target));
+        let group = &mut groups.list[g];
+        if group.state.is_broken() {
+            continue;
+        }
+        group.order = Some(Order::Attack(target));
+        group.auto_order = false;
+        let dir = target_c - group.centroid;
+        if group.shape == crate::formation::FormShape::Rect && dir.length() > 1.0 {
+            group.facing = crate::formation::facing_of(dir);
+            group.reform = true;
         }
     }
 }

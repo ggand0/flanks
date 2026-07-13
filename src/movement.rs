@@ -15,8 +15,9 @@ use crate::units::Units;
 
 const SEP_RADIUS: f32 = 1.4;
 const SEP_STRENGTH: f32 = 60.0;
-/// Neighbor query radius: must cover both separation and the longest
-/// melee reach in `unit_types::TYPES`.
+/// Base neighbor query radius: covers separation and sword reach. Kinds
+/// with longer reach (spears) widen their own scan per unit — the sword
+/// majority must not pay for the spear's reach.
 const QUERY_RADIUS: f32 = 2.0;
 /// Cap on summed separation push to avoid explosive forces deep in a crowd.
 const SEP_PUSH_MAX: f32 = 2.5;
@@ -303,7 +304,7 @@ pub fn step_sim(
                     let mut best_d2 = f32::MAX;
                     let mut best_idx = u32::MAX;
                     let mut sticky = false;
-                    grid.for_each_candidate(p, QUERY_RADIUS, |o| {
+                    grid.for_each_candidate(p, QUERY_RADIUS.max(params.reach), |o| {
                         if o.idx as usize == i {
                             return;
                         }
@@ -320,9 +321,7 @@ pub fn step_sim(
                         }
                         if d2 < SEP_RADIUS * SEP_RADIUS && d2 > 1e-8 {
                             // Mass-weighted: heavies shove lights aside.
-                            let o_mass = TYPES[((o.meta & crate::spatial::META_KIND) != 0)
-                                as usize]
-                                .mass;
+                            let o_mass = TYPES[crate::spatial::meta_kind(o.meta)].mass;
                             let mw = 2.0 * o_mass / (my_mass + o_mass);
                             let len = d2.sqrt();
                             let w = 1.0 - len / SEP_RADIUS;
@@ -440,9 +439,16 @@ pub fn step_sim(
                                     // variety only): 0 = stab, 1 = the
                                     // classic swing. (2 = slash exists in
                                     // the shader, benched by owner.)
-                                    let style = (crate::units::hash01(
-                                        tick_seed ^ (i as u32).wrapping_mul(0x51ED),
-                                    ) * 2.0) as u8;
+                                    // Spears only ever thrust.
+                                    let style = if my_kind
+                                        == crate::unit_types::KIND_SPEAR as usize
+                                    {
+                                        0
+                                    } else {
+                                        (crate::units::hash01(
+                                            tick_seed ^ (i as u32).wrapping_mul(0x51ED),
+                                        ) * 2.0) as u8
+                                    };
                                     let style = style << crate::units::SWING_STYLE_SHIFT;
                                     sw_chunk[j] = if v2 > cs * cs {
                                         crate::units::SWING_WINDUP

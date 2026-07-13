@@ -3,6 +3,7 @@ mod audio;
 mod banners;
 mod camera;
 mod combat;
+mod formation;
 mod frontline;
 mod morale;
 mod movement;
@@ -50,6 +51,7 @@ fn main() {
             audio::BattleAudioPlugin,
             movement::MovementPlugin,
             orders::OrdersPlugin,
+            formation::FormationPlugin,
             frontline::FrontlinePlugin,
             combat::CombatPlugin,
             render_units::UnitRenderPlugin,

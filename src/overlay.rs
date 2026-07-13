@@ -104,10 +104,10 @@ fn update_inspect_panel(
     };
     *vis = Visibility::Visible;
 
-    let kind = if gd.kind == crate::unit_types::KIND_HEAVY {
-        "Heavy Knights"
-    } else {
-        "Men-at-Arms"
+    let kind = match gd.kind {
+        crate::unit_types::KIND_HEAVY => "Heavy Knights",
+        crate::unit_types::KIND_SPEAR => "Spearmen",
+        _ => "Men-at-Arms",
     };
     let team = if gd.team == 0 { "blue" } else { "orange" };
     let state = match gd.state {

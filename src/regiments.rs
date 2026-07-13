@@ -7,7 +7,7 @@ use bevy::prelude::*;
 
 use crate::orders::{GroupData, Groups, RegState};
 use crate::terrain::Terrain;
-use crate::unit_types::{KIND_HEAVY, KIND_LIGHT};
+use crate::unit_types::{KIND_HEAVY, KIND_LIGHT, KIND_SPEAR};
 use crate::units::{Units, hash01, push_unit, units_per_team};
 
 /// Unit spacing inside a regiment block.
@@ -37,6 +37,12 @@ fn heavy_frac() -> f32 {
     crate::util::env_or("FL_HEAVY_FRAC", 0.4)
 }
 
+/// Fraction of each army's regiments that are spear infantry (behind the
+/// heavies, ahead of the lights).
+fn spear_frac() -> f32 {
+    crate::util::env_or("FL_SPEAR_FRAC", 0.25)
+}
+
 /// Spawn one regiment block (units + GroupData). `dir` faces the enemy
 /// (+1 toward -Z spawns rows so the block front is enemy-side).
 #[allow(clippy::too_many_arguments)] // spawn-time plumbing, all scalars
@@ -64,6 +70,13 @@ fn spawn_regiment(
         let z = anchor.y + dir * ((row as f32 - (rows - 1) as f32 / 2.0) * SPACING) + jz * 0.5;
         push_unit(units, terrain, seed, team, kind, g, x, z, anchor);
     }
+    // Rigid rank-and-file by default: exact slots into `home` (the spawn
+    // jitter stays in the positions — inside the hold deadzone, so the
+    // line reads organic without anyone shuffling at t=0).
+    let gd = &mut list[g as usize];
+    gd.shape = crate::formation::FormShape::Rect;
+    gd.files = cols as u32;
+    crate::formation::assign_slots(units, g, gd);
 }
 
 fn spawn_battle(mut units: ResMut<Units>, terrain: Res<Terrain>, mut groups: ResMut<Groups>) {
@@ -144,6 +157,7 @@ fn do_spawn_battle(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
             n_regs
         };
         let n_heavy = (n_regs as f32 * heavy_frac()).round() as usize;
+        let n_spear = (n_regs as f32 * spear_frac()).round() as usize;
         let dir: f32 = if team == 0 { -1.0 } else { 1.0 };
         for r in 0..n_regs {
             let rank = r / per_rank;
@@ -153,17 +167,26 @@ fn do_spawn_battle(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
             let x0 = (file as f32 - (in_rank - 1) as f32 / 2.0) * pitch_x;
             let z0 = dir * (ARMY_GAP / 2.0 + block_d / 2.0 + rank as f32 * (block_d + REG_GAP));
             let anchor = Vec2::new(x0, z0);
-            let kind = if r < n_heavy { KIND_HEAVY } else { KIND_LIGHT };
+            // Heavies lead, spears back them, lights fill the rear ranks.
+            let kind = if r < n_heavy {
+                KIND_HEAVY
+            } else if r < n_heavy + n_spear {
+                KIND_SPEAR
+            } else {
+                KIND_LIGHT
+            };
             spawn_regiment(units, terrain, &mut list, team, kind, anchor, size, dir);
         }
     }
     let heavies = list.iter().filter(|g| g.kind == KIND_HEAVY).count();
+    let spears = list.iter().filter(|g| g.kind == KIND_SPEAR).count();
     let blue = list.iter().filter(|g| g.team == 0).count();
     info!(
-        "spawned {} vs {} regiments ({} heavy) x {} units ({} total units)",
+        "spawned {} vs {} regiments ({} heavy, {} spear) x {} units ({} total units)",
         blue,
         list.len() - blue,
         heavies,
+        spears,
         size,
         units.len()
     );

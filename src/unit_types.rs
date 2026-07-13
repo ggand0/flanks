@@ -3,9 +3,12 @@
 //! append rows later.
 
 /// Unit kind ids (the `kind` column value and the render bucket index).
+/// NOTE: the spatial grid packs kind into a 2-bit meta field — at most 4
+/// kinds without widening it (spatial.rs META_KIND).
 pub const KIND_HEAVY: u8 = 0;
 pub const KIND_LIGHT: u8 = 1;
-pub const NUM_KINDS: usize = 2;
+pub const KIND_SPEAR: u8 = 2;
+pub const NUM_KINDS: usize = 3;
 
 pub struct UnitTypeParams {
     pub hp: f32,
@@ -53,6 +56,20 @@ pub const TYPES: [UnitTypeParams; NUM_KINDS] = [
         speed: 9.5,
         mass: 1.0,
         morale_resist: 1.0,
+        half_height: 0.50,
+    },
+    // KIND_SPEAR — spear infantry: chainmail line troops. Longest reach
+    // (first strike on contact), steadier than lights, slower swings;
+    // the spearwall (formation.rs) is where they earn their keep.
+    UnitTypeParams {
+        hp: 100.0,
+        damage: 20.0,
+        reach: 2.4,
+        windup_ticks: 10,
+        cooldown_ticks: 38,
+        speed: 8.5,
+        mass: 1.2,
+        morale_resist: 0.85,
         half_height: 0.50,
     },
 ];

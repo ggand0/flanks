@@ -23,10 +23,18 @@ const MAX_DIM: usize = 2048;
 /// Units per parallel rebuild chunk.
 const REBUILD_CHUNK: usize = 32_768;
 
-/// Meta bits carried by each sorted unit.
+/// Meta bits carried by each sorted unit. Kind is a 2-bit FIELD (up to 4
+/// unit kinds), not a flag — read it with `meta_kind`, never as a mask test.
 pub const META_TEAM: u32 = 1 << 0;
-pub const META_KIND: u32 = 1 << 1;
-pub const META_DYING: u32 = 1 << 2;
+pub const META_KIND_SHIFT: u32 = 1;
+pub const META_KIND: u32 = 0b11 << META_KIND_SHIFT;
+pub const META_DYING: u32 = 1 << 3;
+
+/// The kind field of a `SortedUnit::meta` (index into `unit_types::TYPES`).
+#[inline]
+pub fn meta_kind(meta: u32) -> usize {
+    ((meta & META_KIND) >> META_KIND_SHIFT) as usize
+}
 
 /// One unit in grid order: everything a neighbor query needs, in 16 bytes.
 #[derive(Clone, Copy, Default)]
@@ -147,7 +155,7 @@ impl SpatialGrid {
                         let k = hist[c] as usize;
                         hist[c] += 1;
                         let meta = ((teams[i] as u32) * META_TEAM)
-                            | ((kinds[i] as u32) * META_KIND)
+                            | ((kinds[i] as u32) << META_KIND_SHIFT)
                             | (((death_t[i] > 0) as u32) * META_DYING);
                         unsafe {
                             *out.0.add(k) = SortedUnit {

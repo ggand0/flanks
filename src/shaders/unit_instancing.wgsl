@@ -5,7 +5,8 @@ struct Vertex {
     @location(0) position: vec3<f32>,
     @location(1) normal: vec3<f32>,
     // NOT texture coords: x = body part id (0 body, 1 sword arm,
-    // 2 left leg, 3 right leg), y = the part's pivot height.
+    // 2 left leg, 3 right leg, 4 spear arm, 5 shield arm), y = the
+    // part's pivot height.
     @location(2) part_pivot: vec2<f32>,
     // Part material: rgb = fixed color, a = team-color blend amount.
     @location(5) v_color: vec4<f32>,
@@ -98,7 +99,28 @@ fn vertex(vertex: Vertex) -> VertexOutput {
     let phase = globals.time * 9.0 + seed * 6.2831853;
 
     // --- Part animation (rotations around the part pivot) ---
-    if part > 1.5 {
+    if part > 4.5 {
+        // Shield arm: carried at the side. (Shieldwall raise arrives with
+        // the wall instance signal.)
+    } else if part > 3.5 {
+        // Spear arm: the shaft is carried VERTICAL. Battle stance (or a
+        // watch-range advance) levels the point at the enemy — a line of
+        // spears coming down IS the brace — and the stab thrusts the
+        // leveled shaft forward. Charging carries it leveled too.
+        let raise = smoothstep(0.0, 0.8, lunge);
+        let chop = smoothstep(0.85, 1.0, lunge);
+        let level = max(max(stance, ready * 0.75), max(sprint, raise));
+        // Slight walk sway while the spear is upright; vertical pump on
+        // a victory cheer.
+        var ang = -1.42 * level * (1.0 - celebrate)
+            + 0.05 * moving * sin(phase + 3.1415) * (1.0 - level)
+            + 0.10 * celebrate * sin(globals.time * 9.0 + seed * 6.2831853);
+        local = pitch_about(local, pivot, ang);
+        normal = pitch_normal(normal, ang);
+        // Draw back, then punch the point home (the damage tick lands at
+        // lunge 1.0, same timing as every other weapon).
+        local.z += -0.30 * raise + 1.15 * chop;
+    } else if part > 1.5 {
         // Legs: opposite-phase walk swing, harder stride on the charge;
         // bracing splits the stance (one foot planted forward).
         let side = select(1.0, -1.0, part > 2.5);
