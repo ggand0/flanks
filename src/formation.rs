@@ -137,6 +137,20 @@ pub fn assign_slots(units: &mut Units, g: u32, gd: &mut GroupData) {
     gd.reform = false;
 }
 
+/// Wall flavor of a regiment (spacing == Wall and still fighting):
+/// 0 = none, 1 = shieldwall (sword kinds), 2 = spearwall (spears).
+/// Shared by the sim damage model and the render wall pose.
+#[inline]
+pub fn wall_kind(gd: &GroupData) -> u8 {
+    if gd.spacing != FormSpacing::Wall || gd.state.is_broken() {
+        0
+    } else if gd.kind == crate::unit_types::KIND_SPEAR {
+        2
+    } else {
+        1
+    }
+}
+
 pub struct FormationPlugin;
 
 impl Plugin for FormationPlugin {
@@ -144,6 +158,101 @@ impl Plugin for FormationPlugin {
         app.add_systems(
             FixedUpdate,
             apply_reforms.before(crate::movement::step_sim),
+        )
+        .add_systems(Update, formation_keys);
+    }
+}
+
+/// Formation hotkeys for the selection — F: wall on/off (shieldwall for
+/// sword regiments, spearwall for spears), L: loose order on/off,
+/// B: blob <-> ranks (the pre-formation look, kept for levies).
+fn formation_keys(
+    keys: Res<ButtonInput<KeyCode>>,
+    selection: Res<crate::orders::Selection>,
+    mut groups: ResMut<Groups>,
+) {
+    let wall = keys.just_pressed(KeyCode::KeyF);
+    let loose = keys.just_pressed(KeyCode::KeyL);
+    let blob = keys.just_pressed(KeyCode::KeyB);
+    let hold = keys.just_pressed(KeyCode::KeyH);
+    if !(wall || loose || blob || hold) || selection.count_units == 0 {
+        return;
+    }
+    let picked: Vec<usize> = selection
+        .regiments
+        .iter()
+        .enumerate()
+        .filter(|(g, s)| {
+            **s && {
+                let gd = &groups.list[*g];
+                gd.count > 0 && !gd.state.is_broken()
+            }
+        })
+        .map(|(g, _)| g)
+        .collect();
+    if picked.is_empty() {
+        return;
+    }
+
+    if wall || loose {
+        let want = if wall { FormSpacing::Wall } else { FormSpacing::Loose };
+        // Toggle as a set: if anyone is not yet in the mode, everyone
+        // enters it; if all are, everyone falls back to close order.
+        let on = picked.iter().any(|&g| groups.list[g].spacing != want);
+        let mut shield = 0;
+        let mut spear = 0;
+        for &g in &picked {
+            let gd = &mut groups.list[g];
+            gd.spacing = if on { want } else { FormSpacing::Normal };
+            gd.shape = FormShape::Rect;
+            if gd.files == 0 {
+                gd.files = default_files(gd.count);
+            }
+            gd.reform = true;
+            match wall_kind(gd) {
+                1 => shield += 1,
+                2 => spear += 1,
+                _ => {}
+            }
+        }
+        if !on {
+            info!("{} regiments back to close order", picked.len());
+        } else if wall {
+            info!("wall formed: {shield} shieldwall, {spear} spearwall regiments");
+        } else {
+            info!("{} regiments to LOOSE order", picked.len());
+        }
+    }
+
+    if blob {
+        let on = picked.iter().any(|&g| groups.list[g].shape != FormShape::Blob);
+        for &g in &picked {
+            let gd = &mut groups.list[g];
+            gd.shape = if on { FormShape::Blob } else { FormShape::Rect };
+            if gd.files == 0 {
+                gd.files = default_files(gd.count);
+            }
+            gd.reform = true;
+        }
+        info!(
+            "{} regiments to {}",
+            picked.len(),
+            if on { "BLOB (mob)" } else { "ranks" }
+        );
+    }
+
+    if hold {
+        // Hold position (defend) vs at ease: held regiments never chase
+        // and never engage on their own — they fight what steps into
+        // reach and nothing else.
+        let on = picked.iter().any(|&g| !groups.list[g].hold);
+        for &g in &picked {
+            groups.list[g].hold = on;
+        }
+        info!(
+            "{} regiments {}",
+            picked.len(),
+            if on { "HOLD POSITION" } else { "AT EASE" }
         );
     }
 }

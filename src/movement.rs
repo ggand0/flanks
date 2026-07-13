@@ -55,8 +55,19 @@ const ROUT_FLEE_FRAC: f32 = 0.9;
 const WIDE_ACQUIRE_R: f32 = 4.0;
 /// Speed fraction above which a newly started swing counts as a charge.
 const CHARGE_SPEED_FRAC: f32 = 0.6;
-/// Damage multiplier for charging hits (momentum bonus).
+/// Damage multiplier for charging hits (momentum bonus). Applied in the
+/// damage pass — a braced SPEARWALL nullifies it (points beat momentum).
 const CHARGE_MULT: f32 = 1.75;
+/// A regiment in its charge phase runs the last stretch home.
+const CHARGE_SPEED_BOOST: f32 = 1.15;
+/// Walls advance at a deliberate pace — breaking into a run breaks the wall.
+const WALL_SPEED_FRAC: f32 = 0.72;
+/// Shieldwall: shields catch a share of every incoming blow.
+const SHIELDWALL_ABSORB: f32 = 0.7;
+/// Shieldwall trades some offense for the cover (arms stay behind shields).
+const SHIELDWALL_DMG_OUT: f32 = 0.9;
+/// Spearwall: set spears strike harder (the wall of points does the work).
+const SPEARWALL_DMG_OUT: f32 = 1.25;
 
 /// Global damage multiplier. FL_COMBAT_SCALE overrides (fast test battles).
 #[derive(Resource)]
@@ -74,6 +85,10 @@ pub struct DamageEvent {
     pub victim: u32,
     pub attacker: u32,
     pub dmg: f32,
+    /// Swing started at charging speed: the momentum bonus is applied at
+    /// damage time, where the VICTIM's wall state is known (a braced
+    /// spearwall cancels it).
+    pub charge: bool,
 }
 
 /// One event buffer per integrate chunk; allocations persist across ticks.
@@ -188,16 +203,29 @@ pub fn step_sim(
     let broken = &broken[..];
     // Regiments in combat-watch range of an enemy (sparse-fight
     // acquisition): order type is irrelevant — a Move-order fight that
-    // went sparse stalls exactly the same way.
+    // went sparse stalls exactly the same way. HOLD regiments never
+    // acquire wide: they stand their ground and take what comes.
     let press: Vec<bool> = groups
         .list
         .iter()
-        .map(|g| g.enemy_near || g.engaged)
+        .map(|g| (g.enemy_near || g.engaged) && !g.hold)
         .collect();
     let press = &press[..];
+    // Hold-position leash: units of a held regiment close only the last
+    // step to a swing (no chasing across open ground).
+    let hold: Vec<bool> = groups.list.iter().map(|g| g.hold).collect();
+    let hold = &hold[..];
     // Direction to the nearest enemy regiment (brace facing).
     let threat: Vec<Vec2> = groups.list.iter().map(|g| g.threat_dir).collect();
     let threat = &threat[..];
+    // Wall stance per regiment (0 none / 1 shieldwall / 2 spearwall):
+    // slower advance, damage model tweaks in the events + apply pass.
+    let wall: Vec<u8> = groups.list.iter().map(crate::formation::wall_kind).collect();
+    let wall = &wall[..];
+    // Charge phase: the run home (speed boost feeds the per-unit
+    // SWING_CHARGE predicate too — momentum the sim can see).
+    let charging: Vec<bool> = groups.list.iter().map(|g| g.charging).collect();
+    let charging = &charging[..];
     let bounds_min = terrain.min() + 4.0;
     let bounds_max = terrain.max() - 4.0;
 
@@ -392,16 +420,19 @@ pub fn step_sim(
                                     // or dead target is a whiff.
                                     let jit =
                                         0.85 + 0.3 * crate::units::hash01(tick_seed ^ (i as u32));
-                                    let charge =
-                                        if sw_chunk[j] & crate::units::SWING_CHARGE != 0 {
-                                            CHARGE_MULT
-                                        } else {
-                                            1.0
-                                        };
+                                    // Own wall stance shapes the blow;
+                                    // the charge bonus resolves at apply
+                                    // time against the victim's stance.
+                                    let wall_out = match wall[gi] {
+                                        1 => SHIELDWALL_DMG_OUT,
+                                        2 => SPEARWALL_DMG_OUT,
+                                        _ => 1.0,
+                                    };
                                     events.push(DamageEvent {
                                         victim: tgt_chunk[j],
                                         attacker: i as u32,
-                                        dmg: params.damage * combat_scale * jit * charge,
+                                        dmg: params.damage * combat_scale * jit * wall_out,
+                                        charge: sw_chunk[j] & crate::units::SWING_CHARGE != 0,
                                     });
                                     sw_chunk[j] = crate::units::SWING_RECOVER;
                                     let cjit = 0.75
@@ -515,10 +546,21 @@ pub fn step_sim(
                     {
                         let to_enemy = pos_prev[close_to as usize].xz() - p;
                         let dist = to_enemy.length();
-                        if dist > 1.2 && dist < WIDE_ACQUIRE_R + 1.0 {
+                        // Held regiments fight at arm's length only.
+                        let max_close = if hold[gi] { 2.2 } else { WIDE_ACQUIRE_R + 1.0 };
+                        if dist > 1.2 && dist < max_close {
                             let urge = ((dist - 1.2) / 0.8).clamp(0.0, 1.0);
                             desired += to_enemy * (speed[i] * 0.35 * urge / dist);
                         }
+                    }
+                    // Formation pace: walls advance deliberately (running
+                    // breaks a wall), the charge phase runs the last
+                    // stretch home. Broken/dying already excluded from
+                    // both states by construction.
+                    if wall[gi] != 0 {
+                        desired *= WALL_SPEED_FRAC;
+                    } else if charging[gi] && !dying && !routed {
+                        desired *= CHARGE_SPEED_BOOST;
                     }
 
                     let v = v_chunk[j].xz();
@@ -628,7 +670,18 @@ pub fn step_sim(
                 if pos_prev[v].xz().distance_squared(pos_prev[a].xz()) > reach * reach {
                     continue;
                 }
-                hp[v] -= ev.dmg;
+                // Victim stance: a braced spearwall nullifies the charge
+                // momentum bonus (points beat momentum); a shieldwall
+                // catches part of every blow.
+                let mut dmg = ev.dmg;
+                let v_wall = wall[group[v] as usize];
+                if ev.charge && v_wall != 2 {
+                    dmg *= CHARGE_MULT;
+                }
+                if v_wall == 1 {
+                    dmg *= SHIELDWALL_ABSORB;
+                }
+                hp[v] -= dmg;
                 flash[v] = FLASH_TICKS;
                 if hp[v] <= 0.0 {
                     death_t[v] = DEATH_TICKS;

@@ -396,6 +396,11 @@ fn event_cues(
             && gd.order != st.prev_order[g]
             && gd.count > 0
             && !gd.state.is_broken()
+            // At-ease self-engagement is not a player click: no UI
+            // feedback (the war cry below still fires — that one is
+            // battlefield sound, and a regiment roaring as it takes
+            // matters into its own hands is correct).
+            && !gd.auto_order
         {
             match gd.order {
                 Some(Order::Attack(_)) => new_own_attack = true,
