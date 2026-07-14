@@ -97,24 +97,10 @@ const DISORDER_FULL: f32 = 7.0;
 const WALL_STEADY: f32 = 0.85;
 /// Recovery per second when unengaged and undisturbed.
 const MORALE_RECOVERY: f32 = 3.0;
-/// Enemies at the back (phase D of formation combat v2, pulled
-/// forward): hostile MASS on a formed regiment's rear arc is a
-/// standing morale drain — M2TW's attacked-in-rear modifier, which is
-/// situational (who is engaged where), never a wound tally. Read off
-/// the same 8 density probes as the encirclement term, weighted by the
-/// probe's angle to the regiment's FACING: the ring measures how much
-/// of the compass is hostile, this measures which way the men are
-/// looking while it happens. Fear starts as the threat closes in
-/// (before contact — cavalry circling behind wavers a unit in M2TW
-/// too), scales with the mass back there, and a frontal fight scores
-/// exactly zero. Two fully hostile rear probes = full drain, matching
-/// full encirclement on the ring; the two stack for the hammer-anvil.
-const MORALE_REAR_EXPOSED: f32 = 6.0;
-/// Side probes count at this weight (shield-side fear is real but
-/// lesser; the encirclement term already prices true pincers).
-const REAR_SIDE_WEIGHT: f32 = 0.4;
-/// Log throttle for the enemies-at-the-back event line (ticks).
-const REAR_LOG_TICKS: u16 = 300;
+// NOTE (formation combat v2): no direction-aware morale term, by owner
+// decision — a rear attack demoralizes through the casualty drain
+// below, because it genuinely kills faster (directional defense +
+// human-rate turning in movement.rs). Morale rework comes later.
 /// Routing-neighbor / rally-safety radius.
 const NEIGHBOR_R: f32 = 60.0;
 /// Broken regiments below this fraction of initial strength shatter.
@@ -159,10 +145,6 @@ fn update_morale(
             continue;
         }
         let resist = TYPES[g.kind as usize].morale_resist;
-
-        if g.rear_log_cd > 0 {
-            g.rear_log_cd -= 1;
-        }
 
         match g.state {
             RegState::Steady => {
@@ -213,35 +195,6 @@ fn update_morale(
                 let safe_arc = safe_run.min(8) as f32 * 45.0;
                 let flanked = ((225.0 - safe_arc) / 225.0).clamp(0.0, 1.0);
                 pressure += MORALE_FLANKED * flanked;
-                // Enemies at the BACK: the same probes, weighted by the
-                // regiment's facing. The safe-arc term above is blind to
-                // direction (any single contact scores 0, front or rear);
-                // this one prices hostile mass the men can feel behind
-                // them. Formed regiments only — a mob has no rear.
-                if g.shape == crate::formation::FormShape::Rect {
-                    let fwd = crate::formation::facing_dir(g.facing);
-                    let mut rear_exposed = 0.0;
-                    for (k, h) in hostile.iter().enumerate() {
-                        if !h {
-                            continue;
-                        }
-                        let a = k as f32 / 8.0 * std::f32::consts::TAU;
-                        let along = Vec2::new(a.cos(), a.sin()).dot(fwd);
-                        rear_exposed += if along < -0.5 {
-                            1.0
-                        } else if along <= 0.5 {
-                            REAR_SIDE_WEIGHT
-                        } else {
-                            0.0
-                        };
-                    }
-                    let rear_exposed = (rear_exposed / 2.0).min(1.0);
-                    pressure += MORALE_REAR_EXPOSED * rear_exposed;
-                    if rear_exposed >= 0.5 && g.rear_log_cd == 0 {
-                        g.rear_log_cd = REAR_LOG_TICKS;
-                        info!("regiment {gi} has enemies at its BACK");
-                    }
-                }
                 // Routing friendlies nearby shake resolve.
                 let rout_drain = routing_centroids
                     .iter()

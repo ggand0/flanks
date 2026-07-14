@@ -129,8 +129,6 @@ pub struct GroupData {
     pub state: RegState,
     /// Deaths since the last morale tick (tallied by the damage apply pass).
     pub recent_deaths: u32,
-    /// Log throttle for the enemies-at-the-back event line (morale.rs).
-    pub rear_log_cd: u16,
 }
 
 impl GroupData {
@@ -165,7 +163,6 @@ impl GroupData {
             morale: 100.0,
             state: RegState::Steady,
             recent_deaths: 0,
-            rear_log_cd: 0,
         }
     }
 }
