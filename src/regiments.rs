@@ -188,6 +188,16 @@ fn do_spawn_battle(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
             spawn_regiment(units, terrain, &mut list, team, kind, anchor, size, dir);
         }
     }
+    // FL_ENEMY_STATIC=1: the enemy army holds position (never auto-
+    // engages, never chases — hold's existing semantics) and the AI
+    // stands down (ai.rs). A standing target army for charge practice;
+    // units still defend themselves in melee and still rout.
+    if std::env::var("FL_ENEMY_STATIC").is_ok() {
+        for gd in list.iter_mut().filter(|g| g.team == 1) {
+            gd.hold = true;
+        }
+        info!("enemy army is STATIC (hold position, no AI)");
+    }
     let heavies = list.iter().filter(|g| g.kind == KIND_HEAVY).count();
     let spears = list.iter().filter(|g| g.kind == KIND_SPEAR).count();
     let blue = list.iter().filter(|g| g.team == 0).count();
@@ -232,16 +242,22 @@ fn spawn_rout_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
 /// feeding regiments), i.e. per-attacker rear kill rate >= 2x frontal.
 fn spawn_dir_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
     let mut list = Vec::new();
-    for (cx, rear) in [(-250.0, false), (250.0, true)] {
+    // Attacker spawn offsets per pair: control = front pin + LEFT side
+    // (shield arm covers: factor-identical to frontal), test = front pin
+    // + REAR, lone = a single unassisted rear charge on a holding block
+    // (the M2TW no-auto-face rule: the victims must NOT pirouette to
+    // meet it — their facing holds until the melee rim turns to fight).
+    let pairs: [(f32, &[Vec2]); 3] = [
+        (-250.0, &[Vec2::new(0.0, 35.0), Vec2::new(55.0, 0.0)]),
+        (250.0, &[Vec2::new(0.0, 35.0), Vec2::new(0.0, -55.0)]),
+        (0.0, &[Vec2::new(0.0, -55.0)]),
+    ];
+    for (cx, offsets) in pairs {
         spawn_regiment(units, terrain, &mut list, 0, KIND_LIGHT, Vec2::new(cx, 0.0), 500, -1.0);
         let v = list.len() - 1;
         list[v].hold = true;
-        let a2 = if rear {
-            Vec2::new(cx, -55.0)
-        } else {
-            Vec2::new(cx + 55.0, 0.0)
-        };
-        for anchor in [Vec2::new(cx, 35.0), a2] {
+        for off in offsets {
+            let anchor = Vec2::new(cx, 0.0) + *off;
             spawn_regiment(units, terrain, &mut list, 1, KIND_LIGHT, anchor, 500, 1.0);
             let g = list.len() - 1;
             list[g].order = Some(crate::orders::Order::Move(Vec2::new(cx, 0.0)));
@@ -249,7 +265,10 @@ fn spawn_dir_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
         }
     }
     groups.list = list;
-    info!("[dir-test] control pair (front+left) at x=-250, test pair (front+rear) at x=+250");
+    info!(
+        "[dir-test] control pair (front+left) x=-250, test pair (front+rear) x=+250, \
+         lone rear charge x=0"
+    );
 }
 
 /// FL_TEST_DIR bookkeeping: sector-bucketed kills/damage + per-pair victim
@@ -269,13 +288,22 @@ fn dir_test_log(
         return;
     }
     *next = t + 2.0;
-    let (mut ctl, mut test) = (0usize, 0usize);
+    let (mut ctl, mut test, mut lone) = (0usize, 0usize, 0usize);
+    // The lone-pair victims' facing: mean |yaw| from the ordered facing
+    // (0 = +Z). Before the M2TW no-auto-face rule this snapped to ~pi
+    // (the whole block turned to meet the rear approach) long before
+    // contact; now only soldiers actually fighting may deviate.
+    let (mut yaw_dev, mut yaw_n) = (0.0f32, 0usize);
     for i in 0..units.len() {
         if units.team[i] == 0 && units.death_t[i] == 0 {
-            if units.pos[i].x < 0.0 {
+            if units.pos[i].x < -100.0 {
                 ctl += 1;
-            } else {
+            } else if units.pos[i].x > 100.0 {
                 test += 1;
+            } else {
+                lone += 1;
+                yaw_dev += units.yaw[i].abs();
+                yaw_n += 1;
             }
         }
     }
@@ -283,13 +311,15 @@ fn dir_test_log(
     let per_hit = |s: usize| dir_stats.dmg[s] / dir_stats.hits[s].max(1) as f64;
     info!(
         "[dir-test] t={t:.0}s kills by sector: front {} side {} rear {} \
-         (dmg/hit {:.1}/{:.1}/{:.1}); victims alive: control {ctl}/500, test {test}/500",
+         (dmg/hit {:.1}/{:.1}/{:.1}); victims alive: control {ctl}/500, test {test}/500, \
+         lone {lone}/500 (yaw dev {:.2} rad)",
         k[0],
         k[1],
         k[2],
         per_hit(0),
         per_hit(1),
         per_hit(2),
+        yaw_dev / yaw_n.max(1) as f32,
     );
 }
 
