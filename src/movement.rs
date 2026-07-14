@@ -98,8 +98,20 @@ const CHARGE_KNOCKBACK: f32 = 0.9;
 const WALL_KNOCKBACK_RESIST: f32 = 0.25;
 /// Stagger: a charge-flagged hit cancels the victim's swing and locks
 /// him (no acting, steering, or turning) for ~1 s — the M2TW hit-stun
-/// that lets a charge land a second blow before the answer.
-const STAGGER_TICKS: u8 = 30;
+/// that lets a charge land a second blow before the answer. Pub: the
+/// render sync derives the rocked-back pose progress from swing_t/this.
+pub const STAGGER_TICKS: u8 = 30;
+/// The braced spear is a PHYSICAL hazard, not a stance rule: a
+/// spearwall soldier's leveled point covers a line along his facing,
+/// from POINT_MIN (get inside it and the spear is useless) out to his
+/// reach, this wide. A body crossing that line at charge speed runs
+/// onto the point — a damage event from the spearman powered by the
+/// CHARGER's own momentum, and a stop (stagger). A charger who slips
+/// between the lines (rank edge, dead wielder, hole in the wall)
+/// reaches the spearman and swings with his full charge bonus: gaps
+/// are real, coverage at 1.05 m wall pitch is ~2/3 of the frontage.
+const SPEAR_POINT_MIN: f32 = 0.9;
+const SPEAR_LINE_HALF_W: f32 = 0.35;
 
 /// Global damage multiplier. FL_COMBAT_SCALE overrides (fast test battles).
 #[derive(Resource)]
@@ -123,6 +135,11 @@ pub struct DamageEvent {
     pub jit: f32,
     /// Swing started at charging speed (momentum bonus).
     pub charge: bool,
+    /// Not a swing at all: the victim ran onto a braced spear at charge
+    /// speed (attacker is the spearman). His own charge bonus counts as
+    /// attack points against him, and the point stops him (stagger, no
+    /// knockback — momentum went INTO the spear).
+    pub impale: bool,
 }
 
 /// One event buffer per integrate chunk; allocations persist across ticks.
@@ -210,6 +227,7 @@ pub fn step_sim(
     mut tick: Local<u32>,
     mut wall_flags: Local<Vec<bool>>,
     mut dir_stats: ResMut<DirTestStats>,
+    mut yaw_snapshot: Local<Vec<f32>>,
 ) {
     let dt = time.delta_secs();
     let Units {
@@ -315,6 +333,24 @@ pub fn step_sim(
     let charging = &charging[..];
     let bounds_min = terrain.min() + 4.0;
     let bounds_max = terrain.max() - 4.0;
+
+    // Read-only yaw snapshot (tick-start, like pos_prev) for cross-unit
+    // reads inside the parallel integrate — the live yaw column is split
+    // into &mut chunks there. The spear-line hazard reads the SPEARMAN's
+    // facing from the charger's side of the scan.
+    yaw_snapshot.clear();
+    yaw_snapshot.extend_from_slice(yaw);
+    let yaw_snap = &yaw_snapshot[..];
+    // Spear-line hazard global gate: marching speed exceeds the charge
+    // threshold, so without this every mover in a 200k battle would pay
+    // the wider scan hunting for spearwalls that do not exist. Per team:
+    // does the ENEMY side field a braced spearwall at all this tick?
+    let faces_spearwall: [bool; 2] = [0u8, 1u8].map(|t| {
+        groups
+            .list
+            .iter()
+            .any(|g| g.team != t && g.count > 0 && crate::formation::wall_kind(g) == 2)
+    });
 
     let combat_scale = scale.0;
     let n_chunks = pos.len().div_ceil(CHUNK);
@@ -424,7 +460,27 @@ pub fn step_sim(
                     let mut best_d2 = f32::MAX;
                     let mut best_idx = u32::MAX;
                     let mut sticky = false;
-                    grid.for_each_candidate(p, QUERY_RADIUS.max(params.reach), |o| {
+                    // Moving at charge speed with unspent momentum: braced
+                    // enemy spears in the path are a collision hazard, and
+                    // the scan must see out to SPEAR reach, not just mine.
+                    // A man already run through (flash) or reeling is not
+                    // re-impaled every tick — a spear is a point, not an
+                    // aura.
+                    let spear_reach = TYPES[crate::unit_types::KIND_SPEAR as usize].reach;
+                    let cs = speed[i] * CHARGE_SPEED_FRAC;
+                    let at_charge_speed = faces_spearwall[team[i] as usize]
+                        && !dying
+                        && fl_chunk[j] == 0
+                        && sw_chunk[j] & crate::units::SWING_STAGGERED == 0
+                        && v_chunk[j].xz().length_squared() > cs * cs;
+                    let mut impale_idx = u32::MAX;
+                    let mut impale_d = f32::MAX;
+                    let scan_r = if at_charge_speed {
+                        QUERY_RADIUS.max(params.reach).max(spear_reach)
+                    } else {
+                        QUERY_RADIUS.max(params.reach)
+                    };
+                    grid.for_each_candidate(p, scan_r, |o| {
                         if o.idx as usize == i {
                             return;
                         }
@@ -437,6 +493,31 @@ pub fn step_sim(
                             if d2 < best_d2 {
                                 best_d2 = d2;
                                 best_idx = o.idx;
+                            }
+                        }
+                        // Spear-line collision: he is a braced enemy
+                        // spearman, and my body is crossing his leveled
+                        // point while I close at speed.
+                        if at_charge_speed
+                            && enemy
+                            && (o.meta & crate::spatial::META_WALL) != 0
+                            && crate::spatial::meta_kind(o.meta)
+                                == crate::unit_types::KIND_SPEAR as usize
+                        {
+                            let ys = yaw_snap[o.idx as usize];
+                            let f = Vec2::new(ys.sin(), ys.cos());
+                            let rel = d; // spearman -> me (d = p - o.xz())
+                            let fwd_d = rel.dot(f);
+                            let lat = (rel.x * f.y - rel.y * f.x).abs();
+                            let closing = v_chunk[j].xz().dot(d) < 0.0;
+                            if fwd_d > SPEAR_POINT_MIN
+                                && fwd_d < spear_reach
+                                && lat < SPEAR_LINE_HALF_W
+                                && closing
+                                && fwd_d < impale_d
+                            {
+                                impale_d = fwd_d;
+                                impale_idx = o.idx;
                             }
                         }
                         // Two same-team units both in a wall stance rest
@@ -468,6 +549,26 @@ pub fn step_sim(
                             crowd += w;
                         }
                     });
+
+                    // Ran onto a braced spear: the collision is a damage
+                    // event from the SPEARMAN, resolved with everything
+                    // else in the serial apply (which also stops the
+                    // runner). One point, one wound — the nearest line
+                    // crossed this tick.
+                    if impale_idx != u32::MAX {
+                        let jit = 0.85
+                            + 0.3
+                                * crate::units::hash01(
+                                    tick_seed ^ (i as u32).wrapping_mul(0x7A31),
+                                );
+                        events.push(DamageEvent {
+                            victim: i as u32,
+                            attacker: impale_idx,
+                            jit,
+                            charge: false,
+                            impale: true,
+                        });
+                    }
 
                     // Sparse-fight acquisition (see WIDE_ACQUIRE_R): a
                     // pressing unit with an empty scan and open space
@@ -528,6 +629,7 @@ pub fn step_sim(
                                         attacker: i as u32,
                                         jit,
                                         charge: sw_chunk[j] & crate::units::SWING_CHARGE != 0,
+                                        impale: false,
                                     });
                                     sw_chunk[j] = crate::units::SWING_RECOVER;
                                     let cjit = 0.75
@@ -892,11 +994,17 @@ pub fn step_sim(
                         2 => SPEARWALL_ATK_PTS,
                         _ => 0.0,
                     };
-                // A braced spearwall nullifies charge momentum with its
-                // points — which face FORWARD; a wall charged in the
-                // flank or rear is bodies like any others.
-                if ev.charge && !(v_wall == 2 && front) {
+                if ev.charge {
                     attack += pa.charge_bonus;
+                }
+                // Impalement: he ran onto this spearman's braced point at
+                // speed (integrate's spear-line collision) — his OWN
+                // momentum is the attack bonus, spent against himself.
+                // No stance rules anywhere: a charger who slipped between
+                // the spear lines and reached the wielder gets his full
+                // charge bonus above like anyone else.
+                if ev.impale {
+                    attack += pv.charge_bonus;
                 }
                 let skill = if rear { 0.0 } else { pv.defence_skill };
                 let shield = if front || left_side {
@@ -924,18 +1032,23 @@ pub fn step_sim(
                 // stun. Walls barely budge and never stagger; a braced
                 // SPEARWALL additionally reflects the charge bonus onto
                 // the charger (points punish momentum) — the M2TW rule.
-                if ev.charge && !died {
-                    let m_a = pa.mass;
-                    let m_v = pv.mass;
-                    // Bracing counts where the men are braced: a wall hit
-                    // FRONTALLY barely budges and never staggers; from
-                    // the flank or rear it is bodies like any others.
+                if (ev.charge || ev.impale) && !died {
+                    // Bracing is posture physics: a wall hit FRONTALLY has
+                    // its weight planted — quarter knockback, no stagger;
+                    // from the flank or rear it is bodies like any others.
                     let braced = v_wall != 0 && front;
-                    let resist = if braced { WALL_KNOCKBACK_RESIST } else { 1.0 };
-                    let shove = -dir * CHARGE_KNOCKBACK * (m_a / (m_a + m_v)) * resist;
-                    let nx = (pos[v].x + shove.x).clamp(bounds_min.x, bounds_max.x);
-                    let nz = (pos[v].z + shove.y).clamp(bounds_min.y, bounds_max.y);
-                    pos[v] = Vec3::new(nx, terrain.height_at(nx, nz) + pv.half_height, nz);
+                    if ev.charge {
+                        let m_a = pa.mass;
+                        let m_v = pv.mass;
+                        let resist = if braced { WALL_KNOCKBACK_RESIST } else { 1.0 };
+                        let shove = -dir * CHARGE_KNOCKBACK * (m_a / (m_a + m_v)) * resist;
+                        let nx = (pos[v].x + shove.x).clamp(bounds_min.x, bounds_max.x);
+                        let nz = (pos[v].z + shove.y).clamp(bounds_min.y, bounds_max.y);
+                        pos[v] = Vec3::new(nx, terrain.height_at(nx, nz) + pv.half_height, nz);
+                    }
+                    // An impaled runner is STOPPED, not thrown — his
+                    // momentum went into the point; the stagger is the
+                    // stop.
                     if !braced {
                         if swing[v] & crate::units::SWING_STAGGER_IMMUNE != 0 {
                             // The free pass earned by the last stagger is
@@ -946,20 +1059,6 @@ pub fn step_sim(
                                 | crate::units::SWING_STAGGERED;
                             swing_t[v] = swing_t[v].max(STAGGER_TICKS);
                         }
-                    }
-                }
-                if ev.charge && v_wall == 2 && front && hp[a] > 0.0 && death_t[a] == 0 {
-                    // Reflected charge: the bonus damage the charger
-                    // brought is dealt back to him instead (his base blow
-                    // above already landed without it — the wall nullifies
-                    // the momentum, the points collect it).
-                    let reflect = dmg * (FACTOR_MULT.powf(pa.charge_bonus) - 1.0);
-                    hp[a] -= reflect;
-                    flash[a] = FLASH_TICKS;
-                    if hp[a] <= 0.0 {
-                        death_t[a] = DEATH_TICKS;
-                        cstats.kills[team[a] as usize] += 1;
-                        groups.list[group[a] as usize].recent_deaths += 1;
                     }
                 }
                 if dir_stats.enabled {
