@@ -55,12 +55,13 @@ fn scripts_active() -> bool {
 
 fn ai_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    // FL_ENEMY_STATIC=1: practice-dummy mode — the enemy army spawns in
-    // hold-position (regiments.rs) and the strategy AI stands down, so
-    // regiments defend where they stand but never advance or chase.
+    // FL_ENEMY_STATIC=1 / FL_ARENA=1: practice-dummy modes — the enemy
+    // spawns in hold-position (regiments.rs) and the strategy AI stands
+    // down, so regiments defend where they stand but never advance.
     *ON.get_or_init(|| {
         !std::env::var("FL_AI").is_ok_and(|v| v == "0")
             && std::env::var("FL_ENEMY_STATIC").is_err()
+            && std::env::var("FL_ARENA").is_err()
             && !scripts_active()
     })
 }

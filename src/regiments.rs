@@ -29,7 +29,7 @@ impl Plugin for RegimentsPlugin {
         // Terrain resource is created in PreStartup (generate_terrain).
         // Morale lives in crate::morale (MoralePlugin).
         app.add_systems(Startup, spawn_battle)
-            .add_systems(Update, (rout_test_log, dir_test_log, restart_key));
+            .add_systems(Update, (rout_test_log, dir_test_log, arena_log, restart_key));
     }
 }
 
@@ -99,12 +99,14 @@ fn restart_key(
     mut selection: ResMut<crate::orders::Selection>,
     mut outcome: ResMut<crate::ai::BattleOutcome>,
     mut corpses: ResMut<crate::render_units::Corpses>,
+    mut dir_stats: ResMut<crate::movement::DirTestStats>,
 ) {
     if !keys.just_pressed(KeyCode::KeyR) {
         return;
     }
     *units = Units::default();
     *stats = crate::combat::CombatStats::default();
+    *dir_stats = crate::movement::DirTestStats::default();
     *selection = crate::orders::Selection::default();
     outcome.0 = None;
     corpses.clear();
@@ -123,6 +125,10 @@ fn do_spawn_battle(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
     }
     if std::env::var("FL_TEST_DIR").is_ok() {
         spawn_dir_test(units, terrain, groups);
+        return;
+    }
+    if std::env::var("FL_ARENA").is_ok() {
+        spawn_arena(units, terrain, groups);
         return;
     }
 
@@ -307,8 +313,8 @@ fn dir_test_log(
             }
         }
     }
-    let k = &dir_stats.kills;
-    let per_hit = |s: usize| dir_stats.dmg[s] / dir_stats.hits[s].max(1) as f64;
+    let k = &dir_stats.kills[0];
+    let per_hit = |s: usize| dir_stats.dmg[0][s] / dir_stats.hits[0][s].max(1) as f64;
     info!(
         "[dir-test] t={t:.0}s kills by sector: front {} side {} rear {} \
          (dmg/hit {:.1}/{:.1}/{:.1}); victims alive: control {ctl}/500, test {test}/500, \
@@ -320,6 +326,92 @@ fn dir_test_log(
         per_hit(1),
         per_hit(2),
         yaw_dev / yaw_n.max(1) as f32,
+    );
+}
+
+/// FL_ARENA=1: hand-testing range for directional damage. Two mirrored
+/// duel lanes of identical heavy regiments; both enemies HOLD facing
+/// south (toward the player side) with the AI stood down. Lane FRONT
+/// (west): your regiment south of the enemy — attack it head-on. Lane
+/// REAR (east): your regiment already parked BEHIND the enemy — attack
+/// south into its back. Same kind, same size, same distance; the only
+/// variable is the sector, and the [arena] log prints your kills and
+/// damage per hit by sector so the comparison is numbers, not vibes.
+fn spawn_arena(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
+    let size = crate::util::env_or("FL_REG_SIZE", 500_usize).max(50);
+    let mut list = Vec::new();
+    for (lane_x, player_z) in [(-80.0_f32, -85.0_f32), (80.0, 85.0)] {
+        spawn_regiment(
+            units,
+            terrain,
+            &mut list,
+            0,
+            KIND_HEAVY,
+            Vec2::new(lane_x, player_z),
+            size,
+            if player_z < 0.0 { -1.0 } else { 1.0 },
+        );
+        let g = list.len() - 1;
+        if player_z > 0.0 {
+            // The rear-lane regiment starts behind the enemy: face back
+            // south toward it (slots rebake to the new facing).
+            list[g].facing = std::f32::consts::PI;
+            crate::formation::assign_slots(units, g as u32, &mut list[g]);
+        }
+        spawn_regiment(units, terrain, &mut list, 1, KIND_HEAVY, Vec2::new(lane_x, 0.0), size, 1.0);
+        let e = list.len() - 1;
+        list[e].hold = true; // faces south by default (team-1 facing)
+    }
+    groups.list = list;
+    info!(
+        "[arena] FRONT lane west: attack the enemy head-on. REAR lane east: \
+         attack the enemy from behind. Identical heavies, enemies hold, no AI."
+    );
+}
+
+/// FL_ARENA bookkeeping: per-lane strengths + the player's kills and
+/// damage per hit by sector, every 4 s once fighting starts.
+fn arena_log(
+    dir_stats: Res<crate::movement::DirTestStats>,
+    units: Res<Units>,
+    time: Res<Time>,
+    mut next: Local<f32>,
+) {
+    if std::env::var("FL_ARENA").is_err() || units.len() == 0 {
+        return;
+    }
+    let t = time.elapsed_secs();
+    if t < *next {
+        return;
+    }
+    *next = t + 4.0;
+    // Lane split at x = 0: west = frontal duel, east = rear duel.
+    let mut alive = [[0usize; 2]; 2]; // [lane][team]
+    for i in 0..units.len() {
+        if units.death_t[i] == 0 {
+            let lane = usize::from(units.pos[i].x > 0.0);
+            alive[lane][units.team[i] as usize] += 1;
+        }
+    }
+    // Your kills = hits on team-1 victims.
+    let k = &dir_stats.kills[1];
+    if k.iter().sum::<u64>() == 0 && dir_stats.kills[0].iter().sum::<u64>() == 0 {
+        return; // nothing has happened yet — keep the log quiet
+    }
+    let per_hit = |s: usize| dir_stats.dmg[1][s] / dir_stats.hits[1][s].max(1) as f64;
+    info!(
+        "[arena] t={t:.0}s FRONT lane you {} vs {} | REAR lane you {} vs {} | \
+         your kills: front {} ({:.1}/hit), side {} ({:.1}/hit), rear {} ({:.1}/hit)",
+        alive[0][0],
+        alive[0][1],
+        alive[1][0],
+        alive[1][1],
+        k[0],
+        per_hit(0),
+        k[1],
+        per_hit(1),
+        k[2],
+        per_hit(2),
     );
 }
 

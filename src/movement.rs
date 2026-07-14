@@ -104,24 +104,26 @@ pub struct DamageEvent {
 #[derive(Resource, Default)]
 pub struct DamageBuffers(pub Vec<Vec<DamageEvent>>);
 
-/// FL_TEST_DIR bookkeeping: hits on team-0 victims bucketed by attack
-/// sector, filled by the damage apply pass, logged from regiments.rs.
+/// FL_TEST_DIR / FL_ARENA bookkeeping: every hit bucketed by victim team
+/// and attack sector, filled by the damage apply pass, logged from
+/// regiments.rs (the dir test reads blue victims, the arena reads orange
+/// victims — the player's kills).
 #[derive(Resource)]
 pub struct DirTestStats {
-    /// Indexed front / side / rear.
-    pub kills: [u64; 3],
-    pub hits: [u64; 3],
-    pub dmg: [f64; 3],
+    /// Indexed [victim team][front / side / rear].
+    pub kills: [[u64; 3]; 2],
+    pub hits: [[u64; 3]; 2],
+    pub dmg: [[f64; 3]; 2],
     pub enabled: bool,
 }
 
 impl Default for DirTestStats {
     fn default() -> Self {
         Self {
-            kills: [0; 3],
-            hits: [0; 3],
-            dmg: [0.0; 3],
-            enabled: std::env::var("FL_TEST_DIR").is_ok(),
+            kills: [[0; 3]; 2],
+            hits: [[0; 3]; 2],
+            dmg: [[0.0; 3]; 2],
+            enabled: std::env::var("FL_TEST_DIR").is_ok() || std::env::var("FL_ARENA").is_ok(),
         }
     }
 }
@@ -807,12 +809,13 @@ pub fn step_sim(
                     cstats.kills[team[v] as usize] += 1;
                     groups.list[group[v] as usize].recent_deaths += 1;
                 }
-                if dir_stats.enabled && team[v] == 0 {
+                if dir_stats.enabled {
+                    let vt = team[v] as usize;
                     let s = if front { 0 } else if !rear { 1 } else { 2 };
-                    dir_stats.hits[s] += 1;
-                    dir_stats.dmg[s] += dmg as f64;
+                    dir_stats.hits[vt][s] += 1;
+                    dir_stats.dmg[vt][s] += dmg as f64;
                     if died {
-                        dir_stats.kills[s] += 1;
+                        dir_stats.kills[vt][s] += 1;
                     }
                 }
             }
