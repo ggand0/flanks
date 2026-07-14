@@ -101,8 +101,24 @@ const WALL_KNOCKBACK_RESIST: f32 = 0.25;
 /// that lets a charge land a second blow before the answer. Pub: the
 /// render sync derives the rocked-back pose progress from swing_t/this.
 pub const STAGGER_TICKS: u8 = 30;
+/// Per-hit stagger (M2TW: a hit that connects, is not blocked, and does
+/// not kill staggers its victim — and blocking IS the defence stats
+/// working). The chance rides the combat factor, the continuous "did
+/// the defence stop it": even matchup ~0.65, rear hits ~1.0 (nobody
+/// parries what he cannot see — skill and shield are already zero from
+/// behind), elite shieldwall frontal ~0.3 (they block and parry a lot),
+/// and AP-vs-armour staggers more purely through the halved armour.
+/// Charge impacts and impalements stay certain (physics, not a parry
+/// contest). A regular hit is a brief stumble; impacts stun full-length
+/// (the render pose scales with remaining ticks, so stumbles read
+/// lighter than impacts for free).
+const STAGGER_P0: f32 = 0.65;
+const STAGGER_P_PER_FACTOR: f32 = 0.05;
+const STAGGER_P_MIN: f32 = 0.05;
+const HIT_STAGGER_TICKS: u8 = 15;
+
 /// FL_DEBUG_STAGGER=1: every landed hit staggers its victim (animation
-/// debugging — normally only charge impacts and spear impalements do).
+/// debugging — normally the roll above decides).
 fn debug_stagger() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("FL_DEBUG_STAGGER").is_ok())
@@ -1013,7 +1029,16 @@ pub fn step_sim(
                 if ev.impale {
                     attack += pv.charge_bonus;
                 }
-                let skill = if rear { 0.0 } else { pv.defence_skill };
+                // A staggered man cannot parry (M2TW: no blocking while
+                // staggering — the outnumbered-men snowball): his defence
+                // SKILL is gone until he recovers; the shield still
+                // passively covers and armour always counts.
+                let v_staggered = swing[v] & crate::units::SWING_STAGGERED != 0;
+                let skill = if rear || v_staggered {
+                    0.0
+                } else {
+                    pv.defence_skill
+                };
                 let shield = if front || left_side {
                     pv.shield + if v_wall == 1 { SHIELDWALL_SHIELD_PTS } else { 0.0 }
                 } else {
@@ -1039,7 +1064,22 @@ pub fn step_sim(
                 // stun. Walls barely budge and never stagger; a braced
                 // SPEARWALL additionally reflects the charge bonus onto
                 // the charger (points punish momentum) — the M2TW rule.
-                if (ev.charge || ev.impale || debug_stagger()) && !died {
+                if !died {
+                    // Impacts always rock their man; an ordinary blow
+                    // staggers when it got through cleanly — the roll
+                    // rides the same factor the damage did.
+                    let certain = ev.charge || ev.impale || debug_stagger();
+                    let p = if certain {
+                        1.0
+                    } else {
+                        (STAGGER_P0 + STAGGER_P_PER_FACTOR * factor)
+                            .clamp(STAGGER_P_MIN, 1.0)
+                    };
+                    let roll = crate::units::hash01(
+                        tick_seed
+                            ^ (ev.victim.wrapping_mul(0x9E37))
+                            ^ (ev.attacker.wrapping_mul(0x85EB)),
+                    );
                     // Bracing is posture physics: a wall hit FRONTALLY has
                     // its weight planted — quarter knockback, no stagger;
                     // from the flank or rear it is bodies like any others.
@@ -1056,15 +1096,20 @@ pub fn step_sim(
                     // An impaled runner is STOPPED, not thrown — his
                     // momentum went into the point; the stagger is the
                     // stop.
-                    if !braced {
+                    if !braced && roll < p {
                         if swing[v] & crate::units::SWING_STAGGER_IMMUNE != 0 {
                             // The free pass earned by the last stagger is
                             // spent absorbing this one.
                             swing[v] &= !crate::units::SWING_STAGGER_IMMUNE;
                         } else {
+                            let stun = if certain {
+                                STAGGER_TICKS
+                            } else {
+                                HIT_STAGGER_TICKS
+                            };
                             swing[v] = crate::units::SWING_RECOVER
                                 | crate::units::SWING_STAGGERED;
-                            swing_t[v] = swing_t[v].max(STAGGER_TICKS);
+                            swing_t[v] = swing_t[v].max(stun);
                         }
                     }
                 }
