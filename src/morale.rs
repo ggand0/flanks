@@ -97,6 +97,24 @@ const DISORDER_FULL: f32 = 7.0;
 const WALL_STEADY: f32 = 0.85;
 /// Recovery per second when unengaged and undisturbed.
 const MORALE_RECOVERY: f32 = 3.0;
+/// Attacked-in-the-rear/flank (phase D of formation combat v2, pulled
+/// forward): blades landing in a regiment's back are a STANDING morale
+/// drain while the pressure lasts — M2TW's attacked-in-rear modifier;
+/// there a rear attack routs the unit through morale, not attrition,
+/// and the slaughter is the pursuit. Driven by the per-sector hit
+/// tallies the damage apply fills (~1 s memory, saturation-normalized):
+/// self-measuring, so a lone backstab is noise and a full-width rear
+/// engagement pins the drain at maximum. Rear at saturation matches
+/// full encirclement on the density ring (MORALE_FLANKED) — the two
+/// stack for the true hammer-and-anvil.
+const MORALE_REAR_ATTACK: f32 = 6.0;
+const MORALE_FLANK_ATTACK: f32 = 2.5;
+/// Sector hits (tally units) that count as full pressure.
+const SHOCK_SAT: f32 = 10.0;
+/// Per-tick decay of the tallies (~1 s memory).
+const SHOCK_DECAY: f32 = 0.92;
+/// Log throttle for the rear-attack event line (ticks).
+const SHOCK_LOG_TICKS: u16 = 300;
 /// Routing-neighbor / rally-safety radius.
 const NEIGHBOR_R: f32 = 60.0;
 /// Broken regiments below this fraction of initial strength shatter.
@@ -141,6 +159,20 @@ fn update_morale(
             continue;
         }
         let resist = TYPES[g.kind as usize].morale_resist;
+
+        // Attacked-in-the-rear/flank pressure (0..1) from this tick's
+        // sector-hit tallies; the tallies then decay (~1 s memory).
+        let p_rear = (g.shock_rear / SHOCK_SAT).min(1.0);
+        let p_flank = (g.shock_flank / SHOCK_SAT).min(1.0);
+        if g.shock_cd > 0 {
+            g.shock_cd -= 1;
+        }
+        if p_rear >= 0.5 && g.shock_cd == 0 && !g.state.is_broken() {
+            g.shock_cd = SHOCK_LOG_TICKS;
+            info!("regiment {gi} is taking blades in the REAR");
+        }
+        g.shock_rear *= SHOCK_DECAY;
+        g.shock_flank *= SHOCK_DECAY;
 
         match g.state {
             RegState::Steady => {
@@ -191,6 +223,12 @@ fn update_morale(
                 let safe_arc = safe_run.min(8) as f32 * 45.0;
                 let flanked = ((225.0 - safe_arc) / 225.0).clamp(0.0, 1.0);
                 pressure += MORALE_FLANKED * flanked;
+                // Blades actually landing in the back/side (per-sector
+                // hit pressure): the ring above reads enemy MASS around
+                // the block; this reads the wounds themselves, so a
+                // single regiment carving the rear registers even when
+                // the density ring calls the fight one-sided.
+                pressure += MORALE_REAR_ATTACK * p_rear + MORALE_FLANK_ATTACK * p_flank;
                 // Routing friendlies nearby shake resolve.
                 let rout_drain = routing_centroids
                     .iter()

@@ -529,7 +529,28 @@ pub fn step_sim(
                                 // start attacks (they still defend nothing —
                                 // pursuit is free hits).
                                 let chosen = if sticky { prev_target } else { best_idx };
-                                if chosen != u32::MAX && !routed {
+                                // No eyes in the back of his head: a man
+                                // only opens on a target in his forward
+                                // half-plane — UNLESS he was just struck
+                                // (the blow tells him where to turn, and
+                                // the wind-up facing spins him around).
+                                // Without this gate every rear-approached
+                                // victim counter-wound-up on proximity and
+                                // was face-on before the first blow landed;
+                                // the rear sector never fired in practice.
+                                let aware = chosen != u32::MAX && {
+                                    let t = chosen as usize;
+                                    fl_chunk[j] > 0
+                                        || (t < pos_prev.len() && {
+                                            let to_t = pos_prev[t].xz() - p;
+                                            let fwd = Vec2::new(
+                                                yaw_chunk[j].sin(),
+                                                yaw_chunk[j].cos(),
+                                            );
+                                            fwd.dot(to_t) >= 0.0
+                                        })
+                                };
+                                if chosen != u32::MAX && !routed && aware {
                                     tgt_chunk[j] = chosen;
                                     // Arriving at speed = a charging blow:
                                     // momentum converts to damage + a bigger
@@ -675,7 +696,23 @@ pub fn step_sim(
                     yawp_chunk[j] = yaw_chunk[j];
                     let face_dir = match face_target {
                         Some(t) => t - p,
-                        None if !routed && best_idx != u32::MAX => {
+                        // A man IN his swing cycle faces the fight (a
+                        // formed one too — he is the fighting rim), and a
+                        // man JUST STRUCK turns toward the blow (flash).
+                        // A man merely NEAR an enemy does not: turning on
+                        // proximity raced the attacker's wind-up and had
+                        // every rear-approached victim frontal by first
+                        // blood — the whole point of facing, gone. So the
+                        // first hit lands in the back, spins its victim,
+                        // and THEN he answers. Unformed units (Blob, no
+                        // facing claim) still turn on proximity.
+                        None if !routed
+                            && best_idx != u32::MAX
+                            && ((sw_chunk[j] & crate::units::SWING_STATE_MASK)
+                                != crate::units::SWING_READY
+                                || fl_chunk[j] > 0
+                                || form_face[gi] == Vec2::ZERO) =>
+                        {
                             pos_prev[best_idx as usize].xz() - p
                         }
                         // Standing in formation: HOLD the ordered facing.
@@ -683,9 +720,7 @@ pub fn step_sim(
                         // toward a threat (it goes "ready" in place; the
                         // render brace pose keys off enemy_near, not yaw);
                         // facing is the player's job, and leaving a flank
-                        // open is supposed to cost. Soldiers with an enemy
-                        // inside the combat scan face him via the branches
-                        // above — the fighting rim turns, the ranks don't.
+                        // open is supposed to cost.
                         None if !routed
                             && new_v.length_squared() < 0.25
                             && form_face[gi] != Vec2::ZERO =>
@@ -808,6 +843,18 @@ pub fn step_sim(
                     // kills[] counts losses OF that team (overlay semantics).
                     cstats.kills[team[v] as usize] += 1;
                     groups.list[group[v] as usize].recent_deaths += 1;
+                }
+                // Rear/flank shock tally (morale.rs): a burst of blows
+                // into the rear or flank is a morale event over and above
+                // the casualties — M2TW's attacked-in-the-rear state. Not
+                // gated on the charge flag: the crowd brakes most chargers
+                // below charge speed at contact, and a wall of blades in
+                // your back is the shock whether or not they arrived at a
+                // sprint.
+                if rear {
+                    groups.list[group[v] as usize].shock_rear += 1.0;
+                } else if !front {
+                    groups.list[group[v] as usize].shock_flank += 1.0;
                 }
                 if dir_stats.enabled {
                     let vt = team[v] as usize;
