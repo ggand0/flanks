@@ -217,6 +217,23 @@ fn vertex(vertex: Vertex) -> VertexOutput {
         * clamp(local.y + 0.5, 0.0, 1.5);
     local.z += lean * 0.3;
 
+    // Stagger (anim2.w = remaining stun, 1 at the blow -> 0 recovered):
+    // rocked back off a charging blow or a spear point. The whole body
+    // pitches backward from the feet with a short reel, hardest at the
+    // hit and easing out as the man finds his balance; the knee-buckle
+    // sink rides the position offset below.
+    let stagger = vertex.i_anim2.w;
+    if stagger > 0.001 {
+        let reel = 1.0 + 0.18 * sin(globals.time * 22.0 + seed * 6.2831853);
+        let sang = -0.42 * stagger * stagger * reel;
+        let sca = cos(sang);
+        let ssa = sin(sang);
+        let sfy = local.y + 0.5;
+        local = vec3<f32>(local.x, sfy * sca - local.z * ssa - 0.5, sfy * ssa + local.z * sca);
+        normal =
+            vec3<f32>(normal.x, normal.y * sca - normal.z * ssa, normal.y * ssa + normal.z * sca);
+    }
+
     // Death: topple around the feet and sink slightly. Fall direction
     // varies per unit (seed): forward, backward, or to either side —
     // corpses keep their seed, so the pose persists on the ground.
@@ -259,7 +276,8 @@ fn vertex(vertex: Vertex) -> VertexOutput {
         + vertex.i_pos_scale.xyz
         + vec3<f32>(
             0.0,
-            bob - 0.15 * death - 0.07 * brace - 0.03 * ready * moving - 0.05 * wall + hop,
+            bob - 0.15 * death - 0.07 * brace - 0.03 * ready * moving - 0.05 * wall
+                - 0.10 * stagger + hop,
             0.0,
         );
 

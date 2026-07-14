@@ -538,6 +538,17 @@ fn sync_instance_data(
                     } else {
                         units.flash[i] as f32 * 0.25
                     };
+                    // Stagger progress (1 at the blow, 0 recovered): the
+                    // rocked-back pose. Death pose owns dying men.
+                    let stagger = if units.death_t[i] == 0
+                        && sw & crate::units::SWING_STAGGERED != 0
+                    {
+                        (units.swing_t[i] as f32
+                            / crate::movement::STAGGER_TICKS as f32)
+                            .min(1.0)
+                    } else {
+                        0.0
+                    };
                     chunk_scratch[bucket_of(units, i)].push(InstanceData {
                         position,
                         scale: 1.0,
@@ -547,7 +558,7 @@ fn sync_instance_data(
                             march_chunk[i - start],
                             wall_chunk[i - start],
                             reg_phase.get(gi).copied().unwrap_or(0.0),
-                            0.0,
+                            stagger,
                         ],
                     });
                 }
