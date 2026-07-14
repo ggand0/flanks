@@ -676,22 +676,28 @@ pub fn step_sim(
                         None if !routed && best_idx != u32::MAX => {
                             pos_prev[best_idx as usize].xz() - p
                         }
-                        // Standing watch: near-stationary units of a
-                        // regiment with enemy mass nearby turn toward it
-                        // (brace facing) instead of keeping a stale yaw.
-                        None if !routed
-                            && new_v.length_squared() < 0.25
-                            && threat[gi] != Vec2::ZERO =>
-                        {
-                            threat[gi]
-                        }
-                        // Standing at ease in formation: dress to the
-                        // regiment's ordered facing (the drag direction).
+                        // Standing in formation: HOLD the ordered facing.
+                        // M2TW rule — a formed unit never rotates itself
+                        // toward a threat (it goes "ready" in place; the
+                        // render brace pose keys off enemy_near, not yaw);
+                        // facing is the player's job, and leaving a flank
+                        // open is supposed to cost. Soldiers with an enemy
+                        // inside the combat scan face him via the branches
+                        // above — the fighting rim turns, the ranks don't.
                         None if !routed
                             && new_v.length_squared() < 0.25
                             && form_face[gi] != Vec2::ZERO =>
                         {
                             form_face[gi]
+                        }
+                        // Standing watch WITHOUT a formation claim (Blob
+                        // mobs, rallied remnants): face the enemy mass
+                        // instead of keeping a stale yaw.
+                        None if !routed
+                            && new_v.length_squared() < 0.25
+                            && threat[gi] != Vec2::ZERO =>
+                        {
+                            threat[gi]
                         }
                         None => new_v,
                     };
