@@ -361,6 +361,12 @@ fn spawn_arena(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
         spawn_regiment(units, terrain, &mut list, 1, KIND_HEAVY, Vec2::new(lane_x, 0.0), size, 1.0);
         let e = list.len() - 1;
         list[e].hold = true; // faces south by default (team-1 facing)
+        // FL_ARENA_AUTO=1: fire both attacks immediately through the
+        // same Order::Attack the RMB click writes — the whole arena
+        // becomes a scripted acceptance run for the sector numbers.
+        if std::env::var("FL_ARENA_AUTO").is_ok() {
+            list[g].order = Some(crate::orders::Order::Attack(e as u32));
+        }
     }
     groups.list = list;
     info!(
@@ -374,10 +380,11 @@ fn spawn_arena(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
 fn arena_log(
     dir_stats: Res<crate::movement::DirTestStats>,
     units: Res<Units>,
+    groups: Res<Groups>,
     time: Res<Time>,
     mut next: Local<f32>,
 ) {
-    if std::env::var("FL_ARENA").is_err() || units.len() == 0 {
+    if std::env::var("FL_ARENA").is_err() || units.len() == 0 || groups.list.len() < 4 {
         return;
     }
     let t = time.elapsed_secs();
@@ -400,12 +407,15 @@ fn arena_log(
     }
     let per_hit = |s: usize| dir_stats.dmg[1][s] / dir_stats.hits[1][s].max(1) as f64;
     info!(
-        "[arena] t={t:.0}s FRONT lane you {} vs {} | REAR lane you {} vs {} | \
+        "[arena] t={t:.0}s FRONT lane you {} vs {} (morale {:.0}) | \
+         REAR lane you {} vs {} (morale {:.0}) | \
          your kills: front {} ({:.1}/hit), side {} ({:.1}/hit), rear {} ({:.1}/hit)",
         alive[0][0],
         alive[0][1],
+        groups.list[1].morale,
         alive[1][0],
         alive[1][1],
+        groups.list[3].morale,
         k[0],
         per_hit(0),
         k[1],
