@@ -35,6 +35,12 @@ const MAX_ACCEL: f32 = 50.0;
 /// Facing turn smoothing (fraction/s of the remaining angle) — the
 /// settle behavior for SMALL corrections.
 const YAW_RATE: f32 = 10.0;
+/// A blooded soldier (one whose combat memo holds a living enemy) keeps
+/// facing the fight while that enemy stands within this range, instead
+/// of dressing back to the ordered facing between swing cycles. Fresh
+/// men still hold the line — this is memory of a fight, not proximity
+/// awareness, so rear ambushes keep their first-blood advantage.
+const KEEP_FACING_R: f32 = 6.0;
 /// Hard angular speed cap (rad/s). The smoothing above is exponential,
 /// so before this cap a 180° about-face finished in ~0.2 s — rear-
 /// attacked soldiers whipped around between two swings and rear
@@ -723,6 +729,26 @@ pub fn step_sim(
                                 || form_face[gi] == Vec2::ZERO) =>
                         {
                             pos_prev[best_idx as usize].xz() - p
+                        }
+                        // Blooded and the enemy still close: a man who has
+                        // traded blows keeps facing the fight while his
+                        // last foe (combat memo, validated by team and
+                        // distance like the closing drive) stands within
+                        // KEEP_FACING_R — no parade dressing with a sword
+                        // a few strides away. A player reform takes hold
+                        // once the ground near him clears. Fresh men fall
+                        // through and hold the ordered line.
+                        None if !routed
+                            && new_v.length_squared() < 0.25
+                            && form_face[gi] != Vec2::ZERO
+                            && (tgt_chunk[j] as usize) < pos_prev.len()
+                            && team[tgt_chunk[j] as usize] != team[i]
+                            && pos_prev[tgt_chunk[j] as usize]
+                                .xz()
+                                .distance_squared(p)
+                                < KEEP_FACING_R * KEEP_FACING_R =>
+                        {
+                            pos_prev[tgt_chunk[j] as usize].xz() - p
                         }
                         // Standing in formation: HOLD the ordered facing.
                         // M2TW rule — a formed unit never rotates itself
