@@ -101,6 +101,13 @@ const WALL_KNOCKBACK_RESIST: f32 = 0.25;
 /// that lets a charge land a second blow before the answer. Pub: the
 /// render sync derives the rocked-back pose progress from swing_t/this.
 pub const STAGGER_TICKS: u8 = 30;
+/// FL_DEBUG_STAGGER=1: every landed hit staggers its victim (animation
+/// debugging — normally only charge impacts and spear impalements do).
+fn debug_stagger() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FL_DEBUG_STAGGER").is_ok())
+}
+
 /// The braced spear is a PHYSICAL hazard, not a stance rule: a
 /// spearwall soldier's leveled point covers a line along his facing,
 /// from POINT_MIN (get inside it and the spear is useless) out to his
@@ -1032,7 +1039,7 @@ pub fn step_sim(
                 // stun. Walls barely budge and never stagger; a braced
                 // SPEARWALL additionally reflects the charge bonus onto
                 // the charger (points punish momentum) — the M2TW rule.
-                if (ev.charge || ev.impale) && !died {
+                if (ev.charge || ev.impale || debug_stagger()) && !died {
                     // Bracing is posture physics: a wall hit FRONTALLY has
                     // its weight planted — quarter knockback, no stagger;
                     // from the flank or rear it is bodies like any others.
