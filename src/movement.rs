@@ -89,6 +89,17 @@ const SPEARWALL_ATK_PTS: f32 = 2.0;
 /// Sector test at damage apply: cos(60 deg). Front = attack direction
 /// within 60 deg of the victim's facing; rear = beyond 120 deg; else side.
 const SECTOR_COS_60: f32 = 0.5;
+/// Charge impact (phase B). A charge-flagged hit shoves its victim along
+/// the blow: displacement = KNOCKBACK * m_a/(m_a+m_v), applied straight
+/// to position (next tick's separation resolves the pile — same pipe as
+/// all overlap). Heavy into light ~0.55 m: the line visibly DENTS.
+const CHARGE_KNOCKBACK: f32 = 0.9;
+/// Braced walls barely budge (0.25x knockback) and never stagger.
+const WALL_KNOCKBACK_RESIST: f32 = 0.25;
+/// Stagger: a charge-flagged hit cancels the victim's swing and locks
+/// him (no acting, steering, or turning) for ~1 s — the M2TW hit-stun
+/// that lets a charge land a second blow before the answer.
+const STAGGER_TICKS: u8 = 30;
 
 /// Global damage multiplier. FL_COMBAT_SCALE overrides (fast test battles).
 #[derive(Resource)]
@@ -531,7 +542,19 @@ pub fn step_sim(
                             }
                             crate::units::SWING_RECOVER => {
                                 if swt_chunk[j] == 0 {
-                                    sw_chunk[j] = crate::units::SWING_READY;
+                                    // A stagger that just wore off leaves
+                                    // one free pass against the next one
+                                    // (anti-stunlock); a plain recovery
+                                    // carries an unspent pass forward.
+                                    let immune = if sw_chunk[j]
+                                        & crate::units::SWING_STAGGERED
+                                        != 0
+                                    {
+                                        crate::units::SWING_STAGGER_IMMUNE
+                                    } else {
+                                        sw_chunk[j] & crate::units::SWING_STAGGER_IMMUNE
+                                    };
+                                    sw_chunk[j] = crate::units::SWING_READY | immune;
                                 } else {
                                     swt_chunk[j] -= 1;
                                 }
@@ -634,7 +657,8 @@ pub fn step_sim(
                     // sweeps reindex, so it is validated as "some enemy
                     // within closing range" — a legitimate closing target
                     // regardless of identity.
-                    let close_to = if sw_chunk[j] != crate::units::SWING_READY
+                    let close_to = if sw_chunk[j] & crate::units::SWING_STATE_MASK
+                        != crate::units::SWING_READY
                         && (tgt_chunk[j] as usize) < pos_prev.len()
                     {
                         tgt_chunk[j]
@@ -667,6 +691,13 @@ pub fn step_sim(
                         desired *= WALL_SPEED_FRAC;
                     } else if charging[gi] && !dying && !routed {
                         desired *= CHARGE_SPEED_BOOST;
+                    }
+                    // A staggered man reels where the blow left him: no
+                    // steering, no closing, until the stun runs out. The
+                    // shove that staggered him still resolves through
+                    // separation — he is a body, not an actor.
+                    if sw_chunk[j] & crate::units::SWING_STAGGERED != 0 {
+                        desired = Vec2::ZERO;
                     }
 
                     let v = v_chunk[j].xz();
@@ -778,7 +809,13 @@ pub fn step_sim(
                     } else {
                         0.25 // velocity facing ignores micro-drift
                     };
-                    if !dying && face_dir.length_squared() > min_len2 {
+                    // A staggered man cannot even turn — the stun freezes
+                    // his facing, so a charge's second blow finds the same
+                    // back the first one hit.
+                    if !dying
+                        && sw_chunk[j] & crate::units::SWING_STAGGERED == 0
+                        && face_dir.length_squared() > min_len2
+                    {
                         let target_yaw = face_dir.x.atan2(face_dir.y);
                         let diff = (target_yaw - yaw_chunk[j] + std::f32::consts::PI)
                             .rem_euclid(std::f32::consts::TAU)
@@ -855,7 +892,10 @@ pub fn step_sim(
                         2 => SPEARWALL_ATK_PTS,
                         _ => 0.0,
                     };
-                if ev.charge && v_wall != 2 {
+                // A braced spearwall nullifies charge momentum with its
+                // points — which face FORWARD; a wall charged in the
+                // flank or rear is bodies like any others.
+                if ev.charge && !(v_wall == 2 && front) {
                     attack += pa.charge_bonus;
                 }
                 let skill = if rear { 0.0 } else { pv.defence_skill };
@@ -879,6 +919,48 @@ pub fn step_sim(
                     // kills[] counts losses OF that team (overlay semantics).
                     cstats.kills[team[v] as usize] += 1;
                     groups.list[group[v] as usize].recent_deaths += 1;
+                }
+                // Charge impact (phase B): momentum becomes a shove and a
+                // stun. Walls barely budge and never stagger; a braced
+                // SPEARWALL additionally reflects the charge bonus onto
+                // the charger (points punish momentum) — the M2TW rule.
+                if ev.charge && !died {
+                    let m_a = pa.mass;
+                    let m_v = pv.mass;
+                    // Bracing counts where the men are braced: a wall hit
+                    // FRONTALLY barely budges and never staggers; from
+                    // the flank or rear it is bodies like any others.
+                    let braced = v_wall != 0 && front;
+                    let resist = if braced { WALL_KNOCKBACK_RESIST } else { 1.0 };
+                    let shove = -dir * CHARGE_KNOCKBACK * (m_a / (m_a + m_v)) * resist;
+                    let nx = (pos[v].x + shove.x).clamp(bounds_min.x, bounds_max.x);
+                    let nz = (pos[v].z + shove.y).clamp(bounds_min.y, bounds_max.y);
+                    pos[v] = Vec3::new(nx, terrain.height_at(nx, nz) + pv.half_height, nz);
+                    if !braced {
+                        if swing[v] & crate::units::SWING_STAGGER_IMMUNE != 0 {
+                            // The free pass earned by the last stagger is
+                            // spent absorbing this one.
+                            swing[v] &= !crate::units::SWING_STAGGER_IMMUNE;
+                        } else {
+                            swing[v] = crate::units::SWING_RECOVER
+                                | crate::units::SWING_STAGGERED;
+                            swing_t[v] = swing_t[v].max(STAGGER_TICKS);
+                        }
+                    }
+                }
+                if ev.charge && v_wall == 2 && front && hp[a] > 0.0 && death_t[a] == 0 {
+                    // Reflected charge: the bonus damage the charger
+                    // brought is dealt back to him instead (his base blow
+                    // above already landed without it — the wall nullifies
+                    // the momentum, the points collect it).
+                    let reflect = dmg * (FACTOR_MULT.powf(pa.charge_bonus) - 1.0);
+                    hp[a] -= reflect;
+                    flash[a] = FLASH_TICKS;
+                    if hp[a] <= 0.0 {
+                        death_t[a] = DEATH_TICKS;
+                        cstats.kills[team[a] as usize] += 1;
+                        groups.list[group[a] as usize].recent_deaths += 1;
+                    }
                 }
                 if dir_stats.enabled {
                     let vt = team[v] as usize;

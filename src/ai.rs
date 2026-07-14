@@ -47,6 +47,7 @@ fn scripts_active() -> bool {
             "FL_TEST_ROUT",
             "FL_TEST_FORM",
             "FL_TEST_DIR",
+            "FL_TEST_CHARGE",
         ]
             .iter()
             .any(|k| std::env::var(k).is_ok())

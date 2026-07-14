@@ -69,6 +69,14 @@ pub const SWING_STYLE_MASK: u8 = 0b11 << SWING_STYLE_SHIFT;
 /// Set when the swing was started at charging speed: bonus damage and a
 /// bigger lunge — momentum matters (cavalry-less charge bonus for now).
 pub const SWING_CHARGE: u8 = 4;
+/// Staggered by a charging blow (state is Recover): can't act, can't
+/// steer, can't even turn until `swing_t` runs out — the M2TW hit-stun.
+/// Set by the damage apply pass, cleared when Recover expires.
+pub const SWING_STAGGERED: u8 = 1 << 5;
+/// One free pass against the NEXT stagger (set when a stagger expires,
+/// consumed by the would-be stagger or wiped by the man's next swing):
+/// chain-charging cannot stunlock a man who never gets to act.
+pub const SWING_STAGGER_IMMUNE: u8 = 1 << 6;
 
 impl Units {
     pub fn len(&self) -> usize {

@@ -89,7 +89,11 @@ pub const TYPES: [UnitTypeParams; NUM_KINDS] = [
         windup_ticks: 12,
         cooldown_ticks: 48,
         speed: 6.0,
-        mass: 2.0,
+        // Masses sit on the vanilla EDU scale (militia 0.8 / spears 1.0 /
+        // sergeants 1.2 / dismounted knights 1.5) so future cavalry mounts
+        // (~3.5) slot in above; mass drives separation shove and charge
+        // knockback ratios.
+        mass: 1.5,
         morale_resist: 0.6,
         half_height: 0.55,
     },
@@ -107,7 +111,7 @@ pub const TYPES: [UnitTypeParams; NUM_KINDS] = [
         windup_ticks: 9,
         cooldown_ticks: 33,
         speed: 9.5,
-        mass: 1.0,
+        mass: 0.9,
         morale_resist: 1.0,
         half_height: 0.50,
     },
@@ -129,7 +133,7 @@ pub const TYPES: [UnitTypeParams; NUM_KINDS] = [
         windup_ticks: 10,
         cooldown_ticks: 38,
         speed: 8.5,
-        mass: 1.2,
+        mass: 1.0,
         morale_resist: 0.85,
         half_height: 0.50,
     },
