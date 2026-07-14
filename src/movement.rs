@@ -32,8 +32,16 @@ const CROWD_SLOW: f32 = 1.2;
 const CROWD_STOP: f32 = 2.5;
 const STEER_GAIN: f32 = 3.0;
 const MAX_ACCEL: f32 = 50.0;
-/// Facing turn rate (rad/s toward the movement direction).
+/// Facing turn smoothing (fraction/s of the remaining angle) — the
+/// settle behavior for SMALL corrections.
 const YAW_RATE: f32 = 10.0;
+/// Hard angular speed cap (rad/s). The smoothing above is exponential,
+/// so before this cap a 180° about-face finished in ~0.2 s — rear-
+/// attacked soldiers whipped around between two swings and rear
+/// attacks played out as frontal fights. A burdened man in ranks
+/// turns ~180° in about a second: pi rad/s. Small angles never hit
+/// the cap, so marching wheels and duel tracking feel unchanged.
+const TURN_SPEED_MAX: f32 = std::f32::consts::PI;
 /// Positional overlap resolution: fraction of pair overlap corrected per
 /// tick per unit, and the per-tick cap on total correction distance.
 /// UNDER-relaxed on purpose: resolving overlap over ~3-4 ticks reads as
@@ -531,24 +539,25 @@ pub fn step_sim(
                                 let chosen = if sticky { prev_target } else { best_idx };
                                 // No eyes in the back of his head: a man
                                 // only opens on a target in his forward
-                                // half-plane — UNLESS he was just struck
-                                // (the blow tells him where to turn, and
-                                // the wind-up facing spins him around).
+                                // half-plane. Being struck tells him where
+                                // to turn (the flash facing below), but it
+                                // does NOT let him swing backward over his
+                                // shoulder — he attacks once he has turned
+                                // far enough, at the human turn-speed cap.
                                 // Without this gate every rear-approached
                                 // victim counter-wound-up on proximity and
                                 // was face-on before the first blow landed;
                                 // the rear sector never fired in practice.
                                 let aware = chosen != u32::MAX && {
                                     let t = chosen as usize;
-                                    fl_chunk[j] > 0
-                                        || (t < pos_prev.len() && {
-                                            let to_t = pos_prev[t].xz() - p;
-                                            let fwd = Vec2::new(
-                                                yaw_chunk[j].sin(),
-                                                yaw_chunk[j].cos(),
-                                            );
-                                            fwd.dot(to_t) >= 0.0
-                                        })
+                                    t < pos_prev.len() && {
+                                        let to_t = pos_prev[t].xz() - p;
+                                        let fwd = Vec2::new(
+                                            yaw_chunk[j].sin(),
+                                            yaw_chunk[j].cos(),
+                                        );
+                                        fwd.dot(to_t) >= 0.0
+                                    }
                                 };
                                 if chosen != u32::MAX && !routed && aware {
                                     tgt_chunk[j] = chosen;
@@ -748,7 +757,8 @@ pub fn step_sim(
                         let diff = (target_yaw - yaw_chunk[j] + std::f32::consts::PI)
                             .rem_euclid(std::f32::consts::TAU)
                             - std::f32::consts::PI;
-                        yaw_chunk[j] += diff * (YAW_RATE * dt).min(1.0);
+                        let step = diff * (YAW_RATE * dt).min(1.0);
+                        yaw_chunk[j] += step.clamp(-TURN_SPEED_MAX * dt, TURN_SPEED_MAX * dt);
                     }
 
                     v_chunk[j] = Vec3::new(new_v.x, 0.0, new_v.y);
