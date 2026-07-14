@@ -129,14 +129,8 @@ pub struct GroupData {
     pub state: RegState,
     /// Deaths since the last morale tick (tallied by the damage apply pass).
     pub recent_deaths: u32,
-    /// Hits taken in the rear / flank sectors, tallied by the damage
-    /// apply pass and decayed by morale.rs (~1 s memory). Saturation-
-    /// normalized into the attacked-in-the-rear/flank morale drain —
-    /// M2TW's standing modifier. Frontal fighting can never feed it.
-    pub shock_rear: f32,
-    pub shock_flank: f32,
-    /// Log throttle for the rear-attack event line (morale.rs).
-    pub shock_cd: u16,
+    /// Log throttle for the enemies-at-the-back event line (morale.rs).
+    pub rear_log_cd: u16,
 }
 
 impl GroupData {
@@ -171,9 +165,7 @@ impl GroupData {
             morale: 100.0,
             state: RegState::Steady,
             recent_deaths: 0,
-            shock_rear: 0.0,
-            shock_flank: 0.0,
-            shock_cd: 0,
+            rear_log_cd: 0,
         }
     }
 }

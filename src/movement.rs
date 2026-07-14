@@ -844,18 +844,6 @@ pub fn step_sim(
                     cstats.kills[team[v] as usize] += 1;
                     groups.list[group[v] as usize].recent_deaths += 1;
                 }
-                // Rear/flank shock tally (morale.rs): a burst of blows
-                // into the rear or flank is a morale event over and above
-                // the casualties — M2TW's attacked-in-the-rear state. Not
-                // gated on the charge flag: the crowd brakes most chargers
-                // below charge speed at contact, and a wall of blades in
-                // your back is the shock whether or not they arrived at a
-                // sprint.
-                if rear {
-                    groups.list[group[v] as usize].shock_rear += 1.0;
-                } else if !front {
-                    groups.list[group[v] as usize].shock_flank += 1.0;
-                }
                 if dir_stats.enabled {
                     let vt = team[v] as usize;
                     let s = if front { 0 } else if !rear { 1 } else { 2 };
