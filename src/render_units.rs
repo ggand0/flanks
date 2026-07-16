@@ -543,8 +543,11 @@ fn sync_instance_data(
                     let stagger = if units.death_t[i] == 0
                         && sw & crate::units::SWING_STAGGERED != 0
                     {
+                        // Normalized by the STUMBLE length: an ordinary
+                        // stumble plays the full rock for its 0.5 s; a
+                        // charge impact or impalement holds it ~1 s.
                         (units.swing_t[i] as f32
-                            / crate::movement::STAGGER_TICKS as f32)
+                            / crate::movement::HIT_STAGGER_TICKS as f32)
                             .min(1.0)
                     } else {
                         0.0

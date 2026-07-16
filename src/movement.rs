@@ -115,7 +115,10 @@ pub const STAGGER_TICKS: u8 = 30;
 const STAGGER_P0: f32 = 0.65;
 const STAGGER_P_PER_FACTOR: f32 = 0.05;
 const STAGGER_P_MIN: f32 = 0.05;
-const HIT_STAGGER_TICKS: u8 = 15;
+/// Pub: the render normalizes the pose by the STUMBLE length, so a
+/// stumble plays the full-strength rock for 0.5 s and an impact holds
+/// it ~1 s — hierarchy by duration, not amplitude.
+pub const HIT_STAGGER_TICKS: u8 = 15;
 
 /// FL_DEBUG_STAGGER=1: every landed hit staggers its victim (animation
 /// debugging — normally the roll above decides).
