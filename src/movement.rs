@@ -360,13 +360,6 @@ pub fn step_sim(
     let bounds_min = terrain.min() + 4.0;
     let bounds_max = terrain.max() - 4.0;
 
-    // Read-only yaw snapshot (tick-start, like pos_prev) for cross-unit
-    // reads inside the parallel integrate — the live yaw column is split
-    // into &mut chunks there. The spear-line hazard reads the SPEARMAN's
-    // facing from the charger's side of the scan.
-    yaw_snapshot.clear();
-    yaw_snapshot.extend_from_slice(yaw);
-    let yaw_snap = &yaw_snapshot[..];
     // Spear-line hazard global gate: marching speed exceeds the charge
     // threshold, so without this every mover in a 200k battle would pay
     // the wider scan hunting for spearwalls that do not exist. Per team:
@@ -377,6 +370,16 @@ pub fn step_sim(
             .iter()
             .any(|g| g.team != t && g.count > 0 && crate::formation::wall_kind(g) == 2)
     });
+    // Read-only yaw snapshot (tick-start, like pos_prev) for cross-unit
+    // reads inside the parallel integrate — the live yaw column is split
+    // into &mut chunks there. The spear-line hazard reads the SPEARMAN's
+    // facing from the charger's side of the scan; no spearwalls anywhere,
+    // no copy.
+    yaw_snapshot.clear();
+    if faces_spearwall[0] || faces_spearwall[1] {
+        yaw_snapshot.extend_from_slice(yaw);
+    }
+    let yaw_snap = &yaw_snapshot[..];
 
     let combat_scale = scale.0;
     let n_chunks = pos.len().div_ceil(CHUNK);
@@ -1177,6 +1180,26 @@ pub fn step_sim(
         };
         stats.move_avg = (sum_disp / pos_prev.len().max(1) as f64) as f32;
         stats.audit_ms = audit_t0.elapsed().as_secs_f32() * 1000.0;
+    }
+
+    // Spike attribution: name any tick that blows past the norm, with
+    // component costs inline — lag hunting works on facts, and the
+    // audit above runs every 60 ticks inside this same system, so an
+    // audit-tick spike shows its fresh cost here.
+    let audit_now = (*tick).is_multiple_of(60);
+    if stats.step_ms + stats.grid_ms + if audit_now { stats.audit_ms } else { 0.0 } > 14.0 {
+        info!(
+            "[spike] step {:.1} + grid {:.1}{} ms ({} damage events, {} units)",
+            stats.step_ms,
+            stats.grid_ms,
+            if audit_now {
+                format!(" + AUDIT {:.1}", stats.audit_ms)
+            } else {
+                String::new()
+            },
+            stats.events,
+            pos.len(),
+        );
     }
 }
 
