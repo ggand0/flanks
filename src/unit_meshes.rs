@@ -22,6 +22,11 @@ const PART_BODY: f32 = 0.0;
 const PART_ARM: f32 = 1.0; // sword arm + sword: attack swing
 const PART_LEG_L: f32 = 2.0;
 const PART_LEG_R: f32 = 3.0;
+/// Spear arm: shaft modeled VERTICAL; the shader levels it at the enemy
+/// (battle stance / spearwall) and thrusts it on the stab.
+const PART_SPEAR_ARM: f32 = 4.0;
+/// Shield arm + shield: static normally, raised/fronted in shieldwall.
+const PART_SHIELD: f32 = 5.0;
 
 /// Part palette: rgb = material color, a = team-color blend amount.
 /// Team color must stay DOMINANT (Thronefall rule): steel is darker than
@@ -33,6 +38,8 @@ const DARK_STEEL: [f32; 4] = [0.36, 0.38, 0.45, 0.20];
 const BLADE: [f32; 4] = [0.88, 0.91, 0.97, 0.0];
 const WOOD: [f32; 4] = [0.44, 0.30, 0.18, 0.0];
 const PANTS: [f32; 4] = [0.50, 0.46, 0.42, 0.30];
+/// Chainmail: duller than plate, a little team dye in the rings.
+const CHAIN: [f32; 4] = [0.46, 0.48, 0.53, 0.22];
 
 struct MeshBuf {
     pos: Vec<[f32; 3]>,
@@ -216,15 +223,15 @@ pub fn build_knight() -> Mesh {
     m.cuboid(
         Vec3::new(-0.29, 0.05, 0.03),
         Vec3::new(0.06, 0.06, 0.09),
-        PART_BODY,
-        0.0,
+        PART_SHIELD,
+        shoulder,
         STEEL,
     );
     m.cuboid(
         Vec3::new(-0.345, -0.02, 0.09),
         Vec3::new(0.03, 0.26, 0.17),
-        PART_BODY,
-        0.0,
+        PART_SHIELD,
+        shoulder,
         TEAM,
     );
     // sword arm: tabard-sleeved shoulder + steel vambrace, then the sword
@@ -309,15 +316,15 @@ pub fn build_man_at_arms() -> Mesh {
     m.cuboid(
         Vec3::new(-0.225, 0.04, 0.03),
         Vec3::new(0.05, 0.05, 0.08),
-        PART_BODY,
-        0.0,
+        PART_SHIELD,
+        shoulder,
         TEAM,
     );
     m.cuboid(
         Vec3::new(-0.265, 0.04, 0.10),
         Vec3::new(0.022, 0.11, 0.11),
-        PART_BODY,
-        0.0,
+        PART_SHIELD,
+        shoulder,
         WOOD,
     );
     // cloth sword arm + shorter sword
@@ -336,5 +343,143 @@ pub fn build_man_at_arms() -> Mesh {
         SKIN,
     );
     m.sword(Vec3::new(0.22, shoulder - 0.02, 0.235), 0.30, 1.0, shoulder);
+    build(m)
+}
+
+/// Spear infantry: chainmail hauberk under a team surcoat, bare face in a
+/// wide-brim steel kettle hat over a mail coif, round team shield, and a
+/// tall spear carried VERTICAL (the shader levels it at the enemy and
+/// thrusts it on the stab). 17 cuboids, 204 tris. Height 1.0 m
+/// (half_height 0.50).
+pub fn build_spearman() -> Mesh {
+    let mut m = MeshBuf::new();
+    let hip_pivot = -0.16;
+    let shoulder = 0.14;
+    // cloth legs
+    m.cuboid(
+        Vec3::new(-0.09, -0.345, 0.0),
+        Vec3::new(0.068, 0.155, 0.082),
+        PART_LEG_L,
+        hip_pivot,
+        PANTS,
+    );
+    m.cuboid(
+        Vec3::new(0.09, -0.345, 0.0),
+        Vec3::new(0.068, 0.155, 0.082),
+        PART_LEG_R,
+        hip_pivot,
+        PANTS,
+    );
+    // chainmail hauberk hem -> team surcoat chest
+    m.cuboid(
+        Vec3::new(0.0, -0.08, 0.0),
+        Vec3::new(0.15, 0.10, 0.10),
+        PART_BODY,
+        0.0,
+        CHAIN,
+    );
+    m.cuboid(
+        Vec3::new(0.0, 0.09, 0.0),
+        Vec3::new(0.18, 0.10, 0.115),
+        PART_BODY,
+        0.0,
+        TEAM,
+    );
+    // mail coif collar + bare face
+    m.cuboid(
+        Vec3::new(0.0, 0.215, 0.0),
+        Vec3::new(0.115, 0.03, 0.115),
+        PART_BODY,
+        0.0,
+        CHAIN,
+    );
+    m.cuboid(
+        Vec3::new(0.0, 0.30, 0.0),
+        Vec3::new(0.095, 0.095, 0.095),
+        PART_BODY,
+        0.0,
+        SKIN,
+    );
+    // kettle hat: wide brim + shallow crown
+    m.cuboid(
+        Vec3::new(0.0, 0.395, 0.0),
+        Vec3::new(0.165, 0.02, 0.165),
+        PART_BODY,
+        0.0,
+        STEEL,
+    );
+    m.cuboid(
+        Vec3::new(0.0, 0.44, 0.0),
+        Vec3::new(0.085, 0.028, 0.085),
+        PART_BODY,
+        0.0,
+        STEEL,
+    );
+    // shield arm (mail sleeve) + round team shield with a steel boss
+    m.cuboid(
+        Vec3::new(-0.225, 0.04, 0.03),
+        Vec3::new(0.05, 0.05, 0.08),
+        PART_SHIELD,
+        shoulder,
+        CHAIN,
+    );
+    m.cuboid(
+        Vec3::new(-0.27, 0.04, 0.09),
+        Vec3::new(0.022, 0.13, 0.13),
+        PART_SHIELD,
+        shoulder,
+        TEAM,
+    );
+    m.cuboid(
+        Vec3::new(-0.295, 0.04, 0.09),
+        Vec3::new(0.012, 0.05, 0.05),
+        PART_SHIELD,
+        shoulder,
+        STEEL,
+    );
+    // spear arm: mail shoulder + bare hand gripping the shaft
+    m.cuboid(
+        Vec3::new(0.22, shoulder - 0.02, 0.045),
+        Vec3::new(0.055, 0.055, 0.085),
+        PART_SPEAR_ARM,
+        shoulder,
+        CHAIN,
+    );
+    m.cuboid(
+        Vec3::new(0.24, shoulder - 0.02, 0.10),
+        Vec3::new(0.042, 0.042, 0.05),
+        PART_SPEAR_ARM,
+        shoulder,
+        SKIN,
+    );
+    // the spear, upright: long ash shaft, leaf blade, butt ferrule
+    m.cuboid(
+        Vec3::new(0.24, 0.40, 0.10),
+        Vec3::new(0.024, 0.75, 0.024),
+        PART_SPEAR_ARM,
+        shoulder,
+        WOOD,
+    );
+    m.cuboid(
+        Vec3::new(0.24, 1.24, 0.10),
+        Vec3::new(0.034, 0.09, 0.014),
+        PART_SPEAR_ARM,
+        shoulder,
+        BLADE,
+    );
+    m.cuboid(
+        Vec3::new(0.24, 1.335, 0.10),
+        Vec3::new(0.016, 0.035, 0.010),
+        PART_SPEAR_ARM,
+        shoulder,
+        BLADE,
+    );
+    m.cuboid(
+        Vec3::new(0.24, -0.33, 0.10),
+        Vec3::new(0.028, 0.028, 0.028),
+        PART_SPEAR_ARM,
+        shoulder,
+        DARK_STEEL,
+    );
     build(m)
 }

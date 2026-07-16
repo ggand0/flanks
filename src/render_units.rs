@@ -65,6 +65,11 @@ pub struct InstanceData {
     /// x = yaw, y = move amount 0..1 (walk bob/lean),
     /// z = lunge 0..1 (attack), w = fx: [0,1) hit flash, [1,2] death.
     pub anim: [f32; 4],
+    /// Regiment-level pose signals, smoothed per unit CPU-side:
+    /// x = march-in-step 0..1 (walk phase blends to the regiment phase),
+    /// y = wall 0..1 (shieldwall shield-front / spearwall leveled spears),
+    /// z = the regiment's shared walk phase offset, w = spare.
+    pub anim2: [f32; 4],
 }
 
 #[derive(Component, Deref, DerefMut, Default)]
@@ -217,6 +222,7 @@ fn setup_unit_mesh(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
     let kind_meshes = [
         crate::unit_meshes::build_knight(),
         crate::unit_meshes::build_man_at_arms(),
+        crate::unit_meshes::build_spearman(),
     ];
     for (bucket, mesh) in kind_meshes.into_iter().enumerate() {
         let handle = meshes.add(mesh);
@@ -270,6 +276,8 @@ fn sync_instance_data(
     mut scratch: Local<Vec<[Vec<InstanceData>; NUM_BUCKETS]>>,
     mut walk_ema: Local<Vec<f32>>,
     mut band_ema: Local<Vec<f32>>,
+    mut march_ema: Local<Vec<f32>>,
+    mut wall_ema: Local<Vec<f32>>,
 ) {
     let _span = info_span!("sync_instances").entered();
     let t0 = std::time::Instant::now();
@@ -336,6 +344,41 @@ fn sync_instance_data(
         })
         .collect();
     let celebrating = &celebrating[..];
+    // March-in-step: a formed Rect regiment moving under orders walks on a
+    // SHARED phase (soldiers in step). Contact, the charge sprint, and
+    // routs break step; the per-unit EMA below blends in/out smoothly.
+    let marching: Vec<f32> = groups
+        .list
+        .iter()
+        .map(|g| {
+            let formed = g.shape == crate::formation::FormShape::Rect
+                && g.order.is_some()
+                && !g.engaged
+                && !g.charging
+                && !g.state.is_broken();
+            if formed { 1.0 } else { 0.0 }
+        })
+        .collect();
+    let marching = &marching[..];
+    // Wall stance (shieldwall / spearwall by kind — the bucket knows).
+    let walled: Vec<f32> = groups
+        .list
+        .iter()
+        .map(|g| {
+            if g.spacing == crate::formation::FormSpacing::Wall && !g.state.is_broken() {
+                1.0
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    let walled = &walled[..];
+    // Per-regiment walk-phase offset so two marching regiments aren't in
+    // step with EACH OTHER.
+    let reg_phase: Vec<f32> = (0..groups.list.len())
+        .map(|g| crate::units::hash01(g as u32 ^ 0x51ED_BEEF) * std::f32::consts::TAU)
+        .collect();
+    let reg_phase = &reg_phase[..];
 
     // Parallel cull + bucket build into per-chunk scratch, then one memcpy
     // concat per bucket. The scratch vecs keep their allocations across
@@ -355,14 +398,21 @@ fn sync_instance_data(
     // is invisible.
     walk_ema.resize(units.len(), 0.0);
     band_ema.resize(units.len(), 0.0);
+    march_ema.resize(units.len(), 0.0);
+    wall_ema.resize(units.len(), 0.0);
     let ema_k = (time.delta_secs() / 0.25).min(1.0);
     // Stance tiers are per-regiment and snap; the POSE blends (~0.35 s).
     let band_k = (time.delta_secs() / 0.35).min(1.0);
+    // Step/wall signals blend a touch slower (falling into step is a
+    // deliberate act, not a snap).
+    let march_k = (time.delta_secs() / 0.5).min(1.0);
     bevy::tasks::ComputeTaskPool::get().scope(|scope| {
-        for (ci, ((chunk_scratch, ema_chunk), band_chunk)) in scratch
+        for (ci, ((((chunk_scratch, ema_chunk), band_chunk), march_chunk), wall_chunk)) in scratch
             .iter_mut()
             .zip(walk_ema.chunks_mut(SYNC_CHUNK))
             .zip(band_ema.chunks_mut(SYNC_CHUNK))
+            .zip(march_ema.chunks_mut(SYNC_CHUNK))
+            .zip(wall_ema.chunks_mut(SYNC_CHUNK))
             .enumerate()
             .take(n_chunks)
         {
@@ -385,6 +435,11 @@ fn sync_instance_data(
                     let tier = stance.get(units.group[i] as usize).copied().unwrap_or(0.0);
                     let band = &mut band_chunk[i - start];
                     *band += (tier - *band) * band_k;
+                    let gi = units.group[i] as usize;
+                    let march = &mut march_chunk[i - start];
+                    *march += (marching.get(gi).copied().unwrap_or(0.0) - *march) * march_k;
+                    let wall = &mut wall_chunk[i - start];
+                    *wall += (walled.get(gi).copied().unwrap_or(0.0) - *wall) * march_k;
 
                     let position = units.pos_prev[i].lerp(units.pos[i], alpha);
                     let sphere = Sphere {
@@ -483,11 +538,31 @@ fn sync_instance_data(
                     } else {
                         units.flash[i] as f32 * 0.25
                     };
+                    // Stagger progress (1 at the blow, 0 recovered): the
+                    // rocked-back pose. Death pose owns dying men.
+                    let stagger = if units.death_t[i] == 0
+                        && sw & crate::units::SWING_STAGGERED != 0
+                    {
+                        // Normalized by the STUMBLE length: an ordinary
+                        // stumble plays the full rock for its 0.5 s; a
+                        // charge impact or impalement holds it ~1 s.
+                        (units.swing_t[i] as f32
+                            / crate::movement::HIT_STAGGER_TICKS as f32)
+                            .min(1.0)
+                    } else {
+                        0.0
+                    };
                     chunk_scratch[bucket_of(units, i)].push(InstanceData {
                         position,
                         scale: 1.0,
                         color,
                         anim: [yaw, move_amount, lunge, fx],
+                        anim2: [
+                            march_chunk[i - start],
+                            wall_chunk[i - start],
+                            reg_phase.get(gi).copied().unwrap_or(0.0),
+                            stagger,
+                        ],
                     });
                 }
             });
@@ -673,6 +748,11 @@ impl SpecializedMeshPipeline for CustomPipeline {
                     format: VertexFormat::Float32x4,
                     offset: VertexFormat::Float32x4.size() * 2,
                     shader_location: 10,
+                },
+                VertexAttribute {
+                    format: VertexFormat::Float32x4,
+                    offset: VertexFormat::Float32x4.size() * 3,
+                    shader_location: 11,
                 },
             ],
         });

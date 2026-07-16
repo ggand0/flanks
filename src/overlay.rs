@@ -104,10 +104,10 @@ fn update_inspect_panel(
     };
     *vis = Visibility::Visible;
 
-    let kind = if gd.kind == crate::unit_types::KIND_HEAVY {
-        "Heavy Knights"
-    } else {
-        "Men-at-Arms"
+    let kind = match gd.kind {
+        crate::unit_types::KIND_HEAVY => "Heavy Knights",
+        crate::unit_types::KIND_SPEAR => "Spearmen",
+        _ => "Men-at-Arms",
     };
     let team = if gd.team == 0 { "blue" } else { "orange" };
     let state = match gd.state {
@@ -117,8 +117,20 @@ fn update_inspect_panel(
         RegState::Routing { .. } => "ROUTING",
         RegState::Shattered => "SHATTERED",
     };
+    // Formation line: shape/files, spacing mode, engagement stance.
+    let formation = match gd.shape {
+        crate::formation::FormShape::Blob => "mob".to_string(),
+        crate::formation::FormShape::Rect => format!("{} files", gd.files),
+    };
+    let mode = match crate::formation::wall_kind(gd) {
+        1 => "  SHIELDWALL",
+        2 => "  SPEARWALL",
+        _ if gd.spacing == crate::formation::FormSpacing::Loose => "  loose order",
+        _ => "",
+    };
+    let stance = if gd.hold { "  HOLD POSITION" } else { "" };
     let mut s = format!(
-        "{kind} {g} ({team})\n{}/{} men    morale {:>3.0}    {state}\n",
+        "{kind} {g} ({team})\n{}/{} men    morale {:>3.0}    {state}\n{formation}{mode}{stance}\n",
         gd.count,
         gd.initial_count,
         gd.morale.clamp(0.0, 100.0),
@@ -126,12 +138,14 @@ fn update_inspect_panel(
     if matches!(gd.state, RegState::Steady) {
         let f = readout.0.get(g).copied().unwrap_or_default();
         s += &format!(
-            "casualties      -{:.1}/s\nflanked {:>3.0}%    -{:.1}/s\noutnumbered     -{:.1}/s\nrout nearby     -{:.1}/s\nallies x{}   psych x{:.2}   depletion x{:.2}",
+            "casualties      -{:.1}/s\nflanked {:>3.0}%    -{:.1}/s\noutnumbered     -{:.1}/s\nrout nearby     -{:.1}/s\ndisorder {:>4.1}m  -{:.1}/s\nallies x{}   psych x{:.2}   depletion x{:.2}",
             f.casualties,
             f.flanked01 * 100.0,
             f.flanked,
             f.outnumbered,
             f.contagion,
+            gd.disorder,
+            f.disorder,
             f.friends,
             f.psych_mult,
             f.depletion,
