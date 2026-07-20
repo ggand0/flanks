@@ -93,9 +93,10 @@ impl Terrain {
         (dx * dx + dz * dz).sqrt()
     }
 
-    /// Impassable ground (nearest-vertex mask lookup). The bridge deck
-    /// rectangle is exempt: walkable even though the mask keeps the
-    /// channel under it blocked.
+    /// Impassable ground (nearest-vertex mask lookup). Steep ground
+    /// only — the river is wadeable and never in the mask. The bridge
+    /// deck rectangle is exempt so the deck stays walkable even if a
+    /// mask rule ever covers the channel again.
     #[inline]
     pub fn blocked_at(&self, x: f32, z: f32) -> bool {
         if bridge_deck_contains(x, z) {
