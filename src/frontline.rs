@@ -252,13 +252,14 @@ fn update_field(
 
 /// Refresh group centroids, contact flags, and charge state (bookkeeping
 /// only — nothing here steers units).
-/// FL_RECTFIGHT: an attack order's fight is REAL — and its path freezes —
-/// once this many of the regiment's soldiers are inside a swing cycle
-/// against the ORDERED target's men. The engine's own gate is a count
-/// ("enough enemy soldiers in the proximity zone", per-enemy
-/// engagedSoldiers records); the value separates an overflow trickle
-/// (2-3 in-cycle) from a genuine frontage (20+ in-cycle at ~34 files).
-const ENGAGE_LOCK_MIN: u32 = 10;
+/// FL_RECTFIGHT: fraction of living strength that must be in a swing
+/// cycle against the ordered target for the path to freeze. The
+/// engine tracks both engagedSoldiers count and engagedRatio per
+/// enemy unit; a percentage scales to remnants (10 absolute was a
+/// third of a 30-man remnant but 1% of a full regiment). Floor of 4
+/// so a 2-man trickle against a 50-man remnant never locks.
+const ENGAGE_LOCK_FRAC: f32 = 0.03;
+const ENGAGE_LOCK_FLOOR: u32 = 4;
 /// Squared range for counting a soldier as fighting his ordered target.
 const ENGAGE_RANGE_SQ: f32 = 4.0 * 4.0;
 
@@ -383,7 +384,8 @@ fn update_groups(units: Res<Units>, mut groups: ResMut<Groups>) {
         let engaged = group.engage_hold > 0;
         // Engagement WITH the ordered target (FL_RECTFIGHT): the count
         // gate above, bridged across swing-cycle gaps like `engaged`.
-        if fight_vs[g] >= ENGAGE_LOCK_MIN {
+        let lock_threshold = ((group.count as f32 * ENGAGE_LOCK_FRAC) as u32).max(ENGAGE_LOCK_FLOOR);
+        if fight_vs[g] >= lock_threshold {
             group.engage_target_hold = ENGAGE_HOLD_TICKS;
         } else {
             group.engage_target_hold = group.engage_target_hold.saturating_sub(1);
