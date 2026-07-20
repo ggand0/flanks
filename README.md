@@ -20,10 +20,13 @@ Engine:
   separation, crowd jam yield, positional overlap resolution.
 - Deformable heightmap terrain with chunked remeshing, plus a density
   field that draws the live front line as a contour.
-- Map art: a meandering fordable river carved into the heightfield
-  (animated faceted water shader, foam banks, gorge where it exits the
-  mountains), terraced plateau highlands, wheat-field patches, and
-  chunk-merged low-poly forests. All visual-only.
+- Map art: a meandering river carved into the heightfield (animated
+  faceted water shader, foam banks, a gorge where it exits the
+  mountains). The river is wadeable everywhere at reduced speed; a
+  stone bridge gives a dry full-speed crossing. Highlands above ~15 m
+  are terraced into angled plateau steps whose risers are impassable
+  (M2TW-style mountain framing). Wheat-field patches and chunk-merged
+  low-poly forests fill the outskirts.
 
 Game:
 

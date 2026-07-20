@@ -418,14 +418,6 @@ pub fn step_sim(
                     }
                 }
             }
-            // River routing (M2TW): the channel is impassable away from
-            // the ford and the bridge, so a cross-river order marches to
-            // the nearer crossing first. Stateless — recomputed from the
-            // live anchor each tick, so reaching the far bank re-aims at
-            // the real target on its own.
-            if !gd.state.is_broken() {
-                goal = goal.map(|gpos| terrain.route_via_crossing(gd.anchor, gpos));
-            }
             goal
         })
         .collect();
@@ -562,7 +554,11 @@ pub fn step_sim(
                             * 0.7;
                         let dir = Vec2::new(lat, flee_z).normalize_or_zero();
                         let slope = terrain.slope_at(p.x, p.y);
-                        desired = dir * speed[i] * ROUT_FLEE_FRAC / (1.0 + 3.0 * slope * slope);
+                        desired = dir
+                            * speed[i]
+                            * ROUT_FLEE_FRAC
+                            * terrain.wade_mult(p.x, p.y)
+                            / (1.0 + 3.0 * slope * slope);
                     } else if !dying {
                         let holding = orders[gi].is_none();
                         let goal = orders[gi].unwrap_or(anchors[gi]) + home[i];
@@ -576,6 +572,8 @@ pub fn step_sim(
                         // — with 1.5 the ranks never finished dressing.
                         if !(holding && dist < 0.7) {
                             // Slope penalty: steep ground is slow ground.
+                            // Wading the river is slow too (the bridge
+                            // deck is dry: full speed).
                             let slope = terrain.slope_at(p.x, p.y);
                             let slope_mult = 1.0 / (1.0 + 3.0 * slope * slope);
                             let (gain, arrive) = if holding {
@@ -583,8 +581,11 @@ pub fn step_sim(
                             } else {
                                 (1.0, ARRIVE_RADIUS)
                             };
-                            let desired_speed =
-                                speed[i] * slope_mult * gain * (dist / arrive).min(1.0);
+                            let desired_speed = speed[i]
+                                * slope_mult
+                                * terrain.wade_mult(p.x, p.y)
+                                * gain
+                                * (dist / arrive).min(1.0);
                             if dist > 1e-3 {
                                 desired = to_goal * (desired_speed / dist);
                             }

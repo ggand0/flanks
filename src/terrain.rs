@@ -97,29 +97,17 @@ impl Terrain {
         self.blocked[gz * VERTS_X + gx]
     }
 
-    /// River-aware march goal: if the straight line from→to crosses the
-    /// channel away from a crossing, march to the nearer crossing first
-    /// (single river ⇒ a single waypoint suffices). Recomputed per tick
-    /// by the movement pass, so crossing to the far side flips the side
-    /// test and the goal reverts to the real target.
-    pub fn route_via_crossing(&self, from: Vec2, to: Vec2) -> Vec2 {
-        let sd = |p: Vec2| p.x - river_center_x(p.y);
-        let (sf, st) = (sd(from), sd(to));
-        if sf * st >= 0.0 {
-            return to; // same bank (or on the centerline)
+    /// Wading slow multiplier: WADE_SLOW inside the channel, 1.0 on
+    /// land — and on the bridge deck, which stays dry. Applied next to
+    /// the slope penalty in the movement pass.
+    #[inline]
+    pub fn wade_mult(&self, x: f32, z: f32) -> f32 {
+        let d = (x - river_center_x(z)).abs();
+        if d < river_half_width(z) && !bridge_deck_contains(x, z) {
+            WADE_SLOW
+        } else {
+            1.0
         }
-        // Already at a crossing: standing in its span near the water —
-        // go straight (the ford/deck carries the rest of the way).
-        let in_span = (from.y - FORD_Z).abs() < FORD_HALF_SPAN
-            || (from.y - BRIDGE_Z).abs() < BRIDGE_HALF_SPAN;
-        if in_span && sf.abs() < river_half_width(from.y) * 1.2 {
-            return to;
-        }
-        let ford = Vec2::new(river_center_x(FORD_Z), FORD_Z);
-        let bridge = Vec2::new(river_center_x(BRIDGE_Z), BRIDGE_Z);
-        let detour_ford = from.distance(ford) + ford.distance(to);
-        let detour_bridge = from.distance(bridge) + bridge.distance(to);
-        if detour_ford < detour_bridge { ford } else { bridge }
     }
 
     /// Carve a crater: smooth depression + small raised rim. Marks chunks dirty.
@@ -201,20 +189,10 @@ impl Terrain {
     }
 }
 
-/// Same side of the river centerline? Target selection uses this to
-/// prefer local fights instead of funneling the army into crossings.
-pub fn same_river_side(a: Vec2, b: Vec2) -> bool {
-    let sd = |p: Vec2| p.x - river_center_x(p.y);
-    sd(a) * sd(b) >= 0.0
-}
-
-/// Mask rule per vertex: river channel (minus crossings) or a face
-/// steeper than SLOPE_BLOCK against any 4-neighbor.
-fn vertex_blocked(heights: &[f32], origin: Vec2, x: usize, z: usize) -> bool {
-    let p = origin + Vec2::new(x as f32, z as f32) * CELL;
-    if river_blocks(p) {
-        return true;
-    }
+/// Mask rule per vertex: a face steeper than SLOPE_BLOCK against any
+/// 4-neighbor (terrace risers, gorge walls, crater lips). The river
+/// itself is wadeable and never blocks.
+fn vertex_blocked(heights: &[f32], _origin: Vec2, x: usize, z: usize) -> bool {
     let h = heights[z * VERTS_X + x];
     let mut max_d = 0.0f32;
     if x > 0 {
@@ -300,33 +278,32 @@ pub fn river_water_level(z: f32) -> f32 {
     0.5 + z * 0.008
 }
 
-/// Max bed depth below the water surface (channel center).
-pub const RIVER_DEPTH: f32 = 1.4;
+/// Max bed depth below the water surface (channel center): wading
+/// depth — the whole river is fordable, just slow (M2TW shallows).
+pub const RIVER_DEPTH: f32 = 0.6;
 /// Bank rise per unit t (t = distance / half-width) past the shoreline.
 pub(crate) const RIVER_BANK: f32 = 3.0;
 /// River-shaped corridor half-width in units of t (beyond: untouched).
 pub const RIVER_CORRIDOR: f32 = 2.3;
 
-// ---- Crossings ----------------------------------------------------------
-// The channel is impassable except at two spans (M2TW-style): a shallow
-// ford in the north half and a stone bridge in the south half.
+// ---- Bridge -------------------------------------------------------------
+// One stone bridge (south half): a solid deck over the channel. Not a
+// required crossing — the river is wadeable everywhere — but units on
+// the deck stay dry and keep full speed, so it emerges as the fast
+// route with zero pathfinding.
 
-/// z of the ford crossing (north half): bed rises to ankle depth.
-pub const FORD_Z: f32 = -110.0;
-/// z of the bridge crossing (south half): solid deck over the channel.
+/// z of the bridge crossing (south half).
 pub const BRIDGE_Z: f32 = 130.0;
-/// Half-length of the ford's traversable span along z.
-pub const FORD_HALF_SPAN: f32 = 14.0;
 /// Half-width of the bridge deck along z (the walkable band).
 pub const BRIDGE_HALF_SPAN: f32 = 6.0;
 /// Deck height above the local water level.
 pub const BRIDGE_DECK_LIFT: f32 = 1.5;
-/// Ford bed depth below the water (ankle-deep wade).
-const FORD_DEPTH: f32 = 0.35;
 
 /// Slope (rise per meter) at which ground becomes impassable: terrace
 /// risers, gorge walls, crater lips. Below this the slope penalty only.
 pub const SLOPE_BLOCK: f32 = 1.0;
+/// Speed multiplier while wading the channel.
+pub const WADE_SLOW: f32 = 0.55;
 
 /// The bridge deck rectangle (x across the channel, z along it).
 /// Units inside it walk at deck height and are never "in the water".
@@ -348,15 +325,6 @@ fn smoothstep(a: f32, b: f32, x: f32) -> f32 {
 /// Riverbed depth below the water at normalized distance t (0 at shore).
 pub fn river_bed_depth(t: f32) -> f32 {
     RIVER_DEPTH * (1.0 - t * t).max(0.0).powf(0.75)
-}
-
-/// Channel is impassable here (mask rule): inside the shoreline, not at
-/// the ford span. The bridge span stays blocked in the mask — its deck
-/// is exempted by `blocked_at`'s rectangle test instead, so men can
-/// neither wade under the bridge nor be shoved off its sides.
-fn river_blocks(p: Vec2) -> bool {
-    let d = (p.x - river_center_x(p.y)).abs();
-    d < river_half_width(p.y) * 0.95 && (p.y - FORD_Z).abs() >= FORD_HALF_SPAN
 }
 
 fn generate_terrain(mut commands: Commands) {
@@ -401,16 +369,7 @@ fn generate_terrain(mut commands: Commands) {
             if t < RIVER_CORRIDOR {
                 let wl = river_water_level(p.y);
                 let prof = if t <= 1.0 {
-                    // The ford's bed rises to ankle depth across its span.
-                    let ford_blend = smoothstep(
-                        FORD_HALF_SPAN,
-                        FORD_HALF_SPAN + 10.0,
-                        (p.y - FORD_Z).abs(),
-                    );
-                    let depth = river_bed_depth(t)
-                        * (FORD_DEPTH / RIVER_DEPTH
-                            + (1.0 - FORD_DEPTH / RIVER_DEPTH) * ford_blend);
-                    wl - depth
+                    wl - river_bed_depth(t)
                 } else {
                     wl + (t - 1.0) * RIVER_BANK
                 };
