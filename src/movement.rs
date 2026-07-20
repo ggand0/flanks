@@ -1142,10 +1142,10 @@ pub fn step_sim(
                         .clamp(bounds_min.x, bounds_max.x);
                     let mut nz = (pos_prev[i].z + new_v.y * dt + corr.y)
                         .clamp(bounds_min.y, bounds_max.y);
-                    // Impassable ground (river channel, terrace risers):
-                    // wall-slide — keep the axis that stays on walkable
-                    // ground, drop the one that doesn't. Crowds funnel
-                    // through the crossings instead of stopping dead.
+                    // Impassable ground (terrace risers, gorge walls,
+                    // crater lips): wall-slide — keep the axis that
+                    // stays on walkable ground, drop the one that
+                    // doesn't, so crowds flow along the obstacle.
                     if terrain.blocked_at(nx, nz) {
                         let (px, pz) = (pos_prev[i].x, pos_prev[i].z);
                         if !terrain.blocked_at(nx, pz) {

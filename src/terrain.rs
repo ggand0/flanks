@@ -18,12 +18,12 @@ pub const CHUNKS_Z: usize = 12;
 const VERTS_X: usize = CHUNKS_X * CHUNK_CELLS + 1;
 const VERTS_Z: usize = CHUNKS_Z * CHUNK_CELLS + 1;
 
-/// FL_MAP=old: the pre-map-art generation (main branch) — no river,
-/// no terraces, no ground variety, no vegetation/water, nothing
-/// blocked. Anything else (default): the current map.
+/// FL_MAP=river: the map-art generation (river, terraces, ground
+/// variety, vegetation, water, bridge, steep-ground blocking).
+/// Anything else (default): the classic pre-map-art map.
 pub fn map_is_classic() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("FL_MAP").is_ok_and(|v| v == "old"))
+    *ON.get_or_init(|| !std::env::var("FL_MAP").is_ok_and(|v| v == "river"))
 }
 
 #[derive(Resource)]
@@ -159,7 +159,7 @@ impl Terrain {
             for z in bz0..=bz1 {
                 for x in bx0..=bx1 {
                     self.blocked[z * VERTS_X + x] =
-                        vertex_blocked(&self.heights, self.origin, x, z);
+                        vertex_blocked(&self.heights, x, z);
                 }
             }
         }
@@ -209,7 +209,7 @@ impl Terrain {
 /// Mask rule per vertex: a face steeper than SLOPE_BLOCK against any
 /// 4-neighbor (terrace risers, gorge walls, crater lips). The river
 /// itself is wadeable and never blocks.
-fn vertex_blocked(heights: &[f32], _origin: Vec2, x: usize, z: usize) -> bool {
+fn vertex_blocked(heights: &[f32], x: usize, z: usize) -> bool {
     let h = heights[z * VERTS_X + x];
     let mut max_d = 0.0f32;
     if x > 0 {
@@ -322,16 +322,17 @@ pub const SLOPE_BLOCK: f32 = 1.0;
 /// Speed multiplier while wading the channel.
 pub const WADE_SLOW: f32 = 0.55;
 
+/// Deck half-length across the channel: it lands where the carved
+/// bank profile reaches deck height (wl + (t−1)·BANK = wl + LIFT).
+pub fn bridge_deck_half_len(z: f32) -> f32 {
+    (1.0 + BRIDGE_DECK_LIFT / RIVER_BANK) * river_half_width(z)
+}
+
 /// The bridge deck rectangle (x across the channel, z along it).
 /// Units inside it walk at deck height and are never "in the water".
 pub fn bridge_deck_contains(x: f32, z: f32) -> bool {
-    if (z - BRIDGE_Z).abs() >= BRIDGE_HALF_SPAN {
-        return false;
-    }
-    // Deck lands where the carved bank profile reaches deck height:
-    // wl + (t-1)*BANK = wl + LIFT -> t = 1 + LIFT/BANK.
-    let t_deck = 1.0 + BRIDGE_DECK_LIFT / RIVER_BANK;
-    (x - river_center_x(z)).abs() < t_deck * river_half_width(z)
+    (z - BRIDGE_Z).abs() < BRIDGE_HALF_SPAN
+        && (x - river_center_x(z)).abs() < bridge_deck_half_len(z)
 }
 
 fn smoothstep(a: f32, b: f32, x: f32) -> f32 {
@@ -403,7 +404,7 @@ fn generate_terrain(mut commands: Commands) {
     if !classic {
         for z in 0..VERTS_Z {
             for x in 0..VERTS_X {
-                blocked[z * VERTS_X + x] = vertex_blocked(&heights, origin, x, z);
+                blocked[z * VERTS_X + x] = vertex_blocked(&heights, x, z);
             }
         }
     }
@@ -414,8 +415,8 @@ fn generate_terrain(mut commands: Commands) {
         origin,
         dirty: vec![false; CHUNKS_X * CHUNKS_Z],
     });
-    if classic {
-        info!("FL_MAP=old: classic terrain (no river/terraces/vegetation)");
+    if !classic {
+        info!("FL_MAP=river: map-art terrain (river, terraces, vegetation)");
     }
 }
 

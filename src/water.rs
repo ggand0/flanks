@@ -11,7 +11,7 @@ use bevy::render::render_resource::AsBindGroup;
 use bevy::shader::ShaderRef;
 
 use crate::terrain::{
-    self, BRIDGE_DECK_LIFT, BRIDGE_HALF_SPAN, BRIDGE_Z, RIVER_BANK, river_bed_depth,
+    self, BRIDGE_DECK_LIFT, BRIDGE_HALF_SPAN, BRIDGE_Z, bridge_deck_half_len, river_bed_depth,
     river_center_x, river_half_width, river_water_level,
 };
 use crate::vegetation::{Soup, srgb};
@@ -139,7 +139,7 @@ fn spawn_bridge(
     let wl = river_water_level(BRIDGE_Z);
     let deck_y = wl + BRIDGE_DECK_LIFT;
     // Matches bridge_deck_contains: the deck lands on the bank profile.
-    let deck_half = (1.0 + BRIDGE_DECK_LIFT / RIVER_BANK) * hw;
+    let deck_half = bridge_deck_half_len(BRIDGE_Z);
 
     let stone = srgb(0.52, 0.50, 0.46);
     let stone_light = srgb(0.58, 0.56, 0.52);

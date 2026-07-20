@@ -55,8 +55,9 @@ Verification is log-based: FL_TEST_* environment knobs run scripted
 acceptance scenarios (front line formation, order cohesion, encirclement,
 rout behavior) whose outcomes are checked from the log rather than by
 eye. FL_UNITS, FL_REG_SIZE, FL_COMBAT_SCALE, FL_AI and similar knobs
-configure sandbox battles. FL_MAP=old swaps back to the classic
-pre-map-art terrain (no river/terraces/vegetation); FL_VOLUME=0 mutes.
+configure sandbox battles. FL_MAP=river enables the map-art terrain
+(river/terraces/vegetation; classic map is the default); FL_VOLUME=0
+mutes.
 
 ## Build and run
 
