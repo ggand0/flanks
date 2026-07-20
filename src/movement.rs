@@ -14,17 +14,14 @@ use crate::unit_types::{BASE_DMG, FACTOR_CLAMP, FACTOR_MULT, TYPES};
 use crate::units::Units;
 
 const SEP_RADIUS: f32 = 1.4;
-/// FL_RECTFIGHT: rest distance for CROSS-TEAM pairs — body contact,
-/// just above the hard-body floor. Resting enemies at SEP_RADIUS was
-/// a force field no body could pass: 1.4 equals our formation pitch
-/// (gap-to-body ratio 1.0), so an enemy block had no gap a man could
-/// enter and at most one rank per side ever reached (measured:
-/// FL_DIAG_MELEE held r1+ at 0% in-reach across a 100 s fight). M2TW
-/// rests bodies at ~0.8 m inside a 1.2 m grid (radius 0.4, Feral-
-/// documented; ratio 1.5): enemies physically fit through the grid
-/// gaps, and the front ranks of both sides interleave into the brawl
-/// band. 0.95 against our 1.4 pitch gives ratio 1.47.
-const ENEMY_SEP_RADIUS: f32 = 0.95;
+/// FL_RECTFIGHT: rest distance for CROSS-TEAM pairs. Currently equal
+/// to SEP_RADIUS (same spacing as same-team). Lower values let enemy
+/// bodies enter the formation grid's gaps and produce a multi-rank
+/// fighting band; the owner tested 0.95–1.25 and found the visual
+/// clipping unacceptable with the current model scale, so it sits at
+/// parade spacing for now. Tuning target for when model proportions
+/// are revisited.
+const ENEMY_SEP_RADIUS: f32 = 1.4;
 const SEP_STRENGTH: f32 = 60.0;
 /// Base neighbor query radius: covers separation and sword reach. Kinds
 /// with longer reach (spears) widen their own scan per unit — the sword
