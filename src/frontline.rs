@@ -259,6 +259,8 @@ fn update_field(
 /// engagedSoldiers records); the value separates an overflow trickle
 /// (2-3 in-cycle) from a genuine frontage (20+ in-cycle at ~34 files).
 const ENGAGE_LOCK_MIN: u32 = 10;
+/// Squared range for counting a soldier as fighting his ordered target.
+const ENGAGE_RANGE_SQ: f32 = 4.0 * 4.0;
 
 fn update_groups(units: Res<Units>, mut groups: ResMut<Groups>) {
     let rf = crate::formation::rectfight();
@@ -310,7 +312,7 @@ fn update_groups(units: Res<Units>, mut groups: ResMut<Groups>) {
                         units.pos[ti].z - units.pos[i].z,
                     )
                     .length_squared()
-                        < 16.0
+                        < ENGAGE_RANGE_SQ
                 {
                     fight_vs[g] += 1;
                 }
@@ -408,7 +410,7 @@ fn update_groups(units: Res<Units>, mut groups: ResMut<Groups>) {
         // the regiment RE-FORMS where it is (the engine's discrete
         // reforming state): dress the square, then any surviving
         // order resumes.
-        if crate::formation::rectfight()
+        if rf
             && group.shape == crate::formation::FormShape::Rect
             && !group.state.is_broken()
         {

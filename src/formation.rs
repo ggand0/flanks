@@ -36,16 +36,13 @@ const CLOSE_RANKS_PERIOD: u32 = 90;
 const ENGAGED_CLOSE_RANKS_PERIOD: u32 = 240;
 
 /// FL_RECTFIGHT=1 (owner-gated): the M2TW melee model from the engine
-/// research (devlog 0036) — four mechanisms, all men-level or existing
-/// machinery. (1) FREEZE: an engaged attack order stops chasing the
-/// target centroid; the frame anchors where contact happened instead
-/// of dragging the slot grid through the enemy block. (2) PRESS:
-/// soldiers of a fighting regiment pack shoulder-to-shoulder toward
-/// the fight (META_PRESS pairs rest at the wall radius) — bodies stop
-/// them, not a density rule. (3) SLOT MEMORY: unchanged — men always
-/// keep their slots. (4) REFORM: when the fight ends the regiment
-/// re-dresses where it stands (a discrete event, like the engine's
-/// `reforming` state).
+/// research (devlog 0036). (1) FREEZE: the attack destination freezes
+/// once the ordered fight becomes real (count-gated); men walk into
+/// the enemy mass, bodies stop them. (2) PRESS: surplus ranks walk
+/// into the enemy at body contact — no density rule, no META_PRESS.
+/// (3) SLOT MEMORY: unchanged — men always keep their slots.
+/// (4) REFORM: when the fight ends the regiment re-dresses where it
+/// stands (a discrete event, like the engine's `reforming` state).
 pub fn rectfight() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("FL_RECTFIGHT").is_ok())

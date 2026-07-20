@@ -411,7 +411,7 @@ pub fn step_sim(
                     if let Some((s, u, r)) = hit {
                         let c = groups.list[u].centroid;
                         let mut side = (a + ab * s - c).normalize_or_zero();
-                        if side.length_squared() < 0.5 {
+                        if side == Vec2::ZERO {
                             // Path through the ally's center: pick a
                             // flank deterministically per regiment.
                             let d = ab / len2.sqrt();
