@@ -202,6 +202,9 @@ fn spawn_vegetation(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
+    if terrain.classic {
+        return;
+    }
     let material = materials.add(StandardMaterial {
         base_color: Color::WHITE,
         perceptual_roughness: 1.0,

@@ -18,14 +18,24 @@ pub const CHUNKS_Z: usize = 12;
 const VERTS_X: usize = CHUNKS_X * CHUNK_CELLS + 1;
 const VERTS_Z: usize = CHUNKS_Z * CHUNK_CELLS + 1;
 
+/// FL_MAP=old: the pre-map-art generation (main branch) — no river,
+/// no terraces, no ground variety, no vegetation/water, nothing
+/// blocked. Anything else (default): the current map.
+pub fn map_is_classic() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FL_MAP").is_ok_and(|v| v == "old"))
+}
+
 #[derive(Resource)]
 pub struct Terrain {
     /// Vertex heights, row-major [z][x].
     heights: Vec<f32>,
-    /// Impassable vertices (river channel, terrace risers, gorge walls),
-    /// same grid as `heights`. The bridge deck is exempted in
-    /// `blocked_at` by rectangle, not in this mask.
+    /// Impassable vertices (terrace risers, gorge walls, crater lips),
+    /// same grid as `heights`. All-false on the classic map.
     blocked: Vec<bool>,
+    /// True on the classic map: skips the river carve, terraces, ground
+    /// variety, and every river-dependent system (water, bridge, wade).
+    pub classic: bool,
     /// World-space min corner.
     pub origin: Vec2,
     dirty: Vec<bool>,
@@ -53,7 +63,7 @@ impl Terrain {
     /// overrides the carved channel so units walk ON the bridge.
     #[inline]
     pub fn height_at(&self, x: f32, z: f32) -> f32 {
-        if bridge_deck_contains(x, z) {
+        if !self.classic && bridge_deck_contains(x, z) {
             return river_water_level(z) + BRIDGE_DECK_LIFT;
         }
         let g = (Vec2::new(x, z) - self.origin) / CELL;
@@ -102,6 +112,9 @@ impl Terrain {
     /// the slope penalty in the movement pass.
     #[inline]
     pub fn wade_mult(&self, x: f32, z: f32) -> f32 {
+        if self.classic {
+            return 1.0;
+        }
         let d = (x - river_center_x(z)).abs();
         if d < river_half_width(z) && !bridge_deck_contains(x, z) {
             WADE_SLOW
@@ -136,14 +149,18 @@ impl Terrain {
             }
         }
         // Refresh the blocked mask over the touched area (one vertex of
-        // margin: the slope rule reads 4-neighbors).
-        let bx0 = x0.saturating_sub(1);
-        let bz0 = z0.saturating_sub(1);
-        let bx1 = (x1 + 1).min(VERTS_X - 1);
-        let bz1 = (z1 + 1).min(VERTS_Z - 1);
-        for z in bz0..=bz1 {
-            for x in bx0..=bx1 {
-                self.blocked[z * VERTS_X + x] = vertex_blocked(&self.heights, self.origin, x, z);
+        // margin: the slope rule reads 4-neighbors). The classic map
+        // never blocks.
+        if !self.classic {
+            let bx0 = x0.saturating_sub(1);
+            let bz0 = z0.saturating_sub(1);
+            let bx1 = (x1 + 1).min(VERTS_X - 1);
+            let bz1 = (z1 + 1).min(VERTS_Z - 1);
+            for z in bz0..=bz1 {
+                for x in bx0..=bx1 {
+                    self.blocked[z * VERTS_X + x] =
+                        vertex_blocked(&self.heights, self.origin, x, z);
+                }
             }
         }
         // Chunk c spans verts [c*32, c*32+32]; a vertex touches up to 2 chunks.
@@ -328,6 +345,7 @@ pub fn river_bed_depth(t: f32) -> f32 {
 }
 
 fn generate_terrain(mut commands: Commands) {
+    let classic = map_is_classic();
     let origin = Vec2::new(
         -(VERTS_X as f32 - 1.0) * CELL * 0.5,
         -(VERTS_Z as f32 - 1.0) * CELL * 0.5,
@@ -349,48 +367,56 @@ fn generate_terrain(mut commands: Commands) {
             // Bias up so the battlefield sits in the grass bands; dirt only
             // in real hollows and crater floors.
             h += 2.6;
-            // Terraced highlands: partially quantize the TALL ground
-            // into 3.5 m steps — flat shading turns the risers into
-            // angled plateau faces, and the blocked mask makes those
-            // massifs impassable (M2TW mountains framing the field).
-            // Mid-height hills stay smooth and traversable.
-            let ts = smoothstep(15.0, 26.0, h);
-            if ts > 0.0 {
-                const STEP: f32 = 3.5;
-                let hq = (h / STEP).round() * STEP;
-                h += (hq - h) * ts * 0.8;
-            }
-            // River channel: exact bed profile inside the shoreline,
-            // banks blended out to t = RIVER_CORRIDOR. Carving after
-            // everything else so the river always wins; at the mountainous
-            // map edges this cuts a gorge.
-            let d = (p.x - river_center_x(p.y)).abs();
-            let t = d / river_half_width(p.y);
-            if t < RIVER_CORRIDOR {
-                let wl = river_water_level(p.y);
-                let prof = if t <= 1.0 {
-                    wl - river_bed_depth(t)
-                } else {
-                    wl + (t - 1.0) * RIVER_BANK
-                };
-                let s = smoothstep(1.0, RIVER_CORRIDOR, t);
-                h = prof + (h - prof) * s;
+            if !classic {
+                // Terraced highlands: partially quantize the TALL ground
+                // into 3.5 m steps — flat shading turns the risers into
+                // angled plateau faces, and the blocked mask makes those
+                // massifs impassable (M2TW mountains framing the field).
+                // Mid-height hills stay smooth and traversable.
+                let ts = smoothstep(15.0, 26.0, h);
+                if ts > 0.0 {
+                    const STEP: f32 = 3.5;
+                    let hq = (h / STEP).round() * STEP;
+                    h += (hq - h) * ts * 0.8;
+                }
+                // River channel: exact bed profile inside the shoreline,
+                // banks blended out to t = RIVER_CORRIDOR. Carving after
+                // everything else so the river always wins; at the mountainous
+                // map edges this cuts a gorge.
+                let d = (p.x - river_center_x(p.y)).abs();
+                let t = d / river_half_width(p.y);
+                if t < RIVER_CORRIDOR {
+                    let wl = river_water_level(p.y);
+                    let prof = if t <= 1.0 {
+                        wl - river_bed_depth(t)
+                    } else {
+                        wl + (t - 1.0) * RIVER_BANK
+                    };
+                    let s = smoothstep(1.0, RIVER_CORRIDOR, t);
+                    h = prof + (h - prof) * s;
+                }
             }
             heights[z * VERTS_X + x] = h;
         }
     }
     let mut blocked = vec![false; VERTS_X * VERTS_Z];
-    for z in 0..VERTS_Z {
-        for x in 0..VERTS_X {
-            blocked[z * VERTS_X + x] = vertex_blocked(&heights, origin, x, z);
+    if !classic {
+        for z in 0..VERTS_Z {
+            for x in 0..VERTS_X {
+                blocked[z * VERTS_X + x] = vertex_blocked(&heights, origin, x, z);
+            }
         }
     }
     commands.insert_resource(Terrain {
         heights,
         blocked,
+        classic,
         origin,
         dirty: vec![false; CHUNKS_X * CHUNKS_Z],
     });
+    if classic {
+        info!("FL_MAP=old: classic terrain (no river/terraces/vegetation)");
+    }
 }
 
 fn spawn_chunks(
@@ -420,7 +446,7 @@ fn spawn_chunks(
     }
 }
 
-fn band_color(h: f32, slope: f32, p: Vec2) -> [f32; 4] {
+fn band_color(h: f32, slope: f32, p: Vec2, classic: bool) -> [f32; 4] {
     let mut c = if slope > 0.75 {
         Color::srgb(0.46, 0.42, 0.36) // scree on steep faces
     } else if h < -2.5 {
@@ -440,7 +466,8 @@ fn band_color(h: f32, slope: f32, p: Vec2) -> [f32; 4] {
     };
     // Grass-band variety: golden wheat patches and a subtle per-triangle
     // tone wobble so the open field doesn't read as flat plastic.
-    if slope <= 0.75 && (0.0..11.0).contains(&h) {
+    // (New map only — the classic map keeps the flat bands.)
+    if !classic && slope <= 0.75 && (0.0..11.0).contains(&h) {
         let patch = fbm(p / 70.0 + Vec2::splat(47.1));
         if patch > 0.62 {
             c = Color::srgb(0.62, 0.53, 0.24); // wheat field
@@ -488,7 +515,7 @@ fn build_chunk_mesh(terrain: &Terrain, cx: usize, cz: usize) -> Mesh {
                     (tri[0].x + tri[1].x + tri[2].x) / 3.0,
                     (tri[0].z + tri[1].z + tri[2].z) / 3.0,
                 );
-                let col = band_color(hc, slope, pc);
+                let col = band_color(hc, slope, pc, terrain.classic);
                 for v in tri {
                     positions.push(v);
                     normals.push(n);

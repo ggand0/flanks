@@ -106,6 +106,9 @@ fn spawn_water(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<WaterMaterial>>,
 ) {
+    if terrain.classic {
+        return;
+    }
     let mesh = build_water_mesh(&terrain);
     let aabb = mesh.compute_aabb();
     let handle = meshes.add(mesh);
@@ -124,9 +127,13 @@ fn spawn_water(
 /// this mesh is purely the visual.
 fn spawn_bridge(
     mut commands: Commands,
+    terrain: Res<terrain::Terrain>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
+    if terrain.classic {
+        return;
+    }
     let cx = river_center_x(BRIDGE_Z);
     let hw = river_half_width(BRIDGE_Z);
     let wl = river_water_level(BRIDGE_Z);
