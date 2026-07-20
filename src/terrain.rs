@@ -158,7 +158,7 @@ impl Plugin for TerrainPlugin {
     }
 }
 
-fn fbm(p: Vec2) -> f32 {
+pub(crate) fn fbm(p: Vec2) -> f32 {
     fn lattice(xi: i32, zi: i32) -> f32 {
         let ux = xi as u32;
         let uz = zi as u32;
@@ -191,6 +191,43 @@ fn fbm(p: Vec2) -> f32 {
     sum
 }
 
+// ---- River -------------------------------------------------------------
+// A shallow, fordable river meandering north-south through the midfield.
+// Purely visual for now: the bed is carved into the heightfield and the
+// water surface (water.rs) follows the same three functions.
+
+/// River centerline: x as a function of z.
+pub fn river_center_x(z: f32) -> f32 {
+    110.0 * (z * 0.0055 + 0.9).sin() + 55.0 * (z * 0.0017 + 2.6).sin()
+}
+
+/// Channel half-width (to the shoreline), varies along the course.
+pub fn river_half_width(z: f32) -> f32 {
+    14.0 + 4.0 * (z * 0.011 + 0.5).sin()
+}
+
+/// Water surface height, gently falling from north to south.
+pub fn river_water_level(z: f32) -> f32 {
+    0.5 + z * 0.008
+}
+
+/// Max bed depth below the water surface (channel center).
+pub const RIVER_DEPTH: f32 = 1.4;
+/// Bank rise per unit t (t = distance / half-width) past the shoreline.
+const RIVER_BANK: f32 = 3.0;
+/// River-shaped corridor half-width in units of t (beyond: untouched).
+pub const RIVER_CORRIDOR: f32 = 2.3;
+
+fn smoothstep(a: f32, b: f32, x: f32) -> f32 {
+    let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Riverbed depth below the water at normalized distance t (0 at shore).
+pub fn river_bed_depth(t: f32) -> f32 {
+    RIVER_DEPTH * (1.0 - t * t).max(0.0).powf(0.75)
+}
+
 fn generate_terrain(mut commands: Commands) {
     let origin = Vec2::new(
         -(VERTS_X as f32 - 1.0) * CELL * 0.5,
@@ -212,7 +249,33 @@ fn generate_terrain(mut commands: Commands) {
             h *= 0.35 + 0.65 * center_dist.min(1.0);
             // Bias up so the battlefield sits in the grass bands; dirt only
             // in real hollows and crater floors.
-            heights[z * VERTS_X + x] = h + 2.6;
+            h += 2.6;
+            // Terraced highlands: partially quantize taller ground into
+            // 3.5 m steps — flat shading turns the steps into angled,
+            // plateau-like hillsides. The low battlefield is untouched.
+            let ts = smoothstep(8.0, 20.0, h);
+            if ts > 0.0 {
+                const STEP: f32 = 3.5;
+                let hq = (h / STEP).round() * STEP;
+                h += (hq - h) * ts * 0.8;
+            }
+            // River channel: exact bed profile inside the shoreline,
+            // banks blended out to t = RIVER_CORRIDOR. Carving after
+            // everything else so the river always wins; at the mountainous
+            // map edges this cuts a gorge.
+            let d = (p.x - river_center_x(p.y)).abs();
+            let t = d / river_half_width(p.y);
+            if t < RIVER_CORRIDOR {
+                let wl = river_water_level(p.y);
+                let prof = if t <= 1.0 {
+                    wl - river_bed_depth(t)
+                } else {
+                    wl + (t - 1.0) * RIVER_BANK
+                };
+                let s = smoothstep(1.0, RIVER_CORRIDOR, t);
+                h = prof + (h - prof) * s;
+            }
+            heights[z * VERTS_X + x] = h;
         }
     }
     commands.insert_resource(Terrain {
@@ -249,8 +312,8 @@ fn spawn_chunks(
     }
 }
 
-fn band_color(h: f32, slope: f32) -> [f32; 4] {
-    let c = if slope > 0.75 {
+fn band_color(h: f32, slope: f32, p: Vec2) -> [f32; 4] {
+    let mut c = if slope > 0.75 {
         Color::srgb(0.46, 0.42, 0.36) // scree on steep faces
     } else if h < -2.5 {
         Color::srgb(0.33, 0.25, 0.17) // crater floor / deep dirt
@@ -267,6 +330,18 @@ fn band_color(h: f32, slope: f32) -> [f32; 4] {
     } else {
         Color::srgb(0.78, 0.79, 0.82) // snowcap
     };
+    // Grass-band variety: golden wheat patches and a subtle per-triangle
+    // tone wobble so the open field doesn't read as flat plastic.
+    if slope <= 0.75 && (0.0..11.0).contains(&h) {
+        let patch = fbm(p / 70.0 + Vec2::splat(47.1));
+        if patch > 0.62 {
+            c = Color::srgb(0.62, 0.53, 0.24); // wheat field
+        } else {
+            let k = 0.94 + 0.12 * fbm(p / 45.0 + Vec2::splat(13.7));
+            let l = c.to_linear();
+            c = Color::linear_rgb(l.red * k, l.green * k, l.blue * k);
+        }
+    }
     c.to_linear().to_f32_array()
 }
 
@@ -301,7 +376,11 @@ fn build_chunk_mesh(terrain: &Terrain, cx: usize, cz: usize) -> Mesh {
                 let n = (tri[1] - tri[0]).cross(tri[2] - tri[0]).normalize_or_zero();
                 let hc = (tri[0].y + tri[1].y + tri[2].y) / 3.0;
                 let slope = (1.0 - n.y * n.y).sqrt() / n.y.max(0.1);
-                let col = band_color(hc, slope);
+                let pc = Vec2::new(
+                    (tri[0].x + tri[1].x + tri[2].x) / 3.0,
+                    (tri[0].z + tri[1].z + tri[2].z) / 3.0,
+                );
+                let col = band_color(hc, slope, pc);
                 for v in tri {
                     positions.push(v);
                     normals.push(n);

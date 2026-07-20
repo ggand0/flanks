@@ -18,6 +18,8 @@ mod unit_meshes;
 mod unit_types;
 mod units;
 mod util;
+mod vegetation;
+mod water;
 
 use bevy::prelude::*;
 use bevy::window::PresentMode;
@@ -58,6 +60,8 @@ fn main() {
         )
         .add_plugins((
             terrain::TerrainPlugin,
+            water::WaterPlugin,
+            vegetation::VegetationPlugin,
             units::UnitsPlugin,
             regiments::RegimentsPlugin,
             morale::MoralePlugin,

@@ -20,6 +20,10 @@ Engine:
   separation, crowd jam yield, positional overlap resolution.
 - Deformable heightmap terrain with chunked remeshing, plus a density
   field that draws the live front line as a contour.
+- Map art: a meandering fordable river carved into the heightfield
+  (animated faceted water shader, foam banks, gorge where it exits the
+  mountains), terraced plateau highlands, wheat-field patches, and
+  chunk-merged low-poly forests. All visual-only.
 
 Game:
 
