@@ -424,6 +424,7 @@ fn update_groups(units: Res<Units>, mut groups: ResMut<Groups>) {
                 if counts[t] > 0 && !broken[t] {
                     group.anchor = cents[t];
                 }
+                group.fight_origin = group.centroid;
             }
             if engaged != group.engaged {
                 if engaged {

@@ -134,6 +134,11 @@ pub struct GroupData {
     pub hostile_near: bool,
     /// Victory-cheer ticks remaining (render-only celebration).
     pub celebrate: u16,
+    /// FL_RECTFIGHT: where the fight happened — set on engagement, read
+    /// by the pursuit-range check. M2TW's melee manager limits pursuit
+    /// to attack-dist-multiplier × max-engage-dist from the engagement
+    /// point (3.0 × 40 = 120 m in vanilla config_ai_battle.xml).
+    pub fight_origin: Vec2,
     // --- morale (morale.rs updates per tick) ---
     pub morale: f32,
     pub state: RegState,
@@ -172,6 +177,7 @@ impl GroupData {
             threat_dir: Vec2::ZERO,
             hostile_near: false,
             celebrate: 0,
+            fight_origin: Vec2::ZERO,
             morale: 100.0,
             state: RegState::Steady,
             recent_deaths: 0,
@@ -570,6 +576,7 @@ fn halt_key(
 /// centroid refreshed by the frontline pass each tick.
 pub fn clear_arrived_orders(mut groups: ResMut<Groups>) {
     let counts: Vec<usize> = groups.list.iter().map(|g| g.count).collect();
+    let broken_flags: Vec<bool> = groups.list.iter().map(|g| g.state.is_broken()).collect();
     for (g, group) in groups.list.iter_mut().enumerate() {
         match group.order {
             Some(Order::Move(t)) => {
@@ -586,6 +593,23 @@ pub fn clear_arrived_orders(mut groups: ResMut<Groups>) {
                 group.anchor = group.centroid;
                 group.order = None;
                 info!("regiment {g} attack target {t} destroyed, holding");
+            }
+            // FL_RECTFIGHT pursuit range: M2TW's melee manager limits
+            // pursuit to attack-dist-multiplier × max-engage-dist from
+            // the engagement point (vanilla: 3.0 × 40 = 120 m). Once
+            // the regiment has moved that far from where the fight
+            // happened, it disengages and reforms — "pursuing" is a
+            // bounded engine state, not infinite chase.
+            Some(Order::Attack(t))
+                if crate::formation::rectfight()
+                    && broken_flags[t as usize]
+                    && group.fight_origin != Vec2::ZERO
+                    && group.centroid.distance_squared(group.fight_origin) > 120.0 * 120.0 =>
+            {
+                group.anchor = group.centroid;
+                group.reform = true;
+                group.order = None;
+                info!("regiment {g} pursuit range exceeded, reforming");
             }
             _ => {}
         }
