@@ -33,6 +33,13 @@ pub const META_DYING: u32 = 1 << 3;
 /// tighter separation rest distance (a shieldwall the physics would
 /// otherwise push back out to normal spacing).
 pub const META_WALL: u32 = 1 << 4;
+/// Unit's regiment is BROKEN (routing/shattered): a fleeing body
+/// collides at body scale — it commands no rank-dressing courtesy.
+pub const META_BROKEN: u32 = 1 << 5;
+/// Unit's regiment is executing a Move order: a body deliberately
+/// passing through (the engine's formationMovingThrough) — body-scale
+/// collision against formed same-team lines.
+pub const META_MOVER: u32 = 1 << 6;
 
 /// The kind field of a `SortedUnit::meta` (index into `unit_types::TYPES`).
 #[inline]
@@ -79,6 +86,7 @@ pub struct SpatialGrid {
 }
 
 impl SpatialGrid {
+    #[allow(clippy::too_many_arguments)] // parallel SoA columns
     pub fn rebuild(
         &mut self,
         positions: &[Vec3],
@@ -86,6 +94,8 @@ impl SpatialGrid {
         kinds: &[u8],
         death_t: &[u8],
         walled: &[bool],
+        broken: &[bool],
+        mover: &[bool],
     ) {
         let n = positions.len();
         if n == 0 {
@@ -168,7 +178,9 @@ impl SpatialGrid {
                         let meta = ((teams[i] as u32) * META_TEAM)
                             | ((kinds[i] as u32) << META_KIND_SHIFT)
                             | (((death_t[i] > 0) as u32) * META_DYING)
-                            | ((walled[i] as u32) * META_WALL);
+                            | ((walled[i] as u32) * META_WALL)
+                            | ((broken[i] as u32) * META_BROKEN)
+                            | ((mover[i] as u32) * META_MOVER);
                         unsafe {
                             *out.0.add(k) = SortedUnit {
                                 x: p.x,

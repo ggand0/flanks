@@ -263,6 +263,8 @@ pub fn step_sim(
     mut stats: ResMut<SimStats>,
     mut tick: Local<u32>,
     mut wall_flags: Local<Vec<bool>>,
+    mut broken_flags: Local<Vec<bool>>,
+    mut mover_flags: Local<Vec<bool>>,
     mut dir_stats: ResMut<DirTestStats>,
     mut yaw_snapshot: Local<Vec<f32>>,
 ) {
@@ -302,6 +304,23 @@ pub fn step_sim(
         .collect();
     wall_flags.clear();
     wall_flags.extend(group.iter().map(|&g| group_wall[g as usize]));
+    // Pass-through flags for the grid meta (FL_RECTFIGHT): a BROKEN
+    // man is a fleeing body, and a man of a MOVE-ordered regiment is a
+    // body deliberately passing through (the engine's explicit
+    // formationMovingThrough state) — both collide at body scale
+    // instead of commanding the 1.4 m rank-dressing courtesy, so a
+    // rout or an ordered withdrawal slips THROUGH a formed line's
+    // seams instead of excavating a corridor through the formation.
+    let group_broken: Vec<bool> = groups.list.iter().map(|g| g.state.is_broken()).collect();
+    let group_mover: Vec<bool> = groups
+        .list
+        .iter()
+        .map(|g| !g.state.is_broken() && matches!(g.order, Some(crate::orders::Order::Move(_))))
+        .collect();
+    broken_flags.clear();
+    broken_flags.extend(group.iter().map(|&g| group_broken[g as usize]));
+    mover_flags.clear();
+    mover_flags.extend(group.iter().map(|&g| group_mover[g as usize]));
     // No packing rule for fighting regiments: vanilla M2TW keeps its
     // formation grid (and observably LOOSENS it) during melee — the
     // fighting crowd's spacing is slots + body collision, nothing
@@ -314,7 +333,7 @@ pub fn step_sim(
     let t0 = Instant::now();
     {
         let _span = info_span!("grid_rebuild").entered();
-        grid.rebuild(pos_prev, team, kind, death_t, &wall_flags);
+        grid.rebuild(pos_prev, team, kind, death_t, &wall_flags, &broken_flags, &mover_flags);
     }
     let t1 = Instant::now();
     stats.grid_ms = (t1 - t0).as_secs_f32() * 1000.0;
@@ -339,21 +358,77 @@ pub fn step_sim(
     let orders: Vec<Option<Vec2>> = (0..groups.list.len())
         .map(|g| {
             let gd = &groups.list[g];
+            // The freeze keys on engagement WITH the ordered target
+            // (count-gated, frontline.rs) — incidental duels against
+            // an overflow trickle never halt the march.
             if rf
-                && gd.engaged
+                && gd.engaged_with_target
                 && let Some(crate::orders::Order::Attack(t)) = gd.order
                 && !groups.list[t as usize].state.is_broken()
             {
                 return None;
             }
-            groups.goal(g)
+            let goal = groups.goal(g);
+            // Friendly formed blocks are SOLID to a marching attack
+            // (engine: isBlocked/blockedBy — a unit's path routes
+            // AROUND a friendly, never through his ranks). The
+            // coarsest faithful version: when the straight approach
+            // crosses an ally's footprint, aim at a waypoint off that
+            // ally's flank; recomputed from live positions each tick,
+            // the march swings smoothly around and re-aims at the
+            // target beyond.
+            if rf
+                && !gd.state.is_broken()
+                && matches!(gd.order, Some(crate::orders::Order::Attack(_)))
+                && let Some(gpos) = goal
+            {
+                let a = gd.centroid;
+                let ab = gpos - a;
+                let len2 = ab.length_squared();
+                if len2 > 1.0 {
+                    let mut hit: Option<(f32, usize, f32)> = None; // (s, ally, radius)
+                    for (u, ud) in groups.list.iter().enumerate() {
+                        if u == g
+                            || ud.team != gd.team
+                            || ud.count == 0
+                            || ud.shape != crate::formation::FormShape::Rect
+                            || ud.state.is_broken()
+                        {
+                            continue;
+                        }
+                        let r = (ud.count as f32).sqrt() * crate::formation::BASE_SPACING * 0.55
+                            + 1.5;
+                        let s = ((ud.centroid - a).dot(ab) / len2).clamp(0.0, 1.0);
+                        if s <= 0.02 || s >= 0.98 {
+                            continue;
+                        }
+                        if (a + ab * s).distance_squared(ud.centroid) < r * r
+                            && hit.is_none_or(|(hs, ..)| s < hs)
+                        {
+                            hit = Some((s, u, r));
+                        }
+                    }
+                    if let Some((s, u, r)) = hit {
+                        let c = groups.list[u].centroid;
+                        let mut side = (a + ab * s - c).normalize_or_zero();
+                        if side.length_squared() < 0.5 {
+                            // Path through the ally's center: pick a
+                            // flank deterministically per regiment.
+                            let d = ab / len2.sqrt();
+                            side = Vec2::new(-d.y, d.x) * if g % 2 == 0 { 1.0 } else { -1.0 };
+                        }
+                        return Some(c + side * (r + 2.0));
+                    }
+                }
+            }
+            goal
         })
         .collect();
     let orders = &orders[..];
     let anchors: Vec<Vec2> = groups.list.iter().map(|g| g.anchor).collect();
     let anchors = &anchors[..];
-    let broken: Vec<bool> = groups.list.iter().map(|g| g.state.is_broken()).collect();
-    let broken = &broken[..];
+    let broken = &group_broken[..];
+    let group_mover = &group_mover[..];
     // Regiments in combat-watch range of an enemy (sparse-fight
     // acquisition): order type is irrelevant — a Move-order fight that
     // went sparse stalls exactly the same way. HOLD regiments never
@@ -593,54 +668,73 @@ pub fn step_sim(
                         // keep parade spacing even while fighting — the
                         // seams between files are what enemy bodies flow
                         // into.
-                        let sep_r = if (o.meta & crate::spatial::META_TEAM) != my_team_bit {
+                        let cross = (o.meta & crate::spatial::META_TEAM) != my_team_bit;
+                        // Pass-through pairs: a fleeing body, or a
+                        // Move-ordered regiment walking through the
+                        // lines (the engine's explicit
+                        // formationMovingThrough state), collide at
+                        // body scale — the passer slips through a
+                        // formed line's seams; the formation is not
+                        // excavated into a 1.4 m corridor.
+                        let pass_pair = rf
+                            && !cross
+                            && (routed
+                                || group_mover[gi]
+                                || (o.meta
+                                    & (crate::spatial::META_BROKEN
+                                        | crate::spatial::META_MOVER))
+                                    != 0);
+                        let sep_r = if cross {
                             // Enemy bodies rest at body contact (see
                             // ENEMY_SEP_RADIUS): contact distance is a
                             // property of bodies, not of allegiance —
                             // the wide courtesy gap belongs to ranks
                             // dressing on the same side only.
                             if rf { ENEMY_SEP_RADIUS } else { SEP_RADIUS }
+                        } else if pass_pair {
+                            ENEMY_SEP_RADIUS
                         } else if my_wall && (o.meta & crate::spatial::META_WALL) != 0 {
                             WALL_SEP_RADIUS
                         } else {
                             SEP_RADIUS
                         };
-                        if d2 < SEP_RADIUS * SEP_RADIUS && d2 > 1e-8 {
+                        if d2 < sep_r * sep_r && d2 > 1e-8 {
+                            // Mass-weighted: heavies shove lights aside.
+                            let o_mass = TYPES[crate::spatial::meta_kind(o.meta)].mass;
+                            let mw = 2.0 * o_mass / (my_mass + o_mass);
                             let len = d2.sqrt();
-                            if rf {
-                                // The jam density reads at the ORIGINAL
-                                // body scale for EVERY pair. Keyed to the
-                                // tight pair rest radii, per-pair w could
-                                // never sum past ~0.9 at full body-pack —
-                                // below CROWD_SLOW — so the brake and its
-                                // viscous damping went dead and the press
-                                // twitched against undamped springs: the
-                                // exact oscillation the jam was built to
-                                // kill. Rest radii decide where bodies
-                                // STOP; the jam decides when to stop
-                                // SHOVING, and that is a question about
-                                // how much flesh stands around a man, on
-                                // one fixed scale.
-                                crowd += 1.0 - len / SEP_RADIUS;
+                            let w = 1.0 - len / sep_r;
+                            if len < HARD_RADIUS {
+                                // Overlap is resolved POSITIONALLY only.
+                                // (There used to be a hard force boost here
+                                // too — two solvers fighting over the same
+                                // overlap made packed crowds oscillate at
+                                // the accel cap: the every-frame twitch.)
+                                corr += d * ((HARD_RADIUS - len) * CORR_GAIN * mw / len);
                             }
-                            if d2 < sep_r * sep_r {
-                                // Mass-weighted: heavies shove lights aside.
-                                let o_mass = TYPES[crate::spatial::meta_kind(o.meta)].mass;
-                                let mw = 2.0 * o_mass / (my_mass + o_mass);
-                                let w = 1.0 - len / sep_r;
-                                if len < HARD_RADIUS {
-                                    // Overlap is resolved POSITIONALLY only.
-                                    // (There used to be a hard force boost here
-                                    // too — two solvers fighting over the same
-                                    // overlap made packed crowds oscillate at
-                                    // the accel cap: the every-frame twitch.)
-                                    corr += d * ((HARD_RADIUS - len) * CORR_GAIN * mw / len);
-                                }
-                                push += d * (w * mw / len);
-                                if !rf {
-                                    crowd += w;
-                                }
-                            }
+                            push += d * (w * mw / len);
+                            // Jam density: COMPRESSED pairs only — a
+                            // neighbor resting AT his pair's rest
+                            // distance contests nothing, so a formed
+                            // man's slot-keeping is never faded by the
+                            // settled enemies one stride away (the
+                            // yield-and-stay-ragged defect). Gated, the
+                            // weight reads on the one body scale
+                            // regardless of the pair's rest radius —
+                            // per-rest weights sum too small at tight
+                            // radii to ever brake (the twitch). EXCEPT
+                            // pass-through pairs: a body threading the
+                            // seams at its intended body distance is
+                            // not a wedged crowd — weighing it on the
+                            // 1.4 scale made a passer crawl at a
+                            // quarter speed and faded the standing
+                            // line's slot-keeping (measured, ROUTPASS).
+                            // Ungated all formulas are identical.
+                            crowd += if rf && !pass_pair {
+                                1.0 - len / SEP_RADIUS
+                            } else {
+                                w
+                            };
                         }
                     });
 

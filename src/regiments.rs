@@ -31,7 +31,7 @@ impl Plugin for RegimentsPlugin {
         app.add_systems(Startup, spawn_battle)
             .add_systems(
                 Update,
-                (rout_test_log, dir_test_log, arena_log, charge_test_log, pile_test_log, melee_diag_log, restart_key),
+                (rout_test_log, dir_test_log, arena_log, charge_test_log, pile_test_log, melee_diag_log, join_test_log, routpass_test_log, restart_key),
             );
     }
 }
@@ -140,6 +140,14 @@ fn do_spawn_battle(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
     }
     if std::env::var("FL_TEST_PILE").is_ok() {
         spawn_pile_test(units, terrain, groups);
+        return;
+    }
+    if std::env::var("FL_TEST_JOIN").is_ok() {
+        spawn_join_test(units, terrain, groups);
+        return;
+    }
+    if std::env::var("FL_TEST_ROUTPASS").is_ok() {
+        spawn_routpass_test(units, terrain, groups);
         return;
     }
 
@@ -437,6 +445,105 @@ fn spawn_pile_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
     }
     groups.list = list;
     info!("[pile-test] six blue regiments attack ONE holding orange regiment");
+}
+
+/// FL_TEST_JOIN=1: the join-the-fight order (owner's repro). Orange
+/// attacks blue A's line head-on; blue B stands BEHIND A, ordered onto
+/// the same orange regiment at spawn. Acceptance: B's march never
+/// halts for the overflow trickle that pokes it, B routes AROUND A's
+/// ranks (friendly blocks are solid to a march), reaches the orange
+/// mass, and its fighter count ramps into the dozens.
+fn spawn_join_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
+    let mut list = Vec::new();
+    spawn_regiment(units, terrain, &mut list, 1, KIND_LIGHT, Vec2::new(0.0, 50.0), 500, 1.0);
+    list[0].order = Some(crate::orders::Order::Attack(1));
+    list[0].auto_order = true;
+    // A and B carry PLAYER-issued orders (auto_order stays false): the
+    // at-ease AI stands auto-engaged regiments down when their target
+    // breaks — correct doctrine, but the owner's repro is about
+    // player-ordered attacks, which persist through the rout.
+    spawn_regiment(units, terrain, &mut list, 0, KIND_LIGHT, Vec2::new(0.0, 10.0), 500, -1.0);
+    list[1].order = Some(crate::orders::Order::Attack(0));
+    spawn_regiment(units, terrain, &mut list, 0, KIND_LIGHT, Vec2::new(0.0, -30.0), 500, -1.0);
+    list[2].order = Some(crate::orders::Order::Attack(0));
+    groups.list = list;
+    info!("[join-test] orange attacks A's line; B behind A ordered onto the same orange");
+}
+
+/// FL_TEST_JOIN bookkeeping every 4 s: does B actually get into the
+/// ordered fight instead of stalling behind A on overflow duels?
+fn join_test_log(
+    units: Res<Units>,
+    groups: Res<crate::orders::Groups>,
+    time: Res<Time>,
+    mut next: Local<f32>,
+) {
+    if std::env::var("FL_TEST_JOIN").is_err() || groups.list.len() < 3 {
+        return;
+    }
+    let t = time.elapsed_secs();
+    if t < *next {
+        return;
+    }
+    *next = t + 4.0;
+    let mut b_windups = 0;
+    for i in 0..units.len() {
+        if units.group[i] == 2
+            && units.death_t[i] == 0
+            && units.swing[i] & crate::units::SWING_STATE_MASK == crate::units::SWING_WINDUP
+        {
+            b_windups += 1;
+        }
+    }
+    info!(
+        "[join-test] t={t:.0}s orange {} / A {} / B {} alive; B->orange {:.1} m, B windups {b_windups}, B locked {}",
+        groups.list[0].count,
+        groups.list[1].count,
+        groups.list[2].count,
+        groups.list[2].centroid.distance(groups.list[0].centroid),
+        groups.list[2].engaged_with_target,
+    );
+}
+
+/// FL_TEST_ROUTPASS=1: an ordered withdrawal straight through a formed
+/// friendly line (the owner's "unit makes stupid space for retreating
+/// unit" repro). A holds its line; the passer regiment is Move-ordered
+/// through A's ranks. Acceptance: the passer slips through the seams
+/// at body scale, A's disorder bumps briefly and re-dresses — no
+/// corridor excavated, no lasting raggedness.
+fn spawn_routpass_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
+    let mut list = Vec::new();
+    spawn_regiment(units, terrain, &mut list, 0, KIND_LIGHT, Vec2::new(0.0, 0.0), 500, 1.0);
+    list[0].hold = true;
+    spawn_regiment(units, terrain, &mut list, 0, KIND_LIGHT, Vec2::new(0.0, 35.0), 500, -1.0);
+    list[1].order = Some(crate::orders::Order::Move(Vec2::new(0.0, -60.0)));
+    list[1].auto_order = true;
+    groups.list = list;
+    info!("[routpass-test] passer Move-ordered straight through A's held line");
+}
+
+/// FL_TEST_ROUTPASS bookkeeping every 2 s: A's shape while the passer
+/// walks through it, and the overlap floor.
+fn routpass_test_log(
+    groups: Res<crate::orders::Groups>,
+    stats: Res<crate::movement::SimStats>,
+    time: Res<Time>,
+    mut next: Local<f32>,
+) {
+    if std::env::var("FL_TEST_ROUTPASS").is_err() || groups.list.len() < 2 {
+        return;
+    }
+    let t = time.elapsed_secs();
+    if t < *next {
+        return;
+    }
+    *next = t + 2.0;
+    info!(
+        "[routpass-test] t={t:.0}s A disorder {:.2} m, passer z {:.1}, nn min {:.2}",
+        groups.list[0].disorder,
+        groups.list[1].centroid.y,
+        stats.nn_min,
+    );
 }
 
 /// FL_TEST_PILE bookkeeping every 4 s: victim strength + how many of

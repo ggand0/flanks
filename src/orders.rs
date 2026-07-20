@@ -109,6 +109,16 @@ pub struct GroupData {
     pub engaged: bool,
     /// Ticks of `engaged` left since the last soldier fought.
     pub engage_hold: u8,
+    /// FL_RECTFIGHT: enough of this regiment's soldiers are in a swing
+    /// cycle against its ORDERED attack target's men (the engine keeps
+    /// per-enemy-unit engagedSoldiers counts and gates engagement on
+    /// "enough soldiers in the proximity zone"). THIS is what freezes
+    /// the attack path — a trickle of overflow duels never halts the
+    /// march; the poked men defend individually while the block keeps
+    /// walking to its ordered fight.
+    pub engaged_with_target: bool,
+    /// Ticks of `engaged_with_target` left (same swing-gap bridge).
+    pub engage_target_hold: u8,
     /// In the charge phase: attack order, inside charge range of the
     /// target, not yet in contact. Drives the war cry + sprint pose.
     pub charging: bool,
@@ -155,6 +165,8 @@ impl GroupData {
             centroid: anchor,
             engaged: false,
             engage_hold: 0,
+            engaged_with_target: false,
+            engage_target_hold: 0,
             charging: false,
             enemy_near: false,
             threat_dir: Vec2::ZERO,
