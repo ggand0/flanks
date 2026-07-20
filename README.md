@@ -20,6 +20,13 @@ Engine:
   separation, crowd jam yield, positional overlap resolution.
 - Deformable heightmap terrain with chunked remeshing, plus a density
   field that draws the live front line as a contour.
+- Map art: a meandering river carved into the heightfield (animated
+  faceted water shader, foam banks, a gorge where it exits the
+  mountains). The river is wadeable everywhere at reduced speed; a
+  stone bridge gives a dry full-speed crossing. Highlands above ~15 m
+  are terraced into angled plateau steps whose risers are impassable
+  (M2TW-style mountain framing). Wheat-field patches and chunk-merged
+  low-poly forests fill the outskirts.
 
 Game:
 
@@ -48,7 +55,9 @@ Verification is log-based: FL_TEST_* environment knobs run scripted
 acceptance scenarios (front line formation, order cohesion, encirclement,
 rout behavior) whose outcomes are checked from the log rather than by
 eye. FL_UNITS, FL_REG_SIZE, FL_COMBAT_SCALE, FL_AI and similar knobs
-configure sandbox battles.
+configure sandbox battles. FL_MAP=river enables the map-art terrain
+(river/terraces/vegetation; classic map is the default); FL_VOLUME=0
+mutes.
 
 ## Build and run
 

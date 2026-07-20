@@ -365,7 +365,7 @@ pub fn step_sim(
             {
                 return None;
             }
-            let goal = groups.goal(g);
+            let mut goal = groups.goal(g);
             // Friendly formed blocks are SOLID to a marching attack
             // (engine: isBlocked/blockedBy — a unit's path routes
             // AROUND a friendly, never through his ranks). The
@@ -414,7 +414,7 @@ pub fn step_sim(
                             let d = ab / len2.sqrt();
                             side = Vec2::new(-d.y, d.x) * if g % 2 == 0 { 1.0 } else { -1.0 };
                         }
-                        return Some(c + side * (r + 2.0));
+                        goal = Some(c + side * (r + 2.0));
                     }
                 }
             }
@@ -554,7 +554,11 @@ pub fn step_sim(
                             * 0.7;
                         let dir = Vec2::new(lat, flee_z).normalize_or_zero();
                         let slope = terrain.slope_at(p.x, p.y);
-                        desired = dir * speed[i] * ROUT_FLEE_FRAC / (1.0 + 3.0 * slope * slope);
+                        desired = dir
+                            * speed[i]
+                            * ROUT_FLEE_FRAC
+                            * terrain.wade_mult(p.x, p.y)
+                            / (1.0 + 3.0 * slope * slope);
                     } else if !dying {
                         let holding = orders[gi].is_none();
                         let goal = orders[gi].unwrap_or(anchors[gi]) + home[i];
@@ -568,6 +572,8 @@ pub fn step_sim(
                         // — with 1.5 the ranks never finished dressing.
                         if !(holding && dist < 0.7) {
                             // Slope penalty: steep ground is slow ground.
+                            // Wading the river is slow too (the bridge
+                            // deck is dry: full speed).
                             let slope = terrain.slope_at(p.x, p.y);
                             let slope_mult = 1.0 / (1.0 + 3.0 * slope * slope);
                             let (gain, arrive) = if holding {
@@ -575,8 +581,11 @@ pub fn step_sim(
                             } else {
                                 (1.0, ARRIVE_RADIUS)
                             };
-                            let desired_speed =
-                                speed[i] * slope_mult * gain * (dist / arrive).min(1.0);
+                            let desired_speed = speed[i]
+                                * slope_mult
+                                * terrain.wade_mult(p.x, p.y)
+                                * gain
+                                * (dist / arrive).min(1.0);
                             if dist > 1e-3 {
                                 desired = to_goal * (desired_speed / dist);
                             }
@@ -1129,10 +1138,25 @@ pub fn step_sim(
                     }
 
                     v_chunk[j] = Vec3::new(new_v.x, 0.0, new_v.y);
-                    let nx = (pos_prev[i].x + new_v.x * dt + corr.x)
+                    let mut nx = (pos_prev[i].x + new_v.x * dt + corr.x)
                         .clamp(bounds_min.x, bounds_max.x);
-                    let nz = (pos_prev[i].z + new_v.y * dt + corr.y)
+                    let mut nz = (pos_prev[i].z + new_v.y * dt + corr.y)
                         .clamp(bounds_min.y, bounds_max.y);
+                    // Impassable ground (terrace risers, gorge walls,
+                    // crater lips): wall-slide — keep the axis that
+                    // stays on walkable ground, drop the one that
+                    // doesn't, so crowds flow along the obstacle.
+                    if terrain.blocked_at(nx, nz) {
+                        let (px, pz) = (pos_prev[i].x, pos_prev[i].z);
+                        if !terrain.blocked_at(nx, pz) {
+                            nz = pz;
+                        } else if !terrain.blocked_at(px, nz) {
+                            nx = px;
+                        } else {
+                            nx = px;
+                            nz = pz;
+                        }
+                    }
                     p_chunk[j] = Vec3::new(
                         nx,
                         terrain.height_at(nx, nz) + TYPES[kind[i] as usize].half_height,
@@ -1268,8 +1292,14 @@ pub fn step_sim(
                         let m_v = pv.mass;
                         let resist = if braced { WALL_KNOCKBACK_RESIST } else { 1.0 };
                         let shove = -dir * CHARGE_KNOCKBACK * (m_a / (m_a + m_v)) * resist;
-                        let nx = (pos[v].x + shove.x).clamp(bounds_min.x, bounds_max.x);
-                        let nz = (pos[v].z + shove.y).clamp(bounds_min.y, bounds_max.y);
+                        let mut nx = (pos[v].x + shove.x).clamp(bounds_min.x, bounds_max.x);
+                        let mut nz = (pos[v].z + shove.y).clamp(bounds_min.y, bounds_max.y);
+                        // Charges can't knock a man into the river or
+                        // through a terrace riser — the shove just dies.
+                        if terrain.blocked_at(nx, nz) {
+                            nx = pos[v].x;
+                            nz = pos[v].z;
+                        }
                         pos[v] = Vec3::new(nx, terrain.height_at(nx, nz) + pv.half_height, nz);
                     }
                     // An impaled runner is STOPPED, not thrown — his
