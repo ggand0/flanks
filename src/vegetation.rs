@@ -23,14 +23,14 @@ impl Plugin for VegetationPlugin {
 
 /// Flat-shaded triangle soup builder (positions/normals/colors), same
 /// style as the terrain chunks.
-struct Soup {
+pub(crate) struct Soup {
     positions: Vec<[f32; 3]>,
     normals: Vec<[f32; 3]>,
     colors: Vec<[f32; 4]>,
 }
 
 impl Soup {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             positions: Vec::new(),
             normals: Vec::new(),
@@ -38,7 +38,7 @@ impl Soup {
         }
     }
 
-    fn tri(&mut self, a: Vec3, b: Vec3, c: Vec3, color: [f32; 4]) {
+    pub(crate) fn tri(&mut self, a: Vec3, b: Vec3, c: Vec3, color: [f32; 4]) {
         let n = (b - a).cross(c - a).normalize_or_zero();
         for v in [a, b, c] {
             self.positions.push(v.to_array());
@@ -47,13 +47,13 @@ impl Soup {
         }
     }
 
-    fn quad(&mut self, a: Vec3, b: Vec3, c: Vec3, d: Vec3, color: [f32; 4]) {
+    pub(crate) fn quad(&mut self, a: Vec3, b: Vec3, c: Vec3, d: Vec3, color: [f32; 4]) {
         self.tri(a, b, c, color);
         self.tri(a, c, d, color);
     }
 
     /// Axis-aligned cuboid (pre-rotation); `c` = center, `h` = half extents.
-    fn cuboid(&mut self, c: Vec3, h: Vec3, color: [f32; 4]) {
+    pub(crate) fn cuboid(&mut self, c: Vec3, h: Vec3, color: [f32; 4]) {
         let p = |x: f32, y: f32, z: f32| c + Vec3::new(x * h.x, y * h.y, z * h.z);
         // 8 corners.
         let v = [
@@ -76,7 +76,7 @@ impl Soup {
 
     /// 4-sided pyramid: square base half-width `hw` at y0, apex at y1.
     /// Bottom face skipped (hidden).
-    fn pyramid(&mut self, c: Vec3, hw: f32, y0: f32, y1: f32, color: [f32; 4]) {
+    pub(crate) fn pyramid(&mut self, c: Vec3, hw: f32, y0: f32, y1: f32, color: [f32; 4]) {
         let b = [
             Vec3::new(c.x - hw, y0, c.z - hw),
             Vec3::new(c.x + hw, y0, c.z - hw),
@@ -100,11 +100,11 @@ impl Soup {
         }
     }
 
-    fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.positions.is_empty()
     }
 
-    fn into_mesh(self) -> Mesh {
+    pub(crate) fn into_mesh(self) -> Mesh {
         Mesh::new(
             PrimitiveTopology::TriangleList,
             RenderAssetUsages::default(),
@@ -115,7 +115,7 @@ impl Soup {
     }
 }
 
-fn srgb(r: f32, g: f32, b: f32) -> [f32; 4] {
+pub(crate) fn srgb(r: f32, g: f32, b: f32) -> [f32; 4] {
     Color::srgb(r, g, b).to_linear().to_f32_array()
 }
 

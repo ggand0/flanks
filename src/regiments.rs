@@ -194,6 +194,13 @@ fn do_spawn_battle(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
         let n_heavy = (n_regs as f32 * heavy_frac()).round() as usize;
         let n_spear = (n_regs as f32 * spear_frac()).round() as usize;
         let dir: f32 = if team == 0 { -1.0 } else { 1.0 };
+        // The river is impassable away from the crossings: a file whose
+        // block would straddle the channel can't shift sideways (one
+        // pitch over is the next file's slot — overlapping spawns jam
+        // permanently), so it's deferred to a reserve line behind the
+        // army instead.
+        let mut reserve: Vec<(u8, Vec2)> = Vec::new();
+        let n_ranks = n_regs.div_ceil(per_rank);
         for r in 0..n_regs {
             let rank = r / per_rank;
             let file = r % per_rank;
@@ -210,7 +217,56 @@ fn do_spawn_battle(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
             } else {
                 KIND_LIGHT
             };
+            let rc = crate::terrain::river_center_x(z0);
+            let margin = crate::terrain::river_half_width(z0) * 1.1 + block_w * 0.5 + 2.0;
+            if (x0 - rc).abs() < margin {
+                reserve.push((kind, anchor));
+                continue;
+            }
             spawn_regiment(units, terrain, &mut list, team, kind, anchor, size, dir);
+        }
+        // Reserve line: the displaced regiments deploy on extra ranks
+        // behind the army, filling file slots west-to-east and still
+        // skipping any x that falls inside the river corridor.
+        let mut i = 0;
+        let mut rank = n_ranks;
+        while i < reserve.len() {
+            let z0 = dir * (army_gap / 2.0 + block_d / 2.0 + rank as f32 * (block_d + REG_GAP));
+            let rc = crate::terrain::river_center_x(z0);
+            let margin = crate::terrain::river_half_width(z0) * 1.1 + block_w * 0.5 + 2.0;
+            let mut placed = 0;
+            let mut file = 0;
+            let x_limit = terrain.max().x - block_w * 0.5 - 8.0;
+            while placed < per_rank && i < reserve.len() {
+                let x0 = (file as f32 - (per_rank - 1) as f32 / 2.0) * pitch_x;
+                file += 1;
+                if x0.abs() > x_limit {
+                    break; // rank full past the corridor gap: next rank
+                }
+                if (x0 - rc).abs() < margin {
+                    continue;
+                }
+                let (kind, _) = reserve[i];
+                spawn_regiment(
+                    units,
+                    terrain,
+                    &mut list,
+                    team,
+                    kind,
+                    Vec2::new(x0, z0),
+                    size,
+                    dir,
+                );
+                placed += 1;
+                i += 1;
+            }
+            rank += 1;
+        }
+        if !reserve.is_empty() {
+            info!(
+                "team {team}: {} regiments deferred to reserve ranks (river corridor)",
+                reserve.len()
+            );
         }
     }
     // FL_ENEMY_STATIC=1: the enemy army holds position (never auto-

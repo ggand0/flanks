@@ -22,6 +22,10 @@ const VERTS_Z: usize = CHUNKS_Z * CHUNK_CELLS + 1;
 pub struct Terrain {
     /// Vertex heights, row-major [z][x].
     heights: Vec<f32>,
+    /// Impassable vertices (river channel, terrace risers, gorge walls),
+    /// same grid as `heights`. The bridge deck is exempted in
+    /// `blocked_at` by rectangle, not in this mask.
+    blocked: Vec<bool>,
     /// World-space min corner.
     pub origin: Vec2,
     dirty: Vec<bool>,
@@ -45,9 +49,13 @@ impl Terrain {
         self.heights[z * VERTS_X + x]
     }
 
-    /// Bilinear height sample, clamped to the field.
+    /// Bilinear height sample, clamped to the field. The bridge deck
+    /// overrides the carved channel so units walk ON the bridge.
     #[inline]
     pub fn height_at(&self, x: f32, z: f32) -> f32 {
+        if bridge_deck_contains(x, z) {
+            return river_water_level(z) + BRIDGE_DECK_LIFT;
+        }
         let g = (Vec2::new(x, z) - self.origin) / CELL;
         let gx = g.x.clamp(0.0, (VERTS_X - 2) as f32);
         let gz = g.y.clamp(0.0, (VERTS_Z - 2) as f32);
@@ -75,6 +83,45 @@ impl Terrain {
         (dx * dx + dz * dz).sqrt()
     }
 
+    /// Impassable ground (nearest-vertex mask lookup). The bridge deck
+    /// rectangle is exempt: walkable even though the mask keeps the
+    /// channel under it blocked.
+    #[inline]
+    pub fn blocked_at(&self, x: f32, z: f32) -> bool {
+        if bridge_deck_contains(x, z) {
+            return false;
+        }
+        let g = (Vec2::new(x, z) - self.origin) / CELL;
+        let gx = (g.x.round() as usize).min(VERTS_X - 1);
+        let gz = (g.y.round() as usize).min(VERTS_Z - 1);
+        self.blocked[gz * VERTS_X + gx]
+    }
+
+    /// River-aware march goal: if the straight line from→to crosses the
+    /// channel away from a crossing, march to the nearer crossing first
+    /// (single river ⇒ a single waypoint suffices). Recomputed per tick
+    /// by the movement pass, so crossing to the far side flips the side
+    /// test and the goal reverts to the real target.
+    pub fn route_via_crossing(&self, from: Vec2, to: Vec2) -> Vec2 {
+        let sd = |p: Vec2| p.x - river_center_x(p.y);
+        let (sf, st) = (sd(from), sd(to));
+        if sf * st >= 0.0 {
+            return to; // same bank (or on the centerline)
+        }
+        // Already at a crossing: standing in its span near the water —
+        // go straight (the ford/deck carries the rest of the way).
+        let in_span = (from.y - FORD_Z).abs() < FORD_HALF_SPAN
+            || (from.y - BRIDGE_Z).abs() < BRIDGE_HALF_SPAN;
+        if in_span && sf.abs() < river_half_width(from.y) * 1.2 {
+            return to;
+        }
+        let ford = Vec2::new(river_center_x(FORD_Z), FORD_Z);
+        let bridge = Vec2::new(river_center_x(BRIDGE_Z), BRIDGE_Z);
+        let detour_ford = from.distance(ford) + ford.distance(to);
+        let detour_bridge = from.distance(bridge) + bridge.distance(to);
+        if detour_ford < detour_bridge { ford } else { bridge }
+    }
+
     /// Carve a crater: smooth depression + small raised rim. Marks chunks dirty.
     pub fn carve_crater(&mut self, center: Vec2, radius: f32, depth: f32) {
         let rim_r = radius * 1.35;
@@ -98,6 +145,17 @@ impl Terrain {
                     continue;
                 };
                 self.heights[z * VERTS_X + x] += dh;
+            }
+        }
+        // Refresh the blocked mask over the touched area (one vertex of
+        // margin: the slope rule reads 4-neighbors).
+        let bx0 = x0.saturating_sub(1);
+        let bz0 = z0.saturating_sub(1);
+        let bx1 = (x1 + 1).min(VERTS_X - 1);
+        let bz1 = (z1 + 1).min(VERTS_Z - 1);
+        for z in bz0..=bz1 {
+            for x in bx0..=bx1 {
+                self.blocked[z * VERTS_X + x] = vertex_blocked(&self.heights, self.origin, x, z);
             }
         }
         // Chunk c spans verts [c*32, c*32+32]; a vertex touches up to 2 chunks.
@@ -141,6 +199,37 @@ impl Terrain {
         }
         None
     }
+}
+
+/// Same side of the river centerline? Target selection uses this to
+/// prefer local fights instead of funneling the army into crossings.
+pub fn same_river_side(a: Vec2, b: Vec2) -> bool {
+    let sd = |p: Vec2| p.x - river_center_x(p.y);
+    sd(a) * sd(b) >= 0.0
+}
+
+/// Mask rule per vertex: river channel (minus crossings) or a face
+/// steeper than SLOPE_BLOCK against any 4-neighbor.
+fn vertex_blocked(heights: &[f32], origin: Vec2, x: usize, z: usize) -> bool {
+    let p = origin + Vec2::new(x as f32, z as f32) * CELL;
+    if river_blocks(p) {
+        return true;
+    }
+    let h = heights[z * VERTS_X + x];
+    let mut max_d = 0.0f32;
+    if x > 0 {
+        max_d = max_d.max((h - heights[z * VERTS_X + x - 1]).abs());
+    }
+    if x + 1 < VERTS_X {
+        max_d = max_d.max((h - heights[z * VERTS_X + x + 1]).abs());
+    }
+    if z > 0 {
+        max_d = max_d.max((h - heights[(z - 1) * VERTS_X + x]).abs());
+    }
+    if z + 1 < VERTS_Z {
+        max_d = max_d.max((h - heights[(z + 1) * VERTS_X + x]).abs());
+    }
+    max_d / CELL >= SLOPE_BLOCK
 }
 
 /// Mesh handle + entity per chunk, indexed [cz * CHUNKS_X + cx].
@@ -214,9 +303,42 @@ pub fn river_water_level(z: f32) -> f32 {
 /// Max bed depth below the water surface (channel center).
 pub const RIVER_DEPTH: f32 = 1.4;
 /// Bank rise per unit t (t = distance / half-width) past the shoreline.
-const RIVER_BANK: f32 = 3.0;
+pub(crate) const RIVER_BANK: f32 = 3.0;
 /// River-shaped corridor half-width in units of t (beyond: untouched).
 pub const RIVER_CORRIDOR: f32 = 2.3;
+
+// ---- Crossings ----------------------------------------------------------
+// The channel is impassable except at two spans (M2TW-style): a shallow
+// ford in the north half and a stone bridge in the south half.
+
+/// z of the ford crossing (north half): bed rises to ankle depth.
+pub const FORD_Z: f32 = -110.0;
+/// z of the bridge crossing (south half): solid deck over the channel.
+pub const BRIDGE_Z: f32 = 130.0;
+/// Half-length of the ford's traversable span along z.
+pub const FORD_HALF_SPAN: f32 = 14.0;
+/// Half-width of the bridge deck along z (the walkable band).
+pub const BRIDGE_HALF_SPAN: f32 = 6.0;
+/// Deck height above the local water level.
+pub const BRIDGE_DECK_LIFT: f32 = 1.5;
+/// Ford bed depth below the water (ankle-deep wade).
+const FORD_DEPTH: f32 = 0.35;
+
+/// Slope (rise per meter) at which ground becomes impassable: terrace
+/// risers, gorge walls, crater lips. Below this the slope penalty only.
+pub const SLOPE_BLOCK: f32 = 1.0;
+
+/// The bridge deck rectangle (x across the channel, z along it).
+/// Units inside it walk at deck height and are never "in the water".
+pub fn bridge_deck_contains(x: f32, z: f32) -> bool {
+    if (z - BRIDGE_Z).abs() >= BRIDGE_HALF_SPAN {
+        return false;
+    }
+    // Deck lands where the carved bank profile reaches deck height:
+    // wl + (t-1)*BANK = wl + LIFT -> t = 1 + LIFT/BANK.
+    let t_deck = 1.0 + BRIDGE_DECK_LIFT / RIVER_BANK;
+    (x - river_center_x(z)).abs() < t_deck * river_half_width(z)
+}
 
 fn smoothstep(a: f32, b: f32, x: f32) -> f32 {
     let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
@@ -226,6 +348,15 @@ fn smoothstep(a: f32, b: f32, x: f32) -> f32 {
 /// Riverbed depth below the water at normalized distance t (0 at shore).
 pub fn river_bed_depth(t: f32) -> f32 {
     RIVER_DEPTH * (1.0 - t * t).max(0.0).powf(0.75)
+}
+
+/// Channel is impassable here (mask rule): inside the shoreline, not at
+/// the ford span. The bridge span stays blocked in the mask — its deck
+/// is exempted by `blocked_at`'s rectangle test instead, so men can
+/// neither wade under the bridge nor be shoved off its sides.
+fn river_blocks(p: Vec2) -> bool {
+    let d = (p.x - river_center_x(p.y)).abs();
+    d < river_half_width(p.y) * 0.95 && (p.y - FORD_Z).abs() >= FORD_HALF_SPAN
 }
 
 fn generate_terrain(mut commands: Commands) {
@@ -250,10 +381,12 @@ fn generate_terrain(mut commands: Commands) {
             // Bias up so the battlefield sits in the grass bands; dirt only
             // in real hollows and crater floors.
             h += 2.6;
-            // Terraced highlands: partially quantize taller ground into
-            // 3.5 m steps — flat shading turns the steps into angled,
-            // plateau-like hillsides. The low battlefield is untouched.
-            let ts = smoothstep(8.0, 20.0, h);
+            // Terraced highlands: partially quantize the TALL ground
+            // into 3.5 m steps — flat shading turns the risers into
+            // angled plateau faces, and the blocked mask makes those
+            // massifs impassable (M2TW mountains framing the field).
+            // Mid-height hills stay smooth and traversable.
+            let ts = smoothstep(15.0, 26.0, h);
             if ts > 0.0 {
                 const STEP: f32 = 3.5;
                 let hq = (h / STEP).round() * STEP;
@@ -268,7 +401,16 @@ fn generate_terrain(mut commands: Commands) {
             if t < RIVER_CORRIDOR {
                 let wl = river_water_level(p.y);
                 let prof = if t <= 1.0 {
-                    wl - river_bed_depth(t)
+                    // The ford's bed rises to ankle depth across its span.
+                    let ford_blend = smoothstep(
+                        FORD_HALF_SPAN,
+                        FORD_HALF_SPAN + 10.0,
+                        (p.y - FORD_Z).abs(),
+                    );
+                    let depth = river_bed_depth(t)
+                        * (FORD_DEPTH / RIVER_DEPTH
+                            + (1.0 - FORD_DEPTH / RIVER_DEPTH) * ford_blend);
+                    wl - depth
                 } else {
                     wl + (t - 1.0) * RIVER_BANK
                 };
@@ -278,8 +420,15 @@ fn generate_terrain(mut commands: Commands) {
             heights[z * VERTS_X + x] = h;
         }
     }
+    let mut blocked = vec![false; VERTS_X * VERTS_Z];
+    for z in 0..VERTS_Z {
+        for x in 0..VERTS_X {
+            blocked[z * VERTS_X + x] = vertex_blocked(&heights, origin, x, z);
+        }
+    }
     commands.insert_resource(Terrain {
         heights,
+        blocked,
         origin,
         dirty: vec![false; CHUNKS_X * CHUNKS_Z],
     });

@@ -18,6 +18,11 @@ const THINK_PERIOD: f32 = 2.0;
 /// Distance penalty per regiment already targeting the same player
 /// regiment (meters-equivalent).
 const SPREAD_PENALTY: f32 = 40.0;
+/// Extra cost for a target across the river: the detour through a
+/// crossing is long, so regiments fight the battle on THEIR bank and
+/// only cross when no same-side targets remain (keeps the crossings
+/// from becoming an army-wide gridlock).
+const CROSS_RIVER_PENALTY: f32 = 250.0;
 const AI_TEAM: u8 = 1;
 /// At-ease engagement range: an idle regiment (either team, not in HOLD)
 /// attacks an unbroken enemy regiment that closes to this distance.
@@ -122,8 +127,13 @@ fn ai_think(
         let Some((best, _)) = (0..groups.list.len())
             .filter(|&tg| alive_player(&groups, tg))
             .map(|tg| {
-                let cost =
-                    from.distance(groups.list[tg].centroid) + SPREAD_PENALTY * load[tg] as f32;
+                let c = groups.list[tg].centroid;
+                let cross = if crate::terrain::same_river_side(from, c) {
+                    0.0
+                } else {
+                    CROSS_RIVER_PENALTY
+                };
+                let cost = from.distance(c) + SPREAD_PENALTY * load[tg] as f32 + cross;
                 (tg, cost)
             })
             .min_by(|a, b| a.1.total_cmp(&b.1))
@@ -183,10 +193,13 @@ fn auto_engage(time: Res<Time>, mut groups: ResMut<Groups>, mut next: Local<f32>
         }
         let team = gd.team;
         let from = gd.centroid;
+        // Same-bank only: a regiment across the river is a long detour
+        // via a crossing, not an "at ease" threat worth chasing.
         let Some((tg, d2)) = snapshot
             .iter()
             .enumerate()
             .filter(|(_, (tt, count, _, broken))| *tt != team && *count > 0 && !broken)
+            .filter(|(_, (_, _, c, _))| crate::terrain::same_river_side(from, *c))
             .map(|(tg, (_, _, c, _))| (tg, c.distance_squared(from)))
             .min_by(|a, b| a.1.total_cmp(&b.1))
         else {
