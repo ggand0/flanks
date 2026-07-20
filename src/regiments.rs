@@ -31,7 +31,7 @@ impl Plugin for RegimentsPlugin {
         app.add_systems(Startup, spawn_battle)
             .add_systems(
                 Update,
-                (rout_test_log, dir_test_log, arena_log, charge_test_log, restart_key),
+                (rout_test_log, dir_test_log, arena_log, charge_test_log, pile_test_log, melee_diag_log, join_test_log, routpass_test_log, restart_key),
             );
     }
 }
@@ -136,6 +136,18 @@ fn do_spawn_battle(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
     }
     if std::env::var("FL_TEST_CHARGE").is_ok() {
         spawn_charge_test(units, terrain, groups);
+        return;
+    }
+    if std::env::var("FL_TEST_PILE").is_ok() {
+        spawn_pile_test(units, terrain, groups);
+        return;
+    }
+    if std::env::var("FL_TEST_JOIN").is_ok() {
+        spawn_join_test(units, terrain, groups);
+        return;
+    }
+    if std::env::var("FL_TEST_ROUTPASS").is_ok() {
+        spawn_routpass_test(units, terrain, groups);
         return;
     }
 
@@ -409,6 +421,236 @@ fn charge_test_log(
         staggered[0],
         staggered[1],
     );
+}
+
+/// FL_TEST_PILE=1: the pile-on order — six blue regiments in a 3x2
+/// block, ALL attack-ordered at one holding orange regiment (the blob
+/// repro from the FL_RECTFIGHT saga). Acceptance: the fight crowds the
+/// victim's perimeter and the second wave stands PRESSED against the
+/// fighting mass (not parked at parade pitch, not smeared into one
+/// ball); the victim collapses; blues re-dress rectangles afterward.
+fn spawn_pile_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
+    let mut list = Vec::new();
+    spawn_regiment(units, terrain, &mut list, 1, KIND_LIGHT, Vec2::new(0.0, 60.0), 500, 1.0);
+    list[0].hold = true;
+    for row in 0..2 {
+        for col in 0..3 {
+            let anchor =
+                Vec2::new((col as f32 - 1.0) * 55.0, -40.0 - row as f32 * 35.0);
+            spawn_regiment(units, terrain, &mut list, 0, KIND_LIGHT, anchor, 500, -1.0);
+            let g = list.len() - 1;
+            list[g].order = Some(crate::orders::Order::Attack(0));
+            list[g].auto_order = true;
+        }
+    }
+    groups.list = list;
+    info!("[pile-test] six blue regiments attack ONE holding orange regiment");
+}
+
+/// FL_TEST_JOIN=1: the join-the-fight order (owner's repro). Orange
+/// attacks blue A's line head-on; blue B stands BEHIND A, ordered onto
+/// the same orange regiment at spawn. Acceptance: B's march never
+/// halts for the overflow trickle that pokes it, B routes AROUND A's
+/// ranks (friendly blocks are solid to a march), reaches the orange
+/// mass, and its fighter count ramps into the dozens.
+fn spawn_join_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
+    let mut list = Vec::new();
+    spawn_regiment(units, terrain, &mut list, 1, KIND_LIGHT, Vec2::new(0.0, 50.0), 500, 1.0);
+    list[0].order = Some(crate::orders::Order::Attack(1));
+    list[0].auto_order = true;
+    // A and B carry PLAYER-issued orders (auto_order stays false): the
+    // at-ease AI stands auto-engaged regiments down when their target
+    // breaks — correct doctrine, but the owner's repro is about
+    // player-ordered attacks, which persist through the rout.
+    spawn_regiment(units, terrain, &mut list, 0, KIND_LIGHT, Vec2::new(0.0, 10.0), 500, -1.0);
+    list[1].order = Some(crate::orders::Order::Attack(0));
+    spawn_regiment(units, terrain, &mut list, 0, KIND_LIGHT, Vec2::new(0.0, -30.0), 500, -1.0);
+    list[2].order = Some(crate::orders::Order::Attack(0));
+    groups.list = list;
+    info!("[join-test] orange attacks A's line; B behind A ordered onto the same orange");
+}
+
+/// FL_TEST_JOIN bookkeeping every 4 s: does B actually get into the
+/// ordered fight instead of stalling behind A on overflow duels?
+fn join_test_log(
+    units: Res<Units>,
+    groups: Res<crate::orders::Groups>,
+    time: Res<Time>,
+    mut next: Local<f32>,
+) {
+    if std::env::var("FL_TEST_JOIN").is_err() || groups.list.len() < 3 {
+        return;
+    }
+    let t = time.elapsed_secs();
+    if t < *next {
+        return;
+    }
+    *next = t + 4.0;
+    let mut b_windups = 0;
+    for i in 0..units.len() {
+        if units.group[i] == 2
+            && units.death_t[i] == 0
+            && units.swing[i] & crate::units::SWING_STATE_MASK == crate::units::SWING_WINDUP
+        {
+            b_windups += 1;
+        }
+    }
+    info!(
+        "[join-test] t={t:.0}s orange {} / A {} / B {} alive; B->orange {:.1} m, B windups {b_windups}, B locked {}",
+        groups.list[0].count,
+        groups.list[1].count,
+        groups.list[2].count,
+        groups.list[2].centroid.distance(groups.list[0].centroid),
+        groups.list[2].engaged_with_target,
+    );
+}
+
+/// FL_TEST_ROUTPASS=1: an ordered withdrawal straight through a formed
+/// friendly line (the owner's "unit makes stupid space for retreating
+/// unit" repro). A holds its line; the passer regiment is Move-ordered
+/// through A's ranks. Acceptance: the passer slips through the seams
+/// at body scale, A's disorder bumps briefly and re-dresses — no
+/// corridor excavated, no lasting raggedness.
+fn spawn_routpass_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
+    let mut list = Vec::new();
+    spawn_regiment(units, terrain, &mut list, 0, KIND_LIGHT, Vec2::new(0.0, 0.0), 500, 1.0);
+    list[0].hold = true;
+    spawn_regiment(units, terrain, &mut list, 0, KIND_LIGHT, Vec2::new(0.0, 35.0), 500, -1.0);
+    list[1].order = Some(crate::orders::Order::Move(Vec2::new(0.0, -60.0)));
+    list[1].auto_order = true;
+    groups.list = list;
+    info!("[routpass-test] passer Move-ordered straight through A's held line");
+}
+
+/// FL_TEST_ROUTPASS bookkeeping every 2 s: A's shape while the passer
+/// walks through it, and the overlap floor.
+fn routpass_test_log(
+    groups: Res<crate::orders::Groups>,
+    stats: Res<crate::movement::SimStats>,
+    time: Res<Time>,
+    mut next: Local<f32>,
+) {
+    if std::env::var("FL_TEST_ROUTPASS").is_err() || groups.list.len() < 2 {
+        return;
+    }
+    let t = time.elapsed_secs();
+    if t < *next {
+        return;
+    }
+    *next = t + 2.0;
+    info!(
+        "[routpass-test] t={t:.0}s A disorder {:.2} m, passer z {:.1}, nn min {:.2}",
+        groups.list[0].disorder,
+        groups.list[1].centroid.y,
+        stats.nn_min,
+    );
+}
+
+/// FL_TEST_PILE bookkeeping every 4 s: victim strength + how many of
+/// the six attackers are actually fighting.
+fn pile_test_log(groups: Res<Groups>, time: Res<Time>, mut next: Local<f32>) {
+    if std::env::var("FL_TEST_PILE").is_err() || groups.list.len() < 7 {
+        return;
+    }
+    let t = time.elapsed_secs();
+    if t < *next {
+        return;
+    }
+    *next = t + 4.0;
+    let engaged = groups.list[1..].iter().filter(|g| g.engaged).count();
+    info!(
+        "[pile-test] t={t:.0}s orange {} alive, blues engaged {engaged}/6",
+        groups.list[0].count
+    );
+}
+
+/// FL_DIAG_MELEE=1: per-rank ground truth for the first engaged
+/// regiment, every 4 s — each rank's headcount, mean distance to the
+/// nearest living enemy, the share of it inside its own weapon reach,
+/// and the share mid-windup. The log that answers "why does only the
+/// first row fight" with data instead of theory.
+fn melee_diag_log(
+    units: Res<Units>,
+    groups: Res<crate::orders::Groups>,
+    grid: Res<crate::spatial::SpatialGrid>,
+    time: Res<Time>,
+    mut next: Local<f32>,
+) {
+    if std::env::var("FL_DIAG_MELEE").is_err() {
+        return;
+    }
+    let t = time.elapsed_secs();
+    if t < *next {
+        return;
+    }
+    *next = t + 4.0;
+    let Some((g, gd)) = groups.list.iter().enumerate().find(|(_, gd)| {
+        gd.engaged
+            && gd.count > 0
+            && !gd.state.is_broken()
+            && gd.shape == crate::formation::FormShape::Rect
+    }) else {
+        return;
+    };
+    let fwd = crate::formation::facing_dir(gd.facing);
+    let pitch = gd.spacing.pitch().y;
+    let mut members: Vec<(usize, f32)> = Vec::new();
+    let mut max_fwd = f32::MIN;
+    for i in 0..units.len() {
+        if units.group[i] as usize == g && units.death_t[i] == 0 {
+            let f = units.home[i].dot(fwd);
+            max_fwd = max_fwd.max(f);
+            members.push((i, f));
+        }
+    }
+    if members.is_empty() {
+        return;
+    }
+    const R: usize = 8; // ranks 0..6 individually, 7+ pooled
+    let mut cnt = [0u32; R];
+    let mut dsum = [0.0f64; R];
+    let mut in_reach = [0u32; R];
+    let mut windup = [0u32; R];
+    for (i, f) in members {
+        let rank = ((((max_fwd - f) / pitch).round() as i64).max(0) as usize).min(R - 1);
+        let p = Vec2::new(units.pos[i].x, units.pos[i].z);
+        let team_bit = (units.team[i] as u32) * crate::spatial::META_TEAM;
+        let mut best = f32::MAX;
+        grid.for_each_candidate(p, 6.0, |o| {
+            if (o.meta & crate::spatial::META_TEAM) != team_bit
+                && (o.meta & crate::spatial::META_DYING) == 0
+            {
+                best = best.min(p.distance_squared(o.xz()));
+            }
+        });
+        cnt[rank] += 1;
+        if best < f32::MAX {
+            let d = best.sqrt();
+            dsum[rank] += d as f64;
+            if d <= crate::unit_types::TYPES[units.kind[i] as usize].reach {
+                in_reach[rank] += 1;
+            }
+        } else {
+            dsum[rank] += 6.0; // beyond the 6 m probe
+        }
+        if units.swing[i] & crate::units::SWING_STATE_MASK == crate::units::SWING_WINDUP {
+            windup[rank] += 1;
+        }
+    }
+    let mut s = String::new();
+    for r in 0..R {
+        if cnt[r] == 0 {
+            continue;
+        }
+        s.push_str(&format!(
+            " r{r}[n{} d{:.2} reach{}% wind{}%]",
+            cnt[r],
+            dsum[r] / cnt[r] as f64,
+            in_reach[r] * 100 / cnt[r],
+            windup[r] * 100 / cnt[r],
+        ));
+    }
+    info!("[melee-diag] t={t:.0}s regiment {g}:{s}");
 }
 
 /// FL_ARENA=1: hand-testing range for directional damage. Two mirrored

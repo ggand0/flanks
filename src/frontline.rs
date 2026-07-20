@@ -252,11 +252,24 @@ fn update_field(
 
 /// Refresh group centroids, contact flags, and charge state (bookkeeping
 /// only — nothing here steers units).
+/// FL_RECTFIGHT: fraction of living strength that must be in a swing
+/// cycle against the ordered target for the path to freeze. The
+/// engine tracks both engagedSoldiers count and engagedRatio per
+/// enemy unit; a percentage scales to remnants (10 absolute was a
+/// third of a 30-man remnant but 1% of a full regiment). Floor of 4
+/// so a 2-man trickle against a 50-man remnant never locks.
+const ENGAGE_LOCK_FRAC: f32 = 0.03;
+const ENGAGE_LOCK_FLOOR: u32 = 4;
+/// Squared range for counting a soldier as fighting his ordered target.
+const ENGAGE_RANGE_SQ: f32 = 4.0 * 4.0;
+
 fn update_groups(units: Res<Units>, mut groups: ResMut<Groups>) {
+    let rf = crate::formation::rectfight();
     let n = groups.list.len();
     let mut sums = vec![Vec2::ZERO; n];
     let mut counts = vec![0usize; n];
     let mut fighting = vec![false; n];
+    let mut fight_vs = vec![0u32; n];
     // Disorder measures SHAPE coherence, not travel: deviation from the
     // slot relative to the regiment's own centroid (last tick's — 33 ms
     // stale is nothing at 2 s smoothing). A rigid march scores ~0; a
@@ -280,6 +293,31 @@ fn update_groups(units: Res<Units>, mut groups: ResMut<Groups>) {
             && units.swing[i] & crate::units::SWING_STATE_MASK == crate::units::SWING_WINDUP
         {
             fighting[g] = true;
+        }
+        // Per-ordered-target engagement count (FL_RECTFIGHT): men in a
+        // swing cycle whose combat memo points at a living soldier of
+        // the regiment's ORDERED target, close enough to be a real
+        // fight. Recover-state memos can be spawn garbage, so the
+        // target is validated by group, life, and distance.
+        if rf && units.death_t[i] == 0 {
+            let st = units.swing[i] & crate::units::SWING_STATE_MASK;
+            if (st == crate::units::SWING_WINDUP || st == crate::units::SWING_RECOVER)
+                && let Some(crate::orders::Order::Attack(ot)) = groups.list[g].order
+            {
+                let ti = units.target[i] as usize;
+                if ti < units.len()
+                    && units.group[ti] as usize == ot as usize
+                    && units.death_t[ti] == 0
+                    && Vec2::new(
+                        units.pos[ti].x - units.pos[i].x,
+                        units.pos[ti].z - units.pos[i].z,
+                    )
+                    .length_squared()
+                        < ENGAGE_RANGE_SQ
+                {
+                    fight_vs[g] += 1;
+                }
+            }
         }
     }
     let cents: Vec<Vec2> = sums
@@ -344,13 +382,63 @@ fn update_groups(units: Res<Units>, mut groups: ResMut<Groups>) {
             group.engage_hold = group.engage_hold.saturating_sub(1);
         }
         let engaged = group.engage_hold > 0;
+        // Engagement WITH the ordered target (FL_RECTFIGHT): the count
+        // gate above, bridged across swing-cycle gaps like `engaged`.
+        let lock_threshold = ((group.count as f32 * ENGAGE_LOCK_FRAC) as u32).max(ENGAGE_LOCK_FLOOR);
+        if fight_vs[g] >= lock_threshold {
+            group.engage_target_hold = ENGAGE_HOLD_TICKS;
+        } else {
+            group.engage_target_hold = group.engage_target_hold.saturating_sub(1);
+        }
+        let engaged_with_target = group.engage_target_hold > 0;
         if engaged != group.engaged {
             info!(
                 "regiment {g} {}",
                 if engaged { "ENGAGED" } else { "DISENGAGED" }
             );
         }
+        // FL_RECTFIGHT: the frame stops mattering at contact (M2TW:
+        // "formations update after the last point"). The DESTINATION
+        // freezes, not the block: the attack path was computed TO the
+        // enemy as he stood when the ordered fight became real, and
+        // the men keep walking into the enemy mass — bodies stop them
+        // at the interface, surplus ranks stack up behind, and that
+        // pressure is the press. The freeze keys on ENGAGEMENT WITH
+        // THE ORDERED TARGET (count-gated above), never on incidental
+        // contact: a regiment poked by an overflow trickle keeps
+        // marching to its ordered fight while the poked men defend
+        // individually. A defender with no attack order stands his
+        // ground — his line IS his destination. When the fight ends,
+        // the regiment RE-FORMS where it is (the engine's discrete
+        // reforming state): dress the square, then any surviving
+        // order resumes.
+        if rf
+            && group.shape == crate::formation::FormShape::Rect
+            && !group.state.is_broken()
+        {
+            if engaged_with_target
+                && !group.engaged_with_target
+                && let Some(crate::orders::Order::Attack(t)) = group.order
+            {
+                let t = t as usize;
+                if counts[t] > 0 && !broken[t] {
+                    group.anchor = cents[t];
+                }
+                group.fight_origin = group.centroid;
+            }
+            if engaged != group.engaged {
+                if engaged {
+                    if !matches!(group.order, Some(crate::orders::Order::Attack(_))) {
+                        group.anchor = group.centroid;
+                    }
+                } else {
+                    group.anchor = group.centroid;
+                    group.reform = true;
+                }
+            }
+        }
         group.engaged = engaged;
+        group.engaged_with_target = engaged_with_target;
 
         // Charge phase: explicit attack order, inside charge range of the
         // target, not yet in contact. Pure predicate — no latch, nothing

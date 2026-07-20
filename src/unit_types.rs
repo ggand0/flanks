@@ -77,7 +77,7 @@ pub struct UnitTypeParams {
 pub const TYPES: [UnitTypeParams; NUM_KINDS] = [
     // KIND_HEAVY — knights: slow, armored, hard-hitting, shove-heavy.
     UnitTypeParams {
-        hp: 160.0,
+        hp: 240.0,
         attack: 13.0,
         charge_bonus: 5.0,
         defence_skill: 6.0,
@@ -99,7 +99,7 @@ pub const TYPES: [UnitTypeParams; NUM_KINDS] = [
     },
     // KIND_LIGHT — men-at-arms: fast, fragile, quicker swings, spear reach.
     UnitTypeParams {
-        hp: 90.0,
+        hp: 135.0,
         attack: 9.0,
         charge_bonus: 3.0,
         defence_skill: 4.0,
@@ -121,7 +121,7 @@ pub const TYPES: [UnitTypeParams; NUM_KINDS] = [
     // penalty folded in (the anti-cavalry bonus waits for cavalry). The
     // spearwall (formation.rs) is where they earn their keep.
     UnitTypeParams {
-        hp: 100.0,
+        hp: 150.0,
         attack: 7.0,
         charge_bonus: 2.0,
         defence_skill: 3.0,
