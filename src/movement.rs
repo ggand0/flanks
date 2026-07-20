@@ -14,6 +14,17 @@ use crate::unit_types::{BASE_DMG, FACTOR_CLAMP, FACTOR_MULT, TYPES};
 use crate::units::Units;
 
 const SEP_RADIUS: f32 = 1.4;
+/// FL_RECTFIGHT: rest distance for CROSS-TEAM pairs — body contact,
+/// just above the hard-body floor. Resting enemies at SEP_RADIUS was
+/// a force field no body could pass: 1.4 equals our formation pitch
+/// (gap-to-body ratio 1.0), so an enemy block had no gap a man could
+/// enter and at most one rank per side ever reached (measured:
+/// FL_DIAG_MELEE held r1+ at 0% in-reach across a 100 s fight). M2TW
+/// rests bodies at ~0.8 m inside a 1.2 m grid (radius 0.4, Feral-
+/// documented; ratio 1.5): enemies physically fit through the grid
+/// gaps, and the front ranks of both sides interleave into the brawl
+/// band. 0.95 against our 1.4 pitch gives ratio 1.47.
+const ENEMY_SEP_RADIUS: f32 = 0.95;
 const SEP_STRENGTH: f32 = 60.0;
 /// Base neighbor query radius: covers separation and sword reach. Kinds
 /// with longer reach (spears) widen their own scan per unit — the sword
@@ -291,6 +302,14 @@ pub fn step_sim(
         .collect();
     wall_flags.clear();
     wall_flags.extend(group.iter().map(|&g| group_wall[g as usize]));
+    // No packing rule for fighting regiments: vanilla M2TW keeps its
+    // formation grid (and observably LOOSENS it) during melee — the
+    // fighting crowd's spacing is slots + body collision, nothing
+    // else. A shoulder-to-shoulder press rest was tried here (bit 5,
+    // META_PRESS) and it sealed the very seams the intermix needs:
+    // a pressed front's gaps shrank to ~1.05 m against 0.95 m bodies
+    // and symmetric fights collapsed to a two-rank duel line.
+    let rf = crate::formation::rectfight();
 
     let t0 = Instant::now();
     {
@@ -309,8 +328,27 @@ pub fn step_sim(
     let group = &group[..];
     let home = &home[..];
     // Orders resolved to this tick's destination (attack orders chase
-    // their target regiment's current centroid).
-    let orders: Vec<Option<Vec2>> = (0..groups.list.len()).map(|g| groups.goal(g)).collect();
+    // their target regiment's current centroid). FL_RECTFIGHT: an
+    // ENGAGED attack order stops chasing — the frame froze where
+    // contact happened (anchor snap, update_groups) and the men fight
+    // individually from there; dragging the slot grid onward through
+    // a moving enemy centroid is what smeared blocks into blobs. A
+    // BROKEN target keeps the chase alive: pursuit is a hunt, not a
+    // fight. Move orders never freeze — pulling a regiment out of
+    // melee is the player's call.
+    let orders: Vec<Option<Vec2>> = (0..groups.list.len())
+        .map(|g| {
+            let gd = &groups.list[g];
+            if rf
+                && gd.engaged
+                && let Some(crate::orders::Order::Attack(t)) = gd.order
+                && !groups.list[t as usize].state.is_broken()
+            {
+                return None;
+            }
+            groups.goal(g)
+        })
+        .collect();
     let orders = &orders[..];
     let anchors: Vec<Vec2> = groups.list.iter().map(|g| g.anchor).collect();
     let anchors = &anchors[..];
@@ -549,33 +587,60 @@ pub fn step_sim(
                                 impale_idx = o.idx;
                             }
                         }
-                        // Two same-team units both in a wall stance rest
+                        // Two same-team units both in a wall STANCE rest
                         // shoulder to shoulder (symmetric predicate: both
-                        // sides compute the same radius).
-                        let sep_r = if my_wall
-                            && (o.meta & crate::spatial::META_WALL) != 0
-                            && (o.meta & crate::spatial::META_TEAM) == my_team_bit
-                        {
+                        // sides compute the same radius). Ordinary ranks
+                        // keep parade spacing even while fighting — the
+                        // seams between files are what enemy bodies flow
+                        // into.
+                        let sep_r = if (o.meta & crate::spatial::META_TEAM) != my_team_bit {
+                            // Enemy bodies rest at body contact (see
+                            // ENEMY_SEP_RADIUS): contact distance is a
+                            // property of bodies, not of allegiance —
+                            // the wide courtesy gap belongs to ranks
+                            // dressing on the same side only.
+                            if rf { ENEMY_SEP_RADIUS } else { SEP_RADIUS }
+                        } else if my_wall && (o.meta & crate::spatial::META_WALL) != 0 {
                             WALL_SEP_RADIUS
                         } else {
                             SEP_RADIUS
                         };
-                        if d2 < sep_r * sep_r && d2 > 1e-8 {
-                            // Mass-weighted: heavies shove lights aside.
-                            let o_mass = TYPES[crate::spatial::meta_kind(o.meta)].mass;
-                            let mw = 2.0 * o_mass / (my_mass + o_mass);
+                        if d2 < SEP_RADIUS * SEP_RADIUS && d2 > 1e-8 {
                             let len = d2.sqrt();
-                            let w = 1.0 - len / sep_r;
-                            if len < HARD_RADIUS {
-                                // Overlap is resolved POSITIONALLY only.
-                                // (There used to be a hard force boost here
-                                // too — two solvers fighting over the same
-                                // overlap made packed crowds oscillate at
-                                // the accel cap: the every-frame twitch.)
-                                corr += d * ((HARD_RADIUS - len) * CORR_GAIN * mw / len);
+                            if rf {
+                                // The jam density reads at the ORIGINAL
+                                // body scale for EVERY pair. Keyed to the
+                                // tight pair rest radii, per-pair w could
+                                // never sum past ~0.9 at full body-pack —
+                                // below CROWD_SLOW — so the brake and its
+                                // viscous damping went dead and the press
+                                // twitched against undamped springs: the
+                                // exact oscillation the jam was built to
+                                // kill. Rest radii decide where bodies
+                                // STOP; the jam decides when to stop
+                                // SHOVING, and that is a question about
+                                // how much flesh stands around a man, on
+                                // one fixed scale.
+                                crowd += 1.0 - len / SEP_RADIUS;
                             }
-                            push += d * (w * mw / len);
-                            crowd += w;
+                            if d2 < sep_r * sep_r {
+                                // Mass-weighted: heavies shove lights aside.
+                                let o_mass = TYPES[crate::spatial::meta_kind(o.meta)].mass;
+                                let mw = 2.0 * o_mass / (my_mass + o_mass);
+                                let w = 1.0 - len / sep_r;
+                                if len < HARD_RADIUS {
+                                    // Overlap is resolved POSITIONALLY only.
+                                    // (There used to be a hard force boost here
+                                    // too — two solvers fighting over the same
+                                    // overlap made packed crowds oscillate at
+                                    // the accel cap: the every-frame twitch.)
+                                    corr += d * ((HARD_RADIUS - len) * CORR_GAIN * mw / len);
+                                }
+                                push += d * (w * mw / len);
+                                if !rf {
+                                    crowd += w;
+                                }
+                            }
                         }
                     });
 
@@ -605,11 +670,18 @@ pub fn step_sim(
                     // the closing drive below can restore contact. Gated
                     // hard (press + no near enemy + low crowd + 1/8
                     // cadence) to stay off the 200k hot path.
+                    // FL_RECTFIGHT: acquisition stays open until the
+                    // crowd genuinely jams (CROWD_STOP) instead of the
+                    // first hint of density — a rank-2 man shoulder to
+                    // shoulder in the press must still want in; the
+                    // (1 - jam) brake on the surge below is what stops
+                    // him, continuously, when the pack is real.
+                    let acquire_crowd_lim = if rf { CROWD_STOP } else { CROWD_SLOW };
                     if best_idx == u32::MAX
                         && !dying
                         && !routed
                         && press[gi]
-                        && crowd < CROWD_SLOW
+                        && crowd < acquire_crowd_lim
                         && (i as u32).wrapping_add(tick_seed).is_multiple_of(8)
                     {
                         let mut far_d2 = WIDE_ACQUIRE_R * WIDE_ACQUIRE_R;
@@ -788,17 +860,17 @@ pub fn step_sim(
                     // sweeps reindex, so it is validated as "some enemy
                     // within closing range" — a legitimate closing target
                     // regardless of identity.
-                    let close_to = if sw_chunk[j] & crate::units::SWING_STATE_MASK
+                    let (close_to, memo_close) = if sw_chunk[j] & crate::units::SWING_STATE_MASK
                         != crate::units::SWING_READY
                         && (tgt_chunk[j] as usize) < pos_prev.len()
                     {
-                        tgt_chunk[j]
+                        (tgt_chunk[j], false)
                     } else if best_idx != u32::MAX {
-                        best_idx
-                    } else if crowd < CROWD_SLOW {
-                        tgt_chunk[j]
+                        (best_idx, false)
+                    } else if crowd < acquire_crowd_lim {
+                        (tgt_chunk[j], true)
                     } else {
-                        u32::MAX
+                        (u32::MAX, false)
                     };
                     if !dying
                         && !routed
@@ -810,7 +882,17 @@ pub fn step_sim(
                         // Held regiments fight at arm's length only.
                         let max_close = if hold[gi] { 2.2 } else { WIDE_ACQUIRE_R + 1.0 };
                         if dist > 1.2 && dist < max_close {
-                            let urge = ((dist - 1.2) / 0.8).clamp(0.0, 1.0);
+                            let mut urge = ((dist - 1.2) / 0.8).clamp(0.0, 1.0);
+                            // The surge toward a REMEMBERED enemy (no
+                            // one in reach yet) is steering, not combat
+                            // execution: it yields to the jam like all
+                            // steering, so the press brakes on genuine
+                            // body-pack. Ungated this factor is always
+                            // 1 (the memo gate above already required
+                            // crowd < CROWD_SLOW, i.e. jam == 0).
+                            if memo_close {
+                                urge *= 1.0 - jam;
+                            }
                             desired += to_enemy * (speed[i] * 0.35 * urge / dist);
                         }
                     }

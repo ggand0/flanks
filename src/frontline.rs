@@ -349,6 +349,44 @@ fn update_groups(units: Res<Units>, mut groups: ResMut<Groups>) {
                 "regiment {g} {}",
                 if engaged { "ENGAGED" } else { "DISENGAGED" }
             );
+            // FL_RECTFIGHT: the frame stops mattering at contact
+            // (M2TW: "formations update after the last point"). On
+            // engagement the DESTINATION freezes, not the block: M2TW
+            // computes the attack path once, TO the enemy as he stood,
+            // and the men keep walking into the enemy mass — bodies
+            // stop them at the interface, surplus ranks stack up
+            // behind, and that pressure is the press. Parking the
+            // frame where it stood at first wind-up (the old snap)
+            // rebuilt the standoff one level up: one corner touched,
+            // and every slot behind it held its man out of the fight
+            // (measured: FL_DIAG_MELEE r1+ parked at 3-5 m, 0% in
+            // reach, while the enemy was one stride away). A defender
+            // with no attack order stands his ground — his line IS
+            // his destination. When the fight ends, the regiment
+            // RE-FORMS where it is (the engine's discrete reforming
+            // state): dress the square, then any surviving order
+            // resumes.
+            if crate::formation::rectfight()
+                && group.shape == crate::formation::FormShape::Rect
+                && !group.state.is_broken()
+            {
+                if engaged {
+                    group.anchor =
+                        if let Some(crate::orders::Order::Attack(t)) = group.order {
+                            let t = t as usize;
+                            if counts[t] > 0 && !broken[t] {
+                                cents[t]
+                            } else {
+                                group.centroid
+                            }
+                        } else {
+                            group.centroid
+                        };
+                } else {
+                    group.anchor = group.centroid;
+                    group.reform = true;
+                }
+            }
         }
         group.engaged = engaged;
 

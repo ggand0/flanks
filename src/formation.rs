@@ -29,6 +29,27 @@ const DEFAULT_ASPECT: f32 = 2.2;
 const CLOSE_RANKS_FRAC: f32 = 0.06;
 /// Ticks between close-ranks checks per regiment (staggered by index).
 const CLOSE_RANKS_PERIOD: u32 = 90;
+/// Ticks between close-ranks checks while ENGAGED (FL_RECTFIGHT, ~8 s):
+/// casualties empty slots mid-fight and the block re-dresses where it
+/// stands. Without the gate nobody dresses in contact (pre-existing
+/// behavior, unchanged).
+const ENGAGED_CLOSE_RANKS_PERIOD: u32 = 240;
+
+/// FL_RECTFIGHT=1 (owner-gated): the M2TW melee model from the engine
+/// research (devlog 0036) — four mechanisms, all men-level or existing
+/// machinery. (1) FREEZE: an engaged attack order stops chasing the
+/// target centroid; the frame anchors where contact happened instead
+/// of dragging the slot grid through the enemy block. (2) PRESS:
+/// soldiers of a fighting regiment pack shoulder-to-shoulder toward
+/// the fight (META_PRESS pairs rest at the wall radius) — bodies stop
+/// them, not a density rule. (3) SLOT MEMORY: unchanged — men always
+/// keep their slots. (4) REFORM: when the fight ends the regiment
+/// re-dresses where it stands (a discrete event, like the engine's
+/// `reforming` state).
+pub fn rectfight() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FL_RECTFIGHT").is_ok())
+}
 
 /// Formation shape of a regiment.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -177,7 +198,7 @@ impl Plugin for FormationPlugin {
             FixedUpdate,
             apply_reforms.before(crate::movement::step_sim),
         )
-        .add_systems(Update, (formation_keys, test_form_script));
+        .add_systems(Update, (formation_keys, test_form_script, rectfight_log));
     }
 }
 
@@ -342,6 +363,32 @@ fn test_form_script(
     }
 }
 
+/// FL_RECTFIGHT diagnostic, every 4 s while anyone fights: mean
+/// disorder (m off the slots) of engaged regiments — the
+/// blocks-stay-blocks number. FL_LOG_DISORDER=1 fires it with the
+/// gate off, for the A/B baseline.
+fn rectfight_log(groups: Res<Groups>, time: Res<Time>, mut next: Local<f32>) {
+    if !rectfight() && std::env::var("FL_LOG_DISORDER").is_err() {
+        return;
+    }
+    let t = time.elapsed_secs();
+    if t < *next {
+        return;
+    }
+    *next = t + 4.0;
+    let (mut disorder, mut regs) = (0.0f32, 0usize);
+    for gd in groups.list.iter().filter(|gd| gd.engaged && gd.count > 0) {
+        disorder += gd.disorder;
+        regs += 1;
+    }
+    if regs > 0 {
+        info!(
+            "[rectfight] t={t:.0}s {regs} engaged regiments, mean disorder {:.2} m",
+            disorder / regs as f32
+        );
+    }
+}
+
 /// Formation hotkeys for the selection — F: wall on/off (shieldwall for
 /// sword regiments, spearwall for spears), L: loose order on/off,
 /// B: blob <-> ranks (the pre-formation look, kept for levies).
@@ -448,15 +495,27 @@ fn apply_reforms(mut units: ResMut<Units>, mut groups: ResMut<Groups>, mut tick:
             continue;
         }
         let mut do_reform = gd.reform;
-        if !do_reform
-            && gd.shape == FormShape::Rect
-            && !gd.engaged
-            && (*tick).wrapping_add(g as u32).is_multiple_of(CLOSE_RANKS_PERIOD)
-        {
-            let lost = gd.count_at_reform.saturating_sub(gd.count);
-            if lost >= 8.max((gd.count_at_reform as f32 * CLOSE_RANKS_FRAC) as usize) {
-                do_reform = true;
-                info!("regiment {g} closes ranks ({} men)", gd.count);
+        if !do_reform && gd.shape == FormShape::Rect && (!gd.engaged || rectfight()) {
+            let period = if gd.engaged {
+                ENGAGED_CLOSE_RANKS_PERIOD
+            } else {
+                CLOSE_RANKS_PERIOD
+            };
+            if (*tick).wrapping_add(g as u32).is_multiple_of(period) {
+                let lost = gd.count_at_reform.saturating_sub(gd.count);
+                if lost >= 8.max((gd.count_at_reform as f32 * CLOSE_RANKS_FRAC) as usize) {
+                    do_reform = true;
+                    // The anchor stays put on purpose: for an attacker
+                    // it is the frozen destination (the press must not
+                    // retreat to wherever the block currently stands),
+                    // for a defender it is the ground he holds — men
+                    // shoved off it lean back toward their line.
+                    info!(
+                        "regiment {g} closes ranks ({} men{})",
+                        gd.count,
+                        if gd.engaged { ", engaged" } else { "" }
+                    );
+                }
             }
         }
         if do_reform {
