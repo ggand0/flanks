@@ -242,7 +242,7 @@ impl Plugin for MovementPlugin {
             .init_resource::<DirTestStats>()
             .insert_resource(DebugViz(true))
             .init_resource::<SpatialGrid>()
-            .add_systems(FixedUpdate, step_sim)
+            .add_systems(FixedUpdate, step_sim.in_set(crate::game_state::SimSet))
             .add_systems(Update, toggle_debug_viz);
     }
 }

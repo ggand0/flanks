@@ -32,7 +32,13 @@ pub struct AiPlugin;
 impl Plugin for AiPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<BattleOutcome>()
-            .add_systems(Update, (ai_think, auto_engage, check_victory));
+            .add_systems(
+                Update,
+                (
+                    (ai_think, auto_engage).in_set(crate::game_state::BattleInputSet),
+                    check_victory,
+                ),
+            );
     }
 }
 
@@ -71,10 +77,11 @@ fn ai_think(
     time: Res<Time>,
     mut groups: ResMut<Groups>,
     outcome: Res<BattleOutcome>,
+    config: Res<crate::game_state::BattleConfig>,
     mut next: Local<f32>,
     mut targets: Local<Vec<Option<usize>>>,
 ) {
-    if !ai_enabled() || outcome.0.is_some() {
+    if !config.ai_enabled || !ai_enabled() || outcome.0.is_some() {
         return;
     }
     let t = time.elapsed_secs();

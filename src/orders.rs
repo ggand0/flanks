@@ -236,13 +236,20 @@ impl Plugin for OrdersPlugin {
             .add_systems(
                 Update,
                 (
-                    (issue_order, draw_order_preview).chain(),
-                    halt_key,
+                    (issue_order, draw_order_preview)
+                        .chain()
+                        .in_set(crate::game_state::BattleInputSet),
+                    halt_key.in_set(crate::game_state::BattleInputSet),
                     test_orders_script,
                     draw_order_gizmos,
                 ),
             )
-            .add_systems(FixedUpdate, clear_arrived_orders.after(crate::movement::step_sim));
+            .add_systems(
+                FixedUpdate,
+                clear_arrived_orders
+                    .after(crate::movement::step_sim)
+                    .in_set(crate::game_state::SimSet),
+            );
     }
 }
 

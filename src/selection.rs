@@ -50,7 +50,11 @@ impl Plugin for SelectionPlugin {
             .init_resource::<ControlGroups>()
             .add_systems(
                 Update,
-                (drag_select, update_hover, control_group_keys, draw_selection_gizmos),
+                (
+                    (drag_select, update_hover, control_group_keys)
+                        .in_set(crate::game_state::BattleInputSet),
+                    draw_selection_gizmos,
+                ),
             );
     }
 }

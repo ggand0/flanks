@@ -8,7 +8,7 @@ use bevy::prelude::*;
 use crate::orders::{GroupData, Groups, RegState};
 use crate::terrain::Terrain;
 use crate::unit_types::{KIND_HEAVY, KIND_LIGHT, KIND_SPEAR};
-use crate::units::{Units, hash01, push_unit, units_per_team};
+use crate::units::{Units, hash01, push_unit};
 
 /// Unit spacing inside a regiment block.
 const SPACING: f32 = 1.4;
@@ -26,21 +26,13 @@ pub struct RegimentsPlugin;
 
 impl Plugin for RegimentsPlugin {
     fn build(&self, app: &mut App) {
-        // Terrain resource is created in PreStartup (generate_terrain).
-        // Morale lives in crate::morale (MoralePlugin).
-        app.add_systems(Startup, spawn_battle)
-            .add_systems(
-                Update,
-                (rout_test_log, dir_test_log, arena_log, charge_test_log, pile_test_log, melee_diag_log, join_test_log, routpass_test_log, restart_key),
-            );
+        app.add_systems(
+            Update,
+            (rout_test_log, dir_test_log, arena_log, charge_test_log, pile_test_log, melee_diag_log, join_test_log, routpass_test_log),
+        );
     }
 }
 
-fn reg_size() -> usize {
-    crate::util::env_or("FL_REG_SIZE", 1000_usize).max(50)
-}
-
-/// Fraction of each army's regiments that are heavy infantry (front ranks).
 fn heavy_frac() -> f32 {
     crate::util::env_or("FL_HEAVY_FRAC", 0.4)
 }
@@ -87,72 +79,30 @@ fn spawn_regiment(
     crate::formation::assign_slots(units, g, gd);
 }
 
-fn spawn_battle(mut units: ResMut<Units>, terrain: Res<Terrain>, mut groups: ResMut<Groups>) {
-    do_spawn_battle(&mut units, &terrain, &mut groups);
-}
-
-/// R: restart the battle from scratch (fresh armies, cleared stats).
-#[allow(clippy::too_many_arguments)] // bevy system params
-fn restart_key(
-    keys: Res<ButtonInput<KeyCode>>,
-    mut units: ResMut<Units>,
-    terrain: Res<Terrain>,
-    mut groups: ResMut<Groups>,
-    mut stats: ResMut<crate::combat::CombatStats>,
-    mut selection: ResMut<crate::orders::Selection>,
-    mut outcome: ResMut<crate::ai::BattleOutcome>,
-    mut corpses: ResMut<crate::render_units::Corpses>,
-    mut dir_stats: ResMut<crate::movement::DirTestStats>,
+pub fn do_spawn_battle(
+    units: &mut Units,
+    terrain: &Terrain,
+    groups: &mut Groups,
+    config: &crate::game_state::BattleConfig,
 ) {
-    if !keys.just_pressed(KeyCode::KeyR) {
-        return;
-    }
-    *units = Units::default();
-    *stats = crate::combat::CombatStats::default();
-    *dir_stats = crate::movement::DirTestStats::default();
-    *selection = crate::orders::Selection::default();
-    outcome.0 = None;
-    corpses.clear();
-    do_spawn_battle(&mut units, &terrain, &mut groups);
-    info!("battle restarted");
-}
-
-fn do_spawn_battle(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
-    if std::env::var("FL_TEST_SURROUND").is_ok() {
-        crate::units::spawn_surround_test(units, terrain, groups);
-        return;
-    }
-    if std::env::var("FL_TEST_ROUT").is_ok() {
-        spawn_rout_test(units, terrain, groups);
-        return;
-    }
-    if std::env::var("FL_TEST_DIR").is_ok() {
-        spawn_dir_test(units, terrain, groups);
-        return;
-    }
-    if std::env::var("FL_ARENA").is_ok() {
-        spawn_arena(units, terrain, groups);
-        return;
-    }
-    if std::env::var("FL_TEST_CHARGE").is_ok() {
-        spawn_charge_test(units, terrain, groups);
-        return;
-    }
-    if std::env::var("FL_TEST_PILE").is_ok() {
-        spawn_pile_test(units, terrain, groups);
-        return;
-    }
-    if std::env::var("FL_TEST_JOIN").is_ok() {
-        spawn_join_test(units, terrain, groups);
-        return;
-    }
-    if std::env::var("FL_TEST_ROUTPASS").is_ok() {
-        spawn_routpass_test(units, terrain, groups);
-        return;
+    use crate::game_state::Scenario;
+    match config.scenario {
+        Scenario::Surround => {
+            crate::units::spawn_surround_test(units, terrain, groups);
+            return;
+        }
+        Scenario::Rout => { spawn_rout_test(units, terrain, groups); return; }
+        Scenario::Dir => { spawn_dir_test(units, terrain, groups); return; }
+        Scenario::Arena => { spawn_arena(units, terrain, groups); return; }
+        Scenario::Charge => { spawn_charge_test(units, terrain, groups); return; }
+        Scenario::Pile => { spawn_pile_test(units, terrain, groups); return; }
+        Scenario::Join => { spawn_join_test(units, terrain, groups); return; }
+        Scenario::Routpass => { spawn_routpass_test(units, terrain, groups); return; }
+        Scenario::Normal => {}
     }
 
-    let per_team = units_per_team();
-    let size = reg_size();
+    let per_team = config.units_per_team;
+    let size = config.reg_size;
     let n_regs = (per_team / size).max(1);
 
     // Block geometry: wider than deep (~2.2:1).

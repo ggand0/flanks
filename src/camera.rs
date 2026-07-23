@@ -59,7 +59,7 @@ fn control_camera(
     motion: Res<AccumulatedMouseMotion>,
     scroll: Res<AccumulatedMouseScroll>,
     window: Query<&Window, With<PrimaryWindow>>,
-    time: Res<Time>,
+    time: Res<Time<Real>>,
     mut query: Query<&mut RtsCamera>,
 ) {
     let Ok(mut cam) = query.single_mut() else {

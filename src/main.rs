@@ -5,6 +5,7 @@ mod camera;
 mod combat;
 mod formation;
 mod frontline;
+mod game_state;
 mod morale;
 mod movement;
 mod orders;
@@ -58,6 +59,7 @@ fn main() {
                     ..default()
                 }),
         )
+        .add_plugins(game_state::GameShellPlugin)
         .add_plugins((
             terrain::TerrainPlugin,
             water::WaterPlugin,

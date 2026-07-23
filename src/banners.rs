@@ -23,10 +23,15 @@ pub struct BannersPlugin;
 
 impl Plugin for BannersPlugin {
     fn build(&self, app: &mut App) {
-        // PostStartup: the regiment spawn fills Groups during Startup.
-        app.add_systems(PostStartup, spawn_banners).add_systems(
+        app.add_systems(
+            OnEnter(crate::game_state::GameState::Battle),
+            spawn_banners.after(crate::game_state::setup_battle),
+        )
+        .add_systems(
             Update,
-            update_banners.after(crate::camera::apply_camera_transform),
+            update_banners
+                .after(crate::camera::apply_camera_transform)
+                .run_if(in_state(crate::game_state::GameState::Battle)),
         );
     }
 }
@@ -126,6 +131,7 @@ fn spawn_banners(
             .spawn((
                 Transform::default(),
                 Visibility::default(),
+                DespawnOnExit(crate::game_state::GameState::Battle),
                 Banner {
                     group: g,
                     flag,
@@ -158,12 +164,13 @@ fn update_banners(
     viz: Res<crate::movement::DebugViz>,
     camera: Query<&crate::camera::RtsCamera>,
     time: Res<Time>,
-    assets: Res<BannerAssets>,
+    assets: Option<Res<BannerAssets>>,
     mut roots: Query<(&Banner, &mut Transform, &mut Visibility)>,
     mut parts: Query<(&mut Transform, &mut Visibility), Without<Banner>>,
     mut part_mats: Query<&mut MeshMaterial3d<StandardMaterial>>,
 ) {
     let Ok(cam) = camera.single() else { return };
+    let Some(assets) = assets else { return };
     let billboard = Quat::from_rotation_y(cam.yaw);
     let dist_scale = (cam.distance * 0.013).clamp(0.8, 3.2);
 

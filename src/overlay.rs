@@ -30,7 +30,41 @@ impl Plugin for OverlayPlugin {
             RenderDiagnosticsPlugin,
         ))
             .add_systems(Startup, (spawn_overlay, spawn_inspect_panel))
-            .add_systems(Update, (update_overlay, update_inspect_panel));
+            .add_systems(
+                OnEnter(crate::game_state::GameState::Battle),
+                show_overlay,
+            )
+            .add_systems(
+                Update,
+                (update_overlay, update_inspect_panel)
+                    .run_if(in_state(crate::game_state::GameState::Battle)),
+            )
+            .add_systems(
+                OnEnter(crate::game_state::GameState::Menu),
+                hide_overlay,
+            )
+            .add_systems(
+                OnEnter(crate::game_state::GameState::Results),
+                hide_overlay,
+            );
+    }
+}
+
+fn show_overlay(mut overlay: Query<&mut Visibility, With<OverlayText>>) {
+    for mut vis in &mut overlay {
+        *vis = Visibility::Visible;
+    }
+}
+
+fn hide_overlay(
+    mut overlay: Query<&mut Visibility, With<OverlayText>>,
+    mut panel: Query<&mut Visibility, (With<InspectPanel>, Without<OverlayText>)>,
+) {
+    for mut vis in &mut overlay {
+        *vis = Visibility::Hidden;
+    }
+    for mut vis in &mut panel {
+        *vis = Visibility::Hidden;
     }
 }
 
@@ -48,6 +82,7 @@ fn spawn_overlay(mut commands: Commands) {
             left: Val::Px(8.0),
             ..default()
         },
+        Visibility::Hidden,
         OverlayText,
     ));
 }
