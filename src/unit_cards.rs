@@ -32,6 +32,22 @@ struct CardFill(usize);
 #[derive(Component)]
 struct CardMorale(usize);
 
+/// Kind letter fallback, shown when the card is too narrow for the icon.
+#[derive(Component)]
+struct CardGlyph(usize);
+
+/// Node-drawn kind icon (helm / spear / sword), shown on wide cards.
+#[derive(Component)]
+struct CardIcon(usize);
+
+/// The Loose button's icon reflects what pressing it yields: spread
+/// squares while the selection is in close order, tight squares once
+/// everyone is loose (M2TW-style state icon).
+#[derive(Component)]
+struct LooseIconVariant {
+    tight: bool,
+}
+
 #[derive(Component, Clone, Copy, PartialEq, Eq)]
 enum ControlButton {
     Halt,
@@ -62,6 +78,12 @@ const BTN_PRESSED: Color = Color::srgba(0.10, 0.11, 0.14, 0.95);
 const BTN_ACTIVE: Color = Color::srgba(0.22, 0.38, 0.62, 0.95);
 const BTN_ACTIVE_HOVER: Color = Color::srgba(0.30, 0.48, 0.74, 0.95);
 const BTN_DISABLED: Color = Color::srgba(0.09, 0.10, 0.12, 0.80);
+
+/// M2TW-ish parchment pictograms on the dark circles.
+const ICON_COLOR: Color = Color::srgb(0.90, 0.87, 0.76);
+const ICON_DETAIL: Color = Color::srgb(0.10, 0.11, 0.13);
+/// Cards at least this wide (logical px) swap the kind letter for the icon.
+const CARD_ICON_MIN_W: f32 = 30.0;
 
 /// True when the pointer sits on any interactive UI node: map input
 /// (lasso start, RMB order start) must not fire through the HUD.
@@ -125,6 +147,134 @@ fn morale_color(gd: &crate::orders::GroupData) -> Color {
     }
 }
 
+// ── Icon drawing ──
+//
+// Pictograms are composed from plain UI nodes (rects + border-radius
+// rounding), matching the game's flat look with no image assets.
+
+/// Absolute-positioned rectangle inside an icon canvas.
+fn shape(
+    p: &mut ChildSpawnerCommands,
+    (x, y, w, h): (f32, f32, f32, f32),
+    color: Color,
+    radius: BorderRadius,
+) {
+    p.spawn((
+        Node {
+            position_type: PositionType::Absolute,
+            left: Val::Px(x),
+            top: Val::Px(y),
+            width: Val::Px(w),
+            height: Val::Px(h),
+            border_radius: radius,
+            ..default()
+        },
+        BackgroundColor(color),
+    ));
+}
+
+/// Fixed-size relative canvas the shapes position inside.
+fn icon_canvas(w: f32, h: f32) -> Node {
+    Node {
+        width: Val::Px(w),
+        height: Val::Px(h),
+        ..default()
+    }
+}
+
+/// Knight's helm: rounded dome with a dark eye slit.
+fn draw_helm(p: &mut ChildSpawnerCommands) {
+    let dome = BorderRadius {
+        top_left: Val::Px(7.0),
+        top_right: Val::Px(7.0),
+        bottom_left: Val::Px(1.0),
+        bottom_right: Val::Px(1.0),
+    };
+    shape(p, (3.0, 2.0, 14.0, 18.0), ICON_COLOR, dome);
+    shape(p, (4.0, 9.0, 12.0, 2.0), ICON_DETAIL, BorderRadius::ZERO);
+    // Nose bar splitting the slit.
+    shape(p, (9.0, 9.0, 2.0, 5.0), ICON_COLOR, BorderRadius::ZERO);
+}
+
+/// Spear: leaf head on a long shaft.
+fn draw_spear(p: &mut ChildSpawnerCommands) {
+    shape(p, (7.0, 0.0, 6.0, 9.0), ICON_COLOR, BorderRadius::MAX);
+    shape(p, (9.0, 8.0, 2.0, 14.0), ICON_COLOR, BorderRadius::ZERO);
+}
+
+/// Arming sword: blade, crossguard, grip.
+fn draw_sword(p: &mut ChildSpawnerCommands) {
+    shape(p, (8.5, 1.0, 3.0, 12.0), ICON_COLOR, BorderRadius::ZERO);
+    shape(p, (5.0, 13.0, 10.0, 2.0), ICON_COLOR, BorderRadius::ZERO);
+    shape(p, (9.0, 15.0, 2.0, 5.0), ICON_COLOR, BorderRadius::ZERO);
+    shape(p, (8.0, 20.0, 4.0, 2.0), ICON_COLOR, BorderRadius::MAX);
+}
+
+fn draw_kind_icon(p: &mut ChildSpawnerCommands, kind: u8) {
+    match kind {
+        KIND_HEAVY => draw_helm(p),
+        KIND_SPEAR => draw_spear(p),
+        _ => draw_sword(p),
+    }
+}
+
+/// Halt: stop square.
+fn draw_halt(p: &mut ChildSpawnerCommands) {
+    shape(
+        p,
+        (6.0, 6.0, 10.0, 10.0),
+        ICON_COLOR,
+        BorderRadius::all(Val::Px(2.0)),
+    );
+}
+
+/// Wall: three shields shoulder to shoulder.
+fn draw_wall(p: &mut ChildSpawnerCommands) {
+    let shield = BorderRadius {
+        top_left: Val::Px(1.0),
+        top_right: Val::Px(1.0),
+        bottom_left: Val::Px(3.0),
+        bottom_right: Val::Px(3.0),
+    };
+    for x in [2.0, 8.0, 14.0] {
+        shape(p, (x, 5.0, 5.0, 12.0), ICON_COLOR, shield);
+    }
+}
+
+/// Loose: 2x3 squares; both spacing variants exist and refresh toggles
+/// which one is visible (the icon shows what pressing yields).
+fn draw_loose_variant(p: &mut ChildSpawnerCommands, tight: bool) {
+    let (xs, ys): (&[f32], &[f32]) = if tight {
+        (&[4.0, 9.0, 14.0], &[6.0, 11.0])
+    } else {
+        (&[1.0, 9.0, 17.0], &[3.0, 13.0])
+    };
+    for &y in ys {
+        for &x in xs {
+            shape(p, (x, y, 4.0, 4.0), ICON_COLOR, BorderRadius::ZERO);
+        }
+    }
+}
+
+/// Blob: an undressed scatter of men.
+fn draw_blob(p: &mut ChildSpawnerCommands) {
+    for (x, y) in [(3.0, 4.0), (12.0, 2.0), (16.0, 10.0), (5.0, 12.0), (11.0, 16.0)] {
+        shape(p, (x, y, 4.0, 4.0), ICON_COLOR, BorderRadius::MAX);
+    }
+}
+
+/// Hold: a planted shield with a boss.
+fn draw_hold(p: &mut ChildSpawnerCommands) {
+    let shield = BorderRadius {
+        top_left: Val::Px(3.0),
+        top_right: Val::Px(3.0),
+        bottom_left: Val::Px(9.0),
+        bottom_right: Val::Px(9.0),
+    };
+    shape(p, (4.0, 3.0, 14.0, 16.0), ICON_COLOR, shield);
+    shape(p, (9.0, 8.0, 4.0, 4.0), ICON_DETAIL, BorderRadius::MAX);
+}
+
 // ── Spawn ──
 
 fn spawn_card_bar(mut commands: Commands, groups: Res<Groups>) {
@@ -148,7 +298,6 @@ fn spawn_card_bar(mut commands: Commands, groups: Res<Groups>) {
             DespawnOnExit(GameState::Battle),
         ))
         .with_children(|bar| {
-            spawn_control_panel(bar);
             bar.spawn(Node {
                 flex_grow: 1.0,
                 min_width: Val::Px(0.0),
@@ -165,6 +314,7 @@ fn spawn_card_bar(mut commands: Commands, groups: Res<Groups>) {
                     }
                 }
             });
+            spawn_control_panel(bar);
         });
 }
 
@@ -223,38 +373,44 @@ fn spawn_card(strip: &mut ChildSpawnerCommands, g: usize, kind: u8) {
                     ..default()
                 },
                 TextColor(Color::srgba(0.95, 0.95, 0.90, 0.75)),
+                CardGlyph(g),
             ));
+            card.spawn((
+                icon_canvas(20.0, 22.0),
+                CardIcon(g),
+            ))
+            .with_children(|icon| draw_kind_icon(icon, kind));
         });
 }
 
+/// M2TW-style round icon buttons, right end of the bar.
 fn spawn_control_panel(bar: &mut ChildSpawnerCommands) {
-    const BUTTONS: [(ControlButton, &str); 5] = [
-        (ControlButton::Halt, "Halt"),
-        (ControlButton::Wall, "Wall"),
-        (ControlButton::Loose, "Loose"),
-        (ControlButton::Blob, "Blob"),
-        (ControlButton::Hold, "Hold"),
+    const BUTTONS: [ControlButton; 5] = [
+        ControlButton::Halt,
+        ControlButton::Wall,
+        ControlButton::Loose,
+        ControlButton::Blob,
+        ControlButton::Hold,
     ];
     bar.spawn(Node {
-        width: Val::Px(118.0),
         flex_shrink: 0.0,
         flex_direction: FlexDirection::Row,
-        flex_wrap: FlexWrap::Wrap,
-        align_content: AlignContent::FlexEnd,
-        row_gap: Val::Px(2.0),
-        column_gap: Val::Px(2.0),
+        align_items: AlignItems::Center,
+        align_self: AlignSelf::Center,
+        column_gap: Val::Px(6.0),
         ..default()
     })
     .with_children(|panel| {
-        for (btn, label) in BUTTONS {
+        for btn in BUTTONS {
             panel
                 .spawn((
                     Button,
                     Node {
-                        width: Val::Px(56.0),
-                        height: Val::Px(17.0),
+                        width: Val::Px(36.0),
+                        height: Val::Px(36.0),
                         justify_content: JustifyContent::Center,
                         align_items: AlignItems::Center,
+                        border_radius: BorderRadius::MAX,
                         ..default()
                     },
                     BackgroundColor(BTN_DISABLED),
@@ -262,14 +418,44 @@ fn spawn_control_panel(bar: &mut ChildSpawnerCommands) {
                     CustomStyled,
                 ))
                 .with_children(|b| {
-                    b.spawn((
-                        Text::new(label),
-                        TextFont {
-                            font_size: FontSize::Px(10.0),
-                            ..default()
-                        },
-                        TextColor(Color::srgb(0.80, 0.80, 0.75)),
-                    ));
+                    match btn {
+                        ControlButton::Loose => {
+                            // Both spacing variants stacked on the same
+                            // canvas; refresh shows one.
+                            b.spawn(icon_canvas(22.0, 22.0)).with_children(|c| {
+                                for tight in [false, true] {
+                                    c.spawn((
+                                        Node {
+                                            position_type: PositionType::Absolute,
+                                            left: Val::Px(0.0),
+                                            top: Val::Px(0.0),
+                                            width: Val::Px(22.0),
+                                            height: Val::Px(22.0),
+                                            ..default()
+                                        },
+                                        if tight {
+                                            Visibility::Hidden
+                                        } else {
+                                            Visibility::Inherited
+                                        },
+                                        LooseIconVariant { tight },
+                                    ))
+                                    .with_children(|v| draw_loose_variant(v, tight));
+                                }
+                            });
+                        }
+                        _ => {
+                            b.spawn(icon_canvas(22.0, 22.0)).with_children(|c| {
+                                match btn {
+                                    ControlButton::Halt => draw_halt(c),
+                                    ControlButton::Wall => draw_wall(c),
+                                    ControlButton::Blob => draw_blob(c),
+                                    ControlButton::Hold => draw_hold(c),
+                                    ControlButton::Loose => unreachable!(),
+                                }
+                            });
+                        }
+                    }
                 });
         }
     });
@@ -322,18 +508,32 @@ fn card_hover(cards: Query<(&Interaction, &UnitCard)>, mut hover: ResMut<Hover>)
 
 // ── Card refresh ──
 
-#[allow(clippy::type_complexity)] // disjoint BackgroundColor access
+#[allow(clippy::type_complexity)] // disjoint BackgroundColor/Node access
 fn refresh_cards(
     groups: Res<Groups>,
     selection: Res<Selection>,
-    mut cards: Query<(&UnitCard, &Interaction, &mut BackgroundColor, &mut Outline)>,
+    mut cards: Query<(
+        &UnitCard,
+        &ComputedNode,
+        &Interaction,
+        &mut BackgroundColor,
+        &mut Outline,
+    )>,
     mut fills: Query<
         (&CardFill, &mut Node, &mut BackgroundColor),
-        (Without<UnitCard>, Without<CardMorale>),
+        (Without<UnitCard>, Without<CardMorale>, Without<CardGlyph>, Without<CardIcon>),
     >,
     mut strips: Query<
         (&CardMorale, &mut BackgroundColor),
         (Without<UnitCard>, Without<CardFill>),
+    >,
+    mut glyphs: Query<
+        (&CardGlyph, &mut Node),
+        (Without<UnitCard>, Without<CardFill>, Without<CardIcon>),
+    >,
+    mut icons: Query<
+        (&CardIcon, &mut Node),
+        (Without<UnitCard>, Without<CardFill>, Without<CardGlyph>),
     >,
 ) {
     let set = |bg: &mut BackgroundColor, c: Color| {
@@ -342,7 +542,13 @@ fn refresh_cards(
         }
     };
 
-    for (card, interaction, mut bg, mut outline) in &mut cards {
+    // Wide-enough cards show the kind icon, narrow ones the letter
+    // (which the sliver clip then eats). Indexed by regiment.
+    let mut wide = vec![false; groups.list.len()];
+
+    for (card, computed, interaction, mut bg, mut outline) in &mut cards {
+        wide[card.0] =
+            computed.size().x * computed.inverse_scale_factor() >= CARD_ICON_MIN_W;
         let gd = &groups.list[card.0];
         let want_bg = if gd.count == 0 {
             CARD_BG_DEAD
@@ -385,6 +591,21 @@ fn refresh_cards(
         };
         set(&mut bg, color);
     }
+
+    // Display (not Visibility) so the hidden one leaves the flex layout;
+    // it only flips when a card crosses the width threshold.
+    for (glyph, mut node) in &mut glyphs {
+        let want = if wide[glyph.0] { Display::None } else { Display::Flex };
+        if node.display != want {
+            node.display = want;
+        }
+    }
+    for (icon, mut node) in &mut icons {
+        let want = if wide[icon.0] { Display::Flex } else { Display::None };
+        if node.display != want {
+            node.display = want;
+        }
+    }
 }
 
 // ── Control panel ──
@@ -416,6 +637,7 @@ fn refresh_control_buttons(
     groups: Res<Groups>,
     selection: Res<Selection>,
     mut query: Query<(&ControlButton, &Interaction, &mut BackgroundColor)>,
+    mut loose_icons: Query<(&LooseIconVariant, &mut Visibility)>,
 ) {
     let picked: Vec<usize> = selection
         .regiments
@@ -430,6 +652,7 @@ fn refresh_control_buttons(
         .map(|(g, _)| g)
         .collect();
 
+    let mut loose_active = false;
     for (btn, interaction, mut bg) in &mut query {
         let want = if picked.is_empty() {
             BTN_DISABLED
@@ -447,6 +670,9 @@ fn refresh_control_buttons(
                 }
                 ControlButton::Hold => picked.iter().all(|&g| groups.list[g].hold),
             };
+            if *btn == ControlButton::Loose {
+                loose_active = active;
+            }
             match (active, interaction) {
                 (_, Interaction::Pressed) => BTN_PRESSED,
                 (true, Interaction::Hovered) => BTN_ACTIVE_HOVER,
@@ -457,6 +683,19 @@ fn refresh_control_buttons(
         };
         if bg.0 != want {
             bg.0 = want;
+        }
+    }
+
+    // The Loose icon previews the press result: spread squares while in
+    // close order, tight squares once the whole selection is loose.
+    for (variant, mut vis) in &mut loose_icons {
+        let want = if variant.tight == loose_active {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
+        if *vis != want {
+            *vis = want;
         }
     }
 }
