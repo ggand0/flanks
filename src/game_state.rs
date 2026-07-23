@@ -83,35 +83,19 @@ impl Default for BattleConfig {
     }
 }
 
-#[derive(States, Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(States, Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub enum GameState {
+    #[default]
     Menu,
     Battle,
     Results,
 }
 
-impl Default for GameState {
-    fn default() -> Self {
-        GameState::Menu
-    }
-}
-
 fn scripts_active() -> bool {
-    [
-        "FL_TEST_FRONT",
-        "FL_TEST_ORDERS",
-        "FL_TEST_SURROUND",
-        "FL_TEST_ROUT",
-        "FL_TEST_FORM",
-        "FL_TEST_DIR",
-        "FL_TEST_CHARGE",
-        "FL_TEST_PILE",
-        "FL_TEST_JOIN",
-        "FL_TEST_ROUTPASS",
-        "FL_ARENA",
-    ]
-    .iter()
-    .any(|k| std::env::var(k).is_ok())
+    Scenario::from_env() != Scenario::Normal
+        || std::env::var("FL_TEST_FRONT").is_ok()
+        || std::env::var("FL_TEST_ORDERS").is_ok()
+        || std::env::var("FL_TEST_FORM").is_ok()
 }
 
 #[derive(SystemSet, Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -136,7 +120,6 @@ enum OptionButton {
 
 #[derive(Component)]
 struct DebugButton(Scenario);
-
 
 #[derive(Component)]
 struct PauseRoot;
@@ -514,6 +497,7 @@ fn sync_scenario_env(scenario: Scenario) {
 
 // ── Battle lifecycle ──
 
+#[allow(clippy::too_many_arguments)]
 pub fn setup_battle(
     mut units: ResMut<Units>,
     terrain: Res<Terrain>,
@@ -650,20 +634,12 @@ fn pause_buttons(
         if *interaction != Interaction::Pressed {
             continue;
         }
-        match btn {
-            PauseButton::Resume => {
-                virt_time.unpause();
-                for e in &overlay {
-                    commands.entity(e).despawn();
-                }
-            }
-            PauseButton::QuitToMenu => {
-                virt_time.unpause();
-                for e in &overlay {
-                    commands.entity(e).despawn();
-                }
-                next.set(GameState::Menu);
-            }
+        virt_time.unpause();
+        for e in &overlay {
+            commands.entity(e).despawn();
+        }
+        if matches!(btn, PauseButton::QuitToMenu) {
+            next.set(GameState::Menu);
         }
     }
 }
@@ -776,6 +752,7 @@ fn results_buttons(
 
 // ── Shared button hover style ──
 
+#[allow(clippy::type_complexity)]
 fn button_hover_style(
     mut query: Query<(&Interaction, &mut BackgroundColor), (Changed<Interaction>, With<Button>)>,
 ) {
