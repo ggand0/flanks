@@ -2,15 +2,6 @@
 
 use bevy::prelude::*;
 
-/// Units per team. `FL_UNITS` overrides (e.g. FL_UNITS=50000 -> 100k
-/// total). Default 100k/team = 200k total — the perf standard. At 500
-/// spawn columns the formation depth caps out around 125k/team before
-/// rows fall off the terrain edge.
-pub fn units_per_team() -> usize {
-    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| crate::util::env_or("FL_UNITS", 100_000))
-}
-
 /// All per-unit state, structure-of-arrays.
 #[derive(Resource, Default)]
 pub struct Units {

@@ -1,3 +1,4 @@
+use bevy::ecs::hierarchy::ChildSpawnerCommands;
 use bevy::prelude::*;
 use bevy::time::common_conditions::paused as time_paused;
 
@@ -8,6 +9,25 @@ use crate::orders::{Groups, Selection};
 use crate::render_units::Corpses;
 use crate::terrain::Terrain;
 use crate::units::Units;
+
+#[derive(Resource)]
+pub struct BattleConfig {
+    pub units_per_team: usize,
+    pub reg_size: usize,
+    pub use_river_map: bool,
+    pub ai_enabled: bool,
+}
+
+impl Default for BattleConfig {
+    fn default() -> Self {
+        Self {
+            units_per_team: crate::util::env_or("FL_UNITS", 100_000),
+            reg_size: crate::util::env_or("FL_REG_SIZE", 1000_usize).max(50),
+            use_river_map: std::env::var("FL_MAP").is_ok_and(|v| v == "river"),
+            ai_enabled: !std::env::var("FL_AI").is_ok_and(|v| v == "0"),
+        }
+    }
+}
 
 #[derive(States, Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum GameState {
@@ -55,6 +75,13 @@ enum MenuButton {
 }
 
 #[derive(Component)]
+enum OptionButton {
+    ArmySize,
+    Ai,
+}
+
+
+#[derive(Component)]
 struct PauseRoot;
 
 #[derive(Component)]
@@ -76,7 +103,8 @@ pub struct GameShellPlugin;
 
 impl Plugin for GameShellPlugin {
     fn build(&self, app: &mut App) {
-        app.init_state::<GameState>()
+        app.init_resource::<BattleConfig>()
+            .init_state::<GameState>()
             .configure_sets(
                 FixedUpdate,
                 SimSet.run_if(in_state(GameState::Battle)),
@@ -93,7 +121,7 @@ impl Plugin for GameShellPlugin {
             .add_systems(
                 Update,
                 (
-                    menu_buttons.run_if(in_state(GameState::Menu)),
+                    (menu_buttons, menu_option_buttons).run_if(in_state(GameState::Menu)),
                     (toggle_pause, pause_buttons, transition_to_results)
                         .run_if(in_state(GameState::Battle)),
                     results_buttons.run_if(in_state(GameState::Results)),
@@ -134,7 +162,22 @@ fn button_node() -> Node {
 
 // ── Menu ──
 
-fn spawn_menu(mut commands: Commands) {
+const ARMY_SIZES: &[(usize, &str)] = &[
+    (10_000, "20k"),
+    (25_000, "50k"),
+    (50_000, "100k"),
+    (100_000, "200k"),
+];
+
+fn army_size_label(per_team: usize) -> &'static str {
+    ARMY_SIZES
+        .iter()
+        .find(|(n, _)| *n == per_team)
+        .map(|(_, s)| *s)
+        .unwrap_or("200k")
+}
+
+fn spawn_menu(mut commands: Commands, config: Res<BattleConfig>) {
     commands
         .spawn((
             fullscreen_overlay(),
@@ -152,7 +195,7 @@ fn spawn_menu(mut commands: Commands) {
                 },
                 TextColor(TEXT_COLOR),
                 Node {
-                    margin: UiRect::bottom(Val::Px(40.0)),
+                    margin: UiRect::bottom(Val::Px(12.0)),
                     ..default()
                 },
             ));
@@ -164,10 +207,33 @@ fn spawn_menu(mut commands: Commands) {
                 },
                 TextColor(DIM_TEXT_COLOR),
                 Node {
-                    margin: UiRect::bottom(Val::Px(40.0)),
+                    margin: UiRect::bottom(Val::Px(28.0)),
                     ..default()
                 },
             ));
+
+            // Options panel
+            p.spawn(Node {
+                flex_direction: FlexDirection::Column,
+                padding: UiRect::all(Val::Px(16.0)),
+                margin: UiRect::bottom(Val::Px(20.0)),
+                ..default()
+            })
+            .with_children(|opts| {
+                spawn_option_row(
+                    opts,
+                    "Army",
+                    army_size_label(config.units_per_team),
+                    OptionButton::ArmySize,
+                );
+                spawn_option_row(
+                    opts,
+                    "AI",
+                    if config.ai_enabled { "On" } else { "Off" },
+                    OptionButton::Ai,
+                );
+            });
+
             p.spawn((
                 Button,
                 button_node(),
@@ -192,11 +258,56 @@ fn spawn_menu(mut commands: Commands) {
                 },
                 TextColor(DIM_TEXT_COLOR),
                 Node {
-                    margin: UiRect::top(Val::Px(40.0)),
+                    margin: UiRect::top(Val::Px(28.0)),
                     ..default()
                 },
             ));
         });
+}
+
+fn spawn_option_row(p: &mut ChildSpawnerCommands, label: &str, value: &str, btn: OptionButton) {
+    p.spawn(Node {
+        flex_direction: FlexDirection::Row,
+        align_items: AlignItems::Center,
+        margin: UiRect::vertical(Val::Px(4.0)),
+        ..default()
+    })
+    .with_children(|row| {
+        row.spawn((
+            Text::new(format!("{label}:")),
+            TextFont {
+                font_size: FontSize::Px(15.0),
+                ..default()
+            },
+            TextColor(DIM_TEXT_COLOR),
+            Node {
+                width: Val::Px(80.0),
+                ..default()
+            },
+        ));
+        row.spawn((
+            Button,
+            Node {
+                padding: UiRect::axes(Val::Px(16.0), Val::Px(6.0)),
+                min_width: Val::Px(100.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                ..default()
+            },
+            BackgroundColor(BTN_NORMAL),
+            btn,
+        ))
+        .with_children(|b| {
+            b.spawn((
+                Text::new(value.to_string()),
+                TextFont {
+                    font_size: FontSize::Px(15.0),
+                    ..default()
+                },
+                TextColor(TEXT_COLOR),
+            ));
+        });
+    });
 }
 
 fn menu_buttons(
@@ -223,6 +334,39 @@ fn menu_buttons(
     }
 }
 
+fn menu_option_buttons(
+    query: Query<(&Interaction, &OptionButton, &Children), Changed<Interaction>>,
+    mut texts: Query<&mut Text>,
+    mut config: ResMut<BattleConfig>,
+) {
+    for (interaction, opt, children) in &query {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+        let new_label = match opt {
+            OptionButton::ArmySize => {
+                let idx = ARMY_SIZES
+                    .iter()
+                    .position(|(n, _)| *n == config.units_per_team)
+                    .map(|i| (i + 1) % ARMY_SIZES.len())
+                    .unwrap_or(0);
+                config.units_per_team = ARMY_SIZES[idx].0;
+                config.reg_size = if config.units_per_team <= 10_000 { 500 } else { 1000 };
+                ARMY_SIZES[idx].1
+            }
+            OptionButton::Ai => {
+                config.ai_enabled = !config.ai_enabled;
+                if config.ai_enabled { "On" } else { "Off" }
+            }
+        };
+        for child in children.iter() {
+            if let Ok(mut text) = texts.get_mut(child) {
+                text.0 = new_label.to_string();
+            }
+        }
+    }
+}
+
 // ── Battle lifecycle ──
 
 pub fn setup_battle(
@@ -235,6 +379,7 @@ pub fn setup_battle(
     mut corpses: ResMut<Corpses>,
     mut dir_stats: ResMut<DirTestStats>,
     mut virt_time: ResMut<Time<Virtual>>,
+    config: Res<BattleConfig>,
 ) {
     *units = Units::default();
     *stats = CombatStats::default();
@@ -243,8 +388,14 @@ pub fn setup_battle(
     outcome.0 = None;
     corpses.clear();
     virt_time.unpause();
-    crate::regiments::do_spawn_battle(&mut units, &terrain, &mut groups);
-    info!("battle started");
+    crate::regiments::do_spawn_battle(&mut units, &terrain, &mut groups, &config);
+    info!(
+        "battle started: {} per team, reg size {}, map {}, AI {}",
+        config.units_per_team,
+        config.reg_size,
+        if config.use_river_map { "river" } else { "classic" },
+        if config.ai_enabled { "on" } else { "off" },
+    );
 }
 
 fn transition_to_results(

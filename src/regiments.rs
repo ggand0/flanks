@@ -8,7 +8,7 @@ use bevy::prelude::*;
 use crate::orders::{GroupData, Groups, RegState};
 use crate::terrain::Terrain;
 use crate::unit_types::{KIND_HEAVY, KIND_LIGHT, KIND_SPEAR};
-use crate::units::{Units, hash01, push_unit, units_per_team};
+use crate::units::{Units, hash01, push_unit};
 
 /// Unit spacing inside a regiment block.
 const SPACING: f32 = 1.4;
@@ -33,11 +33,6 @@ impl Plugin for RegimentsPlugin {
     }
 }
 
-fn reg_size() -> usize {
-    crate::util::env_or("FL_REG_SIZE", 1000_usize).max(50)
-}
-
-/// Fraction of each army's regiments that are heavy infantry (front ranks).
 fn heavy_frac() -> f32 {
     crate::util::env_or("FL_HEAVY_FRAC", 0.4)
 }
@@ -84,7 +79,12 @@ fn spawn_regiment(
     crate::formation::assign_slots(units, g, gd);
 }
 
-pub fn do_spawn_battle(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
+pub fn do_spawn_battle(
+    units: &mut Units,
+    terrain: &Terrain,
+    groups: &mut Groups,
+    config: &crate::game_state::BattleConfig,
+) {
     if std::env::var("FL_TEST_SURROUND").is_ok() {
         crate::units::spawn_surround_test(units, terrain, groups);
         return;
@@ -118,8 +118,8 @@ pub fn do_spawn_battle(units: &mut Units, terrain: &Terrain, groups: &mut Groups
         return;
     }
 
-    let per_team = units_per_team();
-    let size = reg_size();
+    let per_team = config.units_per_team;
+    let size = config.reg_size;
     let n_regs = (per_team / size).max(1);
 
     // Block geometry: wider than deep (~2.2:1).
