@@ -395,19 +395,46 @@ fn rectfight_log(groups: Res<Groups>, time: Res<Time>, mut next: Local<f32>) {
     }
 }
 
-/// Formation hotkeys for the selection — F: wall on/off (shieldwall for
-/// sword regiments, spearwall for spears), L: loose order on/off,
-/// B: blob <-> ranks (the pre-formation look, kept for levies).
+/// Formation commands for the current selection. One code path for the
+/// hotkeys and the control-panel buttons (unit_cards.rs).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum FormCmd {
+    /// Wall on/off (shieldwall for sword regiments, spearwall for spears).
+    Wall,
+    /// Loose order on/off.
+    Loose,
+    /// Blob <-> ranks (the pre-formation look, kept for levies).
+    Blob,
+    /// Hold position <-> at ease.
+    Hold,
+}
+
+/// Formation hotkeys for the selection — F: wall, L: loose, B: blob,
+/// H: hold position.
 fn formation_keys(
     keys: Res<ButtonInput<KeyCode>>,
     selection: Res<crate::orders::Selection>,
     mut groups: ResMut<Groups>,
 ) {
-    let wall = keys.just_pressed(KeyCode::KeyF);
-    let loose = keys.just_pressed(KeyCode::KeyL);
-    let blob = keys.just_pressed(KeyCode::KeyB);
-    let hold = keys.just_pressed(KeyCode::KeyH);
-    if !(wall || loose || blob || hold) || selection.count_units == 0 {
+    const KEYS: [(KeyCode, FormCmd); 4] = [
+        (KeyCode::KeyF, FormCmd::Wall),
+        (KeyCode::KeyL, FormCmd::Loose),
+        (KeyCode::KeyB, FormCmd::Blob),
+        (KeyCode::KeyH, FormCmd::Hold),
+    ];
+    for (key, cmd) in KEYS {
+        if keys.just_pressed(key) {
+            apply_formation_cmd(cmd, &selection, &mut groups);
+        }
+    }
+}
+
+pub fn apply_formation_cmd(
+    cmd: FormCmd,
+    selection: &crate::orders::Selection,
+    groups: &mut Groups,
+) {
+    if selection.count_units == 0 {
         return;
     }
     let picked: Vec<usize> = selection
@@ -426,66 +453,69 @@ fn formation_keys(
         return;
     }
 
-    if wall || loose {
-        let want = if wall { FormSpacing::Wall } else { FormSpacing::Loose };
-        // Toggle as a set: if anyone is not yet in the mode, everyone
-        // enters it; if all are, everyone falls back to close order.
-        let on = picked.iter().any(|&g| groups.list[g].spacing != want);
-        let mut shield = 0;
-        let mut spear = 0;
-        for &g in &picked {
-            let gd = &mut groups.list[g];
-            gd.spacing = if on { want } else { FormSpacing::Normal };
-            gd.shape = FormShape::Rect;
-            if gd.files == 0 {
-                gd.files = default_files(gd.count);
+    match cmd {
+        FormCmd::Wall | FormCmd::Loose => {
+            let wall = cmd == FormCmd::Wall;
+            let want = if wall { FormSpacing::Wall } else { FormSpacing::Loose };
+            // Toggle as a set: if anyone is not yet in the mode, everyone
+            // enters it; if all are, everyone falls back to close order.
+            let on = picked.iter().any(|&g| groups.list[g].spacing != want);
+            let mut shield = 0;
+            let mut spear = 0;
+            for &g in &picked {
+                let gd = &mut groups.list[g];
+                gd.spacing = if on { want } else { FormSpacing::Normal };
+                gd.shape = FormShape::Rect;
+                if gd.files == 0 {
+                    gd.files = default_files(gd.count);
+                }
+                gd.reform = true;
+                match wall_kind(gd) {
+                    1 => shield += 1,
+                    2 => spear += 1,
+                    _ => {}
+                }
             }
-            gd.reform = true;
-            match wall_kind(gd) {
-                1 => shield += 1,
-                2 => spear += 1,
-                _ => {}
+            if !on {
+                info!("{} regiments back to close order", picked.len());
+            } else if wall {
+                info!("wall formed: {shield} shieldwall, {spear} spearwall regiments");
+            } else {
+                info!("{} regiments to LOOSE order", picked.len());
             }
         }
-        if !on {
-            info!("{} regiments back to close order", picked.len());
-        } else if wall {
-            info!("wall formed: {shield} shieldwall, {spear} spearwall regiments");
-        } else {
-            info!("{} regiments to LOOSE order", picked.len());
-        }
-    }
 
-    if blob {
-        let on = picked.iter().any(|&g| groups.list[g].shape != FormShape::Blob);
-        for &g in &picked {
-            let gd = &mut groups.list[g];
-            gd.shape = if on { FormShape::Blob } else { FormShape::Rect };
-            if gd.files == 0 {
-                gd.files = default_files(gd.count);
+        FormCmd::Blob => {
+            let on = picked.iter().any(|&g| groups.list[g].shape != FormShape::Blob);
+            for &g in &picked {
+                let gd = &mut groups.list[g];
+                gd.shape = if on { FormShape::Blob } else { FormShape::Rect };
+                if gd.files == 0 {
+                    gd.files = default_files(gd.count);
+                }
+                gd.reform = true;
             }
-            gd.reform = true;
+            info!(
+                "{} regiments to {}",
+                picked.len(),
+                if on { "BLOB (mob)" } else { "ranks" }
+            );
         }
-        info!(
-            "{} regiments to {}",
-            picked.len(),
-            if on { "BLOB (mob)" } else { "ranks" }
-        );
-    }
 
-    if hold {
-        // Hold position (defend) vs at ease: held regiments never chase
-        // and never engage on their own — they fight what steps into
-        // reach and nothing else.
-        let on = picked.iter().any(|&g| !groups.list[g].hold);
-        for &g in &picked {
-            groups.list[g].hold = on;
+        FormCmd::Hold => {
+            // Hold position (defend) vs at ease: held regiments never chase
+            // and never engage on their own — they fight what steps into
+            // reach and nothing else.
+            let on = picked.iter().any(|&g| !groups.list[g].hold);
+            for &g in &picked {
+                groups.list[g].hold = on;
+            }
+            info!(
+                "{} regiments {}",
+                picked.len(),
+                if on { "HOLD POSITION" } else { "AT EASE" }
+            );
         }
-        info!(
-            "{} regiments {}",
-            picked.len(),
-            if on { "HOLD POSITION" } else { "AT EASE" }
-        );
     }
 }
 

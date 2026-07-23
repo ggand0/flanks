@@ -71,7 +71,7 @@ pub fn cursor_ground_point(
 }
 
 #[allow(clippy::too_many_arguments)] // bevy system params
-fn drag_select(
+pub fn drag_select(
     buttons: Res<ButtonInput<MouseButton>>,
     window: Query<&Window, With<PrimaryWindow>>,
     camera: Query<(&Camera, &GlobalTransform)>,
@@ -80,13 +80,19 @@ fn drag_select(
     groups: Res<Groups>,
     mut drag: ResMut<DragLine>,
     mut selection: ResMut<Selection>,
+    ui: Query<&Interaction>,
 ) {
     let Ok(window) = window.single() else { return };
     let Ok((camera, cam_tf)) = camera.single() else {
         return;
     };
 
-    if buttons.just_pressed(MouseButton::Left) {
+    // A stroke must start on the map: clicking a unit card or a control
+    // button never doubles as a (selection-clearing) lasso on the
+    // terrain behind the HUD.
+    if buttons.just_pressed(MouseButton::Left)
+        && !crate::unit_cards::pointer_over_ui(ui.iter())
+    {
         drag.points.clear();
         drag.active = true;
     }
@@ -222,7 +228,7 @@ pub fn regiment_at(groups: &Groups, p: Vec2, enemy: bool) -> Option<u32> {
         .map(|(g, _)| g as u32)
 }
 
-fn update_hover(
+pub fn update_hover(
     window: Query<&Window, With<PrimaryWindow>>,
     camera: Query<(&Camera, &GlobalTransform)>,
     terrain: Res<Terrain>,

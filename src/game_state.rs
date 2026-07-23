@@ -754,7 +754,16 @@ fn results_buttons(
 
 #[allow(clippy::type_complexity)]
 fn button_hover_style(
-    mut query: Query<(&Interaction, &mut BackgroundColor), (Changed<Interaction>, With<Button>)>,
+    mut query: Query<
+        (&Interaction, &mut BackgroundColor),
+        (
+            Changed<Interaction>,
+            With<Button>,
+            // HUD buttons (unit cards, control panel) paint their own
+            // state-dependent colors.
+            Without<crate::unit_cards::CustomStyled>,
+        ),
+    >,
 ) {
     for (interaction, mut bg) in &mut query {
         *bg = match interaction {

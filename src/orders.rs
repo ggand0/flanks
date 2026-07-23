@@ -426,6 +426,7 @@ fn issue_order(
     mut groups: ResMut<Groups>,
     selection: Res<Selection>,
     mut drag: ResMut<OrderDrag>,
+    ui: Query<&Interaction>,
 ) {
     if selection.count_units == 0 {
         drag.start = None;
@@ -446,7 +447,12 @@ fn issue_order(
         .map(|(g, _)| g)
         .collect();
 
-    if buttons.just_pressed(MouseButton::Right) {
+    // An order press must start on the map: a right-click on the HUD
+    // (card bar, control panel) never falls through to the terrain
+    // behind it. A drag that STARTED on the map may pass over the HUD.
+    if buttons.just_pressed(MouseButton::Right)
+        && !crate::unit_cards::pointer_over_ui(ui.iter())
+    {
         drag.start = ground;
         drag.active = false;
         drag.layout.clear();
@@ -560,7 +566,15 @@ fn halt_key(
     selection: Res<Selection>,
     mut groups: ResMut<Groups>,
 ) {
-    if !keys.just_pressed(KeyCode::Backspace) || selection.count_units == 0 {
+    if !keys.just_pressed(KeyCode::Backspace) {
+        return;
+    }
+    halt_selected(&selection, &mut groups);
+}
+
+/// Shared by the Backspace hotkey and the Halt button (unit_cards.rs).
+pub fn halt_selected(selection: &Selection, groups: &mut Groups) {
+    if selection.count_units == 0 {
         return;
     }
     let mut halted = 0;
