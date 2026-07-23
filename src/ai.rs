@@ -32,7 +32,13 @@ pub struct AiPlugin;
 impl Plugin for AiPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<BattleOutcome>()
-            .add_systems(Update, (ai_think, auto_engage, check_victory));
+            .add_systems(
+                Update,
+                (
+                    (ai_think, auto_engage).in_set(crate::game_state::BattleInputSet),
+                    check_victory,
+                ),
+            );
     }
 }
 

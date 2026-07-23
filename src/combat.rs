@@ -29,7 +29,8 @@ impl Plugin for CombatPlugin {
             FixedUpdate,
             process_deaths
                 .after(crate::movement::step_sim)
-                .before(crate::orders::clear_arrived_orders),
+                .before(crate::orders::clear_arrived_orders)
+                .in_set(crate::game_state::SimSet),
         );
     }
 }

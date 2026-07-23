@@ -26,13 +26,10 @@ pub struct RegimentsPlugin;
 
 impl Plugin for RegimentsPlugin {
     fn build(&self, app: &mut App) {
-        // Terrain resource is created in PreStartup (generate_terrain).
-        // Morale lives in crate::morale (MoralePlugin).
-        app.add_systems(Startup, spawn_battle)
-            .add_systems(
-                Update,
-                (rout_test_log, dir_test_log, arena_log, charge_test_log, pile_test_log, melee_diag_log, join_test_log, routpass_test_log, restart_key),
-            );
+        app.add_systems(
+            Update,
+            (rout_test_log, dir_test_log, arena_log, charge_test_log, pile_test_log, melee_diag_log, join_test_log, routpass_test_log),
+        );
     }
 }
 
@@ -87,37 +84,7 @@ fn spawn_regiment(
     crate::formation::assign_slots(units, g, gd);
 }
 
-fn spawn_battle(mut units: ResMut<Units>, terrain: Res<Terrain>, mut groups: ResMut<Groups>) {
-    do_spawn_battle(&mut units, &terrain, &mut groups);
-}
-
-/// R: restart the battle from scratch (fresh armies, cleared stats).
-#[allow(clippy::too_many_arguments)] // bevy system params
-fn restart_key(
-    keys: Res<ButtonInput<KeyCode>>,
-    mut units: ResMut<Units>,
-    terrain: Res<Terrain>,
-    mut groups: ResMut<Groups>,
-    mut stats: ResMut<crate::combat::CombatStats>,
-    mut selection: ResMut<crate::orders::Selection>,
-    mut outcome: ResMut<crate::ai::BattleOutcome>,
-    mut corpses: ResMut<crate::render_units::Corpses>,
-    mut dir_stats: ResMut<crate::movement::DirTestStats>,
-) {
-    if !keys.just_pressed(KeyCode::KeyR) {
-        return;
-    }
-    *units = Units::default();
-    *stats = crate::combat::CombatStats::default();
-    *dir_stats = crate::movement::DirTestStats::default();
-    *selection = crate::orders::Selection::default();
-    outcome.0 = None;
-    corpses.clear();
-    do_spawn_battle(&mut units, &terrain, &mut groups);
-    info!("battle restarted");
-}
-
-fn do_spawn_battle(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
+pub fn do_spawn_battle(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
     if std::env::var("FL_TEST_SURROUND").is_ok() {
         crate::units::spawn_surround_test(units, terrain, groups);
         return;

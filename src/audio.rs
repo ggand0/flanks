@@ -140,10 +140,12 @@ fn update_beds(
     groups: Res<Groups>,
     stats: Res<SimStats>,
     camera: Query<&RtsCamera>,
-    time: Res<Time>,
+    time: Res<Time<Real>>,
+    virt_time: Res<Time<Virtual>>,
     mut sinks: Query<(&Bed, &mut AudioSink)>,
 ) {
     let Ok(cam) = camera.single() else { return };
+    let paused = virt_time.is_paused();
     let focus = Vec2::new(cam.focus.x, cam.focus.z);
 
     let mut engaged_total = 0usize;
@@ -181,6 +183,9 @@ fn update_beds(
 
     let m = master();
     let target = |bed: &Bed| -> f32 {
+        if paused {
+            return 0.0;
+        }
         match bed {
             Bed::Far => 0.22 * ((engaged_total as f32) / 8.0).clamp(0.0, 1.0) * m,
             Bed::Mid => 0.45 * ((engaged_near as f32) / 5.0).clamp(0.0, 1.0) * prox.sqrt() * m,
@@ -244,7 +249,7 @@ fn pick(v: &[Handle<AudioSource>], seed: u32) -> Option<Handle<AudioSource>> {
 #[allow(clippy::too_many_arguments)] // bevy system params
 fn combat_one_shots(
     mut commands: Commands,
-    bank: Res<AudioBank>,
+    bank: Option<Res<AudioBank>>,
     stats: Res<SimStats>,
     combat: Res<CombatStats>,
     groups: Res<Groups>,
@@ -256,6 +261,7 @@ fn combat_one_shots(
     mut frame: Local<u32>,
 ) {
     *frame = frame.wrapping_add(1);
+    let Some(bank) = bank else { return };
     let Ok(cam) = camera.single() else { return };
     let focus = Vec2::new(cam.focus.x, cam.focus.z);
     let min_dist = groups
@@ -343,7 +349,7 @@ struct CueState {
 #[allow(clippy::too_many_arguments)] // bevy system params
 fn event_cues(
     mut commands: Commands,
-    bank: Res<AudioBank>,
+    bank: Option<Res<AudioBank>>,
     groups: Res<Groups>,
     selection: Res<Selection>,
     outcome: Res<crate::ai::BattleOutcome>,
@@ -351,6 +357,7 @@ fn event_cues(
     time: Res<Time>,
     mut st: Local<CueState>,
 ) {
+    let Some(bank) = bank else { return };
     st.frame = st.frame.wrapping_add(1);
     st.horn_gate -= time.delta_secs();
     st.vox_gate -= time.delta_secs();

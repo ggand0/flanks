@@ -223,7 +223,8 @@ impl Plugin for FrontlinePlugin {
                 FixedUpdate,
                 (update_field, update_groups)
                     .chain()
-                    .before(crate::movement::step_sim),
+                    .before(crate::movement::step_sim)
+                    .in_set(crate::game_state::SimSet),
             )
             .add_systems(Update, (draw_front_gizmos, test_front_script));
     }
@@ -234,10 +235,11 @@ fn init_field(mut commands: Commands, terrain: Res<Terrain>) {
 }
 
 fn update_field(
-    mut field: ResMut<InfluenceField>,
+    field: Option<ResMut<InfluenceField>>,
     units: Res<Units>,
     mut stats: ResMut<crate::movement::SimStats>,
 ) {
+    let Some(mut field) = field else { return };
     let t0 = std::time::Instant::now();
     {
         let _span = info_span!("density_field").entered();
@@ -463,10 +465,11 @@ fn update_groups(units: Res<Units>, mut groups: ResMut<Groups>) {
 
 fn draw_front_gizmos(
     viz: Res<DebugViz>,
-    field: Res<InfluenceField>,
+    field: Option<Res<InfluenceField>>,
     terrain: Res<Terrain>,
     mut gizmos: Gizmos,
 ) {
+    let Some(field) = field else { return };
     if !viz.0 {
         return;
     }

@@ -220,6 +220,9 @@ __marimo__/
 # local devlogs (not committed)
 devlogs/
 
+# intermediate / WIP assets (not committed)
+assets_dev/
+
 # local scratch (not committed)
 tmp/
 docs/plans/

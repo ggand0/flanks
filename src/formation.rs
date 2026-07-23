@@ -193,9 +193,18 @@ impl Plugin for FormationPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(
             FixedUpdate,
-            apply_reforms.before(crate::movement::step_sim),
+            apply_reforms
+                .before(crate::movement::step_sim)
+                .in_set(crate::game_state::SimSet),
         )
-        .add_systems(Update, (formation_keys, test_form_script, rectfight_log));
+        .add_systems(
+            Update,
+            (
+                formation_keys.in_set(crate::game_state::BattleInputSet),
+                test_form_script,
+                rectfight_log,
+            ),
+        );
     }
 }
 
