@@ -7,8 +7,10 @@
 //! whole message. Everything here is presentation: it reads `Groups` /
 //! `Selection` and issues the same commands as the existing hotkeys.
 
+use bevy::asset::RenderAssetUsages;
 use bevy::ecs::hierarchy::ChildSpawnerCommands;
 use bevy::prelude::*;
+use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 
 use crate::formation::{FormCmd, FormShape, FormSpacing, apply_formation_cmd};
 use crate::game_state::{BattleInputSet, GameState};
@@ -47,6 +49,18 @@ struct CardIcon(usize);
 struct LooseIconVariant {
     tight: bool,
 }
+
+/// Hover tooltip of a control button (name + hotkey).
+#[derive(Component)]
+struct BtnTooltip(ControlButton);
+
+/// One rasterized icon texture per unit kind, shared by every card so
+/// all icons of a kind are pixel-identical. (Node-composed icons round
+/// each rect to the pixel grid separately, and under a fractional
+/// display scale neighboring cards land on different subpixel phases,
+/// visibly warping each copy differently.)
+#[derive(Resource)]
+struct KindIcons([Handle<Image>; crate::unit_types::NUM_KINDS]);
 
 #[derive(Component, Clone, Copy, PartialEq, Eq)]
 enum ControlButton {
@@ -182,40 +196,106 @@ fn icon_canvas(w: f32, h: f32) -> Node {
     }
 }
 
-/// Knight's helm: rounded dome with a dark eye slit.
-fn draw_helm(p: &mut ChildSpawnerCommands) {
-    let dome = BorderRadius {
-        top_left: Val::Px(7.0),
-        top_right: Val::Px(7.0),
-        bottom_left: Val::Px(1.0),
-        bottom_right: Val::Px(1.0),
-    };
-    shape(p, (3.0, 2.0, 14.0, 18.0), ICON_COLOR, dome);
-    shape(p, (4.0, 9.0, 12.0, 2.0), ICON_DETAIL, BorderRadius::ZERO);
-    // Nose bar splitting the slit.
-    shape(p, (9.0, 9.0, 2.0, 5.0), ICON_COLOR, BorderRadius::ZERO);
+// ── Kind icon rasterizer ──
+//
+// Card kind icons are rendered ONCE into a small texture per kind and
+// shared by every card via ImageNode, so all copies are identical.
+// Authored at 2x the 20x22 logical canvas for crisp downsampling.
+
+const ICON_TEX_W: u32 = 40;
+const ICON_TEX_H: u32 = 44;
+const ICON_RGB: [u8; 3] = [230, 222, 194];
+const ICON_RGB_DETAIL: [u8; 3] = [26, 28, 33];
+
+/// A rounded rectangle in texture pixels: rect + per-corner radii
+/// (tl, tr, br, bl) + straight-alpha color.
+struct IconShape {
+    rect: (f32, f32, f32, f32),
+    radius: [f32; 4],
+    rgb: [u8; 3],
 }
 
-/// Spear: leaf head on a long shaft.
-fn draw_spear(p: &mut ChildSpawnerCommands) {
-    shape(p, (7.0, 0.0, 6.0, 9.0), ICON_COLOR, BorderRadius::MAX);
-    shape(p, (9.0, 8.0, 2.0, 14.0), ICON_COLOR, BorderRadius::ZERO);
-}
-
-/// Arming sword: blade, crossguard, grip.
-fn draw_sword(p: &mut ChildSpawnerCommands) {
-    shape(p, (8.5, 1.0, 3.0, 12.0), ICON_COLOR, BorderRadius::ZERO);
-    shape(p, (5.0, 13.0, 10.0, 2.0), ICON_COLOR, BorderRadius::ZERO);
-    shape(p, (9.0, 15.0, 2.0, 5.0), ICON_COLOR, BorderRadius::ZERO);
-    shape(p, (8.0, 20.0, 4.0, 2.0), ICON_COLOR, BorderRadius::MAX);
-}
-
-fn draw_kind_icon(p: &mut ChildSpawnerCommands, kind: u8) {
+fn kind_icon_shapes(kind: u8) -> Vec<IconShape> {
+    let s = |rect, radius, rgb| IconShape { rect, radius, rgb };
     match kind {
-        KIND_HEAVY => draw_helm(p),
-        KIND_SPEAR => draw_spear(p),
-        _ => draw_sword(p),
+        // Knight's helm: dome, dark eye slit, nose bar.
+        KIND_HEAVY => vec![
+            s((6.0, 4.0, 28.0, 36.0), [14.0, 14.0, 2.0, 2.0], ICON_RGB),
+            s((8.0, 18.0, 24.0, 4.0), [0.0; 4], ICON_RGB_DETAIL),
+            s((18.0, 18.0, 4.0, 10.0), [0.0; 4], ICON_RGB),
+        ],
+        // Spear: leaf head on a long shaft.
+        KIND_SPEAR => vec![
+            s((14.0, 0.0, 12.0, 18.0), [6.0; 4], ICON_RGB),
+            s((18.0, 16.0, 4.0, 28.0), [0.0; 4], ICON_RGB),
+        ],
+        // Arming sword: blade, crossguard, grip, pommel.
+        _ => vec![
+            s((17.0, 2.0, 6.0, 24.0), [0.0; 4], ICON_RGB),
+            s((10.0, 26.0, 20.0, 4.0), [1.0; 4], ICON_RGB),
+            s((18.0, 30.0, 4.0, 10.0), [0.0; 4], ICON_RGB),
+            s((16.0, 40.0, 8.0, 4.0), [2.0; 4], ICON_RGB),
+        ],
     }
+}
+
+/// Signed distance to a rounded rect (y-down; radii tl, tr, br, bl).
+fn sd_round_rect(px: f32, py: f32, shape: &IconShape) -> f32 {
+    let (x, y, w, h) = shape.rect;
+    let (hw, hh) = (w * 0.5, h * 0.5);
+    let (qx, qy) = (px - (x + hw), py - (y + hh));
+    let r = match (qx > 0.0, qy > 0.0) {
+        (false, false) => shape.radius[0],
+        (true, false) => shape.radius[1],
+        (true, true) => shape.radius[2],
+        (false, true) => shape.radius[3],
+    }
+    .min(hw)
+    .min(hh);
+    let ax = qx.abs() - (hw - r);
+    let ay = qy.abs() - (hh - r);
+    let (dx, dy) = (ax.max(0.0), ay.max(0.0));
+    (dx * dx + dy * dy).sqrt() + ax.max(ay).min(0.0) - r
+}
+
+/// Software rasterization with 1px edge AA, straight-alpha src-over.
+fn rasterize_kind_icon(kind: u8) -> Image {
+    let (w, h) = (ICON_TEX_W as usize, ICON_TEX_H as usize);
+    let mut buf = vec![0.0f32; w * h * 4];
+    for shape in kind_icon_shapes(kind) {
+        let src: [f32; 3] = shape.rgb.map(|c| c as f32 / 255.0);
+        for py in 0..h {
+            for px in 0..w {
+                let d = sd_round_rect(px as f32 + 0.5, py as f32 + 0.5, &shape);
+                let sa = (0.5 - d).clamp(0.0, 1.0);
+                if sa <= 0.0 {
+                    continue;
+                }
+                let p = &mut buf[(py * w + px) * 4..(py * w + px) * 4 + 4];
+                let da = p[3] * (1.0 - sa);
+                let a = sa + da;
+                for c in 0..3 {
+                    p[c] = (src[c] * sa + p[c] * da) / a;
+                }
+                p[3] = a;
+            }
+        }
+    }
+    let data = buf
+        .iter()
+        .map(|v| (v * 255.0).round().clamp(0.0, 255.0) as u8)
+        .collect();
+    Image::new(
+        Extent3d {
+            width: ICON_TEX_W,
+            height: ICON_TEX_H,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        data,
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::RENDER_WORLD,
+    )
 }
 
 /// Halt: stop square.
@@ -277,7 +357,21 @@ fn draw_hold(p: &mut ChildSpawnerCommands) {
 
 // ── Spawn ──
 
-fn spawn_card_bar(mut commands: Commands, groups: Res<Groups>) {
+fn spawn_card_bar(
+    mut commands: Commands,
+    groups: Res<Groups>,
+    mut images: ResMut<Assets<Image>>,
+    icons: Option<Res<KindIcons>>,
+) {
+    let icons = match icons {
+        Some(r) => r.0.clone(),
+        None => {
+            let handles =
+                [0u8, 1, 2].map(|kind| images.add(rasterize_kind_icon(kind)));
+            commands.insert_resource(KindIcons(handles.clone()));
+            handles
+        }
+    };
     commands
         .spawn((
             Node {
@@ -310,7 +404,7 @@ fn spawn_card_bar(mut commands: Commands, groups: Res<Groups>) {
             .with_children(|strip| {
                 for (g, gd) in groups.list.iter().enumerate() {
                     if gd.team == PLAYER_TEAM {
-                        spawn_card(strip, g, gd.kind);
+                        spawn_card(strip, g, gd.kind, icons[gd.kind as usize].clone());
                     }
                 }
             });
@@ -318,7 +412,7 @@ fn spawn_card_bar(mut commands: Commands, groups: Res<Groups>) {
         });
 }
 
-fn spawn_card(strip: &mut ChildSpawnerCommands, g: usize, kind: u8) {
+fn spawn_card(strip: &mut ChildSpawnerCommands, g: usize, kind: u8, icon: Handle<Image>) {
     strip
         .spawn((
             Button,
@@ -376,21 +470,25 @@ fn spawn_card(strip: &mut ChildSpawnerCommands, g: usize, kind: u8) {
                 CardGlyph(g),
             ));
             card.spawn((
-                icon_canvas(20.0, 22.0),
+                Node {
+                    width: Val::Px(20.0),
+                    height: Val::Px(22.0),
+                    ..default()
+                },
+                ImageNode::new(icon),
                 CardIcon(g),
-            ))
-            .with_children(|icon| draw_kind_icon(icon, kind));
+            ));
         });
 }
 
 /// M2TW-style round icon buttons, right end of the bar.
 fn spawn_control_panel(bar: &mut ChildSpawnerCommands) {
-    const BUTTONS: [ControlButton; 5] = [
-        ControlButton::Halt,
-        ControlButton::Wall,
-        ControlButton::Loose,
-        ControlButton::Blob,
-        ControlButton::Hold,
+    const BUTTONS: [(ControlButton, &str); 5] = [
+        (ControlButton::Halt, "Halt (Backspace)"),
+        (ControlButton::Wall, "Wall (F)"),
+        (ControlButton::Loose, "Loose (L)"),
+        (ControlButton::Blob, "Blob (B)"),
+        (ControlButton::Hold, "Hold (H)"),
     ];
     bar.spawn(Node {
         flex_shrink: 0.0,
@@ -401,7 +499,7 @@ fn spawn_control_panel(bar: &mut ChildSpawnerCommands) {
         ..default()
     })
     .with_children(|panel| {
-        for btn in BUTTONS {
+        for (btn, label) in BUTTONS {
             panel
                 .spawn((
                     Button,
@@ -418,6 +516,32 @@ fn spawn_control_panel(bar: &mut ChildSpawnerCommands) {
                     CustomStyled,
                 ))
                 .with_children(|b| {
+                    // Hover tooltip, floating above the button. Anchored
+                    // to its right edge so it never leaves the screen
+                    // (the panel hugs the window's right side).
+                    b.spawn((
+                        Node {
+                            position_type: PositionType::Absolute,
+                            bottom: Val::Px(42.0),
+                            right: Val::Px(-2.0),
+                            padding: UiRect::axes(Val::Px(8.0), Val::Px(4.0)),
+                            border_radius: BorderRadius::all(Val::Px(4.0)),
+                            ..default()
+                        },
+                        BackgroundColor(Color::srgba(0.04, 0.05, 0.07, 0.95)),
+                        Visibility::Hidden,
+                        BtnTooltip(btn),
+                    ))
+                    .with_children(|t| {
+                        t.spawn((
+                            Text::new(label),
+                            TextFont {
+                                font_size: FontSize::Px(11.0),
+                                ..default()
+                            },
+                            TextColor(Color::srgb(0.92, 0.92, 0.85)),
+                        ));
+                    });
                     match btn {
                         ControlButton::Loose => {
                             // Both spacing variants stacked on the same
@@ -638,6 +762,10 @@ fn refresh_control_buttons(
     selection: Res<Selection>,
     mut query: Query<(&ControlButton, &Interaction, &mut BackgroundColor)>,
     mut loose_icons: Query<(&LooseIconVariant, &mut Visibility)>,
+    mut tooltips: Query<
+        (&BtnTooltip, &mut Visibility),
+        Without<LooseIconVariant>,
+    >,
 ) {
     let picked: Vec<usize> = selection
         .regiments
@@ -653,7 +781,11 @@ fn refresh_control_buttons(
         .collect();
 
     let mut loose_active = false;
+    let mut hovered: Option<ControlButton> = None;
     for (btn, interaction, mut bg) in &mut query {
+        if matches!(interaction, Interaction::Hovered | Interaction::Pressed) {
+            hovered = Some(*btn);
+        }
         let want = if picked.is_empty() {
             BTN_DISABLED
         } else {
@@ -690,6 +822,17 @@ fn refresh_control_buttons(
     // close order, tight squares once the whole selection is loose.
     for (variant, mut vis) in &mut loose_icons {
         let want = if variant.tight == loose_active {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
+        if *vis != want {
+            *vis = want;
+        }
+    }
+
+    for (tip, mut vis) in &mut tooltips {
+        let want = if hovered == Some(tip.0) {
             Visibility::Inherited
         } else {
             Visibility::Hidden
