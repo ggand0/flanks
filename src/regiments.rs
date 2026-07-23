@@ -85,37 +85,20 @@ pub fn do_spawn_battle(
     groups: &mut Groups,
     config: &crate::game_state::BattleConfig,
 ) {
-    if std::env::var("FL_TEST_SURROUND").is_ok() {
-        crate::units::spawn_surround_test(units, terrain, groups);
-        return;
-    }
-    if std::env::var("FL_TEST_ROUT").is_ok() {
-        spawn_rout_test(units, terrain, groups);
-        return;
-    }
-    if std::env::var("FL_TEST_DIR").is_ok() {
-        spawn_dir_test(units, terrain, groups);
-        return;
-    }
-    if std::env::var("FL_ARENA").is_ok() {
-        spawn_arena(units, terrain, groups);
-        return;
-    }
-    if std::env::var("FL_TEST_CHARGE").is_ok() {
-        spawn_charge_test(units, terrain, groups);
-        return;
-    }
-    if std::env::var("FL_TEST_PILE").is_ok() {
-        spawn_pile_test(units, terrain, groups);
-        return;
-    }
-    if std::env::var("FL_TEST_JOIN").is_ok() {
-        spawn_join_test(units, terrain, groups);
-        return;
-    }
-    if std::env::var("FL_TEST_ROUTPASS").is_ok() {
-        spawn_routpass_test(units, terrain, groups);
-        return;
+    use crate::game_state::Scenario;
+    match config.scenario {
+        Scenario::Surround => {
+            crate::units::spawn_surround_test(units, terrain, groups);
+            return;
+        }
+        Scenario::Rout => { spawn_rout_test(units, terrain, groups); return; }
+        Scenario::Dir => { spawn_dir_test(units, terrain, groups); return; }
+        Scenario::Arena => { spawn_arena(units, terrain, groups); return; }
+        Scenario::Charge => { spawn_charge_test(units, terrain, groups); return; }
+        Scenario::Pile => { spawn_pile_test(units, terrain, groups); return; }
+        Scenario::Join => { spawn_join_test(units, terrain, groups); return; }
+        Scenario::Routpass => { spawn_routpass_test(units, terrain, groups); return; }
+        Scenario::Normal => {}
     }
 
     let per_team = config.units_per_team;

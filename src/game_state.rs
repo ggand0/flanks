@@ -10,12 +10,66 @@ use crate::render_units::Corpses;
 use crate::terrain::Terrain;
 use crate::units::Units;
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Scenario {
+    #[default]
+    Normal,
+    Surround,
+    Rout,
+    Dir,
+    Arena,
+    Charge,
+    Pile,
+    Join,
+    Routpass,
+}
+
+impl Scenario {
+    const ALL: &[Scenario] = &[
+        Self::Normal,
+        Self::Surround,
+        Self::Rout,
+        Self::Dir,
+        Self::Arena,
+        Self::Charge,
+        Self::Pile,
+        Self::Join,
+        Self::Routpass,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "Normal",
+            Self::Surround => "Surround",
+            Self::Rout => "Rout",
+            Self::Dir => "Dir Defense",
+            Self::Arena => "Arena",
+            Self::Charge => "Charge",
+            Self::Pile => "Pile-on",
+            Self::Join => "Join Fight",
+            Self::Routpass => "Rout Pass",
+        }
+    }
+
+    fn from_env() -> Self {
+        if std::env::var("FL_TEST_SURROUND").is_ok() { return Self::Surround; }
+        if std::env::var("FL_TEST_ROUT").is_ok() { return Self::Rout; }
+        if std::env::var("FL_TEST_DIR").is_ok() { return Self::Dir; }
+        if std::env::var("FL_ARENA").is_ok() { return Self::Arena; }
+        if std::env::var("FL_TEST_CHARGE").is_ok() { return Self::Charge; }
+        if std::env::var("FL_TEST_PILE").is_ok() { return Self::Pile; }
+        if std::env::var("FL_TEST_JOIN").is_ok() { return Self::Join; }
+        if std::env::var("FL_TEST_ROUTPASS").is_ok() { return Self::Routpass; }
+        Self::Normal
+    }
+}
+
 #[derive(Resource)]
 pub struct BattleConfig {
     pub units_per_team: usize,
     pub reg_size: usize,
-    pub use_river_map: bool,
     pub ai_enabled: bool,
+    pub scenario: Scenario,
 }
 
 impl Default for BattleConfig {
@@ -23,8 +77,8 @@ impl Default for BattleConfig {
         Self {
             units_per_team: crate::util::env_or("FL_UNITS", 100_000),
             reg_size: crate::util::env_or("FL_REG_SIZE", 1000_usize).max(50),
-            use_river_map: std::env::var("FL_MAP").is_ok_and(|v| v == "river"),
             ai_enabled: !std::env::var("FL_AI").is_ok_and(|v| v == "0"),
+            scenario: Scenario::from_env(),
         }
     }
 }
@@ -80,6 +134,9 @@ enum OptionButton {
     Ai,
 }
 
+#[derive(Component)]
+struct DebugButton(Scenario);
+
 
 #[derive(Component)]
 struct PauseRoot;
@@ -121,7 +178,8 @@ impl Plugin for GameShellPlugin {
             .add_systems(
                 Update,
                 (
-                    (menu_buttons, menu_option_buttons).run_if(in_state(GameState::Menu)),
+                    (menu_buttons, menu_option_buttons, debug_scenario_buttons)
+                        .run_if(in_state(GameState::Menu)),
                     (toggle_pause, pause_buttons, transition_to_results)
                         .run_if(in_state(GameState::Battle)),
                     results_buttons.run_if(in_state(GameState::Results)),
@@ -250,6 +308,53 @@ fn spawn_menu(mut commands: Commands, config: Res<BattleConfig>) {
                     TextColor(TEXT_COLOR),
                 ));
             });
+            // Debug scenarios
+            p.spawn((
+                Text::new("Debug Scenarios"),
+                TextFont {
+                    font_size: FontSize::Px(13.0),
+                    ..default()
+                },
+                TextColor(DIM_TEXT_COLOR),
+                Node {
+                    margin: UiRect::new(Val::Px(0.0), Val::Px(0.0), Val::Px(24.0), Val::Px(8.0)),
+                    ..default()
+                },
+            ));
+            p.spawn(Node {
+                flex_direction: FlexDirection::Row,
+                flex_wrap: FlexWrap::Wrap,
+                justify_content: JustifyContent::Center,
+                max_width: Val::Px(520.0),
+                ..default()
+            })
+            .with_children(|row| {
+                for &scenario in &Scenario::ALL[1..] {
+                    row.spawn((
+                        Button,
+                        Node {
+                            padding: UiRect::axes(Val::Px(12.0), Val::Px(5.0)),
+                            margin: UiRect::all(Val::Px(3.0)),
+                            justify_content: JustifyContent::Center,
+                            align_items: AlignItems::Center,
+                            ..default()
+                        },
+                        BackgroundColor(BTN_NORMAL),
+                        DebugButton(scenario),
+                    ))
+                    .with_children(|b| {
+                        b.spawn((
+                            Text::new(scenario.label()),
+                            TextFont {
+                                font_size: FontSize::Px(12.0),
+                                ..default()
+                            },
+                            TextColor(DIM_TEXT_COLOR),
+                        ));
+                    });
+                }
+            });
+
             p.spawn((
                 Text::new("v0.1.0"),
                 TextFont {
@@ -258,7 +363,7 @@ fn spawn_menu(mut commands: Commands, config: Res<BattleConfig>) {
                 },
                 TextColor(DIM_TEXT_COLOR),
                 Node {
-                    margin: UiRect::top(Val::Px(28.0)),
+                    margin: UiRect::top(Val::Px(20.0)),
                     ..default()
                 },
             ));
@@ -313,6 +418,7 @@ fn spawn_option_row(p: &mut ChildSpawnerCommands, label: &str, value: &str, btn:
 fn menu_buttons(
     query: Query<(&Interaction, &MenuButton), Changed<Interaction>>,
     keys: Res<ButtonInput<KeyCode>>,
+    mut config: ResMut<BattleConfig>,
     mut next: ResMut<NextState<GameState>>,
     mut auto: Local<bool>,
 ) {
@@ -322,13 +428,17 @@ fn menu_buttons(
         return;
     }
     if keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::Space) {
+        config.scenario = Scenario::Normal;
         next.set(GameState::Battle);
         return;
     }
     for (interaction, btn) in &query {
         if *interaction == Interaction::Pressed {
             match btn {
-                MenuButton::StartBattle => next.set(GameState::Battle),
+                MenuButton::StartBattle => {
+                    config.scenario = Scenario::Normal;
+                    next.set(GameState::Battle);
+                }
             }
         }
     }
@@ -367,6 +477,41 @@ fn menu_option_buttons(
     }
 }
 
+fn debug_scenario_buttons(
+    query: Query<(&Interaction, &DebugButton), Changed<Interaction>>,
+    mut config: ResMut<BattleConfig>,
+    mut next: ResMut<NextState<GameState>>,
+) {
+    for (interaction, btn) in &query {
+        if *interaction == Interaction::Pressed {
+            config.scenario = btn.0;
+            next.set(GameState::Battle);
+        }
+    }
+}
+
+fn sync_scenario_env(scenario: Scenario) {
+    let vars = [
+        ("FL_TEST_SURROUND", Scenario::Surround),
+        ("FL_TEST_ROUT", Scenario::Rout),
+        ("FL_TEST_DIR", Scenario::Dir),
+        ("FL_ARENA", Scenario::Arena),
+        ("FL_TEST_CHARGE", Scenario::Charge),
+        ("FL_TEST_PILE", Scenario::Pile),
+        ("FL_TEST_JOIN", Scenario::Join),
+        ("FL_TEST_ROUTPASS", Scenario::Routpass),
+    ];
+    for (key, s) in vars {
+        unsafe {
+            if scenario == s {
+                std::env::set_var(key, "1");
+            } else {
+                std::env::remove_var(key);
+            }
+        }
+    }
+}
+
 // ── Battle lifecycle ──
 
 pub fn setup_battle(
@@ -388,12 +533,12 @@ pub fn setup_battle(
     outcome.0 = None;
     corpses.clear();
     virt_time.unpause();
+    sync_scenario_env(config.scenario);
     crate::regiments::do_spawn_battle(&mut units, &terrain, &mut groups, &config);
     info!(
-        "battle started: {} per team, reg size {}, map {}, AI {}",
+        "battle started: {} per team, scenario {}, AI {}",
         config.units_per_team,
-        config.reg_size,
-        if config.use_river_map { "river" } else { "classic" },
+        config.scenario.label(),
         if config.ai_enabled { "on" } else { "off" },
     );
 }
