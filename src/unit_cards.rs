@@ -200,55 +200,79 @@ fn icon_canvas(w: f32, h: f32) -> Node {
 //
 // Card kind icons are rendered ONCE into a small texture per kind and
 // shared by every card via ImageNode, so all copies are identical.
-// Authored at 2x the 20x22 logical canvas for crisp downsampling.
+// Authored at 2x the 20x24 logical canvas for crisp downsampling.
+// (20x24 logical is integer physical at 125/150/200% display scales,
+// so the quad never rounds to a different size per card.)
 
 const ICON_TEX_W: u32 = 40;
-const ICON_TEX_H: u32 = 44;
+const ICON_TEX_H: u32 = 48;
 const ICON_RGB: [u8; 3] = [230, 222, 194];
 const ICON_RGB_DETAIL: [u8; 3] = [26, 28, 33];
 
-/// A rounded rectangle in texture pixels: rect + per-corner radii
-/// (tl, tr, br, bl) + straight-alpha color.
-struct IconShape {
-    rect: (f32, f32, f32, f32),
-    radius: [f32; 4],
-    rgb: [u8; 3],
+/// A shape in texture pixels with a straight-alpha color.
+enum IconShape {
+    /// Rounded rect: rect + per-corner radii (tl, tr, br, bl).
+    Rect {
+        rect: (f32, f32, f32, f32),
+        radius: [f32; 4],
+        rgb: [u8; 3],
+    },
+    Tri {
+        a: Vec2,
+        b: Vec2,
+        c: Vec2,
+        rgb: [u8; 3],
+    },
 }
 
 fn kind_icon_shapes(kind: u8) -> Vec<IconShape> {
-    let s = |rect, radius, rgb| IconShape { rect, radius, rgb };
+    let s = |rect, radius, rgb| IconShape::Rect { rect, radius, rgb };
+    let t = |a: (f32, f32), b: (f32, f32), c: (f32, f32)| IconShape::Tri {
+        a: Vec2::new(a.0, a.1),
+        b: Vec2::new(b.0, b.1),
+        c: Vec2::new(c.0, c.1),
+        rgb: ICON_RGB,
+    };
     match kind {
         // Knight's helm: dome, dark eye slit, nose bar.
         KIND_HEAVY => vec![
-            s((6.0, 4.0, 28.0, 36.0), [14.0, 14.0, 2.0, 2.0], ICON_RGB),
-            s((8.0, 18.0, 24.0, 4.0), [0.0; 4], ICON_RGB_DETAIL),
-            s((18.0, 18.0, 4.0, 10.0), [0.0; 4], ICON_RGB),
+            s((6.0, 6.0, 28.0, 36.0), [14.0, 14.0, 2.0, 2.0], ICON_RGB),
+            s((8.0, 20.0, 24.0, 4.0), [0.0; 4], ICON_RGB_DETAIL),
+            s((18.0, 20.0, 4.0, 10.0), [0.0; 4], ICON_RGB),
         ],
-        // Spear: leaf head on a long shaft.
+        // Spear: pointed leaf head on a long thin shaft.
         KIND_SPEAR => vec![
-            s((14.0, 0.0, 12.0, 18.0), [6.0; 4], ICON_RGB),
-            s((18.0, 16.0, 4.0, 28.0), [0.0; 4], ICON_RGB),
+            t((20.0, 0.0), (14.5, 14.0), (25.5, 14.0)),
+            s((18.5, 13.0, 3.0, 34.0), [0.0; 4], ICON_RGB),
         ],
-        // Arming sword: blade, crossguard, grip, pommel.
+        // Longsword, point up: tapered tip, blade with a dark fuller,
+        // narrow crossguard, grip, pommel.
         _ => vec![
-            s((17.0, 2.0, 6.0, 24.0), [0.0; 4], ICON_RGB),
-            s((10.0, 26.0, 20.0, 4.0), [1.0; 4], ICON_RGB),
-            s((18.0, 30.0, 4.0, 10.0), [0.0; 4], ICON_RGB),
-            s((16.0, 40.0, 8.0, 4.0), [2.0; 4], ICON_RGB),
+            t((20.0, 2.0), (16.5, 12.0), (23.5, 12.0)),
+            s((16.5, 11.0, 7.0, 18.0), [0.0; 4], ICON_RGB),
+            s((19.0, 13.0, 2.0, 14.0), [0.0; 4], ICON_RGB_DETAIL),
+            s((11.0, 29.0, 18.0, 3.0), [1.0; 4], ICON_RGB),
+            s((18.5, 32.0, 3.0, 9.0), [0.0; 4], ICON_RGB),
+            s((17.0, 41.0, 6.0, 5.0), [2.5; 4], ICON_RGB),
         ],
     }
 }
 
 /// Signed distance to a rounded rect (y-down; radii tl, tr, br, bl).
-fn sd_round_rect(px: f32, py: f32, shape: &IconShape) -> f32 {
-    let (x, y, w, h) = shape.rect;
+fn sd_round_rect(
+    px: f32,
+    py: f32,
+    rect: (f32, f32, f32, f32),
+    radius: [f32; 4],
+) -> f32 {
+    let (x, y, w, h) = rect;
     let (hw, hh) = (w * 0.5, h * 0.5);
     let (qx, qy) = (px - (x + hw), py - (y + hh));
     let r = match (qx > 0.0, qy > 0.0) {
-        (false, false) => shape.radius[0],
-        (true, false) => shape.radius[1],
-        (true, true) => shape.radius[2],
-        (false, true) => shape.radius[3],
+        (false, false) => radius[0],
+        (true, false) => radius[1],
+        (true, true) => radius[2],
+        (false, true) => radius[3],
     }
     .min(hw)
     .min(hh);
@@ -258,15 +282,54 @@ fn sd_round_rect(px: f32, py: f32, shape: &IconShape) -> f32 {
     (dx * dx + dy * dy).sqrt() + ax.max(ay).min(0.0) - r
 }
 
+/// Signed distance to a triangle (Inigo Quilez's formula).
+fn sd_triangle(p: Vec2, a: Vec2, b: Vec2, c: Vec2) -> f32 {
+    let (e0, e1, e2) = (b - a, c - b, a - c);
+    let (v0, v1, v2) = (p - a, p - b, p - c);
+    let pq0 = v0 - e0 * (v0.dot(e0) / e0.length_squared()).clamp(0.0, 1.0);
+    let pq1 = v1 - e1 * (v1.dot(e1) / e1.length_squared()).clamp(0.0, 1.0);
+    let pq2 = v2 - e2 * (v2.dot(e2) / e2.length_squared()).clamp(0.0, 1.0);
+    let s = (e0.x * e2.y - e0.y * e2.x).signum();
+    let d = (pq0.length_squared(), s * (v0.x * e0.y - v0.y * e0.x));
+    let d = (
+        d.0.min(pq1.length_squared()),
+        d.1.min(s * (v1.x * e1.y - v1.y * e1.x)),
+    );
+    let d = (
+        d.0.min(pq2.length_squared()),
+        d.1.min(s * (v2.x * e2.y - v2.y * e2.x)),
+    );
+    -d.0.sqrt() * d.1.signum()
+}
+
+impl IconShape {
+    fn sd(&self, px: f32, py: f32) -> f32 {
+        match self {
+            IconShape::Rect { rect, radius, .. } => {
+                sd_round_rect(px, py, *rect, *radius)
+            }
+            IconShape::Tri { a, b, c, .. } => {
+                sd_triangle(Vec2::new(px, py), *a, *b, *c)
+            }
+        }
+    }
+
+    fn rgb(&self) -> [u8; 3] {
+        match self {
+            IconShape::Rect { rgb, .. } | IconShape::Tri { rgb, .. } => *rgb,
+        }
+    }
+}
+
 /// Software rasterization with 1px edge AA, straight-alpha src-over.
 fn rasterize_kind_icon(kind: u8) -> Image {
     let (w, h) = (ICON_TEX_W as usize, ICON_TEX_H as usize);
     let mut buf = vec![0.0f32; w * h * 4];
     for shape in kind_icon_shapes(kind) {
-        let src: [f32; 3] = shape.rgb.map(|c| c as f32 / 255.0);
+        let src: [f32; 3] = shape.rgb().map(|c| c as f32 / 255.0);
         for py in 0..h {
             for px in 0..w {
-                let d = sd_round_rect(px as f32 + 0.5, py as f32 + 0.5, &shape);
+                let d = shape.sd(px as f32 + 0.5, py as f32 + 0.5);
                 let sa = (0.5 - d).clamp(0.0, 1.0);
                 if sa <= 0.0 {
                     continue;
@@ -472,7 +535,7 @@ fn spawn_card(strip: &mut ChildSpawnerCommands, g: usize, kind: u8, icon: Handle
             card.spawn((
                 Node {
                     width: Val::Px(20.0),
-                    height: Val::Px(22.0),
+                    height: Val::Px(24.0),
                     ..default()
                 },
                 ImageNode::new(icon),
