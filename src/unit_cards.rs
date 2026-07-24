@@ -50,6 +50,14 @@ struct LooseIconVariant {
     tight: bool,
 }
 
+/// The Wall button's icon matches what the selection would form: a row
+/// of shields normally, spears braced over shields when every picked
+/// regiment is a spear regiment (spearwall).
+#[derive(Component)]
+struct WallIconVariant {
+    spear: bool,
+}
+
 /// Hover tooltip of a control button (name + hotkey).
 #[derive(Component)]
 struct BtnTooltip(ControlButton);
@@ -371,16 +379,49 @@ fn draw_halt(p: &mut ChildSpawnerCommands) {
     );
 }
 
-/// Wall: three shields shoulder to shoulder.
-fn draw_wall(p: &mut ChildSpawnerCommands) {
+/// One mini heater shield with a dark boss: rounded top corners, the
+/// bottom curved almost to a point.
+fn draw_mini_shield(p: &mut ChildSpawnerCommands, x: f32, y: f32, h: f32) {
     let shield = BorderRadius {
-        top_left: Val::Px(1.0),
-        top_right: Val::Px(1.0),
-        bottom_left: Val::Px(3.0),
-        bottom_right: Val::Px(3.0),
+        top_left: Val::Px(1.5),
+        top_right: Val::Px(1.5),
+        bottom_left: Val::Px(5.0),
+        bottom_right: Val::Px(5.0),
     };
-    for x in [2.0, 8.0, 14.0] {
-        shape(p, (x, 5.0, 5.0, 12.0), ICON_COLOR, shield);
+    shape(p, (x, y, 6.0, h), ICON_COLOR, shield);
+    shape(
+        p,
+        (x + 2.0, y + h * 0.4 - 1.0, 2.0, 2.0),
+        ICON_DETAIL,
+        BorderRadius::MAX,
+    );
+}
+
+/// Wall: a row of shields shoulder to shoulder; the spearwall variant
+/// braces spear shafts over a lower shield row.
+fn draw_wall_variant(p: &mut ChildSpawnerCommands, spear: bool) {
+    if spear {
+        for x in [3.0, 9.0, 15.0] {
+            p.spawn((
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: Val::Px(x),
+                    top: Val::Px(0.0),
+                    width: Val::Px(2.0),
+                    height: Val::Px(11.0),
+                    ..default()
+                },
+                BackgroundColor(ICON_COLOR),
+                UiTransform::from_rotation(Rot2::degrees(18.0)),
+            ));
+        }
+        for x in [2.0, 8.0, 14.0] {
+            draw_mini_shield(p, x, 9.0, 11.0);
+        }
+    } else {
+        for x in [2.0, 8.0, 14.0] {
+            draw_mini_shield(p, x, 5.0, 13.0);
+        }
     }
 }
 
@@ -399,9 +440,9 @@ fn draw_loose_variant(p: &mut ChildSpawnerCommands, tight: bool) {
     }
 }
 
-/// Blob: an undressed scatter of men.
+/// Blob: a loose cluster of men — quincunx, symmetric.
 fn draw_blob(p: &mut ChildSpawnerCommands) {
-    for (x, y) in [(3.0, 4.0), (12.0, 2.0), (16.0, 10.0), (5.0, 12.0), (11.0, 16.0)] {
+    for (x, y) in [(3.0, 3.0), (15.0, 3.0), (9.0, 9.0), (3.0, 15.0), (15.0, 15.0)] {
         shape(p, (x, y, 4.0, 4.0), ICON_COLOR, BorderRadius::MAX);
     }
 }
@@ -605,21 +646,22 @@ fn spawn_control_panel(bar: &mut ChildSpawnerCommands) {
                             TextColor(Color::srgb(0.92, 0.92, 0.85)),
                         ));
                     });
+                    // Stateful icons spawn every variant stacked on one
+                    // canvas; refresh shows the one matching the selection.
+                    let variant_node = || Node {
+                        position_type: PositionType::Absolute,
+                        left: Val::Px(0.0),
+                        top: Val::Px(0.0),
+                        width: Val::Px(22.0),
+                        height: Val::Px(22.0),
+                        ..default()
+                    };
                     match btn {
                         ControlButton::Loose => {
-                            // Both spacing variants stacked on the same
-                            // canvas; refresh shows one.
                             b.spawn(icon_canvas(22.0, 22.0)).with_children(|c| {
                                 for tight in [false, true] {
                                     c.spawn((
-                                        Node {
-                                            position_type: PositionType::Absolute,
-                                            left: Val::Px(0.0),
-                                            top: Val::Px(0.0),
-                                            width: Val::Px(22.0),
-                                            height: Val::Px(22.0),
-                                            ..default()
-                                        },
+                                        variant_node(),
                                         if tight {
                                             Visibility::Hidden
                                         } else {
@@ -631,14 +673,29 @@ fn spawn_control_panel(bar: &mut ChildSpawnerCommands) {
                                 }
                             });
                         }
+                        ControlButton::Wall => {
+                            b.spawn(icon_canvas(22.0, 22.0)).with_children(|c| {
+                                for spear in [false, true] {
+                                    c.spawn((
+                                        variant_node(),
+                                        if spear {
+                                            Visibility::Hidden
+                                        } else {
+                                            Visibility::Inherited
+                                        },
+                                        WallIconVariant { spear },
+                                    ))
+                                    .with_children(|v| draw_wall_variant(v, spear));
+                                }
+                            });
+                        }
                         _ => {
                             b.spawn(icon_canvas(22.0, 22.0)).with_children(|c| {
                                 match btn {
                                     ControlButton::Halt => draw_halt(c),
-                                    ControlButton::Wall => draw_wall(c),
                                     ControlButton::Blob => draw_blob(c),
                                     ControlButton::Hold => draw_hold(c),
-                                    ControlButton::Loose => unreachable!(),
+                                    _ => unreachable!(),
                                 }
                             });
                         }
@@ -820,11 +877,16 @@ fn control_buttons(
 /// Toggle buttons light up when the WHOLE controllable selection is in
 /// the mode (matching the hotkeys' toggle-as-a-set semantics: lit means
 /// the next press turns it off).
+#[allow(clippy::type_complexity)] // disjoint Visibility access
 fn refresh_control_buttons(
     groups: Res<Groups>,
     selection: Res<Selection>,
     mut query: Query<(&ControlButton, &Interaction, &mut BackgroundColor)>,
     mut loose_icons: Query<(&LooseIconVariant, &mut Visibility)>,
+    mut wall_icons: Query<
+        (&WallIconVariant, &mut Visibility),
+        (Without<LooseIconVariant>, Without<BtnTooltip>),
+    >,
     mut tooltips: Query<
         (&BtnTooltip, &mut Visibility),
         Without<LooseIconVariant>,
@@ -885,6 +947,21 @@ fn refresh_control_buttons(
     // close order, tight squares once the whole selection is loose.
     for (variant, mut vis) in &mut loose_icons {
         let want = if variant.tight == loose_active {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
+        if *vis != want {
+            *vis = want;
+        }
+    }
+
+    // The Wall icon matches what the selection would form: spears over
+    // shields when everything picked is a spear regiment.
+    let wall_spear = !picked.is_empty()
+        && picked.iter().all(|&g| groups.list[g].kind == KIND_SPEAR);
+    for (variant, mut vis) in &mut wall_icons {
+        let want = if variant.spear == wall_spear {
             Visibility::Inherited
         } else {
             Visibility::Hidden
