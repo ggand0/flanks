@@ -62,6 +62,10 @@ struct WallIconVariant {
 #[derive(Component)]
 struct BtnTooltip(ControlButton);
 
+/// The Wall tooltip's Text: its label tracks the wall icon variant.
+#[derive(Component)]
+struct WallTooltipText;
+
 /// One rasterized icon texture per unit kind, shared by every card so
 /// all icons of a kind are pixel-identical. (Node-composed icons round
 /// each rect to the pixel grid separately, and under a fractional
@@ -101,9 +105,6 @@ const BTN_ACTIVE: Color = Color::srgba(0.22, 0.38, 0.62, 0.95);
 const BTN_ACTIVE_HOVER: Color = Color::srgba(0.30, 0.48, 0.74, 0.95);
 const BTN_DISABLED: Color = Color::srgba(0.09, 0.10, 0.12, 0.80);
 
-/// M2TW-ish parchment pictograms on the dark circles.
-const ICON_COLOR: Color = Color::srgb(0.90, 0.87, 0.76);
-const ICON_DETAIL: Color = Color::srgb(0.10, 0.11, 0.13);
 /// Cards at least this wide (logical px) swap the kind letter for the icon.
 const CARD_ICON_MIN_W: f32 = 30.0;
 
@@ -169,51 +170,21 @@ fn morale_color(gd: &crate::orders::GroupData) -> Color {
     }
 }
 
-// ── Icon drawing ──
+// ── Icon rasterizer ──
 //
-// Pictograms are composed from plain UI nodes (rects + border-radius
-// rounding), matching the game's flat look with no image assets.
-
-/// Absolute-positioned rectangle inside an icon canvas.
-fn shape(
-    p: &mut ChildSpawnerCommands,
-    (x, y, w, h): (f32, f32, f32, f32),
-    color: Color,
-    radius: BorderRadius,
-) {
-    p.spawn((
-        Node {
-            position_type: PositionType::Absolute,
-            left: Val::Px(x),
-            top: Val::Px(y),
-            width: Val::Px(w),
-            height: Val::Px(h),
-            border_radius: radius,
-            ..default()
-        },
-        BackgroundColor(color),
-    ));
-}
-
-/// Fixed-size relative canvas the shapes position inside.
-fn icon_canvas(w: f32, h: f32) -> Node {
-    Node {
-        width: Val::Px(w),
-        height: Val::Px(h),
-        ..default()
-    }
-}
-
-// ── Kind icon rasterizer ──
-//
-// Card kind icons are rendered ONCE into a small texture per kind and
-// shared by every card via ImageNode, so all copies are identical.
-// Authored at 2x the 20x24 logical canvas for crisp downsampling.
-// (20x24 logical is integer physical at 125/150/200% display scales,
-// so the quad never rounds to a different size per card.)
+// Every HUD pictogram (card kind icons AND button icons) is rendered
+// once into a small texture and displayed via ImageNode. Node-composed
+// icons round each rect to the pixel grid separately and turn to mush
+// at 22px; a supersampled SDF rasterization stays crisp and every
+// consumer of a texture is pixel-identical. Authored at 2x the logical
+// canvas. Card icons are 20x24 logical (integer physical at
+// 125/150/200% display scales, so the quad never rounds to a different
+// size per card).
 
 const ICON_TEX_W: u32 = 40;
 const ICON_TEX_H: u32 = 48;
+/// Button icon texture: 2x the 22x22 logical button canvas.
+const BTN_TEX: u32 = 44;
 const ICON_RGB: [u8; 3] = [230, 222, 194];
 const ICON_RGB_DETAIL: [u8; 3] = [26, 28, 33];
 
@@ -229,6 +200,13 @@ enum IconShape {
         a: Vec2,
         b: Vec2,
         c: Vec2,
+        rgb: [u8; 3],
+    },
+    /// Capsule: a line segment with thickness (angled shafts).
+    Seg {
+        a: Vec2,
+        b: Vec2,
+        r: f32,
         rgb: [u8; 3],
     },
 }
@@ -310,6 +288,13 @@ fn sd_triangle(p: Vec2, a: Vec2, b: Vec2, c: Vec2) -> f32 {
     -d.0.sqrt() * d.1.signum()
 }
 
+/// Distance from a point to a line segment.
+fn sd_segment(p: Vec2, a: Vec2, b: Vec2) -> f32 {
+    let (pa, ba) = (p - a, b - a);
+    let h = (pa.dot(ba) / ba.length_squared()).clamp(0.0, 1.0);
+    (pa - ba * h).length()
+}
+
 impl IconShape {
     fn sd(&self, px: f32, py: f32) -> f32 {
         match self {
@@ -319,21 +304,26 @@ impl IconShape {
             IconShape::Tri { a, b, c, .. } => {
                 sd_triangle(Vec2::new(px, py), *a, *b, *c)
             }
+            IconShape::Seg { a, b, r, .. } => {
+                sd_segment(Vec2::new(px, py), *a, *b) - r
+            }
         }
     }
 
     fn rgb(&self) -> [u8; 3] {
         match self {
-            IconShape::Rect { rgb, .. } | IconShape::Tri { rgb, .. } => *rgb,
+            IconShape::Rect { rgb, .. }
+            | IconShape::Tri { rgb, .. }
+            | IconShape::Seg { rgb, .. } => *rgb,
         }
     }
 }
 
 /// Software rasterization with 1px edge AA, straight-alpha src-over.
-fn rasterize_kind_icon(kind: u8) -> Image {
-    let (w, h) = (ICON_TEX_W as usize, ICON_TEX_H as usize);
+fn rasterize_icon(shapes: Vec<IconShape>, tex_w: u32, tex_h: u32) -> Image {
+    let (w, h) = (tex_w as usize, tex_h as usize);
     let mut buf = vec![0.0f32; w * h * 4];
-    for shape in kind_icon_shapes(kind) {
+    for shape in shapes {
         let src: [f32; 3] = shape.rgb().map(|c| c as f32 / 255.0);
         for py in 0..h {
             for px in 0..w {
@@ -358,8 +348,8 @@ fn rasterize_kind_icon(kind: u8) -> Image {
         .collect();
     Image::new(
         Extent3d {
-            width: ICON_TEX_W,
-            height: ICON_TEX_H,
+            width: tex_w,
+            height: tex_h,
             depth_or_array_layers: 1,
         },
         TextureDimension::D2,
@@ -369,94 +359,154 @@ fn rasterize_kind_icon(kind: u8) -> Image {
     )
 }
 
-/// Halt: stop square.
-fn draw_halt(p: &mut ChildSpawnerCommands) {
-    shape(
-        p,
-        (6.0, 6.0, 10.0, 10.0),
-        ICON_COLOR,
-        BorderRadius::all(Val::Px(2.0)),
-    );
+fn rasterize_kind_icon(kind: u8) -> Image {
+    rasterize_icon(kind_icon_shapes(kind), ICON_TEX_W, ICON_TEX_H)
 }
 
-/// One mini heater shield with a dark boss: rounded top corners, the
-/// bottom curved almost to a point.
-fn draw_mini_shield(p: &mut ChildSpawnerCommands, x: f32, y: f32, h: f32) {
-    let shield = BorderRadius {
-        top_left: Val::Px(1.5),
-        top_right: Val::Px(1.5),
-        bottom_left: Val::Px(5.0),
-        bottom_right: Val::Px(5.0),
-    };
-    shape(p, (x, y, 6.0, h), ICON_COLOR, shield);
-    shape(
-        p,
-        (x + 2.0, y + h * 0.4 - 1.0, 2.0, 2.0),
-        ICON_DETAIL,
-        BorderRadius::MAX,
-    );
+// ── Button icon shapes (44x44 texture = 2x the 22px button canvas) ──
+
+/// Heater shield: rounded-top body, sides tapering to a bottom point,
+/// with a dark boss.
+fn heater_shield(out: &mut Vec<IconShape>, x: f32, y: f32, w: f32, h: f32) {
+    let body_h = h * 0.60;
+    out.push(IconShape::Rect {
+        rect: (x, y, w, body_h),
+        radius: [w * 0.22, w * 0.22, 0.0, 0.0],
+        rgb: ICON_RGB,
+    });
+    out.push(IconShape::Tri {
+        a: Vec2::new(x, y + body_h - 0.5),
+        b: Vec2::new(x + w, y + body_h - 0.5),
+        c: Vec2::new(x + w * 0.5, y + h),
+        rgb: ICON_RGB,
+    });
+    let r = w * 0.16;
+    out.push(IconShape::Rect {
+        rect: (x + w * 0.5 - r, y + h * 0.35 - r, r * 2.0, r * 2.0),
+        radius: [r; 4],
+        rgb: ICON_RGB_DETAIL,
+    });
 }
 
-/// Wall: a row of shields shoulder to shoulder; the spearwall variant
-/// braces spear shafts over a lower shield row.
-fn draw_wall_variant(p: &mut ChildSpawnerCommands, spear: bool) {
-    if spear {
-        for x in [3.0, 9.0, 15.0] {
-            p.spawn((
-                Node {
-                    position_type: PositionType::Absolute,
-                    left: Val::Px(x),
-                    top: Val::Px(0.0),
-                    width: Val::Px(2.0),
-                    height: Val::Px(11.0),
-                    ..default()
-                },
-                BackgroundColor(ICON_COLOR),
-                UiTransform::from_rotation(Rot2::degrees(18.0)),
-            ));
-        }
-        for x in [2.0, 8.0, 14.0] {
-            draw_mini_shield(p, x, 9.0, 11.0);
-        }
-    } else {
-        for x in [2.0, 8.0, 14.0] {
-            draw_mini_shield(p, x, 5.0, 13.0);
-        }
+/// Spear with a leaf head, from butt to tip.
+fn spear(out: &mut Vec<IconShape>, base: Vec2, tip: Vec2, shaft_r: f32) {
+    let d = (tip - base).normalize();
+    let perp = Vec2::new(-d.y, d.x);
+    let head_base = tip - d * 11.0;
+    out.push(IconShape::Seg {
+        a: base,
+        b: head_base + d,
+        r: shaft_r,
+        rgb: ICON_RGB,
+    });
+    out.push(IconShape::Tri {
+        a: tip,
+        b: head_base + perp * 4.0,
+        c: head_base - perp * 4.0,
+        rgb: ICON_RGB,
+    });
+}
+
+fn halt_shapes() -> Vec<IconShape> {
+    vec![IconShape::Rect {
+        rect: (12.0, 12.0, 20.0, 20.0),
+        radius: [4.0; 4],
+        rgb: ICON_RGB,
+    }]
+}
+
+/// Shield wall: three heater shields shoulder to shoulder.
+fn wall_shield_shapes() -> Vec<IconShape> {
+    let mut out = Vec::new();
+    for x in [2.0, 15.5, 29.0] {
+        heater_shield(&mut out, x, 8.0, 13.0, 28.0);
     }
+    out
 }
 
-/// Loose: 2x3 squares; both spacing variants exist and refresh toggles
-/// which one is visible (the icon shows what pressing yields).
-fn draw_loose_variant(p: &mut ChildSpawnerCommands, tight: bool) {
+/// Spear wall: a dense rank of five braced spears over a low line.
+fn wall_spear_shapes() -> Vec<IconShape> {
+    let mut out = Vec::new();
+    for bx in [4.0, 11.0, 18.0, 25.0, 32.0] {
+        spear(
+            &mut out,
+            Vec2::new(bx, 40.0),
+            Vec2::new(bx + 11.0, 12.0),
+            1.8,
+        );
+    }
+    out.push(IconShape::Rect {
+        rect: (4.0, 37.0, 36.0, 5.0),
+        radius: [2.0; 4],
+        rgb: ICON_RGB,
+    });
+    out
+}
+
+/// Loose: 2x3 squares; the two spacing variants toggle at runtime.
+fn loose_shapes(tight: bool) -> Vec<IconShape> {
     let (xs, ys): (&[f32], &[f32]) = if tight {
-        (&[4.0, 9.0, 14.0], &[6.0, 11.0])
+        (&[8.0, 18.0, 28.0], &[13.0, 23.0])
     } else {
-        (&[1.0, 9.0, 17.0], &[3.0, 13.0])
+        (&[2.0, 18.0, 34.0], &[7.0, 27.0])
     };
+    let mut out = Vec::new();
     for &y in ys {
         for &x in xs {
-            shape(p, (x, y, 4.0, 4.0), ICON_COLOR, BorderRadius::ZERO);
+            out.push(IconShape::Rect {
+                rect: (x, y, 8.0, 8.0),
+                radius: [0.0; 4],
+                rgb: ICON_RGB,
+            });
         }
     }
+    out
 }
 
 /// Blob: a loose cluster of men — quincunx, symmetric.
-fn draw_blob(p: &mut ChildSpawnerCommands) {
-    for (x, y) in [(3.0, 3.0), (15.0, 3.0), (9.0, 9.0), (3.0, 15.0), (15.0, 15.0)] {
-        shape(p, (x, y, 4.0, 4.0), ICON_COLOR, BorderRadius::MAX);
-    }
+fn blob_shapes() -> Vec<IconShape> {
+    [(6.0, 6.0), (30.0, 6.0), (18.0, 18.0), (6.0, 30.0), (30.0, 30.0)]
+        .into_iter()
+        .map(|(x, y)| IconShape::Rect {
+            rect: (x, y, 8.0, 8.0),
+            radius: [4.0; 4],
+            rgb: ICON_RGB,
+        })
+        .collect()
 }
 
-/// Hold: a planted shield with a boss.
-fn draw_hold(p: &mut ChildSpawnerCommands) {
-    let shield = BorderRadius {
-        top_left: Val::Px(3.0),
-        top_right: Val::Px(3.0),
-        bottom_left: Val::Px(9.0),
-        bottom_right: Val::Px(9.0),
-    };
-    shape(p, (4.0, 3.0, 14.0, 16.0), ICON_COLOR, shield);
-    shape(p, (9.0, 8.0, 4.0, 4.0), ICON_DETAIL, BorderRadius::MAX);
+/// Hold: one planted heater shield.
+fn hold_shapes() -> Vec<IconShape> {
+    let mut out = Vec::new();
+    heater_shield(&mut out, 12.0, 5.0, 20.0, 33.0);
+    out
+}
+
+/// Rasterized button icon textures, built once (handles are shared).
+#[derive(Resource, Clone)]
+struct ButtonIcons {
+    halt: Handle<Image>,
+    wall_shield: Handle<Image>,
+    wall_spear: Handle<Image>,
+    loose_spread: Handle<Image>,
+    loose_tight: Handle<Image>,
+    blob: Handle<Image>,
+    hold: Handle<Image>,
+}
+
+impl ButtonIcons {
+    fn build(images: &mut Assets<Image>) -> Self {
+        let mut add = |shapes| images.add(rasterize_icon(shapes, BTN_TEX, BTN_TEX));
+        Self {
+            halt: add(halt_shapes()),
+            wall_shield: add(wall_shield_shapes()),
+            wall_spear: add(wall_spear_shapes()),
+            loose_spread: add(loose_shapes(false)),
+            loose_tight: add(loose_shapes(true)),
+            blob: add(blob_shapes()),
+            hold: add(hold_shapes()),
+        }
+    }
 }
 
 // ── Spawn ──
@@ -466,6 +516,7 @@ fn spawn_card_bar(
     groups: Res<Groups>,
     mut images: ResMut<Assets<Image>>,
     icons: Option<Res<KindIcons>>,
+    btn_icons: Option<Res<ButtonIcons>>,
 ) {
     let icons = match icons {
         Some(r) => r.0.clone(),
@@ -474,6 +525,14 @@ fn spawn_card_bar(
                 [0u8, 1, 2].map(|kind| images.add(rasterize_kind_icon(kind)));
             commands.insert_resource(KindIcons(handles.clone()));
             handles
+        }
+    };
+    let btn_icons = match btn_icons {
+        Some(r) => r.clone(),
+        None => {
+            let built = ButtonIcons::build(&mut images);
+            commands.insert_resource(built.clone());
+            built
         }
     };
     commands
@@ -512,7 +571,7 @@ fn spawn_card_bar(
                     }
                 }
             });
-            spawn_control_panel(bar);
+            spawn_control_panel(bar, &btn_icons);
         });
 }
 
@@ -586,10 +645,10 @@ fn spawn_card(strip: &mut ChildSpawnerCommands, g: usize, kind: u8, icon: Handle
 }
 
 /// M2TW-style round icon buttons, right end of the bar.
-fn spawn_control_panel(bar: &mut ChildSpawnerCommands) {
+fn spawn_control_panel(bar: &mut ChildSpawnerCommands, icons: &ButtonIcons) {
     const BUTTONS: [(ControlButton, &str); 5] = [
         (ControlButton::Halt, "Halt (Backspace)"),
-        (ControlButton::Wall, "Wall (F)"),
+        (ControlButton::Wall, "Shield Wall (F)"),
         (ControlButton::Loose, "Loose (L)"),
         (ControlButton::Blob, "Blob (B)"),
         (ControlButton::Hold, "Hold (H)"),
@@ -637,7 +696,7 @@ fn spawn_control_panel(bar: &mut ChildSpawnerCommands) {
                         BtnTooltip(btn),
                     ))
                     .with_children(|t| {
-                        t.spawn((
+                        let mut text = t.spawn((
                             Text::new(label),
                             TextFont {
                                 font_size: FontSize::Px(11.0),
@@ -645,9 +704,15 @@ fn spawn_control_panel(bar: &mut ChildSpawnerCommands) {
                             },
                             TextColor(Color::srgb(0.92, 0.92, 0.85)),
                         ));
+                        // The Wall label tracks the icon variant
+                        // (Shield Wall / Spear Wall).
+                        if btn == ControlButton::Wall {
+                            text.insert(WallTooltipText);
+                        }
                     });
-                    // Stateful icons spawn every variant stacked on one
-                    // canvas; refresh shows the one matching the selection.
+                    // Icon: a 22x22 quad over the rasterized texture.
+                    // Stateful buttons stack both variants; refresh
+                    // shows the one matching the selection.
                     let variant_node = || Node {
                         position_type: PositionType::Absolute,
                         left: Val::Px(0.0),
@@ -656,48 +721,62 @@ fn spawn_control_panel(bar: &mut ChildSpawnerCommands) {
                         height: Val::Px(22.0),
                         ..default()
                     };
+                    let canvas = Node {
+                        width: Val::Px(22.0),
+                        height: Val::Px(22.0),
+                        ..default()
+                    };
                     match btn {
                         ControlButton::Loose => {
-                            b.spawn(icon_canvas(22.0, 22.0)).with_children(|c| {
+                            b.spawn(canvas).with_children(|c| {
                                 for tight in [false, true] {
                                     c.spawn((
                                         variant_node(),
+                                        ImageNode::new(if tight {
+                                            icons.loose_tight.clone()
+                                        } else {
+                                            icons.loose_spread.clone()
+                                        }),
                                         if tight {
                                             Visibility::Hidden
                                         } else {
                                             Visibility::Inherited
                                         },
                                         LooseIconVariant { tight },
-                                    ))
-                                    .with_children(|v| draw_loose_variant(v, tight));
+                                    ));
                                 }
                             });
                         }
                         ControlButton::Wall => {
-                            b.spawn(icon_canvas(22.0, 22.0)).with_children(|c| {
+                            b.spawn(canvas).with_children(|c| {
                                 for spear in [false, true] {
                                     c.spawn((
                                         variant_node(),
+                                        ImageNode::new(if spear {
+                                            icons.wall_spear.clone()
+                                        } else {
+                                            icons.wall_shield.clone()
+                                        }),
                                         if spear {
                                             Visibility::Hidden
                                         } else {
                                             Visibility::Inherited
                                         },
                                         WallIconVariant { spear },
-                                    ))
-                                    .with_children(|v| draw_wall_variant(v, spear));
+                                    ));
                                 }
                             });
                         }
                         _ => {
-                            b.spawn(icon_canvas(22.0, 22.0)).with_children(|c| {
-                                match btn {
-                                    ControlButton::Halt => draw_halt(c),
-                                    ControlButton::Blob => draw_blob(c),
-                                    ControlButton::Hold => draw_hold(c),
+                            b.spawn((
+                                canvas,
+                                ImageNode::new(match btn {
+                                    ControlButton::Halt => icons.halt.clone(),
+                                    ControlButton::Blob => icons.blob.clone(),
+                                    ControlButton::Hold => icons.hold.clone(),
                                     _ => unreachable!(),
-                                }
-                            });
+                                }),
+                            ));
                         }
                     }
                 });
@@ -891,6 +970,7 @@ fn refresh_control_buttons(
         (&BtnTooltip, &mut Visibility),
         Without<LooseIconVariant>,
     >,
+    mut wall_tip_text: Query<&mut Text, With<WallTooltipText>>,
 ) {
     let picked: Vec<usize> = selection
         .regiments
@@ -956,8 +1036,8 @@ fn refresh_control_buttons(
         }
     }
 
-    // The Wall icon matches what the selection would form: spears over
-    // shields when everything picked is a spear regiment.
+    // The Wall icon and label match what the selection would form:
+    // a spearwall when everything picked is a spear regiment.
     let wall_spear = !picked.is_empty()
         && picked.iter().all(|&g| groups.list[g].kind == KIND_SPEAR);
     for (variant, mut vis) in &mut wall_icons {
@@ -968,6 +1048,16 @@ fn refresh_control_buttons(
         };
         if *vis != want {
             *vis = want;
+        }
+    }
+    let wall_label = if wall_spear {
+        "Spear Wall (F)"
+    } else {
+        "Shield Wall (F)"
+    };
+    for mut text in &mut wall_tip_text {
+        if text.0 != wall_label {
+            text.0 = wall_label.to_string();
         }
     }
 
