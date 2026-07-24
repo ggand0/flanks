@@ -12,15 +12,15 @@ use bevy::ecs::hierarchy::ChildSpawnerCommands;
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 
-use crate::formation::{FormCmd, FormShape, FormSpacing, apply_formation_cmd};
-use crate::game_state::{BattleInputSet, GameState};
+use crate::formation::{
+    FormCmd, FormShape, FormSpacing, apply_formation_cmd, is_spearwall_kind,
+};
+use crate::game_state::{
+    BTN_HOVER, BTN_NORMAL, BTN_PRESSED, CustomStyled, GameState, HudInputSet,
+    TEXT_COLOR,
+};
 use crate::orders::{Groups, Hover, PLAYER_TEAM, RegState, Selection, halt_selected};
-use crate::unit_types::{KIND_HEAVY, KIND_SPEAR};
-
-/// Marker: this Button paints its own BackgroundColor — the global hover
-/// styler in game_state.rs must leave it alone.
-#[derive(Component)]
-pub struct CustomStyled;
+use crate::unit_types::{KIND_HEAVY, KIND_SPEAR, NUM_KINDS};
 
 /// Card button; the payload is the regiment's index into `Groups::list`.
 #[derive(Component)]
@@ -34,28 +34,21 @@ struct CardFill(usize);
 #[derive(Component)]
 struct CardMorale(usize);
 
-/// Kind letter fallback, shown when the card is too narrow for the icon.
+/// The card's kind art: the rasterized icon (`icon: true`, shown on
+/// wide cards) or the letter fallback (`icon: false`, narrow cards).
 #[derive(Component)]
-struct CardGlyph(usize);
-
-/// Node-drawn kind icon (helm / spear / sword), shown on wide cards.
-#[derive(Component)]
-struct CardIcon(usize);
-
-/// The Loose button's icon reflects what pressing it yields: spread
-/// squares while the selection is in close order, tight squares once
-/// everyone is loose (M2TW-style state icon).
-#[derive(Component)]
-struct LooseIconVariant {
-    tight: bool,
+struct CardArt {
+    g: usize,
+    icon: bool,
 }
 
-/// The Wall button's icon matches what the selection would form: a row
-/// of shields normally, spears braced over shields when every picked
-/// regiment is a spear regiment (spearwall).
+/// One variant of a stateful button icon (M2TW-style: the icon previews
+/// what pressing yields). `alt: false` is the default art, `alt: true`
+/// the alternate; refresh shows the variant matching the selection.
 #[derive(Component)]
-struct WallIconVariant {
-    spear: bool,
+struct StatefulIcon {
+    btn: ControlButton,
+    alt: bool,
 }
 
 /// Hover tooltip of a control button (name + hotkey).
@@ -66,21 +59,10 @@ struct BtnTooltip(ControlButton);
 #[derive(Component)]
 struct WallTooltipText;
 
-/// One rasterized icon texture per unit kind, shared by every card so
-/// all icons of a kind are pixel-identical. (Node-composed icons round
-/// each rect to the pixel grid separately, and under a fractional
-/// display scale neighboring cards land on different subpixel phases,
-/// visibly warping each copy differently.)
-#[derive(Resource)]
-struct KindIcons([Handle<Image>; crate::unit_types::NUM_KINDS]);
-
 #[derive(Component, Clone, Copy, PartialEq, Eq)]
 enum ControlButton {
     Halt,
-    Wall,
-    Loose,
-    Blob,
-    Hold,
+    Form(FormCmd),
 }
 
 const BAR_BG: Color = Color::srgba(0.05, 0.06, 0.08, 0.80);
@@ -94,19 +76,19 @@ const KIND_FILL: [Color; 3] = [
     Color::srgb(0.42, 0.62, 0.95), // light: pale blue
     Color::srgb(0.30, 0.55, 0.70), // spear: teal blue
 ];
-/// Broken regiments drain to the broken-flag gray (banners.rs).
-const FILL_BROKEN: Color = Color::srgb(0.45, 0.50, 0.58);
+/// Broken regiments drain to the broken-flag gray.
+const FILL_BROKEN: Color = crate::banners::FLAG_BROKEN[0];
 const SEL_OUTLINE: Color = Color::srgb(0.95, 0.95, 0.90);
 
-const BTN_NORMAL: Color = Color::srgba(0.15, 0.16, 0.20, 0.92);
-const BTN_HOVER: Color = Color::srgba(0.25, 0.27, 0.32, 0.95);
-const BTN_PRESSED: Color = Color::srgba(0.10, 0.11, 0.14, 0.95);
 const BTN_ACTIVE: Color = Color::srgba(0.22, 0.38, 0.62, 0.95);
 const BTN_ACTIVE_HOVER: Color = Color::srgba(0.30, 0.48, 0.74, 0.95);
 const BTN_DISABLED: Color = Color::srgba(0.09, 0.10, 0.12, 0.80);
 
 /// Cards at least this wide (logical px) swap the kind letter for the icon.
 const CARD_ICON_MIN_W: f32 = 30.0;
+/// Total bar height (56px card + 2x5px padding); overlay.rs derives the
+/// inspect plaque's offset from it.
+pub const BAR_HEIGHT: f32 = 66.0;
 
 /// True when the pointer sits on any interactive UI node: map input
 /// (lasso start, RMB order start) must not fire through the HUD.
@@ -125,16 +107,7 @@ impl Plugin for UnitCardsPlugin {
         .add_systems(
             Update,
             (
-                (
-                    // After the lasso: the over-UI guard in drag_select
-                    // reads hover state that lags synthetic same-frame
-                    // move+click input by one frame, and if a click ever
-                    // slips through both paths the card must win.
-                    card_clicks.after(crate::selection::drag_select),
-                    card_hover.after(crate::selection::update_hover),
-                    control_buttons,
-                )
-                    .in_set(BattleInputSet),
+                (card_clicks, card_hover, control_buttons).in_set(HudInputSet),
                 // Visual refresh keeps running while paused: the HUD stays
                 // readable, only input is gated.
                 (refresh_cards, refresh_control_buttons)
@@ -425,18 +398,19 @@ fn wall_shield_shapes() -> Vec<IconShape> {
 }
 
 /// Spear wall: a dense rank of five braced spears over a low line.
+/// Content bbox spans x 1..42, y 7..37: centered on the 44x44 canvas.
 fn wall_spear_shapes() -> Vec<IconShape> {
     let mut out = Vec::new();
-    for bx in [4.0, 11.0, 18.0, 25.0, 32.0] {
+    for bx in [3.0, 10.0, 17.0, 24.0, 31.0] {
         spear(
             &mut out,
-            Vec2::new(bx, 40.0),
-            Vec2::new(bx + 11.0, 12.0),
+            Vec2::new(bx, 35.0),
+            Vec2::new(bx + 11.0, 7.0),
             1.8,
         );
     }
     out.push(IconShape::Rect {
-        rect: (4.0, 37.0, 36.0, 5.0),
+        rect: (3.0, 32.0, 36.0, 5.0),
         radius: [2.0; 4],
         rgb: ICON_RGB,
     });
@@ -448,7 +422,7 @@ fn loose_shapes(tight: bool) -> Vec<IconShape> {
     let (xs, ys): (&[f32], &[f32]) = if tight {
         (&[8.0, 18.0, 28.0], &[13.0, 23.0])
     } else {
-        (&[2.0, 18.0, 34.0], &[7.0, 27.0])
+        (&[2.0, 18.0, 34.0], &[8.0, 28.0])
     };
     let mut out = Vec::new();
     for &y in ys {
@@ -482,8 +456,9 @@ fn hold_shapes() -> Vec<IconShape> {
     out
 }
 
-/// Rasterized button icon textures, built once (handles are shared).
-#[derive(Resource, Clone)]
+/// Rasterized button icon textures. Rebuilt on every battle entry: the
+/// whole set is ~10 tiny images and sub-millisecond to draw, and the
+/// old handles free themselves when the previous bar despawns.
 struct ButtonIcons {
     halt: Handle<Image>,
     wall_shield: Handle<Image>,
@@ -515,26 +490,10 @@ fn spawn_card_bar(
     mut commands: Commands,
     groups: Res<Groups>,
     mut images: ResMut<Assets<Image>>,
-    icons: Option<Res<KindIcons>>,
-    btn_icons: Option<Res<ButtonIcons>>,
 ) {
-    let icons = match icons {
-        Some(r) => r.0.clone(),
-        None => {
-            let handles =
-                [0u8, 1, 2].map(|kind| images.add(rasterize_kind_icon(kind)));
-            commands.insert_resource(KindIcons(handles.clone()));
-            handles
-        }
-    };
-    let btn_icons = match btn_icons {
-        Some(r) => r.clone(),
-        None => {
-            let built = ButtonIcons::build(&mut images);
-            commands.insert_resource(built.clone());
-            built
-        }
-    };
+    let icons: [Handle<Image>; NUM_KINDS] =
+        std::array::from_fn(|kind| images.add(rasterize_kind_icon(kind as u8)));
+    let btn_icons = ButtonIcons::build(&mut images);
     commands
         .spawn((
             Node {
@@ -630,7 +589,7 @@ fn spawn_card(strip: &mut ChildSpawnerCommands, g: usize, kind: u8, icon: Handle
                     ..default()
                 },
                 TextColor(Color::srgba(0.95, 0.95, 0.90, 0.75)),
-                CardGlyph(g),
+                CardArt { g, icon: false },
             ));
             card.spawn((
                 Node {
@@ -639,7 +598,7 @@ fn spawn_card(strip: &mut ChildSpawnerCommands, g: usize, kind: u8, icon: Handle
                     ..default()
                 },
                 ImageNode::new(icon),
-                CardIcon(g),
+                CardArt { g, icon: true },
             ));
         });
 }
@@ -648,10 +607,10 @@ fn spawn_card(strip: &mut ChildSpawnerCommands, g: usize, kind: u8, icon: Handle
 fn spawn_control_panel(bar: &mut ChildSpawnerCommands, icons: &ButtonIcons) {
     const BUTTONS: [(ControlButton, &str); 5] = [
         (ControlButton::Halt, "Halt (Backspace)"),
-        (ControlButton::Wall, "Shield Wall (F)"),
-        (ControlButton::Loose, "Loose (L)"),
-        (ControlButton::Blob, "Blob (B)"),
-        (ControlButton::Hold, "Hold (H)"),
+        (ControlButton::Form(FormCmd::Wall), "Shield Wall (F)"),
+        (ControlButton::Form(FormCmd::Loose), "Loose (L)"),
+        (ControlButton::Form(FormCmd::Blob), "Blob (B)"),
+        (ControlButton::Form(FormCmd::Hold), "Hold (H)"),
     ];
     bar.spawn(Node {
         flex_shrink: 0.0,
@@ -702,82 +661,69 @@ fn spawn_control_panel(bar: &mut ChildSpawnerCommands, icons: &ButtonIcons) {
                                 font_size: FontSize::Px(11.0),
                                 ..default()
                             },
-                            TextColor(Color::srgb(0.92, 0.92, 0.85)),
+                            TextColor(TEXT_COLOR),
                         ));
                         // The Wall label tracks the icon variant
                         // (Shield Wall / Spear Wall).
-                        if btn == ControlButton::Wall {
+                        if btn == ControlButton::Form(FormCmd::Wall) {
                             text.insert(WallTooltipText);
                         }
                     });
                     // Icon: a 22x22 quad over the rasterized texture.
                     // Stateful buttons stack both variants; refresh
                     // shows the one matching the selection.
-                    let variant_node = || Node {
-                        position_type: PositionType::Absolute,
-                        left: Val::Px(0.0),
-                        top: Val::Px(0.0),
-                        width: Val::Px(22.0),
-                        height: Val::Px(22.0),
-                        ..default()
-                    };
                     let canvas = Node {
                         width: Val::Px(22.0),
                         height: Val::Px(22.0),
                         ..default()
                     };
-                    match btn {
-                        ControlButton::Loose => {
-                            b.spawn(canvas).with_children(|c| {
-                                for tight in [false, true] {
-                                    c.spawn((
-                                        variant_node(),
-                                        ImageNode::new(if tight {
-                                            icons.loose_tight.clone()
-                                        } else {
-                                            icons.loose_spread.clone()
-                                        }),
-                                        if tight {
-                                            Visibility::Hidden
-                                        } else {
-                                            Visibility::Inherited
-                                        },
-                                        LooseIconVariant { tight },
-                                    ));
+                    let variants: Option<[&Handle<Image>; 2]> = match btn {
+                        ControlButton::Form(FormCmd::Wall) => {
+                            Some([&icons.wall_shield, &icons.wall_spear])
+                        }
+                        ControlButton::Form(FormCmd::Loose) => {
+                            Some([&icons.loose_spread, &icons.loose_tight])
+                        }
+                        _ => None,
+                    };
+                    if let Some(pair) = variants {
+                        b.spawn(canvas).with_children(|c| {
+                            for (alt, handle) in
+                                [(false, pair[0]), (true, pair[1])]
+                            {
+                                c.spawn((
+                                    Node {
+                                        position_type: PositionType::Absolute,
+                                        left: Val::Px(0.0),
+                                        top: Val::Px(0.0),
+                                        width: Val::Px(22.0),
+                                        height: Val::Px(22.0),
+                                        ..default()
+                                    },
+                                    ImageNode::new(handle.clone()),
+                                    if alt {
+                                        Visibility::Hidden
+                                    } else {
+                                        Visibility::Inherited
+                                    },
+                                    StatefulIcon { btn, alt },
+                                ));
+                            }
+                        });
+                    } else {
+                        b.spawn((
+                            canvas,
+                            ImageNode::new(match btn {
+                                ControlButton::Halt => icons.halt.clone(),
+                                ControlButton::Form(FormCmd::Blob) => {
+                                    icons.blob.clone()
                                 }
-                            });
-                        }
-                        ControlButton::Wall => {
-                            b.spawn(canvas).with_children(|c| {
-                                for spear in [false, true] {
-                                    c.spawn((
-                                        variant_node(),
-                                        ImageNode::new(if spear {
-                                            icons.wall_spear.clone()
-                                        } else {
-                                            icons.wall_shield.clone()
-                                        }),
-                                        if spear {
-                                            Visibility::Hidden
-                                        } else {
-                                            Visibility::Inherited
-                                        },
-                                        WallIconVariant { spear },
-                                    ));
+                                ControlButton::Form(FormCmd::Hold) => {
+                                    icons.hold.clone()
                                 }
-                            });
-                        }
-                        _ => {
-                            b.spawn((
-                                canvas,
-                                ImageNode::new(match btn {
-                                    ControlButton::Halt => icons.halt.clone(),
-                                    ControlButton::Blob => icons.blob.clone(),
-                                    ControlButton::Hold => icons.hold.clone(),
-                                    _ => unreachable!(),
-                                }),
-                            ));
-                        }
+                                _ => unreachable!(),
+                            }),
+                        ));
                     }
                 });
         }
@@ -806,13 +752,7 @@ fn card_clicks(
         }
         selection.regiments.resize(groups.list.len(), false);
         selection.regiments[card.0] = !additive || !selection.regiments[card.0];
-        selection.count_units = selection
-            .regiments
-            .iter()
-            .enumerate()
-            .filter(|(g, s)| **s && groups.list[*g].team == PLAYER_TEAM)
-            .map(|(g, _)| groups.list[g].count)
-            .sum();
+        selection.recount(&groups);
     }
 }
 
@@ -835,6 +775,10 @@ fn card_hover(cards: Query<(&Interaction, &UnitCard)>, mut hover: ResMut<Hover>)
 fn refresh_cards(
     groups: Res<Groups>,
     selection: Res<Selection>,
+    // Wide-enough cards show the kind icon, narrow ones the letter
+    // (which the sliver clip then eats). Indexed by regiment; kept
+    // across frames to stay allocation-free.
+    mut wide: Local<Vec<bool>>,
     mut cards: Query<(
         &UnitCard,
         &ComputedNode,
@@ -844,30 +788,16 @@ fn refresh_cards(
     )>,
     mut fills: Query<
         (&CardFill, &mut Node, &mut BackgroundColor),
-        (Without<UnitCard>, Without<CardMorale>, Without<CardGlyph>, Without<CardIcon>),
+        (Without<UnitCard>, Without<CardMorale>, Without<CardArt>),
     >,
     mut strips: Query<
         (&CardMorale, &mut BackgroundColor),
         (Without<UnitCard>, Without<CardFill>),
     >,
-    mut glyphs: Query<
-        (&CardGlyph, &mut Node),
-        (Without<UnitCard>, Without<CardFill>, Without<CardIcon>),
-    >,
-    mut icons: Query<
-        (&CardIcon, &mut Node),
-        (Without<UnitCard>, Without<CardFill>, Without<CardGlyph>),
-    >,
+    mut arts: Query<(&CardArt, &mut Node), (Without<UnitCard>, Without<CardFill>)>,
 ) {
-    let set = |bg: &mut BackgroundColor, c: Color| {
-        if bg.0 != c {
-            bg.0 = c;
-        }
-    };
-
-    // Wide-enough cards show the kind icon, narrow ones the letter
-    // (which the sliver clip then eats). Indexed by regiment.
-    let mut wide = vec![false; groups.list.len()];
+    wide.clear();
+    wide.resize(groups.list.len(), false);
 
     for (card, computed, interaction, mut bg, mut outline) in &mut cards {
         wide[card.0] =
@@ -880,12 +810,13 @@ fn refresh_cards(
         } else {
             CARD_BG
         };
-        set(&mut bg, want_bg);
+        bg.set_if_neq(BackgroundColor(want_bg));
         let selected = selection.regiments.get(card.0).copied().unwrap_or(false);
-        let want_outline = if selected { SEL_OUTLINE } else { Color::NONE };
-        if outline.color != want_outline {
-            outline.color = want_outline;
-        }
+        outline.set_if_neq(Outline {
+            width: Val::Px(2.0),
+            offset: Val::Px(0.0),
+            color: if selected { SEL_OUTLINE } else { Color::NONE },
+        });
     }
 
     for (fill, mut node, mut bg) in &mut fills {
@@ -897,34 +828,30 @@ fn refresh_cards(
         if node.height != want {
             node.height = want;
         }
-        let color = if gd.state.is_broken() {
+        bg.set_if_neq(BackgroundColor(if gd.state.is_broken() {
             FILL_BROKEN
         } else {
             KIND_FILL[gd.kind as usize]
-        };
-        set(&mut bg, color);
+        }));
     }
 
     for (strip, mut bg) in &mut strips {
         let gd = &groups.list[strip.0];
-        let color = if gd.count == 0 {
+        bg.set_if_neq(BackgroundColor(if gd.count == 0 {
             Color::NONE
         } else {
             morale_color(gd)
-        };
-        set(&mut bg, color);
+        }));
     }
 
     // Display (not Visibility) so the hidden one leaves the flex layout;
     // it only flips when a card crosses the width threshold.
-    for (glyph, mut node) in &mut glyphs {
-        let want = if wide[glyph.0] { Display::None } else { Display::Flex };
-        if node.display != want {
-            node.display = want;
-        }
-    }
-    for (icon, mut node) in &mut icons {
-        let want = if wide[icon.0] { Display::Flex } else { Display::None };
+    for (art, mut node) in &mut arts {
+        let want = if wide[art.g] == art.icon {
+            Display::Flex
+        } else {
+            Display::None
+        };
         if node.display != want {
             node.display = want;
         }
@@ -945,10 +872,9 @@ fn control_buttons(
         }
         match btn {
             ControlButton::Halt => halt_selected(&selection, &mut groups),
-            ControlButton::Wall => apply_formation_cmd(FormCmd::Wall, &selection, &mut groups),
-            ControlButton::Loose => apply_formation_cmd(FormCmd::Loose, &selection, &mut groups),
-            ControlButton::Blob => apply_formation_cmd(FormCmd::Blob, &selection, &mut groups),
-            ControlButton::Hold => apply_formation_cmd(FormCmd::Hold, &selection, &mut groups),
+            ControlButton::Form(cmd) => {
+                apply_formation_cmd(*cmd, &selection, &mut groups)
+            }
         }
     }
 }
@@ -956,61 +882,45 @@ fn control_buttons(
 /// Toggle buttons light up when the WHOLE controllable selection is in
 /// the mode (matching the hotkeys' toggle-as-a-set semantics: lit means
 /// the next press turns it off).
-#[allow(clippy::type_complexity)] // disjoint Visibility access
 fn refresh_control_buttons(
     groups: Res<Groups>,
     selection: Res<Selection>,
     mut query: Query<(&ControlButton, &Interaction, &mut BackgroundColor)>,
-    mut loose_icons: Query<(&LooseIconVariant, &mut Visibility)>,
-    mut wall_icons: Query<
-        (&WallIconVariant, &mut Visibility),
-        (Without<LooseIconVariant>, Without<BtnTooltip>),
-    >,
-    mut tooltips: Query<
-        (&BtnTooltip, &mut Visibility),
-        Without<LooseIconVariant>,
-    >,
+    mut icons: Query<(&StatefulIcon, &mut Visibility)>,
+    mut tooltips: Query<(&BtnTooltip, &mut Visibility), Without<StatefulIcon>>,
     mut wall_tip_text: Query<&mut Text, With<WallTooltipText>>,
 ) {
-    let picked: Vec<usize> = selection
-        .regiments
-        .iter()
-        .enumerate()
-        .filter(|(g, s)| {
-            **s && {
-                let gd = &groups.list[*g];
-                gd.count > 0 && !gd.state.is_broken()
-            }
-        })
-        .map(|(g, _)| g)
-        .collect();
+    // One pass over the controllable selection accumulates every
+    // all-in-mode flag the buttons need (no per-frame Vec).
+    let (mut any, mut all_wall, mut all_loose, mut all_blob, mut all_hold) =
+        (false, true, true, true, true);
+    let mut all_spear = true;
+    for g in selection.picked_controllable(&groups) {
+        let gd = &groups.list[g];
+        any = true;
+        all_wall &= gd.spacing == FormSpacing::Wall;
+        all_loose &= gd.spacing == FormSpacing::Loose;
+        all_blob &= gd.shape == FormShape::Blob;
+        all_hold &= gd.hold;
+        all_spear &= is_spearwall_kind(gd.kind);
+    }
+    let active_of = |btn: ControlButton| match btn {
+        ControlButton::Halt => false,
+        ControlButton::Form(FormCmd::Wall) => all_wall,
+        ControlButton::Form(FormCmd::Loose) => all_loose,
+        ControlButton::Form(FormCmd::Blob) => all_blob,
+        ControlButton::Form(FormCmd::Hold) => all_hold,
+    };
 
-    let mut loose_active = false;
     let mut hovered: Option<ControlButton> = None;
     for (btn, interaction, mut bg) in &mut query {
         if matches!(interaction, Interaction::Hovered | Interaction::Pressed) {
             hovered = Some(*btn);
         }
-        let want = if picked.is_empty() {
+        let want = if !any {
             BTN_DISABLED
         } else {
-            let active = match btn {
-                ControlButton::Halt => false,
-                ControlButton::Wall => {
-                    picked.iter().all(|&g| groups.list[g].spacing == FormSpacing::Wall)
-                }
-                ControlButton::Loose => {
-                    picked.iter().all(|&g| groups.list[g].spacing == FormSpacing::Loose)
-                }
-                ControlButton::Blob => {
-                    picked.iter().all(|&g| groups.list[g].shape == FormShape::Blob)
-                }
-                ControlButton::Hold => picked.iter().all(|&g| groups.list[g].hold),
-            };
-            if *btn == ControlButton::Loose {
-                loose_active = active;
-            }
-            match (active, interaction) {
+            match (active_of(*btn), interaction) {
                 (_, Interaction::Pressed) => BTN_PRESSED,
                 (true, Interaction::Hovered) => BTN_ACTIVE_HOVER,
                 (true, Interaction::None) => BTN_ACTIVE,
@@ -1018,37 +928,24 @@ fn refresh_control_buttons(
                 (false, Interaction::None) => BTN_NORMAL,
             }
         };
-        if bg.0 != want {
-            bg.0 = want;
-        }
+        bg.set_if_neq(BackgroundColor(want));
     }
 
-    // The Loose icon previews the press result: spread squares while in
-    // close order, tight squares once the whole selection is loose.
-    for (variant, mut vis) in &mut loose_icons {
-        let want = if variant.tight == loose_active {
+    // Stateful icons preview what pressing yields: the Loose icon shows
+    // the target spacing, the Wall icon the wall the selection's KIND
+    // would form (spearwall when everything picked is spears).
+    let wall_spear = any && all_spear;
+    for (icon, mut vis) in &mut icons {
+        let alt_wanted = match icon.btn {
+            ControlButton::Form(FormCmd::Loose) => any && all_loose,
+            ControlButton::Form(FormCmd::Wall) => wall_spear,
+            _ => false,
+        };
+        vis.set_if_neq(if icon.alt == alt_wanted {
             Visibility::Inherited
         } else {
             Visibility::Hidden
-        };
-        if *vis != want {
-            *vis = want;
-        }
-    }
-
-    // The Wall icon and label match what the selection would form:
-    // a spearwall when everything picked is a spear regiment.
-    let wall_spear = !picked.is_empty()
-        && picked.iter().all(|&g| groups.list[g].kind == KIND_SPEAR);
-    for (variant, mut vis) in &mut wall_icons {
-        let want = if variant.spear == wall_spear {
-            Visibility::Inherited
-        } else {
-            Visibility::Hidden
-        };
-        if *vis != want {
-            *vis = want;
-        }
+        });
     }
     let wall_label = if wall_spear {
         "Spear Wall (F)"
@@ -1062,13 +959,10 @@ fn refresh_control_buttons(
     }
 
     for (tip, mut vis) in &mut tooltips {
-        let want = if hovered == Some(tip.0) {
+        vis.set_if_neq(if hovered == Some(tip.0) {
             Visibility::Inherited
         } else {
             Visibility::Hidden
-        };
-        if *vis != want {
-            *vis = want;
-        }
+        });
     }
 }

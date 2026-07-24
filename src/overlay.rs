@@ -93,8 +93,8 @@ fn spawn_inspect_panel(mut commands: Commands) {
             Node {
                 position_type: PositionType::Absolute,
                 right: Val::Px(10.0),
-                // Sits above the unit card bar (unit_cards.rs).
-                bottom: Val::Px(76.0),
+                // Sits above the unit card bar.
+                bottom: Val::Px(crate::unit_cards::BAR_HEIGHT + 10.0),
                 padding: UiRect::all(Val::Px(10.0)),
                 ..default()
             },

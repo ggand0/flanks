@@ -20,6 +20,36 @@ pub struct Selection {
     pub count_units: usize,
 }
 
+impl Selection {
+    /// Recompute `count_units` from the mask (player team only). Every
+    /// mask mutation site calls this instead of maintaining the
+    /// invariant by hand.
+    pub fn recount(&mut self, groups: &Groups) {
+        self.count_units = self
+            .regiments
+            .iter()
+            .enumerate()
+            .filter(|(g, s)| **s && groups.list[*g].team == PLAYER_TEAM)
+            .map(|(g, _)| groups.list[g].count)
+            .sum();
+    }
+
+    /// Selected regiments that are alive and controllable — the set
+    /// every selection command acts on (and the HUD previews).
+    pub fn picked_controllable<'a>(
+        &'a self,
+        groups: &'a Groups,
+    ) -> impl Iterator<Item = usize> + 'a {
+        self.regiments.iter().enumerate().filter_map(move |(g, s)| {
+            (*s && {
+                let gd = &groups.list[g];
+                gd.count > 0 && !gd.state.is_broken()
+            })
+            .then_some(g)
+        })
+    }
+}
+
 /// In-progress drag: projected ground points of the selection line.
 #[derive(Resource, Default)]
 pub struct DragLine {
@@ -52,7 +82,7 @@ impl Plugin for SelectionPlugin {
                 Update,
                 (
                     (drag_select, update_hover, control_group_keys)
-                        .in_set(crate::game_state::BattleInputSet),
+                        .in_set(crate::game_state::MapInputSet),
                     draw_selection_gizmos,
                 ),
             );
@@ -71,7 +101,7 @@ pub fn cursor_ground_point(
 }
 
 #[allow(clippy::too_many_arguments)] // bevy system params
-pub fn drag_select(
+fn drag_select(
     buttons: Res<ButtonInput<MouseButton>>,
     window: Query<&Window, With<PrimaryWindow>>,
     camera: Query<(&Camera, &GlobalTransform)>,
@@ -228,7 +258,7 @@ pub fn regiment_at(groups: &Groups, p: Vec2, enemy: bool) -> Option<u32> {
         .map(|(g, _)| g as u32)
 }
 
-pub fn update_hover(
+fn update_hover(
     window: Query<&Window, With<PrimaryWindow>>,
     camera: Query<(&Camera, &GlobalTransform)>,
     terrain: Res<Terrain>,
@@ -281,13 +311,7 @@ fn control_group_keys(
     } else if !cg.0[slot].is_empty() {
         selection.regiments = cg.0[slot].clone();
         selection.regiments.resize(groups.list.len(), false);
-        selection.count_units = selection
-            .regiments
-            .iter()
-            .enumerate()
-            .filter(|(g, s)| **s && groups.list[*g].team == PLAYER_TEAM)
-            .map(|(g, _)| groups.list[g].count)
-            .sum();
+        selection.recount(&groups);
         info!(
             "control group {} recalled ({} units)",
             slot + 1,

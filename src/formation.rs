@@ -177,10 +177,17 @@ pub fn assign_slots(units: &mut Units, g: u32, gd: &mut GroupData) {
 /// 0 = none, 1 = shieldwall (sword kinds), 2 = spearwall (spears).
 /// Shared by the sim damage model and the render wall pose.
 #[inline]
+/// Which wall a unit kind forms when Wall spacing goes on: spear kinds
+/// brace a spearwall, everyone else locks shields. The HUD's wall
+/// button previews this, so the classification lives in one place.
+pub fn is_spearwall_kind(kind: u8) -> bool {
+    kind == crate::unit_types::KIND_SPEAR
+}
+
 pub fn wall_kind(gd: &GroupData) -> u8 {
     if gd.spacing != FormSpacing::Wall || gd.state.is_broken() {
         0
-    } else if gd.kind == crate::unit_types::KIND_SPEAR {
+    } else if is_spearwall_kind(gd.kind) {
         2
     } else {
         1
@@ -437,18 +444,7 @@ pub fn apply_formation_cmd(
     if selection.count_units == 0 {
         return;
     }
-    let picked: Vec<usize> = selection
-        .regiments
-        .iter()
-        .enumerate()
-        .filter(|(g, s)| {
-            **s && {
-                let gd = &groups.list[*g];
-                gd.count > 0 && !gd.state.is_broken()
-            }
-        })
-        .map(|(g, _)| g)
-        .collect();
+    let picked: Vec<usize> = selection.picked_controllable(groups).collect();
     if picked.is_empty() {
         return;
     }
