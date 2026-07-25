@@ -13,6 +13,7 @@ mod overlay;
 mod regiments;
 mod render_units;
 mod selection;
+mod settings;
 mod spatial;
 mod terrain;
 mod unit_cards;
@@ -24,9 +25,11 @@ mod vegetation;
 mod water;
 
 use bevy::prelude::*;
-use bevy::window::PresentMode;
 
 fn main() {
+    // Load before the App so the window opens with the saved video
+    // settings instead of switching modes one frame in.
+    let user_settings = settings::Settings::load();
     // FL_THREADS caps the compute task pool (default: all cores). The
     // parallel sim scopes' wall time is gated by their slowest chunk, so
     // on a loaded box a full-width pool oversubscribes and any stolen
@@ -47,8 +50,10 @@ fn main() {
                 .set(WindowPlugin {
                     primary_window: Some(Window {
                         title: "frontline".into(),
-                        // Uncapped so the FPS overlay shows real headroom.
-                        present_mode: PresentMode::AutoNoVsync,
+                        // Default vsync off: the FPS overlay should
+                        // show real headroom.
+                        present_mode: settings::present_mode(&user_settings),
+                        mode: settings::window_mode(&user_settings),
                         ..default()
                     }),
                     ..default()
@@ -60,7 +65,9 @@ fn main() {
                     ..default()
                 }),
         )
+        .insert_resource(user_settings)
         .add_plugins(game_state::GameShellPlugin)
+        .add_plugins(settings::SettingsPlugin)
         .add_plugins((
             terrain::TerrainPlugin,
             water::WaterPlugin,

@@ -181,10 +181,20 @@ impl Plugin for GameShellPlugin {
             .add_systems(
                 Update,
                 (
+                    // Menu/pause input yields to the settings modal:
+                    // its backdrop blocks picking, and the gate keeps
+                    // the keyboard shortcuts (Enter/Space/ESC) from
+                    // acting behind it.
                     (menu_buttons, menu_option_buttons, debug_scenario_buttons)
-                        .run_if(in_state(GameState::Menu)),
-                    (toggle_pause, pause_buttons, transition_to_results)
-                        .run_if(in_state(GameState::Battle)),
+                        .run_if(
+                            in_state(GameState::Menu)
+                                .and_then(crate::settings::settings_closed),
+                        ),
+                    (toggle_pause, pause_buttons).run_if(
+                        in_state(GameState::Battle)
+                            .and_then(crate::settings::settings_closed),
+                    ),
+                    transition_to_results.run_if(in_state(GameState::Battle)),
                     results_buttons.run_if(in_state(GameState::Results)),
                     button_hover_style,
                 ),
@@ -304,6 +314,22 @@ fn spawn_menu(mut commands: Commands, config: Res<BattleConfig>) {
             .with_children(|b| {
                 b.spawn((
                     Text::new("Start Battle"),
+                    TextFont {
+                        font_size: FontSize::Px(20.0),
+                        ..default()
+                    },
+                    TextColor(TEXT_COLOR),
+                ));
+            });
+            p.spawn((
+                Button,
+                button_node(),
+                BackgroundColor(BTN_NORMAL),
+                crate::settings::OpenSettingsButton,
+            ))
+            .with_children(|b| {
+                b.spawn((
+                    Text::new("Settings"),
                     TextFont {
                         font_size: FontSize::Px(20.0),
                         ..default()
@@ -617,6 +643,22 @@ fn spawn_pause_overlay(commands: &mut Commands) {
             .with_children(|b| {
                 b.spawn((
                     Text::new("Resume"),
+                    TextFont {
+                        font_size: FontSize::Px(20.0),
+                        ..default()
+                    },
+                    TextColor(TEXT_COLOR),
+                ));
+            });
+            p.spawn((
+                Button,
+                button_node(),
+                BackgroundColor(BTN_NORMAL),
+                crate::settings::OpenSettingsButton,
+            ))
+            .with_children(|b| {
+                b.spawn((
+                    Text::new("Settings"),
                     TextFont {
                         font_size: FontSize::Px(20.0),
                         ..default()

@@ -60,6 +60,7 @@ fn control_camera(
     scroll: Res<AccumulatedMouseScroll>,
     window: Query<&Window, With<PrimaryWindow>>,
     time: Res<Time<Real>>,
+    settings: Res<crate::settings::Settings>,
     mut query: Query<&mut RtsCamera>,
 ) {
     let Ok(mut cam) = query.single_mut() else {
@@ -82,7 +83,8 @@ fn control_camera(
     }
     // Screen-edge pan — only when no key pan is active (opposing inputs
     // must not cancel) and the cursor is inside the window.
-    if pan == Vec2::ZERO
+    if settings.camera.edge_pan
+        && pan == Vec2::ZERO
         && let Ok(win) = window.single()
         && let Some(c) = win.cursor_position()
     {
@@ -100,7 +102,7 @@ fn control_camera(
     }
     if pan != Vec2::ZERO {
         let pan = pan.clamp_length_max(1.0);
-        let speed = cam.distance * 0.9 * time.delta_secs();
+        let speed = cam.distance * 0.9 * settings.camera.pan_speed * time.delta_secs();
         let (sin_yaw, cos_yaw) = cam.yaw.sin_cos();
         let forward = Vec3::new(-sin_yaw, 0.0, -cos_yaw);
         let right = Vec3::new(cos_yaw, 0.0, -sin_yaw);
