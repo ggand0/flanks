@@ -26,8 +26,20 @@ pub struct RtsCameraPlugin;
 
 impl Plugin for RtsCameraPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, spawn_camera)
-            .add_systems(Update, (control_camera, apply_camera_transform).chain());
+        // Input only in battle (still active while paused, M2TW style)
+        // and never under the settings modal; the transform apply keeps
+        // running so the menu/results backdrop stays valid.
+        app.add_systems(Startup, spawn_camera).add_systems(
+            Update,
+            (
+                control_camera.run_if(
+                    in_state(crate::game_state::GameState::Battle)
+                        .and_then(crate::settings::settings_closed),
+                ),
+                apply_camera_transform,
+            )
+                .chain(),
+        );
     }
 }
 

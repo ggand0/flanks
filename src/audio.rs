@@ -11,6 +11,7 @@ use bevy::prelude::*;
 
 use crate::camera::RtsCamera;
 use crate::combat::CombatStats;
+use crate::game_state::GameState;
 use crate::movement::SimStats;
 use crate::orders::{Groups, Order, RegState, Selection};
 use crate::units::hash01;
@@ -40,10 +41,21 @@ pub struct BattleAudioPlugin;
 
 impl Plugin for BattleAudioPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, setup_audio).add_systems(
-            Update,
-            (update_beds, combat_one_shots, event_cues).chain(),
-        );
+        // Battle-only: outside the battle the sim stats these systems
+        // read are stale, and quitting to the menu must not leave the
+        // beds ringing (or stale stats spawning clangs) behind it.
+        app.add_systems(Startup, setup_audio)
+            .add_systems(
+                Update,
+                (update_beds, combat_one_shots, event_cues)
+                    .chain()
+                    .run_if(in_state(GameState::Battle)),
+            )
+            // Beds cut on leaving battle; one-shots survive into the
+            // results screen (the victory/defeat sting must finish)
+            // and are only culled when the menu comes up.
+            .add_systems(OnExit(GameState::Battle), silence_beds)
+            .add_systems(OnEnter(GameState::Menu), stop_one_shots);
     }
 }
 
@@ -145,6 +157,22 @@ fn setup_audio(mut commands: Commands, assets: Res<AssetServer>) {
     commands.spawn((bed("bed_melee_close0"), Bed::Close));
     commands.spawn((bed("sig_drums_march"), Bed::Drums));
     commands.spawn((bed("sfx_new/bed_march_freesound_loop_14.5s"), Bed::March));
+}
+
+fn silence_beds(mut sinks: Query<&mut AudioSink, With<Bed>>) {
+    for mut sink in &mut sinks {
+        sink.set_volume(Volume::Linear(0.0));
+    }
+}
+
+/// Despawn every in-flight one-shot (war cries, horns, sting tails).
+fn stop_one_shots(
+    mut commands: Commands,
+    playing: Query<Entity, (With<AudioPlayer>, Without<Bed>)>,
+) {
+    for e in &playing {
+        commands.entity(e).despawn();
+    }
 }
 
 /// Crossfade the beds from battle state around the camera focus.
