@@ -101,6 +101,11 @@ pub struct GroupData {
     /// skew the living slots' center away from the anchor, and disorder
     /// must not count that skew as chaos.
     pub home_bias: Vec2,
+    /// Footprint radius estimate (m): 1.5x the RMS distance of living
+    /// units to the centroid, smoothed ~2 s. The morale flank ring
+    /// probes OUTSIDE this — a probe inside our own mass measures
+    /// nothing (a 1000-man block swallows any fixed ring).
+    pub radius: f32,
     // --- refreshed every fixed tick by the frontline pass ---
     pub centroid: Vec2,
     /// TW rule: one soldier of the regiment fighting = the whole regiment
@@ -184,6 +189,7 @@ impl GroupData {
             count_at_reform: count,
             disorder: 0.0,
             home_bias: Vec2::ZERO,
+            radius: 0.0,
             centroid: anchor,
             engaged: false,
             engage_hold: 0,

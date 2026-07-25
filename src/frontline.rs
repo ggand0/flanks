@@ -280,12 +280,14 @@ fn update_groups(units: Res<Units>, mut groups: ResMut<Groups>) {
     let prev_bias: Vec<Vec2> = groups.list.iter().map(|g| g.home_bias).collect();
     let mut slot_err = vec![0.0f32; n];
     let mut sum_home = vec![Vec2::ZERO; n];
+    let mut sum_r2 = vec![0.0f32; n];
     for i in 0..units.len() {
         let g = units.group[i] as usize;
         let p = Vec2::new(units.pos[i].x, units.pos[i].z);
         sums[g] += p;
         counts[g] += 1;
         sum_home[g] += units.home[i];
+        sum_r2[g] += (p - prev_cents[g]).length_squared();
         slot_err[g] += (p - prev_cents[g] - units.home[i] + prev_bias[g]).length();
         // Ground-truth contact: a unit in WIND-UP has an enemy in reach
         // and is striking. TW rule — one soldier fighting engages the
@@ -348,6 +350,10 @@ fn update_groups(units: Res<Units>, mut groups: ResMut<Groups>) {
             0.0
         };
         group.disorder += (err - group.disorder) / 60.0;
+        // Footprint radius: RMS distance x 1.5 reaches the block edge
+        // (uniform disc: RMS = R/sqrt(2)); smoothed like disorder.
+        let r = (sum_r2[g] / counts[g] as f32).sqrt() * 1.5;
+        group.radius += (r - group.radius) / 60.0;
         let mut nearest_d2 = ENEMY_NEAR_R * ENEMY_NEAR_R;
         let mut threat = Vec2::ZERO;
         let mut hostile = false;

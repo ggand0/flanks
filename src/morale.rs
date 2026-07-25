@@ -103,8 +103,12 @@ const MORALE_OUTNUMBERED: f32 = -2.0;
 /// The 8-probe ring maps frontal contact to 0, pincer ~0.4, and
 /// encirclement 1.0 of this.
 const MORALE_FLANKED: f32 = -6.0;
-/// Radius of the 8-probe flank ring around the centroid (ours).
+/// Minimum radius of the 8-probe flank ring around the centroid (ours).
+/// The live ring is the regiment's own footprint radius + FLANK_MARGIN:
+/// probes must sit OUTSIDE our own mass, or a big block swallows the
+/// ring and encirclement reads as nothing (rout-test regression, 0055).
 const FLANK_RING_R: f32 = 22.0;
+const FLANK_MARGIN: f32 = 10.0;
 /// Enemy blurred density at a ring probe below which a sector can't be
 /// hostile regardless of ratio (noise floor).
 const FLANK_T: f32 = 0.6;
@@ -248,11 +252,12 @@ pub fn update_morale(
         // fight read as encircled). The largest hostile-free arc is the
         // safe side: a full frontal contact (3 adjacent sectors) scores
         // exactly 0, a pincer ~0.4, encirclement 1.
+        let ring_r = (g.radius + FLANK_MARGIN).max(FLANK_RING_R);
         let mut hostile = [false; 8];
         let mut any_hostile = false;
         for (s, h) in hostile.iter_mut().enumerate() {
             let a = s as f32 / 8.0 * std::f32::consts::TAU;
-            let p = g.centroid + Vec2::new(a.cos(), a.sin()) * FLANK_RING_R;
+            let p = g.centroid + Vec2::new(a.cos(), a.sin()) * ring_r;
             let e = field.density(1 - g.team, p);
             *h = e > FLANK_T && e > field.density(g.team, p) * FLANK_DOMINANCE;
             any_hostile |= *h;
