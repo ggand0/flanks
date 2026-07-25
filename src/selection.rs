@@ -20,6 +20,36 @@ pub struct Selection {
     pub count_units: usize,
 }
 
+impl Selection {
+    /// Recompute `count_units` from the mask (player team only). Every
+    /// mask mutation site calls this instead of maintaining the
+    /// invariant by hand.
+    pub fn recount(&mut self, groups: &Groups) {
+        self.count_units = self
+            .regiments
+            .iter()
+            .enumerate()
+            .filter(|(g, s)| **s && groups.list[*g].team == PLAYER_TEAM)
+            .map(|(g, _)| groups.list[g].count)
+            .sum();
+    }
+
+    /// Selected regiments that are alive and controllable — the set
+    /// every selection command acts on (and the HUD previews).
+    pub fn picked_controllable<'a>(
+        &'a self,
+        groups: &'a Groups,
+    ) -> impl Iterator<Item = usize> + 'a {
+        self.regiments.iter().enumerate().filter_map(move |(g, s)| {
+            (*s && {
+                let gd = &groups.list[g];
+                gd.count > 0 && !gd.state.is_broken()
+            })
+            .then_some(g)
+        })
+    }
+}
+
 /// In-progress drag: projected ground points of the selection line.
 #[derive(Resource, Default)]
 pub struct DragLine {
@@ -52,7 +82,7 @@ impl Plugin for SelectionPlugin {
                 Update,
                 (
                     (drag_select, update_hover, control_group_keys)
-                        .in_set(crate::game_state::BattleInputSet),
+                        .in_set(crate::game_state::MapInputSet),
                     draw_selection_gizmos,
                 ),
             );
@@ -80,13 +110,19 @@ fn drag_select(
     groups: Res<Groups>,
     mut drag: ResMut<DragLine>,
     mut selection: ResMut<Selection>,
+    ui: Query<&Interaction>,
 ) {
     let Ok(window) = window.single() else { return };
     let Ok((camera, cam_tf)) = camera.single() else {
         return;
     };
 
-    if buttons.just_pressed(MouseButton::Left) {
+    // A stroke must start on the map: clicking a unit card or a control
+    // button never doubles as a (selection-clearing) lasso on the
+    // terrain behind the HUD.
+    if buttons.just_pressed(MouseButton::Left)
+        && !crate::unit_cards::pointer_over_ui(ui.iter())
+    {
         drag.points.clear();
         drag.active = true;
     }
@@ -275,13 +311,7 @@ fn control_group_keys(
     } else if !cg.0[slot].is_empty() {
         selection.regiments = cg.0[slot].clone();
         selection.regiments.resize(groups.list.len(), false);
-        selection.count_units = selection
-            .regiments
-            .iter()
-            .enumerate()
-            .filter(|(g, s)| **s && groups.list[*g].team == PLAYER_TEAM)
-            .map(|(g, _)| groups.list[g].count)
-            .sum();
+        selection.recount(&groups);
         info!(
             "control group {} recalled ({} units)",
             slot + 1,

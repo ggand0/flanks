@@ -104,6 +104,22 @@ pub struct SimSet;
 #[derive(SystemSet, Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct BattleInputSet;
 
+/// Map pointer input (lasso, hover pick), inside `BattleInputSet`.
+#[derive(SystemSet, Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct MapInputSet;
+
+/// HUD input (unit cards, control buttons), after `MapInputSet`: the
+/// HUD's over-UI guards read hover state that lags synthetic same-frame
+/// move+click input by one frame, and if a click ever reaches both
+/// paths the HUD must win.
+#[derive(SystemSet, Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct HudInputSet;
+
+/// Buttons that paint their own state-dependent BackgroundColor: the
+/// global hover styler below leaves them alone.
+#[derive(Component)]
+pub struct CustomStyled;
+
 #[derive(Component)]
 struct MenuRoot;
 
@@ -155,6 +171,10 @@ impl Plugin for GameShellPlugin {
                     in_state(GameState::Battle).and_then(not(time_paused)),
                 ),
             )
+            .configure_sets(
+                Update,
+                (MapInputSet, HudInputSet).chain().in_set(BattleInputSet),
+            )
             .add_systems(OnEnter(GameState::Menu), spawn_menu)
             .add_systems(OnEnter(GameState::Battle), setup_battle)
             .add_systems(OnEnter(GameState::Results), spawn_results)
@@ -172,12 +192,12 @@ impl Plugin for GameShellPlugin {
     }
 }
 
-const TEXT_COLOR: Color = Color::srgb(0.92, 0.92, 0.85);
+pub const TEXT_COLOR: Color = Color::srgb(0.92, 0.92, 0.85);
 const DIM_TEXT_COLOR: Color = Color::srgb(0.55, 0.55, 0.50);
 const PANEL_BG: Color = Color::srgba(0.05, 0.06, 0.08, 0.92);
-const BTN_NORMAL: Color = Color::srgba(0.15, 0.16, 0.20, 0.92);
-const BTN_HOVER: Color = Color::srgba(0.25, 0.27, 0.32, 0.95);
-const BTN_PRESSED: Color = Color::srgba(0.10, 0.11, 0.14, 0.95);
+pub const BTN_NORMAL: Color = Color::srgba(0.15, 0.16, 0.20, 0.92);
+pub const BTN_HOVER: Color = Color::srgba(0.25, 0.27, 0.32, 0.95);
+pub const BTN_PRESSED: Color = Color::srgba(0.10, 0.11, 0.14, 0.95);
 
 fn fullscreen_overlay() -> Node {
     Node {
@@ -754,7 +774,14 @@ fn results_buttons(
 
 #[allow(clippy::type_complexity)]
 fn button_hover_style(
-    mut query: Query<(&Interaction, &mut BackgroundColor), (Changed<Interaction>, With<Button>)>,
+    mut query: Query<
+        (&Interaction, &mut BackgroundColor),
+        (
+            Changed<Interaction>,
+            With<Button>,
+            Without<CustomStyled>,
+        ),
+    >,
 ) {
     for (interaction, mut bg) in &mut query {
         *bg = match interaction {

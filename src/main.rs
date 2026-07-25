@@ -15,6 +15,7 @@ mod render_units;
 mod selection;
 mod spatial;
 mod terrain;
+mod unit_cards;
 mod unit_meshes;
 mod unit_types;
 mod units;
@@ -81,6 +82,7 @@ fn main() {
             render_units::UnitRenderPlugin,
             camera::RtsCameraPlugin,
             overlay::OverlayPlugin,
+            unit_cards::UnitCardsPlugin,
         ))
         .insert_resource(Time::<Fixed>::from_hz(30.0))
         .insert_resource(ClearColor(Color::srgb(0.62, 0.70, 0.78)))

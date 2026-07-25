@@ -37,6 +37,13 @@ impl Plugin for BannersPlugin {
 }
 
 /// Root component; child entity ids for the dynamic parts.
+/// Desaturated per-team flag colors for broken regiments. The HUD's
+/// card strength fill drains to the same gray (unit_cards.rs).
+pub const FLAG_BROKEN: [Color; 2] = [
+    Color::srgb(0.45, 0.50, 0.58),
+    Color::srgb(0.58, 0.50, 0.42),
+];
+
 #[derive(Component)]
 struct Banner {
     group: usize,
@@ -67,10 +74,7 @@ fn spawn_banners(
         mats.add(unlit(Color::srgb(0.25, 0.50, 0.95))),
         mats.add(unlit(Color::srgb(0.95, 0.45, 0.12))),
     ];
-    let flag_mats_broken = [
-        mats.add(unlit(Color::srgb(0.45, 0.50, 0.58))),
-        mats.add(unlit(Color::srgb(0.58, 0.50, 0.42))),
-    ];
+    let flag_mats_broken = FLAG_BROKEN.map(|c| mats.add(unlit(c)));
     let pole_mat = mats.add(unlit(Color::srgb(0.24, 0.19, 0.14)));
     let back_mat = mats.add(unlit(Color::srgb(0.07, 0.07, 0.07)));
     let morale_mat = mats.add(unlit(Color::srgb(0.90, 0.16, 0.10)));
