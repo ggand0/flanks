@@ -119,16 +119,16 @@ pub fn cannot_charge(fatigue: f32) -> bool {
 // warmed up to winded. M2TW tires men SLOWLY; nothing came close to
 // exhausted in a quarter-hour battle.
 //
-// Calibrated to that (and to the owner's feel pass, which independently
-// called the old rates too fast): continuous melee reaches Tired at
-// ~6 min and Exhausted at ~10 min; standing recovers Very Tired ->
-// Fresh in ~10 min. Ordering (fight > charge > move, idle recovers)
-// remains the evidenced part.
-const FAT_FIGHT: f32 = 0.14;
-const FAT_CHARGE: f32 = 0.20;
+// Calibrated to that anchor, then to the owner's feel passes (first
+// round: far too fast; second round: "could deplete slightly faster").
+// Now: continuous melee reaches Tired at ~4 min and Exhausted at
+// ~7 min; standing recovers Very Tired -> Fresh in ~10 min. Ordering
+// (fight > charge > move, idle recovers) remains the evidenced part.
+const FAT_FIGHT: f32 = 0.20;
+const FAT_CHARGE: f32 = 0.28;
 /// All ordered movement runs today; when the walk/run toggle lands,
 /// walking drops to a token trickle and this becomes the RUN rate.
-const FAT_MOVE: f32 = 0.08;
+const FAT_MOVE: f32 = 0.11;
 const FAT_RECOVER: f32 = 0.12;
 
 /// Per-tick fatigue update (serial, ~200 rows). Runs after step_sim so
