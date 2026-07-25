@@ -19,7 +19,7 @@ use bevy::ui::FocusPolicy;
 use bevy::window::{MonitorSelection, PresentMode, PrimaryWindow, WindowMode};
 use serde::{Deserialize, Serialize};
 
-use crate::game_state::{BTN_NORMAL, GameState, TEXT_COLOR};
+use crate::game_state::{BTN_NORMAL, DIM_TEXT_COLOR, GameState, TEXT_COLOR};
 
 // ── Data + persistence ──
 
@@ -216,7 +216,6 @@ fn load_click_sound(mut commands: Commands, assets: Res<AssetServer>) {
 
 const PANEL_BG: Color = Color::srgba(0.07, 0.08, 0.10, 0.97);
 const BACKDROP: Color = Color::srgba(0.01, 0.02, 0.03, 0.6);
-const DIM_TEXT: Color = Color::srgb(0.55, 0.55, 0.50);
 const TRACK_BG: Color = Color::srgb(0.20, 0.21, 0.25);
 const FILL_BG: Color = Color::srgb(0.55, 0.58, 0.66);
 const TRACK_WIDTH: f32 = 220.0;
@@ -294,7 +293,7 @@ fn section_header(p: &mut ChildSpawnerCommands, label: &str) {
     p.spawn((
         Text::new(label),
         TextFont { font_size: FontSize::Px(13.0), ..default() },
-        TextColor(DIM_TEXT),
+        TextColor(DIM_TEXT_COLOR),
         Node {
             margin: UiRect::new(Val::Px(0.0), Val::Px(0.0), Val::Px(14.0), Val::Px(6.0)),
             ..default()
@@ -538,7 +537,7 @@ fn close_on_state_change(
 /// fraction along the track until the button is released, even if the
 /// cursor leaves the node. Geometry comes from the track's computed
 /// layout (physical px) against the physical cursor position.
-#[allow(clippy::too_many_arguments)] // bevy system params
+#[allow(clippy::too_many_arguments, clippy::type_complexity)] // bevy system params
 fn slider_drag(
     mut commands: Commands,
     buttons: Res<ButtonInput<MouseButton>>,
