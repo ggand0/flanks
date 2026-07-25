@@ -149,6 +149,7 @@ fn update_inspect_panel(
     let state = match gd.state {
         RegState::Steady if gd.charging => "STEADY - CHARGING",
         RegState::Steady if gd.wavering => "WAVERING",
+        RegState::Steady if gd.shaken => "SHAKEN",
         RegState::Steady if gd.engaged => "STEADY - engaged",
         RegState::Steady => "STEADY",
         RegState::Routing { .. } => "ROUTING",
@@ -189,6 +190,7 @@ fn update_inspect_panel(
             ("no enemy near", f.no_enemy),
             ("braced wall", f.wall),
             ("commander", f.leader),
+            ("rout lock", f.rout_lock),
         ] {
             if v.abs() >= 0.05 {
                 s += &format!("\n{label:<15} {v:+.1}");

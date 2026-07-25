@@ -103,10 +103,11 @@ pub const TYPES: [UnitTypeParams; NUM_KINDS] = [
         // (~3.5) slot in above; mass drives separation shove and charge
         // knockback ratios.
         mass: 1.5,
-        // Elite knights: near the top of the M2TW elite band — frontal
-        // attrition alone cannot push 14 (+wall) below the -6 rout line;
-        // heavies still break only when flanked or the line collapses.
-        base_morale: 14.0,
+        // MEASURED vanilla EDU scale (devlog 0057): base morale runs
+        // 1..11 across all 413 units — 11 is the CEILING (Dismounted
+        // English Knights, Demi Lancers, Norman Knights), not a midpoint.
+        // Our heavies map to the dismounted-knight rows of devlog 0031.
+        base_morale: 11.0,
         discipline: 0.6,
         fatigue_rate: 1.3,
         half_height: 0.55,
@@ -126,8 +127,8 @@ pub const TYPES: [UnitTypeParams; NUM_KINDS] = [
         cooldown_ticks: 33,
         speed: 9.5,
         mass: 0.9,
-        // Line troops on the vanilla scale.
-        base_morale: 8.0,
+        // Armored Sergeants / Billmen row = 5 on the measured scale.
+        base_morale: 5.0,
         discipline: 1.0,
         fatigue_rate: 1.0,
         half_height: 0.50,
@@ -151,8 +152,8 @@ pub const TYPES: [UnitTypeParams; NUM_KINDS] = [
         cooldown_ticks: 38,
         speed: 8.5,
         mass: 1.0,
-        // Upper spear militia: a notch above the lights, steadier drilled.
-        base_morale: 9.0,
+        // Pikemen row = 5 (highly_trained); spear militia sit at 3.
+        base_morale: 5.0,
         discipline: 0.85,
         fatigue_rate: 1.1,
         half_height: 0.50,

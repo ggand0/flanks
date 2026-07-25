@@ -66,9 +66,13 @@ pub struct MoraleFactors {
     /// regiment rally).
     pub no_enemy: f32,
     pub wall: f32,
-    /// Army leadership: +2 while the command regiment stands, the
-    /// death shock / permanent loss after it breaks.
+    /// Army leadership: +2 while the command regiment stands (+8 more
+    /// on the commander's own regiment), the death shock / permanent
+    /// loss after it breaks.
     pub leader: f32,
+    /// The rout lock while broken (0 when steady): decays away, and
+    /// until it does the regiment cannot rally.
+    pub rout_lock: f32,
     /// The recomputed level (== GroupData::morale).
     pub effective: f32,
     /// Steady friendly regiments counted for support (0..=3).
@@ -81,16 +85,38 @@ pub struct MoraleReadout(pub Vec<MoraleFactors>);
 // --- Morale tuning ---
 // MTW1 official-guide values (the numeric template CA carried forward;
 // M2TW's own are hardcoded and unpublished) unless flagged otherwise.
+/// State bands, MEASURED from the live engine (devlog 0057: base morale
+/// + summed effect amounts, per state, across 13950 samples):
+/// high +12, firm +3, shaken -3, wavering -7, routing -11 (medians).
+/// The bands overlap in the engine (documented anti-thrash hysteresis);
+/// we take those medians as edges and get the hysteresis from
+/// BREAK_HOLD_S plus the rally gap.
+const SHAKEN_AT: f32 = -3.0;
+const WAVER_AT: f32 = -7.0;
 /// Break at this level or less; rally hysteresis re-enters at RALLY_AT.
-const ROUT_AT: f32 = -6.0;
-const RALLY_AT: f32 = -5.0;
+/// Confirmed by the capture: a Pikemen unit (base 5) broke holding
+/// casualties -12 and a -4 neighbour term = exactly -11.
+const ROUT_AT: f32 = -11.0;
+const RALLY_AT: f32 = -7.0;
+/// The ROUT LOCK. On breaking, M2TW injects a -50 effect that is present
+/// in essentially every routing sample and in no other state — it is
+/// what keeps routers running instead of recovering the moment the
+/// threat passes. The engine holds it flat (its rally is driven by
+/// separate counters we do not model), so we DECAY ours: a broken
+/// regiment can only rally once it is both safe and has had time to
+/// collect itself.
+const ROUT_LOCK: f32 = -50.0;
+const ROUT_LOCK_DECAY_S: f32 = 25.0;
 /// Level must sit at/below ROUT_AT this long before the break — the
 /// engine's waveringTimer analog; overlapping state bands are the
 /// documented anti-thrash device.
 const BREAK_HOLD_S: f32 = 1.0;
-/// Casualty penalty curve: piecewise through the MTW1 anchor points
-/// (10% -> -2, 50% -> -8, 80% -> -12), extrapolated on the last slope.
-const CASUALTY_PTS: [(f32, f32); 4] = [(0.0, 0.0), (0.10, -2.0), (0.50, -8.0), (0.80, -12.0)];
+/// Casualty ladder, MEASURED from the live engine (devlog 0057, proven
+/// by bucketing every sample's effect amount against that unit's actual
+/// soldiers/soldiersMax): discrete STEPS, and nothing at all below 10%.
+/// The 25% step was previously unknown to the community.
+const CASUALTY_STEPS: [(f32, f32); 4] =
+    [(0.10, -2.0), (0.25, -4.0), (0.50, -8.0), (0.80, -12.0)];
 /// Losing combat scales to -8, winning to +6 (MTW1), by the smoothed
 /// kill/death exchange. Saturates when combined losses reach
 /// EXCHANGE_FULL_RATE of current strength per second (our calibration).
@@ -146,8 +172,13 @@ const DISORDER_FULL: f32 = 7.0;
 /// Routing-neighbor / support / rout-enemy radius (ours; the M2TW
 /// radii were never extracted).
 const NEIGHBOR_R: f32 = 60.0;
-/// Broken regiments below this fraction of initial strength shatter.
-const SHATTER_FRAC: f32 = 0.15;
+/// Broken regiments below this fraction of initial strength shatter
+/// (never rally, flee until despawn). OURS, not M2TW: the engine keeps
+/// routing units routing — the capture caught a Pikemen unit fleeing
+/// with 1 man of 120 left (devlog 0057). With the measured rout line at
+/// -11, regiments break so late that a 15% floor made every break
+/// shatter instantly and the rout phase disappeared; 3% restores it.
+const SHATTER_FRAC: f32 = 0.03;
 /// Seconds routing before rally is possible (engine minRoutDelay analog).
 const RALLY_DELAY: f32 = 8.0;
 /// Leadership. M2TW: every army is LED — a captain when no general is
@@ -157,6 +188,10 @@ const RALLY_DELAY: f32 = 8.0;
 /// command is ~6 m (6 + 7xcommand + 4xinfluence) — effectively nothing,
 /// so the aura waits for real generals with stars.
 const LEADER_ALIVE: f32 = 2.0;
+/// The commander's OWN regiment carries far more: MEASURED +8 (devlog
+/// 0057, effect id 3 — it appeared on the general's bodyguard and on no
+/// other unit, matching Feral's RTW documentation exactly).
+const LEADER_SELF: f32 = 8.0;
 /// Leader falls: -8 for a few seconds, then -2 for the rest of the
 /// battle and the alive bonus is gone (MTW official table; M2TW's own
 /// shock size unextracted).
@@ -181,18 +216,15 @@ fn rout_weight(observer_kind: u8, router_kind: u8) -> f32 {
     if od < 1.0 && rd > od { 0.5 } else { 1.0 }
 }
 
-/// MTW1 casualty curve (fraction lost -> level penalty).
+/// Measured casualty ladder (fraction lost -> level penalty).
 fn casualty_penalty(lost_frac: f32) -> f32 {
-    let pts = CASUALTY_PTS;
-    for w in pts.windows(2) {
-        let ((x0, y0), (x1, y1)) = (w[0], w[1]);
-        if lost_frac < x1 {
-            return y0 + (y1 - y0) * (lost_frac - x0) / (x1 - x0);
+    let mut pen = 0.0;
+    for (at, amount) in CASUALTY_STEPS {
+        if lost_frac >= at {
+            pen = amount;
         }
     }
-    // Extrapolate past the last anchor on its slope.
-    let ((x0, y0), (x1, y1)) = (pts[2], pts[3]);
-    y1 + (y1 - y0) / (x1 - x0) * (lost_frac - x1)
+    pen
 }
 
 /// Per-tick regiment morale update (serial; ~200 rows). Runs after the
@@ -415,8 +447,21 @@ pub fn update_morale(
             f.wall = WALL_BONUS;
         }
 
-        // The army's commander: present, freshly fallen, or lost.
+        // The army's commander: present, freshly fallen, or lost. His
+        // own regiment stands on the measured +8 as well.
         f.leader = leader_term[g.team as usize];
+        if g.leader && !g.state.is_broken() {
+            f.leader += LEADER_SELF;
+        }
+
+        // The rout lock: a broken regiment carries a heavy penalty that
+        // decays, so it keeps running until it has genuinely collected
+        // itself (measured -50 on break; the engine holds it flat).
+        if let RegState::Routing { since } = g.state {
+            let elapsed = (*tick - since) as f32 * dt;
+            let k = 1.0 - (elapsed / ROUT_LOCK_DECAY_S).clamp(0.0, 1.0);
+            f.rout_lock = ROUT_LOCK * k;
+        }
 
         let eff = f.base
             + f.casualties
@@ -430,13 +475,15 @@ pub fn update_morale(
             + f.disorder
             + f.fatigue
             + f.wall
-            + f.leader;
+            + f.leader
+            + f.rout_lock;
         f.effective = eff;
         g.morale = eff;
 
         match g.state {
             RegState::Steady => {
-                g.wavering = eff <= 0.0;
+                g.shaken = eff <= SHAKEN_AT;
+                g.wavering = eff <= WAVER_AT;
                 if eff <= ROUT_AT {
                     let held = g.break_ticks as f32 * dt;
                     if held >= BREAK_HOLD_S {
@@ -456,6 +503,7 @@ pub fn update_morale(
             }
             RegState::Routing { since } => {
                 g.wavering = false;
+                g.shaken = false;
                 if (g.count as f32) < g.initial_count as f32 * SHATTER_FRAC {
                     g.state = RegState::Shattered;
                     info!("regiment {gi} shatters");
@@ -473,6 +521,7 @@ pub fn update_morale(
             }
             RegState::Shattered => {
                 g.wavering = false;
+                g.shaken = false;
             }
         }
     }
