@@ -126,6 +126,7 @@ struct MenuRoot;
 #[derive(Component)]
 enum MenuButton {
     StartBattle,
+    Quit,
 }
 
 #[derive(Component)]
@@ -322,6 +323,7 @@ fn spawn_menu(mut commands: Commands, config: Res<BattleConfig>) {
 
             spawn_text_button(p, "Start Battle", MenuButton::StartBattle);
             spawn_text_button(p, "Settings", crate::settings::OpenSettingsButton);
+            spawn_text_button(p, "Quit", MenuButton::Quit);
             // Debug scenarios
             p.spawn((
                 Text::new("Debug Scenarios"),
@@ -434,6 +436,7 @@ fn menu_buttons(
     keys: Res<ButtonInput<KeyCode>>,
     mut config: ResMut<BattleConfig>,
     mut next: ResMut<NextState<GameState>>,
+    mut exit: MessageWriter<AppExit>,
     mut auto: Local<bool>,
 ) {
     if !*auto && scripts_active() {
@@ -452,6 +455,9 @@ fn menu_buttons(
                 MenuButton::StartBattle => {
                     config.scenario = Scenario::Normal;
                     next.set(GameState::Battle);
+                }
+                MenuButton::Quit => {
+                    exit.write(AppExit::Success);
                 }
             }
         }
