@@ -193,7 +193,7 @@ fn update_banners(
         );
         tf.rotation = billboard;
         let mut s = dist_scale;
-        if !broken && gd.wavering {
+        if !broken && crate::morale::band(gd) == crate::morale::Band::Wavering {
             // About to break: the whole banner trembles.
             s *= 1.0 + 0.07 * (time.elapsed_secs() * 7.0).sin();
         }

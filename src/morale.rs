@@ -73,10 +73,6 @@ pub struct MoraleFactors {
     /// The rout lock while broken (0 when steady): decays away, and
     /// until it does the regiment cannot rally.
     pub rout_lock: f32,
-    /// The recomputed level (== GroupData::morale).
-    pub effective: f32,
-    /// Steady friendly regiments counted for support (0..=3).
-    pub friends: u32,
 }
 
 #[derive(Resource, Default)]
@@ -115,8 +111,7 @@ const BREAK_HOLD_S: f32 = 1.0;
 /// by bucketing every sample's effect amount against that unit's actual
 /// soldiers/soldiersMax): discrete STEPS, and nothing at all below 10%.
 /// The 25% step was previously unknown to the community.
-const CASUALTY_STEPS: [(f32, f32); 4] =
-    [(0.10, -2.0), (0.25, -4.0), (0.50, -8.0), (0.80, -12.0)];
+const CASUALTY_STEPS: [(f32, f32); 4] = [(0.10, -2.0), (0.25, -4.0), (0.50, -8.0), (0.80, -12.0)];
 /// Losing combat scales to -8, winning to +6 (MTW1), by the smoothed
 /// kill/death exchange. Saturates when combined losses reach
 /// EXCHANGE_FULL_RATE of current strength per second (our calibration).
@@ -172,6 +167,10 @@ const DISORDER_FULL: f32 = 7.0;
 /// Routing-neighbor / support / rout-enemy radius (ours; the M2TW
 /// radii were never extracted).
 const NEIGHBOR_R: f32 = 60.0;
+/// Squared, because these scans run per regiment per tick: comparing
+/// against the square skips a sqrt each time (the same convention the
+/// regiment-pair loop in frontline.rs already uses).
+const NEIGHBOR_R2: f32 = NEIGHBOR_R * NEIGHBOR_R;
 /// Broken regiments below this fraction of initial strength shatter
 /// (never rally, flee until despawn). OURS, not M2TW: the engine keeps
 /// routing units routing — the capture caught a Pikemen unit fleeing
@@ -198,6 +197,28 @@ const LEADER_SELF: f32 = 8.0;
 const LEADER_SHOCK: f32 = -8.0;
 const LEADER_SHOCK_S: f32 = 10.0;
 const LEADER_LOST_PERM: f32 = -2.0;
+
+/// Which measured band a steady regiment's morale sits in. Derived, not
+/// stored: the level already says it, and a cached copy would have to be
+/// cleared by hand in every other state.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Band {
+    Steady,
+    Shaken,
+    Wavering,
+}
+
+pub fn band(gd: &crate::orders::GroupData) -> Band {
+    if gd.state.is_broken() {
+        Band::Steady
+    } else if gd.morale <= WAVER_AT {
+        Band::Wavering
+    } else if gd.morale <= SHAKEN_AT {
+        Band::Shaken
+    } else {
+        Band::Steady
+    }
+}
 
 /// Display normalization for bars/cards: full at the unit's calm base,
 /// empty exactly at the rout line.
@@ -240,6 +261,10 @@ pub fn update_morale(
     mut deaths_ema: Local<Vec<f32>>,
     mut kills_ema: Local<Vec<f32>>,
     mut leader_lost: Local<[u32; 2]>,
+    // Reused across ticks: these snapshots are rebuilt every tick and
+    // would otherwise be two allocations per tick forever.
+    mut broken_centroids: Local<Vec<(u8, u8, Vec2)>>,
+    mut steady_centroids: Local<Vec<(usize, u8, Vec2)>>,
 ) {
     *tick += 1;
     let dt = time.delta_secs();
@@ -259,9 +284,7 @@ pub fn update_morale(
             let pick = groups
                 .list
                 .iter()
-                .position(|g| {
-                    g.team == t && g.count > 0 && g.kind == crate::unit_types::KIND_HEAVY
-                })
+                .position(|g| g.team == t && g.count > 0 && g.kind == crate::unit_types::KIND_HEAVY)
                 .or_else(|| groups.list.iter().position(|g| g.team == t && g.count > 0));
             if let Some(i) = pick {
                 groups.list[i].leader = true;
@@ -299,19 +322,24 @@ pub fn update_morale(
 
     // Snapshot broken/steady centroids for the neighbor terms (state
     // from last tick is fine — morale contagion is not latency-sensitive).
-    let broken_centroids: Vec<(u8, u8, Vec2)> = groups
-        .list
-        .iter()
-        .filter(|g| g.state.is_broken() && g.count > 0)
-        .map(|g| (g.team, g.kind, g.centroid))
-        .collect();
-    let steady_centroids: Vec<(usize, u8, Vec2)> = groups
-        .list
-        .iter()
-        .enumerate()
-        .filter(|(_, g)| !g.state.is_broken() && g.count > 0)
-        .map(|(i, g)| (i, g.team, g.centroid))
-        .collect();
+    broken_centroids.clear();
+    broken_centroids.extend(
+        groups
+            .list
+            .iter()
+            .filter(|g| g.state.is_broken() && g.count > 0)
+            .map(|g| (g.team, g.kind, g.centroid)),
+    );
+    steady_centroids.clear();
+    steady_centroids.extend(
+        groups
+            .list
+            .iter()
+            .enumerate()
+            .filter(|(_, g)| !g.state.is_broken() && g.count > 0)
+            .map(|(i, g)| (i, g.team, g.centroid)),
+    );
+    let (broken_centroids, steady_centroids) = (&*broken_centroids, &*steady_centroids);
 
     for (gi, g) in groups.list.iter_mut().enumerate() {
         if g.count == 0 {
@@ -351,7 +379,11 @@ pub fn update_morale(
             let intensity = (total / EXCHANGE_FULL_RATE).min(1.0);
             f.exchange = net
                 * intensity
-                * if net < 0.0 { -EXCHANGE_LOSING } else { EXCHANGE_WINNING };
+                * if net < 0.0 {
+                    -EXCHANGE_LOSING
+                } else {
+                    EXCHANGE_WINNING
+                };
         }
 
         // Outflanked. 8 probes on a ring around the centroid; a sector
@@ -395,33 +427,35 @@ pub fn update_morale(
         // casualties and exhaustion spare no one.
         let disc = params.discipline;
         f.flanked = MORALE_FLANKED * flanked01 * disc;
-        f.outnumbered = if outnumbered { MORALE_OUTNUMBERED * disc } else { 0.0 };
+        f.outnumbered = if outnumbered {
+            MORALE_OUTNUMBERED * disc
+        } else {
+            0.0
+        };
 
         // Routing friendlies nearby shake resolve; routing ENEMIES in
         // view lift it. Both use the documented class weighting and
         // saturate at two weighted units — discipline decides how much
         // each router COUNTS (rout_weight), so no extra multiplier here.
-        let rout_friends: f32 = broken_centroids
-            .iter()
-            .filter(|(t, _, c)| *t == g.team && c.distance(g.centroid) < NEIGHBOR_R)
-            .map(|(_, k, _)| rout_weight(g.kind, *k))
-            .sum();
-        f.contagion = rout_friends.min(CONTAGION_SAT) * CONTAGION_PER;
-        let rout_enemies: f32 = broken_centroids
-            .iter()
-            .filter(|(t, _, c)| *t != g.team && c.distance(g.centroid) < NEIGHBOR_R)
-            .map(|(_, k, _)| rout_weight(g.kind, *k))
-            .sum();
-        f.rout_enemies = rout_enemies.min(CONTAGION_SAT) * ROUT_ENEMY_PER;
+        // One pass over the routers: [enemy, own] weighted sums.
+        let mut routers = [0.0f32; 2];
+        for (t, k, c) in broken_centroids {
+            if c.distance_squared(g.centroid) < NEIGHBOR_R2 {
+                routers[(*t == g.team) as usize] += rout_weight(g.kind, *k);
+            }
+        }
+        f.contagion = routers[1].min(CONTAGION_SAT) * CONTAGION_PER;
+        f.rout_enemies = routers[0].min(CONTAGION_SAT) * ROUT_ENEMY_PER;
 
         // Steady friends nearby secure the flanks — full +4 with three
         // of them and a quiet ring, eroded as the ring turns hostile.
         let friends = steady_centroids
             .iter()
-            .filter(|(i, t, c)| *i != gi && *t == g.team && c.distance(g.centroid) < NEIGHBOR_R)
+            .filter(|(i, t, c)| {
+                *i != gi && *t == g.team && c.distance_squared(g.centroid) < NEIGHBOR_R2
+            })
             .count()
             .min(3);
-        f.friends = friends as u32;
         f.support = SUPPORT_MAX * friends as f32 / 3.0 * (1.0 - flanked01);
 
         // Calm: no enemy anywhere near. This is also the rally pull —
@@ -434,8 +468,8 @@ pub fn update_morale(
         // a scattered regiment dressing its ranks in peace is fine, the
         // same scatter in melee is how formations die.
         if g.engaged {
-            let disorder01 = ((g.disorder - DISORDER_FREE) / (DISORDER_FULL - DISORDER_FREE))
-                .clamp(0.0, 1.0);
+            let disorder01 =
+                ((g.disorder - DISORDER_FREE) / (DISORDER_FULL - DISORDER_FREE)).clamp(0.0, 1.0);
             f.disorder = MORALE_DISORDER * disorder01;
         }
 
@@ -477,13 +511,10 @@ pub fn update_morale(
             + f.wall
             + f.leader
             + f.rout_lock;
-        f.effective = eff;
         g.morale = eff;
 
         match g.state {
             RegState::Steady => {
-                g.shaken = eff <= SHAKEN_AT;
-                g.wavering = eff <= WAVER_AT;
                 if eff <= ROUT_AT {
                     let held = g.break_ticks as f32 * dt;
                     if held >= BREAK_HOLD_S {
@@ -502,8 +533,6 @@ pub fn update_morale(
                 }
             }
             RegState::Routing { since } => {
-                g.wavering = false;
-                g.shaken = false;
                 if (g.count as f32) < g.initial_count as f32 * SHATTER_FRAC {
                     g.state = RegState::Shattered;
                     info!("regiment {gi} shatters");
@@ -514,15 +543,19 @@ pub fn update_morale(
                     g.anchor = g.centroid;
                     // Re-dress the ranks where the rout ended, facing
                     // back the way they fled from.
-                    g.facing = if g.team == 0 { 0.0 } else { std::f32::consts::PI };
+                    g.facing = if g.team == 0 {
+                        0.0
+                    } else {
+                        std::f32::consts::PI
+                    };
                     g.reform = true;
-                    info!("regiment {gi} rallies at morale {eff:.1} ({} left)", g.count);
+                    info!(
+                        "regiment {gi} rallies at morale {eff:.1} ({} left)",
+                        g.count
+                    );
                 }
             }
-            RegState::Shattered => {
-                g.wavering = false;
-                g.shaken = false;
-            }
+            RegState::Shattered => {}
         }
     }
 }

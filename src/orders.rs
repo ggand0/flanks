@@ -153,12 +153,6 @@ pub struct GroupData {
     /// situational modifiers, recomputed every tick — NOT an accumulator.
     /// Rout threshold is at -6 (morale.rs); typical range ~-20..+20.
     pub morale: f32,
-    /// Effective morale at or below the measured SHAKEN band (~-3):
-    /// rattled but holding. Display only.
-    pub shaken: bool,
-    /// At or below the measured WAVERING band (~-7): about to break,
-    /// fights on. Display flag (trembling banner, card color).
-    pub wavering: bool,
     /// Ticks the effective level has sat at/below the rout line
     /// (hysteresis: one spiked tick must not break a regiment).
     pub break_ticks: u8,
@@ -211,8 +205,6 @@ impl GroupData {
             leader: false,
             // Overwritten by the first morale tick (base + calm bonuses).
             morale: crate::unit_types::TYPES[kind as usize].base_morale,
-            shaken: false,
-            wavering: false,
             break_ticks: 0,
             fatigue: 0.0,
             state: RegState::Steady,

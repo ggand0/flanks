@@ -31,9 +31,10 @@ impl Plugin for FatiguePlugin {
 }
 
 /// The six M2TW fatigue states (engine display names).
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
 pub enum FatigueState {
-    Fresh,
+    Fresh = 0,
     WarmedUp,
     Winded,
     Tired,
@@ -43,64 +44,51 @@ pub enum FatigueState {
 
 /// Band boundaries on the 0..100 accumulator.
 const BANDS: [f32; 5] = [15.0, 30.0, 50.0, 70.0, 85.0];
+const ORDER: [FatigueState; 6] = [
+    FatigueState::Fresh,
+    FatigueState::WarmedUp,
+    FatigueState::Winded,
+    FatigueState::Tired,
+    FatigueState::VeryTired,
+    FatigueState::Exhausted,
+];
+
+/// Per-state effects, indexed by `state(f) as usize`: display name,
+/// attack points (MTW1 official table; it lists attack only, so defence
+/// stays untouched), morale level modifier (same table), and locomotion
+/// multiplier (qualitative evidence only — "clear hard penalty at
+/// exhausted, cannot chase" — kept gentle pending a feel pass).
+const EFFECTS: [(&str, f32, f32, f32); 6] = [
+    ("fresh", 0.0, 0.0, 1.0),
+    ("warmed up", 0.0, 0.0, 1.0),
+    ("winded", -2.0, 0.0, 1.0),
+    ("tired", -3.0, -3.0, 0.95),
+    ("very tired", -4.0, -6.0, 0.88),
+    ("exhausted", -6.0, -8.0, 0.78),
+];
 
 #[inline]
 pub fn state(fatigue: f32) -> FatigueState {
-    match BANDS.iter().position(|b| fatigue < *b) {
-        Some(0) => FatigueState::Fresh,
-        Some(1) => FatigueState::WarmedUp,
-        Some(2) => FatigueState::Winded,
-        Some(3) => FatigueState::Tired,
-        Some(4) => FatigueState::VeryTired,
-        _ => FatigueState::Exhausted,
-    }
+    ORDER[BANDS.iter().position(|b| fatigue < *b).unwrap_or(5)]
 }
 
 pub fn state_name(s: FatigueState) -> &'static str {
-    match s {
-        FatigueState::Fresh => "fresh",
-        FatigueState::WarmedUp => "warmed up",
-        FatigueState::Winded => "winded",
-        FatigueState::Tired => "tired",
-        FatigueState::VeryTired => "very tired",
-        FatigueState::Exhausted => "exhausted",
-    }
+    EFFECTS[s as usize].0
 }
 
-/// Attack-point penalty per state (MTW1 official table mapped onto the
-/// six M2TW states; MTW1 lists attack only — defence stays untouched).
 #[inline]
 pub fn attack_penalty(fatigue: f32) -> f32 {
-    match state(fatigue) {
-        FatigueState::Fresh | FatigueState::WarmedUp => 0.0,
-        FatigueState::Winded => -2.0,
-        FatigueState::Tired => -3.0,
-        FatigueState::VeryTired => -4.0,
-        FatigueState::Exhausted => -6.0,
-    }
+    EFFECTS[state(fatigue) as usize].1
 }
 
-/// Morale-level modifier per state (MTW1 table).
 #[inline]
 pub fn morale_penalty(fatigue: f32) -> f32 {
-    match state(fatigue) {
-        FatigueState::Fresh | FatigueState::WarmedUp | FatigueState::Winded => 0.0,
-        FatigueState::Tired => -3.0,
-        FatigueState::VeryTired => -6.0,
-        FatigueState::Exhausted => -8.0,
-    }
+    EFFECTS[state(fatigue) as usize].2
 }
 
-/// Locomotion multiplier. Qualitative evidence only ("clear hard penalty
-/// at exhausted, cannot chase"); kept gentle until owner feel pass.
 #[inline]
 pub fn speed_mult(fatigue: f32) -> f32 {
-    match state(fatigue) {
-        FatigueState::Fresh | FatigueState::WarmedUp | FatigueState::Winded => 1.0,
-        FatigueState::Tired => 0.95,
-        FatigueState::VeryTired => 0.88,
-        FatigueState::Exhausted => 0.78,
-    }
+    EFFECTS[state(fatigue) as usize].3
 }
 
 /// MTW1: completely exhausted units "cannot run or charge" — the charge

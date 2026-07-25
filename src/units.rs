@@ -126,7 +126,7 @@ pub fn hash01(mut x: u32) -> f32 {
 /// so run-to-run variance must be injected at spawn).
 fn spawn_seed_offset() -> u32 {
     static S: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *S.get_or_init(|| (crate::util::env_or("FL_SEED", 0.0) as u32).wrapping_mul(0x9E37_79B1))
+    *S.get_or_init(|| crate::util::env_or("FL_SEED", 0u32).wrapping_mul(0x9E37_79B1))
 }
 
 /// Append one fully-initialized unit to every SoA column. `anchor` is the

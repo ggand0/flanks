@@ -148,8 +148,10 @@ fn update_inspect_panel(
     let team = if gd.team == 0 { "blue" } else { "orange" };
     let state = match gd.state {
         RegState::Steady if gd.charging => "STEADY - CHARGING",
-        RegState::Steady if gd.wavering => "WAVERING",
-        RegState::Steady if gd.shaken => "SHAKEN",
+        RegState::Steady if crate::morale::band(gd) == crate::morale::Band::Wavering => {
+            "WAVERING"
+        }
+        RegState::Steady if crate::morale::band(gd) == crate::morale::Band::Shaken => "SHAKEN",
         RegState::Steady if gd.engaged => "STEADY - engaged",
         RegState::Steady => "STEADY",
         RegState::Routing { .. } => "ROUTING",

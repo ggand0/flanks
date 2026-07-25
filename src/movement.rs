@@ -1199,11 +1199,6 @@ pub fn step_sim(
             .iter()
             .map(|g| crate::fatigue::attack_penalty(g.fatigue))
             .collect();
-        let fat_nocharge: Vec<bool> = groups
-            .list
-            .iter()
-            .map(|g| crate::fatigue::cannot_charge(g.fatigue))
-            .collect();
         for buf in &mut damage.0 {
             stats.events += buf.len();
             for ev in buf.drain(..) {
