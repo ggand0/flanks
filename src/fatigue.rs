@@ -111,17 +111,25 @@ pub fn cannot_charge(fatigue: f32) -> bool {
 }
 
 // --- Accumulation rates (per second, before the kind fatigue_rate
-// mult). M2TW's exact rates are hardcoded and unpublished — these are
-// free knobs calibrated to: continuous melee reaches Tired in ~2 min
-// and Exhausted in ~3.5; standing recovers Very Tired -> Fresh in
-// ~3.5 min (community datum: minutes-scale, slow). Ordering (fight >
-// charge > run > walk, idle recovers) is the evidenced part.
-const FAT_FIGHT: f32 = 0.55;
-const FAT_CHARGE: f32 = 0.8;
+// mult). M2TW's exact rates are hardcoded and were never published for
+// ANY title in the lineage, so these are knobs — but they now have a
+// MEASURED anchor (devlog 0057): reading the engine's own per-unit
+// fatigue counter through two live battles, 855 s of hard fighting
+// moved units only to 2-5 on the engine's 0..15 scale, i.e. roughly
+// warmed up to winded. M2TW tires men SLOWLY; nothing came close to
+// exhausted in a quarter-hour battle.
+//
+// Calibrated to that (and to the owner's feel pass, which independently
+// called the old rates too fast): continuous melee reaches Tired at
+// ~6 min and Exhausted at ~10 min; standing recovers Very Tired ->
+// Fresh in ~10 min. Ordering (fight > charge > move, idle recovers)
+// remains the evidenced part.
+const FAT_FIGHT: f32 = 0.14;
+const FAT_CHARGE: f32 = 0.20;
 /// All ordered movement runs today; when the walk/run toggle lands,
 /// walking drops to a token trickle and this becomes the RUN rate.
-const FAT_MOVE: f32 = 0.3;
-const FAT_RECOVER: f32 = 0.35;
+const FAT_MOVE: f32 = 0.08;
+const FAT_RECOVER: f32 = 0.12;
 
 /// Per-tick fatigue update (serial, ~200 rows). Runs after step_sim so
 /// `engaged`/`charging` are this tick's truth, before the morale tick
