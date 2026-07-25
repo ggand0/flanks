@@ -121,6 +121,14 @@ pub fn hash01(mut x: u32) -> f32 {
     (x >> 8) as f32 / 16_777_216.0
 }
 
+/// FL_SEED: offsets every per-unit spawn hash — perturbation runs for
+/// battle-outcome sensitivity sweeps (the sim itself is deterministic,
+/// so run-to-run variance must be injected at spawn).
+fn spawn_seed_offset() -> u32 {
+    static S: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *S.get_or_init(|| (crate::util::env_or("FL_SEED", 0.0) as u32).wrapping_mul(0x9E37_79B1))
+}
+
 /// Append one fully-initialized unit to every SoA column. `anchor` is the
 /// unit's regiment anchor; the spawn offset from it becomes `home`.
 #[allow(clippy::too_many_arguments)] // spawn-time plumbing, all scalars
@@ -139,6 +147,7 @@ pub fn push_unit(
         Vec3::new(0.20, 0.45, 0.85), // blue
         Vec3::new(0.90, 0.40, 0.15), // orange
     ];
+    let seed = seed.wrapping_add(spawn_seed_offset());
     let params = &crate::unit_types::TYPES[kind as usize];
     let p = Vec3::new(x, terrain.height_at(x, z) + params.half_height, z);
     units.pos.push(p);

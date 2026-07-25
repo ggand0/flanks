@@ -116,13 +116,15 @@ const FLANK_T: f32 = 0.6;
 /// this factor there — probes landing inside our own block or the
 /// front-line mixing zone must not count (a frontal press ≠ a flank).
 const FLANK_DOMINANCE: f32 = 1.2;
-/// Routing friendly regiments within NEIGHBOR_R: MTW1 caps the factor
-/// at -12; per-neighbor step is ours.
-const CONTAGION_PER: f32 = -3.0;
-const CONTAGION_CAP: f32 = -12.0;
-/// Routing ENEMY regiments in view: up to +8 (MTW1).
-const ROUT_ENEMY_PER: f32 = 2.0;
-const ROUT_ENEMY_CAP: f32 = 8.0;
+/// Routing friendly regiments within NEIGHBOR_R — the documented MTW
+/// curve (primary source, devlog 0055 round 2): -6 per WEIGHTED routing
+/// unit, saturating at two units (-12). Routers are weighted by class
+/// against observer discipline (rout_weight): drilled troops half-count
+/// lesser men streaming past — the built-in anti-cascade anchor.
+const CONTAGION_PER: f32 = -6.0;
+const CONTAGION_SAT: f32 = 2.0;
+/// Routing ENEMY regiments in view: +4 per weighted unit, cap two (+8).
+const ROUT_ENEMY_PER: f32 = 4.0;
 /// "Flanks secure" +4 (MTW1): earned by steady friendlies nearby,
 /// eroded as the flank ring finds hostiles.
 const SUPPORT_MAX: f32 = 4.0;
@@ -151,6 +153,16 @@ const RALLY_DELAY: f32 = 8.0;
 pub fn morale01(gd: &crate::orders::GroupData) -> f32 {
     let base = TYPES[gd.kind as usize].base_morale;
     ((gd.morale - ROUT_AT) / (base - ROUT_AT)).clamp(0.0, 1.0)
+}
+
+/// MTW discipline weighting of a routing unit in view: elites and
+/// drilled troops count men LESS disciplined than themselves as half a
+/// unit; undrilled men count every rout in full ("disciplined units
+/// care little for routing peasants").
+fn rout_weight(observer_kind: u8, router_kind: u8) -> f32 {
+    let od = TYPES[observer_kind as usize].discipline;
+    let rd = TYPES[router_kind as usize].discipline;
+    if od < 1.0 && rd > od { 0.5 } else { 1.0 }
 }
 
 /// MTW1 casualty curve (fraction lost -> level penalty).
@@ -191,11 +203,11 @@ pub fn update_morale(
 
     // Snapshot broken/steady centroids for the neighbor terms (state
     // from last tick is fine — morale contagion is not latency-sensitive).
-    let broken_centroids: Vec<(u8, Vec2)> = groups
+    let broken_centroids: Vec<(u8, u8, Vec2)> = groups
         .list
         .iter()
         .filter(|g| g.state.is_broken() && g.count > 0)
-        .map(|g| (g.team, g.centroid))
+        .map(|g| (g.team, g.kind, g.centroid))
         .collect();
     let steady_centroids: Vec<(usize, u8, Vec2)> = groups
         .list
@@ -290,17 +302,21 @@ pub fn update_morale(
         f.outnumbered = if outnumbered { MORALE_OUTNUMBERED * disc } else { 0.0 };
 
         // Routing friendlies nearby shake resolve; routing ENEMIES in
-        // view lift it.
-        let rout_friends = broken_centroids
+        // view lift it. Both use the documented class weighting and
+        // saturate at two weighted units — discipline decides how much
+        // each router COUNTS (rout_weight), so no extra multiplier here.
+        let rout_friends: f32 = broken_centroids
             .iter()
-            .filter(|(t, c)| *t == g.team && c.distance(g.centroid) < NEIGHBOR_R)
-            .count() as f32;
-        f.contagion = (rout_friends * CONTAGION_PER).max(CONTAGION_CAP) * disc;
-        let rout_enemies = broken_centroids
+            .filter(|(t, _, c)| *t == g.team && c.distance(g.centroid) < NEIGHBOR_R)
+            .map(|(_, k, _)| rout_weight(g.kind, *k))
+            .sum();
+        f.contagion = rout_friends.min(CONTAGION_SAT) * CONTAGION_PER;
+        let rout_enemies: f32 = broken_centroids
             .iter()
-            .filter(|(t, c)| *t != g.team && c.distance(g.centroid) < NEIGHBOR_R)
-            .count() as f32;
-        f.rout_enemies = (rout_enemies * ROUT_ENEMY_PER).min(ROUT_ENEMY_CAP);
+            .filter(|(t, _, c)| *t != g.team && c.distance(g.centroid) < NEIGHBOR_R)
+            .map(|(_, k, _)| rout_weight(g.kind, *k))
+            .sum();
+        f.rout_enemies = rout_enemies.min(CONTAGION_SAT) * ROUT_ENEMY_PER;
 
         // Steady friends nearby secure the flanks — full +4 with three
         // of them and a quiet ring, eroded as the ring turns hostile.
