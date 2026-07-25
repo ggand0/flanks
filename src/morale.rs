@@ -86,8 +86,8 @@ pub struct MoraleReadout(pub Vec<MoraleFactors>);
 // MTW1 official-guide values (the numeric template CA carried forward;
 // M2TW's own are hardcoded and unpublished) unless flagged otherwise.
 /// State bands, MEASURED from the live engine (devlog 0057: base morale
-/// + summed effect amounts, per state, across 13950 samples):
-/// high +12, firm +3, shaken -3, wavering -7, routing -11 (medians).
+/// plus the summed effect amounts, per state, across 13950 samples).
+/// Medians: high +12, firm +3, shaken -3, wavering -7, routing -11.
 /// The bands overlap in the engine (documented anti-thrash hysteresis);
 /// we take those medians as edges and get the hysteresis from
 /// BREAK_HOLD_S plus the rally gap.
