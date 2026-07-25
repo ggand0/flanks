@@ -140,10 +140,27 @@ pub struct GroupData {
     /// point (3.0 × 40 = 120 m in vanilla config_ai_battle.xml).
     pub fight_origin: Vec2,
     // --- morale (morale.rs updates per tick) ---
+    /// Effective morale LEVEL (M2TW model): base stat + the signed sum of
+    /// situational modifiers, recomputed every tick — NOT an accumulator.
+    /// Rout threshold is at -6 (morale.rs); typical range ~-20..+20.
     pub morale: f32,
+    /// Steady but effective morale in the 0..-6 band: about to break,
+    /// fights on. Display flag (trembling banner, card color).
+    pub wavering: bool,
+    /// Ticks the effective level has sat at/below the rout line
+    /// (hysteresis: one spiked tick must not break a regiment).
+    pub break_ticks: u8,
+    // --- fatigue (fatigue.rs updates per tick) ---
+    /// 0 (fresh) .. 100 (exhausted cap). Fighting > charging > running
+    /// accumulate; standing recovers. Banded into the six M2TW states.
+    pub fatigue: f32,
     pub state: RegState,
     /// Deaths since the last morale tick (tallied by the damage apply pass).
     pub recent_deaths: u32,
+    /// Kills MADE by this regiment since the last morale tick (damage
+    /// apply pass): recent_kills vs recent_deaths is the winning/losing-
+    /// melee morale factor.
+    pub recent_kills: u32,
 }
 
 impl GroupData {
@@ -178,9 +195,14 @@ impl GroupData {
             hostile_near: false,
             celebrate: 0,
             fight_origin: Vec2::ZERO,
-            morale: 100.0,
+            // Overwritten by the first morale tick (base + calm bonuses).
+            morale: crate::unit_types::TYPES[kind as usize].base_morale,
+            wavering: false,
+            break_ticks: 0,
+            fatigue: 0.0,
             state: RegState::Steady,
             recent_deaths: 0,
+            recent_kills: 0,
         }
     }
 }

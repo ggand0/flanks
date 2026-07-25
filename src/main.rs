@@ -3,6 +3,7 @@ mod audio;
 mod banners;
 mod camera;
 mod combat;
+mod fatigue;
 mod formation;
 mod frontline;
 mod game_state;
@@ -75,6 +76,7 @@ fn main() {
             units::UnitsPlugin,
             regiments::RegimentsPlugin,
             morale::MoralePlugin,
+            fatigue::FatiguePlugin,
             ai::AiPlugin,
             banners::BannersPlugin,
             audio::BattleAudioPlugin,

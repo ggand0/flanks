@@ -15,10 +15,6 @@ use crate::terrain::Terrain;
 
 /// Bar fill width in banner-local units.
 const BAR_W: f32 = 1.5;
-/// Morale below this pulses the banner (matches nothing in the sim — pure
-/// "about to break" readability threshold).
-const WAVER_MORALE: f32 = 25.0;
-
 pub struct BannersPlugin;
 
 impl Plugin for BannersPlugin {
@@ -197,14 +193,14 @@ fn update_banners(
         );
         tf.rotation = billboard;
         let mut s = dist_scale;
-        if !broken && gd.morale < WAVER_MORALE {
+        if !broken && gd.wavering {
             // About to break: the whole banner trembles.
             s *= 1.0 + 0.07 * (time.elapsed_secs() * 7.0).sin();
         }
         tf.scale = Vec3::splat(s);
 
         // Left-anchored bar fills.
-        let morale = (gd.morale / 100.0).clamp(0.0, 1.0);
+        let morale = crate::morale::morale01(gd);
         if let Ok((mut t, _)) = parts.get_mut(banner.morale_fill) {
             t.scale.x = (BAR_W * morale).max(0.001);
             t.translation.x = -BAR_W * (1.0 - morale) / 2.0;

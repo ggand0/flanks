@@ -60,8 +60,17 @@ pub struct UnitTypeParams {
     pub speed: f32,
     /// Relative shove weight in separation (heavier pushes lighter).
     pub mass: f32,
-    /// Multiplier on morale damage taken by this unit's regiment.
-    pub morale_resist: f32,
+    /// Base morale level (M2TW `stat_mental` first field). The situational
+    /// modifier sum in morale.rs rides on top of this; vanilla M2TW scale:
+    /// militia ~5-7, line ~9, elites 11-16 (devlog 0055 evidence).
+    pub base_morale: f32,
+    /// Multiplier on morale SHOCK modifiers (flanked, rout contagion) —
+    /// M2TW discipline: "determines the amount of morale lost when morale
+    /// shocks occur". Lower = steadier under shock.
+    pub discipline: f32,
+    /// Fatigue accumulation multiplier — the M2TW `stat_heat` analog:
+    /// heavy armour tires its wearer faster. Recovery is unscaled.
+    pub fatigue_rate: f32,
     /// Mesh half height; units sit on the terrain at this Y.
     pub half_height: f32,
 }
@@ -94,7 +103,12 @@ pub const TYPES: [UnitTypeParams; NUM_KINDS] = [
         // (~3.5) slot in above; mass drives separation shove and charge
         // knockback ratios.
         mass: 1.5,
-        morale_resist: 0.6,
+        // Elite knights: near the top of the M2TW elite band — frontal
+        // attrition alone cannot push 14 (+wall) below the -6 rout line;
+        // heavies still break only when flanked or the line collapses.
+        base_morale: 14.0,
+        discipline: 0.6,
+        fatigue_rate: 1.3,
         half_height: 0.55,
     },
     // KIND_LIGHT — men-at-arms: fast, fragile, quicker swings, spear reach.
@@ -112,7 +126,10 @@ pub const TYPES: [UnitTypeParams; NUM_KINDS] = [
         cooldown_ticks: 33,
         speed: 9.5,
         mass: 0.9,
-        morale_resist: 1.0,
+        // Line troops on the vanilla scale.
+        base_morale: 8.0,
+        discipline: 1.0,
+        fatigue_rate: 1.0,
         half_height: 0.50,
     },
     // KIND_SPEAR — spear infantry: chainmail line troops behind big
@@ -134,7 +151,10 @@ pub const TYPES: [UnitTypeParams; NUM_KINDS] = [
         cooldown_ticks: 38,
         speed: 8.5,
         mass: 1.0,
-        morale_resist: 0.85,
+        // Upper spear militia: a notch above the lights, steadier drilled.
+        base_morale: 9.0,
+        discipline: 0.85,
+        fatigue_rate: 1.1,
         half_height: 0.50,
     },
 ];

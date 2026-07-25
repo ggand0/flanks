@@ -131,7 +131,7 @@ fn morale_color(gd: &crate::orders::GroupData) -> Color {
         RegState::Shattered => Color::srgb(0.35, 0.12, 0.10),
         RegState::Steady => {
             // Green (100) -> yellow (50) -> red (0), two-segment lerp.
-            let t = (gd.morale / 100.0).clamp(0.0, 1.0);
+            let t = crate::morale::morale01(gd);
             if t > 0.5 {
                 let k = (t - 0.5) * 2.0;
                 Color::srgb(0.85 - 0.55 * k, 0.80, 0.25)
