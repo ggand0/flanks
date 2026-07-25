@@ -66,6 +66,9 @@ pub struct MoraleFactors {
     /// regiment rally).
     pub no_enemy: f32,
     pub wall: f32,
+    /// Army leadership: +2 while the command regiment stands, the
+    /// death shock / permanent loss after it breaks.
+    pub leader: f32,
     /// The recomputed level (== GroupData::morale).
     pub effective: f32,
     /// Steady friendly regiments counted for support (0..=3).
@@ -147,6 +150,19 @@ const NEIGHBOR_R: f32 = 60.0;
 const SHATTER_FRAC: f32 = 0.15;
 /// Seconds routing before rally is possible (engine minRoutDelay analog).
 const RALLY_DELAY: f32 = 8.0;
+/// Leadership. M2TW: every army is LED — a captain when no general is
+/// present. RTW engine formula (Feral docs): army-wide bonus =
+/// 2 + command + influence/2 + TroopMorale, i.e. a bare captain still
+/// floors at +2 for the whole army. The nearby aura radius at zero
+/// command is ~6 m (6 + 7xcommand + 4xinfluence) — effectively nothing,
+/// so the aura waits for real generals with stars.
+const LEADER_ALIVE: f32 = 2.0;
+/// Leader falls: -8 for a few seconds, then -2 for the rest of the
+/// battle and the alive bonus is gone (MTW official table; M2TW's own
+/// shock size unextracted).
+const LEADER_SHOCK: f32 = -8.0;
+const LEADER_SHOCK_S: f32 = 10.0;
+const LEADER_LOST_PERM: f32 = -2.0;
 
 /// Display normalization for bars/cards: full at the unit's calm base,
 /// empty exactly at the rout line.
@@ -182,6 +198,7 @@ fn casualty_penalty(lost_frac: f32) -> f32 {
 /// Per-tick regiment morale update (serial; ~200 rows). Runs after the
 /// damage apply pass so `recent_deaths`/`recent_kills` are this tick's
 /// tally, and after fatigue so the fatigue penalty is current.
+#[allow(clippy::too_many_arguments)] // bevy system params
 pub fn update_morale(
     mut groups: ResMut<Groups>,
     field: Res<InfluenceField>,
@@ -190,6 +207,7 @@ pub fn update_morale(
     mut tick: Local<u32>,
     mut deaths_ema: Local<Vec<f32>>,
     mut kills_ema: Local<Vec<f32>>,
+    mut leader_lost: Local<[u32; 2]>,
 ) {
     *tick += 1;
     let dt = time.delta_secs();
@@ -200,6 +218,52 @@ pub fn update_morale(
     readout.0.resize(n, MoraleFactors::default());
     deaths_ema.resize(n, 0.0);
     kills_ema.resize(n, 0.0);
+
+    // Leadership: every army is LED (a captain when no general). The
+    // command regiment is assigned once — the first heavy regiment
+    // (the captain rides with the armor), else the first alive.
+    for t in 0..2u8 {
+        if !groups.list.iter().any(|g| g.leader && g.team == t) {
+            let pick = groups
+                .list
+                .iter()
+                .position(|g| {
+                    g.team == t && g.count > 0 && g.kind == crate::unit_types::KIND_HEAVY
+                })
+                .or_else(|| groups.list.iter().position(|g| g.team == t && g.count > 0));
+            if let Some(i) = pick {
+                groups.list[i].leader = true;
+            }
+        }
+    }
+    // Army-wide leadership term per team: +2 while the command regiment
+    // stands; when it breaks, the death shock then the permanent loss.
+    // A rallied command regiment takes back up its standard.
+    let mut leader_term = [0.0f32; 2];
+    for t in 0..2usize {
+        let standing = groups
+            .list
+            .iter()
+            .any(|g| g.leader && g.team == t as u8 && g.count > 0 && !g.state.is_broken());
+        if standing {
+            if leader_lost[t] != 0 {
+                info!("team {t} commander returns to the field");
+            }
+            leader_lost[t] = 0;
+            leader_term[t] = LEADER_ALIVE;
+        } else if groups.list.iter().any(|g| g.leader && g.team == t as u8) {
+            if leader_lost[t] == 0 {
+                leader_lost[t] = *tick;
+                info!("team {t} LOSES ITS COMMANDER");
+            }
+            let since = (*tick - leader_lost[t]) as f32 * dt;
+            leader_term[t] = if since < LEADER_SHOCK_S {
+                LEADER_SHOCK
+            } else {
+                LEADER_LOST_PERM
+            };
+        }
+    }
 
     // Snapshot broken/steady centroids for the neighbor terms (state
     // from last tick is fine — morale contagion is not latency-sensitive).
@@ -351,6 +415,9 @@ pub fn update_morale(
             f.wall = WALL_BONUS;
         }
 
+        // The army's commander: present, freshly fallen, or lost.
+        f.leader = leader_term[g.team as usize];
+
         let eff = f.base
             + f.casualties
             + f.exchange
@@ -362,7 +429,8 @@ pub fn update_morale(
             + f.no_enemy
             + f.disorder
             + f.fatigue
-            + f.wall;
+            + f.wall
+            + f.leader;
         f.effective = eff;
         g.morale = eff;
 

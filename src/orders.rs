@@ -144,6 +144,10 @@ pub struct GroupData {
     /// to attack-dist-multiplier × max-engage-dist from the engagement
     /// point (3.0 × 40 = 120 m in vanilla config_ai_battle.xml).
     pub fight_origin: Vec2,
+    /// The army's command regiment (the captain/general rides here).
+    /// M2TW: every army has a leader; his presence is an army-wide
+    /// morale term and his fall a shock. Assigned once by morale.rs.
+    pub leader: bool,
     // --- morale (morale.rs updates per tick) ---
     /// Effective morale LEVEL (M2TW model): base stat + the signed sum of
     /// situational modifiers, recomputed every tick — NOT an accumulator.
@@ -201,6 +205,7 @@ impl GroupData {
             hostile_near: false,
             celebrate: 0,
             fight_origin: Vec2::ZERO,
+            leader: false,
             // Overwritten by the first morale tick (base + calm bonuses).
             morale: crate::unit_types::TYPES[kind as usize].base_morale,
             wavering: false,

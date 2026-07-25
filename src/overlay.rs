@@ -188,6 +188,7 @@ fn update_inspect_panel(
             ("allies close", f.support),
             ("no enemy near", f.no_enemy),
             ("braced wall", f.wall),
+            ("commander", f.leader),
         ] {
             if v.abs() >= 0.05 {
                 s += &format!("\n{label:<15} {v:+.1}");
