@@ -34,6 +34,11 @@ struct CardFill(usize);
 #[derive(Component)]
 struct CardMorale(usize);
 
+/// Fatigue strip child (under the morale strip): remaining stamina as a
+/// left-anchored fill, tinted by the M2TW fatigue state.
+#[derive(Component)]
+struct CardFatigue(usize);
+
 /// The card's kind art: the rasterized icon (`icon: true`, shown on
 /// wide cards) or the letter fallback (`icon: false`, narrow cards).
 #[derive(Component)]
@@ -122,6 +127,18 @@ fn kind_letter(kind: u8) -> &'static str {
         KIND_HEAVY => "H",
         KIND_SPEAR => "S",
         _ => "L",
+    }
+}
+
+/// Stamina tint per fatigue band: cool while fresh, hot when spent.
+fn fatigue_color(fatigue: f32) -> Color {
+    use crate::fatigue::FatigueState as F;
+    match crate::fatigue::state(fatigue) {
+        F::Fresh | F::WarmedUp => Color::srgb(0.30, 0.62, 0.68),
+        F::Winded => Color::srgb(0.72, 0.68, 0.30),
+        F::Tired => Color::srgb(0.82, 0.55, 0.20),
+        F::VeryTired => Color::srgb(0.85, 0.38, 0.15),
+        F::Exhausted => Color::srgb(0.70, 0.20, 0.12),
     }
 }
 
@@ -583,6 +600,18 @@ fn spawn_card(strip: &mut ChildSpawnerCommands, g: usize, kind: u8, icon: Handle
                 CardMorale(g),
             ));
             card.spawn((
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: Val::Px(0.0),
+                    top: Val::Px(5.0),
+                    width: Val::Percent(100.0),
+                    height: Val::Px(3.0),
+                    ..default()
+                },
+                BackgroundColor(fatigue_color(0.0)),
+                CardFatigue(g),
+            ));
+            card.spawn((
                 Text::new(kind_letter(kind)),
                 TextFont {
                     font_size: FontSize::Px(12.0),
@@ -771,7 +800,7 @@ fn card_hover(cards: Query<(&Interaction, &UnitCard)>, mut hover: ResMut<Hover>)
 
 // ── Card refresh ──
 
-#[allow(clippy::type_complexity)] // disjoint BackgroundColor/Node access
+#[allow(clippy::type_complexity, clippy::too_many_arguments)] // bevy system params
 fn refresh_cards(
     groups: Res<Groups>,
     selection: Res<Selection>,
@@ -792,9 +821,16 @@ fn refresh_cards(
     >,
     mut strips: Query<
         (&CardMorale, &mut BackgroundColor),
-        (Without<UnitCard>, Without<CardFill>),
+        (Without<UnitCard>, Without<CardFill>, Without<CardFatigue>),
     >,
-    mut arts: Query<(&CardArt, &mut Node), (Without<UnitCard>, Without<CardFill>)>,
+    mut stamina: Query<
+        (&CardFatigue, &mut Node, &mut BackgroundColor),
+        (Without<UnitCard>, Without<CardFill>, Without<CardMorale>, Without<CardArt>),
+    >,
+    mut arts: Query<
+        (&CardArt, &mut Node),
+        (Without<UnitCard>, Without<CardFill>, Without<CardFatigue>),
+    >,
 ) {
     wide.clear();
     wide.resize(groups.list.len(), false);
@@ -842,6 +878,22 @@ fn refresh_cards(
         } else {
             morale_color(gd)
         }));
+    }
+
+    for (fat, mut node, mut bg) in &mut stamina {
+        let gd = &groups.list[fat.0];
+        if gd.count == 0 {
+            bg.set_if_neq(BackgroundColor(Color::NONE));
+            continue;
+        }
+        // Whole-percent steps keep relayout off the per-frame path
+        // (fatigue moves ~0.5/s at most).
+        let pct = (100.0 - gd.fatigue).clamp(0.0, 100.0).round();
+        let want = Val::Percent(pct);
+        if node.width != want {
+            node.width = want;
+        }
+        bg.set_if_neq(BackgroundColor(fatigue_color(gd.fatigue)));
     }
 
     // Display (not Visibility) so the hidden one leaves the flex layout;
