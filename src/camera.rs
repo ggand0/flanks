@@ -26,8 +26,20 @@ pub struct RtsCameraPlugin;
 
 impl Plugin for RtsCameraPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, spawn_camera)
-            .add_systems(Update, (control_camera, apply_camera_transform).chain());
+        // Input only in battle (still active while paused, M2TW style)
+        // and never under the settings modal; the transform apply keeps
+        // running so the menu/results backdrop stays valid.
+        app.add_systems(Startup, spawn_camera).add_systems(
+            Update,
+            (
+                control_camera.run_if(
+                    in_state(crate::game_state::GameState::Battle)
+                        .and_then(crate::settings::settings_closed),
+                ),
+                apply_camera_transform,
+            )
+                .chain(),
+        );
     }
 }
 
@@ -60,6 +72,7 @@ fn control_camera(
     scroll: Res<AccumulatedMouseScroll>,
     window: Query<&Window, With<PrimaryWindow>>,
     time: Res<Time<Real>>,
+    settings: Res<crate::settings::Settings>,
     mut query: Query<&mut RtsCamera>,
 ) {
     let Ok(mut cam) = query.single_mut() else {
@@ -82,7 +95,8 @@ fn control_camera(
     }
     // Screen-edge pan — only when no key pan is active (opposing inputs
     // must not cancel) and the cursor is inside the window.
-    if pan == Vec2::ZERO
+    if settings.camera.edge_pan
+        && pan == Vec2::ZERO
         && let Ok(win) = window.single()
         && let Some(c) = win.cursor_position()
     {
@@ -100,7 +114,7 @@ fn control_camera(
     }
     if pan != Vec2::ZERO {
         let pan = pan.clamp_length_max(1.0);
-        let speed = cam.distance * 0.9 * time.delta_secs();
+        let speed = cam.distance * 0.9 * settings.camera.pan_speed * time.delta_secs();
         let (sin_yaw, cos_yaw) = cam.yaw.sin_cos();
         let forward = Vec3::new(-sin_yaw, 0.0, -cos_yaw);
         let right = Vec3::new(cos_yaw, 0.0, -sin_yaw);

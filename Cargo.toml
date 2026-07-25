@@ -7,6 +7,9 @@ edition = "2024"
 # mp3: the generated battle audio is mp3 (bevy default is vorbis-only).
 bevy = { version = "0.19", features = ["mp3"] }
 bytemuck = { version = "1", features = ["derive"] }
+dirs = "6.0.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_yaml_ng = "0.10.0"
 
 [features]
 # Profiling: `cargo run --profile opt-dev --features tracy`, then attach

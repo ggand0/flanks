@@ -11,14 +11,27 @@ use bevy::prelude::*;
 
 use crate::camera::RtsCamera;
 use crate::combat::CombatStats;
+use crate::game_state::GameState;
 use crate::movement::SimStats;
 use crate::orders::{Groups, Order, RegState, Selection};
 use crate::units::hash01;
 
-/// Master volume (FL_VOLUME overrides, linear).
-fn master() -> f32 {
+/// Env master override (FL_VOLUME, linear). Multiplies the settings
+/// volumes so scripted test runs stay muted regardless of the saved
+/// settings file.
+pub fn env_master() -> f32 {
     static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
     *V.get_or_init(|| crate::util::env_or("FL_VOLUME", 1.0))
+}
+
+/// Effective battle-sound volume (beds, combat, vox, horns, stings).
+fn battle_vol(s: &crate::settings::Settings) -> f32 {
+    s.audio.master * s.audio.battle * env_master()
+}
+
+/// Effective UI-sound volume (selection/order clicks).
+fn ui_vol(s: &crate::settings::Settings) -> f32 {
+    s.audio.master * s.audio.ui * env_master()
 }
 
 /// Bed smoothing time constant (seconds to ~2/3 of the way to target).
@@ -28,10 +41,21 @@ pub struct BattleAudioPlugin;
 
 impl Plugin for BattleAudioPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, setup_audio).add_systems(
-            Update,
-            (update_beds, combat_one_shots, event_cues).chain(),
-        );
+        // Battle-only: outside the battle the sim stats these systems
+        // read are stale, and quitting to the menu must not leave the
+        // beds ringing (or stale stats spawning clangs) behind it.
+        app.add_systems(Startup, setup_audio)
+            .add_systems(
+                Update,
+                (update_beds, combat_one_shots, event_cues)
+                    .chain()
+                    .run_if(in_state(GameState::Battle)),
+            )
+            // Beds cut on leaving battle; one-shots survive into the
+            // results screen (the victory/defeat sting must finish)
+            // and are only culled when the menu comes up.
+            .add_systems(OnExit(GameState::Battle), silence_beds)
+            .add_systems(OnEnter(GameState::Menu), stop_one_shots);
     }
 }
 
@@ -135,6 +159,22 @@ fn setup_audio(mut commands: Commands, assets: Res<AssetServer>) {
     commands.spawn((bed("sfx_new/bed_march_freesound_loop_14.5s"), Bed::March));
 }
 
+fn silence_beds(mut sinks: Query<&mut AudioSink, With<Bed>>) {
+    for mut sink in &mut sinks {
+        sink.set_volume(Volume::Linear(0.0));
+    }
+}
+
+/// Despawn every in-flight one-shot (war cries, horns, sting tails).
+fn stop_one_shots(
+    mut commands: Commands,
+    playing: Query<Entity, (With<AudioPlayer>, Without<Bed>)>,
+) {
+    for e in &playing {
+        commands.entity(e).despawn();
+    }
+}
+
 /// Crossfade the beds from battle state around the camera focus.
 fn update_beds(
     groups: Res<Groups>,
@@ -142,6 +182,7 @@ fn update_beds(
     camera: Query<&RtsCamera>,
     time: Res<Time<Real>>,
     virt_time: Res<Time<Virtual>>,
+    settings: Res<crate::settings::Settings>,
     mut sinks: Query<(&Bed, &mut AudioSink)>,
 ) {
     let Ok(cam) = camera.single() else { return };
@@ -181,7 +222,7 @@ fn update_beds(
     // the close-melee layer fades toward the mid/far beds with distance.
     let zoom_att = zoom_attenuation(cam.distance);
 
-    let m = master();
+    let m = battle_vol(&settings);
     let target = |bed: &Bed| -> f32 {
         if paused {
             return 0.0;
@@ -225,12 +266,13 @@ fn zoom_attenuation(cam_distance: f32) -> f32 {
     (90.0 / cam_distance.max(90.0)).clamp(0.12, 1.0)
 }
 
-/// Spawn a fire-and-forget one-shot with volume/pitch jitter.
+/// Spawn a fire-and-forget one-shot with volume/pitch jitter. `vol` is
+/// the final linear volume; callers scale by `battle_vol`/`ui_vol`.
 fn one_shot(commands: &mut Commands, h: Handle<AudioSource>, vol: f32, speed: f32) {
     commands.spawn((
         AudioPlayer::new(h),
         PlaybackSettings {
-            volume: Volume::Linear(vol * master()),
+            volume: Volume::Linear(vol),
             speed,
             ..PlaybackSettings::DESPAWN
         },
@@ -255,6 +297,7 @@ fn combat_one_shots(
     groups: Res<Groups>,
     camera: Query<&RtsCamera>,
     time: Res<Time>,
+    settings: Res<crate::settings::Settings>,
     mut clang_acc: Local<f32>,
     mut prev_kills: Local<u64>,
     mut death_cooldown: Local<f32>,
@@ -263,6 +306,7 @@ fn combat_one_shots(
     *frame = frame.wrapping_add(1);
     let Some(bank) = bank else { return };
     let Ok(cam) = camera.single() else { return };
+    let bv = battle_vol(&settings);
     let focus = Vec2::new(cam.focus.x, cam.focus.z);
     let min_dist = groups
         .list
@@ -300,7 +344,7 @@ fn combat_one_shots(
             one_shot(
                 &mut commands,
                 h,
-                (0.16 + 0.10 * hash01(seed ^ 0x11)) * zoom_att,
+                (0.16 + 0.10 * hash01(seed ^ 0x11)) * zoom_att * bv,
                 0.92 + 0.16 * hash01(seed ^ 0x22),
             );
         }
@@ -316,7 +360,7 @@ fn combat_one_shots(
             one_shot(
                 &mut commands,
                 h,
-                (0.18 + 0.12 * hash01(seed ^ 0x33)) * prox * zoom_att,
+                (0.18 + 0.12 * hash01(seed ^ 0x33)) * prox * zoom_att * bv,
                 0.9 + 0.2 * hash01(seed ^ 0x44),
             );
         }
@@ -355,9 +399,12 @@ fn event_cues(
     outcome: Res<crate::ai::BattleOutcome>,
     camera: Query<&RtsCamera>,
     time: Res<Time>,
+    settings: Res<crate::settings::Settings>,
     mut st: Local<CueState>,
 ) {
     let Some(bank) = bank else { return };
+    let bv = battle_vol(&settings);
+    let uv = ui_vol(&settings);
     st.frame = st.frame.wrapping_add(1);
     st.horn_gate -= time.delta_secs();
     st.vox_gate -= time.delta_secs();
@@ -368,7 +415,7 @@ fn event_cues(
 
     // Selection click on a changed non-empty selection.
     if selection.count_units > 0 && selection.count_units != st.prev_sel {
-        one_shot(&mut commands, bank.ui_select.clone(), 0.5, 1.0);
+        one_shot(&mut commands, bank.ui_select.clone(), 0.5 * uv, 1.0);
     }
     st.prev_sel = selection.count_units;
 
@@ -463,7 +510,7 @@ fn event_cues(
         let prox = (1.0 - cry_dist / hear).clamp(0.0, 1.0);
         if prox > 0.05 {
             if let Some(h) = pick(&bank.vox_warcry, seed ^ 0xAB) {
-                let vol = 0.55 * (0.25 + 0.75 * prox);
+                let vol = 0.55 * (0.25 + 0.75 * prox) * bv;
                 one_shot(&mut commands, h, vol, 0.94 + 0.12 * hash01(seed ^ 0xAC));
                 info!("war cry (edge, vol {vol:.2}, prox {prox:.2})");
             }
@@ -475,14 +522,14 @@ fn event_cues(
     // Order-click feedback: immediate and ungated, like the selection
     // click — this is UI, not battlefield sound.
     if new_own_attack {
-        one_shot(&mut commands, bank.ui_attack.clone(), 0.45, 1.0);
+        one_shot(&mut commands, bank.ui_attack.clone(), 0.45 * uv, 1.0);
     }
     if new_own_move {
-        one_shot(&mut commands, bank.ui_order.clone(), 0.35, 1.0);
+        one_shot(&mut commands, bank.ui_order.clone(), 0.35 * uv, 1.0);
     }
     if (new_own_attack || new_own_move) && st.horn_gate <= 0.0 {
         if let Some(h) = pick(&bank.horn_charge, seed) {
-            one_shot(&mut commands, h, 0.55, 1.0);
+            one_shot(&mut commands, h, 0.55 * bv, 1.0);
         }
         st.horn_gate = 3.0;
     }
@@ -490,21 +537,21 @@ fn event_cues(
         // One vox per gate window, most dramatic first.
         if new_break_any {
             if let Some(h) = pick(&bank.vox_rout, seed ^ 0x66) {
-                one_shot(&mut commands, h, 0.55, 1.0);
+                one_shot(&mut commands, h, 0.55 * bv, 1.0);
             }
             if new_break_own {
-                one_shot(&mut commands, bank.horn_rout.clone(), 0.5, 1.0);
+                one_shot(&mut commands, bank.horn_rout.clone(), 0.5 * bv, 1.0);
             }
             // Victors roar over the enemy's panic (TW moment).
             if new_break_enemy
                 && let Some(h) = pick(&bank.vox_cheer, seed ^ 0xBB)
             {
-                one_shot(&mut commands, h, 0.5, 1.0);
+                one_shot(&mut commands, h, 0.5 * bv, 1.0);
             }
             st.vox_gate = 1.5;
         } else if new_rally {
             if let Some(h) = pick(&bank.vox_rally, seed ^ 0x77) {
-                one_shot(&mut commands, h, 0.5, 1.0);
+                one_shot(&mut commands, h, 0.5 * bv, 1.0);
             }
             st.vox_gate = 1.5;
         } else {
@@ -515,7 +562,7 @@ fn event_cues(
             let prox = (1.0 - charge_dist / hear).clamp(0.0, 1.0);
             if prox > 0.05 && st.roar_budget > 0 {
                 if let Some(h) = pick(&bank.vox_warcry, seed ^ 0x88) {
-                    let vol = 0.55 * (0.25 + 0.75 * prox);
+                    let vol = 0.55 * (0.25 + 0.75 * prox) * bv;
                     one_shot(&mut commands, h, vol, 0.94 + 0.12 * hash01(seed ^ 0x99));
                     st.roar_budget -= 1;
                     info!(
@@ -534,7 +581,7 @@ fn event_cues(
             Some(0) => bank.sting_victory.clone(),
             _ => bank.sting_defeat.clone(),
         };
-        one_shot(&mut commands, h, 0.8, 1.0);
+        one_shot(&mut commands, h, 0.8 * bv, 1.0);
         st.prev_outcome = true;
     }
 }

@@ -126,6 +126,7 @@ struct MenuRoot;
 #[derive(Component)]
 enum MenuButton {
     StartBattle,
+    Quit,
 }
 
 #[derive(Component)]
@@ -181,10 +182,20 @@ impl Plugin for GameShellPlugin {
             .add_systems(
                 Update,
                 (
+                    // Menu/pause input yields to the settings modal:
+                    // its backdrop blocks picking, and the gate keeps
+                    // the keyboard shortcuts (Enter/Space/ESC) from
+                    // acting behind it.
                     (menu_buttons, menu_option_buttons, debug_scenario_buttons)
-                        .run_if(in_state(GameState::Menu)),
-                    (toggle_pause, pause_buttons, transition_to_results)
-                        .run_if(in_state(GameState::Battle)),
+                        .run_if(
+                            in_state(GameState::Menu)
+                                .and_then(crate::settings::settings_closed),
+                        ),
+                    (toggle_pause, pause_buttons).run_if(
+                        in_state(GameState::Battle)
+                            .and_then(crate::settings::settings_closed),
+                    ),
+                    transition_to_results.run_if(in_state(GameState::Battle)),
                     results_buttons.run_if(in_state(GameState::Results)),
                     button_hover_style,
                 ),
@@ -193,7 +204,7 @@ impl Plugin for GameShellPlugin {
 }
 
 pub const TEXT_COLOR: Color = Color::srgb(0.92, 0.92, 0.85);
-const DIM_TEXT_COLOR: Color = Color::srgb(0.55, 0.55, 0.50);
+pub const DIM_TEXT_COLOR: Color = Color::srgb(0.55, 0.55, 0.50);
 const PANEL_BG: Color = Color::srgba(0.05, 0.06, 0.08, 0.92);
 pub const BTN_NORMAL: Color = Color::srgba(0.15, 0.16, 0.20, 0.92);
 pub const BTN_HOVER: Color = Color::srgba(0.25, 0.27, 0.32, 0.95);
@@ -219,6 +230,21 @@ fn button_node() -> Node {
         align_items: AlignItems::Center,
         ..default()
     }
+}
+
+/// The standard big menu button (menu, pause, results screens).
+fn spawn_text_button(p: &mut ChildSpawnerCommands, label: &str, marker: impl Bundle) {
+    p.spawn((Button, button_node(), BackgroundColor(BTN_NORMAL), marker))
+        .with_children(|b| {
+            b.spawn((
+                Text::new(label),
+                TextFont {
+                    font_size: FontSize::Px(20.0),
+                    ..default()
+                },
+                TextColor(TEXT_COLOR),
+            ));
+        });
 }
 
 // ── Menu ──
@@ -295,22 +321,9 @@ fn spawn_menu(mut commands: Commands, config: Res<BattleConfig>) {
                 );
             });
 
-            p.spawn((
-                Button,
-                button_node(),
-                BackgroundColor(BTN_NORMAL),
-                MenuButton::StartBattle,
-            ))
-            .with_children(|b| {
-                b.spawn((
-                    Text::new("Start Battle"),
-                    TextFont {
-                        font_size: FontSize::Px(20.0),
-                        ..default()
-                    },
-                    TextColor(TEXT_COLOR),
-                ));
-            });
+            spawn_text_button(p, "Start Battle", MenuButton::StartBattle);
+            spawn_text_button(p, "Settings", crate::settings::OpenSettingsButton);
+            spawn_text_button(p, "Quit", MenuButton::Quit);
             // Debug scenarios
             p.spawn((
                 Text::new("Debug Scenarios"),
@@ -423,6 +436,7 @@ fn menu_buttons(
     keys: Res<ButtonInput<KeyCode>>,
     mut config: ResMut<BattleConfig>,
     mut next: ResMut<NextState<GameState>>,
+    mut exit: MessageWriter<AppExit>,
     mut auto: Local<bool>,
 ) {
     if !*auto && scripts_active() {
@@ -441,6 +455,9 @@ fn menu_buttons(
                 MenuButton::StartBattle => {
                     config.scenario = Scenario::Normal;
                     next.set(GameState::Battle);
+                }
+                MenuButton::Quit => {
+                    exit.write(AppExit::Success);
                 }
             }
         }
@@ -608,38 +625,9 @@ fn spawn_pause_overlay(commands: &mut Commands) {
                     ..default()
                 },
             ));
-            p.spawn((
-                Button,
-                button_node(),
-                BackgroundColor(BTN_NORMAL),
-                PauseButton::Resume,
-            ))
-            .with_children(|b| {
-                b.spawn((
-                    Text::new("Resume"),
-                    TextFont {
-                        font_size: FontSize::Px(20.0),
-                        ..default()
-                    },
-                    TextColor(TEXT_COLOR),
-                ));
-            });
-            p.spawn((
-                Button,
-                button_node(),
-                BackgroundColor(BTN_NORMAL),
-                PauseButton::QuitToMenu,
-            ))
-            .with_children(|b| {
-                b.spawn((
-                    Text::new("Quit to Menu"),
-                    TextFont {
-                        font_size: FontSize::Px(20.0),
-                        ..default()
-                    },
-                    TextColor(TEXT_COLOR),
-                ));
-            });
+            spawn_text_button(p, "Resume", PauseButton::Resume);
+            spawn_text_button(p, "Settings", crate::settings::OpenSettingsButton);
+            spawn_text_button(p, "Quit to Menu", PauseButton::QuitToMenu);
         });
 }
 
@@ -721,38 +709,8 @@ fn spawn_results(
                     ..default()
                 },
             ));
-            p.spawn((
-                Button,
-                button_node(),
-                BackgroundColor(BTN_NORMAL),
-                ResultsButton::PlayAgain,
-            ))
-            .with_children(|b| {
-                b.spawn((
-                    Text::new("Play Again"),
-                    TextFont {
-                        font_size: FontSize::Px(20.0),
-                        ..default()
-                    },
-                    TextColor(TEXT_COLOR),
-                ));
-            });
-            p.spawn((
-                Button,
-                button_node(),
-                BackgroundColor(BTN_NORMAL),
-                ResultsButton::MainMenu,
-            ))
-            .with_children(|b| {
-                b.spawn((
-                    Text::new("Main Menu"),
-                    TextFont {
-                        font_size: FontSize::Px(20.0),
-                        ..default()
-                    },
-                    TextColor(TEXT_COLOR),
-                ));
-            });
+            spawn_text_button(p, "Play Again", ResultsButton::PlayAgain);
+            spawn_text_button(p, "Main Menu", ResultsButton::MainMenu);
         });
 }
 
