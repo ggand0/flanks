@@ -54,15 +54,11 @@ const GAMBESON: [f32; 4] = [0.62, 0.52, 0.36, 0.15];
 const LEATHER: [f32; 4] = [0.30, 0.20, 0.12, 0.0];
 /// Arrow fletching: pale goose feather.
 const FLETCH: [f32; 4] = [0.88, 0.86, 0.78, 0.0];
-/// Ranger cloak and hood: team color pulled toward black — reads as the
-/// army's color in a darker, weathered cloth than the tabard.
-const CLOAK: [f32; 4] = [0.05, 0.06, 0.08, 0.80];
-/// The dark under the hood: the cowl swallows the upper face.
-const COWL_SHADOW: [f32; 4] = [0.07, 0.055, 0.05, 0.0];
-/// Bow stave: dark oiled yew, distinct from the pale arrow shafts.
-const BOW_WOOD: [f32; 4] = [0.33, 0.21, 0.11, 0.0];
-/// Bowstring: pale linen (light against the dark stave and cloak).
-const STRING: [f32; 4] = [0.80, 0.76, 0.66, 0.0];
+/// Bow stave: rich warm yew — the stave must read, the string must not
+/// (a bright string over a dark stave is what made the bow "a stick").
+const BOW_WOOD: [f32; 4] = [0.46, 0.29, 0.13, 0.0];
+/// Bowstring: muted flax, quieter than the stave.
+const STRING: [f32; 4] = [0.58, 0.54, 0.46, 0.0];
 
 struct MeshBuf {
     pos: Vec<[f32; 3]>,
@@ -507,170 +503,173 @@ pub fn build_spearman() -> Mesh {
     build(m)
 }
 
-/// Archer: a ranger. Deep pointed hood swept back over the head (team
-/// cloth pulled toward black, cowl shadow swallowing the upper face),
-/// short shoulder-mantled cloak over a gambeson and team tabard, back
-/// quiver with fletched shafts, and a tall strung longbow — grip, two
-/// recurved limbs and nocks stepping forward, pale linen string tip to
-/// tip. No steel anywhere: the hooded silhouette IS the archer read.
-/// 32 cuboids, 384 tris. Height ~1.05 m to the hood point
-/// (half_height 0.50).
+/// Archer: a professional bowman. The design rule learned the hard way
+/// here: NEVER stack shrinking boxes (that is the layer-cake / lego
+/// read) — layer wide-thin-narrow slabs with overhangs and one or two
+/// asymmetric functional details, like the knight's flared crown and
+/// nose guard. Head: open face in a steel SALLET — one dome, a swept
+/// neck-guard tail, a dark brow bar over the eyes, a narrow
+/// front-to-back crest ridge — over a wide mail AVENTAIL draped to the
+/// shoulders. Body: team tabard cinched by a leather belt, quiver
+/// strap across the chest, quilted shoulder rolls, gambeson skirt,
+/// boots. Back quiver with fletched shafts; tall strung longbow.
+/// 32 cuboids, 384 tris. Height ~1.0 m (half_height 0.50).
 pub fn build_archer() -> Mesh {
     let mut m = MeshBuf::new();
     let hip_pivot = -0.16;
     let shoulder = 0.14;
-    // cloth legs
+    // cloth legs in leather boots (boot rides the same leg part)
     m.cuboid(
-        Vec3::new(-0.09, -0.345, 0.0),
-        Vec3::new(0.068, 0.155, 0.082),
+        Vec3::new(-0.09, -0.32, 0.0),
+        Vec3::new(0.068, 0.13, 0.082),
         PART_LEG_L,
         hip_pivot,
         PANTS,
     );
     m.cuboid(
-        Vec3::new(0.09, -0.345, 0.0),
-        Vec3::new(0.068, 0.155, 0.082),
+        Vec3::new(0.09, -0.32, 0.0),
+        Vec3::new(0.068, 0.13, 0.082),
         PART_LEG_R,
         hip_pivot,
         PANTS,
     );
-    // gambeson hem -> team tabard chest
+    m.cuboid(
+        Vec3::new(-0.09, -0.44, 0.008),
+        Vec3::new(0.074, 0.062, 0.092),
+        PART_LEG_L,
+        hip_pivot,
+        LEATHER,
+    );
+    m.cuboid(
+        Vec3::new(0.09, -0.44, 0.008),
+        Vec3::new(0.074, 0.062, 0.092),
+        PART_LEG_R,
+        hip_pivot,
+        LEATHER,
+    );
+    // gambeson skirt -> belt -> team tabard chest -> quiver strap
     m.cuboid(
         Vec3::new(0.0, -0.08, 0.0),
-        Vec3::new(0.14, 0.10, 0.095),
+        Vec3::new(0.145, 0.10, 0.098),
         PART_BODY,
         0.0,
         GAMBESON,
     );
     m.cuboid(
-        Vec3::new(0.0, 0.09, 0.0),
-        Vec3::new(0.165, 0.10, 0.105),
+        Vec3::new(0.0, -0.005, 0.0),
+        Vec3::new(0.152, 0.024, 0.103),
+        PART_BODY,
+        0.0,
+        LEATHER,
+    );
+    m.cuboid(
+        Vec3::new(0.0, 0.095, 0.0),
+        Vec3::new(0.17, 0.095, 0.107),
         PART_BODY,
         0.0,
         TEAM,
     );
-    // the cloak: a back panel falling from the shoulders to the thighs
-    // and a mantle draped over the shoulders
     m.cuboid(
-        Vec3::new(0.0, -0.02, -0.128),
-        Vec3::new(0.185, 0.27, 0.020),
+        Vec3::new(0.0, 0.14, 0.106),
+        Vec3::new(0.145, 0.02, 0.008),
         PART_BODY,
         0.0,
-        CLOAK,
+        LEATHER,
     );
+    // team shoulder rolls cap the arm joints (color identity from
+    // behind, where the tabard band is thinnest)
     m.cuboid(
-        Vec3::new(0.0, 0.203, -0.02),
-        Vec3::new(0.205, 0.042, 0.125),
+        Vec3::new(-0.205, 0.19, 0.0),
+        Vec3::new(0.058, 0.034, 0.088),
         PART_BODY,
         0.0,
-        CLOAK,
+        TEAM,
     );
-    // the face: chin and mouth in the light, the upper half lost in the
-    // cowl's shadow under a jutting brim
     m.cuboid(
-        Vec3::new(0.0, 0.295, 0.005),
-        Vec3::new(0.088, 0.088, 0.088),
+        Vec3::new(0.205, 0.19, 0.0),
+        Vec3::new(0.058, 0.034, 0.088),
+        PART_BODY,
+        0.0,
+        TEAM,
+    );
+    // mail aventail: a wide drape from helm rim to shoulders
+    m.cuboid(
+        Vec3::new(0.0, 0.222, -0.005),
+        Vec3::new(0.132, 0.036, 0.122),
+        PART_BODY,
+        0.0,
+        CHAIN,
+    );
+    // open face
+    m.cuboid(
+        Vec3::new(0.0, 0.30, 0.005),
+        Vec3::new(0.09, 0.09, 0.09),
         PART_BODY,
         0.0,
         SKIN,
     );
+    // sallet: one DARK dome overhanging the face (pale steel washed out
+    // to a white blob in the field light), swept neck-guard tail,
+    // bright brow bar catching the light, narrow crest ridge
     m.cuboid(
-        Vec3::new(0.0, 0.345, 0.068),
-        Vec3::new(0.086, 0.042, 0.028),
+        Vec3::new(0.0, 0.398, 0.0),
+        Vec3::new(0.112, 0.046, 0.112),
         PART_BODY,
         0.0,
-        COWL_SHADOW,
+        DARK_STEEL,
     );
     m.cuboid(
-        Vec3::new(0.0, 0.383, 0.085),
-        Vec3::new(0.102, 0.02, 0.05),
+        Vec3::new(0.0, 0.372, -0.126),
+        Vec3::new(0.082, 0.020, 0.042),
         PART_BODY,
         0.0,
-        CLOAK,
+        DARK_STEEL,
     );
-    // hood shell: cheek panels and back
     m.cuboid(
-        Vec3::new(-0.104, 0.305, -0.02),
-        Vec3::new(0.017, 0.10, 0.10),
+        Vec3::new(0.0, 0.372, 0.104),
+        Vec3::new(0.098, 0.016, 0.012),
         PART_BODY,
         0.0,
-        CLOAK,
+        STEEL,
     );
     m.cuboid(
-        Vec3::new(0.104, 0.305, -0.02),
-        Vec3::new(0.017, 0.10, 0.10),
+        Vec3::new(0.0, 0.452, -0.005),
+        Vec3::new(0.016, 0.016, 0.09),
         PART_BODY,
         0.0,
-        CLOAK,
+        STEEL,
     );
+    // back quiver over the right shoulder + fletched shafts
     m.cuboid(
-        Vec3::new(0.0, 0.305, -0.115),
-        Vec3::new(0.104, 0.10, 0.018),
-        PART_BODY,
-        0.0,
-        CLOAK,
-    );
-    // the point: crown tiers stepping up and SWEEPING BACK, ending in a
-    // drooped tip — the ranger silhouette
-    m.cuboid(
-        Vec3::new(0.0, 0.418, -0.02),
-        Vec3::new(0.104, 0.036, 0.112),
-        PART_BODY,
-        0.0,
-        CLOAK,
-    );
-    m.cuboid(
-        Vec3::new(0.0, 0.468, -0.065),
-        Vec3::new(0.073, 0.030, 0.080),
-        PART_BODY,
-        0.0,
-        CLOAK,
-    );
-    m.cuboid(
-        Vec3::new(0.0, 0.503, -0.118),
-        Vec3::new(0.047, 0.026, 0.055),
-        PART_BODY,
-        0.0,
-        CLOAK,
-    );
-    m.cuboid(
-        Vec3::new(0.0, 0.522, -0.172),
-        Vec3::new(0.026, 0.020, 0.036),
-        PART_BODY,
-        0.0,
-        CLOAK,
-    );
-    // back quiver over the right shoulder, clear of the cloak panel
-    m.cuboid(
-        Vec3::new(0.148, 0.05, -0.175),
+        Vec3::new(0.135, 0.05, -0.15),
         Vec3::new(0.052, 0.17, 0.045),
         PART_BODY,
         0.0,
         LEATHER,
     );
     m.cuboid(
-        Vec3::new(0.13, 0.27, -0.18),
+        Vec3::new(0.117, 0.27, -0.155),
         Vec3::new(0.013, 0.06, 0.013),
         PART_BODY,
         0.0,
         WOOD,
     );
     m.cuboid(
-        Vec3::new(0.168, 0.25, -0.165),
+        Vec3::new(0.155, 0.25, -0.14),
         Vec3::new(0.013, 0.06, 0.013),
         PART_BODY,
         0.0,
         WOOD,
     );
     m.cuboid(
-        Vec3::new(0.13, 0.35, -0.18),
+        Vec3::new(0.117, 0.35, -0.155),
         Vec3::new(0.028, 0.04, 0.028),
         PART_BODY,
         0.0,
         FLETCH,
     );
     m.cuboid(
-        Vec3::new(0.168, 0.32, -0.165),
+        Vec3::new(0.155, 0.32, -0.14),
         Vec3::new(0.024, 0.035, 0.024),
         PART_BODY,
         0.0,
@@ -699,46 +698,46 @@ pub fn build_archer() -> Mesh {
         SKIN,
     );
     // the longbow, strung and carried vertical: thick grip, mid limbs,
-    // recurved nocks — each tier stepping FORWARD to draw the curve —
-    // and the pale string closing tip to tip behind it
+    // recurved nocks — each tier stepping WELL forward so the curve
+    // reads at rank distance — and the muted string tip to tip
     m.cuboid(
-        Vec3::new(-0.24, 0.12, 0.16),
-        Vec3::new(0.028, 0.105, 0.030),
+        Vec3::new(-0.24, 0.12, 0.15),
+        Vec3::new(0.032, 0.105, 0.032),
         PART_BOW_ARM,
         shoulder,
         BOW_WOOD,
     );
     m.cuboid(
-        Vec3::new(-0.24, 0.345, 0.181),
-        Vec3::new(0.023, 0.125, 0.024),
+        Vec3::new(-0.24, 0.345, 0.19),
+        Vec3::new(0.027, 0.125, 0.026),
         PART_BOW_ARM,
         shoulder,
         BOW_WOOD,
     );
     m.cuboid(
-        Vec3::new(-0.24, -0.105, 0.181),
-        Vec3::new(0.023, 0.125, 0.024),
+        Vec3::new(-0.24, -0.105, 0.19),
+        Vec3::new(0.027, 0.125, 0.026),
         PART_BOW_ARM,
         shoulder,
         BOW_WOOD,
     );
     m.cuboid(
-        Vec3::new(-0.24, 0.555, 0.211),
-        Vec3::new(0.019, 0.095, 0.019),
+        Vec3::new(-0.24, 0.555, 0.235),
+        Vec3::new(0.021, 0.095, 0.021),
         PART_BOW_ARM,
         shoulder,
         BOW_WOOD,
     );
     m.cuboid(
-        Vec3::new(-0.24, -0.315, 0.211),
-        Vec3::new(0.019, 0.095, 0.019),
+        Vec3::new(-0.24, -0.315, 0.235),
+        Vec3::new(0.021, 0.095, 0.021),
         PART_BOW_ARM,
         shoulder,
         BOW_WOOD,
     );
     m.cuboid(
-        Vec3::new(-0.24, 0.12, 0.242),
-        Vec3::new(0.007, 0.53, 0.007),
+        Vec3::new(-0.24, 0.12, 0.263),
+        Vec3::new(0.005, 0.53, 0.005),
         PART_BOW_ARM,
         shoulder,
         STRING,

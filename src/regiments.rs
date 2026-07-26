@@ -259,17 +259,31 @@ fn archery_log(
         return;
     }
     *next = t + 4.0;
-    let orange: usize = groups.list.iter().filter(|g| g.team == 1).map(|g| g.count).sum();
+    let flag = |gd: &crate::orders::GroupData| {
+        format!(
+            "{}{}{}{}",
+            if gd.engaged { "E" } else { "-" },
+            if gd.state.is_broken() { "B" } else { "-" },
+            if gd.skirmishing { "S" } else { "-" },
+            if gd.order.is_some() { "O" } else { "-" },
+        )
+    };
     info!(
-        "[archery] t={t:.0}s archers {} (ammo {}) / {} (ammo {}) | arrows in flight {} \
-         (dropped {}) | orange alive {orange}, attacker {} at {:.0} m",
+        "[archery] t={t:.0}s archers {} ({}, ammo {}) / {} ({}, ammo {}) | flight {} | \
+         screen {} | holders {}/{}/{} | attacker {} ({}) at {:.0} m",
         groups.list[1].count,
+        flag(&groups.list[1]),
         groups.list[1].ammo_left,
         groups.list[2].count,
+        flag(&groups.list[2]),
         groups.list[2].ammo_left,
         arrows.len(),
-        astats.dropped,
+        groups.list[0].count,
+        groups.list[3].count,
+        groups.list[4].count,
+        groups.list[5].count,
         groups.list[6].count,
+        flag(&groups.list[6]),
         groups.list[6].centroid.distance(groups.list[1].centroid),
     );
 }

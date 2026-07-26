@@ -51,12 +51,14 @@ pub mod missile {
     /// Landing scatter sigma in meters, RANGE-INDEPENDENT (the measured
     /// M2TW quirk: accuracy does not improve up close).
     pub const SCATTER_SIGMA: f32 = 3.0;
-    /// Damage of a landed arrow at combat factor 0. No direct M2TW
-    /// transplant exists (their kill rolls differ from our hp model);
-    /// anchored so a 4-volley exchange from an equal regiment costs a
-    /// light regiment on the order of 5% casualties (plan doc §9.3),
-    /// then tuned in playtest.
-    pub const BASE_DMG: f32 = 12.0;
+    /// Damage of a landed arrow at combat factor 0. Anchored to the
+    /// MEASURED M2TW kill rate (Withwnar's 4-volley tests, devlog 0060:
+    /// ~10% of loosed arrows kill vs unshielded levies): with our
+    /// ~20-25% body-hit rate into a packed block, roughly a third to a
+    /// half of HITS on a light must kill — arrows shred unarmored men,
+    /// chip plate. First value 12 played far too soft (a volley killed
+    /// nobody, owner playtest).
+    pub const BASE_DMG: f32 = 40.0;
 }
 
 /// Damage swing per combat factor point (M2TW uses ~1.2 on kill CHANCE;
@@ -120,7 +122,11 @@ pub struct UnitTypeParams {
 pub const TYPES: [UnitTypeParams; NUM_KINDS] = [
     // KIND_HEAVY — knights: slow, armored, hard-hitting, shove-heavy.
     UnitTypeParams {
-        hp: 240.0,
+        // The 1.5x "pacing placeholder" HP bump (c0ecffb, pre-morale-
+        // rework) is REVERTED across all kinds (owner call, archer
+        // round 2): 240/135/150 back to the M2TW stat model's original
+        // 160/90/100 anchors.
+        hp: 160.0,
         attack: 13.0,
         charge_bonus: 5.0,
         defence_skill: 6.0,
@@ -148,7 +154,7 @@ pub const TYPES: [UnitTypeParams; NUM_KINDS] = [
     },
     // KIND_LIGHT — men-at-arms: fast, fragile, quicker swings, spear reach.
     UnitTypeParams {
-        hp: 135.0,
+        hp: 90.0,
         attack: 9.0,
         charge_bonus: 3.0,
         defence_skill: 4.0,
@@ -173,7 +179,7 @@ pub const TYPES: [UnitTypeParams; NUM_KINDS] = [
     // penalty folded in (the anti-cavalry bonus waits for cavalry). The
     // spearwall (formation.rs) is where they earn their keep.
     UnitTypeParams {
-        hp: 150.0,
+        hp: 100.0,
         attack: 7.0,
         charge_bonus: 2.0,
         defence_skill: 3.0,
@@ -199,7 +205,7 @@ pub const TYPES: [UnitTypeParams; NUM_KINDS] = [
     // melee attack 2..7, armour 0..1, no shield, morale 3 untrained,
     // mass 0.8.
     UnitTypeParams {
-        hp: 120.0,
+        hp: 80.0,
         attack: 4.0,
         charge_bonus: 1.0,
         defence_skill: 2.0,
