@@ -107,7 +107,7 @@ pub fn cannot_charge(fatigue: f32) -> bool {
 // warmed up to winded. M2TW tires men SLOWLY; nothing came close to
 // exhausted in a quarter-hour battle.
 //
-// Calibrated to that anchor, then to the owner's feel passes (first
+// Calibrated to that anchor, then to the feel passes (first
 // round: far too fast; second round: "could deplete slightly faster").
 // Now: continuous melee reaches Tired at ~4 min and Exhausted at
 // ~7 min; standing recovers Very Tired -> Fresh in ~10 min. Ordering

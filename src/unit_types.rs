@@ -62,7 +62,8 @@ pub struct UnitTypeParams {
     pub mass: f32,
     /// Base morale level (M2TW `stat_mental` first field). The situational
     /// modifier sum in morale.rs rides on top of this; vanilla M2TW scale:
-    /// militia ~5-7, line ~9, elites 11-16 (devlog 0055 evidence).
+    /// measured vanilla range is 1..11 (peasants 1, militia 3, sergeants
+    /// and pikemen 5, knights 9-11) — see devlog 0057.
     pub base_morale: f32,
     /// Multiplier on morale SHOCK modifiers (flanked, rout contagion) —
     /// M2TW discipline: "determines the amount of morale lost when morale
@@ -81,7 +82,7 @@ pub struct UnitTypeParams {
 /// heavies ~ Dismounted Feudal Knights, lights ~ Armored Sergeants'
 /// sword-and-board cousins, spears ~ upper Spear Militia. Elite frontal
 /// fights run LONGER than the old flat model (grindy shield-on-shield,
-/// owner-approved); rear/flank hits skip skill+shield and kill 2-4x
+/// by design); rear/flank hits skip skill+shield and kill 2-4x
 /// faster — facing is the defensive resource now.
 pub const TYPES: [UnitTypeParams; NUM_KINDS] = [
     // KIND_HEAVY — knights: slow, armored, hard-hitting, shove-heavy.

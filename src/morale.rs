@@ -1,6 +1,6 @@
 //! Regiment morale: the most-tuned system in the game.
 //!
-//! Model (owner-directed rework, devlog 0055): morale is a LEVEL, not a
+//! Model (devlog 0055): morale is a LEVEL, not a
 //! draining tank — the M2TW engine keeps a per-unit `moraleLevel` plus a
 //! list of concurrent situational effects summed onto the unit's base
 //! stat, recomputed continuously (M2TWEOP disassembly). Every tick:
@@ -9,9 +9,8 @@
 //!             + rout contagion + fatigue + disorder + secure flanks
 //!             + no-enemy calm + wall stance
 //!
-//! Steady above 0; WAVERING in the 0..-6 band; at -6 or less the
-//! regiment breaks (MTW1 official-guide thresholds — CA's design
-//! template; M2TW's own numbers were never extracted). A routing
+//! Steady above the shaken band; WAVERING below -7; at -11 or less the
+//! regiment breaks (bands measured from the live engine, devlog 0057). A routing
 //! regiment keeps recomputing the same level as it flees: when the
 //! situation genuinely improves (clear of enemies, contagion gone) the
 //! level climbs back over -5 and it rallies — no dice roll. Factor
@@ -120,7 +119,7 @@ const EXCHANGE_WINNING: f32 = 6.0;
 const EXCHANGE_TAU: f32 = 3.0;
 const EXCHANGE_FULL_RATE: f32 = 0.015;
 /// Locally outnumbered >3:1 (blurred density ratio at the centroid):
-/// deliberately minor — a soldier can't count a battlefield (owner
+/// deliberately minor — a soldier can't count a battlefield (design
 /// direction); FLANKS break formations, not headcounts.
 const MORALE_OUTNUMBERED: f32 = -2.0;
 /// Fully surrounded penalty peak; MTW1: one flank -2, both/rear -6.
@@ -159,7 +158,7 @@ const NO_ENEMY_BONUS: f32 = 4.0;
 /// analog (phalanx +2).
 const WALL_BONUS: f32 = 2.0;
 /// Fighting in complete disarray, peak. NOT M2TW-evidenced: carried
-/// over from the previous owner-approved model (formations die when
+/// over from the previous model (formations die when
 /// they lose shape in contact), demoted to a modest level term.
 const MORALE_DISORDER: f32 = -3.0;
 const DISORDER_FREE: f32 = 2.0;

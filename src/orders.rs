@@ -151,7 +151,7 @@ pub struct GroupData {
     // --- morale (morale.rs updates per tick) ---
     /// Effective morale LEVEL (M2TW model): base stat + the signed sum of
     /// situational modifiers, recomputed every tick — NOT an accumulator.
-    /// Rout threshold is at -6 (morale.rs); typical range ~-20..+20.
+    /// Rout threshold is at -11 (morale.rs); typical range ~-20..+20.
     pub morale: f32,
     /// Ticks the effective level has sat at/below the rout line
     /// (hysteresis: one spiked tick must not break a regiment).
