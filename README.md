@@ -1,3 +1,5 @@
+<img src="assets/screenshot.jpg" alt="FLANKS battle screenshot" width="800"/>
+
 # FLANKS
 
 FLANKS is a real-time medieval battle game written in Rust and Bevy.
