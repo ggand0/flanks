@@ -63,7 +63,7 @@ fn spawn_regiment(
     for k in 0..size {
         let row = k / cols;
         let col = k % cols;
-        let seed = (team as u32) << 30 | g << 16 | k as u32;
+        let seed = crate::units::spawn_seed((team as u32) << 30 | g << 16 | k as u32);
         let jx = hash01(seed.wrapping_mul(3) + 1) - 0.5;
         let jz = hash01(seed.wrapping_mul(3) + 2) - 0.5;
         let x = anchor.x + (col as f32 - (cols - 1) as f32 / 2.0) * SPACING + jx * 0.5;
