@@ -1,7 +1,7 @@
 # FLANKS
 
 FLANKS is a real-time medieval battle game written in Rust and Bevy.
-Every soldier on the field is individually simulated, scaling to battles of 200,000 men. The combat model builds on mechanics measured from Medieval 2: Total War, with the goal of going beyond the classics rather than recreating them. It is an early prototype under active development.
+Every soldier on the field is individually simulated, and battles can scale up to a few hundred thousand soldiers (200k tested on an RTX 3090). The combat model builds on mechanics measured from Medieval 2: Total War, with the goal of going beyond the classics rather than recreating them. It is an early prototype under active development.
 
 ## Features
 
