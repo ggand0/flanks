@@ -275,7 +275,7 @@ fn spawn_menu(mut commands: Commands, config: Res<BattleConfig>) {
         ))
         .with_children(|p| {
             p.spawn((
-                Text::new("FRONTLINE"),
+                Text::new("FLANKS"),
                 TextFont {
                     font_size: FontSize::Px(56.0),
                     ..default()
