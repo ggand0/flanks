@@ -35,7 +35,11 @@ impl Plugin for AiPlugin {
             .add_systems(
                 Update,
                 (
-                    (ai_think, auto_engage).in_set(crate::game_state::BattleInputSet),
+                    // Stand down while the player deploys: no enemy
+                    // pre-orders, no auto-engagement across the line.
+                    (ai_think, auto_engage)
+                        .in_set(crate::game_state::BattleInputSet)
+                        .run_if(not(crate::game_state::deploying)),
                     check_victory,
                 ),
             );

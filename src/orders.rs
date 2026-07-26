@@ -269,6 +269,10 @@ impl Plugin for OrdersPlugin {
                         .chain()
                         .in_set(crate::game_state::BattleInputSet),
                     halt_key.in_set(crate::game_state::BattleInputSet),
+                    draw_deploy_zone.run_if(
+                        in_state(crate::game_state::GameState::Battle)
+                            .and_then(crate::game_state::deploying),
+                    ),
                     test_orders_script,
                     draw_order_gizmos,
                 ),
@@ -442,6 +446,118 @@ pub fn line_order(groups: &mut Groups, selected: &[usize], a: Vec2, b: Vec2) {
     }
 }
 
+// ── Deployment placement ──
+//
+// Same RMB press/drag/release gestures as battle orders, but while the
+// Deployment flag is up the release TELEPORTS regiments instead of
+// issuing movement orders (TW deployment is instant placement), and
+// everything is clamped into the player's deployment zone.
+
+/// The player's (team 0) deployment strip: their side of the no-man's
+/// land, inside the same margins the spawner keeps. Returned as
+/// (min, max) corners in ground coordinates.
+fn deploy_zone(terrain: &Terrain) -> (Vec2, Vec2) {
+    use crate::regiments::{EDGE_MARGIN, SIDE_MARGIN, army_gap};
+    (
+        Vec2::new(terrain.min().x + SIDE_MARGIN, terrain.min().y + EDGE_MARGIN),
+        Vec2::new(terrain.max().x - SIDE_MARGIN, -army_gap() * 0.5),
+    )
+}
+
+/// Clamp an anchor so the block stays inside the zone; a block deeper or
+/// wider than the zone itself sits centered on the tight axis.
+fn clamp_anchor(anchor: Vec2, he: Vec2, terrain: &Terrain) -> Vec2 {
+    let (lo, hi) = deploy_zone(terrain);
+    let axis = |v: f32, lo: f32, hi: f32| {
+        if lo > hi { (lo + hi) * 0.5 } else { v.clamp(lo, hi) }
+    };
+    Vec2::new(
+        axis(anchor.x, lo.x + he.x, hi.x - he.x),
+        axis(anchor.y, lo.y + he.y, hi.y - he.y),
+    )
+}
+
+/// Clamp a drag layout into the zone IN THE PREVIEW, so the green slots
+/// always show exactly where the men will stand (TW behavior: a drag
+/// outside the zone slides along its edge).
+fn clamp_layout_to_zone(groups: &Groups, layout: &mut [LinePlacement], terrain: &Terrain) {
+    for p in layout {
+        let he = crate::formation::block_half_extents(&groups.list[p.g], p.files, p.facing);
+        p.anchor = clamp_anchor(p.anchor, he, terrain);
+    }
+}
+
+/// Deployment drag release: place the drawn line by teleport.
+fn deploy_place_line(
+    groups: &mut Groups,
+    units: &mut Units,
+    terrain: &Terrain,
+    layout: Vec<LinePlacement>,
+) {
+    let n = layout.len();
+    for p in layout {
+        let gd = &mut groups.list[p.g];
+        gd.anchor = p.anchor;
+        gd.facing = p.facing;
+        gd.files = p.files;
+        gd.shape = FormShape::Rect;
+        gd.order = None;
+        gd.auto_order = false;
+        crate::formation::snap_to_slots(units, terrain, p.g as u32, gd);
+    }
+    info!("deployment: placed {n} regiments");
+}
+
+/// Deployment click: arrangement-preserving group teleport (the deploy
+/// twin of `order_regiments` — same centroid translation, no marching,
+/// facing kept). `picked` is the controllable selection
+/// (`Selection::picked_controllable`).
+fn deploy_move(
+    groups: &mut Groups,
+    units: &mut Units,
+    terrain: &Terrain,
+    picked: &[usize],
+    target: Vec2,
+) {
+    if picked.is_empty() {
+        return;
+    }
+    let centroid: Vec2 =
+        picked.iter().map(|&g| groups.list[g].centroid).sum::<Vec2>() / picked.len() as f32;
+    for &g in picked {
+        let gd = &mut groups.list[g];
+        let he = crate::formation::block_half_extents(gd, gd.files, gd.facing);
+        gd.anchor = clamp_anchor(target + (gd.centroid - centroid), he, terrain);
+        gd.order = None;
+        gd.auto_order = false;
+        crate::formation::snap_to_slots(units, terrain, g as u32, gd);
+    }
+    info!("deployment: moved {} regiments", picked.len());
+}
+
+/// The deployment zone, drawn as terrain-following gizmo lines: gold
+/// boundary toward the enemy, dimmer side and back edges.
+fn draw_deploy_zone(terrain: Res<Terrain>, mut gizmos: Gizmos) {
+    let (lo, hi) = deploy_zone(&terrain);
+    let gold = Color::srgba(0.95, 0.80, 0.30, 0.9);
+    let dim = Color::srgba(0.95, 0.80, 0.30, 0.35);
+    let lift = |q: Vec2| Vec3::new(q.x, terrain.height_at(q.x, q.y) + 0.5, q.y);
+    let mut ground_line = |a: Vec2, b: Vec2, col: Color| {
+        let steps = (a.distance(b) / 8.0).ceil().max(1.0) as usize;
+        let mut prev = lift(a);
+        for s in 1..=steps {
+            let p = lift(a.lerp(b, s as f32 / steps as f32));
+            gizmos.line(prev, p, col);
+            prev = p;
+        }
+    };
+    // Front (facing the enemy), then sides and back.
+    ground_line(Vec2::new(lo.x, hi.y), Vec2::new(hi.x, hi.y), gold);
+    ground_line(Vec2::new(lo.x, lo.y), Vec2::new(lo.x, hi.y), dim);
+    ground_line(Vec2::new(hi.x, lo.y), Vec2::new(hi.x, hi.y), dim);
+    ground_line(Vec2::new(lo.x, lo.y), Vec2::new(hi.x, lo.y), dim);
+}
+
 /// RMB order issuing: press -> (optional drag with live preview) ->
 /// release. A short click keeps the classic behavior (attack the regiment
 /// under the cursor, else arrangement-preserving group move); a drag
@@ -453,8 +569,10 @@ fn issue_order(
     camera: Query<(&Camera, &GlobalTransform)>,
     terrain: Res<Terrain>,
     mut groups: ResMut<Groups>,
+    mut units: ResMut<Units>,
     selection: Res<Selection>,
     mut drag: ResMut<OrderDrag>,
+    deploy: Res<crate::game_state::Deployment>,
     ui: Query<&Interaction>,
 ) {
     if selection.count_units == 0 {
@@ -495,6 +613,9 @@ fn issue_order(
         }
         if drag.active {
             drag.layout = line_layout(&groups, &selected, start, cur);
+            if deploy.active {
+                clamp_layout_to_zone(&groups, &mut drag.layout, &terrain);
+            }
         }
     }
     if !buttons.just_released(MouseButton::Right) {
@@ -503,7 +624,16 @@ fn issue_order(
     let Some(start) = drag.start.take() else { return };
 
     if drag.active && !drag.layout.is_empty() {
-        apply_line_order(&mut groups, std::mem::take(&mut drag.layout), start, drag.cur);
+        let layout = std::mem::take(&mut drag.layout);
+        if deploy.active {
+            deploy_place_line(&mut groups, &mut units, &terrain, layout);
+        } else {
+            apply_line_order(&mut groups, layout, start, drag.cur);
+        }
+    } else if deploy.active {
+        // No attack targets while deploying: every click is a placement.
+        let picked: Vec<usize> = selection.picked_controllable(&groups).collect();
+        deploy_move(&mut groups, &mut units, &terrain, &picked, start);
     } else if let Some(t) = enemy_regiment_at(&groups, start) {
         attack_regiments(&mut groups, &selected, t);
         info!(

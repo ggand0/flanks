@@ -91,6 +91,20 @@ pub enum GameState {
     Results,
 }
 
+/// TW-style pre-battle deployment: the battle opens frozen while the
+/// player places regiments inside their zone, then a Begin Battle press
+/// releases the sim. A plain resource, not a state: `setup_battle`
+/// decides it and the flip must gate `SimSet` the same frame, with no
+/// transition-schedule lag for a stale phase to slip a tick through.
+#[derive(Resource, Default)]
+pub struct Deployment {
+    pub active: bool,
+}
+
+pub fn deploying(d: Res<Deployment>) -> bool {
+    d.active
+}
+
 fn scripts_active() -> bool {
     Scenario::from_env() != Scenario::Normal
         || std::env::var("FL_TEST_FRONT").is_ok()
@@ -148,6 +162,12 @@ enum PauseButton {
 }
 
 #[derive(Component)]
+struct DeployRoot;
+
+#[derive(Component)]
+struct BeginBattleButton;
+
+#[derive(Component)]
 struct ResultsRoot;
 
 #[derive(Component)]
@@ -161,10 +181,13 @@ pub struct GameShellPlugin;
 impl Plugin for GameShellPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<BattleConfig>()
+            .init_resource::<Deployment>()
             .init_state::<GameState>()
             .configure_sets(
                 FixedUpdate,
-                SimSet.run_if(in_state(GameState::Battle)),
+                SimSet.run_if(
+                    in_state(GameState::Battle).and_then(not(deploying)),
+                ),
             )
             .configure_sets(
                 Update,
@@ -193,6 +216,12 @@ impl Plugin for GameShellPlugin {
                         ),
                     (toggle_pause, pause_buttons).run_if(
                         in_state(GameState::Battle)
+                            .and_then(crate::settings::settings_closed),
+                    ),
+                    begin_battle.run_if(
+                        in_state(GameState::Battle)
+                            .and_then(deploying)
+                            .and_then(not(time_paused))
                             .and_then(crate::settings::settings_closed),
                     ),
                     transition_to_results.run_if(in_state(GameState::Battle)),
@@ -536,6 +565,7 @@ fn sync_scenario_env(scenario: Scenario) {
 
 #[allow(clippy::too_many_arguments)]
 pub fn setup_battle(
+    mut commands: Commands,
     mut units: ResMut<Units>,
     terrain: Res<Terrain>,
     mut groups: ResMut<Groups>,
@@ -545,6 +575,7 @@ pub fn setup_battle(
     mut corpses: ResMut<Corpses>,
     mut dir_stats: ResMut<DirTestStats>,
     mut virt_time: ResMut<Time<Virtual>>,
+    mut deploy: ResMut<Deployment>,
     config: Res<BattleConfig>,
 ) {
     *units = Units::default();
@@ -556,12 +587,88 @@ pub fn setup_battle(
     virt_time.unpause();
     sync_scenario_env(config.scenario);
     crate::regiments::do_spawn_battle(&mut units, &terrain, &mut groups, &config);
+    // Scripted scenarios and test batteries start fighting immediately;
+    // a normal battle opens in deployment. FL_DEPLOY=0 skips it.
+    deploy.active = config.scenario == Scenario::Normal
+        && !scripts_active()
+        && crate::util::env_or("FL_DEPLOY", 1_u32) != 0;
+    if deploy.active {
+        spawn_deploy_ui(&mut commands);
+        info!("deployment phase: place your regiments, then begin the battle");
+    }
     info!(
         "battle started: {} per team, scenario {}, AI {}",
         config.units_per_team,
         config.scenario.label(),
         if config.ai_enabled { "on" } else { "off" },
     );
+}
+
+fn spawn_deploy_ui(commands: &mut Commands) {
+    // One transparent full-screen column: banner pinned up top, Begin
+    // Battle pinned above the card bar. Plain nodes carry no
+    // Interaction, so map picking under it is untouched.
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                flex_direction: FlexDirection::Column,
+                align_items: AlignItems::Center,
+                justify_content: JustifyContent::SpaceBetween,
+                padding: UiRect::top(Val::Px(10.0)).with_bottom(Val::Px(150.0)),
+                ..default()
+            },
+            GlobalZIndex(5),
+            DespawnOnExit(GameState::Battle),
+            DeployRoot,
+        ))
+        .with_children(|p| {
+            p.spawn(Node {
+                flex_direction: FlexDirection::Column,
+                align_items: AlignItems::Center,
+                ..default()
+            })
+            .with_children(|banner| {
+                banner.spawn((
+                    Text::new("Deployment"),
+                    TextFont {
+                        font_size: FontSize::Px(24.0),
+                        ..default()
+                    },
+                    TextColor(TEXT_COLOR),
+                ));
+                banner.spawn((
+                    Text::new("Place your regiments inside the gold zone"),
+                    TextFont {
+                        font_size: FontSize::Px(13.0),
+                        ..default()
+                    },
+                    TextColor(DIM_TEXT_COLOR),
+                ));
+            });
+            spawn_text_button(p, "Begin Battle (Enter)", BeginBattleButton);
+        });
+}
+
+/// Begin Battle button or Enter: release the sim and drop the deploy UI.
+fn begin_battle(
+    mut commands: Commands,
+    mut deploy: ResMut<Deployment>,
+    keys: Res<ButtonInput<KeyCode>>,
+    buttons: Query<&Interaction, (Changed<Interaction>, With<BeginBattleButton>)>,
+    roots: Query<Entity, With<DeployRoot>>,
+) {
+    let clicked = buttons.iter().any(|i| *i == Interaction::Pressed);
+    if !clicked && !keys.just_pressed(KeyCode::Enter) {
+        return;
+    }
+    deploy.active = false;
+    for e in &roots {
+        commands.entity(e).despawn();
+    }
+    info!("deployment done: battle begins");
 }
 
 fn transition_to_results(

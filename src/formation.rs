@@ -121,12 +121,21 @@ pub fn slot_offsets(n: usize, files: usize, pitch: Vec2) -> Vec<Vec2> {
     out
 }
 
+/// Radius of the loose Blob disc holding `n` men at roughly normal
+/// density — the one blob footprint, shared by slot generation and the
+/// deployment zone clamp.
+pub fn blob_radius(n: usize) -> f32 {
+    (n as f32).sqrt() * BASE_SPACING * 0.55
+}
+
 /// Rewrite the `home` slot offsets of regiment `g` for its current shape,
 /// files, spacing, and facing. Rect: row-major grid centered on the
 /// anchor, front rank toward `facing`, partial last rank centered. Units
 /// are assigned to slots front-to-back / left-to-right in their CURRENT
 /// relative order, so a reform never marches men through each other.
-pub fn assign_slots(units: &mut Units, g: u32, gd: &mut GroupData) {
+/// Returns the living member indices so callers (the deployment teleport)
+/// don't rescan the unit buffer for the set this already built.
+pub fn assign_slots(units: &mut Units, g: u32, gd: &mut GroupData) -> Vec<u32> {
     // (unit index, forward coord, lateral coord) relative to the anchor.
     let fwd = facing_dir(gd.facing);
     let right = Vec2::new(fwd.y, -fwd.x);
@@ -139,13 +148,13 @@ pub fn assign_slots(units: &mut Units, g: u32, gd: &mut GroupData) {
     }
     let n = members.len();
     if n == 0 {
-        return;
+        return Vec::new();
     }
 
     match gd.shape {
         FormShape::Blob => {
             // Jittered disc sized to hold n at roughly normal density.
-            let r_max = (n as f32).sqrt() * BASE_SPACING * 0.55;
+            let r_max = blob_radius(n);
             for (k, m) in members.iter().enumerate() {
                 let seed = g.wrapping_mul(0x9E37_79B1) ^ (k as u32);
                 let a = hash01(seed.wrapping_mul(3) + 1) * std::f32::consts::TAU;
@@ -171,6 +180,71 @@ pub fn assign_slots(units: &mut Units, g: u32, gd: &mut GroupData) {
     }
     gd.count_at_reform = n;
     gd.reform = false;
+    members.into_iter().map(|m| m.0).collect()
+}
+
+/// Axis-aligned half extents of a regiment block at `facing`: the
+/// deployment zone clamp keeps the whole block inside, not just its
+/// anchor. Lives here with the rest of the block geometry (pitch,
+/// `slot_offsets`, `blob_radius`) so a density retune can't silently
+/// diverge from the clamp footprint.
+pub fn block_half_extents(gd: &GroupData, files: u32, facing: f32) -> Vec2 {
+    if gd.shape == FormShape::Blob {
+        return Vec2::splat(blob_radius(gd.count));
+    }
+    let files = (files.max(1) as usize).min(gd.count.max(1));
+    let ranks = gd.count.max(1).div_ceil(files);
+    let pitch = gd.spacing.pitch();
+    let half_w = (files - 1) as f32 * 0.5 * pitch.x + 1.0;
+    let half_d = (ranks - 1) as f32 * 0.5 * pitch.y + 1.0;
+    let fwd = facing_dir(facing);
+    let right = Vec2::new(fwd.y, -fwd.x);
+    Vec2::new(
+        (right.x * half_w).abs() + (fwd.x * half_d).abs(),
+        (right.y * half_w).abs() + (fwd.y * half_d).abs(),
+    )
+}
+
+/// Deployment placement: rebake slots, then TELEPORT every man onto his
+/// mark (pos, prev, yaw, zero velocity) — TW deployment moves are
+/// instant, and the sim is frozen so nobody could march there anyway.
+/// Also pins the (sim-owned, now stale) centroid to the anchor so
+/// selection, banners, and follow-up placements read the new spot.
+pub fn snap_to_slots(
+    units: &mut Units,
+    terrain: &crate::terrain::Terrain,
+    g: u32,
+    gd: &mut GroupData,
+) {
+    for i in assign_slots(units, g, gd) {
+        let i = i as usize;
+        let p = gd.anchor + units.home[i];
+        let hh = crate::unit_types::TYPES[units.kind[i] as usize].half_height;
+        let pos = Vec3::new(p.x, terrain.height_at(p.x, p.y) + hh, p.y);
+        units.pos[i] = pos;
+        units.pos_prev[i] = pos;
+        units.vel[i] = Vec3::ZERO;
+        units.yaw[i] = gd.facing;
+        units.yaw_prev[i] = gd.facing;
+    }
+    gd.centroid = gd.anchor;
+}
+
+/// While deploying, formation commands (wall/loose/blob, width) re-dress
+/// the block instantly: `apply_reforms` lives in the frozen sim, so the
+/// pending `reform` flags are snapped here instead, right after the
+/// input sets that raise them.
+fn deploy_reform_snap(
+    mut units: ResMut<Units>,
+    terrain: Res<crate::terrain::Terrain>,
+    mut groups: ResMut<Groups>,
+) {
+    for g in 0..groups.list.len() {
+        let gd = &mut groups.list[g];
+        if gd.reform && gd.team == crate::orders::PLAYER_TEAM && gd.count > 0 {
+            snap_to_slots(&mut units, &terrain, g as u32, gd);
+        }
+    }
 }
 
 /// Wall flavor of a regiment (spacing == Wall and still fighting):
@@ -208,6 +282,12 @@ impl Plugin for FormationPlugin {
             Update,
             (
                 formation_keys.in_set(crate::game_state::BattleInputSet),
+                deploy_reform_snap
+                    .after(crate::game_state::BattleInputSet)
+                    .run_if(
+                        in_state(crate::game_state::GameState::Battle)
+                            .and_then(crate::game_state::deploying),
+                    ),
                 test_form_script,
                 rectfight_log,
             ),
