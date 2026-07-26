@@ -467,6 +467,21 @@ pub fn step_sim(
     // SWING_CHARGE predicate too — momentum the sim can see).
     let charging: Vec<bool> = groups.list.iter().map(|g| g.charging).collect();
     let charging = &charging[..];
+    // Fatigue locomotion: tired legs are slow legs, and exhausted
+    // regiments cannot sprint the charge home (MTW1 "cannot run or
+    // charge"; fleeing men tire too — pursuit catches them).
+    let fat_speed: Vec<f32> = groups
+        .list
+        .iter()
+        .map(|g| crate::fatigue::speed_mult(g.fatigue))
+        .collect();
+    let fat_speed = &fat_speed[..];
+    let fat_nocharge: Vec<bool> = groups
+        .list
+        .iter()
+        .map(|g| crate::fatigue::cannot_charge(g.fatigue))
+        .collect();
+    let fat_nocharge = &fat_nocharge[..];
     let bounds_min = terrain.min() + 4.0;
     let bounds_max = terrain.max() - 4.0;
 
@@ -1002,9 +1017,10 @@ pub fn step_sim(
                     // both states by construction.
                     if wall[gi] != 0 {
                         desired *= WALL_SPEED_FRAC;
-                    } else if charging[gi] && !dying && !routed {
+                    } else if charging[gi] && !dying && !routed && !fat_nocharge[gi] {
                         desired *= CHARGE_SPEED_BOOST;
                     }
+                    desired *= fat_speed[gi];
                     // A staggered man reels where the blow left him: no
                     // steering, no closing, until the stun runs out. The
                     // shove that staggered him still resolves through
@@ -1176,6 +1192,13 @@ pub fn step_sim(
     {
         let _span = info_span!("damage_apply").entered();
         stats.events = 0;
+        // Fatigue stat effects (MTW1 table): weary arms strike with
+        // fewer attack points; exhausted men get no charge bonus at all.
+        let fat_atk: Vec<f32> = groups
+            .list
+            .iter()
+            .map(|g| crate::fatigue::attack_penalty(g.fatigue))
+            .collect();
         for buf in &mut damage.0 {
             stats.events += buf.len();
             for ev in buf.drain(..) {
@@ -1215,12 +1238,13 @@ pub fn step_sim(
                 let a_wall = wall[group[a] as usize];
                 let v_wall = wall[group[v] as usize];
                 let mut attack = pa.attack
+                    + fat_atk[group[a] as usize]
                     + match a_wall {
                         1 => SHIELDWALL_ATK_PTS,
                         2 => SPEARWALL_ATK_PTS,
                         _ => 0.0,
                     };
-                if ev.charge {
+                if ev.charge && !fat_nocharge[group[a] as usize] {
                     attack += pa.charge_bonus;
                 }
                 // Impalement: he ran onto this spearman's braced point at
@@ -1262,6 +1286,8 @@ pub fn step_sim(
                     // kills[] counts losses OF that team (overlay semantics).
                     cstats.kills[team[v] as usize] += 1;
                     groups.list[group[v] as usize].recent_deaths += 1;
+                    // The attacker's regiment is winning its exchange.
+                    groups.list[group[a] as usize].recent_kills += 1;
                 }
                 // Charge impact (phase B): momentum becomes a shove and a
                 // stun. Walls barely budge and never stagger; a braced

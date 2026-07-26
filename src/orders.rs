@@ -101,6 +101,11 @@ pub struct GroupData {
     /// skew the living slots' center away from the anchor, and disorder
     /// must not count that skew as chaos.
     pub home_bias: Vec2,
+    /// Footprint radius estimate (m): 1.5x the RMS distance of living
+    /// units to the centroid, smoothed ~2 s. The morale flank ring
+    /// probes OUTSIDE this — a probe inside our own mass measures
+    /// nothing (a 1000-man block swallows any fixed ring).
+    pub radius: f32,
     // --- refreshed every fixed tick by the frontline pass ---
     pub centroid: Vec2,
     /// TW rule: one soldier of the regiment fighting = the whole regiment
@@ -139,11 +144,29 @@ pub struct GroupData {
     /// to attack-dist-multiplier × max-engage-dist from the engagement
     /// point (3.0 × 40 = 120 m in vanilla config_ai_battle.xml).
     pub fight_origin: Vec2,
+    /// The army's command regiment (the captain/general rides here).
+    /// M2TW: every army has a leader; his presence is an army-wide
+    /// morale term and his fall a shock. Assigned once by morale.rs.
+    pub leader: bool,
     // --- morale (morale.rs updates per tick) ---
+    /// Effective morale LEVEL (M2TW model): base stat + the signed sum of
+    /// situational modifiers, recomputed every tick — NOT an accumulator.
+    /// Rout threshold is at -11 (morale.rs); typical range ~-20..+20.
     pub morale: f32,
+    /// Ticks the effective level has sat at/below the rout line
+    /// (hysteresis: one spiked tick must not break a regiment).
+    pub break_ticks: u8,
+    // --- fatigue (fatigue.rs updates per tick) ---
+    /// 0 (fresh) .. 100 (exhausted cap). Fighting > charging > running
+    /// accumulate; standing recovers. Banded into the six M2TW states.
+    pub fatigue: f32,
     pub state: RegState,
     /// Deaths since the last morale tick (tallied by the damage apply pass).
     pub recent_deaths: u32,
+    /// Kills MADE by this regiment since the last morale tick (damage
+    /// apply pass): recent_kills vs recent_deaths is the winning/losing-
+    /// melee morale factor.
+    pub recent_kills: u32,
 }
 
 impl GroupData {
@@ -167,6 +190,7 @@ impl GroupData {
             count_at_reform: count,
             disorder: 0.0,
             home_bias: Vec2::ZERO,
+            radius: 0.0,
             centroid: anchor,
             engaged: false,
             engage_hold: 0,
@@ -178,9 +202,14 @@ impl GroupData {
             hostile_near: false,
             celebrate: 0,
             fight_origin: Vec2::ZERO,
-            morale: 100.0,
+            leader: false,
+            // Overwritten by the first morale tick (base + calm bonuses).
+            morale: crate::unit_types::TYPES[kind as usize].base_morale,
+            break_ticks: 0,
+            fatigue: 0.0,
             state: RegState::Steady,
             recent_deaths: 0,
+            recent_kills: 0,
         }
     }
 }

@@ -121,6 +121,21 @@ pub fn hash01(mut x: u32) -> f32 {
     (x >> 8) as f32 / 16_777_216.0
 }
 
+/// FL_SEED: offsets every per-unit spawn hash — perturbation runs for
+/// battle-outcome sensitivity sweeps (the sim itself is deterministic,
+/// so run-to-run variance must be injected at spawn). Apply it where a
+/// seed is BUILT, not inside `push_unit`: the positional jitter is
+/// computed at the call sites, and a seed offset applied further down
+/// would leave every run with identical formation geometry.
+pub fn spawn_seed(raw: u32) -> u32 {
+    raw.wrapping_add(spawn_seed_offset())
+}
+
+fn spawn_seed_offset() -> u32 {
+    static S: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *S.get_or_init(|| crate::util::env_or("FL_SEED", 0u32).wrapping_mul(0x9E37_79B1))
+}
+
 /// Append one fully-initialized unit to every SoA column. `anchor` is the
 /// unit's regiment anchor; the spawn offset from it becomes `home`.
 #[allow(clippy::too_many_arguments)] // spawn-time plumbing, all scalars
@@ -189,7 +204,7 @@ pub fn spawn_surround_test(
     use crate::orders::{GroupData, Order};
     use crate::unit_types::KIND_LIGHT;
     let pocket_c = Vec2::new(-200.0, 0.0);
-    let mut seed = 1u32;
+    let mut seed = spawn_seed(1);
     let mut list: Vec<GroupData> = Vec::new();
 
     // Blue pocket (group 0): disc, holds.

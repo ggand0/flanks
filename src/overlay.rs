@@ -148,6 +148,10 @@ fn update_inspect_panel(
     let team = if gd.team == 0 { "blue" } else { "orange" };
     let state = match gd.state {
         RegState::Steady if gd.charging => "STEADY - CHARGING",
+        RegState::Steady if crate::morale::band(gd) == crate::morale::Band::Wavering => {
+            "WAVERING"
+        }
+        RegState::Steady if crate::morale::band(gd) == crate::morale::Band::Shaken => "SHAKEN",
         RegState::Steady if gd.engaged => "STEADY - engaged",
         RegState::Steady => "STEADY",
         RegState::Routing { .. } => "ROUTING",
@@ -165,29 +169,37 @@ fn update_inspect_panel(
         _ => "",
     };
     let stance = if gd.hold { "  HOLD POSITION" } else { "" };
+    let fat = crate::fatigue::state_name(crate::fatigue::state(gd.fatigue));
     let mut s = format!(
-        "{kind} {g} ({team})\n{}/{} men    morale {:>3.0}    {state}\n{formation}{mode}{stance}\n",
-        gd.count,
-        gd.initial_count,
-        gd.morale.clamp(0.0, 100.0),
+        "{kind} {g} ({team})\n{}/{} men    morale {:+.1}    {state}\n{formation}{mode}{stance}    {fat}\n",
+        gd.count, gd.initial_count, gd.morale,
     );
-    if matches!(gd.state, RegState::Steady) {
+    if gd.count > 0 {
+        // Morale is a level now: base + the signed modifier sum. Show
+        // every nonzero factor so the player can SEE the state of mind.
         let f = readout.0.get(g).copied().unwrap_or_default();
-        s += &format!(
-            "casualties      -{:.1}/s\nflanked {:>3.0}%    -{:.1}/s\noutnumbered     -{:.1}/s\nrout nearby     -{:.1}/s\ndisorder {:>4.1}m  -{:.1}/s\nallies x{}   psych x{:.2}   depletion x{:.2}",
-            f.casualties,
-            f.flanked01 * 100.0,
-            f.flanked,
-            f.outnumbered,
-            f.contagion,
-            gd.disorder,
-            f.disorder,
-            f.friends,
-            f.psych_mult,
-            f.depletion,
-        );
-        if f.recovering {
-            s += "\nrecovering      +3.0/s";
+        s += &format!("base            {:+.1}", f.base);
+        for (label, v) in [
+            ("casualties", f.casualties),
+            ("melee exchange", f.exchange),
+            ("flanked", f.flanked),
+            ("outnumbered", f.outnumbered),
+            ("routing allies", f.contagion),
+            ("routing enemies", f.rout_enemies),
+            ("disorder", f.disorder),
+            ("fatigue", f.fatigue),
+            ("allies close", f.support),
+            ("no enemy near", f.no_enemy),
+            ("braced wall", f.wall),
+            ("commander", f.leader),
+            ("rout lock", f.rout_lock),
+        ] {
+            if v.abs() >= 0.05 {
+                s += &format!("\n{label:<15} {v:+.1}");
+            }
+        }
+        if f.flanked01 > 0.0 {
+            s += &format!("\n(surrounded {:.0}%)", f.flanked01 * 100.0);
         }
     }
     text.0 = s;

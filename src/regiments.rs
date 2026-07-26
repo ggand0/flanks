@@ -63,7 +63,7 @@ fn spawn_regiment(
     for k in 0..size {
         let row = k / cols;
         let col = k % cols;
-        let seed = (team as u32) << 30 | g << 16 | k as u32;
+        let seed = crate::units::spawn_seed((team as u32) << 30 | g << 16 | k as u32);
         let jx = hash01(seed.wrapping_mul(3) + 1) - 0.5;
         let jz = hash01(seed.wrapping_mul(3) + 2) - 0.5;
         let x = anchor.x + (col as f32 - (cols - 1) as f32 / 2.0) * SPACING + jx * 0.5;
@@ -703,10 +703,16 @@ fn arena_log(
 pub fn rout_test_log(
     groups: Res<Groups>,
     stats: Res<crate::combat::CombatStats>,
+    readout: Res<crate::morale::MoraleReadout>,
     time: Res<Time>,
     mut next: Local<f32>,
 ) {
-    if std::env::var("FL_TEST_ROUT").is_err() || groups.list.is_empty() {
+    // Regiment-0 morale/fatigue timeline: the rout acceptance AND a
+    // line-fight probe for the front battle (flank ring must read ~0 in
+    // a frontal press).
+    if (std::env::var("FL_TEST_ROUT").is_err() && std::env::var("FL_TEST_FRONT").is_err())
+        || groups.list.is_empty()
+    {
         return;
     }
     let t = time.elapsed_secs();
@@ -720,8 +726,21 @@ pub fn rout_test_log(
         RegState::Routing { .. } => "ROUTING",
         RegState::Shattered => "SHATTERED",
     };
+    let f = readout.0.first().copied().unwrap_or_default();
     info!(
-        "[rout-test] t={t:.0}s blue: {} alive, morale {:.0}, {}, fled {}",
-        g.count, g.morale, state, stats.fled[0]
+        "[rout-test] t={t:.0}s blue: {} alive, morale {:.0}, {}, fled {} | cas {:.1} xchg {:.1} flank {:.1} ({:.0}%) noen {:.1} fat {:.1} r {:.0}m z {:.0} en {}",
+        g.count,
+        g.morale,
+        state,
+        stats.fled[0],
+        f.casualties,
+        f.exchange,
+        f.flanked,
+        f.flanked01 * 100.0,
+        f.no_enemy,
+        g.fatigue,
+        g.radius,
+        g.centroid.y,
+        g.enemy_near,
     );
 }

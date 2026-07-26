@@ -320,7 +320,7 @@ fn sync_instance_data(
             if g.charging {
                 1.0
             } else if g.engaged || matches!(g.order, Some(crate::orders::Order::Attack(_))) {
-                if g.morale > 50.0 { 0.65 } else { 0.5 }
+                if crate::morale::band(g) == crate::morale::Band::Steady { 0.65 } else { 0.5 }
             } else if g.enemy_near {
                 0.25
             } else {

@@ -60,8 +60,18 @@ pub struct UnitTypeParams {
     pub speed: f32,
     /// Relative shove weight in separation (heavier pushes lighter).
     pub mass: f32,
-    /// Multiplier on morale damage taken by this unit's regiment.
-    pub morale_resist: f32,
+    /// Base morale level (M2TW `stat_mental` first field). The situational
+    /// modifier sum in morale.rs rides on top of this; vanilla M2TW scale:
+    /// measured vanilla range is 1..11 (peasants 1, militia 3, sergeants
+    /// and pikemen 5, knights 9-11) — see devlog 0057.
+    pub base_morale: f32,
+    /// Multiplier on morale SHOCK modifiers (flanked, rout contagion) —
+    /// M2TW discipline: "determines the amount of morale lost when morale
+    /// shocks occur". Lower = steadier under shock.
+    pub discipline: f32,
+    /// Fatigue accumulation multiplier — the M2TW `stat_heat` analog:
+    /// heavy armour tires its wearer faster. Recovery is unscaled.
+    pub fatigue_rate: f32,
     /// Mesh half height; units sit on the terrain at this Y.
     pub half_height: f32,
 }
@@ -72,7 +82,7 @@ pub struct UnitTypeParams {
 /// heavies ~ Dismounted Feudal Knights, lights ~ Armored Sergeants'
 /// sword-and-board cousins, spears ~ upper Spear Militia. Elite frontal
 /// fights run LONGER than the old flat model (grindy shield-on-shield,
-/// owner-approved); rear/flank hits skip skill+shield and kill 2-4x
+/// by design); rear/flank hits skip skill+shield and kill 2-4x
 /// faster — facing is the defensive resource now.
 pub const TYPES: [UnitTypeParams; NUM_KINDS] = [
     // KIND_HEAVY — knights: slow, armored, hard-hitting, shove-heavy.
@@ -94,7 +104,13 @@ pub const TYPES: [UnitTypeParams; NUM_KINDS] = [
         // (~3.5) slot in above; mass drives separation shove and charge
         // knockback ratios.
         mass: 1.5,
-        morale_resist: 0.6,
+        // MEASURED vanilla EDU scale (devlog 0057): base morale runs
+        // 1..11 across all 413 units — 11 is the CEILING (Dismounted
+        // English Knights, Demi Lancers, Norman Knights), not a midpoint.
+        // Our heavies map to the dismounted-knight rows of devlog 0031.
+        base_morale: 11.0,
+        discipline: 0.6,
+        fatigue_rate: 1.3,
         half_height: 0.55,
     },
     // KIND_LIGHT — men-at-arms: fast, fragile, quicker swings, spear reach.
@@ -112,7 +128,10 @@ pub const TYPES: [UnitTypeParams; NUM_KINDS] = [
         cooldown_ticks: 33,
         speed: 9.5,
         mass: 0.9,
-        morale_resist: 1.0,
+        // Armored Sergeants / Billmen row = 5 on the measured scale.
+        base_morale: 5.0,
+        discipline: 1.0,
+        fatigue_rate: 1.0,
         half_height: 0.50,
     },
     // KIND_SPEAR — spear infantry: chainmail line troops behind big
@@ -134,7 +153,10 @@ pub const TYPES: [UnitTypeParams; NUM_KINDS] = [
         cooldown_ticks: 38,
         speed: 8.5,
         mass: 1.0,
-        morale_resist: 0.85,
+        // Pikemen row = 5 (highly_trained); spear militia sit at 3.
+        base_morale: 5.0,
+        discipline: 0.85,
+        fatigue_rate: 1.1,
         half_height: 0.50,
     },
 ];
