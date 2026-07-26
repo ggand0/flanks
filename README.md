@@ -46,7 +46,7 @@ A set of `FL_*` environment variables configure sandbox battles and scripted tes
 
 ## Assets
 
-There are no external art assets: unit meshes, terrain, and all animation are generated in code. Sound effects are AI-generated (ElevenLabs), plus one marching-boots loop from freesound.org.
+There are no external art assets: unit meshes, terrain, and all animation are generated in code. Sound effects are AI-generated (ElevenLabs), plus one [marching loop from Pixabay](https://pixabay.com/sound-effects/people-marching-loop-32908/). Audio files are covered by their respective licenses, not the source license below.
 
 ## License
 

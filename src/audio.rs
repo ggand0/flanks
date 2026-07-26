@@ -92,7 +92,7 @@ enum Bed {
     Mid,
     Close,
     Drums,
-    /// Massed boots (freesound loop) — plays with the drums on the march.
+    /// Massed boots (Pixabay loop) — plays with the drums on the march.
     March,
 }
 
@@ -156,7 +156,7 @@ fn setup_audio(mut commands: Commands, assets: Res<AssetServer>) {
     commands.spawn((bed("bed_battle_mid0"), Bed::Mid));
     commands.spawn((bed("bed_melee_close0"), Bed::Close));
     commands.spawn((bed("sig_drums_march"), Bed::Drums));
-    commands.spawn((bed("sfx_new/bed_march_freesound_loop_14.5s"), Bed::March));
+    commands.spawn((bed("sfx_new/bed_march_loop_14.5s"), Bed::March));
 }
 
 fn silence_beds(mut sinks: Query<&mut AudioSink, With<Bed>>) {
