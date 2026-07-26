@@ -109,7 +109,10 @@ pub fn deploying(d: Res<Deployment>) -> bool {
     d.active
 }
 
-fn scripts_active() -> bool {
+/// Any scripted scenario or test battery owns the battle: automatic
+/// order sources (ai.rs) stand down. Deliberately NOT cached — menu
+/// scenario buttons change the env between battles (sync_scenario_env).
+pub fn scripts_active() -> bool {
     Scenario::from_env() != Scenario::Normal
         || std::env::var("FL_TEST_FRONT").is_ok()
         || std::env::var("FL_TEST_ORDERS").is_ok()

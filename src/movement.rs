@@ -121,9 +121,11 @@ pub const STAGGER_TICKS: u8 = 30;
 /// contest). A regular hit is a brief stumble; impacts stun full-length
 /// (the render pose scales with remaining ticks, so stumbles read
 /// lighter than impacts for free).
-const STAGGER_P0: f32 = 0.65;
-const STAGGER_P_PER_FACTOR: f32 = 0.05;
-const STAGGER_P_MIN: f32 = 0.05;
+// Shared with the arrow-impact resolution (arrows.rs): a nonfatal hit
+// rolls the same stumble regardless of what delivered it.
+pub const STAGGER_P0: f32 = 0.65;
+pub const STAGGER_P_PER_FACTOR: f32 = 0.05;
+pub const STAGGER_P_MIN: f32 = 0.05;
 /// Pub: the render normalizes the pose by the STUMBLE length, so a
 /// stumble plays the full-strength rock for 0.5 s and an impact holds
 /// it ~1 s — hierarchy by duration, not amplitude.

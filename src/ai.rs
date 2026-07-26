@@ -46,22 +46,12 @@ impl Plugin for AiPlugin {
     }
 }
 
-/// Test scripts own the orders — every automatic order source stands down.
+/// Test scripts own the orders — every automatic order source stands
+/// down. Shared with game_state (the old private env list here went
+/// stale the moment new scenarios were added: the Archery range's
+/// "static" holders charged because FL_TEST_ARCHERY wasn't on it).
 fn scripts_active() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        [
-            "FL_TEST_FRONT",
-            "FL_TEST_ORDERS",
-            "FL_TEST_SURROUND",
-            "FL_TEST_ROUT",
-            "FL_TEST_FORM",
-            "FL_TEST_DIR",
-            "FL_TEST_CHARGE",
-        ]
-            .iter()
-            .any(|k| std::env::var(k).is_ok())
-    })
+    crate::game_state::scripts_active()
 }
 
 fn ai_enabled() -> bool {
@@ -69,12 +59,14 @@ fn ai_enabled() -> bool {
     // FL_ENEMY_STATIC=1 / FL_ARENA=1: practice-dummy modes — the enemy
     // spawns in hold-position (regiments.rs) and the strategy AI stands
     // down, so regiments defend where they stand but never advance.
-    *ON.get_or_init(|| {
+    // Launch-time knobs stay cached; the scenario check must NOT be
+    // (menu buttons swap scenarios between battles).
+    let static_on = *ON.get_or_init(|| {
         !std::env::var("FL_AI").is_ok_and(|v| v == "0")
             && std::env::var("FL_ENEMY_STATIC").is_err()
             && std::env::var("FL_ARENA").is_err()
-            && !scripts_active()
-    })
+    });
+    static_on && !scripts_active()
 }
 
 fn ai_think(

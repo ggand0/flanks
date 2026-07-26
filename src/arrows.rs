@@ -431,6 +431,38 @@ fn update_arrows(
             if units.team[v] != h.team {
                 groups.list[h.group as usize].recent_kills += 1;
             }
+        } else {
+            // A nonfatal shaft rocks its man: the SAME stumble roll as a
+            // melee blow, on the same factor — no separate mechanism.
+            // M2TW has no missile-stagger parameter anywhere (verified
+            // absence, devlog 0060); what it does have is the generic
+            // hit reaction played on every nonfatal impact, arrows
+            // included — which is exactly what the melee stumble models.
+            // Braced walls hit frontally stay planted and the
+            // anti-stunlock immunity pass applies, like melee.
+            let braced = front
+                && crate::formation::wall_kind(&groups.list[units.group[v] as usize]) != 0;
+            let p = (crate::movement::STAGGER_P0
+                + crate::movement::STAGGER_P_PER_FACTOR * factor)
+                .clamp(crate::movement::STAGGER_P_MIN, 1.0);
+            let roll = hash01(
+                (*tick)
+                    .wrapping_mul(0x85EB_CA6B)
+                    ^ (v as u32).wrapping_mul(0x9E37),
+            );
+            if !braced && roll < p {
+                if units.swing[v] & crate::units::SWING_STAGGER_IMMUNE != 0 {
+                    units.swing[v] &= !crate::units::SWING_STAGGER_IMMUNE;
+                } else {
+                    units.swing[v] =
+                        crate::units::SWING_RECOVER | crate::units::SWING_STAGGERED;
+                    // Clamp the stun window: inheriting a reloading
+                    // archer's 8 s bow cycle as stagger time would
+                    // freeze him into a statue.
+                    units.swing_t[v] = units.swing_t[v]
+                        .clamp(crate::movement::HIT_STAGGER_TICKS, 45);
+                }
+            }
         }
     }
 }
