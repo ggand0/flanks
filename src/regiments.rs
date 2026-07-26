@@ -33,7 +33,7 @@ impl Plugin for RegimentsPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(
             Update,
-            (rout_test_log, dir_test_log, arena_log, charge_test_log, pile_test_log, melee_diag_log, join_test_log, routpass_test_log),
+            (rout_test_log, dir_test_log, arena_log, charge_test_log, pile_test_log, melee_diag_log, join_test_log, routpass_test_log, archery_log),
         );
     }
 }
@@ -109,6 +109,7 @@ pub fn do_spawn_battle(
         Scenario::Pile => { spawn_pile_test(units, terrain, groups); return; }
         Scenario::Join => { spawn_join_test(units, terrain, groups); return; }
         Scenario::Routpass => { spawn_routpass_test(units, terrain, groups); return; }
+        Scenario::Archery => { spawn_archery_test(units, terrain, groups); return; }
         Scenario::Normal => {}
     }
 
@@ -204,6 +205,73 @@ pub fn do_spawn_battle(
         units.len()
     );
     groups.list = list;
+}
+
+/// FL_TEST_ARCHERY: the archer sandbox (also on the menu's debug list).
+/// Two blue archer regiments stand behind a friendly light screen;
+/// three orange regiments hold just OUTSIDE bow range — attack-order
+/// the archers onto one to watch the stand-off halt at ~100 m and the
+/// volleys arc over the screen's heads. One orange regiment marches in
+/// from deep, demonstrating fire-at-will, target lead against a moving
+/// block, and the skirmish back-step when it closes. Everything else
+/// stands down (scripted scenario: no AI).
+fn spawn_archery_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
+    let size = crate::util::env_or("FL_REG_SIZE", 500_usize).max(50);
+    let mut list = Vec::new();
+    // Blue: light screen up front, two archer blocks behind it.
+    spawn_regiment(units, terrain, &mut list, 0, KIND_LIGHT, Vec2::new(0.0, -70.0), size, -1.0);
+    list[0].hold = true;
+    for x in [-30.0, 30.0] {
+        spawn_regiment(units, terrain, &mut list, 0, KIND_ARCHER, Vec2::new(x, -90.0), size, -1.0);
+    }
+    // Orange: three blocks holding a line just outside the 120 m bow.
+    for x in [-60.0, 0.0, 60.0] {
+        spawn_regiment(units, terrain, &mut list, 1, KIND_LIGHT, Vec2::new(x, 40.0), size, 1.0);
+        let g = list.len() - 1;
+        list[g].hold = true;
+    }
+    // The deep attacker: ordered onto the west archer regiment.
+    spawn_regiment(units, terrain, &mut list, 1, KIND_LIGHT, Vec2::new(-30.0, 110.0), size, 1.0);
+    let g = list.len() - 1;
+    list[g].order = Some(crate::orders::Order::Attack(1));
+    list[g].auto_order = true;
+    groups.list = list;
+    info!(
+        "[archery] 2 archer regiments behind a screen; 3 orange blocks hold beyond bow range \
+         (attack-order for the stand-off); 1 attacker inbound from deep (skirmish demo)"
+    );
+}
+
+/// FL_TEST_ARCHERY bookkeeping every 4 s: archer strength + ammo, the
+/// live arrow pool, and orange's bleed.
+fn archery_log(
+    groups: Res<Groups>,
+    arrows: Res<crate::arrows::Arrows>,
+    astats: Res<crate::arrows::ArrowStats>,
+    time: Res<Time>,
+    mut next: Local<f32>,
+) {
+    if std::env::var("FL_TEST_ARCHERY").is_err() || groups.list.len() < 7 {
+        return;
+    }
+    let t = time.elapsed_secs();
+    if t < *next {
+        return;
+    }
+    *next = t + 4.0;
+    let orange: usize = groups.list.iter().filter(|g| g.team == 1).map(|g| g.count).sum();
+    info!(
+        "[archery] t={t:.0}s archers {} (ammo {}) / {} (ammo {}) | arrows in flight {} \
+         (dropped {}) | orange alive {orange}, attacker {} at {:.0} m",
+        groups.list[1].count,
+        groups.list[1].ammo_left,
+        groups.list[2].count,
+        groups.list[2].ammo_left,
+        arrows.len(),
+        astats.dropped,
+        groups.list[6].count,
+        groups.list[6].centroid.distance(groups.list[1].centroid),
+    );
 }
 
 /// FL_TEST_ROUT: one blue regiment vs three converging orange regiments.

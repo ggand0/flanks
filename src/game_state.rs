@@ -22,6 +22,7 @@ pub enum Scenario {
     Pile,
     Join,
     Routpass,
+    Archery,
 }
 
 impl Scenario {
@@ -35,6 +36,7 @@ impl Scenario {
         Self::Pile,
         Self::Join,
         Self::Routpass,
+        Self::Archery,
     ];
 
     fn label(self) -> &'static str {
@@ -48,6 +50,7 @@ impl Scenario {
             Self::Pile => "Pile-on",
             Self::Join => "Join Fight",
             Self::Routpass => "Rout Pass",
+            Self::Archery => "Archery",
         }
     }
 
@@ -60,6 +63,7 @@ impl Scenario {
         if std::env::var("FL_TEST_PILE").is_ok() { return Self::Pile; }
         if std::env::var("FL_TEST_JOIN").is_ok() { return Self::Join; }
         if std::env::var("FL_TEST_ROUTPASS").is_ok() { return Self::Routpass; }
+        if std::env::var("FL_TEST_ARCHERY").is_ok() { return Self::Archery; }
         Self::Normal
     }
 }
@@ -549,6 +553,7 @@ fn sync_scenario_env(scenario: Scenario) {
         ("FL_TEST_PILE", Scenario::Pile),
         ("FL_TEST_JOIN", Scenario::Join),
         ("FL_TEST_ROUTPASS", Scenario::Routpass),
+        ("FL_TEST_ARCHERY", Scenario::Archery),
     ];
     for (key, s) in vars {
         unsafe {
