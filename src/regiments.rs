@@ -7,7 +7,7 @@ use bevy::prelude::*;
 
 use crate::orders::{GroupData, Groups, RegState};
 use crate::terrain::Terrain;
-use crate::unit_types::{KIND_HEAVY, KIND_LIGHT, KIND_SPEAR};
+use crate::unit_types::{KIND_ARCHER, KIND_HEAVY, KIND_LIGHT, KIND_SPEAR};
 use crate::units::{Units, hash01, push_unit};
 
 /// Unit spacing inside a regiment block.
@@ -46,6 +46,12 @@ fn heavy_frac() -> f32 {
 /// heavies, ahead of the lights).
 fn spear_frac() -> f32 {
     crate::util::env_or("FL_SPEAR_FRAC", 0.25)
+}
+
+/// Fraction of each army's regiments that are archers (the rear ranks,
+/// behind the lights).
+fn archer_frac() -> f32 {
+    crate::util::env_or("FL_ARCHER_FRAC", 0.2)
 }
 
 /// Spawn one regiment block (units + GroupData). `dir` faces the enemy
@@ -148,6 +154,8 @@ pub fn do_spawn_battle(
         };
         let n_heavy = (n_regs as f32 * heavy_frac()).round() as usize;
         let n_spear = (n_regs as f32 * spear_frac()).round() as usize;
+        let n_archer = ((n_regs as f32 * archer_frac()).round() as usize)
+            .min(n_regs.saturating_sub(n_heavy + n_spear));
         let dir: f32 = if team == 0 { -1.0 } else { 1.0 };
         for r in 0..n_regs {
             let rank = r / per_rank;
@@ -157,11 +165,14 @@ pub fn do_spawn_battle(
             let x0 = (file as f32 - (in_rank - 1) as f32 / 2.0) * pitch_x;
             let z0 = dir * (army_gap / 2.0 + block_d / 2.0 + rank as f32 * (block_d + REG_GAP));
             let anchor = Vec2::new(x0, z0);
-            // Heavies lead, spears back them, lights fill the rear ranks.
+            // Heavies lead, spears back them, lights fill the middle,
+            // archers take the rear ranks (they shoot over everyone).
             let kind = if r < n_heavy {
                 KIND_HEAVY
             } else if r < n_heavy + n_spear {
                 KIND_SPEAR
+            } else if r >= n_regs - n_archer {
+                KIND_ARCHER
             } else {
                 KIND_LIGHT
             };
@@ -180,13 +191,15 @@ pub fn do_spawn_battle(
     }
     let heavies = list.iter().filter(|g| g.kind == KIND_HEAVY).count();
     let spears = list.iter().filter(|g| g.kind == KIND_SPEAR).count();
+    let archers = list.iter().filter(|g| g.kind == KIND_ARCHER).count();
     let blue = list.iter().filter(|g| g.team == 0).count();
     info!(
-        "spawned {} vs {} regiments ({} heavy, {} spear) x {} units ({} total units)",
+        "spawned {} vs {} regiments ({} heavy, {} spear, {} archer) x {} units ({} total units)",
         blue,
         list.len() - blue,
         heavies,
         spears,
+        archers,
         size,
         units.len()
     );

@@ -577,6 +577,11 @@ pub fn setup_battle(
     mut virt_time: ResMut<Time<Virtual>>,
     mut deploy: ResMut<Deployment>,
     config: Res<BattleConfig>,
+    (mut arrows, mut arrow_spawns, mut stuck): (
+        ResMut<crate::arrows::Arrows>,
+        ResMut<crate::arrows::ArrowSpawns>,
+        ResMut<crate::arrows::StuckArrows>,
+    ),
 ) {
     *units = Units::default();
     *stats = CombatStats::default();
@@ -584,6 +589,7 @@ pub fn setup_battle(
     *selection = Selection::default();
     outcome.0 = None;
     corpses.clear();
+    crate::arrows::reset(&mut arrows, &mut arrow_spawns, &mut stuck);
     virt_time.unpause();
     sync_scenario_env(config.scenario);
     crate::regiments::do_spawn_battle(&mut units, &terrain, &mut groups, &config);

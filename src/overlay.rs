@@ -143,6 +143,7 @@ fn update_inspect_panel(
     let kind = match gd.kind {
         crate::unit_types::KIND_HEAVY => "Heavy Knights",
         crate::unit_types::KIND_SPEAR => "Spearmen",
+        crate::unit_types::KIND_ARCHER => "Archers",
         _ => "Men-at-Arms",
     };
     let team = if gd.team == 0 { "blue" } else { "orange" };

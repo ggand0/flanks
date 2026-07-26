@@ -20,7 +20,7 @@ use crate::game_state::{
     TEXT_COLOR,
 };
 use crate::orders::{Groups, Hover, PLAYER_TEAM, RegState, Selection, halt_selected};
-use crate::unit_types::{KIND_HEAVY, KIND_SPEAR, NUM_KINDS};
+use crate::unit_types::{KIND_ARCHER, KIND_HEAVY, KIND_SPEAR, NUM_KINDS};
 
 /// Card button; the payload is the regiment's index into `Groups::list`.
 #[derive(Component)]
@@ -38,6 +38,11 @@ struct CardMorale(usize);
 /// left-anchored fill, tinted by the M2TW fatigue state.
 #[derive(Component)]
 struct CardFatigue(usize);
+
+/// Ammo strip child (archer cards only, under the fatigue strip):
+/// arrows left as a left-anchored fill.
+#[derive(Component)]
+struct CardAmmo(usize);
 
 /// The card's kind art: the rasterized icon (`icon: true`, shown on
 /// wide cards) or the letter fallback (`icon: false`, narrow cards).
@@ -76,13 +81,16 @@ const CARD_BG_HOVER: Color = Color::srgba(0.22, 0.24, 0.30, 0.95);
 const CARD_BG_DEAD: Color = Color::srgba(0.04, 0.04, 0.05, 0.85);
 /// Strength fill per kind, player-blue family (team color is blue on the
 /// field; the kind letter + shade carries the rest).
-const KIND_FILL: [Color; 3] = [
+const KIND_FILL: [Color; NUM_KINDS] = [
     Color::srgb(0.22, 0.42, 0.85), // heavy: deep blue
     Color::srgb(0.42, 0.62, 0.95), // light: pale blue
     Color::srgb(0.30, 0.55, 0.70), // spear: teal blue
+    Color::srgb(0.38, 0.50, 0.62), // archer: slate blue
 ];
 /// Broken regiments drain to the broken-flag gray.
 const FILL_BROKEN: Color = crate::banners::FLAG_BROKEN[0];
+/// Ammo strip: pale straw (arrow shafts).
+const AMMO_COLOR: Color = Color::srgb(0.85, 0.78, 0.50);
 const SEL_OUTLINE: Color = Color::srgb(0.95, 0.95, 0.90);
 
 const BTN_ACTIVE: Color = Color::srgba(0.22, 0.38, 0.62, 0.95);
@@ -126,6 +134,7 @@ fn kind_letter(kind: u8) -> &'static str {
     match kind {
         KIND_HEAVY => "H",
         KIND_SPEAR => "S",
+        KIND_ARCHER => "A",
         _ => "L",
     }
 }
@@ -220,6 +229,35 @@ fn kind_icon_shapes(kind: u8) -> Vec<IconShape> {
         KIND_SPEAR => vec![
             t((20.0, 0.0), (14.5, 14.0), (25.5, 14.0)),
             s((18.5, 13.0, 3.0, 34.0), [0.0; 4], ICON_RGB),
+        ],
+        // Bow and arrow: tall stave (two angled segments faking the
+        // curve), a taut string, and a nocked arrow with a tip triangle.
+        KIND_ARCHER => vec![
+            IconShape::Seg {
+                a: Vec2::new(13.0, 4.0),
+                b: Vec2::new(10.0, 24.0),
+                r: 1.6,
+                rgb: ICON_RGB,
+            },
+            IconShape::Seg {
+                a: Vec2::new(10.0, 24.0),
+                b: Vec2::new(13.0, 44.0),
+                r: 1.6,
+                rgb: ICON_RGB,
+            },
+            IconShape::Seg {
+                a: Vec2::new(13.0, 4.0),
+                b: Vec2::new(13.0, 44.0),
+                r: 0.8,
+                rgb: ICON_RGB_DETAIL,
+            },
+            IconShape::Seg {
+                a: Vec2::new(13.0, 24.0),
+                b: Vec2::new(32.0, 24.0),
+                r: 1.2,
+                rgb: ICON_RGB,
+            },
+            t((36.0, 24.0), (30.0, 20.5), (30.0, 27.5)),
         ],
         // Longsword, point up: tapered tip, blade with a dark fuller,
         // narrow crossguard, grip, pommel.
@@ -473,6 +511,59 @@ fn hold_shapes() -> Vec<IconShape> {
     out
 }
 
+/// Fire-at-will: a loosed arrow climbing, fletched tail barbs behind.
+fn fire_at_will_shapes() -> Vec<IconShape> {
+    vec![
+        IconShape::Seg {
+            a: Vec2::new(8.0, 36.0),
+            b: Vec2::new(32.0, 12.0),
+            r: 1.8,
+            rgb: ICON_RGB,
+        },
+        IconShape::Tri {
+            a: Vec2::new(38.0, 6.0),
+            b: Vec2::new(27.0, 10.0),
+            c: Vec2::new(34.0, 17.0),
+            rgb: ICON_RGB,
+        },
+        IconShape::Seg {
+            a: Vec2::new(8.0, 36.0),
+            b: Vec2::new(8.0, 27.0),
+            r: 1.5,
+            rgb: ICON_RGB,
+        },
+        IconShape::Seg {
+            a: Vec2::new(8.0, 36.0),
+            b: Vec2::new(17.0, 36.0),
+            r: 1.5,
+            rgb: ICON_RGB,
+        },
+    ]
+}
+
+/// Skirmish: back-step chevrons opening the gap from a contact line.
+fn skirmish_shapes() -> Vec<IconShape> {
+    vec![
+        IconShape::Tri {
+            a: Vec2::new(28.0, 8.0),
+            b: Vec2::new(28.0, 36.0),
+            c: Vec2::new(14.0, 22.0),
+            rgb: ICON_RGB,
+        },
+        IconShape::Tri {
+            a: Vec2::new(17.0, 8.0),
+            b: Vec2::new(17.0, 36.0),
+            c: Vec2::new(3.0, 22.0),
+            rgb: ICON_RGB,
+        },
+        IconShape::Rect {
+            rect: (34.0, 8.0, 5.0, 28.0),
+            radius: [1.5; 4],
+            rgb: ICON_RGB,
+        },
+    ]
+}
+
 /// Rasterized button icon textures. Rebuilt on every battle entry: the
 /// whole set is ~10 tiny images and sub-millisecond to draw, and the
 /// old handles free themselves when the previous bar despawns.
@@ -484,6 +575,8 @@ struct ButtonIcons {
     loose_tight: Handle<Image>,
     blob: Handle<Image>,
     hold: Handle<Image>,
+    fire_at_will: Handle<Image>,
+    skirmish: Handle<Image>,
 }
 
 impl ButtonIcons {
@@ -497,6 +590,8 @@ impl ButtonIcons {
             loose_tight: add(loose_shapes(true)),
             blob: add(blob_shapes()),
             hold: add(hold_shapes()),
+            fire_at_will: add(fire_at_will_shapes()),
+            skirmish: add(skirmish_shapes()),
         }
     }
 }
@@ -611,6 +706,20 @@ fn spawn_card(strip: &mut ChildSpawnerCommands, g: usize, kind: u8, icon: Handle
                 BackgroundColor(fatigue_color(0.0)),
                 CardFatigue(g),
             ));
+            if kind == KIND_ARCHER {
+                card.spawn((
+                    Node {
+                        position_type: PositionType::Absolute,
+                        left: Val::Px(0.0),
+                        top: Val::Px(9.0),
+                        width: Val::Percent(100.0),
+                        height: Val::Px(2.0),
+                        ..default()
+                    },
+                    BackgroundColor(AMMO_COLOR),
+                    CardAmmo(g),
+                ));
+            }
             card.spawn((
                 Text::new(kind_letter(kind)),
                 TextFont {
@@ -634,12 +743,14 @@ fn spawn_card(strip: &mut ChildSpawnerCommands, g: usize, kind: u8, icon: Handle
 
 /// M2TW-style round icon buttons, right end of the bar.
 fn spawn_control_panel(bar: &mut ChildSpawnerCommands, icons: &ButtonIcons) {
-    const BUTTONS: [(ControlButton, &str); 5] = [
+    const BUTTONS: [(ControlButton, &str); 7] = [
         (ControlButton::Halt, "Halt (Backspace)"),
         (ControlButton::Form(FormCmd::Wall), "Shield Wall (F)"),
         (ControlButton::Form(FormCmd::Loose), "Loose (L)"),
         (ControlButton::Form(FormCmd::Blob), "Blob (B)"),
         (ControlButton::Form(FormCmd::Hold), "Hold (H)"),
+        (ControlButton::Form(FormCmd::FireAtWill), "Fire at Will (T)"),
+        (ControlButton::Form(FormCmd::Skirmish), "Skirmish (K)"),
     ];
     bar.spawn(Node {
         flex_shrink: 0.0,
@@ -750,6 +861,12 @@ fn spawn_control_panel(bar: &mut ChildSpawnerCommands, icons: &ButtonIcons) {
                                 ControlButton::Form(FormCmd::Hold) => {
                                     icons.hold.clone()
                                 }
+                                ControlButton::Form(FormCmd::FireAtWill) => {
+                                    icons.fire_at_will.clone()
+                                }
+                                ControlButton::Form(FormCmd::Skirmish) => {
+                                    icons.skirmish.clone()
+                                }
                                 _ => unreachable!(),
                             }),
                         ));
@@ -831,6 +948,16 @@ fn refresh_cards(
         (&CardArt, &mut Node),
         (Without<UnitCard>, Without<CardFill>, Without<CardFatigue>),
     >,
+    mut ammo_strips: Query<
+        (&CardAmmo, &mut Node, &mut BackgroundColor),
+        (
+            Without<UnitCard>,
+            Without<CardFill>,
+            Without<CardMorale>,
+            Without<CardFatigue>,
+            Without<CardArt>,
+        ),
+    >,
 ) {
     wide.clear();
     wide.resize(groups.list.len(), false);
@@ -896,6 +1023,23 @@ fn refresh_cards(
         bg.set_if_neq(BackgroundColor(fatigue_color(gd.fatigue)));
     }
 
+    for (ammo, mut node, mut bg) in &mut ammo_strips {
+        let gd = &groups.list[ammo.0];
+        if gd.count == 0 {
+            bg.set_if_neq(BackgroundColor(Color::NONE));
+            continue;
+        }
+        let full = gd.initial_count as u32 * crate::unit_types::missile::AMMO as u32;
+        let pct = (gd.ammo_left as f32 / full.max(1) as f32 * 100.0)
+            .clamp(0.0, 100.0)
+            .round();
+        let want = Val::Percent(pct);
+        if node.width != want {
+            node.width = want;
+        }
+        bg.set_if_neq(BackgroundColor(AMMO_COLOR));
+    }
+
     // Display (not Visibility) so the hidden one leaves the flex layout;
     // it only flips when a card crosses the width threshold.
     for (art, mut node) in &mut arts {
@@ -947,6 +1091,7 @@ fn refresh_control_buttons(
     let (mut any, mut all_wall, mut all_loose, mut all_blob, mut all_hold) =
         (false, true, true, true, true);
     let mut all_spear = true;
+    let (mut any_archer, mut all_faw, mut all_skirm) = (false, true, true);
     for g in selection.picked_controllable(&groups) {
         let gd = &groups.list[g];
         any = true;
@@ -955,13 +1100,26 @@ fn refresh_control_buttons(
         all_blob &= gd.shape == FormShape::Blob;
         all_hold &= gd.hold;
         all_spear &= is_spearwall_kind(gd.kind);
+        if gd.kind == KIND_ARCHER {
+            any_archer = true;
+            all_faw &= gd.fire_at_will;
+            all_skirm &= gd.skirmish;
+        }
     }
+    let archer_btn = |btn: ControlButton| {
+        matches!(
+            btn,
+            ControlButton::Form(FormCmd::FireAtWill) | ControlButton::Form(FormCmd::Skirmish)
+        )
+    };
     let active_of = |btn: ControlButton| match btn {
         ControlButton::Halt => false,
         ControlButton::Form(FormCmd::Wall) => all_wall,
         ControlButton::Form(FormCmd::Loose) => all_loose,
         ControlButton::Form(FormCmd::Blob) => all_blob,
         ControlButton::Form(FormCmd::Hold) => all_hold,
+        ControlButton::Form(FormCmd::FireAtWill) => any_archer && all_faw,
+        ControlButton::Form(FormCmd::Skirmish) => any_archer && all_skirm,
     };
 
     let mut hovered: Option<ControlButton> = None;
@@ -969,7 +1127,7 @@ fn refresh_control_buttons(
         if matches!(interaction, Interaction::Hovered | Interaction::Pressed) {
             hovered = Some(*btn);
         }
-        let want = if !any {
+        let want = if !any || (archer_btn(*btn) && !any_archer) {
             BTN_DISABLED
         } else {
             match (active_of(*btn), interaction) {

@@ -259,7 +259,11 @@ pub fn is_spearwall_kind(kind: u8) -> bool {
 }
 
 pub fn wall_kind(gd: &GroupData) -> u8 {
-    if gd.spacing != FormSpacing::Wall || gd.state.is_broken() {
+    if gd.spacing != FormSpacing::Wall
+        || gd.state.is_broken()
+        // Archers have no shields to lock: no wall of any flavor.
+        || gd.kind == crate::unit_types::KIND_ARCHER
+    {
         0
     } else if is_spearwall_kind(gd.kind) {
         2
@@ -494,20 +498,26 @@ pub enum FormCmd {
     Blob,
     /// Hold position <-> at ease.
     Hold,
+    /// Fire-at-will on/off (archer regiments in the selection only).
+    FireAtWill,
+    /// Skirmish mode on/off (archer regiments in the selection only).
+    Skirmish,
 }
 
 /// Formation hotkeys for the selection — F: wall, L: loose, B: blob,
-/// H: hold position.
+/// H: hold position, T: fire-at-will, K: skirmish.
 fn formation_keys(
     keys: Res<ButtonInput<KeyCode>>,
     selection: Res<crate::orders::Selection>,
     mut groups: ResMut<Groups>,
 ) {
-    const KEYS: [(KeyCode, FormCmd); 4] = [
+    const KEYS: [(KeyCode, FormCmd); 6] = [
         (KeyCode::KeyF, FormCmd::Wall),
         (KeyCode::KeyL, FormCmd::Loose),
         (KeyCode::KeyB, FormCmd::Blob),
         (KeyCode::KeyH, FormCmd::Hold),
+        (KeyCode::KeyT, FormCmd::FireAtWill),
+        (KeyCode::KeyK, FormCmd::Skirmish),
     ];
     for (key, cmd) in KEYS {
         if keys.just_pressed(key) {
@@ -590,6 +600,42 @@ pub fn apply_formation_cmd(
                 "{} regiments {}",
                 picked.len(),
                 if on { "HOLD POSITION" } else { "AT EASE" }
+            );
+        }
+
+        FormCmd::FireAtWill | FormCmd::Skirmish => {
+            // Archer toggles; melee regiments in the selection ignore them.
+            let archers: Vec<usize> = picked
+                .into_iter()
+                .filter(|&g| groups.list[g].kind == crate::unit_types::KIND_ARCHER)
+                .collect();
+            if archers.is_empty() {
+                return;
+            }
+            let faw = cmd == FormCmd::FireAtWill;
+            let on = archers.iter().any(|&g| {
+                let gd = &groups.list[g];
+                if faw { !gd.fire_at_will } else { !gd.skirmish }
+            });
+            for &g in &archers {
+                let gd = &mut groups.list[g];
+                if faw {
+                    gd.fire_at_will = on;
+                } else {
+                    gd.skirmish = on;
+                    // Switching skirmish off mid-withdrawal: stand fast.
+                    if !on && gd.skirmishing {
+                        gd.skirmishing = false;
+                        gd.order = None;
+                        gd.anchor = gd.centroid;
+                    }
+                }
+            }
+            info!(
+                "{} archer regiments {} {}",
+                archers.len(),
+                if faw { "fire-at-will" } else { "skirmish" },
+                if on { "ON" } else { "OFF" }
             );
         }
     }

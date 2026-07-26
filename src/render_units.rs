@@ -223,6 +223,7 @@ fn setup_unit_mesh(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
         crate::unit_meshes::build_knight(),
         crate::unit_meshes::build_man_at_arms(),
         crate::unit_meshes::build_spearman(),
+        crate::unit_meshes::build_archer(),
     ];
     for (bucket, mesh) in kind_meshes.into_iter().enumerate() {
         let handle = meshes.add(mesh);
@@ -500,9 +501,17 @@ fn sync_instance_data(
                     let lunge = if sw & crate::units::SWING_STATE_MASK
                         == crate::units::SWING_WINDUP
                     {
-                        let w = crate::unit_types::TYPES[units.kind[i] as usize].windup_ticks
-                            as f32;
-                        let t = (w - units.swing_t[i] as f32) / w.max(1.0);
+                        // A bow draw runs on the missile draw time, not
+                        // the melee wind-up (the same 0..1 progress then
+                        // drives the bow-arm raise + string pull).
+                        let w = if sw & crate::units::SWING_RANGED != 0 {
+                            crate::unit_types::missile::DRAW_TICKS as f32
+                        } else {
+                            crate::unit_types::TYPES[units.kind[i] as usize].windup_ticks as f32
+                        };
+                        // Clamped: the draw-start jitter can put swing_t
+                        // above the nominal draw time.
+                        let t = ((w - units.swing_t[i] as f32) / w.max(1.0)).max(0.0);
                         let charge = sw & crate::units::SWING_CHARGE != 0;
                         let amp = if charge { 1.35 } else { 1.0 };
                         // A charging swing raises from the leveled run-in

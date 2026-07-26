@@ -45,6 +45,9 @@ pub struct Units {
     /// for the whole block, rigidly translated per unit by this offset.
     /// Captured at spawn (loose); rigid formations will write slot offsets.
     pub home: Vec<Vec2>,
+    /// Arrows left (archers; 0 for melee kinds). Decremented on loose;
+    /// an empty quiver means melee only.
+    pub ammo: Vec<u8>,
 }
 
 /// Swing states (the `swing` column, low bits) + the charge flag bit.
@@ -68,6 +71,10 @@ pub const SWING_STAGGERED: u8 = 1 << 5;
 /// consumed by the would-be stagger or wiped by the man's next swing):
 /// chain-charging cannot stunlock a man who never gets to act.
 pub const SWING_STAGGER_IMMUNE: u8 = 1 << 6;
+/// The current wind-up is a bow DRAW, not a melee swing (archers): the
+/// strike tick looses an arrow instead of a DamageEvent, and the render
+/// wind-up progress runs on missile::DRAW_TICKS. Cleared on the loose.
+pub const SWING_RANGED: u8 = 1 << 7;
 
 impl Units {
     pub fn len(&self) -> usize {
@@ -186,6 +193,11 @@ pub fn push_unit(
     units.flash.push(0);
     units.death_t.push(0);
     units.home.push(Vec2::new(x, z) - anchor);
+    units.ammo.push(if kind == crate::unit_types::KIND_ARCHER {
+        crate::unit_types::missile::AMMO
+    } else {
+        0
+    });
 }
 
 /// FL_TEST_SURROUND: two equal blue detachments of light infantry, one

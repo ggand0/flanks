@@ -27,6 +27,14 @@ const PART_LEG_R: f32 = 3.0;
 const PART_SPEAR_ARM: f32 = 4.0;
 /// Shield arm + shield: static normally, raised/fronted in shieldwall.
 const PART_SHIELD: f32 = 5.0;
+/// Bow arm + bow (stave modeled VERTICAL in the left hand): the shader
+/// tilts arm and bow up to the loft angle during the draw and settles
+/// them on the loose. The right (draw) hand is plain PART_ARM — the
+/// stab style's pull-back-then-snap reads as the string draw.
+const PART_BOW_ARM: f32 = 6.0;
+/// Arrow projectile (arrows.rs buckets, not a body part): rigid, with
+/// flight pitch riding the anim2.z instance channel.
+const PART_ARROW: f32 = 7.0;
 
 /// Part palette: rgb = material color, a = team-color blend amount.
 /// Team color must stay DOMINANT (Thronefall rule): steel is darker than
@@ -40,6 +48,12 @@ const WOOD: [f32; 4] = [0.44, 0.30, 0.18, 0.0];
 const PANTS: [f32; 4] = [0.50, 0.46, 0.42, 0.30];
 /// Chainmail: duller than plate, a little team dye in the rings.
 const CHAIN: [f32; 4] = [0.46, 0.48, 0.53, 0.22];
+/// Quilted gambeson: undyed padded linen with a hint of team dye.
+const GAMBESON: [f32; 4] = [0.62, 0.52, 0.36, 0.15];
+/// Quiver leather: darker than the bow wood.
+const LEATHER: [f32; 4] = [0.30, 0.20, 0.12, 0.0];
+/// Arrow fletching: pale goose feather.
+const FLETCH: [f32; 4] = [0.88, 0.86, 0.78, 0.0];
 
 struct MeshBuf {
     pos: Vec<[f32; 3]>,
@@ -480,6 +494,217 @@ pub fn build_spearman() -> Mesh {
         PART_SPEAR_ARM,
         shoulder,
         DARK_STEEL,
+    );
+    build(m)
+}
+
+/// Archer: quilted gambeson under a team tabard, bare face framed by a
+/// team hood (no steel — the silhouette that ISN'T a helmet reads
+/// "archer" next to the kettle-hat infantry), back quiver with fletched
+/// shafts over the right shoulder, tall bow carried vertical in the
+/// left hand. 22 cuboids, 264 tris. Height 1.0 m (half_height 0.50).
+pub fn build_archer() -> Mesh {
+    let mut m = MeshBuf::new();
+    let hip_pivot = -0.16;
+    let shoulder = 0.14;
+    // cloth legs
+    m.cuboid(
+        Vec3::new(-0.09, -0.345, 0.0),
+        Vec3::new(0.068, 0.155, 0.082),
+        PART_LEG_L,
+        hip_pivot,
+        PANTS,
+    );
+    m.cuboid(
+        Vec3::new(0.09, -0.345, 0.0),
+        Vec3::new(0.068, 0.155, 0.082),
+        PART_LEG_R,
+        hip_pivot,
+        PANTS,
+    );
+    // gambeson hem -> team tabard chest
+    m.cuboid(
+        Vec3::new(0.0, -0.08, 0.0),
+        Vec3::new(0.14, 0.10, 0.095),
+        PART_BODY,
+        0.0,
+        GAMBESON,
+    );
+    m.cuboid(
+        Vec3::new(0.0, 0.09, 0.0),
+        Vec3::new(0.165, 0.10, 0.105),
+        PART_BODY,
+        0.0,
+        TEAM,
+    );
+    // bare face in a team hood: collar, side and back panels framing
+    // the face, crown, and a small peak falling backward
+    m.cuboid(
+        Vec3::new(0.0, 0.30, 0.0),
+        Vec3::new(0.095, 0.095, 0.095),
+        PART_BODY,
+        0.0,
+        SKIN,
+    );
+    m.cuboid(
+        Vec3::new(0.0, 0.215, 0.0),
+        Vec3::new(0.115, 0.03, 0.115),
+        PART_BODY,
+        0.0,
+        TEAM,
+    );
+    m.cuboid(
+        Vec3::new(-0.108, 0.31, -0.01),
+        Vec3::new(0.014, 0.085, 0.085),
+        PART_BODY,
+        0.0,
+        TEAM,
+    );
+    m.cuboid(
+        Vec3::new(0.108, 0.31, -0.01),
+        Vec3::new(0.014, 0.085, 0.085),
+        PART_BODY,
+        0.0,
+        TEAM,
+    );
+    m.cuboid(
+        Vec3::new(0.0, 0.31, -0.108),
+        Vec3::new(0.10, 0.085, 0.014),
+        PART_BODY,
+        0.0,
+        TEAM,
+    );
+    m.cuboid(
+        Vec3::new(0.0, 0.405, -0.01),
+        Vec3::new(0.105, 0.03, 0.105),
+        PART_BODY,
+        0.0,
+        TEAM,
+    );
+    m.cuboid(
+        Vec3::new(0.0, 0.45, -0.045),
+        Vec3::new(0.045, 0.03, 0.045),
+        PART_BODY,
+        0.0,
+        TEAM,
+    );
+    // back quiver behind the right shoulder + two fletched shafts
+    m.cuboid(
+        Vec3::new(0.13, 0.05, -0.145),
+        Vec3::new(0.055, 0.17, 0.05),
+        PART_BODY,
+        0.0,
+        LEATHER,
+    );
+    m.cuboid(
+        Vec3::new(0.11, 0.27, -0.15),
+        Vec3::new(0.013, 0.06, 0.013),
+        PART_BODY,
+        0.0,
+        WOOD,
+    );
+    m.cuboid(
+        Vec3::new(0.155, 0.25, -0.135),
+        Vec3::new(0.013, 0.06, 0.013),
+        PART_BODY,
+        0.0,
+        WOOD,
+    );
+    m.cuboid(
+        Vec3::new(0.11, 0.35, -0.15),
+        Vec3::new(0.028, 0.04, 0.028),
+        PART_BODY,
+        0.0,
+        FLETCH,
+    );
+    m.cuboid(
+        Vec3::new(0.155, 0.32, -0.135),
+        Vec3::new(0.024, 0.035, 0.024),
+        PART_BODY,
+        0.0,
+        FLETCH,
+    );
+    // bow arm: gambeson sleeve + bare hand + the bow (grip back, limbs
+    // offset forward: a crude C seen from the side)
+    m.cuboid(
+        Vec3::new(-0.21, shoulder - 0.02, 0.045),
+        Vec3::new(0.055, 0.055, 0.085),
+        PART_BOW_ARM,
+        shoulder,
+        GAMBESON,
+    );
+    m.cuboid(
+        Vec3::new(-0.23, shoulder - 0.02, 0.11),
+        Vec3::new(0.04, 0.04, 0.05),
+        PART_BOW_ARM,
+        shoulder,
+        SKIN,
+    );
+    m.cuboid(
+        Vec3::new(-0.23, 0.12, 0.16),
+        Vec3::new(0.024, 0.11, 0.024),
+        PART_BOW_ARM,
+        shoulder,
+        WOOD,
+    );
+    m.cuboid(
+        Vec3::new(-0.23, 0.40, 0.19),
+        Vec3::new(0.018, 0.20, 0.018),
+        PART_BOW_ARM,
+        shoulder,
+        WOOD,
+    );
+    m.cuboid(
+        Vec3::new(-0.23, -0.16, 0.19),
+        Vec3::new(0.018, 0.20, 0.018),
+        PART_BOW_ARM,
+        shoulder,
+        WOOD,
+    );
+    // draw arm: gambeson sleeve + bare hand (no weapon — the stab-style
+    // pull-back-and-snap is the string draw; melee is a scrappy bash)
+    m.cuboid(
+        Vec3::new(0.22, shoulder - 0.02, 0.045),
+        Vec3::new(0.055, 0.055, 0.085),
+        PART_ARM,
+        shoulder,
+        GAMBESON,
+    );
+    m.cuboid(
+        Vec3::new(0.22, shoulder - 0.02, 0.13),
+        Vec3::new(0.04, 0.04, 0.045),
+        PART_ARM,
+        shoulder,
+        SKIN,
+    );
+    build(m)
+}
+
+/// Arrow projectile: shaft + head + fletching along +Z (flight
+/// direction), origin at the shaft center. 3 cuboids, 36 tris. Sized up
+/// slightly from a true arrow so a volley reads at gameplay zoom.
+pub fn build_arrow() -> Mesh {
+    let mut m = MeshBuf::new();
+    m.cuboid(
+        Vec3::ZERO,
+        Vec3::new(0.014, 0.014, 0.36),
+        PART_ARROW,
+        0.0,
+        WOOD,
+    );
+    m.cuboid(
+        Vec3::new(0.0, 0.0, 0.385),
+        Vec3::new(0.022, 0.022, 0.035),
+        PART_ARROW,
+        0.0,
+        BLADE,
+    );
+    m.cuboid(
+        Vec3::new(0.0, 0.0, -0.31),
+        Vec3::new(0.03, 0.03, 0.06),
+        PART_ARROW,
+        0.0,
+        FLETCH,
     );
     build(m)
 }
