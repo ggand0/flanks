@@ -14,6 +14,11 @@ use crate::units::{Units, hash01, push_unit};
 const SPACING: f32 = 1.4;
 /// Gap between regiment blocks.
 const REG_GAP: f32 = 10.0;
+/// Margins the army layout keeps from the terrain edges. Shared with the
+/// deployment zone (orders.rs), which must contain the spawn strip by
+/// construction.
+pub const SIDE_MARGIN: f32 = 30.0;
+pub const EDGE_MARGIN: f32 = 8.0;
 /// No-man's land between the two armies. FL_ARMY_GAP overrides — small
 /// sandbox battles (e.g. FL_UNITS=5000 FL_ENEMY_REGS=4) want 250+ m of
 /// maneuvering room for flank and rear charges; the 200k default keeps
@@ -115,9 +120,9 @@ pub fn do_spawn_battle(
     // ranks past the terrain edge (the sim clamps positions to the bounds
     // and stacked rows would squash onto the boundary line). If the army
     // needs more ranks than fit, widen the ranks and shrink the x pitch.
-    let usable_w = (terrain.max().x - terrain.min().x) - 60.0;
+    let usable_w = (terrain.max().x - terrain.min().x) - 2.0 * SIDE_MARGIN;
     let army_gap = army_gap();
-    let usable_d = terrain.max().y - 8.0 - army_gap / 2.0;
+    let usable_d = terrain.max().y - EDGE_MARGIN - army_gap / 2.0;
     let max_ranks = (((usable_d - block_d) / (block_d + REG_GAP)).floor() as usize + 1).max(1);
     let per_rank = ((usable_w / (block_w + REG_GAP)).floor() as usize)
         .max(n_regs.div_ceil(max_ranks))

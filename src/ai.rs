@@ -39,7 +39,7 @@ impl Plugin for AiPlugin {
                     // pre-orders, no auto-engagement across the line.
                     (ai_think, auto_engage)
                         .in_set(crate::game_state::BattleInputSet)
-                        .run_if(crate::game_state::deployment_done),
+                        .run_if(not(crate::game_state::deploying)),
                     check_victory,
                 ),
             );

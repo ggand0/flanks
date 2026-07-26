@@ -269,8 +269,10 @@ impl Plugin for OrdersPlugin {
                         .chain()
                         .in_set(crate::game_state::BattleInputSet),
                     halt_key.in_set(crate::game_state::BattleInputSet),
-                    draw_deploy_zone
-                        .run_if(in_state(crate::game_state::GameState::Battle)),
+                    draw_deploy_zone.run_if(
+                        in_state(crate::game_state::GameState::Battle)
+                            .and_then(crate::game_state::deploying),
+                    ),
                     test_orders_script,
                     draw_order_gizmos,
                 ),
@@ -455,30 +457,10 @@ pub fn line_order(groups: &mut Groups, selected: &[usize], a: Vec2, b: Vec2) {
 /// land, inside the same margins the spawner keeps. Returned as
 /// (min, max) corners in ground coordinates.
 fn deploy_zone(terrain: &Terrain) -> (Vec2, Vec2) {
-    let gap = crate::regiments::army_gap();
+    use crate::regiments::{EDGE_MARGIN, SIDE_MARGIN, army_gap};
     (
-        Vec2::new(terrain.min().x + 30.0, terrain.min().y + 8.0),
-        Vec2::new(terrain.max().x - 30.0, -gap * 0.5),
-    )
-}
-
-/// Axis-aligned half extents of a regiment block at `facing`, so a clamp
-/// keeps the whole block inside the zone, not just its anchor.
-fn block_half_extents(gd: &GroupData, files: u32, facing: f32) -> Vec2 {
-    if gd.shape == FormShape::Blob {
-        let r = (gd.count as f32).sqrt() * crate::formation::BASE_SPACING * 0.55;
-        return Vec2::splat(r);
-    }
-    let files = (files.max(1) as usize).min(gd.count.max(1));
-    let ranks = gd.count.max(1).div_ceil(files);
-    let pitch = gd.spacing.pitch();
-    let half_w = (files - 1) as f32 * 0.5 * pitch.x + 1.0;
-    let half_d = (ranks - 1) as f32 * 0.5 * pitch.y + 1.0;
-    let fwd = facing_dir(facing);
-    let right = Vec2::new(fwd.y, -fwd.x);
-    Vec2::new(
-        (right.x * half_w).abs() + (fwd.x * half_d).abs(),
-        (right.y * half_w).abs() + (fwd.y * half_d).abs(),
+        Vec2::new(terrain.min().x + SIDE_MARGIN, terrain.min().y + EDGE_MARGIN),
+        Vec2::new(terrain.max().x - SIDE_MARGIN, -army_gap() * 0.5),
     )
 }
 
@@ -500,7 +482,7 @@ fn clamp_anchor(anchor: Vec2, he: Vec2, terrain: &Terrain) -> Vec2 {
 /// outside the zone slides along its edge).
 fn clamp_layout_to_zone(groups: &Groups, layout: &mut [LinePlacement], terrain: &Terrain) {
     for p in layout {
-        let he = block_half_extents(&groups.list[p.g], p.files, p.facing);
+        let he = crate::formation::block_half_extents(&groups.list[p.g], p.files, p.facing);
         p.anchor = clamp_anchor(p.anchor, he, terrain);
     }
 }
@@ -515,9 +497,6 @@ fn deploy_place_line(
     let n = layout.len();
     for p in layout {
         let gd = &mut groups.list[p.g];
-        if gd.team != PLAYER_TEAM {
-            continue;
-        }
         gd.anchor = p.anchor;
         gd.facing = p.facing;
         gd.files = p.files;
@@ -531,30 +510,23 @@ fn deploy_place_line(
 
 /// Deployment click: arrangement-preserving group teleport (the deploy
 /// twin of `order_regiments` — same centroid translation, no marching,
-/// facing kept).
+/// facing kept). `picked` is the controllable selection
+/// (`Selection::picked_controllable`).
 fn deploy_move(
     groups: &mut Groups,
     units: &mut Units,
     terrain: &Terrain,
-    selected: &[usize],
+    picked: &[usize],
     target: Vec2,
 ) {
-    let picked: Vec<usize> = selected
-        .iter()
-        .copied()
-        .filter(|&g| {
-            let gd = &groups.list[g];
-            gd.team == PLAYER_TEAM && gd.count > 0 && !gd.state.is_broken()
-        })
-        .collect();
     if picked.is_empty() {
         return;
     }
     let centroid: Vec2 =
         picked.iter().map(|&g| groups.list[g].centroid).sum::<Vec2>() / picked.len() as f32;
-    for &g in &picked {
+    for &g in picked {
         let gd = &mut groups.list[g];
-        let he = block_half_extents(gd, gd.files, gd.facing);
+        let he = crate::formation::block_half_extents(gd, gd.files, gd.facing);
         gd.anchor = clamp_anchor(target + (gd.centroid - centroid), he, terrain);
         gd.order = None;
         gd.auto_order = false;
@@ -565,24 +537,17 @@ fn deploy_move(
 
 /// The deployment zone, drawn as terrain-following gizmo lines: gold
 /// boundary toward the enemy, dimmer side and back edges.
-fn draw_deploy_zone(
-    deploy: Res<crate::game_state::Deployment>,
-    terrain: Res<Terrain>,
-    mut gizmos: Gizmos,
-) {
-    if !deploy.active {
-        return;
-    }
+fn draw_deploy_zone(terrain: Res<Terrain>, mut gizmos: Gizmos) {
     let (lo, hi) = deploy_zone(&terrain);
     let gold = Color::srgba(0.95, 0.80, 0.30, 0.9);
     let dim = Color::srgba(0.95, 0.80, 0.30, 0.35);
+    let lift = |q: Vec2| Vec3::new(q.x, terrain.height_at(q.x, q.y) + 0.5, q.y);
     let mut ground_line = |a: Vec2, b: Vec2, col: Color| {
         let steps = (a.distance(b) / 8.0).ceil().max(1.0) as usize;
-        let mut prev = a;
+        let mut prev = lift(a);
         for s in 1..=steps {
-            let p = a.lerp(b, s as f32 / steps as f32);
-            let lift = |q: Vec2| Vec3::new(q.x, terrain.height_at(q.x, q.y) + 0.5, q.y);
-            gizmos.line(lift(prev), lift(p), col);
+            let p = lift(a.lerp(b, s as f32 / steps as f32));
+            gizmos.line(prev, p, col);
             prev = p;
         }
     };
@@ -667,7 +632,8 @@ fn issue_order(
         }
     } else if deploy.active {
         // No attack targets while deploying: every click is a placement.
-        deploy_move(&mut groups, &mut units, &terrain, &selected, start);
+        let picked: Vec<usize> = selection.picked_controllable(&groups).collect();
+        deploy_move(&mut groups, &mut units, &terrain, &picked, start);
     } else if let Some(t) = enemy_regiment_at(&groups, start) {
         attack_regiments(&mut groups, &selected, t);
         info!(

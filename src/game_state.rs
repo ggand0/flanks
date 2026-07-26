@@ -105,10 +105,6 @@ pub fn deploying(d: Res<Deployment>) -> bool {
     d.active
 }
 
-pub fn deployment_done(d: Res<Deployment>) -> bool {
-    !d.active
-}
-
 fn scripts_active() -> bool {
     Scenario::from_env() != Scenario::Normal
         || std::env::var("FL_TEST_FRONT").is_ok()
@@ -190,7 +186,7 @@ impl Plugin for GameShellPlugin {
             .configure_sets(
                 FixedUpdate,
                 SimSet.run_if(
-                    in_state(GameState::Battle).and_then(deployment_done),
+                    in_state(GameState::Battle).and_then(not(deploying)),
                 ),
             )
             .configure_sets(
@@ -205,7 +201,6 @@ impl Plugin for GameShellPlugin {
             )
             .add_systems(OnEnter(GameState::Menu), spawn_menu)
             .add_systems(OnEnter(GameState::Battle), setup_battle)
-            .add_systems(OnExit(GameState::Battle), end_deployment_on_exit)
             .add_systems(OnEnter(GameState::Results), spawn_results)
             .add_systems(
                 Update,
@@ -610,52 +605,49 @@ pub fn setup_battle(
 }
 
 fn spawn_deploy_ui(commands: &mut Commands) {
+    // One transparent full-screen column: banner pinned up top, Begin
+    // Battle pinned above the card bar. Plain nodes carry no
+    // Interaction, so map picking under it is untouched.
     commands
         .spawn((
             Node {
                 position_type: PositionType::Absolute,
-                top: Val::Px(10.0),
                 width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                flex_direction: FlexDirection::Column,
+                align_items: AlignItems::Center,
+                justify_content: JustifyContent::SpaceBetween,
+                padding: UiRect::top(Val::Px(10.0)).with_bottom(Val::Px(150.0)),
+                ..default()
+            },
+            GlobalZIndex(5),
+            DespawnOnExit(GameState::Battle),
+            DeployRoot,
+        ))
+        .with_children(|p| {
+            p.spawn(Node {
                 flex_direction: FlexDirection::Column,
                 align_items: AlignItems::Center,
                 ..default()
-            },
-            GlobalZIndex(5),
-            DespawnOnExit(GameState::Battle),
-            DeployRoot,
-        ))
-        .with_children(|p| {
-            p.spawn((
-                Text::new("Deployment"),
-                TextFont {
-                    font_size: FontSize::Px(24.0),
-                    ..default()
-                },
-                TextColor(TEXT_COLOR),
-            ));
-            p.spawn((
-                Text::new("Place your regiments inside the gold zone"),
-                TextFont {
-                    font_size: FontSize::Px(13.0),
-                    ..default()
-                },
-                TextColor(DIM_TEXT_COLOR),
-            ));
-        });
-    commands
-        .spawn((
-            Node {
-                position_type: PositionType::Absolute,
-                bottom: Val::Px(150.0),
-                width: Val::Percent(100.0),
-                justify_content: JustifyContent::Center,
-                ..default()
-            },
-            GlobalZIndex(5),
-            DespawnOnExit(GameState::Battle),
-            DeployRoot,
-        ))
-        .with_children(|p| {
+            })
+            .with_children(|banner| {
+                banner.spawn((
+                    Text::new("Deployment"),
+                    TextFont {
+                        font_size: FontSize::Px(24.0),
+                        ..default()
+                    },
+                    TextColor(TEXT_COLOR),
+                ));
+                banner.spawn((
+                    Text::new("Place your regiments inside the gold zone"),
+                    TextFont {
+                        font_size: FontSize::Px(13.0),
+                        ..default()
+                    },
+                    TextColor(DIM_TEXT_COLOR),
+                ));
+            });
             spawn_text_button(p, "Begin Battle (Enter)", BeginBattleButton);
         });
 }
@@ -677,12 +669,6 @@ fn begin_battle(
         commands.entity(e).despawn();
     }
     info!("deployment done: battle begins");
-}
-
-/// Leaving Battle mid-deployment (quit to menu) must not leave the flag
-/// armed: gizmos and input forks check it outside the battle state too.
-fn end_deployment_on_exit(mut deploy: ResMut<Deployment>) {
-    deploy.active = false;
 }
 
 fn transition_to_results(
