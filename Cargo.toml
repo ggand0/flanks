@@ -3,7 +3,7 @@ name = "flanks"
 version = "0.1.0"
 edition = "2024"
 description = "Real-time massed medieval battles in Rust and Bevy, every soldier simulated"
-license = "MIT"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 # mp3: the generated battle audio is mp3 (bevy default is vorbis-only).
