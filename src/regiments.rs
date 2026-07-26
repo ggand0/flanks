@@ -18,7 +18,7 @@ const REG_GAP: f32 = 10.0;
 /// sandbox battles (e.g. FL_UNITS=5000 FL_ENEMY_REGS=4) want 250+ m of
 /// maneuvering room for flank and rear charges; the 200k default keeps
 /// the short march.
-fn army_gap() -> f32 {
+pub fn army_gap() -> f32 {
     crate::util::env_or("FL_ARMY_GAP", 60.0)
 }
 

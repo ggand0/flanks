@@ -173,6 +173,51 @@ pub fn assign_slots(units: &mut Units, g: u32, gd: &mut GroupData) {
     gd.reform = false;
 }
 
+/// Deployment placement: rebake slots, then TELEPORT every man onto his
+/// mark (pos, prev, yaw, zero velocity) — TW deployment moves are
+/// instant, and the sim is frozen so nobody could march there anyway.
+/// Also pins the (sim-owned, now stale) centroid to the anchor so
+/// selection, banners, and follow-up placements read the new spot.
+pub fn snap_to_slots(
+    units: &mut Units,
+    terrain: &crate::terrain::Terrain,
+    g: u32,
+    gd: &mut GroupData,
+) {
+    assign_slots(units, g, gd);
+    for i in 0..units.len() {
+        if units.group[i] != g || units.death_t[i] != 0 {
+            continue;
+        }
+        let p = gd.anchor + units.home[i];
+        let hh = crate::unit_types::TYPES[units.kind[i] as usize].half_height;
+        let pos = Vec3::new(p.x, terrain.height_at(p.x, p.y) + hh, p.y);
+        units.pos[i] = pos;
+        units.pos_prev[i] = pos;
+        units.vel[i] = Vec3::ZERO;
+        units.yaw[i] = gd.facing;
+        units.yaw_prev[i] = gd.facing;
+    }
+    gd.centroid = gd.anchor;
+}
+
+/// While deploying, formation commands (wall/loose/blob, width) re-dress
+/// the block instantly: `apply_reforms` lives in the frozen sim, so the
+/// pending `reform` flags are snapped here instead, right after the
+/// input sets that raise them.
+fn deploy_reform_snap(
+    mut units: ResMut<Units>,
+    terrain: Res<crate::terrain::Terrain>,
+    mut groups: ResMut<Groups>,
+) {
+    for g in 0..groups.list.len() {
+        let gd = &mut groups.list[g];
+        if gd.reform && gd.team == crate::orders::PLAYER_TEAM && gd.count > 0 {
+            snap_to_slots(&mut units, &terrain, g as u32, gd);
+        }
+    }
+}
+
 /// Wall flavor of a regiment (spacing == Wall and still fighting):
 /// 0 = none, 1 = shieldwall (sword kinds), 2 = spearwall (spears).
 /// Shared by the sim damage model and the render wall pose.
@@ -208,6 +253,12 @@ impl Plugin for FormationPlugin {
             Update,
             (
                 formation_keys.in_set(crate::game_state::BattleInputSet),
+                deploy_reform_snap
+                    .after(crate::game_state::BattleInputSet)
+                    .run_if(
+                        in_state(crate::game_state::GameState::Battle)
+                            .and_then(crate::game_state::deploying),
+                    ),
                 test_form_script,
                 rectfight_log,
             ),
