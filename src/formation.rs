@@ -35,7 +35,7 @@ const CLOSE_RANKS_PERIOD: u32 = 90;
 /// behavior, unchanged).
 const ENGAGED_CLOSE_RANKS_PERIOD: u32 = 240;
 
-/// FL_RECTFIGHT=1 (owner-gated): the M2TW melee model from the engine
+/// FL_RECTFIGHT=1 (off by default): the M2TW melee model from the engine
 /// research (devlog 0036). (1) FREEZE: the attack destination freezes
 /// once the ordered fight becomes real (count-gated); men walk into
 /// the enemy mass, bodies stop them. (2) PRESS: surplus ranks walk

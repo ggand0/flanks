@@ -1,11 +1,17 @@
-# flanks
+# FLANKS
 
-A Medieval 2: Total War style mass battle prototype in Rust and Bevy 0.19.
-Two armies of 100 regiments (1000 soldiers each) fight at a steady 30 Hz
-sim tick and interactive framerates. 200k soldiers is the standard test
-load.
+Real-time massed medieval battles in Rust and Bevy 0.19. Two armies
+of regiments fight at a steady 30 Hz sim tick and interactive
+framerates, every soldier individually simulated. Army size is
+selectable in the menu and scales with your hardware, from tens of
+thousands of soldiers up to hundreds of thousands.
 
-## What is implemented (as of the battle-feel merge)
+The battle model starts from measured Medieval 2: Total War behavior
+(swing-timer melee, morale, fatigue, routs), but the point is the
+scale: battles an order of magnitude past what the classics ran, and a
+foundation for going beyond them rather than recreating one.
+
+## What is implemented
 
 Engine:
 
@@ -65,5 +71,15 @@ mutes.
 cargo run --profile opt-dev
 ```
 
-Rust 1.95 or newer. See CLAUDE.md and devlogs/ (untracked) for
-development notes.
+Rust 1.95 or newer.
+
+## Assets
+
+There are no external art assets: unit meshes, terrain, water,
+vegetation, and all animation are generated in code. Sound effects and
+audio beds are AI-generated (ElevenLabs), plus one marching-boots loop
+from freesound.org.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

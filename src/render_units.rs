@@ -526,7 +526,7 @@ fn sync_instance_data(
                         CELEBRATE_BASE + celebrating[units.group[i] as usize]
                     } else if units.death_t[i] == 0 {
                         // Negative lunge = SMOOTHED battle stance (the
-                        // regiment tier snaps; a pose must not — owner:
+                        // regiment tier snaps; a pose must not —
                         // one-frame stance changes aren't immersive).
                         -band_chunk[i - start]
                     } else {

@@ -69,15 +69,15 @@ struct AudioBank {
     death: Vec<Handle<AudioSource>>,
     vox_rout: Vec<Handle<AudioSource>>,
     vox_rally: Vec<Handle<AudioSource>>,
-    /// Victory cheer when an ENEMY regiment breaks (owner: the
-    /// _celebrate takes are "we broke them", not rally-from-rout).
+    /// Victory cheer when an ENEMY regiment breaks (the _celebrate
+    /// takes read as "we broke them", not rally-from-rout).
     vox_cheer: Vec<Handle<AudioSource>>,
     /// Played once per regiment charge (the latched `charging` state).
     vox_warcry: Vec<Handle<AudioSource>>,
     horn_charge: Vec<Handle<AudioSource>>,
     horn_rout: Handle<AudioSource>,
     ui_select: Handle<AudioSource>,
-    /// Click feedback for a move order (quieter than select per owner).
+    /// Click feedback for a move order (mixed quieter than select).
     ui_order: Handle<AudioSource>,
     /// Click feedback for an attack order on an enemy regiment.
     ui_attack: Handle<AudioSource>,
@@ -102,7 +102,7 @@ fn setup_audio(mut commands: Commands, assets: Res<AssetServer>) {
     };
 
     commands.insert_resource(AudioBank {
-        // Owner-preferred second batch (sfx_new/) over the first clangs.
+        // The second batch (sfx_new/) won out over the first clangs.
         clang: load_set(&[
             "sfx_new/sword_clang_06",
             "sfx_new/sword_clang_07",
@@ -132,7 +132,7 @@ fn setup_audio(mut commands: Commands, assets: Res<AssetServer>) {
             "sfx_new/vox_rally_03_celebrate",
             "sfx_new/vox_rally_04_celebrate",
         ]),
-        // Owner benched vox_warcry_02 — 01 only for now.
+        // vox_warcry_02 is benched — 01 only for now.
         vox_warcry: load_set(&["sfx_new/vox_warcry_01"]),
         horn_charge: load_set(&["sig_horn_charge", "sig_horn_charge_02"]),
         horn_rout: assets.load("sfx_new/sig_horn_rout.mp3"),

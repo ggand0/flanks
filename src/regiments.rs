@@ -397,7 +397,7 @@ fn spawn_pile_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
     info!("[pile-test] six blue regiments attack ONE holding orange regiment");
 }
 
-/// FL_TEST_JOIN=1: the join-the-fight order (owner's repro). Orange
+/// FL_TEST_JOIN=1: the join-the-fight order (regression repro). Orange
 /// attacks blue A's line head-on; blue B stands BEHIND A, ordered onto
 /// the same orange regiment at spawn. Acceptance: B's march never
 /// halts for the overflow trickle that pokes it, B routes AROUND A's
@@ -410,7 +410,7 @@ fn spawn_join_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
     list[0].auto_order = true;
     // A and B carry PLAYER-issued orders (auto_order stays false): the
     // at-ease AI stands auto-engaged regiments down when their target
-    // breaks — correct doctrine, but the owner's repro is about
+    // breaks — correct doctrine, but this repro is about
     // player-ordered attacks, which persist through the rout.
     spawn_regiment(units, terrain, &mut list, 0, KIND_LIGHT, Vec2::new(0.0, 10.0), 500, -1.0);
     list[1].order = Some(crate::orders::Order::Attack(0));
@@ -456,8 +456,8 @@ fn join_test_log(
 }
 
 /// FL_TEST_ROUTPASS=1: an ordered withdrawal straight through a formed
-/// friendly line (the owner's "unit makes stupid space for retreating
-/// unit" repro). A holds its line; the passer regiment is Move-ordered
+/// friendly line (the "unit makes stupid space for retreating unit"
+/// repro). A holds its line; the passer regiment is Move-ordered
 /// through A's ranks. Acceptance: the passer slips through the seams
 /// at body scale, A's disorder bumps briefly and re-dresses — no
 /// corridor excavated, no lasting raggedness.

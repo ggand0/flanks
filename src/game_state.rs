@@ -287,7 +287,7 @@ fn spawn_menu(mut commands: Commands, config: Res<BattleConfig>) {
                 },
             ));
             p.spawn((
-                Text::new("A Medieval Total War style mass battle prototype"),
+                Text::new("Massed medieval battles, every soldier simulated"),
                 TextFont {
                     font_size: FontSize::Px(14.0),
                     ..default()

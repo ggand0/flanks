@@ -7,7 +7,7 @@ use bevy::prelude::*;
 use crate::terrain::Terrain;
 use crate::units::{Units, hash01};
 
-/// Fraction of kills that leave a crater. Disabled (owner call) — deaths
+/// Fraction of kills that leave a crater. Disabled — deaths
 /// don't blow holes in the ground; craters return with explosives/artillery.
 const CRATER_CHANCE: f32 = 0.0;
 /// Remesh guard: max craters carved per tick.

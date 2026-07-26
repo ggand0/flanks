@@ -17,10 +17,10 @@ const SEP_RADIUS: f32 = 1.4;
 /// FL_RECTFIGHT: rest distance for CROSS-TEAM pairs. Currently equal
 /// to SEP_RADIUS (same spacing as same-team). Lower values let enemy
 /// bodies enter the formation grid's gaps and produce a multi-rank
-/// fighting band; the owner tested 0.95–1.25 and found the visual
-/// clipping unacceptable with the current model scale, so it sits at
-/// parade spacing for now. Tuning target for when model proportions
-/// are revisited.
+/// fighting band; play-testing 0.95–1.25 found the visual clipping
+/// unacceptable with the current model scale, so it sits at parade
+/// spacing for now. Tuning target for when model proportions are
+/// revisited.
 const ENEMY_SEP_RADIUS: f32 = 1.4;
 const SEP_STRENGTH: f32 = 60.0;
 /// Base neighbor query radius: covers separation and sword reach. Kinds
@@ -916,7 +916,7 @@ pub fn step_sim(
                                     // Attack style for this swing (render
                                     // variety only): 0 = stab, 1 = the
                                     // classic swing. (2 = slash exists in
-                                    // the shader, benched by owner.)
+                                    // the shader but benched.)
                                     // Spears only ever thrust.
                                     let style = if my_kind
                                         == crate::unit_types::KIND_SPEAR as usize

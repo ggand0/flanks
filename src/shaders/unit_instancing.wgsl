@@ -31,12 +31,12 @@ struct VertexOutput {
     @location(0) color: vec4<f32>,
 };
 
-// Standing brace pose (split legs, crouch, raised guard): benched by
-// the owner ("weird") but kept — set to 1.0 to re-enable. Standing
-// units near an enemy hold the plain forward point instead.
+// Standing brace pose (split legs, crouch, raised guard): read as
+// weird in play-testing, benched but kept — set to 1.0 to re-enable.
+// Standing units near an enemy hold the plain forward point instead.
 const BRACE_ON: f32 = 0.0;
-// Rear-rank taunt: benched pending an owner rework ("something is
-// making me uncomfortable") — set to 1.0 to re-enable.
+// Rear-rank taunt: never looked right in play-testing; benched
+// pending a rework — set to 1.0 to re-enable.
 const TAUNT_ON: f32 = 0.0;
 
 fn rot_y(p: vec3<f32>, c: f32, s: f32) -> vec3<f32> {
