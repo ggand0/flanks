@@ -230,35 +230,34 @@ fn kind_icon_shapes(kind: u8) -> Vec<IconShape> {
             t((20.0, 0.0), (14.5, 14.0), (25.5, 14.0)),
             s((18.5, 13.0, 3.0, 34.0), [0.0; 4], ICON_RGB),
         ],
-        // Bow and arrow: tall stave (two angled segments faking the
-        // curve), a taut string, and a nocked arrow with a tip triangle.
-        KIND_ARCHER => vec![
-            IconShape::Seg {
-                a: Vec2::new(13.0, 4.0),
-                b: Vec2::new(10.0, 24.0),
-                r: 1.6,
+        // A longbow at full draw, arrow pointing left: the stave is an
+        // arc of segments bulging left, the string a V pulled to the
+        // nock, the arrow crossing the middle with head and fletching.
+        KIND_ARCHER => {
+            let seg = |a: (f32, f32), b: (f32, f32), r: f32| IconShape::Seg {
+                a: Vec2::new(a.0, a.1),
+                b: Vec2::new(b.0, b.1),
+                r,
                 rgb: ICON_RGB,
-            },
-            IconShape::Seg {
-                a: Vec2::new(10.0, 24.0),
-                b: Vec2::new(13.0, 44.0),
-                r: 1.6,
-                rgb: ICON_RGB,
-            },
-            IconShape::Seg {
-                a: Vec2::new(13.0, 4.0),
-                b: Vec2::new(13.0, 44.0),
-                r: 0.8,
-                rgb: ICON_RGB_DETAIL,
-            },
-            IconShape::Seg {
-                a: Vec2::new(13.0, 24.0),
-                b: Vec2::new(32.0, 24.0),
-                r: 1.2,
-                rgb: ICON_RGB,
-            },
-            t((36.0, 24.0), (30.0, 20.5), (30.0, 27.5)),
-        ],
+            };
+            vec![
+                // stave arc, tip to tip
+                seg((26.0, 5.0), (19.0, 10.0), 2.0),
+                seg((19.0, 10.0), (15.5, 17.0), 2.0),
+                seg((15.5, 17.0), (14.5, 24.0), 2.0),
+                seg((14.5, 24.0), (15.5, 31.0), 2.0),
+                seg((15.5, 31.0), (19.0, 38.0), 2.0),
+                seg((19.0, 38.0), (26.0, 43.0), 2.0),
+                // string drawn back to the nock
+                seg((26.0, 5.0), (33.0, 24.0), 0.9),
+                seg((33.0, 24.0), (26.0, 43.0), 0.9),
+                // the arrow: shaft, broadhead, fletching
+                seg((3.0, 24.0), (33.0, 24.0), 1.3),
+                t((0.5, 24.0), (8.0, 20.0), (8.0, 28.0)),
+                seg((30.0, 21.0), (34.5, 18.0), 1.2),
+                seg((30.0, 27.0), (34.5, 30.0), 1.2),
+            ]
+        }
         // Longsword, point up: tapered tip, blade with a dark fuller,
         // narrow crossguard, grip, pommel.
         _ => vec![

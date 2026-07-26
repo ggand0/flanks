@@ -54,6 +54,15 @@ const GAMBESON: [f32; 4] = [0.62, 0.52, 0.36, 0.15];
 const LEATHER: [f32; 4] = [0.30, 0.20, 0.12, 0.0];
 /// Arrow fletching: pale goose feather.
 const FLETCH: [f32; 4] = [0.88, 0.86, 0.78, 0.0];
+/// Ranger cloak and hood: team color pulled toward black — reads as the
+/// army's color in a darker, weathered cloth than the tabard.
+const CLOAK: [f32; 4] = [0.05, 0.06, 0.08, 0.80];
+/// The dark under the hood: the cowl swallows the upper face.
+const COWL_SHADOW: [f32; 4] = [0.07, 0.055, 0.05, 0.0];
+/// Bow stave: dark oiled yew, distinct from the pale arrow shafts.
+const BOW_WOOD: [f32; 4] = [0.33, 0.21, 0.11, 0.0];
+/// Bowstring: pale linen (light against the dark stave and cloak).
+const STRING: [f32; 4] = [0.80, 0.76, 0.66, 0.0];
 
 struct MeshBuf {
     pos: Vec<[f32; 3]>,
@@ -498,11 +507,14 @@ pub fn build_spearman() -> Mesh {
     build(m)
 }
 
-/// Archer: quilted gambeson under a team tabard, bare face framed by a
-/// team hood (no steel — the silhouette that ISN'T a helmet reads
-/// "archer" next to the kettle-hat infantry), back quiver with fletched
-/// shafts over the right shoulder, tall bow carried vertical in the
-/// left hand. 22 cuboids, 264 tris. Height 1.0 m (half_height 0.50).
+/// Archer: a ranger. Deep pointed hood swept back over the head (team
+/// cloth pulled toward black, cowl shadow swallowing the upper face),
+/// short shoulder-mantled cloak over a gambeson and team tabard, back
+/// quiver with fletched shafts, and a tall strung longbow — grip, two
+/// recurved limbs and nocks stepping forward, pale linen string tip to
+/// tip. No steel anywhere: the hooded silhouette IS the archer read.
+/// 32 cuboids, 384 tris. Height ~1.05 m to the hood point
+/// (half_height 0.50).
 pub fn build_archer() -> Mesh {
     let mut m = MeshBuf::new();
     let hip_pivot = -0.16;
@@ -537,129 +549,199 @@ pub fn build_archer() -> Mesh {
         0.0,
         TEAM,
     );
-    // bare face in a team hood: collar, side and back panels framing
-    // the face, crown, and a small peak falling backward
+    // the cloak: a back panel falling from the shoulders to the thighs
+    // and a mantle draped over the shoulders
     m.cuboid(
-        Vec3::new(0.0, 0.30, 0.0),
-        Vec3::new(0.095, 0.095, 0.095),
+        Vec3::new(0.0, -0.02, -0.128),
+        Vec3::new(0.185, 0.27, 0.020),
+        PART_BODY,
+        0.0,
+        CLOAK,
+    );
+    m.cuboid(
+        Vec3::new(0.0, 0.203, -0.02),
+        Vec3::new(0.205, 0.042, 0.125),
+        PART_BODY,
+        0.0,
+        CLOAK,
+    );
+    // the face: chin and mouth in the light, the upper half lost in the
+    // cowl's shadow under a jutting brim
+    m.cuboid(
+        Vec3::new(0.0, 0.295, 0.005),
+        Vec3::new(0.088, 0.088, 0.088),
         PART_BODY,
         0.0,
         SKIN,
     );
     m.cuboid(
-        Vec3::new(0.0, 0.215, 0.0),
-        Vec3::new(0.115, 0.03, 0.115),
+        Vec3::new(0.0, 0.345, 0.068),
+        Vec3::new(0.086, 0.042, 0.028),
         PART_BODY,
         0.0,
-        TEAM,
+        COWL_SHADOW,
     );
     m.cuboid(
-        Vec3::new(-0.108, 0.31, -0.01),
-        Vec3::new(0.014, 0.085, 0.085),
+        Vec3::new(0.0, 0.383, 0.085),
+        Vec3::new(0.102, 0.02, 0.05),
         PART_BODY,
         0.0,
-        TEAM,
+        CLOAK,
     );
+    // hood shell: cheek panels and back
     m.cuboid(
-        Vec3::new(0.108, 0.31, -0.01),
-        Vec3::new(0.014, 0.085, 0.085),
+        Vec3::new(-0.104, 0.305, -0.02),
+        Vec3::new(0.017, 0.10, 0.10),
         PART_BODY,
         0.0,
-        TEAM,
+        CLOAK,
     );
     m.cuboid(
-        Vec3::new(0.0, 0.31, -0.108),
-        Vec3::new(0.10, 0.085, 0.014),
+        Vec3::new(0.104, 0.305, -0.02),
+        Vec3::new(0.017, 0.10, 0.10),
         PART_BODY,
         0.0,
-        TEAM,
+        CLOAK,
     );
     m.cuboid(
-        Vec3::new(0.0, 0.405, -0.01),
-        Vec3::new(0.105, 0.03, 0.105),
+        Vec3::new(0.0, 0.305, -0.115),
+        Vec3::new(0.104, 0.10, 0.018),
         PART_BODY,
         0.0,
-        TEAM,
+        CLOAK,
     );
+    // the point: crown tiers stepping up and SWEEPING BACK, ending in a
+    // drooped tip — the ranger silhouette
     m.cuboid(
-        Vec3::new(0.0, 0.45, -0.045),
-        Vec3::new(0.045, 0.03, 0.045),
+        Vec3::new(0.0, 0.418, -0.02),
+        Vec3::new(0.104, 0.036, 0.112),
         PART_BODY,
         0.0,
-        TEAM,
+        CLOAK,
     );
-    // back quiver behind the right shoulder + two fletched shafts
     m.cuboid(
-        Vec3::new(0.13, 0.05, -0.145),
-        Vec3::new(0.055, 0.17, 0.05),
+        Vec3::new(0.0, 0.468, -0.065),
+        Vec3::new(0.073, 0.030, 0.080),
+        PART_BODY,
+        0.0,
+        CLOAK,
+    );
+    m.cuboid(
+        Vec3::new(0.0, 0.503, -0.118),
+        Vec3::new(0.047, 0.026, 0.055),
+        PART_BODY,
+        0.0,
+        CLOAK,
+    );
+    m.cuboid(
+        Vec3::new(0.0, 0.522, -0.172),
+        Vec3::new(0.026, 0.020, 0.036),
+        PART_BODY,
+        0.0,
+        CLOAK,
+    );
+    // back quiver over the right shoulder, clear of the cloak panel
+    m.cuboid(
+        Vec3::new(0.148, 0.05, -0.175),
+        Vec3::new(0.052, 0.17, 0.045),
         PART_BODY,
         0.0,
         LEATHER,
     );
     m.cuboid(
-        Vec3::new(0.11, 0.27, -0.15),
+        Vec3::new(0.13, 0.27, -0.18),
         Vec3::new(0.013, 0.06, 0.013),
         PART_BODY,
         0.0,
         WOOD,
     );
     m.cuboid(
-        Vec3::new(0.155, 0.25, -0.135),
+        Vec3::new(0.168, 0.25, -0.165),
         Vec3::new(0.013, 0.06, 0.013),
         PART_BODY,
         0.0,
         WOOD,
     );
     m.cuboid(
-        Vec3::new(0.11, 0.35, -0.15),
+        Vec3::new(0.13, 0.35, -0.18),
         Vec3::new(0.028, 0.04, 0.028),
         PART_BODY,
         0.0,
         FLETCH,
     );
     m.cuboid(
-        Vec3::new(0.155, 0.32, -0.135),
+        Vec3::new(0.168, 0.32, -0.165),
         Vec3::new(0.024, 0.035, 0.024),
         PART_BODY,
         0.0,
         FLETCH,
     );
-    // bow arm: gambeson sleeve + bare hand + the bow (grip back, limbs
-    // offset forward: a crude C seen from the side)
+    // bow arm: gambeson sleeve, leather bracer, bare hand
     m.cuboid(
-        Vec3::new(-0.21, shoulder - 0.02, 0.045),
-        Vec3::new(0.055, 0.055, 0.085),
+        Vec3::new(-0.21, shoulder - 0.02, 0.04),
+        Vec3::new(0.055, 0.055, 0.075),
         PART_BOW_ARM,
         shoulder,
         GAMBESON,
     );
     m.cuboid(
-        Vec3::new(-0.23, shoulder - 0.02, 0.11),
-        Vec3::new(0.04, 0.04, 0.05),
+        Vec3::new(-0.23, shoulder - 0.02, 0.115),
+        Vec3::new(0.045, 0.045, 0.035),
+        PART_BOW_ARM,
+        shoulder,
+        LEATHER,
+    );
+    m.cuboid(
+        Vec3::new(-0.235, shoulder - 0.02, 0.155),
+        Vec3::new(0.038, 0.038, 0.028),
         PART_BOW_ARM,
         shoulder,
         SKIN,
     );
+    // the longbow, strung and carried vertical: thick grip, mid limbs,
+    // recurved nocks — each tier stepping FORWARD to draw the curve —
+    // and the pale string closing tip to tip behind it
     m.cuboid(
-        Vec3::new(-0.23, 0.12, 0.16),
-        Vec3::new(0.024, 0.11, 0.024),
+        Vec3::new(-0.24, 0.12, 0.16),
+        Vec3::new(0.028, 0.105, 0.030),
         PART_BOW_ARM,
         shoulder,
-        WOOD,
+        BOW_WOOD,
     );
     m.cuboid(
-        Vec3::new(-0.23, 0.40, 0.19),
-        Vec3::new(0.018, 0.20, 0.018),
+        Vec3::new(-0.24, 0.345, 0.181),
+        Vec3::new(0.023, 0.125, 0.024),
         PART_BOW_ARM,
         shoulder,
-        WOOD,
+        BOW_WOOD,
     );
     m.cuboid(
-        Vec3::new(-0.23, -0.16, 0.19),
-        Vec3::new(0.018, 0.20, 0.018),
+        Vec3::new(-0.24, -0.105, 0.181),
+        Vec3::new(0.023, 0.125, 0.024),
         PART_BOW_ARM,
         shoulder,
-        WOOD,
+        BOW_WOOD,
+    );
+    m.cuboid(
+        Vec3::new(-0.24, 0.555, 0.211),
+        Vec3::new(0.019, 0.095, 0.019),
+        PART_BOW_ARM,
+        shoulder,
+        BOW_WOOD,
+    );
+    m.cuboid(
+        Vec3::new(-0.24, -0.315, 0.211),
+        Vec3::new(0.019, 0.095, 0.019),
+        PART_BOW_ARM,
+        shoulder,
+        BOW_WOOD,
+    );
+    m.cuboid(
+        Vec3::new(-0.24, 0.12, 0.242),
+        Vec3::new(0.007, 0.53, 0.007),
+        PART_BOW_ARM,
+        shoulder,
+        STRING,
     );
     // draw arm: gambeson sleeve + bare hand (no weapon — the stab-style
     // pull-back-and-snap is the string draw; melee is a scrappy bash)

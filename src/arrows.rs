@@ -350,7 +350,9 @@ fn update_arrows(
             let arrow_y = prev.y + (p.y - prev.y) * t;
             let hh = TYPES[units.kind[u] as usize].half_height;
             let uy = units.pos[u].y;
-            if arrow_y < uy - hh || arrow_y > uy + hh + 0.15 {
+            // Top margin stays BELOW the launch height (movement.rs
+            // looses at +0.75 over mid-body) or shooters hit themselves.
+            if arrow_y < uy - hh || arrow_y > uy + hh + 0.05 {
                 return;
             }
             if best.is_none_or(|(bt, _)| t < bt) {
@@ -433,13 +435,15 @@ fn update_arrows(
     }
 }
 
-/// Skirmish trigger: a formed enemy block's centroid inside this ring
-/// starts the back-step. No M2TW value exists (the manual only says
-/// "keep a safe distance, usually its missile range") — these are feel
-/// knobs sized so archers reopen to comfortable shooting range.
-const SKIRMISH_TRIGGER: f32 = 35.0;
-/// The withdrawal runs until the gap reopens to this.
-const SKIRMISH_REOPEN: f32 = 55.0;
+/// Skirmish trigger: EDGE gap (centroid distance minus both footprint
+/// radii) — centroid rings read absurdly late for 1000-man blocks
+/// whose fronts touch at 30+ m of centroid separation. No M2TW value
+/// exists (the manual only says "keep a safe distance, usually its
+/// missile range") — these are feel knobs sized so the back-step
+/// starts with real room to run.
+const SKIRMISH_TRIGGER: f32 = 22.0;
+/// The withdrawal runs until the edge gap reopens to this.
+const SKIRMISH_REOPEN: f32 = 40.0;
 
 /// Archer regiment upkeep, before the tick: the M2TW skirmish rule
 /// ("keep a safe distance between itself and the enemy", manual) as an
@@ -481,26 +485,25 @@ fn skirmish_and_ammo(
         if gd.order.is_some() && !gd.skirmishing {
             continue;
         }
-        // Nearest formed enemy block.
+        // Nearest formed enemy block, by EDGE gap.
         let mut nearest: Option<(f32, Vec2)> = None;
         for eg in groups.list.iter() {
             if eg.team == gd.team || eg.count == 0 || eg.state.is_broken() {
                 continue;
             }
-            let d2 = eg.centroid.distance_squared(gd.centroid);
-            if nearest.is_none_or(|(bd, _)| d2 < bd) {
-                nearest = Some((d2, eg.centroid));
+            let gap = eg.centroid.distance(gd.centroid) - eg.radius - gd.radius;
+            if nearest.is_none_or(|(bd, _)| gap < bd) {
+                nearest = Some((gap, eg.centroid));
             }
         }
         let centroid = gd.centroid;
         let was_skirmishing = gd.skirmishing;
         match nearest {
-            Some((d2, ec)) if d2 < SKIRMISH_TRIGGER * SKIRMISH_TRIGGER => {
+            Some((gap, ec)) if gap < SKIRMISH_TRIGGER => {
                 // Back-step directly away, far enough to reopen the gap.
                 let away = (centroid - ec).normalize_or_zero();
                 let away = if away == Vec2::ZERO { Vec2::Y } else { away };
-                let d = d2.sqrt();
-                let mut dest = centroid + away * (SKIRMISH_REOPEN - d + 5.0);
+                let mut dest = centroid + away * (SKIRMISH_REOPEN - gap + 5.0);
                 let (mn, mx) = (terrain.min() + 12.0, terrain.max() - 12.0);
                 dest = dest.clamp(mn, mx);
                 let gd = &mut groups.list[g];
@@ -508,7 +511,7 @@ fn skirmish_and_ammo(
                 gd.auto_order = true;
                 gd.skirmishing = true;
             }
-            Some((d2, _)) if was_skirmishing && d2 > SKIRMISH_REOPEN * SKIRMISH_REOPEN => {
+            Some((gap, _)) if was_skirmishing && gap > SKIRMISH_REOPEN => {
                 // Gap reopened: stand, dress where we are, shoot.
                 let gd = &mut groups.list[g];
                 gd.skirmishing = false;
@@ -556,7 +559,9 @@ fn sync_arrow_instances(
         let pitch = v.y.atan2(v.xz().length());
         data.0.push(InstanceData {
             position: p,
-            scale: 1.0,
+            // Flying arrows draw a third oversized: a volley must READ
+            // at battle zoom (the ground litter stays true-scale).
+            scale: 1.35,
             color: [1.0, 1.0, 1.0, 0.0],
             anim: [yaw, 0.0, 0.0, 0.0],
             anim2: [0.0, 0.0, pitch, 0.0],

@@ -976,8 +976,14 @@ pub fn step_sim(
                                                 (h(0x5DC1) + h(0x6B8D) - 1.0) * sigma,
                                             );
                                         aim += s.vel * (aim.distance(p) / 30.0);
+                                        // Launch ABOVE the body-hit band
+                                        // (arrows.rs tops out at ground
+                                        // + 1.15): a shaft leaving at
+                                        // head height is inside its own
+                                        // shooter's hit cylinder at
+                                        // flight-time zero and kills him.
                                         let from =
-                                            Vec3::new(p.x, pos_prev[i].y + 0.55, p.y);
+                                            Vec3::new(p.x, pos_prev[i].y + 0.75, p.y);
                                         let to = Vec3::new(
                                             aim.x,
                                             terrain.height_at(aim.x, aim.y) + 0.7,

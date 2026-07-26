@@ -293,8 +293,12 @@ fn update_groups(units: Res<Units>, mut groups: ResMut<Groups>) {
         // and is striking. TW rule — one soldier fighting engages the
         // regiment. (`target` is stale outside a swing cycle and `swing`
         // spawns in Recover for strike staggering — neither is usable.)
+        // A bow DRAW is a wind-up too but not melee: counting it made
+        // an archer regiment "engaged" the moment it drew, which
+        // silenced its own fire solution before the first loose.
         if units.death_t[i] == 0
             && units.swing[i] & crate::units::SWING_STATE_MASK == crate::units::SWING_WINDUP
+            && units.swing[i] & crate::units::SWING_RANGED == 0
         {
             fighting[g] = true;
         }
