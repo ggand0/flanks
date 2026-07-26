@@ -50,7 +50,7 @@ fn main() {
                 })
                 .set(WindowPlugin {
                     primary_window: Some(Window {
-                        title: "frontline".into(),
+                        title: "flanks".into(),
                         // Default vsync off: the FPS overlay should
                         // show real headroom.
                         present_mode: settings::present_mode(&user_settings),

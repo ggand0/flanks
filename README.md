@@ -1,4 +1,4 @@
-# cascade ("frontline")
+# flanks
 
 A Medieval 2: Total War style mass battle prototype in Rust and Bevy 0.19.
 Two armies of 100 regiments (1000 soldiers each) fight at a steady 30 Hz

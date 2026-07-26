@@ -1,7 +1,7 @@
 //! Persistent user settings + the settings modal.
 //!
 //! Settings live in a plain `Settings` resource, saved as YAML to the
-//! platform config dir (Linux: ~/.config/frontline/settings.yaml).
+//! platform config dir (Linux: ~/.config/flanks/settings.yaml).
 //! Saving is debounced off resource change detection, so every edit
 //! path (sliders, toggles, future ones) persists without remembering
 //! to call save. Consumers (audio, camera, window) read the resource
@@ -79,7 +79,7 @@ impl Default for VideoSettings {
 }
 
 fn settings_path() -> Option<std::path::PathBuf> {
-    Some(dirs::config_dir()?.join("frontline").join("settings.yaml"))
+    Some(dirs::config_dir()?.join("flanks").join("settings.yaml"))
 }
 
 impl Settings {
