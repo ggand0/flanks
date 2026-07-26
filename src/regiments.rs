@@ -208,13 +208,13 @@ pub fn do_spawn_battle(
 }
 
 /// FL_TEST_ARCHERY: the archer sandbox (also on the menu's debug list).
-/// Two blue archer regiments stand behind a friendly light screen;
-/// three orange regiments hold just OUTSIDE bow range — attack-order
-/// the archers onto one to watch the stand-off halt at ~100 m and the
-/// volleys arc over the screen's heads. One orange regiment marches in
-/// from deep, demonstrating fire-at-will, target lead against a moving
-/// block, and the skirmish back-step when it closes. Everything else
-/// stands down (scripted scenario: no AI).
+/// Two blue archer regiments stand behind a friendly light screen. The
+/// enemy is fully STATIC: the middle orange block holds INSIDE bow
+/// range (fire-at-will opens up within seconds), the flank blocks hold
+/// just outside it (attack-order the archers onto one to watch the
+/// stand-off halt and the arcs over the screen's heads). Nothing
+/// chases. FL_ARCHERY_ATTACK=1 adds the old deep attacker for the
+/// fire-at-will / lead / skirmish demo.
 fn spawn_archery_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
     let size = crate::util::env_or("FL_REG_SIZE", 500_usize).max(50);
     let mut list = Vec::new();
@@ -224,21 +224,24 @@ fn spawn_archery_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups)
     for x in [-30.0, 30.0] {
         spawn_regiment(units, terrain, &mut list, 0, KIND_ARCHER, Vec2::new(x, -90.0), size, -1.0);
     }
-    // Orange: three blocks holding a line just outside the 120 m bow.
-    for x in [-60.0, 0.0, 60.0] {
-        spawn_regiment(units, terrain, &mut list, 1, KIND_LIGHT, Vec2::new(x, 40.0), size, 1.0);
+    // Orange: middle block in range (~110 m), flanks just outside.
+    for (x, z) in [(-60.0, 40.0), (0.0, 20.0), (60.0, 40.0)] {
+        spawn_regiment(units, terrain, &mut list, 1, KIND_LIGHT, Vec2::new(x, z), size, 1.0);
         let g = list.len() - 1;
         list[g].hold = true;
     }
-    // The deep attacker: ordered onto the west archer regiment.
-    spawn_regiment(units, terrain, &mut list, 1, KIND_LIGHT, Vec2::new(-30.0, 110.0), size, 1.0);
-    let g = list.len() - 1;
-    list[g].order = Some(crate::orders::Order::Attack(1));
-    list[g].auto_order = true;
+    // Optional deep attacker, ordered onto the west archer regiment.
+    if std::env::var("FL_ARCHERY_ATTACK").is_ok() {
+        spawn_regiment(units, terrain, &mut list, 1, KIND_LIGHT, Vec2::new(-30.0, 110.0), size, 1.0);
+        let g = list.len() - 1;
+        list[g].order = Some(crate::orders::Order::Attack(1));
+        list[g].auto_order = true;
+    }
     groups.list = list;
     info!(
-        "[archery] 2 archer regiments behind a screen; 3 orange blocks hold beyond bow range \
-         (attack-order for the stand-off); 1 attacker inbound from deep (skirmish demo)"
+        "[archery] 2 archer regiments behind a screen; orange holds STATIC — middle block in \
+         bow range, flanks beyond it (attack-order for the stand-off); FL_ARCHERY_ATTACK=1 \
+         adds a charging attacker"
     );
 }
 
@@ -251,7 +254,7 @@ fn archery_log(
     time: Res<Time>,
     mut next: Local<f32>,
 ) {
-    if std::env::var("FL_TEST_ARCHERY").is_err() || groups.list.len() < 7 {
+    if std::env::var("FL_TEST_ARCHERY").is_err() || groups.list.len() < 6 {
         return;
     }
     let t = time.elapsed_secs();
@@ -268,9 +271,21 @@ fn archery_log(
             if gd.order.is_some() { "O" } else { "-" },
         )
     };
+    let attacker = groups
+        .list
+        .get(6)
+        .map(|a| {
+            format!(
+                ", attacker {} ({}) at {:.0} m",
+                a.count,
+                flag(a),
+                a.centroid.distance(groups.list[1].centroid)
+            )
+        })
+        .unwrap_or_default();
     info!(
-        "[archery] t={t:.0}s archers {} ({}, ammo {}) / {} ({}, ammo {}) | flight {} | \
-         screen {} | holders {}/{}/{} | attacker {} ({}) at {:.0} m",
+        "[archery] t={t:.0}s archers {} ({}, ammo {}) / {} ({}, ammo {}) | flight {} \
+         (dropped {}) | screen {} | holders {}/{}/{}{attacker}",
         groups.list[1].count,
         flag(&groups.list[1]),
         groups.list[1].ammo_left,
@@ -278,13 +293,11 @@ fn archery_log(
         flag(&groups.list[2]),
         groups.list[2].ammo_left,
         arrows.len(),
+        astats.dropped,
         groups.list[0].count,
         groups.list[3].count,
         groups.list[4].count,
         groups.list[5].count,
-        groups.list[6].count,
-        flag(&groups.list[6]),
-        groups.list[6].centroid.distance(groups.list[1].centroid),
     );
 }
 
