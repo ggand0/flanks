@@ -37,6 +37,13 @@ fn ui_vol(s: &crate::settings::Settings) -> f32 {
 /// Bed smoothing time constant (seconds to ~2/3 of the way to target).
 const BED_SMOOTH: f32 = 0.35;
 
+/// Hard ceiling on simultaneously playing one-shots. Every one-shot is
+/// a live decoder on rodio's single mixer thread; past ~50 the stream
+/// underruns ("Buffer underrun/overrun" errors, audible dropouts,
+/// owner-hit with the volley layers). The budgets shape the sound;
+/// this guard protects the mixer no matter what the budgets do.
+const MAX_LIVE_ONE_SHOTS: usize = 40;
+
 /// Massed-volley sheet cues: BENCHED — the pre-rendered 2.5 s sheets
 /// don't track the actual flight (they fire on rate edges, so onset,
 /// length, and position all drift from what's on screen). The likely
@@ -451,10 +458,13 @@ fn archer_one_shots(
     time: Res<Time>,
     virt_time: Res<Time<Virtual>>,
     settings: Res<crate::settings::Settings>,
+    playing: Query<(), (With<AudioPlayer>, Without<Bed>)>,
     mut st: Local<ArrowAudioState>,
 ) {
     let Some(bank) = bank else { return };
     let Ok(cam) = camera.single() else { return };
+    // Mixer-protection allowance for this frame (see MAX_LIVE_ONE_SHOTS).
+    let mut allowance = MAX_LIVE_ONE_SHOTS.saturating_sub(playing.iter().count()) as u32;
     // A paused sim freezes the per-tick counters at their last values:
     // integrating them while paused would drip phantom arrows forever.
     if virt_time.is_paused() {
@@ -512,9 +522,11 @@ fn archer_one_shots(
     // count only mildly; it mostly quiets the clips.
     st.loose_acc +=
         astats.loosed as f32 * 30.0 * dt * 0.35 * shooter_prox * (0.4 + 0.6 * zoom_att);
+    st.loose_acc = st.loose_acc.min(5.0);
     let mut n = (st.loose_acc).floor() as u32;
     st.loose_acc -= n as f32;
-    n = n.min(4);
+    n = n.min(4).min(allowance);
+    allowance -= n;
     for k in 0..n {
         let seed = st.frame.wrapping_mul(53) ^ k ^ 0x51;
         if let Some(h) = pick(&bank.bow_loose, seed) {
@@ -531,9 +543,11 @@ fn archer_one_shots(
     // and the dirt patter of the misses, near the falling cloud. Same
     // mass-scale budgeting as the looses.
     st.impact_acc += astats.hits as f32 * 30.0 * dt * 0.30 * cloud_prox * (0.4 + 0.6 * zoom_att);
+    st.impact_acc = st.impact_acc.min(4.0);
     let mut n = (st.impact_acc).floor() as u32;
     st.impact_acc -= n as f32;
-    n = n.min(3);
+    n = n.min(3).min(allowance);
+    allowance -= n;
     for k in 0..n {
         let seed = st.frame.wrapping_mul(71) ^ k ^ 0x62;
         let set = if hash01(seed ^ 0xA7) < 0.2 {
@@ -552,9 +566,11 @@ fn archer_one_shots(
     }
     let ground = astats.landed.saturating_sub(astats.hits);
     st.ground_acc += ground as f32 * 30.0 * dt * 0.10 * cloud_prox * (0.4 + 0.6 * zoom_att);
+    st.ground_acc = st.ground_acc.min(3.0);
     let mut n = (st.ground_acc).floor() as u32;
     st.ground_acc -= n as f32;
-    n = n.min(2);
+    n = n.min(2).min(allowance);
+    allowance -= n;
     for k in 0..n {
         let seed = st.frame.wrapping_mul(89) ^ k ^ 0x73;
         if let Some(h) = pick(&bank.arrow_ground, seed) {
@@ -603,18 +619,19 @@ fn archer_one_shots(
     // thickens, and fades with the actual flight; a lone skirmish
     // arrow stays a lone whistle. Camera must be down in it (zoom).
     if zoom_att > 0.35 {
-        st.flyby_acc += falling_near as f32 * dt * 0.5 * zoom_att;
+        st.flyby_acc += falling_near as f32 * dt * 0.28 * zoom_att;
     }
+    st.flyby_acc = st.flyby_acc.min(3.0);
     let mut n = (st.flyby_acc).floor() as u32;
     st.flyby_acc -= n as f32;
-    n = n.min(3);
+    n = n.min(2).min(allowance);
     for k in 0..n {
         let seed = st.frame.wrapping_mul(173) ^ k ^ 0x84;
         if let Some(h) = pick(&bank.arrow_flyby, seed) {
             one_shot(
                 &mut commands,
                 h,
-                (0.08 + 0.06 * hash01(seed ^ 0x17)) * zoom_att * bv,
+                (0.05 + 0.04 * hash01(seed ^ 0x17)) * zoom_att * bv,
                 0.86 + 0.28 * hash01(seed ^ 0x28),
             );
         }
