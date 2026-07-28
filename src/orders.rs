@@ -179,6 +179,10 @@ pub struct GroupData {
     pub skirmishing: bool,
     /// Arrows left across the regiment (summed per tick, HUD ammo bar).
     pub ammo_left: u32,
+    /// The regiment has a live fire solution this tick (archers:
+    /// target in range, not marching, not in melee, arrows left) —
+    /// drives the unit card's firing indicator, M2TW-style.
+    pub firing: bool,
 }
 
 impl GroupData {
@@ -230,6 +234,7 @@ impl GroupData {
             } else {
                 0
             },
+            firing: false,
         }
     }
 }

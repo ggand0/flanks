@@ -431,6 +431,11 @@ pub fn step_sim(
             })
         })
         .collect();
+    // The card's firing indicator: a fire solution exists and there are
+    // arrows to spend on it.
+    for (g, s) in shoot_at.iter().enumerate() {
+        groups.list[g].firing = s.is_some() && groups.list[g].ammo_left > 0;
+    }
     let shoot_at = &shoot_at[..];
     // Friendly blocks per team for the loft-over-friendlies check: every
     // live formed regiment as a disc with a clearance ceiling. A

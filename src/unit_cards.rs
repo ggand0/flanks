@@ -44,6 +44,12 @@ struct CardFatigue(usize);
 #[derive(Component)]
 struct CardAmmo(usize);
 
+/// Firing indicator (archer cards only): a tinted mini bow icon in the
+/// card's top-right corner while the regiment has a live fire solution
+/// (GroupData::firing) — the M2TW "this unit is shooting" read.
+#[derive(Component)]
+struct CardFiring(usize);
+
 /// The card's kind art: the rasterized icon (`icon: true`, shown on
 /// wide cards) or the letter fallback (`icon: false`, narrow cards).
 #[derive(Component)]
@@ -91,6 +97,8 @@ const KIND_FILL: [Color; NUM_KINDS] = [
 const FILL_BROKEN: Color = crate::banners::FLAG_BROKEN[0];
 /// Ammo strip: pale straw (arrow shafts).
 const AMMO_COLOR: Color = Color::srgb(0.85, 0.78, 0.50);
+/// Firing indicator tint: hot amber over the bow pictogram.
+const FIRING_COLOR: Color = Color::srgb(1.0, 0.62, 0.22);
 const SEL_OUTLINE: Color = Color::srgb(0.95, 0.95, 0.90);
 
 const BTN_ACTIVE: Color = Color::srgba(0.22, 0.38, 0.62, 0.95);
@@ -718,6 +726,24 @@ fn spawn_card(strip: &mut ChildSpawnerCommands, g: usize, kind: u8, icon: Handle
                     BackgroundColor(AMMO_COLOR),
                     CardAmmo(g),
                 ));
+                // Firing indicator: the card's own bow icon, mini and
+                // amber, tucked under the status strips.
+                card.spawn((
+                    Node {
+                        position_type: PositionType::Absolute,
+                        right: Val::Px(1.0),
+                        top: Val::Px(13.0),
+                        width: Val::Px(10.0),
+                        height: Val::Px(12.0),
+                        ..default()
+                    },
+                    ImageNode {
+                        color: FIRING_COLOR,
+                        ..ImageNode::new(icon.clone())
+                    },
+                    Visibility::Hidden,
+                    CardFiring(g),
+                ));
             }
             card.spawn((
                 Text::new(kind_letter(kind)),
@@ -957,6 +983,7 @@ fn refresh_cards(
             Without<CardArt>,
         ),
     >,
+    mut firing_icons: Query<(&CardFiring, &mut Visibility)>,
 ) {
     wide.clear();
     wide.resize(groups.list.len(), false);
@@ -1037,6 +1064,15 @@ fn refresh_cards(
             node.width = want;
         }
         bg.set_if_neq(BackgroundColor(AMMO_COLOR));
+    }
+
+    for (firing, mut vis) in &mut firing_icons {
+        let gd = &groups.list[firing.0];
+        vis.set_if_neq(if gd.firing && gd.count > 0 && !gd.state.is_broken() {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        });
     }
 
     // Display (not Visibility) so the hidden one leaves the flex layout;
