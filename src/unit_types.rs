@@ -51,14 +51,18 @@ pub mod missile {
     /// Landing scatter sigma in meters, RANGE-INDEPENDENT (the measured
     /// M2TW quirk: accuracy does not improve up close).
     pub const SCATTER_SIGMA: f32 = 3.0;
-    /// Damage of a landed arrow at combat factor 0. Anchored to the
-    /// MEASURED M2TW kill rate (Withwnar's 4-volley tests, devlog 0060:
-    /// ~10% of loosed arrows kill vs unshielded levies): with our
-    /// ~20-25% body-hit rate into a packed block, roughly a third to a
-    /// half of HITS on a light must kill — arrows shred unarmored men,
-    /// chip plate. First value 12 played far too soft (a volley killed
-    /// nobody, owner playtest).
-    pub const BASE_DMG: f32 = 40.0;
+    /// Missile damage curve, CALIBRATED against archery-range logs
+    /// (devlog 0064). Arrows use a steeper factor multiplier than melee:
+    /// armour and shields blunt a falling shaft far harder than they
+    /// blunt a sword, and with the melee curve the measured spread was
+    /// only 2.5x between shielded lights (9.4% kills/arrow — hotter
+    /// than M2TW's measured 10% vs UNARMORED men) and plate heavies
+    /// (3.7%). With this curve, measured: ~11% vs unarmored (the
+    /// Withwnar anchor), ~4% vs shielded lights, ~1% vs heavies, and
+    /// archer-vs-archer duels stay lethal (their factor is +5).
+    pub const FACTOR_MULT: f32 = 1.28;
+    /// Damage of a landed arrow at missile factor 0.
+    pub const BASE_DMG: f32 = 20.0;
 }
 
 /// Damage swing per combat factor point (M2TW uses ~1.2 on kill CHANCE;

@@ -163,11 +163,11 @@ pub fn push_unit(
     ];
     /// Archers wear CLOTH palettes instead of the raw team color: the
     /// mesh's team-blend parts (hood, tunic) lerp toward this per-unit
-    /// instance color, so the blue army fields the owner-approved
-    /// Lincoln-green foresters and the orange army a russet company —
-    /// allegiance reads by palette, banners carry the exact team hue.
+    /// instance color — muted woolen dyes of each army's hue, so
+    /// allegiance reads at a glance while banners and cards carry the
+    /// exact team color.
     const ARCHER_CLOTH: [Vec3; 2] = [
-        Vec3::new(0.30, 0.38, 0.20), // blue army: Lincoln green
+        Vec3::new(0.20, 0.32, 0.48), // blue army: dyed slate-blue wool
         Vec3::new(0.58, 0.35, 0.16), // orange army: autumn russet
     ];
     let params = &crate::unit_types::TYPES[kind as usize];

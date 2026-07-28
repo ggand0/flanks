@@ -122,11 +122,21 @@ fn ai_think(
             continue;
         }
         let from = gr.centroid;
+        // Archers weigh armour: an attack order for them is a fire
+        // order (the stand-off), and arrows respect armour and shields,
+        // so the AI's bows prefer soft targets over near ones. 12 m of
+        // march per protection point trades cheaply against the 2-4x
+        // damage swing.
+        let archer = gr.kind == crate::unit_types::KIND_ARCHER;
         let Some((best, _)) = (0..groups.list.len())
             .filter(|&tg| alive_player(&groups, tg))
             .map(|tg| {
-                let cost =
+                let mut cost =
                     from.distance(groups.list[tg].centroid) + SPREAD_PENALTY * load[tg] as f32;
+                if archer {
+                    let pt = &crate::unit_types::TYPES[groups.list[tg].kind as usize];
+                    cost += 12.0 * (pt.armour + pt.shield);
+                }
                 (tg, cost)
             })
             .min_by(|a, b| a.1.total_cmp(&b.1))

@@ -233,8 +233,19 @@ fn spawn_archery_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups)
         spawn_regiment(units, terrain, &mut list, 0, KIND_ARCHER, Vec2::new(x, -90.0), size, -1.0);
     }
     // Orange: middle block in range (~110 m), flanks just outside.
-    for (x, z) in [(-60.0, 40.0), (0.0, 20.0), (60.0, 40.0)] {
-        spawn_regiment(units, terrain, &mut list, 1, KIND_LIGHT, Vec2::new(x, z), size, 1.0);
+    // FL_ARCHERY_TARGET=heavy|spear swaps the middle block's kind (the
+    // calibration target: kills per volley by armour class).
+    let mid_kind = match std::env::var("FL_ARCHERY_TARGET").as_deref() {
+        Ok("heavy") => KIND_HEAVY,
+        Ok("spear") => KIND_SPEAR,
+        _ => KIND_LIGHT,
+    };
+    for (x, z, kind) in [
+        (-60.0, 40.0, KIND_LIGHT),
+        (0.0, 20.0, mid_kind),
+        (60.0, 40.0, KIND_LIGHT),
+    ] {
+        spawn_regiment(units, terrain, &mut list, 1, kind, Vec2::new(x, z), size, 1.0);
         let g = list.len() - 1;
         list[g].hold = true;
     }

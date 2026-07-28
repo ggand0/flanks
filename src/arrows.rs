@@ -16,7 +16,7 @@ use bevy::camera::visibility::NoFrustumCulling;
 use bevy::render::batching::NoAutomaticBatching;
 
 use crate::render_units::{InstanceData, InstanceMaterialData};
-use crate::unit_types::{FACTOR_CLAMP, FACTOR_MULT, TYPES, missile};
+use crate::unit_types::{FACTOR_CLAMP, TYPES, missile};
 use crate::units::hash01;
 
 /// Live-arrow pool cap. Sized ~4x the steady state of a 200k battle with
@@ -462,7 +462,9 @@ fn update_arrows(
         let shield = if front || left_side { pv.shield } else { 0.0 };
         let factor =
             (missile::ATTACK - (pv.armour + shield)).clamp(-FACTOR_CLAMP, FACTOR_CLAMP);
-        let dmg = missile::BASE_DMG * FACTOR_MULT.powf(factor) * h.jit * combat_scale;
+        // The missile curve is steeper than melee's (missile::FACTOR_MULT):
+        // armour classes must separate hard under arrows (devlog 0064).
+        let dmg = missile::BASE_DMG * missile::FACTOR_MULT.powf(factor) * h.jit * combat_scale;
         units.hp[v] -= dmg;
         units.flash[v] = 4;
         if units.hp[v] <= 0.0 {
