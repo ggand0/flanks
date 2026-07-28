@@ -167,6 +167,22 @@ pub struct GroupData {
     /// apply pass): recent_kills vs recent_deaths is the winning/losing-
     /// melee morale factor.
     pub recent_kills: u32,
+    // --- ranged (archer regiments only; dead flags for melee kinds) ---
+    /// Fire-at-will (M2TW default ON): with no explicit target order,
+    /// the regiment's bows engage the nearest enemy block in range.
+    pub fire_at_will: bool,
+    /// Skirmish mode (M2TW default ON for missile troops): back-step
+    /// when a formed enemy closes, reopen the gap, resume shooting.
+    pub skirmish: bool,
+    /// The current Move order is an auto skirmish withdrawal (ours to
+    /// clear when the gap reopens; distinct from player orders).
+    pub skirmishing: bool,
+    /// Arrows left across the regiment (summed per tick, HUD ammo bar).
+    pub ammo_left: u32,
+    /// The regiment has a live fire solution this tick (archers:
+    /// target in range, not marching, not in melee, arrows left) —
+    /// drives the unit card's firing indicator, M2TW-style.
+    pub firing: bool,
 }
 
 impl GroupData {
@@ -210,6 +226,15 @@ impl GroupData {
             state: RegState::Steady,
             recent_deaths: 0,
             recent_kills: 0,
+            fire_at_will: true,
+            skirmish: kind == crate::unit_types::KIND_ARCHER,
+            skirmishing: false,
+            ammo_left: if kind == crate::unit_types::KIND_ARCHER {
+                count as u32 * crate::unit_types::missile::AMMO as u32
+            } else {
+                0
+            },
+            firing: false,
         }
     }
 }

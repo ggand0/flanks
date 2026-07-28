@@ -37,6 +37,24 @@ fn ui_vol(s: &crate::settings::Settings) -> f32 {
 /// Bed smoothing time constant (seconds to ~2/3 of the way to target).
 const BED_SMOOTH: f32 = 0.35;
 
+/// Hard ceiling on simultaneously playing one-shots. Every one-shot is
+/// a live decoder on rodio's single mixer thread; the underruns
+/// ("Buffer underrun/overrun" errors, audible dropouts) appeared north
+/// of ~100 concurrent. The first guess of 40 audibly starved the loose
+/// and impact layers themselves (a volley's looses alone stack ~50
+/// clips), so the ceiling sits between the two: high enough for the
+/// full volley chorus, under the measured breaking point. The budgets
+/// shape the sound; this guard protects the mixer.
+const MAX_LIVE_ONE_SHOTS: usize = 64;
+
+/// Massed-volley sheet cues: BENCHED — the pre-rendered 2.5 s sheets
+/// don't track the actual flight (they fire on rate edges, so onset,
+/// length, and position all drift from what's on screen). The likely
+/// replacement is many INDIVIDUAL whoosh/swish one-shots budgeted from
+/// the live arrow cloud so the volley layers itself organically, like
+/// every other sound here. Set to true to hear the sheets again.
+const VOLLEY_SHEETS_ON: bool = false;
+
 pub struct BattleAudioPlugin;
 
 impl Plugin for BattleAudioPlugin {
@@ -47,14 +65,20 @@ impl Plugin for BattleAudioPlugin {
         app.add_systems(Startup, setup_audio)
             .add_systems(
                 Update,
-                (update_beds, combat_one_shots, event_cues)
+                (
+                    update_beds,
+                    combat_one_shots,
+                    archer_one_shots,
+                    arrow_fly_loops,
+                    event_cues,
+                )
                     .chain()
                     .run_if(in_state(GameState::Battle)),
             )
             // Beds cut on leaving battle; one-shots survive into the
             // results screen (the victory/defeat sting must finish)
             // and are only culled when the menu comes up.
-            .add_systems(OnExit(GameState::Battle), silence_beds)
+            .add_systems(OnExit(GameState::Battle), (silence_beds, stop_fly_loops))
             .add_systems(OnEnter(GameState::Menu), stop_one_shots);
     }
 }
@@ -83,6 +107,22 @@ struct AudioBank {
     ui_attack: Handle<AudioSource>,
     sting_victory: Handle<AudioSource>,
     sting_defeat: Handle<AudioSource>,
+    // --- archer set (sfx_bow/, prompts in tmp/archer-sfx-prompts.md) ---
+    /// Single string-snap releases, budgeted from ArrowStats.loosed.
+    bow_loose: Vec<Handle<AudioSource>>,
+    /// Body hits; the wood knocks mix in at low odds (shielded men).
+    arrow_flesh: Vec<Handle<AudioSource>>,
+    arrow_wood: Vec<Handle<AudioSource>>,
+    /// Shafts thudding into dirt (the miss patter).
+    arrow_ground: Vec<Handle<AudioSource>>,
+    /// Near-miss whistle for close-up incoming fire.
+    arrow_flyby: Vec<Handle<AudioSource>>,
+    /// Seamless in-flight air loop, attached per arrow (the M2TW
+    /// ARROW_FLY model). Missing files stay silent until generated.
+    arrow_fly_loop: Vec<Handle<AudioSource>>,
+    /// Massed-volley sheets: loosed away / falling on the camera.
+    volley_away: Vec<Handle<AudioSource>>,
+    volley_incoming: Vec<Handle<AudioSource>>,
 }
 
 /// Looping bed entities, indexed by `Bed`.
@@ -141,6 +181,38 @@ fn setup_audio(mut commands: Commands, assets: Res<AssetServer>) {
         ui_attack: assets.load("sfx_new/ui_attack.mp3"),
         sting_victory: assets.load("sting_victory.mp3"),
         sting_defeat: assets.load("sting_defeat.mp3"),
+        bow_loose: load_set(&[
+            "sfx_bow/sfx_bow_loose_01",
+            "sfx_bow/sfx_bow_loose_02",
+            "sfx_bow/sfx_bow_loose_03",
+            "sfx_bow/sfx_bow_loose_04",
+        ]),
+        arrow_flesh: load_set(&[
+            "sfx_bow/sfx_arrow_flesh_01",
+            "sfx_bow/sfx_arrow_flesh_02",
+            "sfx_bow/sfx_arrow_flesh_03",
+        ]),
+        arrow_wood: load_set(&["sfx_bow/sfx_arrow_wood_01", "sfx_bow/sfx_arrow_wood_02"]),
+        arrow_ground: load_set(&[
+            "sfx_bow/sfx_arrow_ground_01",
+            "sfx_bow/sfx_arrow_ground_02",
+            "sfx_bow/sfx_arrow_ground_03",
+        ]),
+        arrow_flyby: load_set(&["sfx_bow/sfx_arrow_flyby_01", "sfx_bow/sfx_arrow_flyby_02"]),
+        arrow_fly_loop: load_set(&[
+            "sfx_bow/sfx_arrow_fly_loop_01",
+            "sfx_bow/sfx_arrow_fly_loop_02",
+        ]),
+        volley_away: vec![
+            assets.load("sfx_bow/sfx_volley_away_01.wav"),
+            assets.load("sfx_bow/sfx_volley_away_02.mp3"),
+            assets.load("sfx_bow/sfx_volley_away_03.mp3"),
+        ],
+        volley_incoming: vec![
+            assets.load("sfx_bow/volley_02_flight_incoming.wav"),
+            assets.load("sfx_bow/arrow_incoming_02_several.mp3"),
+            assets.load("sfx_bow/arrow_incoming_03.mp3"),
+        ],
     });
 
     let bed = |name: &str| {
@@ -162,6 +234,14 @@ fn setup_audio(mut commands: Commands, assets: Res<AssetServer>) {
 fn silence_beds(mut sinks: Query<&mut AudioSink, With<Bed>>) {
     for mut sink in &mut sinks {
         sink.set_volume(Volume::Linear(0.0));
+    }
+}
+
+/// Looping fly sounds must not ring into the results screen (one-shots
+/// may — the sting must finish; a loop never finishes).
+fn stop_fly_loops(mut commands: Commands, loops: Query<Entity, With<ArrowFlyLoop>>) {
+    for e in &loops {
+        commands.entity(e).despawn();
     }
 }
 
@@ -258,6 +338,19 @@ fn update_beds(
     }
 }
 
+/// Mean XZ of the live arrow pool — where "the volley" is for
+/// proximity purposes. None when nothing is in the air.
+fn arrow_cloud(arrows: &crate::arrows::Arrows) -> Option<Vec2> {
+    if arrows.len() == 0 {
+        return None;
+    }
+    let mut sum = Vec2::ZERO;
+    for p in &arrows.pos {
+        sum += p.xz();
+    }
+    Some(sum / arrows.len() as f32)
+}
+
 /// Poor-man's proximity: how "inside the battle" the camera is by zoom.
 /// 1.0 at RTS close-up (<= 90 m), fading to a floor when surveying the
 /// whole map. Real per-source spatial audio is a future item; this alone
@@ -298,6 +391,10 @@ fn combat_one_shots(
     camera: Query<&RtsCamera>,
     time: Res<Time>,
     settings: Res<crate::settings::Settings>,
+    (astats, arrows): (
+        Res<crate::arrows::ArrowStats>,
+        Res<crate::arrows::Arrows>,
+    ),
     mut clang_acc: Local<f32>,
     mut prev_kills: Local<u64>,
     mut death_cooldown: Local<f32>,
@@ -352,6 +449,16 @@ fn combat_one_shots(
 
     // Death screams: on kill deltas, rate-limited, and strictly a
     // close-up sound — a scream you can pick out from a hilltop is wrong.
+    // Men dying under arrows die far from any ENGAGED regiment, so the
+    // melee-proximity gate alone kept volley kills silent: when shafts
+    // are landing on bodies this tick, the falling cloud's proximity
+    // counts too.
+    let mut prox = prox;
+    if astats.hits > 0
+        && let Some(cloud) = arrow_cloud(&arrows)
+    {
+        prox = prox.max((1.0 - cloud.distance(focus) / hear).clamp(0.0, 1.0));
+    }
     *death_cooldown -= time.delta_secs();
     let kills: u64 = combat.kills[0] + combat.kills[1];
     if kills > *prev_kills && *death_cooldown <= 0.0 && prox > 0.25 && zoom_att > 0.35 {
@@ -367,6 +474,313 @@ fn combat_one_shots(
         *death_cooldown = 0.5 + 0.5 * hash01(seed ^ 0x55);
     }
     *prev_kills = kills;
+}
+
+/// A looping fly sound riding ONE arrow (the M2TW ARROW_FLY model:
+/// `looped, probability .3, fadein .2, fadeout .2` — a fraction of
+/// arrows carry a positional air loop that dies WITH the arrow, so the
+/// whoosh audibly resolves into its own impact). We track the stable
+/// arrow id (pool indices reshuffle every tick) and steer the sink's
+/// volume by live distance each frame.
+#[derive(Component)]
+struct ArrowFlyLoop {
+    arrow_id: u32,
+    /// Seconds of fade-out left once the arrow is gone; f32::MAX = live.
+    fading: f32,
+}
+
+/// M2TW: probability .3 — only this fraction of arrows sing.
+const FLY_LOOP_PROB: f32 = 0.3;
+/// Concurrent fly loops (each is one more decoder on the mixer).
+const MAX_FLY_LOOPS: usize = 12;
+/// M2TW: fadeout .2 s at the arrow's death.
+const FLY_LOOP_FADE: f32 = 0.2;
+
+/// Attach, follow, and retire the per-arrow fly loops.
+#[allow(clippy::too_many_arguments)] // bevy system params
+fn arrow_fly_loops(
+    mut commands: Commands,
+    bank: Option<Res<AudioBank>>,
+    arrows: Res<crate::arrows::Arrows>,
+    camera: Query<&RtsCamera>,
+    time: Res<Time>,
+    virt_time: Res<Time<Virtual>>,
+    settings: Res<crate::settings::Settings>,
+    mut loops: Query<(Entity, &mut ArrowFlyLoop, Option<&mut AudioSink>)>,
+) {
+    let Some(bank) = bank else { return };
+    let Ok(cam) = camera.single() else { return };
+    let dt = time.delta_secs();
+    let paused = virt_time.is_paused();
+    let bv = battle_vol(&settings);
+    let zoom_att = zoom_attenuation(cam.distance);
+    let focus = Vec2::new(cam.focus.x, cam.focus.z);
+    let hear = 140.0 + cam.distance * 0.3;
+
+    // One pass over the pool: positions of tracked ids + spawn candidates.
+    let mut tracked: Vec<u32> = loops.iter().map(|(_, l, _)| l.arrow_id).collect();
+    let mut found: Vec<(u32, f32)> = Vec::with_capacity(tracked.len()); // (id, dist)
+    let mut budget = MAX_FLY_LOOPS.saturating_sub(tracked.len());
+    for i in 0..arrows.len() {
+        let id = arrows.id[i];
+        let d = arrows.pos[i].xz().distance(focus);
+        if tracked.contains(&id) {
+            found.push((id, d));
+            continue;
+        }
+        // New candidates: the M2TW probability gate (stable per id, so
+        // an arrow is either a singer for its whole flight or never),
+        // in earshot, budget-capped.
+        if budget > 0
+            && !paused
+            && d < hear
+            && hash01(id.wrapping_mul(0x9E37_79B1)) < FLY_LOOP_PROB
+            && let Some(h) = pick(&bank.arrow_fly_loop, id)
+        {
+            commands.spawn((
+                AudioPlayer::new(h),
+                PlaybackSettings {
+                    volume: Volume::Linear(0.0),
+                    speed: 0.85 + 0.3 * hash01(id.wrapping_mul(0x85EB)),
+                    ..PlaybackSettings::LOOP
+                },
+                ArrowFlyLoop {
+                    arrow_id: id,
+                    fading: f32::MAX,
+                },
+            ));
+            tracked.push(id);
+            budget -= 1;
+        }
+    }
+
+    for (e, mut fl, sink) in &mut loops {
+        let live = found.iter().find(|(id, _)| *id == fl.arrow_id);
+        if live.is_none() && fl.fading == f32::MAX {
+            // Its arrow landed this frame: begin the M2TW fade-out (the
+            // impact one-shot is taking over right now).
+            fl.fading = FLY_LOOP_FADE;
+        }
+        let Some(mut sink) = sink else { continue };
+        if fl.fading < f32::MAX {
+            fl.fading -= dt;
+            if fl.fading <= 0.0 {
+                commands.entity(e).despawn();
+                continue;
+            }
+            let cur = sink.volume().to_linear();
+            sink.set_volume(Volume::Linear(cur * (fl.fading / FLY_LOOP_FADE).clamp(0.0, 1.0)));
+        } else if paused {
+            sink.set_volume(Volume::Linear(0.0));
+        } else if let Some((_, d)) = live {
+            let prox = (1.0 - d / hear).clamp(0.0, 1.0);
+            sink.set_volume(Volume::Linear(0.16 * prox * prox * zoom_att.max(0.3) * bv));
+        }
+    }
+}
+
+/// State for `archer_one_shots`, bundled into one Local.
+#[derive(Default)]
+struct ArrowAudioState {
+    loose_acc: f32,
+    impact_acc: f32,
+    ground_acc: f32,
+    /// Loosed-per-second EMA (the volley-onset detector).
+    rate_ema: f32,
+    away_high: bool,
+    away_gate: f32,
+    incoming_high: bool,
+    incoming_gate: f32,
+    flyby_acc: f32,
+    frame: u32,
+}
+
+/// Archer sound: string snaps and impact thuds budgeted from the
+/// per-tick ArrowStats counters (same fractional-accumulator pattern as
+/// the melee clangs), plus the two massed-volley sheets as edge cues —
+/// `volley_away` when the loose rate spikes near friendly bows,
+/// `volley_incoming` when a cloud of falling arrows is about to land
+/// near the camera. Assets: sfx_bow/ (tmp/archer-sfx-prompts.md).
+#[allow(clippy::too_many_arguments)] // bevy system params
+fn archer_one_shots(
+    mut commands: Commands,
+    bank: Option<Res<AudioBank>>,
+    astats: Res<crate::arrows::ArrowStats>,
+    arrows: Res<crate::arrows::Arrows>,
+    groups: Res<Groups>,
+    camera: Query<&RtsCamera>,
+    time: Res<Time>,
+    virt_time: Res<Time<Virtual>>,
+    settings: Res<crate::settings::Settings>,
+    playing: Query<(), (With<AudioPlayer>, Without<Bed>)>,
+    mut st: Local<ArrowAudioState>,
+) {
+    let Some(bank) = bank else { return };
+    let Ok(cam) = camera.single() else { return };
+    // Mixer-protection allowance for this frame (see MAX_LIVE_ONE_SHOTS).
+    let mut allowance = MAX_LIVE_ONE_SHOTS.saturating_sub(playing.iter().count()) as u32;
+    // A paused sim freezes the per-tick counters at their last values:
+    // integrating them while paused would drip phantom arrows forever.
+    if virt_time.is_paused() {
+        return;
+    }
+    st.frame = st.frame.wrapping_add(1);
+    let dt = time.delta_secs();
+    st.away_gate -= dt;
+    st.incoming_gate -= dt;
+    let bv = battle_vol(&settings);
+    let zoom_att = zoom_attenuation(cam.distance);
+    let focus = Vec2::new(cam.focus.x, cam.focus.z);
+    let hear = 200.0 + cam.distance * 0.4;
+
+    // Where the bows are: nearest archer regiment still carrying arrows.
+    let shooter_dist = groups
+        .list
+        .iter()
+        .filter(|g| {
+            g.kind == crate::unit_types::KIND_ARCHER && g.count > 0 && g.ammo_left > 0
+        })
+        .map(|g| g.centroid.distance(focus))
+        .fold(f32::MAX, f32::min);
+    let shooter_prox = if shooter_dist == f32::MAX {
+        0.0
+    } else {
+        (1.0 - shooter_dist / hear).clamp(0.0, 1.0)
+    };
+
+    // Where the arrows are: the volley cloud, and how many shafts are
+    // dropping around the camera (the flyby feed).
+    let cloud_prox = arrow_cloud(&arrows)
+        .map(|c| (1.0 - c.distance(focus) / hear).clamp(0.0, 1.0))
+        .unwrap_or(0.0);
+    let mut falling_near = 0usize;
+    for i in 0..arrows.len() {
+        if arrows.vel[i].y < 0.0 && arrows.pos[i].xz().distance_squared(focus) < 80.0 * 80.0 {
+            falling_near += 1;
+        }
+    }
+
+    // String snaps: a volley is the EVENT, not garnish over a din (the
+    // melee-clang tuning read as "a dozen archers", owner-tested) — a
+    // large share of looses each spawn a jittered snap and the clips
+    // LAYER into the ripple of a massed release. Distance thins the
+    // count only mildly; it mostly quiets the clips.
+    st.loose_acc +=
+        astats.loosed as f32 * 30.0 * dt * 0.35 * shooter_prox * (0.4 + 0.6 * zoom_att);
+    st.loose_acc = st.loose_acc.min(5.0);
+    let mut n = (st.loose_acc).floor() as u32;
+    st.loose_acc -= n as f32;
+    n = n.min(4).min(allowance);
+    allowance -= n;
+    for k in 0..n {
+        let seed = st.frame.wrapping_mul(53) ^ k ^ 0x51;
+        if let Some(h) = pick(&bank.bow_loose, seed) {
+            one_shot(
+                &mut commands,
+                h,
+                (0.09 + 0.06 * hash01(seed ^ 0x12)) * zoom_att * bv,
+                0.88 + 0.24 * hash01(seed ^ 0x23),
+            );
+        }
+    }
+
+    // Body hits (wood knock at low odds — the shaft that found a shield)
+    // and the dirt patter of the misses, near the falling cloud. Same
+    // mass-scale budgeting as the looses.
+    st.impact_acc += astats.hits as f32 * 30.0 * dt * 0.30 * cloud_prox * (0.4 + 0.6 * zoom_att);
+    st.impact_acc = st.impact_acc.min(4.0);
+    let mut n = (st.impact_acc).floor() as u32;
+    st.impact_acc -= n as f32;
+    n = n.min(3).min(allowance);
+    allowance -= n;
+    for k in 0..n {
+        let seed = st.frame.wrapping_mul(71) ^ k ^ 0x62;
+        let set = if hash01(seed ^ 0xA7) < 0.2 {
+            &bank.arrow_wood
+        } else {
+            &bank.arrow_flesh
+        };
+        if let Some(h) = pick(set, seed) {
+            one_shot(
+                &mut commands,
+                h,
+                (0.11 + 0.08 * hash01(seed ^ 0x13)) * zoom_att * bv,
+                0.88 + 0.24 * hash01(seed ^ 0x24),
+            );
+        }
+    }
+    let ground = astats.landed.saturating_sub(astats.hits);
+    st.ground_acc += ground as f32 * 30.0 * dt * 0.10 * cloud_prox * (0.4 + 0.6 * zoom_att);
+    st.ground_acc = st.ground_acc.min(3.0);
+    let mut n = (st.ground_acc).floor() as u32;
+    st.ground_acc -= n as f32;
+    n = n.min(2).min(allowance);
+    allowance -= n;
+    for k in 0..n {
+        let seed = st.frame.wrapping_mul(89) ^ k ^ 0x73;
+        if let Some(h) = pick(&bank.arrow_ground, seed) {
+            one_shot(
+                &mut commands,
+                h,
+                (0.07 + 0.05 * hash01(seed ^ 0x14)) * zoom_att * bv,
+                0.86 + 0.28 * hash01(seed ^ 0x25),
+            );
+        }
+    }
+
+    // Volley-away sheet: the loose rate spiking = a massed release.
+    let rate = astats.loosed as f32 * 30.0;
+    st.rate_ema += (rate - st.rate_ema) * (dt / 0.25).min(1.0);
+    let high = st.rate_ema > 60.0;
+    if VOLLEY_SHEETS_ON && high && !st.away_high && st.away_gate <= 0.0 && shooter_prox > 0.05 {
+        let seed = st.frame.wrapping_mul(131);
+        if let Some(h) = pick(&bank.volley_away, seed) {
+            let vol = 0.5 * (0.3 + 0.7 * shooter_prox) * bv;
+            one_shot(&mut commands, h, vol, 0.96 + 0.08 * hash01(seed ^ 0x15));
+            info!("volley away (vol {vol:.2}, rate {:.0}/s)", st.rate_ema);
+        }
+        st.away_gate = 2.0;
+    }
+    st.away_high = high;
+
+    // Incoming sheet: a cloud of descending shafts over the camera.
+    let inc = falling_near > 25;
+    if VOLLEY_SHEETS_ON && inc && !st.incoming_high && st.incoming_gate <= 0.0 && zoom_att > 0.2
+    {
+        let seed = st.frame.wrapping_mul(151);
+        if let Some(h) = pick(&bank.volley_incoming, seed) {
+            let vol = 0.45 * zoom_att.max(0.5) * bv;
+            one_shot(&mut commands, h, vol, 0.96 + 0.08 * hash01(seed ^ 0x16));
+            info!("volley incoming (vol {vol:.2}, {falling_near} falling near)");
+        }
+        st.incoming_gate = 2.5;
+    }
+    st.incoming_high = inc;
+
+    // Flyby whooshes: budgeted from the COUNT of shafts currently
+    // falling around the camera (an arrow spends ~1.5 s in the zone, so
+    // ~0.5/s per shaft means most of them whistle once) — a volley
+    // passing overhead layers itself into a rushing stream that starts,
+    // thickens, and fades with the actual flight; a lone skirmish
+    // arrow stays a lone whistle. Camera must be down in it (zoom).
+    if zoom_att > 0.35 {
+        st.flyby_acc += falling_near as f32 * dt * 0.28 * zoom_att;
+    }
+    st.flyby_acc = st.flyby_acc.min(3.0);
+    let mut n = (st.flyby_acc).floor() as u32;
+    st.flyby_acc -= n as f32;
+    n = n.min(2).min(allowance);
+    for k in 0..n {
+        let seed = st.frame.wrapping_mul(173) ^ k ^ 0x84;
+        if let Some(h) = pick(&bank.arrow_flyby, seed) {
+            one_shot(
+                &mut commands,
+                h,
+                (0.05 + 0.04 * hash01(seed ^ 0x17)) * zoom_att * bv,
+                0.86 + 0.28 * hash01(seed ^ 0x28),
+            );
+        }
+    }
 }
 
 /// Edge-detection state for `event_cues`, bundled into one Local (the
@@ -496,7 +910,15 @@ fn event_cues(
             }
             _ => (u32::MAX, false),
         };
-        let cry = in_range && gd.count > 0 && !gd.state.is_broken();
+        // Archers ordered onto a close target VOLLEY it (the stand-off
+        // fire order) — no melee war cry while there are arrows to
+        // spend. Gated on AMMO, not the firing flag: the flag lags a
+        // sim tick behind a fresh order and the cry edge fires the
+        // same frame the order lands (the "cries once sometimes" bug).
+        // An empty quiver turns the same order into a real knife
+        // charge, and that one roars.
+        let volleying = gd.kind == crate::unit_types::KIND_ARCHER && gd.ammo_left > 0;
+        let cry = in_range && gd.count > 0 && !gd.state.is_broken() && !volleying;
         if cry && (!st.prev_cry[g] || atk != prev_atk) {
             cry_dist = cry_dist.min(gd.centroid.distance(focus));
         }

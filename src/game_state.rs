@@ -22,6 +22,7 @@ pub enum Scenario {
     Pile,
     Join,
     Routpass,
+    Archery,
 }
 
 impl Scenario {
@@ -35,6 +36,7 @@ impl Scenario {
         Self::Pile,
         Self::Join,
         Self::Routpass,
+        Self::Archery,
     ];
 
     fn label(self) -> &'static str {
@@ -48,6 +50,7 @@ impl Scenario {
             Self::Pile => "Pile-on",
             Self::Join => "Join Fight",
             Self::Routpass => "Rout Pass",
+            Self::Archery => "Archery",
         }
     }
 
@@ -60,6 +63,7 @@ impl Scenario {
         if std::env::var("FL_TEST_PILE").is_ok() { return Self::Pile; }
         if std::env::var("FL_TEST_JOIN").is_ok() { return Self::Join; }
         if std::env::var("FL_TEST_ROUTPASS").is_ok() { return Self::Routpass; }
+        if std::env::var("FL_TEST_ARCHERY").is_ok() { return Self::Archery; }
         Self::Normal
     }
 }
@@ -105,7 +109,10 @@ pub fn deploying(d: Res<Deployment>) -> bool {
     d.active
 }
 
-fn scripts_active() -> bool {
+/// Any scripted scenario or test battery owns the battle: automatic
+/// order sources (ai.rs) stand down. Deliberately NOT cached — menu
+/// scenario buttons change the env between battles (sync_scenario_env).
+pub fn scripts_active() -> bool {
     Scenario::from_env() != Scenario::Normal
         || std::env::var("FL_TEST_FRONT").is_ok()
         || std::env::var("FL_TEST_ORDERS").is_ok()
@@ -549,6 +556,7 @@ fn sync_scenario_env(scenario: Scenario) {
         ("FL_TEST_PILE", Scenario::Pile),
         ("FL_TEST_JOIN", Scenario::Join),
         ("FL_TEST_ROUTPASS", Scenario::Routpass),
+        ("FL_TEST_ARCHERY", Scenario::Archery),
     ];
     for (key, s) in vars {
         unsafe {
@@ -577,6 +585,11 @@ pub fn setup_battle(
     mut virt_time: ResMut<Time<Virtual>>,
     mut deploy: ResMut<Deployment>,
     config: Res<BattleConfig>,
+    (mut arrows, mut arrow_spawns, mut stuck): (
+        ResMut<crate::arrows::Arrows>,
+        ResMut<crate::arrows::ArrowSpawns>,
+        ResMut<crate::arrows::StuckArrows>,
+    ),
 ) {
     *units = Units::default();
     *stats = CombatStats::default();
@@ -584,6 +597,7 @@ pub fn setup_battle(
     *selection = Selection::default();
     outcome.0 = None;
     corpses.clear();
+    crate::arrows::reset(&mut arrows, &mut arrow_spawns, &mut stuck);
     virt_time.unpause();
     sync_scenario_env(config.scenario);
     crate::regiments::do_spawn_battle(&mut units, &terrain, &mut groups, &config);

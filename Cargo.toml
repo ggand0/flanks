@@ -6,8 +6,9 @@ description = "Real-time massed medieval battles in Rust and Bevy, every soldier
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-# mp3: the generated battle audio is mp3 (bevy default is vorbis-only).
-bevy = { version = "0.19", features = ["mp3"] }
+# mp3: the generated battle audio is mp3 (bevy default is vorbis-only);
+# wav: two of the volley-sheet takes came out of the generator as wav.
+bevy = { version = "0.19", features = ["mp3", "wav"] }
 bytemuck = { version = "1", features = ["derive"] }
 dirs = "6.0.0"
 serde = { version = "1.0.229", features = ["derive"] }

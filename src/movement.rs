@@ -96,7 +96,8 @@ const SHIELDWALL_ATK_PTS: f32 = -1.0;
 const SPEARWALL_ATK_PTS: f32 = 2.0;
 /// Sector test at damage apply: cos(60 deg). Front = attack direction
 /// within 60 deg of the victim's facing; rear = beyond 120 deg; else side.
-const SECTOR_COS_60: f32 = 0.5;
+/// Shared with the arrow-impact resolution (arrows.rs).
+pub const SECTOR_COS_60: f32 = 0.5;
 /// Charge impact (phase B). A charge-flagged hit shoves its victim along
 /// the blow: displacement = KNOCKBACK * m_a/(m_a+m_v), applied straight
 /// to position (next tick's separation resolves the pile — same pipe as
@@ -120,9 +121,11 @@ pub const STAGGER_TICKS: u8 = 30;
 /// contest). A regular hit is a brief stumble; impacts stun full-length
 /// (the render pose scales with remaining ticks, so stumbles read
 /// lighter than impacts for free).
-const STAGGER_P0: f32 = 0.65;
-const STAGGER_P_PER_FACTOR: f32 = 0.05;
-const STAGGER_P_MIN: f32 = 0.05;
+// Shared with the arrow-impact resolution (arrows.rs): a nonfatal hit
+// rolls the same stumble regardless of what delivered it.
+pub const STAGGER_P0: f32 = 0.65;
+pub const STAGGER_P_PER_FACTOR: f32 = 0.05;
+pub const STAGGER_P_MIN: f32 = 0.05;
 /// Pub: the render normalizes the pose by the STUMBLE length, so a
 /// stumble plays the full-strength rock for 0.5 s and an impact holds
 /// it ~1 s — hierarchy by duration, not amplitude.
@@ -252,6 +255,10 @@ pub fn step_sim(
     mut units: ResMut<Units>,
     mut grid: ResMut<SpatialGrid>,
     mut damage: ResMut<DamageBuffers>,
+    (mut arrow_spawns, tracks): (
+        ResMut<crate::arrows::ArrowSpawns>,
+        Res<crate::arrows::RegTracks>,
+    ),
     mut cstats: ResMut<crate::combat::CombatStats>,
     mut groups: ResMut<Groups>,
     terrain: Res<Terrain>,
@@ -283,6 +290,7 @@ pub fn step_sim(
         flash,
         death_t,
         home,
+        ammo,
         ..
     } = &mut *units;
     if pos.is_empty() {
@@ -335,6 +343,120 @@ pub fn step_sim(
     let t1 = Instant::now();
     stats.grid_ms = (t1 - t0).as_secs_f32() * 1000.0;
 
+    // ---- Archer fire solutions (regiment level). An attack order for a
+    // ranged regiment is a FIRE order, not a melee charge: the regiment
+    // halts once the target is inside range (the stand-off below feeds
+    // the order resolution) and volleys from where it stands; the march
+    // resumes if the target slips back out of range.
+    let n_groups = groups.list.len();
+    let standoff: Vec<bool> = groups
+        .list
+        .iter()
+        .map(|gd| {
+            gd.kind == crate::unit_types::KIND_ARCHER
+                && gd.count > 0
+                && !gd.state.is_broken()
+                && matches!(gd.order, Some(crate::orders::Order::Attack(t))
+                    if groups.list[t as usize].count > 0
+                        && groups.list[t as usize].centroid.distance(gd.centroid)
+                            < crate::unit_types::missile::RANGE * 0.85)
+        })
+        .collect();
+    for (g, &so) in standoff.iter().enumerate() {
+        // Entering the stand-off freezes the frame here (the same anchor
+        // snap engagement does): holding units dress where they stopped
+        // instead of walking back to a stale anchor.
+        if so && groups.list[g].anchor.distance(groups.list[g].centroid) > 2.0 {
+            let c = groups.list[g].centroid;
+            groups.list[g].anchor = c;
+        }
+    }
+    // What each archer regiment's bows shoot at this tick: the ordered
+    // target once standing off, else fire-at-will's nearest live enemy
+    // regiment in range. Regiments in melee or on the march don't volley
+    // (M2TW: foot archers halt to shoot; fire-at-will pauses on the move).
+    struct ShootAt {
+        c: Vec2,
+        vel: Vec2,
+        r: f32,
+    }
+    let shoot_at: Vec<Option<ShootAt>> = (0..n_groups)
+        .map(|g| {
+            let gd = &groups.list[g];
+            if gd.kind != crate::unit_types::KIND_ARCHER
+                || gd.count == 0
+                || gd.state.is_broken()
+                || gd.engaged
+            {
+                return None;
+            }
+            let t = match gd.order {
+                Some(crate::orders::Order::Move(_)) => return None,
+                Some(crate::orders::Order::Attack(t)) => {
+                    // An explicit target overrides fire-at-will: no
+                    // shots until the march brings it into range.
+                    if !standoff[g] || groups.list[t as usize].count == 0 {
+                        return None;
+                    }
+                    t as usize
+                }
+                None => {
+                    // Fire-at-will: nearest live, unbroken enemy block.
+                    if !gd.fire_at_will {
+                        return None;
+                    }
+                    let mut best: Option<(f32, usize)> = None;
+                    for (e, eg) in groups.list.iter().enumerate() {
+                        if eg.team == gd.team || eg.count == 0 || eg.state.is_broken() {
+                            continue;
+                        }
+                        let d2 = eg.centroid.distance_squared(gd.centroid);
+                        if best.is_none_or(|(bd, _)| d2 < bd) {
+                            best = Some((d2, e));
+                        }
+                    }
+                    let (d2, e) = best?;
+                    let range = crate::unit_types::missile::RANGE;
+                    if d2 > range * range {
+                        return None;
+                    }
+                    e
+                }
+            };
+            let tg = &groups.list[t];
+            Some(ShootAt {
+                c: tg.centroid,
+                vel: tracks.vel.get(t).copied().unwrap_or(Vec2::ZERO),
+                r: tg.radius.clamp(3.0, 25.0),
+            })
+        })
+        .collect();
+    // The card's firing indicator: a fire solution exists and there are
+    // arrows to spend on it.
+    for (g, s) in shoot_at.iter().enumerate() {
+        groups.list[g].firing = s.is_some() && groups.list[g].ammo_left > 0;
+    }
+    let shoot_at = &shoot_at[..];
+    // Friendly blocks per team for the loft-over-friendlies check: every
+    // live formed regiment as a disc with a clearance ceiling. A
+    // shooter's own regiment is in here too — that is what makes rear
+    // ranks loft over their own front rank.
+    let blocks: [Vec<(Vec2, f32, f32)>; 2] = [0u8, 1u8].map(|tm| {
+        groups
+            .list
+            .iter()
+            .filter(|g| g.team == tm && g.count > 0 && !g.state.is_broken())
+            .map(|g| {
+                (
+                    g.centroid,
+                    g.radius.max(3.0),
+                    terrain.height_at(g.centroid.x, g.centroid.y) + 2.4,
+                )
+            })
+            .collect()
+    });
+    let blocks = &blocks;
+
     let grid = &*grid;
     let terrain = &*terrain;
     let pos_prev = &pos_prev[..];
@@ -355,6 +477,12 @@ pub fn step_sim(
     let orders: Vec<Option<Vec2>> = (0..groups.list.len())
         .map(|g| {
             let gd = &groups.list[g];
+            // Archer stand-off: in range of the ordered target — stand
+            // and shoot (the order survives; the chase resumes if the
+            // target moves out of range).
+            if standoff[g] {
+                return None;
+            }
             // The freeze keys on engagement WITH the ordered target
             // (count-gated, frontline.rs) — incidental duels against
             // an overflow trickle never halt the march.
@@ -511,6 +639,9 @@ pub fn step_sim(
     if damage.0.len() < n_chunks {
         damage.0.resize_with(n_chunks, Vec::new);
     }
+    if arrow_spawns.0.len() < n_chunks {
+        arrow_spawns.0.resize_with(n_chunks, Vec::new);
+    }
     let tick_seed = tick.wrapping_mul(0x9E37_79B1);
     let integrate_span = info_span!("integrate").entered();
     ComputeTaskPool::get().scope(|scope| {
@@ -525,10 +656,12 @@ pub fn step_sim(
             .zip(flash.chunks_mut(CHUNK))
             .zip(death_t.chunks_mut(CHUNK))
             .zip(&mut damage.0)
+            .zip(ammo.chunks_mut(CHUNK))
+            .zip(&mut arrow_spawns.0)
             .enumerate()
         {
-            let (((((((((p_chunk, v_chunk), yaw_chunk), yawp_chunk), tgt_chunk), sw_chunk),
-                swt_chunk), fl_chunk), dt_chunk), events) = chunk;
+            let (((((((((((p_chunk, v_chunk), yaw_chunk), yawp_chunk), tgt_chunk), sw_chunk),
+                swt_chunk), fl_chunk), dt_chunk), events), ammo_chunk), arrow_out) = chunk;
             let start = ci * CHUNK;
             scope.spawn(async move {
                 events.clear();
@@ -818,6 +951,82 @@ pub fn step_sim(
                     let mut face_target = None;
                     if !dying {
                         match sw_chunk[j] & crate::units::SWING_STATE_MASK {
+                            crate::units::SWING_WINDUP
+                                if sw_chunk[j] & crate::units::SWING_RANGED != 0 =>
+                            {
+                                // Drawing the bow: feet planted, eyes on
+                                // the target block.
+                                desired = Vec2::ZERO;
+                                if let Some(s) = &shoot_at[gi] {
+                                    face_target = Some(s.c);
+                                    if swt_chunk[j] == 0 {
+                                        let h = |k: u32| {
+                                            crate::units::hash01(
+                                                tick_seed
+                                                    ^ (i as u32).wrapping_mul(k).wrapping_add(k),
+                                            )
+                                        };
+                                        // Aim: a spot on the target's
+                                        // footprint, the M2TW range-
+                                        // INDEPENDENT landing scatter
+                                        // (devlog 0060), and a lead for
+                                        // the block's drift over the
+                                        // flight.
+                                        let ang = h(0x1F3B) * std::f32::consts::TAU;
+                                        let rad = s.r * 0.85 * h(0x2E5D).sqrt();
+                                        let sigma =
+                                            crate::unit_types::missile::SCATTER_SIGMA * 1.75;
+                                        let mut aim = s.c
+                                            + Vec2::new(ang.cos(), ang.sin()) * rad
+                                            + Vec2::new(
+                                                (h(0x3B7F) + h(0x45A3) - 1.0) * sigma,
+                                                (h(0x5DC1) + h(0x6B8D) - 1.0) * sigma,
+                                            );
+                                        aim += s.vel * (aim.distance(p) / 30.0);
+                                        // Launch ABOVE the body-hit band
+                                        // (arrows.rs tops out at ground
+                                        // + 1.15): a shaft leaving at
+                                        // head height is inside its own
+                                        // shooter's hit cylinder at
+                                        // flight-time zero and kills him.
+                                        let from =
+                                            Vec3::new(p.x, pos_prev[i].y + 0.75, p.y);
+                                        let to = Vec3::new(
+                                            aim.x,
+                                            terrain.height_at(aim.x, aim.y) + 0.7,
+                                            aim.y,
+                                        );
+                                        arrow_out.push(crate::arrows::ArrowSpawn {
+                                            pos: from,
+                                            vel: crate::arrows::solve_launch(
+                                                from,
+                                                to,
+                                                &blocks[team[i] as usize],
+                                                terrain,
+                                            ),
+                                            team: team[i],
+                                            group: group[i],
+                                        });
+                                        ammo_chunk[j] = ammo_chunk[j].saturating_sub(1);
+                                        sw_chunk[j] = crate::units::SWING_RECOVER;
+                                        // Reload: the M2TW volley cycle is
+                                        // animation-bound at ~10 s; the
+                                        // jitter keeps later volleys ragged.
+                                        swt_chunk[j] =
+                                            (crate::unit_types::missile::RELOAD_TICKS as f32
+                                                * (0.8 + 0.25 * h(0x77F1)))
+                                                .min(255.0)
+                                                as u8;
+                                    } else {
+                                        swt_chunk[j] -= 1;
+                                    }
+                                } else {
+                                    // Target gone mid-draw: ease off and
+                                    // reassess shortly.
+                                    sw_chunk[j] = crate::units::SWING_RECOVER;
+                                    swt_chunk[j] = 20;
+                                }
+                            }
                             crate::units::SWING_WINDUP => {
                                 // Feet planted while winding up — EXCEPT
                                 // against a routing target: the cut-down
@@ -936,8 +1145,39 @@ pub fn step_sim(
                                         crate::units::SWING_WINDUP | style
                                     };
                                     swt_chunk[j] = params.windup_ticks;
+                                } else if my_kind == crate::unit_types::KIND_ARCHER as usize
+                                    && !routed
+                                    && ammo_chunk[j] > 0
+                                    && v_chunk[j].xz().length_squared() < 4.0
+                                    && let Some(s) = &shoot_at[gi]
+                                    && p.distance_squared(s.c)
+                                        < crate::unit_types::missile::RANGE
+                                            * crate::unit_types::missile::RANGE
+                                {
+                                    // Nock and draw (foot archers shoot
+                                    // standing only; the walk gate keeps a
+                                    // marching or skirmishing man's bow on
+                                    // his back). Style bits stay 0: the
+                                    // stab pull-back IS the string draw.
+                                    sw_chunk[j] = crate::units::SWING_WINDUP
+                                        | crate::units::SWING_RANGED;
+                                    swt_chunk[j] = crate::unit_types::missile::DRAW_TICKS
+                                        + (crate::units::hash01(
+                                            tick_seed ^ (i as u32).wrapping_mul(0x2C9F),
+                                        ) * 20.0) as u8;
                                 }
                             }
+                        }
+                        // A reloading archer contacted in melee drops the
+                        // reload: he defends at knife tempo instead of
+                        // standing through the 8 s bow cycle.
+                        if my_kind == crate::unit_types::KIND_ARCHER as usize
+                            && best_idx != u32::MAX
+                            && sw_chunk[j] & crate::units::SWING_STATE_MASK
+                                == crate::units::SWING_RECOVER
+                            && swt_chunk[j] > params.cooldown_ticks
+                        {
+                            swt_chunk[j] = params.cooldown_ticks;
                         }
                     }
                     let mut corr_len2 = corr.length_squared();

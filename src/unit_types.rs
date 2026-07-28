@@ -1,14 +1,15 @@
 //! Per-type unit parameters. Types are data, not code: sim systems index
-//! this table by the `kind` SoA column. Two types for the MVP; archers etc.
-//! append rows later.
+//! this table by the `kind` SoA column.
 
 /// Unit kind ids (the `kind` column value and the render bucket index).
-/// NOTE: the spatial grid packs kind into a 2-bit meta field — at most 4
-/// kinds without widening it (spatial.rs META_KIND).
+/// NOTE: the spatial grid packs kind into a 2-bit meta field — archers
+/// take the LAST slot; a 5th kind requires widening it (spatial.rs
+/// META_KIND).
 pub const KIND_HEAVY: u8 = 0;
 pub const KIND_LIGHT: u8 = 1;
 pub const KIND_SPEAR: u8 = 2;
-pub const NUM_KINDS: usize = 3;
+pub const KIND_ARCHER: u8 = 3;
+pub const NUM_KINDS: usize = 4;
 
 /// Weapon class: indexes `BASE_DMG` and (later) spear/pike special rules.
 /// The swing CYCLE is already per-kind via windup/cooldown ticks.
@@ -25,6 +26,44 @@ pub const BASE_DMG: [f32; 2] = [
     23.0, // Sword: light-vs-light frontal factor is -2 -> 23 * 1.13^-2 = 18
     32.5, // Spear: spear-vs-light frontal factor is -4 -> 32.5 * 1.13^-4 = 20
 ];
+
+/// Ranged stats, archer-only for now (a second ranged kind needs the
+/// spatial META widen first, so these stay consts instead of a TYPES
+/// column). All values M2TW-evidenced (devlog 0060) unless noted.
+pub mod missile {
+    /// EDU missile attack: Peasant Archers 5, Longbowmen 6, Yeoman 8.
+    /// Plain-archer tier with a bit of punch (owner call: plain first).
+    pub const ATTACK: f32 = 6.0;
+    /// Meters, the vanilla `arrow` range (bodkin/composite reach 160).
+    pub const RANGE: f32 = 120.0;
+    /// Arrows per man — 30 for every vanilla foot archer.
+    pub const AMMO: u8 = 30;
+    /// Draw time before the loose (ticks at 30 Hz): 1.5 s.
+    pub const DRAW_TICKS: u8 = 45;
+    /// Reload between volleys: 8 s -> a ~9.5 s cycle, matching the
+    /// animation-bound ~10 s / "6 volleys a minute" M2TW longbow cycle.
+    pub const RELOAD_TICKS: u8 = 240;
+    /// Launch speed band the arc solver may use (verbatim `velocity 20 48`).
+    pub const SPEED_MIN: f32 = 20.0;
+    pub const SPEED_MAX: f32 = 48.0;
+    /// M2TW solves arcs in SI units; arrows fall at real gravity.
+    pub const GRAVITY: f32 = 9.81;
+    /// Landing scatter sigma in meters, RANGE-INDEPENDENT (the measured
+    /// M2TW quirk: accuracy does not improve up close).
+    pub const SCATTER_SIGMA: f32 = 3.0;
+    /// Missile damage curve, CALIBRATED against archery-range logs
+    /// (devlog 0064). Arrows use a steeper factor multiplier than melee:
+    /// armour and shields blunt a falling shaft far harder than they
+    /// blunt a sword, and with the melee curve the measured spread was
+    /// only 2.5x between shielded lights (9.4% kills/arrow — hotter
+    /// than M2TW's measured 10% vs UNARMORED men) and plate heavies
+    /// (3.7%). With this curve, measured: ~11% vs unarmored (the
+    /// Withwnar anchor), ~4% vs shielded lights, ~1% vs heavies, and
+    /// archer-vs-archer duels stay lethal (their factor is +5).
+    pub const FACTOR_MULT: f32 = 1.28;
+    /// Damage of a landed arrow at missile factor 0.
+    pub const BASE_DMG: f32 = 20.0;
+}
 
 /// Damage swing per combat factor point (M2TW uses ~1.2 on kill CHANCE;
 /// on hp damage 1.13 keeps a +/-6 factor spread inside ~2x swings).
@@ -87,7 +126,11 @@ pub struct UnitTypeParams {
 pub const TYPES: [UnitTypeParams; NUM_KINDS] = [
     // KIND_HEAVY — knights: slow, armored, hard-hitting, shove-heavy.
     UnitTypeParams {
-        hp: 240.0,
+        // The 1.5x "pacing placeholder" HP bump (c0ecffb, pre-morale-
+        // rework) is REVERTED across all kinds (owner call, archer
+        // round 2): 240/135/150 back to the M2TW stat model's original
+        // 160/90/100 anchors.
+        hp: 160.0,
         attack: 13.0,
         charge_bonus: 5.0,
         defence_skill: 6.0,
@@ -115,7 +158,7 @@ pub const TYPES: [UnitTypeParams; NUM_KINDS] = [
     },
     // KIND_LIGHT — men-at-arms: fast, fragile, quicker swings, spear reach.
     UnitTypeParams {
-        hp: 135.0,
+        hp: 90.0,
         attack: 9.0,
         charge_bonus: 3.0,
         defence_skill: 4.0,
@@ -140,7 +183,7 @@ pub const TYPES: [UnitTypeParams; NUM_KINDS] = [
     // penalty folded in (the anti-cavalry bonus waits for cavalry). The
     // spearwall (formation.rs) is where they earn their keep.
     UnitTypeParams {
-        hp: 150.0,
+        hp: 100.0,
         attack: 7.0,
         charge_bonus: 2.0,
         defence_skill: 3.0,
@@ -157,6 +200,31 @@ pub const TYPES: [UnitTypeParams; NUM_KINDS] = [
         base_morale: 5.0,
         discipline: 0.85,
         fatigue_rate: 1.1,
+        half_height: 0.50,
+    },
+    // KIND_ARCHER — levy bowmen: the ranged kind (missile stats live in
+    // `missile`); this row is their WEAK melee fallback. Flesh-tier
+    // protection, knife-and-buckler-less scrap, fast on their feet.
+    // Scaled from the Peasant Archers / Longbowmen EDU band (devlog 0060):
+    // melee attack 2..7, armour 0..1, no shield, morale 3 untrained,
+    // mass 0.8.
+    UnitTypeParams {
+        hp: 80.0,
+        attack: 4.0,
+        charge_bonus: 1.0,
+        defence_skill: 2.0,
+        armour: 1.0,
+        shield: 0.0,
+        ap: false,
+        weapon: Weapon::Sword,
+        reach: 1.6,
+        windup_ticks: 9,
+        cooldown_ticks: 33,
+        speed: 9.5,
+        mass: 0.8,
+        base_morale: 3.0,
+        discipline: 1.15,
+        fatigue_rate: 0.9,
         half_height: 0.50,
     },
 ];

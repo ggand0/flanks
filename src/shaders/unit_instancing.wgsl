@@ -5,8 +5,8 @@ struct Vertex {
     @location(0) position: vec3<f32>,
     @location(1) normal: vec3<f32>,
     // NOT texture coords: x = body part id (0 body, 1 sword arm,
-    // 2 left leg, 3 right leg, 4 spear arm, 5 shield arm), y = the
-    // part's pivot height.
+    // 2 left leg, 3 right leg, 4 spear arm, 5 shield arm, 6 bow arm),
+    // y = the part's pivot height.
     @location(2) part_pivot: vec2<f32>,
     // Part material: rgb = fixed color, a = team-color blend amount.
     @location(5) v_color: vec4<f32>,
@@ -111,7 +111,28 @@ fn vertex(vertex: Vertex) -> VertexOutput {
     let walk_s2 = mix(sin(phase * 2.0), sin(phase_reg * 2.0), march);
 
     // --- Part animation (rotations around the part pivot) ---
-    if part > 4.5 {
+    if part > 6.5 {
+        // Arrow projectile (arrows.rs buckets): rigid mesh, flight
+        // pitch rides anim2.z (a dead channel for these instances —
+        // march is always 0 here); yaw is the shared rotation below.
+        let ang = vertex.i_anim2.z;
+        local = pitch_about(local, 0.0, ang);
+        normal = pitch_normal(normal, ang);
+    } else if part > 5.5 {
+        // Bow arm: stave carried vertical at the side. The draw tilts
+        // arm and bow up toward the loft angle (the whole part pitches,
+        // so the stave cants back over the shoulder — an archer aiming
+        // high); the loose settles it, recover eases back to carry.
+        // The draw hand is plain PART_ARM running the stab style: its
+        // pull-back-then-snap IS the string draw and release.
+        let raise = smoothstep(0.0, 0.8, lunge);
+        let chop = smoothstep(0.85, 1.0, lunge);
+        var ang = 0.75 * raise - 0.20 * chop
+            + 0.06 * moving * sin(phase + 3.1415) * (1.0 - raise)
+            + celebrate * (1.5 + 0.3 * sin(globals.time * 9.0 + seed * 6.2831853));
+        local = pitch_about(local, pivot, ang);
+        normal = pitch_normal(normal, ang);
+    } else if part > 4.5 {
         // Shield arm: carried at the side; the wall signal swings it
         // around the body to FACE THE FRONT and lifts it into a guard —
         // a shieldwall is a wall of team color from the enemy's side.

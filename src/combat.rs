@@ -36,7 +36,7 @@ impl Plugin for CombatPlugin {
 }
 
 #[allow(clippy::too_many_arguments)] // bevy system params
-fn process_deaths(
+pub fn process_deaths(
     mut units: ResMut<Units>,
     mut terrain: ResMut<Terrain>,
     mut stats: ResMut<CombatStats>,
@@ -106,6 +106,7 @@ fn process_deaths(
         units.flash.swap_remove(i);
         units.death_t.swap_remove(i);
         units.home.swap_remove(i);
+        units.ammo.swap_remove(i);
     }
     for (c, r) in craters {
         terrain.carve_crater(c, r, r * 0.4);

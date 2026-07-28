@@ -80,11 +80,13 @@ fn spawn_banners(
     let pole_mesh = meshes.add(Cuboid::new(0.09, 4.2, 0.09));
     // Flag shape encodes kind (indexed by `GroupData::kind` — keep in
     // step with unit_types::NUM_KINDS): heavies fly a square standard,
-    // lights a long thin pennant, spears a mid-size banderole.
+    // lights a long thin pennant, spears a mid-size banderole, archers
+    // a small swallowtail-narrow guidon.
     let flag_meshes = [
         meshes.add(Cuboid::new(1.5, 1.0, 0.05)),
         meshes.add(Cuboid::new(1.8, 0.5, 0.05)),
         meshes.add(Cuboid::new(1.2, 0.75, 0.05)),
+        meshes.add(Cuboid::new(0.9, 0.55, 0.05)),
     ];
     let unit_cube = meshes.add(Cuboid::new(1.0, 1.0, 1.0));
     let sel_mesh = meshes.add(Cuboid::new(0.4, 0.4, 0.4));

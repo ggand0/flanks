@@ -54,9 +54,9 @@ fn spawn_camera(mut commands: Commands) {
                 0.0,
                 crate::util::env_or("FL_CAM_Z", 0.0),
             ),
-            yaw: 0.0,
             // Overridable for screenshot-based debugging without input
             // injection (pitch in radians, 0.25..1.45).
+            yaw: crate::util::env_or("FL_CAM_YAW", 0.0),
             pitch: crate::util::env_or("FL_CAM_PITCH", 0.9),
             distance: crate::util::env_or("FL_CAM_DIST", 280.0),
             target_distance: crate::util::env_or("FL_CAM_DIST", 280.0),
@@ -148,6 +148,17 @@ pub fn apply_camera_transform(
     let Ok((mut cam, mut transform)) = query.single_mut() else {
         return;
     };
+    // FL_CAM_LOCK: pin the camera to the FL_CAM_* spawn values every
+    // frame — screenshot debugging needs a stable frame even with a
+    // cursor parked at a screen edge (edge pan) or a stray scroll.
+    if std::env::var("FL_CAM_LOCK").is_ok() {
+        cam.focus.x = crate::util::env_or("FL_CAM_X", 0.0);
+        cam.focus.z = crate::util::env_or("FL_CAM_Z", 0.0);
+        cam.yaw = crate::util::env_or("FL_CAM_YAW", 0.0);
+        cam.pitch = crate::util::env_or("FL_CAM_PITCH", 0.9);
+        cam.distance = crate::util::env_or("FL_CAM_DIST", 280.0);
+        cam.target_distance = cam.distance;
+    }
     let min = terrain.min();
     let max = terrain.max();
     cam.focus.x = cam.focus.x.clamp(min.x, max.x);

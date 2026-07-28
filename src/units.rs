@@ -45,6 +45,9 @@ pub struct Units {
     /// for the whole block, rigidly translated per unit by this offset.
     /// Captured at spawn (loose); rigid formations will write slot offsets.
     pub home: Vec<Vec2>,
+    /// Arrows left (archers; 0 for melee kinds). Decremented on loose;
+    /// an empty quiver means melee only.
+    pub ammo: Vec<u8>,
 }
 
 /// Swing states (the `swing` column, low bits) + the charge flag bit.
@@ -68,6 +71,10 @@ pub const SWING_STAGGERED: u8 = 1 << 5;
 /// consumed by the would-be stagger or wiped by the man's next swing):
 /// chain-charging cannot stunlock a man who never gets to act.
 pub const SWING_STAGGER_IMMUNE: u8 = 1 << 6;
+/// The current wind-up is a bow DRAW, not a melee swing (archers): the
+/// strike tick looses an arrow instead of a DamageEvent, and the render
+/// wind-up progress runs on missile::DRAW_TICKS. Cleared on the loose.
+pub const SWING_RANGED: u8 = 1 << 7;
 
 impl Units {
     pub fn len(&self) -> usize {
@@ -154,6 +161,15 @@ pub fn push_unit(
         Vec3::new(0.20, 0.45, 0.85), // blue
         Vec3::new(0.90, 0.40, 0.15), // orange
     ];
+    /// Archers wear CLOTH palettes instead of the raw team color: the
+    /// mesh's team-blend parts (hood, tunic) lerp toward this per-unit
+    /// instance color — muted woolen dyes of each army's hue, so
+    /// allegiance reads at a glance while banners and cards carry the
+    /// exact team color.
+    const ARCHER_CLOTH: [Vec3; 2] = [
+        Vec3::new(0.20, 0.32, 0.48), // blue army: dyed slate-blue wool
+        Vec3::new(0.58, 0.35, 0.16), // orange army: autumn russet
+    ];
     let params = &crate::unit_types::TYPES[kind as usize];
     let p = Vec3::new(x, terrain.height_at(x, z) + params.half_height, z);
     units.pos.push(p);
@@ -174,7 +190,11 @@ pub fn push_unit(
     // Per-unit tonal variation so a block of 50k doesn't read as a flat
     // texture; alpha = stable anim seed (walk-bob phase), not opacity.
     let tone = 0.85 + 0.3 * hash01(seed.wrapping_mul(3));
-    let c = TEAM_COLORS[team as usize] * tone;
+    let c = if kind == crate::unit_types::KIND_ARCHER {
+        ARCHER_CLOTH[team as usize] * tone
+    } else {
+        TEAM_COLORS[team as usize] * tone
+    };
     units.color.push([c.x, c.y, c.z, hash01(seed.wrapping_mul(11) + 7)]);
     units.target.push(u32::MAX);
     units.swing.push(SWING_RECOVER);
@@ -186,6 +206,11 @@ pub fn push_unit(
     units.flash.push(0);
     units.death_t.push(0);
     units.home.push(Vec2::new(x, z) - anchor);
+    units.ammo.push(if kind == crate::unit_types::KIND_ARCHER {
+        crate::unit_types::missile::AMMO
+    } else {
+        0
+    });
 }
 
 /// FL_TEST_SURROUND: two equal blue detachments of light infantry, one

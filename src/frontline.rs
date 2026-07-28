@@ -293,8 +293,12 @@ fn update_groups(units: Res<Units>, mut groups: ResMut<Groups>) {
         // and is striking. TW rule — one soldier fighting engages the
         // regiment. (`target` is stale outside a swing cycle and `swing`
         // spawns in Recover for strike staggering — neither is usable.)
+        // A bow DRAW is a wind-up too but not melee: counting it made
+        // an archer regiment "engaged" the moment it drew, which
+        // silenced its own fire solution before the first loose.
         if units.death_t[i] == 0
             && units.swing[i] & crate::units::SWING_STATE_MASK == crate::units::SWING_WINDUP
+            && units.swing[i] & crate::units::SWING_RANGED == 0
         {
             fighting[g] = true;
         }
@@ -454,8 +458,17 @@ fn update_groups(units: Res<Units>, mut groups: ResMut<Groups>) {
         let charging = if engaged || group.state.is_broken() {
             false
         } else if let Some(crate::orders::Order::Attack(t)) = group.order {
+            // An archer regiment with arrows left is VOLLEYING, not
+            // charging — its attack order is a fire order (the
+            // stand-off), even at point-blank. Gated on ammo rather
+            // than the firing flag, which lags a tick behind a fresh
+            // order and let a one-tick charge blip through. Out of
+            // ammo, the same order is a real knife charge and flags
+            // like one.
             let t = t as usize;
-            counts[t] > 0 && cents[t].distance(group.centroid) < CHARGE_RANGE
+            counts[t] > 0
+                && cents[t].distance(group.centroid) < CHARGE_RANGE
+                && !(group.kind == crate::unit_types::KIND_ARCHER && group.ammo_left > 0)
         } else {
             false
         };

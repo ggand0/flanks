@@ -1,4 +1,5 @@
 mod ai;
+mod arrows;
 mod audio;
 mod banners;
 mod camera;
@@ -81,6 +82,7 @@ fn main() {
             banners::BannersPlugin,
             audio::BattleAudioPlugin,
             movement::MovementPlugin,
+            arrows::ArrowsPlugin,
         ))
         .add_plugins((
             orders::OrdersPlugin,

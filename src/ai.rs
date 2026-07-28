@@ -46,22 +46,12 @@ impl Plugin for AiPlugin {
     }
 }
 
-/// Test scripts own the orders — every automatic order source stands down.
+/// Test scripts own the orders — every automatic order source stands
+/// down. Shared with game_state (the old private env list here went
+/// stale the moment new scenarios were added: the Archery range's
+/// "static" holders charged because FL_TEST_ARCHERY wasn't on it).
 fn scripts_active() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        [
-            "FL_TEST_FRONT",
-            "FL_TEST_ORDERS",
-            "FL_TEST_SURROUND",
-            "FL_TEST_ROUT",
-            "FL_TEST_FORM",
-            "FL_TEST_DIR",
-            "FL_TEST_CHARGE",
-        ]
-            .iter()
-            .any(|k| std::env::var(k).is_ok())
-    })
+    crate::game_state::scripts_active()
 }
 
 fn ai_enabled() -> bool {
@@ -69,12 +59,14 @@ fn ai_enabled() -> bool {
     // FL_ENEMY_STATIC=1 / FL_ARENA=1: practice-dummy modes — the enemy
     // spawns in hold-position (regiments.rs) and the strategy AI stands
     // down, so regiments defend where they stand but never advance.
-    *ON.get_or_init(|| {
+    // Launch-time knobs stay cached; the scenario check must NOT be
+    // (menu buttons swap scenarios between battles).
+    let static_on = *ON.get_or_init(|| {
         !std::env::var("FL_AI").is_ok_and(|v| v == "0")
             && std::env::var("FL_ENEMY_STATIC").is_err()
             && std::env::var("FL_ARENA").is_err()
-            && !scripts_active()
-    })
+    });
+    static_on && !scripts_active()
 }
 
 fn ai_think(
@@ -130,11 +122,21 @@ fn ai_think(
             continue;
         }
         let from = gr.centroid;
+        // Archers weigh armour: an attack order for them is a fire
+        // order (the stand-off), and arrows respect armour and shields,
+        // so the AI's bows prefer soft targets over near ones. 12 m of
+        // march per protection point trades cheaply against the 2-4x
+        // damage swing.
+        let archer = gr.kind == crate::unit_types::KIND_ARCHER;
         let Some((best, _)) = (0..groups.list.len())
             .filter(|&tg| alive_player(&groups, tg))
             .map(|tg| {
-                let cost =
+                let mut cost =
                     from.distance(groups.list[tg].centroid) + SPREAD_PENALTY * load[tg] as f32;
+                if archer {
+                    let pt = &crate::unit_types::TYPES[groups.list[tg].kind as usize];
+                    cost += 12.0 * (pt.armour + pt.shield);
+                }
                 (tg, cost)
             })
             .min_by(|a, b| a.1.total_cmp(&b.1))
@@ -173,6 +175,12 @@ fn auto_engage(time: Res<Time>, mut groups: ResMut<Groups>, mut next: Local<f32>
     for g in 0..groups.list.len() {
         let gd = &groups.list[g];
         if gd.count == 0 || gd.state.is_broken() || gd.hold {
+            continue;
+        }
+        // Archers never CHARGE at ease — their fire-at-will already
+        // engages at bow range, and skirmish mode handles proximity.
+        // (Out of ammo they still defend themselves when reached.)
+        if gd.kind == crate::unit_types::KIND_ARCHER {
             continue;
         }
         // Stand down a finished AUTO attack (target broken or wiped).

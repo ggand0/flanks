@@ -7,7 +7,7 @@ use bevy::prelude::*;
 
 use crate::orders::{GroupData, Groups, RegState};
 use crate::terrain::Terrain;
-use crate::unit_types::{KIND_HEAVY, KIND_LIGHT, KIND_SPEAR};
+use crate::unit_types::{KIND_ARCHER, KIND_HEAVY, KIND_LIGHT, KIND_SPEAR};
 use crate::units::{Units, hash01, push_unit};
 
 /// Unit spacing inside a regiment block.
@@ -33,7 +33,7 @@ impl Plugin for RegimentsPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(
             Update,
-            (rout_test_log, dir_test_log, arena_log, charge_test_log, pile_test_log, melee_diag_log, join_test_log, routpass_test_log),
+            (rout_test_log, dir_test_log, arena_log, charge_test_log, pile_test_log, melee_diag_log, join_test_log, routpass_test_log, archery_log),
         );
     }
 }
@@ -46,6 +46,21 @@ fn heavy_frac() -> f32 {
 /// heavies, ahead of the lights).
 fn spear_frac() -> f32 {
     crate::util::env_or("FL_SPEAR_FRAC", 0.25)
+}
+
+/// Archer regiments per army: a fixed COUNT by default — archers are
+/// force multipliers, and scaling them with army size turned big
+/// battles into arrow weather (owner: "two is probably enough
+/// considering how OP they are"). FL_ARCHER_FRAC switches back to a
+/// fraction of the army for sandbox play (=1 for all-archer fields).
+fn archer_regs(n_regs: usize) -> usize {
+    match std::env::var("FL_ARCHER_FRAC")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+    {
+        Some(frac) => (n_regs as f32 * frac).round() as usize,
+        None => 2.min(n_regs),
+    }
 }
 
 /// Spawn one regiment block (units + GroupData). `dir` faces the enemy
@@ -103,6 +118,7 @@ pub fn do_spawn_battle(
         Scenario::Pile => { spawn_pile_test(units, terrain, groups); return; }
         Scenario::Join => { spawn_join_test(units, terrain, groups); return; }
         Scenario::Routpass => { spawn_routpass_test(units, terrain, groups); return; }
+        Scenario::Archery => { spawn_archery_test(units, terrain, groups); return; }
         Scenario::Normal => {}
     }
 
@@ -148,6 +164,7 @@ pub fn do_spawn_battle(
         };
         let n_heavy = (n_regs as f32 * heavy_frac()).round() as usize;
         let n_spear = (n_regs as f32 * spear_frac()).round() as usize;
+        let n_archer = archer_regs(n_regs).min(n_regs.saturating_sub(n_heavy + n_spear));
         let dir: f32 = if team == 0 { -1.0 } else { 1.0 };
         for r in 0..n_regs {
             let rank = r / per_rank;
@@ -157,11 +174,14 @@ pub fn do_spawn_battle(
             let x0 = (file as f32 - (in_rank - 1) as f32 / 2.0) * pitch_x;
             let z0 = dir * (army_gap / 2.0 + block_d / 2.0 + rank as f32 * (block_d + REG_GAP));
             let anchor = Vec2::new(x0, z0);
-            // Heavies lead, spears back them, lights fill the rear ranks.
+            // Heavies lead, spears back them, lights fill the middle,
+            // archers take the rear ranks (they shoot over everyone).
             let kind = if r < n_heavy {
                 KIND_HEAVY
             } else if r < n_heavy + n_spear {
                 KIND_SPEAR
+            } else if r >= n_regs - n_archer {
+                KIND_ARCHER
             } else {
                 KIND_LIGHT
             };
@@ -180,17 +200,124 @@ pub fn do_spawn_battle(
     }
     let heavies = list.iter().filter(|g| g.kind == KIND_HEAVY).count();
     let spears = list.iter().filter(|g| g.kind == KIND_SPEAR).count();
+    let archers = list.iter().filter(|g| g.kind == KIND_ARCHER).count();
     let blue = list.iter().filter(|g| g.team == 0).count();
     info!(
-        "spawned {} vs {} regiments ({} heavy, {} spear) x {} units ({} total units)",
+        "spawned {} vs {} regiments ({} heavy, {} spear, {} archer) x {} units ({} total units)",
         blue,
         list.len() - blue,
         heavies,
         spears,
+        archers,
         size,
         units.len()
     );
     groups.list = list;
+}
+
+/// FL_TEST_ARCHERY: the archer sandbox (also on the menu's debug list).
+/// Two blue archer regiments stand behind a friendly light screen. The
+/// enemy is fully STATIC: the middle orange block holds INSIDE bow
+/// range (fire-at-will opens up within seconds), the flank blocks hold
+/// just outside it (attack-order the archers onto one to watch the
+/// stand-off halt and the arcs over the screen's heads). Nothing
+/// chases. FL_ARCHERY_ATTACK=1 adds the old deep attacker for the
+/// fire-at-will / lead / skirmish demo.
+fn spawn_archery_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
+    let size = crate::util::env_or("FL_REG_SIZE", 500_usize).max(50);
+    let mut list = Vec::new();
+    // Blue: light screen up front, two archer blocks behind it.
+    spawn_regiment(units, terrain, &mut list, 0, KIND_LIGHT, Vec2::new(0.0, -70.0), size, -1.0);
+    list[0].hold = true;
+    for x in [-30.0, 30.0] {
+        spawn_regiment(units, terrain, &mut list, 0, KIND_ARCHER, Vec2::new(x, -90.0), size, -1.0);
+    }
+    // Orange: middle block in range (~110 m), flanks just outside.
+    // FL_ARCHERY_TARGET=heavy|spear swaps the middle block's kind (the
+    // calibration target: kills per volley by armour class).
+    let mid_kind = match std::env::var("FL_ARCHERY_TARGET").as_deref() {
+        Ok("heavy") => KIND_HEAVY,
+        Ok("spear") => KIND_SPEAR,
+        _ => KIND_LIGHT,
+    };
+    for (x, z, kind) in [
+        (-60.0, 40.0, KIND_LIGHT),
+        (0.0, 20.0, mid_kind),
+        (60.0, 40.0, KIND_LIGHT),
+    ] {
+        spawn_regiment(units, terrain, &mut list, 1, kind, Vec2::new(x, z), size, 1.0);
+        let g = list.len() - 1;
+        list[g].hold = true;
+    }
+    // Optional deep attacker, ordered onto the west archer regiment.
+    if std::env::var("FL_ARCHERY_ATTACK").is_ok() {
+        spawn_regiment(units, terrain, &mut list, 1, KIND_LIGHT, Vec2::new(-30.0, 110.0), size, 1.0);
+        let g = list.len() - 1;
+        list[g].order = Some(crate::orders::Order::Attack(1));
+        list[g].auto_order = true;
+    }
+    groups.list = list;
+    info!(
+        "[archery] 2 archer regiments behind a screen; orange holds STATIC — middle block in \
+         bow range, flanks beyond it (attack-order for the stand-off); FL_ARCHERY_ATTACK=1 \
+         adds a charging attacker"
+    );
+}
+
+/// FL_TEST_ARCHERY bookkeeping every 4 s: archer strength + ammo, the
+/// live arrow pool, and orange's bleed.
+fn archery_log(
+    groups: Res<Groups>,
+    arrows: Res<crate::arrows::Arrows>,
+    astats: Res<crate::arrows::ArrowStats>,
+    time: Res<Time>,
+    mut next: Local<f32>,
+) {
+    if std::env::var("FL_TEST_ARCHERY").is_err() || groups.list.len() < 6 {
+        return;
+    }
+    let t = time.elapsed_secs();
+    if t < *next {
+        return;
+    }
+    *next = t + 4.0;
+    let flag = |gd: &crate::orders::GroupData| {
+        format!(
+            "{}{}{}{}",
+            if gd.engaged { "E" } else { "-" },
+            if gd.state.is_broken() { "B" } else { "-" },
+            if gd.skirmishing { "S" } else { "-" },
+            if gd.order.is_some() { "O" } else { "-" },
+        )
+    };
+    let attacker = groups
+        .list
+        .get(6)
+        .map(|a| {
+            format!(
+                ", attacker {} ({}) at {:.0} m",
+                a.count,
+                flag(a),
+                a.centroid.distance(groups.list[1].centroid)
+            )
+        })
+        .unwrap_or_default();
+    info!(
+        "[archery] t={t:.0}s archers {} ({}, ammo {}) / {} ({}, ammo {}) | flight {} \
+         (dropped {}) | screen {} | holders {}/{}/{}{attacker}",
+        groups.list[1].count,
+        flag(&groups.list[1]),
+        groups.list[1].ammo_left,
+        groups.list[2].count,
+        flag(&groups.list[2]),
+        groups.list[2].ammo_left,
+        arrows.len(),
+        astats.dropped,
+        groups.list[0].count,
+        groups.list[3].count,
+        groups.list[4].count,
+        groups.list[5].count,
+    );
 }
 
 /// FL_TEST_ROUT: one blue regiment vs three converging orange regiments.
