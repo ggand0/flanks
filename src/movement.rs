@@ -997,6 +997,7 @@ pub fn step_sim(
                                                 from,
                                                 to,
                                                 &blocks[team[i] as usize],
+                                                terrain,
                                             ),
                                             team: team[i],
                                             group: group[i],

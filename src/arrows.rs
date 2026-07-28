@@ -203,11 +203,17 @@ fn setup_arrow_buckets(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>)
 /// Solve a launch velocity from `from` to `to` (M2TW model: the engine
 /// picks a speed in the 20..48 m/s band and an arc that fits). The flat
 /// low-root solution at full draw when the path clears every friendly
-/// block en route; otherwise the slowest lofted arc that reaches — a
-/// high lob just over the crowd (M2TW's loft-over-friendlies; the ~65
-/// degree max angle emerges from the speed floor). `blocks` = friendly
-/// regiment discs as (centroid, radius, clearance top y).
-pub fn solve_launch(from: Vec3, to: Vec3, blocks: &[(Vec2, f32, f32)]) -> Vec3 {
+/// block AND the terrain en route; otherwise the slowest lofted arc
+/// that reaches — a high lob just over the crowd (M2TW's
+/// loft-over-friendlies; the ~65 degree max angle emerges from the
+/// speed floor). `blocks` = friendly regiment discs as
+/// (centroid, radius, clearance top y).
+pub fn solve_launch(
+    from: Vec3,
+    to: Vec3,
+    blocks: &[(Vec2, f32, f32)],
+    terrain: &crate::terrain::Terrain,
+) -> Vec3 {
     let flat = to.xz() - from.xz();
     let d = flat.length().max(0.5);
     let dir = flat / d;
@@ -236,6 +242,31 @@ pub fn solve_launch(from: Vec3, to: Vec3, blocks: &[(Vec2, f32, f32)]) -> Vec3 {
                 lofted = true;
                 break;
             }
+        }
+    }
+    if !lofted {
+        // Terrain line of sight: ground RISING above the shooter's feet
+        // blocks the flat shot — firing up a slope, the flat arc threads
+        // exactly where the uphill front rank's heads are (rear archers
+        // shot their own front rows), or straight into the hillside.
+        // Only raised ground counts: flat fields keep their flat
+        // volleys, downhill stays a sniping shot, and the last meters
+        // are exempt (the arrow has to come down on the target). The
+        // arc must clear a head standing on any such rise.
+        let from_ground = terrain.height_at(from.x, from.z);
+        let step = (d / 24.0).max(4.0);
+        let mut s = 2.0_f32;
+        while s < d - 4.0 {
+            let p = from.xz() + dir * s;
+            let g_s = terrain.height_at(p.x, p.y);
+            if g_s > from_ground + 0.35 {
+                let y = from.y + s * tan - g * s * s * (1.0 + tan * tan) / (2.0 * vv);
+                if y < g_s + 1.30 {
+                    lofted = true;
+                    break;
+                }
+            }
+            s += step;
         }
     }
     if lofted {
