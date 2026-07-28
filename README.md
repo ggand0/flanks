@@ -11,6 +11,7 @@ Every soldier on the field is individually simulated, and battles can scale up t
 - Regiment-based orders that keep formations intact: lasso selection, move and attack orders, battle lines drawn by dragging
 - Formations: shield wall, spear wall, loose order, hold position
 - Melee combat with swing timers, directional defense, charge impact, and physical spear walls
+- Archer regiments: every arrow is a simulated projectile with a real flight arc, and it hits whatever it lands on
 - Morale and fatigue based on values measured from the M2TW engine: regiments waver, rout, rally, or shatter
 - Skirmish AI opponent and battle outcomes
 - Unit cards, regiment banners, and a live morale inspect panel
@@ -38,6 +39,8 @@ Requires Rust 1.95 or newer.
 | Loose order                     | L                         |
 | Blob (mob) formation            | B                         |
 | Hold position                   | H                         |
+| Fire at will (archers)          | T                         |
+| Skirmish mode (archers)         | K                         |
 | Control groups                  | Ctrl + 1..9 store, 1..9 recall |
 | Pan camera                      | WASD or screen edges      |
 | Zoom / rotate camera            | Scroll / middle drag      |
