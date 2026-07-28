@@ -47,7 +47,7 @@ impl Plugin for BattleAudioPlugin {
         app.add_systems(Startup, setup_audio)
             .add_systems(
                 Update,
-                (update_beds, combat_one_shots, event_cues)
+                (update_beds, combat_one_shots, archer_one_shots, event_cues)
                     .chain()
                     .run_if(in_state(GameState::Battle)),
             )
@@ -83,6 +83,19 @@ struct AudioBank {
     ui_attack: Handle<AudioSource>,
     sting_victory: Handle<AudioSource>,
     sting_defeat: Handle<AudioSource>,
+    // --- archer set (sfx_bow/, prompts in tmp/archer-sfx-prompts.md) ---
+    /// Single string-snap releases, budgeted from ArrowStats.loosed.
+    bow_loose: Vec<Handle<AudioSource>>,
+    /// Body hits; the wood knocks mix in at low odds (shielded men).
+    arrow_flesh: Vec<Handle<AudioSource>>,
+    arrow_wood: Vec<Handle<AudioSource>>,
+    /// Shafts thudding into dirt (the miss patter).
+    arrow_ground: Vec<Handle<AudioSource>>,
+    /// Near-miss whistle for close-up incoming fire.
+    arrow_flyby: Vec<Handle<AudioSource>>,
+    /// Massed-volley sheets: loosed away / falling on the camera.
+    volley_away: Vec<Handle<AudioSource>>,
+    volley_incoming: Vec<Handle<AudioSource>>,
 }
 
 /// Looping bed entities, indexed by `Bed`.
@@ -141,6 +154,34 @@ fn setup_audio(mut commands: Commands, assets: Res<AssetServer>) {
         ui_attack: assets.load("sfx_new/ui_attack.mp3"),
         sting_victory: assets.load("sting_victory.mp3"),
         sting_defeat: assets.load("sting_defeat.mp3"),
+        bow_loose: load_set(&[
+            "sfx_bow/sfx_bow_loose_01",
+            "sfx_bow/sfx_bow_loose_02",
+            "sfx_bow/sfx_bow_loose_03",
+            "sfx_bow/sfx_bow_loose_04",
+        ]),
+        arrow_flesh: load_set(&[
+            "sfx_bow/sfx_arrow_flesh_01",
+            "sfx_bow/sfx_arrow_flesh_02",
+            "sfx_bow/sfx_arrow_flesh_03",
+        ]),
+        arrow_wood: load_set(&["sfx_bow/sfx_arrow_wood_01", "sfx_bow/sfx_arrow_wood_02"]),
+        arrow_ground: load_set(&[
+            "sfx_bow/sfx_arrow_ground_01",
+            "sfx_bow/sfx_arrow_ground_02",
+            "sfx_bow/sfx_arrow_ground_03",
+        ]),
+        arrow_flyby: load_set(&["sfx_bow/sfx_arrow_flyby_01", "sfx_bow/sfx_arrow_flyby_02"]),
+        volley_away: vec![
+            assets.load("sfx_bow/sfx_volley_away_01.wav"),
+            assets.load("sfx_bow/sfx_volley_away_02.mp3"),
+            assets.load("sfx_bow/sfx_volley_away_03.mp3"),
+        ],
+        volley_incoming: vec![
+            assets.load("sfx_bow/volley_02_flight_incoming.wav"),
+            assets.load("sfx_bow/arrow_incoming_02_several.mp3"),
+            assets.load("sfx_bow/arrow_incoming_03.mp3"),
+        ],
     });
 
     let bed = |name: &str| {
@@ -367,6 +408,193 @@ fn combat_one_shots(
         *death_cooldown = 0.5 + 0.5 * hash01(seed ^ 0x55);
     }
     *prev_kills = kills;
+}
+
+/// State for `archer_one_shots`, bundled into one Local.
+#[derive(Default)]
+struct ArrowAudioState {
+    loose_acc: f32,
+    impact_acc: f32,
+    ground_acc: f32,
+    /// Loosed-per-second EMA (the volley-onset detector).
+    rate_ema: f32,
+    away_high: bool,
+    away_gate: f32,
+    incoming_high: bool,
+    incoming_gate: f32,
+    flyby_gate: f32,
+    frame: u32,
+}
+
+/// Archer sound: string snaps and impact thuds budgeted from the
+/// per-tick ArrowStats counters (same fractional-accumulator pattern as
+/// the melee clangs), plus the two massed-volley sheets as edge cues —
+/// `volley_away` when the loose rate spikes near friendly bows,
+/// `volley_incoming` when a cloud of falling arrows is about to land
+/// near the camera. Assets: sfx_bow/ (tmp/archer-sfx-prompts.md).
+#[allow(clippy::too_many_arguments)] // bevy system params
+fn archer_one_shots(
+    mut commands: Commands,
+    bank: Option<Res<AudioBank>>,
+    astats: Res<crate::arrows::ArrowStats>,
+    arrows: Res<crate::arrows::Arrows>,
+    groups: Res<Groups>,
+    camera: Query<&RtsCamera>,
+    time: Res<Time>,
+    virt_time: Res<Time<Virtual>>,
+    settings: Res<crate::settings::Settings>,
+    mut st: Local<ArrowAudioState>,
+) {
+    let Some(bank) = bank else { return };
+    let Ok(cam) = camera.single() else { return };
+    // A paused sim freezes the per-tick counters at their last values:
+    // integrating them while paused would drip phantom arrows forever.
+    if virt_time.is_paused() {
+        return;
+    }
+    st.frame = st.frame.wrapping_add(1);
+    let dt = time.delta_secs();
+    st.away_gate -= dt;
+    st.incoming_gate -= dt;
+    st.flyby_gate -= dt;
+    let bv = battle_vol(&settings);
+    let zoom_att = zoom_attenuation(cam.distance);
+    let focus = Vec2::new(cam.focus.x, cam.focus.z);
+    let hear = 200.0 + cam.distance * 0.4;
+
+    // Where the bows are: nearest archer regiment still carrying arrows.
+    let shooter_dist = groups
+        .list
+        .iter()
+        .filter(|g| {
+            g.kind == crate::unit_types::KIND_ARCHER && g.count > 0 && g.ammo_left > 0
+        })
+        .map(|g| g.centroid.distance(focus))
+        .fold(f32::MAX, f32::min);
+    let shooter_prox = if shooter_dist == f32::MAX {
+        0.0
+    } else {
+        (1.0 - shooter_dist / hear).clamp(0.0, 1.0)
+    };
+
+    // Where the arrows are: mean of the live pool (the volley cloud) and
+    // the closest descending shaft to the camera.
+    let mut cloud = Vec2::ZERO;
+    let mut falling_near = 0usize;
+    if arrows.len() > 0 {
+        let mut sum = Vec2::ZERO;
+        for i in 0..arrows.len() {
+            sum += arrows.pos[i].xz();
+            if arrows.vel[i].y < 0.0 && arrows.pos[i].xz().distance_squared(focus) < 80.0 * 80.0
+            {
+                falling_near += 1;
+            }
+        }
+        cloud = sum / arrows.len() as f32;
+    }
+    let cloud_prox = if arrows.len() == 0 {
+        0.0
+    } else {
+        (1.0 - cloud.distance(focus) / hear).clamp(0.0, 1.0)
+    };
+
+    // Single string snaps: a fraction of actual looses, close-up only.
+    st.loose_acc += astats.loosed as f32 * 30.0 * dt * 0.05 * shooter_prox * shooter_prox * zoom_att;
+    let mut n = (st.loose_acc).floor() as u32;
+    st.loose_acc -= n as f32;
+    n = n.min(2);
+    for k in 0..n {
+        let seed = st.frame.wrapping_mul(53) ^ k ^ 0x51;
+        if let Some(h) = pick(&bank.bow_loose, seed) {
+            one_shot(
+                &mut commands,
+                h,
+                (0.14 + 0.08 * hash01(seed ^ 0x12)) * zoom_att * bv,
+                0.92 + 0.16 * hash01(seed ^ 0x23),
+            );
+        }
+    }
+
+    // Body hits (wood knock at low odds — the shaft that found a shield)
+    // and the dirt patter of the misses, near the falling cloud.
+    st.impact_acc += astats.hits as f32 * 30.0 * dt * 0.10 * cloud_prox * cloud_prox * zoom_att;
+    let mut n = (st.impact_acc).floor() as u32;
+    st.impact_acc -= n as f32;
+    n = n.min(2);
+    for k in 0..n {
+        let seed = st.frame.wrapping_mul(71) ^ k ^ 0x62;
+        let set = if hash01(seed ^ 0xA7) < 0.2 {
+            &bank.arrow_wood
+        } else {
+            &bank.arrow_flesh
+        };
+        if let Some(h) = pick(set, seed) {
+            one_shot(
+                &mut commands,
+                h,
+                (0.16 + 0.10 * hash01(seed ^ 0x13)) * zoom_att * bv,
+                0.92 + 0.16 * hash01(seed ^ 0x24),
+            );
+        }
+    }
+    let ground = astats.landed.saturating_sub(astats.hits);
+    st.ground_acc += ground as f32 * 30.0 * dt * 0.03 * cloud_prox * cloud_prox * zoom_att;
+    let mut n = (st.ground_acc).floor() as u32;
+    st.ground_acc -= n as f32;
+    n = n.min(1);
+    for _ in 0..n {
+        let seed = st.frame.wrapping_mul(89) ^ 0x73;
+        if let Some(h) = pick(&bank.arrow_ground, seed) {
+            one_shot(
+                &mut commands,
+                h,
+                (0.10 + 0.06 * hash01(seed ^ 0x14)) * zoom_att * bv,
+                0.9 + 0.2 * hash01(seed ^ 0x25),
+            );
+        }
+    }
+
+    // Volley-away sheet: the loose rate spiking = a massed release.
+    let rate = astats.loosed as f32 * 30.0;
+    st.rate_ema += (rate - st.rate_ema) * (dt / 0.25).min(1.0);
+    let high = st.rate_ema > 60.0;
+    if high && !st.away_high && st.away_gate <= 0.0 && shooter_prox > 0.05 {
+        let seed = st.frame.wrapping_mul(131);
+        if let Some(h) = pick(&bank.volley_away, seed) {
+            let vol = 0.5 * (0.3 + 0.7 * shooter_prox) * bv;
+            one_shot(&mut commands, h, vol, 0.96 + 0.08 * hash01(seed ^ 0x15));
+            info!("volley away (vol {vol:.2}, rate {:.0}/s)", st.rate_ema);
+        }
+        st.away_gate = 2.0;
+    }
+    st.away_high = high;
+
+    // Incoming sheet: a cloud of descending shafts over the camera.
+    let inc = falling_near > 25;
+    if inc && !st.incoming_high && st.incoming_gate <= 0.0 && zoom_att > 0.2 {
+        let seed = st.frame.wrapping_mul(151);
+        if let Some(h) = pick(&bank.volley_incoming, seed) {
+            let vol = 0.45 * zoom_att.max(0.5) * bv;
+            one_shot(&mut commands, h, vol, 0.96 + 0.08 * hash01(seed ^ 0x16));
+            info!("volley incoming (vol {vol:.2}, {falling_near} falling near)");
+        }
+        st.incoming_gate = 2.5;
+    }
+    st.incoming_high = inc;
+
+    // Near-miss flyby: a shaft dropping right past the close-up camera.
+    if falling_near > 0 && st.flyby_gate <= 0.0 && zoom_att > 0.6 {
+        let seed = st.frame.wrapping_mul(173);
+        if let Some(h) = pick(&bank.arrow_flyby, seed) {
+            one_shot(
+                &mut commands,
+                h,
+                (0.14 + 0.08 * hash01(seed ^ 0x17)) * bv,
+                0.94 + 0.12 * hash01(seed ^ 0x28),
+            );
+        }
+        st.flyby_gate = 1.2 + 1.5 * hash01(st.frame.wrapping_mul(7));
+    }
 }
 
 /// Edge-detection state for `event_cues`, bundled into one Local (the
