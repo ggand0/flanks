@@ -338,6 +338,19 @@ fn update_beds(
     }
 }
 
+/// Mean XZ of the live arrow pool — where "the volley" is for
+/// proximity purposes. None when nothing is in the air.
+fn arrow_cloud(arrows: &crate::arrows::Arrows) -> Option<Vec2> {
+    if arrows.len() == 0 {
+        return None;
+    }
+    let mut sum = Vec2::ZERO;
+    for p in &arrows.pos {
+        sum += p.xz();
+    }
+    Some(sum / arrows.len() as f32)
+}
+
 /// Poor-man's proximity: how "inside the battle" the camera is by zoom.
 /// 1.0 at RTS close-up (<= 90 m), fading to a floor when surveying the
 /// whole map. Real per-source spatial audio is a future item; this alone
@@ -441,12 +454,9 @@ fn combat_one_shots(
     // are landing on bodies this tick, the falling cloud's proximity
     // counts too.
     let mut prox = prox;
-    if astats.hits > 0 && arrows.len() > 0 {
-        let mut sum = Vec2::ZERO;
-        for p in &arrows.pos {
-            sum += p.xz();
-        }
-        let cloud = sum / arrows.len() as f32;
+    if astats.hits > 0
+        && let Some(cloud) = arrow_cloud(&arrows)
+    {
         prox = prox.max((1.0 - cloud.distance(focus) / hear).clamp(0.0, 1.0));
     }
     *death_cooldown -= time.delta_secs();
@@ -638,26 +648,17 @@ fn archer_one_shots(
         (1.0 - shooter_dist / hear).clamp(0.0, 1.0)
     };
 
-    // Where the arrows are: mean of the live pool (the volley cloud) and
-    // the closest descending shaft to the camera.
-    let mut cloud = Vec2::ZERO;
+    // Where the arrows are: the volley cloud, and how many shafts are
+    // dropping around the camera (the flyby feed).
+    let cloud_prox = arrow_cloud(&arrows)
+        .map(|c| (1.0 - c.distance(focus) / hear).clamp(0.0, 1.0))
+        .unwrap_or(0.0);
     let mut falling_near = 0usize;
-    if arrows.len() > 0 {
-        let mut sum = Vec2::ZERO;
-        for i in 0..arrows.len() {
-            sum += arrows.pos[i].xz();
-            if arrows.vel[i].y < 0.0 && arrows.pos[i].xz().distance_squared(focus) < 80.0 * 80.0
-            {
-                falling_near += 1;
-            }
+    for i in 0..arrows.len() {
+        if arrows.vel[i].y < 0.0 && arrows.pos[i].xz().distance_squared(focus) < 80.0 * 80.0 {
+            falling_near += 1;
         }
-        cloud = sum / arrows.len() as f32;
     }
-    let cloud_prox = if arrows.len() == 0 {
-        0.0
-    } else {
-        (1.0 - cloud.distance(focus) / hear).clamp(0.0, 1.0)
-    };
 
     // String snaps: a volley is the EVENT, not garnish over a din (the
     // melee-clang tuning read as "a dozen archers", owner-tested) — a
