@@ -53,6 +53,11 @@ pub struct Arrows {
     pub vel: Vec<Vec3>,
     pub team: Vec<u8>,
     pub group: Vec<u32>,
+    /// Stable per-arrow id (monotonic): swap-removes reindex the pool
+    /// every tick, so anything that follows ONE arrow across frames —
+    /// the attached fly-loop sounds (audio.rs) — tracks this instead.
+    pub id: Vec<u32>,
+    next_id: u32,
 }
 
 impl Arrows {
@@ -66,6 +71,7 @@ impl Arrows {
         self.vel.swap_remove(i);
         self.team.swap_remove(i);
         self.group.swap_remove(i);
+        self.id.swap_remove(i);
     }
 
     fn clear(&mut self) {
@@ -74,6 +80,7 @@ impl Arrows {
         self.vel.clear();
         self.team.clear();
         self.group.clear();
+        self.id.clear();
     }
 }
 
@@ -295,6 +302,9 @@ fn update_arrows(
             arrows.vel.push(s.vel);
             arrows.team.push(s.team);
             arrows.group.push(s.group);
+            let id = arrows.next_id;
+            arrows.id.push(id);
+            arrows.next_id = arrows.next_id.wrapping_add(1);
         }
     }
 

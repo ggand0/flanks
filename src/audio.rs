@@ -65,14 +65,20 @@ impl Plugin for BattleAudioPlugin {
         app.add_systems(Startup, setup_audio)
             .add_systems(
                 Update,
-                (update_beds, combat_one_shots, archer_one_shots, event_cues)
+                (
+                    update_beds,
+                    combat_one_shots,
+                    archer_one_shots,
+                    arrow_fly_loops,
+                    event_cues,
+                )
                     .chain()
                     .run_if(in_state(GameState::Battle)),
             )
             // Beds cut on leaving battle; one-shots survive into the
             // results screen (the victory/defeat sting must finish)
             // and are only culled when the menu comes up.
-            .add_systems(OnExit(GameState::Battle), silence_beds)
+            .add_systems(OnExit(GameState::Battle), (silence_beds, stop_fly_loops))
             .add_systems(OnEnter(GameState::Menu), stop_one_shots);
     }
 }
@@ -111,6 +117,9 @@ struct AudioBank {
     arrow_ground: Vec<Handle<AudioSource>>,
     /// Near-miss whistle for close-up incoming fire.
     arrow_flyby: Vec<Handle<AudioSource>>,
+    /// Seamless in-flight air loop, attached per arrow (the M2TW
+    /// ARROW_FLY model). Missing files stay silent until generated.
+    arrow_fly_loop: Vec<Handle<AudioSource>>,
     /// Massed-volley sheets: loosed away / falling on the camera.
     volley_away: Vec<Handle<AudioSource>>,
     volley_incoming: Vec<Handle<AudioSource>>,
@@ -190,6 +199,10 @@ fn setup_audio(mut commands: Commands, assets: Res<AssetServer>) {
             "sfx_bow/sfx_arrow_ground_03",
         ]),
         arrow_flyby: load_set(&["sfx_bow/sfx_arrow_flyby_01", "sfx_bow/sfx_arrow_flyby_02"]),
+        arrow_fly_loop: load_set(&[
+            "sfx_bow/sfx_arrow_fly_loop_01",
+            "sfx_bow/sfx_arrow_fly_loop_02",
+        ]),
         volley_away: vec![
             assets.load("sfx_bow/sfx_volley_away_01.wav"),
             assets.load("sfx_bow/sfx_volley_away_02.mp3"),
@@ -221,6 +234,14 @@ fn setup_audio(mut commands: Commands, assets: Res<AssetServer>) {
 fn silence_beds(mut sinks: Query<&mut AudioSink, With<Bed>>) {
     for mut sink in &mut sinks {
         sink.set_volume(Volume::Linear(0.0));
+    }
+}
+
+/// Looping fly sounds must not ring into the results screen (one-shots
+/// may — the sting must finish; a loop never finishes).
+fn stop_fly_loops(mut commands: Commands, loops: Query<Entity, With<ArrowFlyLoop>>) {
+    for e in &loops {
+        commands.entity(e).despawn();
     }
 }
 
@@ -426,6 +447,109 @@ fn combat_one_shots(
         *death_cooldown = 0.5 + 0.5 * hash01(seed ^ 0x55);
     }
     *prev_kills = kills;
+}
+
+/// A looping fly sound riding ONE arrow (the M2TW ARROW_FLY model:
+/// `looped, probability .3, fadein .2, fadeout .2` — a fraction of
+/// arrows carry a positional air loop that dies WITH the arrow, so the
+/// whoosh audibly resolves into its own impact). We track the stable
+/// arrow id (pool indices reshuffle every tick) and steer the sink's
+/// volume by live distance each frame.
+#[derive(Component)]
+struct ArrowFlyLoop {
+    arrow_id: u32,
+    /// Seconds of fade-out left once the arrow is gone; f32::MAX = live.
+    fading: f32,
+}
+
+/// M2TW: probability .3 — only this fraction of arrows sing.
+const FLY_LOOP_PROB: f32 = 0.3;
+/// Concurrent fly loops (each is one more decoder on the mixer).
+const MAX_FLY_LOOPS: usize = 12;
+/// M2TW: fadeout .2 s at the arrow's death.
+const FLY_LOOP_FADE: f32 = 0.2;
+
+/// Attach, follow, and retire the per-arrow fly loops.
+#[allow(clippy::too_many_arguments)] // bevy system params
+fn arrow_fly_loops(
+    mut commands: Commands,
+    bank: Option<Res<AudioBank>>,
+    arrows: Res<crate::arrows::Arrows>,
+    camera: Query<&RtsCamera>,
+    time: Res<Time>,
+    virt_time: Res<Time<Virtual>>,
+    settings: Res<crate::settings::Settings>,
+    mut loops: Query<(Entity, &mut ArrowFlyLoop, Option<&mut AudioSink>)>,
+) {
+    let Some(bank) = bank else { return };
+    let Ok(cam) = camera.single() else { return };
+    let dt = time.delta_secs();
+    let paused = virt_time.is_paused();
+    let bv = battle_vol(&settings);
+    let zoom_att = zoom_attenuation(cam.distance);
+    let focus = Vec2::new(cam.focus.x, cam.focus.z);
+    let hear = 140.0 + cam.distance * 0.3;
+
+    // One pass over the pool: positions of tracked ids + spawn candidates.
+    let mut tracked: Vec<u32> = loops.iter().map(|(_, l, _)| l.arrow_id).collect();
+    let mut found: Vec<(u32, f32)> = Vec::with_capacity(tracked.len()); // (id, dist)
+    let mut budget = MAX_FLY_LOOPS.saturating_sub(tracked.len());
+    for i in 0..arrows.len() {
+        let id = arrows.id[i];
+        let d = arrows.pos[i].xz().distance(focus);
+        if tracked.contains(&id) {
+            found.push((id, d));
+            continue;
+        }
+        // New candidates: the M2TW probability gate (stable per id, so
+        // an arrow is either a singer for its whole flight or never),
+        // in earshot, budget-capped.
+        if budget > 0
+            && !paused
+            && d < hear
+            && hash01(id.wrapping_mul(0x9E37_79B1)) < FLY_LOOP_PROB
+            && let Some(h) = pick(&bank.arrow_fly_loop, id)
+        {
+            commands.spawn((
+                AudioPlayer::new(h),
+                PlaybackSettings {
+                    volume: Volume::Linear(0.0),
+                    speed: 0.85 + 0.3 * hash01(id.wrapping_mul(0x85EB)),
+                    ..PlaybackSettings::LOOP
+                },
+                ArrowFlyLoop {
+                    arrow_id: id,
+                    fading: f32::MAX,
+                },
+            ));
+            tracked.push(id);
+            budget -= 1;
+        }
+    }
+
+    for (e, mut fl, sink) in &mut loops {
+        let live = found.iter().find(|(id, _)| *id == fl.arrow_id);
+        if live.is_none() && fl.fading == f32::MAX {
+            // Its arrow landed this frame: begin the M2TW fade-out (the
+            // impact one-shot is taking over right now).
+            fl.fading = FLY_LOOP_FADE;
+        }
+        let Some(mut sink) = sink else { continue };
+        if fl.fading < f32::MAX {
+            fl.fading -= dt;
+            if fl.fading <= 0.0 {
+                commands.entity(e).despawn();
+                continue;
+            }
+            let cur = sink.volume().to_linear();
+            sink.set_volume(Volume::Linear(cur * (fl.fading / FLY_LOOP_FADE).clamp(0.0, 1.0)));
+        } else if paused {
+            sink.set_volume(Volume::Linear(0.0));
+        } else if let Some((_, d)) = live {
+            let prox = (1.0 - d / hear).clamp(0.0, 1.0);
+            sink.set_volume(Volume::Linear(0.16 * prox * prox * zoom_att.max(0.3) * bv));
+        }
+    }
 }
 
 /// State for `archer_one_shots`, bundled into one Local.
