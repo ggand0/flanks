@@ -430,7 +430,7 @@ struct ArrowAudioState {
     away_gate: f32,
     incoming_high: bool,
     incoming_gate: f32,
-    flyby_gate: f32,
+    flyby_acc: f32,
     frame: u32,
 }
 
@@ -464,7 +464,6 @@ fn archer_one_shots(
     let dt = time.delta_secs();
     st.away_gate -= dt;
     st.incoming_gate -= dt;
-    st.flyby_gate -= dt;
     let bv = battle_vol(&settings);
     let zoom_att = zoom_attenuation(cam.distance);
     let focus = Vec2::new(cam.focus.x, cam.focus.z);
@@ -597,18 +596,28 @@ fn archer_one_shots(
     }
     st.incoming_high = inc;
 
-    // Near-miss flyby: a shaft dropping right past the close-up camera.
-    if falling_near > 0 && st.flyby_gate <= 0.0 && zoom_att > 0.6 {
-        let seed = st.frame.wrapping_mul(173);
+    // Flyby whooshes: budgeted from the COUNT of shafts currently
+    // falling around the camera (an arrow spends ~1.5 s in the zone, so
+    // ~0.5/s per shaft means most of them whistle once) — a volley
+    // passing overhead layers itself into a rushing stream that starts,
+    // thickens, and fades with the actual flight; a lone skirmish
+    // arrow stays a lone whistle. Camera must be down in it (zoom).
+    if zoom_att > 0.35 {
+        st.flyby_acc += falling_near as f32 * dt * 0.5 * zoom_att;
+    }
+    let mut n = (st.flyby_acc).floor() as u32;
+    st.flyby_acc -= n as f32;
+    n = n.min(3);
+    for k in 0..n {
+        let seed = st.frame.wrapping_mul(173) ^ k ^ 0x84;
         if let Some(h) = pick(&bank.arrow_flyby, seed) {
             one_shot(
                 &mut commands,
                 h,
-                (0.14 + 0.08 * hash01(seed ^ 0x17)) * bv,
-                0.94 + 0.12 * hash01(seed ^ 0x28),
+                (0.08 + 0.06 * hash01(seed ^ 0x17)) * zoom_att * bv,
+                0.86 + 0.28 * hash01(seed ^ 0x28),
             );
         }
-        st.flyby_gate = 1.2 + 1.5 * hash01(st.frame.wrapping_mul(7));
     }
 }
 
