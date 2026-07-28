@@ -57,13 +57,13 @@ const BOW_WOOD: [f32; 4] = [0.46, 0.29, 0.13, 0.0];
 /// Bowstring: pale flax. The string is what makes a bow read as a bow
 /// (without it the stave is just a stick), so it stays BRIGHT and thin.
 const STRING: [f32; 4] = [0.74, 0.70, 0.60, 0.0];
-/// Archer hood: muted Lincoln-green wool — the forester's color, and
-/// no other kind wears cloth on the head.
-const HOOD: [f32; 4] = [0.30, 0.34, 0.22, 0.0];
-/// Archer tunic: forester green, lighter than the hood, with a bit of
-/// team dye so the two armies' archers don't wear the exact same
-/// cloth (M2TW Sherwood archers: all-green, hood to boots).
-const TUNIC: [f32; 4] = [0.34, 0.40, 0.24, 0.25];
+/// Archer hood: takes the per-team CLOTH instance color (units.rs
+/// ARCHER_CLOTH — Lincoln green for blue, russet for orange), darkened
+/// a touch by the base so hood and tunic stay two tones of one dye.
+/// No other kind wears cloth on the head.
+const HOOD: [f32; 4] = [0.20, 0.22, 0.15, 0.80];
+/// Archer tunic: same per-team cloth, lighter than the hood.
+const TUNIC: [f32; 4] = [0.32, 0.34, 0.24, 0.85];
 /// Archer hose: dark brown wool.
 const HOSE: [f32; 4] = [0.36, 0.30, 0.22, 0.0];
 

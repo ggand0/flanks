@@ -48,10 +48,19 @@ fn spear_frac() -> f32 {
     crate::util::env_or("FL_SPEAR_FRAC", 0.25)
 }
 
-/// Fraction of each army's regiments that are archers (the rear ranks,
-/// behind the lights).
-fn archer_frac() -> f32 {
-    crate::util::env_or("FL_ARCHER_FRAC", 0.2)
+/// Archer regiments per army: a fixed COUNT by default — archers are
+/// force multipliers, and scaling them with army size turned big
+/// battles into arrow weather (owner: "two is probably enough
+/// considering how OP they are"). FL_ARCHER_FRAC switches back to a
+/// fraction of the army for sandbox play (=1 for all-archer fields).
+fn archer_regs(n_regs: usize) -> usize {
+    match std::env::var("FL_ARCHER_FRAC")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+    {
+        Some(frac) => (n_regs as f32 * frac).round() as usize,
+        None => 2.min(n_regs),
+    }
 }
 
 /// Spawn one regiment block (units + GroupData). `dir` faces the enemy
@@ -155,8 +164,7 @@ pub fn do_spawn_battle(
         };
         let n_heavy = (n_regs as f32 * heavy_frac()).round() as usize;
         let n_spear = (n_regs as f32 * spear_frac()).round() as usize;
-        let n_archer = ((n_regs as f32 * archer_frac()).round() as usize)
-            .min(n_regs.saturating_sub(n_heavy + n_spear));
+        let n_archer = archer_regs(n_regs).min(n_regs.saturating_sub(n_heavy + n_spear));
         let dir: f32 = if team == 0 { -1.0 } else { 1.0 };
         for r in 0..n_regs {
             let rank = r / per_rank;

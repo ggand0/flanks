@@ -378,6 +378,10 @@ fn combat_one_shots(
     camera: Query<&RtsCamera>,
     time: Res<Time>,
     settings: Res<crate::settings::Settings>,
+    (astats, arrows): (
+        Res<crate::arrows::ArrowStats>,
+        Res<crate::arrows::Arrows>,
+    ),
     mut clang_acc: Local<f32>,
     mut prev_kills: Local<u64>,
     mut death_cooldown: Local<f32>,
@@ -432,6 +436,19 @@ fn combat_one_shots(
 
     // Death screams: on kill deltas, rate-limited, and strictly a
     // close-up sound — a scream you can pick out from a hilltop is wrong.
+    // Men dying under arrows die far from any ENGAGED regiment, so the
+    // melee-proximity gate alone kept volley kills silent: when shafts
+    // are landing on bodies this tick, the falling cloud's proximity
+    // counts too.
+    let mut prox = prox;
+    if astats.hits > 0 && arrows.len() > 0 {
+        let mut sum = Vec2::ZERO;
+        for p in &arrows.pos {
+            sum += p.xz();
+        }
+        let cloud = sum / arrows.len() as f32;
+        prox = prox.max((1.0 - cloud.distance(focus) / hear).clamp(0.0, 1.0));
+    }
     *death_cooldown -= time.delta_secs();
     let kills: u64 = combat.kills[0] + combat.kills[1];
     if kills > *prev_kills && *death_cooldown <= 0.0 && prox > 0.25 && zoom_att > 0.35 {

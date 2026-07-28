@@ -161,6 +161,15 @@ pub fn push_unit(
         Vec3::new(0.20, 0.45, 0.85), // blue
         Vec3::new(0.90, 0.40, 0.15), // orange
     ];
+    /// Archers wear CLOTH palettes instead of the raw team color: the
+    /// mesh's team-blend parts (hood, tunic) lerp toward this per-unit
+    /// instance color, so the blue army fields the owner-approved
+    /// Lincoln-green foresters and the orange army a russet company —
+    /// allegiance reads by palette, banners carry the exact team hue.
+    const ARCHER_CLOTH: [Vec3; 2] = [
+        Vec3::new(0.30, 0.38, 0.20), // blue army: Lincoln green
+        Vec3::new(0.58, 0.35, 0.16), // orange army: autumn russet
+    ];
     let params = &crate::unit_types::TYPES[kind as usize];
     let p = Vec3::new(x, terrain.height_at(x, z) + params.half_height, z);
     units.pos.push(p);
@@ -181,7 +190,11 @@ pub fn push_unit(
     // Per-unit tonal variation so a block of 50k doesn't read as a flat
     // texture; alpha = stable anim seed (walk-bob phase), not opacity.
     let tone = 0.85 + 0.3 * hash01(seed.wrapping_mul(3));
-    let c = TEAM_COLORS[team as usize] * tone;
+    let c = if kind == crate::unit_types::KIND_ARCHER {
+        ARCHER_CLOTH[team as usize] * tone
+    } else {
+        TEAM_COLORS[team as usize] * tone
+    };
     units.color.push([c.x, c.y, c.z, hash01(seed.wrapping_mul(11) + 7)]);
     units.target.push(u32::MAX);
     units.swing.push(SWING_RECOVER);
