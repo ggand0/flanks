@@ -506,29 +506,35 @@ fn archer_one_shots(
         (1.0 - cloud.distance(focus) / hear).clamp(0.0, 1.0)
     };
 
-    // Single string snaps: a fraction of actual looses, close-up only.
-    st.loose_acc += astats.loosed as f32 * 30.0 * dt * 0.05 * shooter_prox * shooter_prox * zoom_att;
+    // String snaps: a volley is the EVENT, not garnish over a din (the
+    // melee-clang tuning read as "a dozen archers", owner-tested) — a
+    // large share of looses each spawn a jittered snap and the clips
+    // LAYER into the ripple of a massed release. Distance thins the
+    // count only mildly; it mostly quiets the clips.
+    st.loose_acc +=
+        astats.loosed as f32 * 30.0 * dt * 0.35 * shooter_prox * (0.4 + 0.6 * zoom_att);
     let mut n = (st.loose_acc).floor() as u32;
     st.loose_acc -= n as f32;
-    n = n.min(2);
+    n = n.min(4);
     for k in 0..n {
         let seed = st.frame.wrapping_mul(53) ^ k ^ 0x51;
         if let Some(h) = pick(&bank.bow_loose, seed) {
             one_shot(
                 &mut commands,
                 h,
-                (0.14 + 0.08 * hash01(seed ^ 0x12)) * zoom_att * bv,
-                0.92 + 0.16 * hash01(seed ^ 0x23),
+                (0.09 + 0.06 * hash01(seed ^ 0x12)) * zoom_att * bv,
+                0.88 + 0.24 * hash01(seed ^ 0x23),
             );
         }
     }
 
     // Body hits (wood knock at low odds — the shaft that found a shield)
-    // and the dirt patter of the misses, near the falling cloud.
-    st.impact_acc += astats.hits as f32 * 30.0 * dt * 0.10 * cloud_prox * cloud_prox * zoom_att;
+    // and the dirt patter of the misses, near the falling cloud. Same
+    // mass-scale budgeting as the looses.
+    st.impact_acc += astats.hits as f32 * 30.0 * dt * 0.30 * cloud_prox * (0.4 + 0.6 * zoom_att);
     let mut n = (st.impact_acc).floor() as u32;
     st.impact_acc -= n as f32;
-    n = n.min(2);
+    n = n.min(3);
     for k in 0..n {
         let seed = st.frame.wrapping_mul(71) ^ k ^ 0x62;
         let set = if hash01(seed ^ 0xA7) < 0.2 {
@@ -540,24 +546,24 @@ fn archer_one_shots(
             one_shot(
                 &mut commands,
                 h,
-                (0.16 + 0.10 * hash01(seed ^ 0x13)) * zoom_att * bv,
-                0.92 + 0.16 * hash01(seed ^ 0x24),
+                (0.11 + 0.08 * hash01(seed ^ 0x13)) * zoom_att * bv,
+                0.88 + 0.24 * hash01(seed ^ 0x24),
             );
         }
     }
     let ground = astats.landed.saturating_sub(astats.hits);
-    st.ground_acc += ground as f32 * 30.0 * dt * 0.03 * cloud_prox * cloud_prox * zoom_att;
+    st.ground_acc += ground as f32 * 30.0 * dt * 0.10 * cloud_prox * (0.4 + 0.6 * zoom_att);
     let mut n = (st.ground_acc).floor() as u32;
     st.ground_acc -= n as f32;
-    n = n.min(1);
-    for _ in 0..n {
-        let seed = st.frame.wrapping_mul(89) ^ 0x73;
+    n = n.min(2);
+    for k in 0..n {
+        let seed = st.frame.wrapping_mul(89) ^ k ^ 0x73;
         if let Some(h) = pick(&bank.arrow_ground, seed) {
             one_shot(
                 &mut commands,
                 h,
-                (0.10 + 0.06 * hash01(seed ^ 0x14)) * zoom_att * bv,
-                0.9 + 0.2 * hash01(seed ^ 0x25),
+                (0.07 + 0.05 * hash01(seed ^ 0x14)) * zoom_att * bv,
+                0.86 + 0.28 * hash01(seed ^ 0x25),
             );
         }
     }
