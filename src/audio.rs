@@ -37,6 +37,14 @@ fn ui_vol(s: &crate::settings::Settings) -> f32 {
 /// Bed smoothing time constant (seconds to ~2/3 of the way to target).
 const BED_SMOOTH: f32 = 0.35;
 
+/// Massed-volley sheet cues: BENCHED — the pre-rendered 2.5 s sheets
+/// don't track the actual flight (they fire on rate edges, so onset,
+/// length, and position all drift from what's on screen). The likely
+/// replacement is many INDIVIDUAL whoosh/swish one-shots budgeted from
+/// the live arrow cloud so the volley layers itself organically, like
+/// every other sound here. Set to true to hear the sheets again.
+const VOLLEY_SHEETS_ON: bool = false;
+
 pub struct BattleAudioPlugin;
 
 impl Plugin for BattleAudioPlugin {
@@ -558,7 +566,7 @@ fn archer_one_shots(
     let rate = astats.loosed as f32 * 30.0;
     st.rate_ema += (rate - st.rate_ema) * (dt / 0.25).min(1.0);
     let high = st.rate_ema > 60.0;
-    if high && !st.away_high && st.away_gate <= 0.0 && shooter_prox > 0.05 {
+    if VOLLEY_SHEETS_ON && high && !st.away_high && st.away_gate <= 0.0 && shooter_prox > 0.05 {
         let seed = st.frame.wrapping_mul(131);
         if let Some(h) = pick(&bank.volley_away, seed) {
             let vol = 0.5 * (0.3 + 0.7 * shooter_prox) * bv;
@@ -571,7 +579,8 @@ fn archer_one_shots(
 
     // Incoming sheet: a cloud of descending shafts over the camera.
     let inc = falling_near > 25;
-    if inc && !st.incoming_high && st.incoming_gate <= 0.0 && zoom_att > 0.2 {
+    if VOLLEY_SHEETS_ON && inc && !st.incoming_high && st.incoming_gate <= 0.0 && zoom_att > 0.2
+    {
         let seed = st.frame.wrapping_mul(151);
         if let Some(h) = pick(&bank.volley_incoming, seed) {
             let vol = 0.45 * zoom_att.max(0.5) * bv;
