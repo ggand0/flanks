@@ -38,11 +38,14 @@ fn ui_vol(s: &crate::settings::Settings) -> f32 {
 const BED_SMOOTH: f32 = 0.35;
 
 /// Hard ceiling on simultaneously playing one-shots. Every one-shot is
-/// a live decoder on rodio's single mixer thread; past ~50 the stream
-/// underruns ("Buffer underrun/overrun" errors, audible dropouts,
-/// owner-hit with the volley layers). The budgets shape the sound;
-/// this guard protects the mixer no matter what the budgets do.
-const MAX_LIVE_ONE_SHOTS: usize = 40;
+/// a live decoder on rodio's single mixer thread; the underruns
+/// ("Buffer underrun/overrun" errors, audible dropouts) appeared north
+/// of ~100 concurrent. The first guess of 40 audibly starved the loose
+/// and impact layers themselves (a volley's looses alone stack ~50
+/// clips), so the ceiling sits between the two: high enough for the
+/// full volley chorus, under the measured breaking point. The budgets
+/// shape the sound; this guard protects the mixer.
+const MAX_LIVE_ONE_SHOTS: usize = 64;
 
 /// Massed-volley sheet cues: BENCHED — the pre-rendered 2.5 s sheets
 /// don't track the actual flight (they fire on rate edges, so onset,
