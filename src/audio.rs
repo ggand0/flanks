@@ -910,10 +910,13 @@ fn event_cues(
             _ => (u32::MAX, false),
         };
         // Archers ordered onto a close target VOLLEY it (the stand-off
-        // fire order) — no melee war cry while the bows are working.
+        // fire order) — no melee war cry while there are arrows to
+        // spend. Gated on AMMO, not the firing flag: the flag lags a
+        // sim tick behind a fresh order and the cry edge fires the
+        // same frame the order lands (the "cries once sometimes" bug).
         // An empty quiver turns the same order into a real knife
         // charge, and that one roars.
-        let volleying = gd.kind == crate::unit_types::KIND_ARCHER && gd.firing;
+        let volleying = gd.kind == crate::unit_types::KIND_ARCHER && gd.ammo_left > 0;
         let cry = in_range && gd.count > 0 && !gd.state.is_broken() && !volleying;
         if cry && (!st.prev_cry[g] || atk != prev_atk) {
             cry_dist = cry_dist.min(gd.centroid.distance(focus));

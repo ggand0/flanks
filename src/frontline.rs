@@ -458,14 +458,17 @@ fn update_groups(units: Res<Units>, mut groups: ResMut<Groups>) {
         let charging = if engaged || group.state.is_broken() {
             false
         } else if let Some(crate::orders::Order::Attack(t)) = group.order {
-            // An archer regiment with a live fire solution is VOLLEYING,
-            // not charging — its attack order is a fire order (the
-            // stand-off), even at point-blank. Out of ammo, the same
-            // order is a real knife charge and flags like one.
+            // An archer regiment with arrows left is VOLLEYING, not
+            // charging — its attack order is a fire order (the
+            // stand-off), even at point-blank. Gated on ammo rather
+            // than the firing flag, which lags a tick behind a fresh
+            // order and let a one-tick charge blip through. Out of
+            // ammo, the same order is a real knife charge and flags
+            // like one.
             let t = t as usize;
             counts[t] > 0
                 && cents[t].distance(group.centroid) < CHARGE_RANGE
-                && !(group.kind == crate::unit_types::KIND_ARCHER && group.firing)
+                && !(group.kind == crate::unit_types::KIND_ARCHER && group.ammo_left > 0)
         } else {
             false
         };
