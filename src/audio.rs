@@ -909,7 +909,12 @@ fn event_cues(
             }
             _ => (u32::MAX, false),
         };
-        let cry = in_range && gd.count > 0 && !gd.state.is_broken();
+        // Archers ordered onto a close target VOLLEY it (the stand-off
+        // fire order) — no melee war cry while the bows are working.
+        // An empty quiver turns the same order into a real knife
+        // charge, and that one roars.
+        let volleying = gd.kind == crate::unit_types::KIND_ARCHER && gd.firing;
+        let cry = in_range && gd.count > 0 && !gd.state.is_broken() && !volleying;
         if cry && (!st.prev_cry[g] || atk != prev_atk) {
             cry_dist = cry_dist.min(gd.centroid.distance(focus));
         }
