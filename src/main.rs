@@ -12,6 +12,7 @@ mod morale;
 mod movement;
 mod orders;
 mod overlay;
+mod picker;
 mod regiments;
 mod render_units;
 mod selection;
@@ -94,6 +95,7 @@ fn main() {
             camera::RtsCameraPlugin,
             overlay::OverlayPlugin,
             unit_cards::UnitCardsPlugin,
+            picker::PickerPlugin,
         ))
         .insert_resource(Time::<Fixed>::from_hz(30.0))
         .insert_resource(ClearColor(Color::srgb(0.62, 0.70, 0.78)))

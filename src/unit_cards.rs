@@ -87,7 +87,7 @@ const CARD_BG_HOVER: Color = Color::srgba(0.22, 0.24, 0.30, 0.95);
 const CARD_BG_DEAD: Color = Color::srgba(0.04, 0.04, 0.05, 0.85);
 /// Strength fill per kind, player-blue family (team color is blue on the
 /// field; the kind letter + shade carries the rest).
-const KIND_FILL: [Color; NUM_KINDS] = [
+pub const KIND_FILL: [Color; NUM_KINDS] = [
     Color::srgb(0.22, 0.42, 0.85), // heavy: deep blue
     Color::srgb(0.42, 0.62, 0.95), // light: pale blue
     Color::srgb(0.30, 0.55, 0.70), // spear: teal blue
@@ -396,6 +396,12 @@ fn rasterize_icon(shapes: Vec<IconShape>, tex_w: u32, tex_h: u32) -> Image {
 
 fn rasterize_kind_icon(kind: u8) -> Image {
     rasterize_icon(kind_icon_shapes(kind), ICON_TEX_W, ICON_TEX_H)
+}
+
+/// A fresh rasterization of a kind pictogram for consumers outside the
+/// battle HUD (the Select Units screen shares the exact textures).
+pub fn kind_icon_image(kind: u8) -> Image {
+    rasterize_kind_icon(kind)
 }
 
 // ── Button icon shapes (44x44 texture = 2x the 22px button canvas) ──

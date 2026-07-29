@@ -68,19 +68,45 @@ impl Scenario {
     }
 }
 
+/// Enemy composition source, set on the Select Units screen: a random
+/// army style rolled at each battle start, a chosen style (still
+/// jittered a little per battle), or hand-picked counts.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum EnemyComp {
+    Random,
+    Style(usize),
+    Manual([usize; crate::unit_types::NUM_KINDS]),
+}
+
 #[derive(Resource)]
 pub struct BattleConfig {
     pub units_per_team: usize,
     pub reg_size: usize,
     pub ai_enabled: bool,
     pub scenario: Scenario,
+    /// Player composition from the Select Units screen: regiments per
+    /// kind (KIND_* indexed), summing to at most `n_slots()`.
+    pub player_regs: [usize; crate::unit_types::NUM_KINDS],
+    pub enemy: EnemyComp,
+}
+
+impl BattleConfig {
+    /// The regiment budget: how many regiment slots the chosen army
+    /// size buys at the current regiment size.
+    pub fn n_slots(&self) -> usize {
+        (self.units_per_team / self.reg_size).max(1)
+    }
 }
 
 impl Default for BattleConfig {
     fn default() -> Self {
+        let units_per_team = crate::util::env_or("FL_UNITS", 100_000);
+        let reg_size = crate::util::env_or("FL_REG_SIZE", 1000_usize).max(50);
         Self {
-            units_per_team: crate::util::env_or("FL_UNITS", 100_000),
-            reg_size: crate::util::env_or("FL_REG_SIZE", 1000_usize).max(50),
+            player_regs: crate::regiments::frac_comp((units_per_team / reg_size).max(1)),
+            enemy: EnemyComp::Random,
+            units_per_team,
+            reg_size,
             ai_enabled: !std::env::var("FL_AI").is_ok_and(|v| v == "0"),
             scenario: Scenario::from_env(),
         }
@@ -91,6 +117,7 @@ impl Default for BattleConfig {
 pub enum GameState {
     #[default]
     Menu,
+    UnitSelect,
     Battle,
     Results,
 }
@@ -241,12 +268,12 @@ impl Plugin for GameShellPlugin {
 
 pub const TEXT_COLOR: Color = Color::srgb(0.92, 0.92, 0.85);
 pub const DIM_TEXT_COLOR: Color = Color::srgb(0.55, 0.55, 0.50);
-const PANEL_BG: Color = Color::srgba(0.05, 0.06, 0.08, 0.92);
+pub const PANEL_BG: Color = Color::srgba(0.05, 0.06, 0.08, 0.92);
 pub const BTN_NORMAL: Color = Color::srgba(0.15, 0.16, 0.20, 0.92);
 pub const BTN_HOVER: Color = Color::srgba(0.25, 0.27, 0.32, 0.95);
 pub const BTN_PRESSED: Color = Color::srgba(0.10, 0.11, 0.14, 0.95);
 
-fn fullscreen_overlay() -> Node {
+pub fn fullscreen_overlay() -> Node {
     Node {
         position_type: PositionType::Absolute,
         width: Val::Percent(100.0),
@@ -269,7 +296,7 @@ fn button_node() -> Node {
 }
 
 /// The standard big menu button (menu, pause, results screens).
-fn spawn_text_button(p: &mut ChildSpawnerCommands, label: &str, marker: impl Bundle) {
+pub fn spawn_text_button(p: &mut ChildSpawnerCommands, label: &str, marker: impl Bundle) {
     p.spawn((Button, button_node(), BackgroundColor(BTN_NORMAL), marker))
         .with_children(|b| {
             b.spawn((
@@ -467,6 +494,29 @@ fn spawn_option_row(p: &mut ChildSpawnerCommands, label: &str, value: &str, btn:
     });
 }
 
+/// Where Start Battle goes: normal battles pass through the Select
+/// Units screen; scripted scenarios and FL_DEPLOY=0 skip deployment and
+/// the picker both and drop straight into the fight.
+fn start_target() -> GameState {
+    if scripts_active() || crate::util::env_or("FL_DEPLOY", 1_u32) == 0 {
+        GameState::Battle
+    } else {
+        GameState::UnitSelect
+    }
+}
+
+/// Start a normal battle from the menu. A previous debug-scenario
+/// battle leaves its env var set until setup_battle syncs, so clear
+/// the scenario envs now: the picker decision must see the chosen
+/// scenario, not the stale one. Launch-only battery envs
+/// (FL_TEST_FRONT and kin) are not scenario envs and still skip the
+/// picker on purpose.
+fn start_normal_battle(config: &mut BattleConfig, next: &mut NextState<GameState>) {
+    config.scenario = Scenario::Normal;
+    sync_scenario_env(Scenario::Normal);
+    next.set(start_target());
+}
+
 fn menu_buttons(
     query: Query<(&Interaction, &MenuButton), Changed<Interaction>>,
     keys: Res<ButtonInput<KeyCode>>,
@@ -481,16 +531,14 @@ fn menu_buttons(
         return;
     }
     if keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::Space) {
-        config.scenario = Scenario::Normal;
-        next.set(GameState::Battle);
+        start_normal_battle(&mut config, &mut next);
         return;
     }
     for (interaction, btn) in &query {
         if *interaction == Interaction::Pressed {
             match btn {
                 MenuButton::StartBattle => {
-                    config.scenario = Scenario::Normal;
-                    next.set(GameState::Battle);
+                    start_normal_battle(&mut config, &mut next);
                 }
                 MenuButton::Quit => {
                     exit.write(AppExit::Success);
@@ -518,6 +566,10 @@ fn menu_option_buttons(
                     .unwrap_or(0);
                 config.units_per_team = ARMY_SIZES[idx].0;
                 config.reg_size = if config.units_per_team <= 10_000 { 500 } else { 1000 };
+                // The regiment budget changed: reset both compositions
+                // (stale counts could overflow the new slot total).
+                config.player_regs = crate::regiments::frac_comp(config.n_slots());
+                config.enemy = EnemyComp::Random;
                 ARMY_SIZES[idx].1
             }
             OptionButton::Ai => {
