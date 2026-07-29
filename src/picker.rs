@@ -51,7 +51,7 @@ fn kind_desc(kind: u8) -> &'static str {
 }
 
 const HINT: &str = "Drag a card into the army list or click it to add a regiment. \
-                    Click a placed card to remove it. Hold Shift for 10 at a time.";
+                    Right-click it or click a placed card to remove one. Hold Shift for 10 at a time.";
 
 pub struct PickerPlugin;
 
@@ -103,6 +103,7 @@ enum PickerPane {
     Grid,
     Note,
     ModeRow,
+    DefaultBtn,
 }
 
 /// Every dynamic text on the screen, refreshed together.
@@ -119,6 +120,7 @@ enum PickerText {
 #[derive(Component)]
 enum PickerButton {
     TeamFlip,
+    Default,
     Back,
     Start,
 }
@@ -266,6 +268,28 @@ fn spawn_army_pane(row: &mut ChildSpawnerCommands) {
                 PickerText::Team,
             ));
             spawn_arrow(h, ">");
+            // Restores the classic split for whichever editable
+            // composition is on screen; hidden on Random/style pages.
+            h.spawn((
+                Button,
+                Node {
+                    padding: UiRect::axes(Val::Px(10.0), Val::Px(4.0)),
+                    margin: UiRect::left(Val::Px(10.0)),
+                    justify_content: JustifyContent::Center,
+                    align_items: AlignItems::Center,
+                    ..default()
+                },
+                BackgroundColor(BTN_NORMAL),
+                PickerButton::Default,
+                PickerPane::DefaultBtn,
+            ))
+            .with_children(|b| {
+                b.spawn((
+                    Text::new("Default"),
+                    TextFont { font_size: FontSize::Px(13.0), ..default() },
+                    TextColor(TEXT_COLOR),
+                ));
+            });
         });
 
         // Enemy only: composition chips — Random, each style, Manual.
@@ -472,28 +496,20 @@ fn remove_regs(config: &mut BattleConfig, state: &mut PickerState, kind: u8, n: 
     }
 }
 
-/// The composition behind the grid; None when the enemy page sits on
-/// Random or a style (the grid is hidden there, the note pane shows).
-fn grid_comp(config: &BattleConfig, state: &PickerState) -> Option<[usize; NUM_KINDS]> {
+/// The composition the screen displays: real for the player page and
+/// Manual, the representative preview for a chosen style, unknown for
+/// Random (the only mode that hides the army list).
+fn shown_counts(config: &BattleConfig, state: &PickerState) -> Option<[usize; NUM_KINDS]> {
     if state.team == 0 {
-        Some(config.player_regs)
-    } else if let EnemyComp::Manual(comp) = config.enemy {
-        Some(comp)
-    } else {
-        None
+        return Some(config.player_regs);
     }
-}
-
-/// The counts shown on the roster cards and info column: real for the
-/// player and Manual, representative for a chosen style, unknown for
-/// Random.
-fn count_comp(config: &BattleConfig, state: &PickerState) -> Option<[usize; NUM_KINDS]> {
-    if state.team == 1
-        && let EnemyComp::Style(idx) = config.enemy
-    {
-        return Some(crate::regiments::archetype_preview(idx, config.n_slots()));
+    match config.enemy {
+        EnemyComp::Manual(comp) => Some(comp),
+        EnemyComp::Style(idx) => {
+            Some(crate::regiments::archetype_preview(idx, config.n_slots()))
+        }
+        EnemyComp::Random => None,
     }
-    grid_comp(config, state)
 }
 
 // ── Drag and drop ──
@@ -506,11 +522,16 @@ fn roster_click(
     mut config: ResMut<BattleConfig>,
     mut state: ResMut<PickerState>,
 ) {
-    if drag.kind.is_some() || ev.event.button != PointerButton::Primary {
+    if drag.kind.is_some() {
         return;
     }
     let Ok(&RosterCard(kind)) = cards.get(ev.entity) else { return };
-    add_regs(&mut config, &mut state, kind, shift_step(&keys));
+    match ev.event.button {
+        PointerButton::Primary => add_regs(&mut config, &mut state, kind, shift_step(&keys)),
+        // M2TW muscle memory: right-clicking the roster card removes.
+        PointerButton::Secondary => remove_regs(&mut config, &mut state, kind, shift_step(&keys)),
+        PointerButton::Middle => {}
+    }
 }
 
 fn roster_drag_start(
@@ -639,7 +660,7 @@ fn cell_click(
     mut config: ResMut<BattleConfig>,
     mut state: ResMut<PickerState>,
 ) {
-    if ev.event.button != PointerButton::Primary {
+    if ev.event.button == PointerButton::Middle {
         return;
     }
     let Ok(&SlotCell(kind)) = cells.get(ev.entity) else { return };
@@ -669,6 +690,15 @@ fn picker_buttons(
         }
         match btn {
             PickerButton::TeamFlip => state.team ^= 1,
+            PickerButton::Default => {
+                let classic = crate::regiments::frac_comp(config.n_slots());
+                if state.team == 0 {
+                    config.player_regs = classic;
+                } else if enemy_manual_mode(&config) {
+                    state.enemy_manual = classic;
+                    config.enemy = EnemyComp::Manual(classic);
+                }
+            }
             PickerButton::Back => next.set(GameState::Menu),
             PickerButton::Start => {
                 if army_valid(&config) {
@@ -720,17 +750,19 @@ fn refresh_picker(
     }
     let Ok(grid_e) = grid.single() else { return };
     let slots = config.n_slots();
-    let comp = grid_comp(&config, &state);
-    let counts = count_comp(&config, &state);
+    let counts = shown_counts(&config, &state);
     let used = counts.map(|c| c.iter().sum::<usize>());
+    let editable = state.team == 0 || enemy_manual_mode(&config);
 
-    // Pane visibility: the enemy page shows the mode chips, and the
-    // Random/style modes swap the army list for a note.
+    // Pane visibility: the enemy page shows the mode chips; Random
+    // hides the army list behind the note, a chosen style shows its
+    // preview cards with the jitter caption underneath.
     for (mut node, pane) in &mut panes {
         node.display = match pane {
             PickerPane::ModeRow if state.team == 1 => Display::Flex,
-            PickerPane::Grid if comp.is_some() => Display::Flex,
-            PickerPane::Note if comp.is_none() => Display::Flex,
+            PickerPane::Grid if counts.is_some() => Display::Flex,
+            PickerPane::Note if state.team == 1 && !enemy_manual_mode(&config) => Display::Flex,
+            PickerPane::DefaultBtn if editable => Display::Flex,
             _ => Display::None,
         };
     }
@@ -757,18 +789,7 @@ fn refresh_picker(
                     EnemyComp::Random => {
                         "A different army style takes the field every battle.".into()
                     }
-                    EnemyComp::Style(idx) => {
-                        let c = crate::regiments::archetype_preview(idx, slots);
-                        format!(
-                            "{}: {} Knights, {} Spearmen, {} Men-at-Arms, {} Bowmen.\n\
-                             Jittered a little every battle.",
-                            crate::regiments::archetype_name(idx),
-                            c[KIND_HEAVY as usize],
-                            c[KIND_SPEAR as usize],
-                            c[KIND_LIGHT as usize],
-                            c[KIND_ARCHER as usize],
-                        )
-                    }
+                    EnemyComp::Style(_) => "Jittered a little every battle.".into(),
                     EnemyComp::Manual(_) => String::new(),
                 };
             }
@@ -797,7 +818,7 @@ fn refresh_picker(
     // Rebuild the army list: filled cells in ladder order, then the
     // remaining empty slots.
     commands.entity(grid_e).despawn_related::<Children>();
-    let Some(comp) = comp else { return };
+    let Some(comp) = counts else { return };
     commands.entity(grid_e).with_children(|g| {
         let cell = || Node {
             width: Val::Px(CELL_W),
