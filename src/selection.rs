@@ -81,7 +81,13 @@ impl Plugin for SelectionPlugin {
             .add_systems(
                 Update,
                 (
-                    (drag_select, update_hover, control_group_keys, select_class_keys)
+                    (
+                        drag_select,
+                        update_hover,
+                        control_group_keys,
+                        select_class_keys,
+                        clear_selection_key,
+                    )
                         .in_set(crate::game_state::MapInputSet),
                     draw_selection_gizmos,
                 ),
@@ -280,6 +286,23 @@ fn update_hover(
     };
     hover.enemy = regiment_at(&groups, p, true);
     hover.own = regiment_at(&groups, p, false);
+}
+
+/// Enter clears the selection. Gated off during deployment, where
+/// Enter is the Begin Battle key.
+fn clear_selection_key(
+    keys: Res<ButtonInput<KeyCode>>,
+    deploy: Res<crate::game_state::Deployment>,
+    mut selection: ResMut<Selection>,
+) {
+    if deploy.active || !keys.just_pressed(KeyCode::Enter) {
+        return;
+    }
+    if selection.count_units > 0 {
+        selection.regiments.fill(false);
+        selection.count_units = 0;
+        info!("selection cleared");
+    }
 }
 
 /// M2TW class-select hotkeys: Ctrl+A selects every regiment, Ctrl+I
