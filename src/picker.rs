@@ -11,8 +11,8 @@ use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 
 use crate::game_state::{
-    BTN_NORMAL, BattleConfig, DIM_TEXT_COLOR, GameState, PANEL_BG, TEXT_COLOR, fullscreen_overlay,
-    spawn_text_button,
+    BTN_NORMAL, BattleConfig, CustomStyled, DIM_TEXT_COLOR, EnemyComp, GameState, PANEL_BG,
+    TEXT_COLOR, fullscreen_overlay, spawn_text_button,
 };
 use crate::unit_cards::KIND_FILL;
 use crate::unit_types::{KIND_ARCHER, KIND_HEAVY, KIND_LIGHT, KIND_SPEAR, NUM_KINDS};
@@ -21,6 +21,8 @@ const GRID_BG: Color = Color::srgba(0.03, 0.04, 0.05, 0.85);
 const CELL_EMPTY: Color = Color::srgba(0.09, 0.10, 0.13, 0.90);
 const CARD_BG: Color = Color::srgba(0.10, 0.11, 0.14, 0.92);
 const CARD_BG_HOVER: Color = Color::srgba(0.22, 0.24, 0.30, 0.95);
+/// The selected enemy-composition chip (same accent as HUD buttons).
+const CHIP_ACTIVE: Color = Color::srgba(0.22, 0.38, 0.62, 0.95);
 
 const CELL_W: f32 = 34.0;
 const CELL_H: f32 = 42.0;
@@ -95,11 +97,11 @@ struct RosterCard(u8);
 #[derive(Component)]
 struct SlotCell(u8);
 
-/// Panes the refresh toggles between player/enemy and Random/Manual.
+/// Panes the refresh toggles between player/enemy and the enemy modes.
 #[derive(Component, PartialEq)]
 enum PickerPane {
     Grid,
-    RandomNote,
+    Note,
     ModeRow,
 }
 
@@ -107,7 +109,7 @@ enum PickerPane {
 #[derive(Component, PartialEq)]
 enum PickerText {
     Team,
-    Mode,
+    Note,
     Slots,
     Soldiers,
     Desc,
@@ -117,9 +119,16 @@ enum PickerText {
 #[derive(Component)]
 enum PickerButton {
     TeamFlip,
-    Mode,
     Back,
     Start,
+}
+
+/// One enemy-composition chip: Random, a named style, or Manual.
+#[derive(Component, Clone, Copy, PartialEq)]
+enum ModeChip {
+    Random,
+    Style(usize),
+    Manual,
 }
 
 fn spawn_picker(
@@ -130,9 +139,10 @@ fn spawn_picker(
     let icons = PickerIcons(std::array::from_fn(|k| {
         images.add(crate::unit_cards::kind_icon_image(k as u8))
     }));
-    let enemy_manual = config
-        .enemy_regs
-        .unwrap_or_else(|| crate::regiments::frac_comp(config.n_slots()));
+    let enemy_manual = match config.enemy {
+        EnemyComp::Manual(comp) => comp,
+        _ => crate::regiments::frac_comp(config.n_slots()),
+    };
     commands.insert_resource(PickerState { team: 0, enemy_manual });
     commands.insert_resource(PickerDrag::default());
 
@@ -258,42 +268,26 @@ fn spawn_army_pane(row: &mut ChildSpawnerCommands) {
             spawn_arrow(h, ">");
         });
 
-        // Enemy only: the Random/Manual composition toggle.
+        // Enemy only: composition chips — Random, each style, Manual.
         pane.spawn((
             Node {
+                width: Val::Px(GRID_W),
                 flex_direction: FlexDirection::Row,
-                align_items: AlignItems::Center,
-                column_gap: Val::Px(8.0),
+                flex_wrap: FlexWrap::Wrap,
+                justify_content: JustifyContent::Center,
+                column_gap: Val::Px(4.0),
+                row_gap: Val::Px(4.0),
                 display: Display::None,
                 ..default()
             },
             PickerPane::ModeRow,
         ))
         .with_children(|m| {
-            m.spawn((
-                Text::new("Composition:"),
-                TextFont { font_size: FontSize::Px(13.0), ..default() },
-                TextColor(DIM_TEXT_COLOR),
-            ));
-            m.spawn((
-                Button,
-                Node {
-                    padding: UiRect::axes(Val::Px(14.0), Val::Px(4.0)),
-                    min_width: Val::Px(90.0),
-                    justify_content: JustifyContent::Center,
-                    ..default()
-                },
-                BackgroundColor(BTN_NORMAL),
-                PickerButton::Mode,
-            ))
-            .with_children(|b| {
-                b.spawn((
-                    Text::new(""),
-                    TextFont { font_size: FontSize::Px(13.0), ..default() },
-                    TextColor(TEXT_COLOR),
-                    PickerText::Mode,
-                ));
-            });
+            spawn_chip(m, "Random", ModeChip::Random);
+            for idx in 0..crate::regiments::archetype_count() {
+                spawn_chip(m, crate::regiments::archetype_name(idx), ModeChip::Style(idx));
+            }
+            spawn_chip(m, "Manual", ModeChip::Manual);
         });
 
         pane.spawn((
@@ -322,15 +316,39 @@ fn spawn_army_pane(row: &mut ChildSpawnerCommands) {
                 display: Display::None,
                 ..default()
             },
-            PickerPane::RandomNote,
+            PickerPane::Note,
         ))
         .with_children(|n| {
             n.spawn((
-                Text::new("A different army style takes the field every battle."),
+                Text::new(""),
                 TextFont { font_size: FontSize::Px(14.0), ..default() },
                 TextColor(DIM_TEXT_COLOR),
+                TextLayout::justify(Justify::Center),
+                PickerText::Note,
             ));
         });
+    });
+}
+
+fn spawn_chip(m: &mut ChildSpawnerCommands, label: &str, chip: ModeChip) {
+    m.spawn((
+        Button,
+        Node {
+            padding: UiRect::axes(Val::Px(10.0), Val::Px(4.0)),
+            justify_content: JustifyContent::Center,
+            align_items: AlignItems::Center,
+            ..default()
+        },
+        BackgroundColor(BTN_NORMAL),
+        CustomStyled,
+        chip,
+    ))
+    .with_children(|b| {
+        b.spawn((
+            Text::new(label),
+            TextFont { font_size: FontSize::Px(12.0), ..default() },
+            TextColor(TEXT_COLOR),
+        ));
     });
 }
 
@@ -427,15 +445,19 @@ fn shift_step(keys: &ButtonInput<KeyCode>) -> usize {
     if keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight) { 10 } else { 1 }
 }
 
+fn enemy_manual_mode(config: &BattleConfig) -> bool {
+    matches!(config.enemy, EnemyComp::Manual(_))
+}
+
 fn add_regs(config: &mut BattleConfig, state: &mut PickerState, kind: u8, n: usize) {
     let slots = config.n_slots();
     if state.team == 0 {
         let free = slots.saturating_sub(config.player_regs.iter().sum::<usize>());
         config.player_regs[kind as usize] += n.min(free);
-    } else if config.enemy_regs.is_some() {
+    } else if enemy_manual_mode(config) {
         let free = slots.saturating_sub(state.enemy_manual.iter().sum::<usize>());
         state.enemy_manual[kind as usize] += n.min(free);
-        config.enemy_regs = Some(state.enemy_manual);
+        config.enemy = EnemyComp::Manual(state.enemy_manual);
     }
 }
 
@@ -443,17 +465,35 @@ fn remove_regs(config: &mut BattleConfig, state: &mut PickerState, kind: u8, n: 
     if state.team == 0 {
         let c = &mut config.player_regs[kind as usize];
         *c = c.saturating_sub(n);
-    } else if config.enemy_regs.is_some() {
+    } else if enemy_manual_mode(config) {
         let c = &mut state.enemy_manual[kind as usize];
         *c = c.saturating_sub(n);
-        config.enemy_regs = Some(state.enemy_manual);
+        config.enemy = EnemyComp::Manual(state.enemy_manual);
     }
 }
 
-/// The composition the screen currently displays; None while the enemy
-/// page sits on Random.
-fn shown_comp(config: &BattleConfig, state: &PickerState) -> Option<[usize; NUM_KINDS]> {
-    if state.team == 0 { Some(config.player_regs) } else { config.enemy_regs }
+/// The composition behind the grid; None when the enemy page sits on
+/// Random or a style (the grid is hidden there, the note pane shows).
+fn grid_comp(config: &BattleConfig, state: &PickerState) -> Option<[usize; NUM_KINDS]> {
+    if state.team == 0 {
+        Some(config.player_regs)
+    } else if let EnemyComp::Manual(comp) = config.enemy {
+        Some(comp)
+    } else {
+        None
+    }
+}
+
+/// The counts shown on the roster cards and info column: real for the
+/// player and Manual, representative for a chosen style, unknown for
+/// Random.
+fn count_comp(config: &BattleConfig, state: &PickerState) -> Option<[usize; NUM_KINDS]> {
+    if state.team == 1
+        && let EnemyComp::Style(idx) = config.enemy
+    {
+        return Some(crate::regiments::archetype_preview(idx, config.n_slots()));
+    }
+    grid_comp(config, state)
 }
 
 // ── Drag and drop ──
@@ -609,12 +649,16 @@ fn cell_click(
 // ── Buttons and refresh ──
 
 fn army_valid(config: &BattleConfig) -> bool {
-    config.player_regs.iter().sum::<usize>() > 0
-        && config.enemy_regs.is_none_or(|c| c.iter().sum::<usize>() > 0)
+    let enemy_ok = match config.enemy {
+        EnemyComp::Manual(comp) => comp.iter().sum::<usize>() > 0,
+        _ => true,
+    };
+    config.player_regs.iter().sum::<usize>() > 0 && enemy_ok
 }
 
 fn picker_buttons(
     query: Query<(&Interaction, &PickerButton), Changed<Interaction>>,
+    chips: Query<(&Interaction, &ModeChip), Changed<Interaction>>,
     mut config: ResMut<BattleConfig>,
     mut state: ResMut<PickerState>,
     mut next: ResMut<NextState<GameState>>,
@@ -625,12 +669,6 @@ fn picker_buttons(
         }
         match btn {
             PickerButton::TeamFlip => state.team ^= 1,
-            PickerButton::Mode => {
-                config.enemy_regs = match config.enemy_regs {
-                    Some(_) => None,
-                    None => Some(state.enemy_manual),
-                };
-            }
             PickerButton::Back => next.set(GameState::Menu),
             PickerButton::Start => {
                 if army_valid(&config) {
@@ -638,6 +676,16 @@ fn picker_buttons(
                 }
             }
         }
+    }
+    for (interaction, chip) in &chips {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+        config.enemy = match chip {
+            ModeChip::Random => EnemyComp::Random,
+            ModeChip::Style(idx) => EnemyComp::Style(*idx),
+            ModeChip::Manual => EnemyComp::Manual(state.enemy_manual),
+        };
     }
 }
 
@@ -664,6 +712,7 @@ fn refresh_picker(
     mut commands: Commands,
     grid: Query<Entity, With<GridRoot>>,
     mut panes: Query<(&mut Node, &PickerPane)>,
+    mut chip_colors: Query<(&mut BackgroundColor, &ModeChip)>,
     mut texts: Query<(&mut Text, &PickerText)>,
 ) {
     if !config.is_changed() && !state.is_changed() {
@@ -671,18 +720,27 @@ fn refresh_picker(
     }
     let Ok(grid_e) = grid.single() else { return };
     let slots = config.n_slots();
-    let comp = shown_comp(&config, &state);
-    let used = comp.map(|c| c.iter().sum::<usize>());
+    let comp = grid_comp(&config, &state);
+    let counts = count_comp(&config, &state);
+    let used = counts.map(|c| c.iter().sum::<usize>());
 
-    // Pane visibility: the enemy page shows the mode row, and Random
-    // mode swaps the army list for a note.
+    // Pane visibility: the enemy page shows the mode chips, and the
+    // Random/style modes swap the army list for a note.
     for (mut node, pane) in &mut panes {
         node.display = match pane {
             PickerPane::ModeRow if state.team == 1 => Display::Flex,
             PickerPane::Grid if comp.is_some() => Display::Flex,
-            PickerPane::RandomNote if comp.is_none() => Display::Flex,
+            PickerPane::Note if comp.is_none() => Display::Flex,
             _ => Display::None,
         };
+    }
+
+    for (mut bg, chip) in &mut chip_colors {
+        let active = matches!(
+            (chip, config.enemy),
+            (ModeChip::Random, EnemyComp::Random) | (ModeChip::Manual, EnemyComp::Manual(_))
+        ) || matches!((chip, config.enemy), (ModeChip::Style(i), EnemyComp::Style(j)) if *i == j);
+        bg.0 = if active { CHIP_ACTIVE } else { BTN_NORMAL };
     }
 
     for (mut text, tag) in &mut texts {
@@ -694,8 +752,25 @@ fn refresh_picker(
                     "Team 2  -  Enemy Army".into()
                 };
             }
-            PickerText::Mode => {
-                text.0 = if config.enemy_regs.is_some() { "Manual".into() } else { "Random".into() };
+            PickerText::Note => {
+                text.0 = match config.enemy {
+                    EnemyComp::Random => {
+                        "A different army style takes the field every battle.".into()
+                    }
+                    EnemyComp::Style(idx) => {
+                        let c = crate::regiments::archetype_preview(idx, slots);
+                        format!(
+                            "{}: {} Knights, {} Spearmen, {} Men-at-Arms, {} Bowmen.\n\
+                             Jittered a little every battle.",
+                            crate::regiments::archetype_name(idx),
+                            c[KIND_HEAVY as usize],
+                            c[KIND_SPEAR as usize],
+                            c[KIND_LIGHT as usize],
+                            c[KIND_ARCHER as usize],
+                        )
+                    }
+                    EnemyComp::Manual(_) => String::new(),
+                };
             }
             PickerText::Slots => {
                 text.0 = match used {
@@ -710,7 +785,7 @@ fn refresh_picker(
                 };
             }
             PickerText::Count(kind) => {
-                text.0 = match comp {
+                text.0 = match counts {
                     Some(c) => format!("x {}", c[*kind as usize]),
                     None => "x ?".into(),
                 };

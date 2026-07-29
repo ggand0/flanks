@@ -68,6 +68,16 @@ impl Scenario {
     }
 }
 
+/// Enemy composition source, set on the Select Units screen: a random
+/// army style rolled at each battle start, a chosen style (still
+/// jittered a little per battle), or hand-picked counts.
+#[derive(Clone, Copy, PartialEq)]
+pub enum EnemyComp {
+    Random,
+    Style(usize),
+    Manual([usize; crate::unit_types::NUM_KINDS]),
+}
+
 #[derive(Resource)]
 pub struct BattleConfig {
     pub units_per_team: usize,
@@ -77,8 +87,7 @@ pub struct BattleConfig {
     /// Player composition from the Select Units screen: regiments per
     /// kind (KIND_* indexed), summing to at most `n_slots()`.
     pub player_regs: [usize; crate::unit_types::NUM_KINDS],
-    /// Enemy composition; `None` rolls a random army style at spawn.
-    pub enemy_regs: Option<[usize; crate::unit_types::NUM_KINDS]>,
+    pub enemy: EnemyComp,
 }
 
 impl BattleConfig {
@@ -95,7 +104,7 @@ impl Default for BattleConfig {
         let reg_size = crate::util::env_or("FL_REG_SIZE", 1000_usize).max(50);
         Self {
             player_regs: crate::regiments::frac_comp((units_per_team / reg_size).max(1)),
-            enemy_regs: None,
+            enemy: EnemyComp::Random,
             units_per_team,
             reg_size,
             ai_enabled: !std::env::var("FL_AI").is_ok_and(|v| v == "0"),
@@ -550,7 +559,7 @@ fn menu_option_buttons(
                 // The regiment budget changed: reset both compositions
                 // (stale counts could overflow the new slot total).
                 config.player_regs = crate::regiments::frac_comp(config.n_slots());
-                config.enemy_regs = None;
+                config.enemy = EnemyComp::Random;
                 ARMY_SIZES[idx].1
             }
             OptionButton::Ai => {

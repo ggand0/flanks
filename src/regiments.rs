@@ -63,14 +63,12 @@ fn archer_regs(n_regs: usize) -> usize {
     }
 }
 
-/// The classic default split as explicit per-kind regiment counts
-/// (KIND_* indexed), honoring the FL_*_FRAC sandbox envs. The Select
-/// Units screen prefills from this; test batteries that script
-/// composition through the env fracs spawn through it unchanged.
-pub fn frac_comp(n_regs: usize) -> [usize; NUM_KINDS] {
-    let n_heavy = ((n_regs as f32 * heavy_frac()).round() as usize).min(n_regs);
-    let n_spear = ((n_regs as f32 * spear_frac()).round() as usize).min(n_regs - n_heavy);
-    let n_archer = archer_regs(n_regs).min(n_regs - n_heavy - n_spear);
+/// Resolve heavy/spear/archer fractions of the regiment budget into
+/// counts, clamped in that order; light infantry absorbs the rest.
+fn comp_from_fracs(n_regs: usize, heavy: f32, spear: f32, archer: usize) -> [usize; NUM_KINDS] {
+    let n_heavy = ((n_regs as f32 * heavy).round() as usize).min(n_regs);
+    let n_spear = ((n_regs as f32 * spear).round() as usize).min(n_regs - n_heavy);
+    let n_archer = archer.min(n_regs - n_heavy - n_spear);
     let mut comp = [0; NUM_KINDS];
     comp[KIND_HEAVY as usize] = n_heavy;
     comp[KIND_SPEAR as usize] = n_spear;
@@ -79,9 +77,17 @@ pub fn frac_comp(n_regs: usize) -> [usize; NUM_KINDS] {
     comp
 }
 
-/// An enemy army style for the picker's Random mode: a coherent
-/// composition that fights its own way. Fracs of the regiment budget
-/// for heavy/spear/archer; light fills the rest.
+/// The classic default split as explicit per-kind regiment counts
+/// (KIND_* indexed), honoring the FL_*_FRAC sandbox envs. The Select
+/// Units screen prefills from this; test batteries that script
+/// composition through the env fracs spawn through it unchanged.
+pub fn frac_comp(n_regs: usize) -> [usize; NUM_KINDS] {
+    comp_from_fracs(n_regs, heavy_frac(), spear_frac(), archer_regs(n_regs))
+}
+
+/// An enemy army style: a coherent composition that fights its own
+/// way. Fracs of the regiment budget for heavy/spear/archer; light
+/// fills the rest.
 struct Archetype {
     name: &'static str,
     heavy: f32,
@@ -97,26 +103,44 @@ const ARCHETYPES: &[Archetype] = &[
     Archetype { name: "Skirmish Horde", heavy: 0.05, spear: 0.12, archer: 0.06 },
 ];
 
-/// Roll a random archetype over the full regiment budget, jittered a
-/// little per draw so two rolls of the same style differ.
-fn roll_archetype(n_regs: usize) -> ([usize; NUM_KINDS], &'static str) {
-    let seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(7);
-    let idx = (hash01(seed) * ARCHETYPES.len() as f32) as usize % ARCHETYPES.len();
+pub fn archetype_count() -> usize {
+    ARCHETYPES.len()
+}
+
+pub fn archetype_name(idx: usize) -> &'static str {
+    ARCHETYPES[idx].name
+}
+
+/// The un-jittered representative composition of a style at the given
+/// budget: what the picker shows when the style is selected.
+pub fn archetype_preview(idx: usize, n_regs: usize) -> [usize; NUM_KINDS] {
+    let a = &ARCHETYPES[idx];
+    comp_from_fracs(
+        n_regs,
+        a.heavy,
+        a.spear,
+        (n_regs as f32 * a.archer).round() as usize,
+    )
+}
+
+/// A battle-start draw of a style: each fraction jittered by up to a
+/// fifth so two draws of the same style differ.
+fn archetype_jittered(idx: usize, n_regs: usize, seed: u32) -> [usize; NUM_KINDS] {
     let a = &ARCHETYPES[idx];
     let jit = |i: u32| 0.8 + 0.4 * hash01(seed.wrapping_mul(31).wrapping_add(i));
-    let n_heavy = ((n_regs as f32 * a.heavy * jit(1)).round() as usize).min(n_regs);
-    let n_spear = ((n_regs as f32 * a.spear * jit(2)).round() as usize).min(n_regs - n_heavy);
-    let n_archer = ((n_regs as f32 * a.archer * jit(3)).round() as usize)
-        .min(n_regs - n_heavy - n_spear);
-    let mut comp = [0; NUM_KINDS];
-    comp[KIND_HEAVY as usize] = n_heavy;
-    comp[KIND_SPEAR as usize] = n_spear;
-    comp[KIND_ARCHER as usize] = n_archer;
-    comp[KIND_LIGHT as usize] = n_regs - n_heavy - n_spear - n_archer;
-    (comp, a.name)
+    comp_from_fracs(
+        n_regs,
+        a.heavy * jit(1),
+        a.spear * jit(2),
+        (n_regs as f32 * a.archer * jit(3)).round() as usize,
+    )
+}
+
+fn time_seed() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(7)
 }
 
 /// Spawn one regiment block (units + GroupData). `dir` faces the enemy
@@ -230,12 +254,23 @@ pub fn do_spawn_battle(
             let capped = crate::util::env_or("FL_ENEMY_REGS", n_regs).clamp(1, n_regs);
             if env_fracs || capped != n_regs {
                 frac_comp(capped)
-            } else if let Some(comp) = config.enemy_regs {
-                comp
             } else {
-                let (comp, style) = roll_archetype(n_regs);
-                info!("enemy army style: {style}");
-                comp
+                use crate::game_state::EnemyComp;
+                match config.enemy {
+                    EnemyComp::Manual(comp) => comp,
+                    EnemyComp::Style(idx) => {
+                        let idx = idx.min(ARCHETYPES.len() - 1);
+                        info!("enemy army style: {}", archetype_name(idx));
+                        archetype_jittered(idx, n_regs, time_seed())
+                    }
+                    EnemyComp::Random => {
+                        let seed = time_seed();
+                        let idx =
+                            (hash01(seed) * ARCHETYPES.len() as f32) as usize % ARCHETYPES.len();
+                        info!("enemy army style: {}", archetype_name(idx));
+                        archetype_jittered(idx, n_regs, seed)
+                    }
+                }
             }
         };
         // An empty army cannot fight; fall back to the classic split.
