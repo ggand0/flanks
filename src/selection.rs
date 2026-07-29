@@ -81,7 +81,7 @@ impl Plugin for SelectionPlugin {
             .add_systems(
                 Update,
                 (
-                    (drag_select, update_hover, control_group_keys)
+                    (drag_select, update_hover, control_group_keys, select_class_keys)
                         .in_set(crate::game_state::MapInputSet),
                     draw_selection_gizmos,
                 ),
@@ -280,6 +280,53 @@ fn update_hover(
     };
     hover.enemy = regiment_at(&groups, p, true);
     hover.own = regiment_at(&groups, p, false);
+}
+
+/// M2TW class-select hotkeys: Ctrl+A selects every regiment, Ctrl+I
+/// the infantry (heavy, light, spear), Ctrl+M the missile troops.
+fn select_class_keys(
+    keys: Res<ButtonInput<KeyCode>>,
+    groups: Res<Groups>,
+    mut selection: ResMut<Selection>,
+    mut cues: MessageWriter<crate::audio::UiCue>,
+) {
+    if !keys.pressed(KeyCode::ControlLeft) && !keys.pressed(KeyCode::ControlRight) {
+        return;
+    }
+    let wanted: &[u8] = if keys.just_pressed(KeyCode::KeyA) {
+        &[
+            crate::unit_types::KIND_HEAVY,
+            crate::unit_types::KIND_LIGHT,
+            crate::unit_types::KIND_SPEAR,
+            crate::unit_types::KIND_ARCHER,
+        ]
+    } else if keys.just_pressed(KeyCode::KeyI) {
+        &[
+            crate::unit_types::KIND_HEAVY,
+            crate::unit_types::KIND_LIGHT,
+            crate::unit_types::KIND_SPEAR,
+        ]
+    } else if keys.just_pressed(KeyCode::KeyM) {
+        &[crate::unit_types::KIND_ARCHER]
+    } else {
+        return;
+    };
+    selection.regiments.clear();
+    selection.regiments.resize(groups.list.len(), false);
+    for (g, gd) in groups.list.iter().enumerate() {
+        if gd.team == PLAYER_TEAM && gd.count > 0 && wanted.contains(&gd.kind) {
+            selection.regiments[g] = true;
+        }
+    }
+    selection.recount(&groups);
+    if selection.count_units > 0 {
+        cues.write(crate::audio::UiCue::Select);
+    }
+    info!(
+        "class select: {} regiments ({} units)",
+        selection.regiments.iter().filter(|s| **s).count(),
+        selection.count_units
+    );
 }
 
 /// Ctrl+digit assigns the current selection to a slot; a bare digit
