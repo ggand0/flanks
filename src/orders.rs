@@ -945,7 +945,7 @@ fn test_orders_script(
                     center + Vec2::new(a.cos(), a.sin()) * 45.0
                 })
                 .collect();
-            select_along_line(&stroke, &units, &groups, &mut selection);
+            select_along_line(&stroke, false, &units, &groups, &mut selection);
             info!(
                 "[test] enclosure selected {} regiments ({} units)",
                 selection.regiments.iter().filter(|s| **s).count(),

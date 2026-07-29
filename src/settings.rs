@@ -28,6 +28,7 @@ use crate::game_state::{BTN_NORMAL, DIM_TEXT_COLOR, GameState, TEXT_COLOR};
 pub struct Settings {
     pub audio: AudioSettings,
     pub camera: CameraSettings,
+    pub controls: ControlsSettings,
     pub video: VideoSettings,
 }
 
@@ -51,6 +52,14 @@ pub struct CameraSettings {
 
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
 #[serde(default)]
+pub struct ControlsSettings {
+    /// Drag-select shape: false = the freehand lasso stroke, true = a
+    /// screen-space selection box (classic RTS marquee).
+    pub box_select: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
+#[serde(default)]
 pub struct VideoSettings {
     /// Default off: the FPS overlay should show real headroom.
     pub vsync: bool,
@@ -63,6 +72,7 @@ impl Default for Settings {
         Self {
             audio: AudioSettings { master: 1.0, battle: 1.0, ui: 1.0 },
             camera: CameraSettings { pan_speed: 1.0, edge_pan: true },
+            controls: ControlsSettings { box_select: false },
             video: VideoSettings { vsync: false, fullscreen: false },
         }
     }
@@ -73,6 +83,9 @@ impl Default for AudioSettings {
 }
 impl Default for CameraSettings {
     fn default() -> Self { Settings::default().camera }
+}
+impl Default for ControlsSettings {
+    fn default() -> Self { Settings::default().controls }
 }
 impl Default for VideoSettings {
     fn default() -> Self { Settings::default().video }
@@ -161,6 +174,7 @@ enum Slider {
 #[derive(Component, Clone, Copy)]
 enum Toggle {
     EdgePan,
+    BoxSelect,
     VSync,
     Fullscreen,
 }
@@ -263,6 +277,7 @@ impl Toggle {
     fn get(self, s: &Settings) -> bool {
         match self {
             Self::EdgePan => s.camera.edge_pan,
+            Self::BoxSelect => s.controls.box_select,
             Self::VSync => s.video.vsync,
             Self::Fullscreen => s.video.fullscreen,
         }
@@ -271,6 +286,7 @@ impl Toggle {
     fn flip(self, s: &mut Settings) {
         match self {
             Self::EdgePan => s.camera.edge_pan = !s.camera.edge_pan,
+            Self::BoxSelect => s.controls.box_select = !s.controls.box_select,
             Self::VSync => s.video.vsync = !s.video.vsync,
             Self::Fullscreen => s.video.fullscreen = !s.video.fullscreen,
         }
@@ -281,6 +297,9 @@ impl Toggle {
         match self {
             Self::Fullscreen => {
                 if on { "Borderless" } else { "Windowed" }
+            }
+            Self::BoxSelect => {
+                if on { "Box" } else { "Lasso" }
             }
             _ => {
                 if on { "On" } else { "Off" }
@@ -450,6 +469,9 @@ fn spawn_modal(commands: &mut Commands, s: &Settings) {
                 section_header(panel, "Camera");
                 slider_row(panel, "Pan speed", Slider::PanSpeed, s);
                 toggle_row(panel, "Edge pan", Toggle::EdgePan, s);
+
+                section_header(panel, "Controls");
+                toggle_row(panel, "Drag select", Toggle::BoxSelect, s);
 
                 section_header(panel, "Video");
                 toggle_row(panel, "Window", Toggle::Fullscreen, s);

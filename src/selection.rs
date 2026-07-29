@@ -51,10 +51,14 @@ impl Selection {
 }
 
 /// In-progress drag: projected ground points of the selection line.
+/// In box mode the points are the four ground-projected corners of the
+/// screen-space marquee instead of a freehand stroke.
 #[derive(Resource, Default)]
 pub struct DragLine {
     points: Vec<Vec2>,
     active: bool,
+    /// Box mode only: cursor position at the press, in window coords.
+    screen_start: Option<Vec2>,
 }
 
 /// Ctrl+1..9 stores the current selection mask; 1..9 recalls it.
@@ -117,6 +121,7 @@ fn drag_select(
     mut drag: ResMut<DragLine>,
     mut selection: ResMut<Selection>,
     mut cues: MessageWriter<crate::audio::UiCue>,
+    settings: Res<crate::settings::Settings>,
     ui: Query<&Interaction>,
 ) {
     let Ok(window) = window.single() else { return };
@@ -132,21 +137,56 @@ fn drag_select(
     {
         drag.points.clear();
         drag.active = true;
+        drag.screen_start = settings
+            .controls
+            .box_select
+            .then(|| window.cursor_position())
+            .flatten();
     }
-    if drag.active
-        && buttons.pressed(MouseButton::Left)
-        && let Some(p) = cursor_ground_point(window, camera, cam_tf, &terrain)
-        && drag.points.last().is_none_or(|l| l.distance(p) > 3.0)
-    {
-        drag.points.push(p);
+    if drag.active && buttons.pressed(MouseButton::Left) {
+        if let Some(s0) = drag.screen_start {
+            // Box mode: reproject the marquee's four corners to the
+            // ground every frame (the quad follows terrain and camera).
+            if let Some(cur) = window.cursor_position() {
+                drag.points.clear();
+                for corner in [s0, Vec2::new(cur.x, s0.y), cur, Vec2::new(s0.x, cur.y)] {
+                    if let Ok(ray) = camera.viewport_to_world(cam_tf, corner)
+                        && let Some(hit) = terrain.raycast(ray)
+                    {
+                        drag.points.push(Vec2::new(hit.x, hit.z));
+                    }
+                }
+            }
+        } else if let Some(p) = cursor_ground_point(window, camera, cam_tf, &terrain)
+            && drag.points.last().is_none_or(|l| l.distance(p) > 3.0)
+        {
+            drag.points.push(p);
+        }
     }
 
     if drag.active && buttons.just_released(MouseButton::Left) {
         drag.active = false;
+        let mut enclose = false;
+        if let Some(s0) = drag.screen_start.take() {
+            let moved = window
+                .cursor_position()
+                .is_some_and(|cur| s0.distance(cur) >= 6.0);
+            if moved {
+                // A ray that missed the map drops its corner; anything
+                // short of the full quad can't enclose.
+                enclose = drag.points.len() == 4;
+            } else {
+                // A stationary click picks like the lasso's point tap.
+                drag.points.clear();
+                if let Some(p) = cursor_ground_point(window, camera, cam_tf, &terrain) {
+                    drag.points.push(p);
+                }
+            }
+        }
         if drag.points.is_empty() {
             return;
         }
-        select_along_line(&drag.points, &units, &groups, &mut selection);
+        select_along_line(&drag.points, enclose, &units, &groups, &mut selection);
         if selection.count_units > 0 {
             cues.write(crate::audio::UiCue::Select);
         }
@@ -186,9 +226,12 @@ fn point_in_poly(p: Vec2, poly: &[Vec2]) -> bool {
 
 /// Per-unit stroke hits, promoted to whole regiments: a regiment is
 /// selected when enough of its units are near the stroke (a sloppy lasso
-/// edge shouldn't grab a neighboring regiment).
+/// edge shouldn't grab a neighboring regiment). `enclose` forces the
+/// polygon interior test (the box marquee); a lasso stroke closes
+/// itself when its endpoints nearly meet.
 pub fn select_along_line(
     line: &[Vec2],
+    enclose: bool,
     units: &Units,
     groups: &Groups,
     selection: &mut Selection,
@@ -210,7 +253,7 @@ pub fn select_along_line(
 
     // War-of-Dots style: an enclosing stroke selects everything inside the
     // loop, in addition to units near the stroke itself.
-    let closed = stroke_is_closed(line);
+    let closed = enclose || stroke_is_closed(line);
     let r2 = SELECT_RADIUS * SELECT_RADIUS;
     for i in 0..units.len() {
         if units.team[i] != PLAYER_TEAM || units.death_t[i] > 0 {
@@ -398,13 +441,32 @@ fn control_group_keys(
     }
 }
 
-/// Selection stroke feedback (debug-viz gated like the other order gizmos).
+/// Selection stroke feedback. The box marquee is player-facing UI (a
+/// drag with no visible box is a guessing game); the lasso stroke stays
+/// debug-viz gated like the other order gizmos.
 fn draw_selection_gizmos(
     viz: Res<DebugViz>,
     drag: Res<DragLine>,
     terrain: Res<Terrain>,
     mut gizmos: Gizmos,
 ) {
+    if drag.active && drag.screen_start.is_some() && drag.points.len() == 4 {
+        let col = Color::srgb(0.95, 0.95, 0.4);
+        for k in 0..4 {
+            let (a, b) = (drag.points[k], drag.points[(k + 1) % 4]);
+            // Terrain-following segments so the box hugs hills.
+            let steps = (a.distance(b) / 8.0).ceil().max(1.0) as usize;
+            let lift =
+                |p: Vec2| Vec3::new(p.x, terrain.height_at(p.x, p.y) + 1.0, p.y);
+            let mut prev = lift(a);
+            for s in 1..=steps {
+                let p = lift(a.lerp(b, s as f32 / steps as f32));
+                gizmos.line(prev, p, col);
+                prev = p;
+            }
+        }
+        return;
+    }
     if !viz.0 {
         return;
     }
