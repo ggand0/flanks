@@ -71,7 +71,7 @@ impl Scenario {
 /// Enemy composition source, set on the Select Units screen: a random
 /// army style rolled at each battle start, a chosen style (still
 /// jittered a little per battle), or hand-picked counts.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum EnemyComp {
     Random,
     Style(usize),

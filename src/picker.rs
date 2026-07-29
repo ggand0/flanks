@@ -258,7 +258,7 @@ fn spawn_army_pane(row: &mut ChildSpawnerCommands) {
             ..default()
         })
         .with_children(|h| {
-            spawn_arrow(h, "<");
+            spawn_small_button(h, "<", 16.0, PickerButton::TeamFlip);
             h.spawn((
                 Text::new(""),
                 TextFont { font_size: FontSize::Px(18.0), ..default() },
@@ -267,29 +267,10 @@ fn spawn_army_pane(row: &mut ChildSpawnerCommands) {
                 Node { width: Val::Px(230.0), ..default() },
                 PickerText::Team,
             ));
-            spawn_arrow(h, ">");
+            spawn_small_button(h, ">", 16.0, PickerButton::TeamFlip);
             // Restores the classic split for whichever editable
             // composition is on screen; hidden on Random/style pages.
-            h.spawn((
-                Button,
-                Node {
-                    padding: UiRect::axes(Val::Px(10.0), Val::Px(4.0)),
-                    margin: UiRect::left(Val::Px(10.0)),
-                    justify_content: JustifyContent::Center,
-                    align_items: AlignItems::Center,
-                    ..default()
-                },
-                BackgroundColor(BTN_NORMAL),
-                PickerButton::Default,
-                PickerPane::DefaultBtn,
-            ))
-            .with_children(|b| {
-                b.spawn((
-                    Text::new("Default"),
-                    TextFont { font_size: FontSize::Px(13.0), ..default() },
-                    TextColor(TEXT_COLOR),
-                ));
-            });
+            spawn_small_button(h, "Default", 13.0, (PickerButton::Default, PickerPane::DefaultBtn));
         });
 
         // Enemy only: composition chips — Random, each style, Manual.
@@ -307,11 +288,16 @@ fn spawn_army_pane(row: &mut ChildSpawnerCommands) {
             PickerPane::ModeRow,
         ))
         .with_children(|m| {
-            spawn_chip(m, "Random", ModeChip::Random);
+            spawn_small_button(m, "Random", 12.0, (CustomStyled, ModeChip::Random));
             for idx in 0..crate::regiments::archetype_count() {
-                spawn_chip(m, crate::regiments::archetype_name(idx), ModeChip::Style(idx));
+                spawn_small_button(
+                    m,
+                    crate::regiments::archetype_name(idx),
+                    12.0,
+                    (CustomStyled, ModeChip::Style(idx)),
+                );
             }
-            spawn_chip(m, "Manual", ModeChip::Manual);
+            spawn_small_button(m, "Manual", 12.0, (CustomStyled, ModeChip::Manual));
         });
 
         pane.spawn((
@@ -354,8 +340,10 @@ fn spawn_army_pane(row: &mut ChildSpawnerCommands) {
     });
 }
 
-fn spawn_chip(m: &mut ChildSpawnerCommands, label: &str, chip: ModeChip) {
-    m.spawn((
+
+/// A small labeled button (team arrows, mode chips, Default).
+fn spawn_small_button(p: &mut ChildSpawnerCommands, label: &str, font_px: f32, extra: impl Bundle) {
+    p.spawn((
         Button,
         Node {
             padding: UiRect::axes(Val::Px(10.0), Val::Px(4.0)),
@@ -364,34 +352,12 @@ fn spawn_chip(m: &mut ChildSpawnerCommands, label: &str, chip: ModeChip) {
             ..default()
         },
         BackgroundColor(BTN_NORMAL),
-        CustomStyled,
-        chip,
+        extra,
     ))
     .with_children(|b| {
         b.spawn((
             Text::new(label),
-            TextFont { font_size: FontSize::Px(12.0), ..default() },
-            TextColor(TEXT_COLOR),
-        ));
-    });
-}
-
-fn spawn_arrow(h: &mut ChildSpawnerCommands, label: &str) {
-    h.spawn((
-        Button,
-        Node {
-            padding: UiRect::axes(Val::Px(12.0), Val::Px(4.0)),
-            justify_content: JustifyContent::Center,
-            align_items: AlignItems::Center,
-            ..default()
-        },
-        BackgroundColor(BTN_NORMAL),
-        PickerButton::TeamFlip,
-    ))
-    .with_children(|b| {
-        b.spawn((
-            Text::new(label),
-            TextFont { font_size: FontSize::Px(16.0), ..default() },
+            TextFont { font_size: FontSize::Px(font_px), ..default() },
             TextColor(TEXT_COLOR),
         ));
     });
@@ -768,10 +734,12 @@ fn refresh_picker(
     }
 
     for (mut bg, chip) in &mut chip_colors {
-        let active = matches!(
-            (chip, config.enemy),
-            (ModeChip::Random, EnemyComp::Random) | (ModeChip::Manual, EnemyComp::Manual(_))
-        ) || matches!((chip, config.enemy), (ModeChip::Style(i), EnemyComp::Style(j)) if *i == j);
+        let active = match (chip, config.enemy) {
+            (ModeChip::Random, EnemyComp::Random) => true,
+            (ModeChip::Manual, EnemyComp::Manual(_)) => true,
+            (ModeChip::Style(i), EnemyComp::Style(j)) => *i == j,
+            _ => false,
+        };
         bg.0 = if active { CHIP_ACTIVE } else { BTN_NORMAL };
     }
 
