@@ -505,6 +505,18 @@ fn start_target() -> GameState {
     }
 }
 
+/// Start a normal battle from the menu. A previous debug-scenario
+/// battle leaves its env var set until setup_battle syncs, so clear
+/// the scenario envs now: the picker decision must see the chosen
+/// scenario, not the stale one. Launch-only battery envs
+/// (FL_TEST_FRONT and kin) are not scenario envs and still skip the
+/// picker on purpose.
+fn start_normal_battle(config: &mut BattleConfig, next: &mut NextState<GameState>) {
+    config.scenario = Scenario::Normal;
+    sync_scenario_env(Scenario::Normal);
+    next.set(start_target());
+}
+
 fn menu_buttons(
     query: Query<(&Interaction, &MenuButton), Changed<Interaction>>,
     keys: Res<ButtonInput<KeyCode>>,
@@ -519,16 +531,14 @@ fn menu_buttons(
         return;
     }
     if keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::Space) {
-        config.scenario = Scenario::Normal;
-        next.set(start_target());
+        start_normal_battle(&mut config, &mut next);
         return;
     }
     for (interaction, btn) in &query {
         if *interaction == Interaction::Pressed {
             match btn {
                 MenuButton::StartBattle => {
-                    config.scenario = Scenario::Normal;
-                    next.set(start_target());
+                    start_normal_battle(&mut config, &mut next);
                 }
                 MenuButton::Quit => {
                     exit.write(AppExit::Success);
