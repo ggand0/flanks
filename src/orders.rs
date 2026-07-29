@@ -366,13 +366,21 @@ fn enemy_regiment_at(groups: &Groups, p: Vec2) -> Option<u32> {
 
 /// Lay `selected` regiments out along the ground line a -> b: the drawn
 /// width is divided by strength, files fill each share, and every block
-/// faces perpendicular to the line, toward the ENEMY army's side of it —
-/// a drawn battle line faces the enemy no matter which hand drew it.
-/// Fallback when there is no enemy signal (none left alive, or the enemy
-/// is dead-parallel to the line): face away from where the selection
-/// stands (troops walk up to the line and face past it). Regiments keep
-/// their left-to-right order along the line to minimize crossing.
-fn line_layout(groups: &Groups, selected: &[usize], a: Vec2, b: Vec2) -> Vec<LinePlacement> {
+/// faces perpendicular to the line. Which side the blocks face is the
+/// M2TW drag-hand rule when `face_hint` is non-zero (the caller derives
+/// it from the camera: a left-to-right drag on screen faces away from
+/// the camera, right-to-left toward it — the player picks the facing
+/// with the hand that draws). A zero hint (script callers with no
+/// camera) falls back to the enemy side of the line, then to facing
+/// away from where the selection stands. Regiments keep their
+/// left-to-right order along the line to minimize crossing.
+fn line_layout(
+    groups: &Groups,
+    selected: &[usize],
+    a: Vec2,
+    b: Vec2,
+    face_hint: Vec2,
+) -> Vec<LinePlacement> {
     let picked: Vec<usize> = selected
         .iter()
         .copied()
@@ -390,30 +398,32 @@ fn line_layout(groups: &Groups, selected: &[usize], a: Vec2, b: Vec2) -> Vec<Lin
         picked.iter().map(|&g| groups.list[g].centroid).sum::<Vec2>() / picked.len() as f32;
     let perp = Vec2::new(-dir.y, dir.x);
     let mid = (a + b) * 0.5;
-    // Which side of the line does the enemy stand on? Strength-weighted
-    // enemy centroid so a routed straggler can't flip the line. The old
-    // rule (away from the selection) broke on the common gesture of
-    // dressing a line in place: with the line ON the selection the side
-    // signal was noise, and the tie fell to the raw drag perpendicular —
-    // facing followed the drag hand, backward for half of all drags.
-    let team = groups.list[picked[0]].team;
-    let mut enemy_sum = Vec2::ZERO;
-    let mut enemy_weight = 0.0f32;
-    for gd in &groups.list {
-        if gd.team != team && gd.count > 0 && !gd.state.is_broken() {
-            enemy_sum += gd.centroid * gd.count as f32;
-            enemy_weight += gd.count as f32;
+    let side = if face_hint != Vec2::ZERO {
+        perp.dot(face_hint)
+    } else {
+        // No camera signal: which side of the line does the enemy stand
+        // on? Strength-weighted enemy centroid so a routed straggler
+        // can't flip the line; the last fallback faces away from where
+        // the selection stands.
+        let team = groups.list[picked[0]].team;
+        let mut enemy_sum = Vec2::ZERO;
+        let mut enemy_weight = 0.0f32;
+        for gd in &groups.list {
+            if gd.team != team && gd.count > 0 && !gd.state.is_broken() {
+                enemy_sum += gd.centroid * gd.count as f32;
+                enemy_weight += gd.count as f32;
+            }
         }
-    }
-    let enemy_side = if enemy_weight > 0.0 {
-        perp.dot(enemy_sum / enemy_weight - mid)
-    } else {
-        0.0
-    };
-    let side = if enemy_side.abs() > 1.0 {
-        enemy_side
-    } else {
-        perp.dot(mid - mean)
+        let enemy_side = if enemy_weight > 0.0 {
+            perp.dot(enemy_sum / enemy_weight - mid)
+        } else {
+            0.0
+        };
+        if enemy_side.abs() > 1.0 {
+            enemy_side
+        } else {
+            perp.dot(mid - mean)
+        }
     };
     let fwd = if side >= 0.0 { perp } else { -perp };
     let facing = facing_of(fwd);
@@ -463,9 +473,10 @@ fn apply_line_order(groups: &mut Groups, layout: Vec<LinePlacement>, a: Vec2, b:
 }
 
 /// Drive the full drag-order path programmatically (the FL_TEST_FORM
-/// script uses this — one code path for the mouse and the test).
+/// script uses this — one code path for the mouse and the test). No
+/// camera here: facing falls back to the enemy-side rule.
 pub fn line_order(groups: &mut Groups, selected: &[usize], a: Vec2, b: Vec2) {
-    let layout = line_layout(groups, selected, a, b);
+    let layout = line_layout(groups, selected, a, b, Vec2::ZERO);
     if !layout.is_empty() {
         apply_line_order(groups, layout, a, b);
     }
@@ -637,7 +648,16 @@ fn issue_order(
             drag.active = true;
         }
         if drag.active {
-            drag.layout = line_layout(&groups, &selected, start, cur);
+            // M2TW drag-hand facing: project the drag onto the camera's
+            // ground axes; a rightward drag on screen faces the camera's
+            // forward side (away from the viewer), leftward faces back.
+            let cam_fwd = cam_tf.forward();
+            let cam_right = cam_tf.right();
+            let fwd_g = Vec2::new(cam_fwd.x, cam_fwd.z).normalize_or_zero();
+            let right_g = Vec2::new(cam_right.x, cam_right.z).normalize_or_zero();
+            let hand = (cur - start).dot(right_g);
+            let face_hint = fwd_g * if hand >= 0.0 { 1.0 } else { -1.0 };
+            drag.layout = line_layout(&groups, &selected, start, cur, face_hint);
             if deploy.active {
                 clamp_layout_to_zone(&groups, &mut drag.layout, &terrain);
             }
