@@ -401,13 +401,23 @@ pub fn step_sim(
                     t as usize
                 }
                 None => {
-                    // Fire-at-will: nearest live, unbroken enemy block.
+                    // Fire-at-will: nearest live, unbroken enemy block
+                    // that is NOT locked in melee. In M2TW fire-at-will
+                    // holds instead of volleying into a fight with
+                    // friends standing in it; an explicit target order
+                    // (the Attack arm above) still forces the shot.
+                    // The flight stays honest either way: no team check
+                    // on what the shaft actually crosses.
                     if !gd.fire_at_will {
                         return None;
                     }
                     let mut best: Option<(f32, usize)> = None;
                     for (e, eg) in groups.list.iter().enumerate() {
-                        if eg.team == gd.team || eg.count == 0 || eg.state.is_broken() {
+                        if eg.team == gd.team
+                            || eg.count == 0
+                            || eg.state.is_broken()
+                            || eg.engaged
+                        {
                             continue;
                         }
                         let d2 = eg.centroid.distance_squared(gd.centroid);
