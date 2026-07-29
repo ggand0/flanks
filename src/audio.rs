@@ -807,7 +807,6 @@ struct CueState {
     prev_state: Vec<u8>,
     /// Last tick's per-regiment "attack target within charge range".
     prev_cry: Vec<bool>,
-    roar_budget: u32,
     prev_outcome: bool,
     horn_gate: f32,
     vox_gate: f32,
@@ -860,16 +859,13 @@ fn event_cues(
     let mut new_break_enemy = false;
     let mut new_break_any = false;
     let mut new_rally = false;
-    // War cry rule (ONE rule): a regiment cries when "attack target
-    // within CHARGE_RANGE" newly becomes true — ordered at close range,
-    // closed to range on an approach, or retargeted to another nearby
-    // enemy while fighting (M2TW). Far attack orders get the horn only.
-    // The cry edge plays immediately; while an unengaged run-in lasts,
-    // the roar re-fires on the vox gate up to WARCRY_CLIPS total (one
-    // clip died before impact on long run-ins; unlimited rolling looped
-    // forever on pursuits).
-    const WARCRY_CLIPS: u32 = 3;
-    let mut charge_dist = f32::MAX;
+    // War cry rule (ONE rule): a regiment cries ONCE when "attack
+    // target within CHARGE_RANGE" newly becomes true — ordered at close
+    // range, closed to range on an approach, or retargeted to another
+    // nearby enemy while fighting (M2TW). Far attack orders get the
+    // horn only. One clip per charge onset: the measured M2TW charge
+    // window is 2.8..7 s (devlog 0056) and the ~4 s clip covers it —
+    // the old rolling re-fire read as the clip looping.
     let mut cry_dist = f32::MAX;
     let focus = camera
         .single()
@@ -901,10 +897,6 @@ fn event_cues(
         }
         st.prev_state[g] = state;
 
-        if gd.charging && gd.count > 0 {
-            charge_dist = charge_dist.min(gd.centroid.distance(focus));
-        }
-
         // Cry-edge detection: attack target alive and within charge
         // range; a target CHANGE while in range also counts (retarget
         // mid-melee, M2TW).
@@ -931,8 +923,7 @@ fn event_cues(
     }
 
     let seed = st.frame.wrapping_mul(211);
-    // Edge cry: plays NOW (order/charge feedback beats the vox gate) and
-    // opens a fresh roar budget for the run-in.
+    // Edge cry: plays NOW (order/charge feedback beats the vox gate).
     if cry_dist < f32::MAX {
         let prox = (1.0 - cry_dist / hear).clamp(0.0, 1.0);
         if prox > 0.05 {
@@ -941,7 +932,6 @@ fn event_cues(
                 one_shot(&mut commands, h, vol, 0.94 + 0.12 * hash01(seed ^ 0xAC));
                 info!("war cry (edge, vol {vol:.2}, prox {prox:.2})");
             }
-            st.roar_budget = WARCRY_CLIPS - 1;
             st.vox_gate = 2.5;
         }
     }
@@ -982,24 +972,6 @@ fn event_cues(
                 one_shot(&mut commands, h, 0.5 * bv, 1.0);
             }
             st.vox_gate = 1.5;
-        } else {
-            // Rolling war cry: one clip per gate window while any charge
-            // runs within earshot AND the onset budget lasts, volume by
-            // proximity. The ~3 s clips on a 2.5 s gate overlap into a
-            // continuous roar from the charge onset to contact.
-            let prox = (1.0 - charge_dist / hear).clamp(0.0, 1.0);
-            if prox > 0.05 && st.roar_budget > 0 {
-                if let Some(h) = pick(&bank.vox_warcry, seed ^ 0x88) {
-                    let vol = 0.55 * (0.25 + 0.75 * prox) * bv;
-                    one_shot(&mut commands, h, vol, 0.94 + 0.12 * hash01(seed ^ 0x99));
-                    st.roar_budget -= 1;
-                    info!(
-                        "war cry (vol {vol:.2}, prox {prox:.2}, {} clips left)",
-                        st.roar_budget
-                    );
-                }
-                st.vox_gate = 2.5;
-            }
         }
     }
 
