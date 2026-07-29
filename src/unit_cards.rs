@@ -915,6 +915,7 @@ fn card_clicks(
     keys: Res<ButtonInput<KeyCode>>,
     groups: Res<Groups>,
     mut selection: ResMut<Selection>,
+    mut cues: MessageWriter<crate::audio::UiCue>,
 ) {
     for (interaction, card) in &cards {
         if *interaction != Interaction::Pressed || groups.list[card.0].count == 0 {
@@ -930,6 +931,7 @@ fn card_clicks(
         selection.regiments.resize(groups.list.len(), false);
         selection.regiments[card.0] = !additive || !selection.regiments[card.0];
         selection.recount(&groups);
+        cues.write(crate::audio::UiCue::Select);
     }
 }
 

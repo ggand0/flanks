@@ -609,6 +609,7 @@ fn issue_order(
     selection: Res<Selection>,
     mut drag: ResMut<OrderDrag>,
     deploy: Res<crate::game_state::Deployment>,
+    mut cues: MessageWriter<crate::audio::UiCue>,
     ui: Query<&Interaction>,
 ) {
     if selection.count_units == 0 {
@@ -672,15 +673,19 @@ fn issue_order(
         let layout = std::mem::take(&mut drag.layout);
         if deploy.active {
             deploy_place_line(&mut groups, &mut units, &terrain, layout);
+            cues.write(crate::audio::UiCue::Deploy);
         } else {
             apply_line_order(&mut groups, layout, start, drag.cur);
+            cues.write(crate::audio::UiCue::Move);
         }
     } else if deploy.active {
         // No attack targets while deploying: every click is a placement.
         let picked: Vec<usize> = selection.picked_controllable(&groups).collect();
         deploy_move(&mut groups, &mut units, &terrain, &picked, start);
+        cues.write(crate::audio::UiCue::Deploy);
     } else if let Some(t) = enemy_regiment_at(&groups, start) {
         attack_regiments(&mut groups, &selected, t);
+        cues.write(crate::audio::UiCue::Attack);
         info!(
             "{} regiments ({} units) ATTACK regiment {t}",
             selected.len(),
@@ -688,6 +693,7 @@ fn issue_order(
         );
     } else {
         order_regiments(&mut groups, &selected, start);
+        cues.write(crate::audio::UiCue::Move);
         info!(
             "{} regiments ({} units) move to ({:.0}, {:.0})",
             selected.len(),

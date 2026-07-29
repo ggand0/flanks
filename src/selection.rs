@@ -110,6 +110,7 @@ fn drag_select(
     groups: Res<Groups>,
     mut drag: ResMut<DragLine>,
     mut selection: ResMut<Selection>,
+    mut cues: MessageWriter<crate::audio::UiCue>,
     ui: Query<&Interaction>,
 ) {
     let Ok(window) = window.single() else { return };
@@ -140,6 +141,9 @@ fn drag_select(
             return;
         }
         select_along_line(&drag.points, &units, &groups, &mut selection);
+        if selection.count_units > 0 {
+            cues.write(crate::audio::UiCue::Select);
+        }
         info!(
             "selected {} regiments ({} units)",
             selection.regiments.iter().filter(|s| **s).count(),
@@ -285,6 +289,7 @@ fn control_group_keys(
     groups: Res<Groups>,
     mut cg: ResMut<ControlGroups>,
     mut selection: ResMut<Selection>,
+    mut cues: MessageWriter<crate::audio::UiCue>,
 ) {
     const DIGITS: [KeyCode; 9] = [
         KeyCode::Digit1,
@@ -312,6 +317,9 @@ fn control_group_keys(
         selection.regiments = cg.0[slot].clone();
         selection.regiments.resize(groups.list.len(), false);
         selection.recount(&groups);
+        if selection.count_units > 0 {
+            cues.write(crate::audio::UiCue::Select);
+        }
         info!(
             "control group {} recalled ({} units)",
             slot + 1,

@@ -13,7 +13,7 @@ use crate::camera::RtsCamera;
 use crate::combat::CombatStats;
 use crate::game_state::GameState;
 use crate::movement::SimStats;
-use crate::orders::{Groups, Order, RegState, Selection};
+use crate::orders::{Groups, Order, RegState};
 use crate::units::hash01;
 
 /// Env master override (FL_VOLUME, linear). Multiplies the settings
@@ -32,6 +32,20 @@ fn battle_vol(s: &crate::settings::Settings) -> f32 {
 /// Effective UI-sound volume (selection/order clicks).
 fn ui_vol(s: &crate::settings::Settings) -> f32 {
     s.audio.master * s.audio.ui * env_master()
+}
+
+/// A player UI action that wants click feedback, written by the input
+/// systems (lasso release, card clicks, order clicks). One clip plays
+/// per message: repeating the same selection or re-ordering the same
+/// attack clicks every time, which the old state-diff detection never
+/// could. Deploy is a placement during the deployment phase — click
+/// only, no charge horn.
+#[derive(Message)]
+pub enum UiCue {
+    Select,
+    Move,
+    Attack,
+    Deploy,
 }
 
 /// Bed smoothing time constant (seconds to ~2/3 of the way to target).
@@ -62,7 +76,8 @@ impl Plugin for BattleAudioPlugin {
         // Battle-only: outside the battle the sim stats these systems
         // read are stale, and quitting to the menu must not leave the
         // beds ringing (or stale stats spawning clangs) behind it.
-        app.add_systems(Startup, setup_audio)
+        app.add_message::<UiCue>()
+            .add_systems(Startup, setup_audio)
             .add_systems(
                 Update,
                 (
@@ -787,9 +802,7 @@ fn archer_one_shots(
 /// bare-Local version blew past Bevy's 16 system-param limit).
 #[derive(Default)]
 struct CueState {
-    prev_sel: usize,
-    /// Last tick's order per regiment (edge = order CHANGED, so
-    /// re-orders click and horn too).
+    /// Last tick's order per regiment (the war-cry retarget edge).
     prev_order: Vec<Option<Order>>,
     prev_state: Vec<u8>,
     /// Last tick's per-regiment "attack target within charge range".
@@ -809,7 +822,7 @@ fn event_cues(
     mut commands: Commands,
     bank: Option<Res<AudioBank>>,
     groups: Res<Groups>,
-    selection: Res<Selection>,
+    mut cues: MessageReader<UiCue>,
     outcome: Res<crate::ai::BattleOutcome>,
     camera: Query<&RtsCamera>,
     time: Res<Time>,
@@ -827,14 +840,22 @@ fn event_cues(
     st.prev_state.resize(n, 0);
     st.prev_cry.resize(n, false);
 
-    // Selection click on a changed non-empty selection.
-    if selection.count_units > 0 && selection.count_units != st.prev_sel {
+    // UI click feedback: one clip per action kind per frame, straight
+    // from the input systems — every click sounds, repeats included.
+    let (mut cue_select, mut cue_move, mut cue_attack, mut cue_deploy) =
+        (false, false, false, false);
+    for cue in cues.read() {
+        match cue {
+            UiCue::Select => cue_select = true,
+            UiCue::Move => cue_move = true,
+            UiCue::Attack => cue_attack = true,
+            UiCue::Deploy => cue_deploy = true,
+        }
+    }
+    if cue_select {
         one_shot(&mut commands, bank.ui_select.clone(), 0.5 * uv, 1.0);
     }
-    st.prev_sel = selection.count_units;
 
-    let mut new_own_move = false;
-    let mut new_own_attack = false;
     let mut new_break_own = false;
     let mut new_break_enemy = false;
     let mut new_break_any = false;
@@ -860,22 +881,6 @@ fn event_cues(
             Some(Order::Attack(t)) => t,
             _ => u32::MAX,
         };
-        if gd.team == 0
-            && gd.order != st.prev_order[g]
-            && gd.count > 0
-            && !gd.state.is_broken()
-            // At-ease self-engagement is not a player click: no UI
-            // feedback (the war cry below still fires — that one is
-            // battlefield sound, and a regiment roaring as it takes
-            // matters into its own hands is correct).
-            && !gd.auto_order
-        {
-            match gd.order {
-                Some(Order::Attack(_)) => new_own_attack = true,
-                Some(Order::Move(_)) => new_own_move = true,
-                None => {}
-            }
-        }
         st.prev_order[g] = gd.order;
 
         let state = match gd.state {
@@ -942,14 +947,15 @@ fn event_cues(
     }
 
     // Order-click feedback: immediate and ungated, like the selection
-    // click — this is UI, not battlefield sound.
-    if new_own_attack {
+    // click — this is UI, not battlefield sound. Deployment placements
+    // click like a move but never horn.
+    if cue_attack {
         one_shot(&mut commands, bank.ui_attack.clone(), 0.45 * uv, 1.0);
     }
-    if new_own_move {
+    if cue_move || cue_deploy {
         one_shot(&mut commands, bank.ui_order.clone(), 0.35 * uv, 1.0);
     }
-    if (new_own_attack || new_own_move) && st.horn_gate <= 0.0 {
+    if (cue_attack || cue_move) && st.horn_gate <= 0.0 {
         if let Some(h) = pick(&bank.horn_charge, seed) {
             one_shot(&mut commands, h, 0.55 * bv, 1.0);
         }
