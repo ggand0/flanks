@@ -909,27 +909,43 @@ fn spawn_control_panel(bar: &mut ChildSpawnerCommands, icons: &ButtonIcons) {
 
 // ── Card interaction ──
 
-/// Click selects the regiment; shift/ctrl-click toggles it in the mask.
+/// Click selects the regiment; ctrl-click toggles it in the mask;
+/// shift-click adds the whole run of cards between the last clicked
+/// card and this one (file-manager range select).
 fn card_clicks(
     cards: Query<(&Interaction, &UnitCard), Changed<Interaction>>,
     keys: Res<ButtonInput<KeyCode>>,
     groups: Res<Groups>,
     mut selection: ResMut<Selection>,
     mut cues: MessageWriter<crate::audio::UiCue>,
+    mut anchor: Local<Option<usize>>,
 ) {
     for (interaction, card) in &cards {
         if *interaction != Interaction::Pressed || groups.list[card.0].count == 0 {
             continue;
         }
-        let additive = keys.pressed(KeyCode::ShiftLeft)
-            || keys.pressed(KeyCode::ShiftRight)
-            || keys.pressed(KeyCode::ControlLeft)
-            || keys.pressed(KeyCode::ControlRight);
-        if !additive {
-            selection.regiments.clear();
-        }
+        let shift =
+            keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
+        let ctrl =
+            keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
         selection.regiments.resize(groups.list.len(), false);
-        selection.regiments[card.0] = !additive || !selection.regiments[card.0];
+        // A stale anchor from a previous battle is out of range.
+        let a = anchor.filter(|a| *a < groups.list.len());
+        if shift && let Some(a) = a {
+            for g in a.min(card.0)..=a.max(card.0) {
+                let gd = &groups.list[g];
+                if gd.team == PLAYER_TEAM && gd.count > 0 {
+                    selection.regiments[g] = true;
+                }
+            }
+        } else if ctrl {
+            selection.regiments[card.0] = !selection.regiments[card.0];
+            *anchor = Some(card.0);
+        } else {
+            selection.regiments.fill(false);
+            selection.regiments[card.0] = true;
+            *anchor = Some(card.0);
+        }
         selection.recount(&groups);
         cues.write(crate::audio::UiCue::Select);
     }
