@@ -379,6 +379,9 @@ pub fn step_sim(
         c: Vec2,
         vel: Vec2,
         r: f32,
+        /// Target regiment (index into `Groups::list`): the per-shot
+        /// aim picks one of its living soldiers.
+        t: usize,
     }
     let shoot_at: Vec<Option<ShootAt>> = (0..n_groups)
         .map(|g| {
@@ -438,6 +441,7 @@ pub fn step_sim(
                 c: tg.centroid,
                 vel: tracks.vel.get(t).copied().unwrap_or(Vec2::ZERO),
                 r: tg.radius.clamp(3.0, 25.0),
+                t,
             })
         })
         .collect();
@@ -446,6 +450,24 @@ pub fn step_sim(
     for (g, s) in shoot_at.iter().enumerate() {
         groups.list[g].firing = s.is_some() && groups.list[g].ammo_left > 0;
     }
+    // Living members of every regiment under fire this tick: each shot
+    // aims at an actual soldier (M2TW's per-soldier aim targets,
+    // devlog 0060), not at a spot on the block's footprint. Into a
+    // locked melee the shafts head for enemy bodies; friends die only
+    // to genuine misses and interceptions.
+    let mut targeted = vec![false; n_groups];
+    for s in shoot_at.iter().flatten() {
+        targeted[s.t] = true;
+    }
+    let mut target_members: Vec<Vec<u32>> = vec![Vec::new(); n_groups];
+    if targeted.iter().any(|t| *t) {
+        for i in 0..pos_prev.len() {
+            if death_t[i] == 0 && targeted[group[i] as usize] {
+                target_members[group[i] as usize].push(i as u32);
+            }
+        }
+    }
+    let target_members = &target_members[..];
     let shoot_at = &shoot_at[..];
     // Friendly blocks per team for the loft-over-friendlies check: every
     // live formed regiment as a disc with a clearance ceiling. A
@@ -976,18 +998,33 @@ pub fn step_sim(
                                                     ^ (i as u32).wrapping_mul(k).wrapping_add(k),
                                             )
                                         };
-                                        // Aim: a spot on the target's
-                                        // footprint, the M2TW range-
-                                        // INDEPENDENT landing scatter
-                                        // (devlog 0060), and a lead for
-                                        // the block's drift over the
-                                        // flight.
-                                        let ang = h(0x1F3B) * std::f32::consts::TAU;
-                                        let rad = s.r * 0.85 * h(0x2E5D).sqrt();
+                                        // Aim: an actual soldier of the
+                                        // target regiment (M2TW keeps a
+                                        // per-soldier aim target, devlog
+                                        // 0060), the M2TW range-
+                                        // INDEPENDENT landing scatter,
+                                        // and a lead for the block's
+                                        // drift over the flight. The
+                                        // footprint-disc spot stands in
+                                        // only if every member died
+                                        // this tick.
+                                        let members = &target_members[s.t];
+                                        let base = if members.is_empty() {
+                                            let ang =
+                                                h(0x1F3B) * std::f32::consts::TAU;
+                                            let rad = s.r * 0.85 * h(0x2E5D).sqrt();
+                                            s.c + Vec2::new(ang.cos(), ang.sin()) * rad
+                                        } else {
+                                            let m = members[(h(0x1F3B)
+                                                * members.len() as f32)
+                                                as usize
+                                                % members.len()]
+                                                as usize;
+                                            pos_prev[m].xz()
+                                        };
                                         let sigma =
                                             crate::unit_types::missile::SCATTER_SIGMA * 1.75;
-                                        let mut aim = s.c
-                                            + Vec2::new(ang.cos(), ang.sin()) * rad
+                                        let mut aim = base
                                             + Vec2::new(
                                                 (h(0x3B7F) + h(0x45A3) - 1.0) * sigma,
                                                 (h(0x5DC1) + h(0x6B8D) - 1.0) * sigma,
