@@ -13,7 +13,7 @@ use crate::camera::RtsCamera;
 use crate::combat::CombatStats;
 use crate::game_state::GameState;
 use crate::movement::SimStats;
-use crate::orders::{Groups, Order, RegState};
+use crate::orders::{Groups, RegState};
 use crate::units::hash01;
 
 /// Env master override (FL_VOLUME, linear). Multiplies the settings
@@ -86,6 +86,7 @@ impl Plugin for BattleAudioPlugin {
                     archer_one_shots,
                     arrow_fly_loops,
                     event_cues,
+                    charge_vox,
                 )
                     .chain()
                     .run_if(in_state(GameState::Battle)),
@@ -111,8 +112,13 @@ struct AudioBank {
     /// Victory cheer when an ENEMY regiment breaks (the _celebrate
     /// takes read as "we broke them", not rally-from-rout).
     vox_cheer: Vec<Handle<AudioSource>>,
-    /// Played once per regiment charge (the latched `charging` state).
-    vox_warcry: Vec<Handle<AudioSource>>,
+    /// Single-man charge yells (sfx_charge/, M2TW Individual_Charge:
+    /// one in five charging soldiers screams his own clip).
+    yell_charge: Vec<Handle<AudioSource>>,
+    /// Group charge sheets (M2TW unit_charge bank), size-banded:
+    /// medium under 300 men, large above.
+    group_charge_medium: Vec<Handle<AudioSource>>,
+    group_charge_large: Vec<Handle<AudioSource>>,
     horn_charge: Vec<Handle<AudioSource>>,
     horn_rout: Handle<AudioSource>,
     ui_select: Handle<AudioSource>,
@@ -187,8 +193,44 @@ fn setup_audio(mut commands: Commands, assets: Res<AssetServer>) {
             "sfx_new/vox_rally_03_celebrate",
             "sfx_new/vox_rally_04_celebrate",
         ]),
-        // vox_warcry_02 is benched — 01 only for now.
-        vox_warcry: load_set(&["sfx_new/vox_warcry_01"]),
+        // The old vox_warcry crowd clips are benched: the charge is
+        // layered from these pools now (devlog 0069).
+        yell_charge: load_set(&[
+            "sfx_charge/vox_yell_01",
+            "sfx_charge/vox_yell_01b",
+            "sfx_charge/vox_yell_02",
+            "sfx_charge/vox_yell_02b",
+            "sfx_charge/vox_yell_03a",
+            "sfx_charge/vox_yell_03b",
+            "sfx_charge/vox_yell_03c",
+            "sfx_charge/vox_yell_03d",
+            "sfx_charge/vox_yell_04",
+            "sfx_charge/vox_yell_04b",
+            "sfx_charge/vox_yell_05a",
+            "sfx_charge/vox_yell_05b",
+            "sfx_charge/vox_yell_06a",
+            "sfx_charge/vox_yell_06b",
+            "sfx_charge/vox_yell_07",
+            "sfx_charge/vox_yell_08",
+            "sfx_charge/vox_yell_09a",
+            "sfx_charge/vox_yell_09b",
+            "sfx_charge/vox_yell_09c",
+            "sfx_charge/vox_yell_09d",
+            "sfx_charge/vox_yell_09_young_a",
+            "sfx_charge/vox_yell_09_young_b",
+            "sfx_charge/vox_yell_09_young_c",
+            "sfx_charge/vox_yell_09_young_d",
+            "sfx_charge/vox_yell_10a",
+            "sfx_charge/vox_yell_10b",
+            "sfx_charge/vox_yell_10c",
+            "sfx_charge/vox_yell_10_young_a",
+            "sfx_charge/vox_yell_10_young_b",
+        ]),
+        group_charge_medium: load_set(&["sfx_charge/group_charge_medium"]),
+        group_charge_large: load_set(&[
+            "sfx_charge/group_charge_large_01",
+            "sfx_charge/group_charge_large_02",
+        ]),
         horn_charge: load_set(&["sig_horn_charge", "sig_horn_charge_02"]),
         horn_rout: assets.load("sfx_new/sig_horn_rout.mp3"),
         ui_select: assets.load("sfx_new/ui_select1.mp3"),
@@ -802,20 +844,16 @@ fn archer_one_shots(
 /// bare-Local version blew past Bevy's 16 system-param limit).
 #[derive(Default)]
 struct CueState {
-    /// Last tick's order per regiment (the war-cry retarget edge).
-    prev_order: Vec<Option<Order>>,
     prev_state: Vec<u8>,
-    /// Last tick's per-regiment "attack target within charge range".
-    prev_cry: Vec<bool>,
     prev_outcome: bool,
     horn_gate: f32,
     vox_gate: f32,
     frame: u32,
 }
 
-/// Discrete cues: selection click, charge horn on new orders, war cry
-/// acknowledgment on attack orders, sustained war cries while regiments
-/// charge home, rout/rally vox + horn, victory/defeat stings.
+/// Discrete cues: selection and order clicks, charge horn on new
+/// orders, rout/rally vox + horn, victory/defeat stings. The charge
+/// war cries live in `charge_vox`.
 #[allow(clippy::too_many_arguments)] // bevy system params
 fn event_cues(
     mut commands: Commands,
@@ -823,7 +861,6 @@ fn event_cues(
     groups: Res<Groups>,
     mut cues: MessageReader<UiCue>,
     outcome: Res<crate::ai::BattleOutcome>,
-    camera: Query<&RtsCamera>,
     time: Res<Time>,
     settings: Res<crate::settings::Settings>,
     mut st: Local<CueState>,
@@ -834,10 +871,7 @@ fn event_cues(
     st.frame = st.frame.wrapping_add(1);
     st.horn_gate -= time.delta_secs();
     st.vox_gate -= time.delta_secs();
-    let n = groups.list.len();
-    st.prev_order.resize(n, None);
-    st.prev_state.resize(n, 0);
-    st.prev_cry.resize(n, false);
+    st.prev_state.resize(groups.list.len(), 0);
 
     // UI click feedback: one clip per action kind per frame, straight
     // from the input systems — every click sounds, repeats included.
@@ -859,26 +893,7 @@ fn event_cues(
     let mut new_break_enemy = false;
     let mut new_break_any = false;
     let mut new_rally = false;
-    // War cry rule (ONE rule): a regiment cries ONCE when "attack
-    // target within CHARGE_RANGE" newly becomes true — ordered at close
-    // range, closed to range on an approach, or retargeted to another
-    // nearby enemy while fighting (M2TW). Far attack orders get the
-    // horn only. One clip per charge onset: the measured M2TW charge
-    // window is 2.8..7 s (devlog 0056) and the ~4 s clip covers it —
-    // the old rolling re-fire read as the clip looping.
-    let mut cry_dist = f32::MAX;
-    let focus = camera
-        .single()
-        .map(|c| Vec2::new(c.focus.x, c.focus.z))
-        .unwrap_or_default();
-    let hear = camera.single().map(|c| 220.0 + c.distance * 0.5).unwrap_or(220.0);
     for (g, gd) in groups.list.iter().enumerate() {
-        let prev_atk = match st.prev_order[g] {
-            Some(Order::Attack(t)) => t,
-            _ => u32::MAX,
-        };
-        st.prev_order[g] = gd.order;
-
         let state = match gd.state {
             RegState::Steady => 0u8,
             RegState::Routing { .. } => 1,
@@ -896,45 +911,9 @@ fn event_cues(
             new_rally = true;
         }
         st.prev_state[g] = state;
-
-        // Cry-edge detection: attack target alive and within charge
-        // range; a target CHANGE while in range also counts (retarget
-        // mid-melee, M2TW).
-        let (atk, in_range) = match gd.order {
-            Some(Order::Attack(t)) if groups.list[t as usize].count > 0 => {
-                let d = gd.centroid.distance(groups.list[t as usize].centroid);
-                (t, d < crate::frontline::CHARGE_RANGE)
-            }
-            _ => (u32::MAX, false),
-        };
-        // Archers ordered onto a close target VOLLEY it (the stand-off
-        // fire order) — no melee war cry while there are arrows to
-        // spend. Gated on AMMO, not the firing flag: the flag lags a
-        // sim tick behind a fresh order and the cry edge fires the
-        // same frame the order lands (the "cries once sometimes" bug).
-        // An empty quiver turns the same order into a real knife
-        // charge, and that one roars.
-        let volleying = gd.kind == crate::unit_types::KIND_ARCHER && gd.ammo_left > 0;
-        let cry = in_range && gd.count > 0 && !gd.state.is_broken() && !volleying;
-        if cry && (!st.prev_cry[g] || atk != prev_atk) {
-            cry_dist = cry_dist.min(gd.centroid.distance(focus));
-        }
-        st.prev_cry[g] = cry;
     }
 
     let seed = st.frame.wrapping_mul(211);
-    // Edge cry: plays NOW (order/charge feedback beats the vox gate).
-    if cry_dist < f32::MAX {
-        let prox = (1.0 - cry_dist / hear).clamp(0.0, 1.0);
-        if prox > 0.05 {
-            if let Some(h) = pick(&bank.vox_warcry, seed ^ 0xAB) {
-                let vol = 0.55 * (0.25 + 0.75 * prox) * bv;
-                one_shot(&mut commands, h, vol, 0.94 + 0.12 * hash01(seed ^ 0xAC));
-                info!("war cry (edge, vol {vol:.2}, prox {prox:.2})");
-            }
-            st.vox_gate = 2.5;
-        }
-    }
 
     // Order-click feedback: immediate and ungated, like the selection
     // click — this is UI, not battlefield sound. Deployment placements
@@ -983,5 +962,118 @@ fn event_cues(
         };
         one_shot(&mut commands, h, 0.8 * bv, 1.0);
         st.prev_outcome = true;
+    }
+}
+
+/// State for `charge_vox`, bundled into one Local.
+#[derive(Default)]
+struct ChargeVoxState {
+    yell_acc: f32,
+    /// Per-regiment group-sheet clock: seconds until the next sheet.
+    sheet_t: Vec<f32>,
+    frame: u32,
+}
+
+/// The M2TW charge soundscape, two layers (mined configs, devlog
+/// 0069). Foreground: single-man charge yells — M2TW plays
+/// `Individual_Charge` on one in five charging soldiers, each his own
+/// positional clip — budgeted here from the men charging near the
+/// camera, the same fractional-accumulator pattern as the clangs and
+/// bow looses. Background: the `unit_charge` group sheet — one quiet
+/// size-banded crowd clip per charging regiment, retriggered every
+/// 2.0..2.5 s while the charge state lasts, overlapping itself into a
+/// wash. The yells carry the moment; the sheet is texture under them.
+#[allow(clippy::too_many_arguments)] // bevy system params
+fn charge_vox(
+    mut commands: Commands,
+    bank: Option<Res<AudioBank>>,
+    groups: Res<Groups>,
+    camera: Query<&RtsCamera>,
+    time: Res<Time>,
+    virt_time: Res<Time<Virtual>>,
+    settings: Res<crate::settings::Settings>,
+    playing: Query<(), (With<AudioPlayer>, Without<Bed>)>,
+    mut st: Local<ChargeVoxState>,
+) {
+    let Some(bank) = bank else { return };
+    let Ok(cam) = camera.single() else { return };
+    if virt_time.is_paused() {
+        return;
+    }
+    st.frame = st.frame.wrapping_add(1);
+    let dt = time.delta_secs();
+    let bv = battle_vol(&settings);
+    let zoom_att = zoom_attenuation(cam.distance);
+    let focus = Vec2::new(cam.focus.x, cam.focus.z);
+    let hear = 220.0 + cam.distance * 0.5;
+    let mut allowance = MAX_LIVE_ONE_SHOTS.saturating_sub(playing.iter().count()) as u32;
+    st.sheet_t.resize(groups.list.len(), 0.0);
+
+    // One pass: the yell feed (charging men, proximity-squared
+    // weighted) and the per-regiment sheet clocks.
+    let mut men_near = 0.0f32;
+    let mut best_prox = 0.0f32;
+    for (g, gd) in groups.list.iter().enumerate() {
+        if !gd.charging || gd.count == 0 {
+            // A finished charge resets its clock: the next one opens
+            // with an immediate sheet.
+            st.sheet_t[g] = 0.0;
+            continue;
+        }
+        let prox = (1.0 - gd.centroid.distance(focus) / hear).clamp(0.0, 1.0);
+        men_near += gd.count as f32 * prox * prox;
+        best_prox = best_prox.max(prox);
+
+        st.sheet_t[g] -= dt;
+        if st.sheet_t[g] <= 0.0 {
+            let seed = st.frame.wrapping_mul(191) ^ (g as u32).wrapping_mul(0x9E37);
+            if prox > 0.05 && allowance > 0 {
+                let set = if gd.count >= 300 {
+                    &bank.group_charge_large
+                } else {
+                    &bank.group_charge_medium
+                };
+                if let Some(h) = pick(set, seed) {
+                    // M2TW volume -25 dB + effect_level .25: well under
+                    // the yells.
+                    one_shot(
+                        &mut commands,
+                        h,
+                        0.10 * (0.3 + 0.7 * prox) * zoom_att.max(0.4) * bv,
+                        0.94 + 0.12 * hash01(seed ^ 0x31),
+                    );
+                    allowance -= 1;
+                }
+            }
+            // M2TW: delay 2.0 randomdelay .5 — the 4 s clips overlap.
+            st.sheet_t[g] = 2.0 + 0.5 * hash01(seed ^ 0x42);
+        }
+    }
+
+    // Yell budget: 0.2 yells per man (M2TW probability) spread over the
+    // measured 2.8..7 s charge window (~4.5 s mid, devlog 0056). Our
+    // regiments run far bigger than M2TW's 60-150 men, so the caps and
+    // the one-shot allowance keep a 1000-man charge a chorus instead
+    // of a decoder flood.
+    if best_prox > 0.0 {
+        st.yell_acc += men_near * (0.2 / 4.5) * dt * (0.4 + 0.6 * zoom_att);
+    }
+    st.yell_acc = st.yell_acc.min(3.0);
+    let mut n = st.yell_acc.floor() as u32;
+    st.yell_acc -= n as f32;
+    n = n.min(2).min(allowance);
+    for k in 0..n {
+        let seed = st.frame.wrapping_mul(227) ^ k ^ 0x95;
+        if let Some(h) = pick(&bank.yell_charge, seed) {
+            one_shot(
+                &mut commands,
+                h,
+                (0.20 + 0.10 * hash01(seed ^ 0x18))
+                    * (0.25 + 0.75 * best_prox)
+                    * zoom_att
+                    * bv,
+                0.90 + 0.20 * hash01(seed ^ 0x29),
+            );
+        }
     }
 }
