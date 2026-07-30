@@ -1034,12 +1034,14 @@ fn charge_vox(
                     &bank.group_charge_medium
                 };
                 if let Some(h) = pick(set, seed) {
-                    // M2TW volume -25 dB + effect_level .25: well under
-                    // the yells.
+                    // Sits under the yell layer but must stay audible
+                    // through it: a sustained wash reads quieter than
+                    // its gain suggests (first cut at 0.10 vanished
+                    // entirely under yells + beds).
                     one_shot(
                         &mut commands,
                         h,
-                        0.10 * (0.3 + 0.7 * prox) * zoom_att.max(0.4) * bv,
+                        0.22 * (0.3 + 0.7 * prox) * zoom_att.max(0.55) * bv,
                         0.94 + 0.12 * hash01(seed ^ 0x31),
                     );
                     allowance -= 1;
