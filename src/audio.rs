@@ -535,13 +535,26 @@ fn combat_one_shots(
     let Ok(cam) = camera.single() else { return };
     let bv = battle_vol(&settings);
     let focus = Vec2::new(cam.focus.x, cam.focus.z);
-    let min_dist = groups
-        .list
-        .iter()
-        .filter(|g| g.engaged && g.count > 0)
-        .map(|g| g.centroid.distance(focus))
-        .fold(f32::MAX, f32::min);
     let hear = 200.0 + cam.distance * 0.4;
+    // M2TW fires EVERY hit's weapon sound positionally (weapon_hit
+    // bank: probability 1, no rate knob anywhere in the format) and
+    // thins by distance ATTENUATION and voice priority, never by
+    // rate. Emulated here: hits are attributed to engaged regiments
+    // by strength and weighted by earshot, giving the audible share
+    // of this tick's hits; the rate cap below stands in for the
+    // voice limit. Camera distance shapes the VOLUME only.
+    let (mut min_dist, mut engaged_total, mut engaged_audible) = (f32::MAX, 0.0f32, 0.0f32);
+    for g in groups.list.iter().filter(|g| g.engaged && g.count > 0) {
+        let d = g.centroid.distance(focus);
+        min_dist = min_dist.min(d);
+        engaged_total += g.count as f32;
+        engaged_audible += g.count as f32 * (1.0 - d / hear).clamp(0.0, 1.0);
+    }
+    let audible = if engaged_total > 0.0 {
+        engaged_audible / engaged_total
+    } else {
+        0.0
+    };
     let prox = if min_dist == f32::MAX {
         0.0
     } else {
@@ -550,13 +563,15 @@ fn combat_one_shots(
 
     let zoom_att = zoom_attenuation(cam.distance);
 
-    // Clang budget: fraction of actual hits, close-up only — both the
-    // RATE and the volume fall away as the camera zooms out.
-    *clang_acc +=
-        stats.events as f32 * 30.0 * time.delta_secs() * 0.02 * prox * prox * zoom_att;
+    // Steel: every audible hit wants its clang, up to the rate cap
+    // (~24 live 0.8 s clips at the cap — the voice-limit analog).
+    const STEEL_RATE_CAP: f32 = 30.0;
+    let near_hit_rate = stats.events as f32 * 30.0 * audible;
+    *clang_acc += near_hit_rate.min(STEEL_RATE_CAP) * time.delta_secs();
+    *clang_acc = (*clang_acc).min(4.0);
     let mut n = (*clang_acc).floor() as u32;
     *clang_acc -= n as f32;
-    n = n.min(2); // hard cap per frame
+    n = n.min(3); // hard cap per frame
     for k in 0..n {
         let seed = frame.wrapping_mul(31) ^ k;
         let r = hash01(seed ^ 0xA5);
@@ -571,7 +586,10 @@ fn combat_one_shots(
             one_shot(
                 &mut commands,
                 h,
-                (0.16 + 0.10 * hash01(seed ^ 0x11)) * zoom_att * bv,
+                (0.16 + 0.10 * hash01(seed ^ 0x11))
+                    * (0.3 + 0.7 * prox)
+                    * zoom_att
+                    * bv,
                 0.92 + 0.16 * hash01(seed ^ 0x22),
             );
         }
@@ -1195,16 +1213,24 @@ fn melee_vox(
     let focus = Vec2::new(cam.focus.x, cam.focus.z);
     let hear = 200.0 + cam.distance * 0.4;
 
-    // Nearest engaged regiment (the per-hit prox) and the
-    // prox-squared-weighted engaged mass (the ambient feed).
-    let mut min_dist = f32::MAX;
+    // Same audible-share model as the clangs (see combat_one_shots):
+    // hits attributed to engaged regiments by strength, weighted by
+    // earshot. Camera distance shapes volume, never rate.
+    let (mut min_dist, mut engaged_total, mut engaged_audible) = (f32::MAX, 0.0f32, 0.0f32);
     let mut men_near = 0.0f32;
     for gd in groups.list.iter().filter(|g| g.engaged && g.count > 0) {
         let d = gd.centroid.distance(focus);
         min_dist = min_dist.min(d);
         let p = (1.0 - d / hear).clamp(0.0, 1.0);
+        engaged_total += gd.count as f32;
+        engaged_audible += gd.count as f32 * p;
         men_near += gd.count as f32 * p * p;
     }
+    let audible = if engaged_total > 0.0 {
+        engaged_audible / engaged_total
+    } else {
+        0.0
+    };
     let prox = if min_dist == f32::MAX {
         0.0
     } else {
@@ -1212,23 +1238,26 @@ fn melee_vox(
     };
     let mut allowance = MAX_LIVE_ONE_SHOTS.saturating_sub(playing.iter().count()) as u32;
 
-    // Per-hit vocals: a slightly denser budget than the clangs
-    // (0.035 vs 0.02 of hits) — in M2TW the voices outnumber the
-    // steel. Whiffed swings go unheard (the sim only counts hits);
-    // acceptable undercount.
-    st.hit_acc += stats.events as f32 * 30.0 * dt * 0.035 * prox * prox * zoom_att;
-    st.hit_acc = st.hit_acc.min(4.0);
+    // Per-hit vocals at 0.6 per steel: M2TW rides ~.9 vocals per hit
+    // but each QUIETER than the material hit — steel is the carrier,
+    // voices the garnish (weapon_hit p 1 vol -10..0 vs vocals
+    // p .4/.25/.25 vol -20/-15). Whiffed swings go unheard (the sim
+    // only counts hits); acceptable undercount.
+    const VOCAL_RATE_CAP: f32 = 18.0;
+    let near_hit_rate = stats.events as f32 * 30.0 * audible;
+    st.hit_acc += (near_hit_rate * 0.6).min(VOCAL_RATE_CAP) * dt;
+    st.hit_acc = st.hit_acc.min(3.0);
     let mut n = st.hit_acc.floor() as u32;
     st.hit_acc -= n as f32;
-    n = n.min(3).min(allowance);
+    n = n.min(2).min(allowance);
     allowance -= n;
     for k in 0..n {
         let seed = st.frame.wrapping_mul(241) ^ k ^ 0xC3;
         let r = hash01(seed ^ 0xD1);
         let (set, vol) = if r < 0.45 {
-            (&bank.melee_attack_grunt, 0.16 + 0.06 * hash01(seed ^ 0x1A))
+            (&bank.melee_attack_grunt, 0.13 + 0.06 * hash01(seed ^ 0x1A))
         } else if r < 0.73 {
-            (&bank.melee_hit_grunt, 0.18 + 0.06 * hash01(seed ^ 0x2B))
+            (&bank.melee_hit_grunt, 0.15 + 0.06 * hash01(seed ^ 0x2B))
         } else {
             (&bank.melee_attack_scream, 0.22 + 0.08 * hash01(seed ^ 0x3C))
         };
@@ -1243,8 +1272,9 @@ fn melee_vox(
     }
 
     // Ambient battle screams: ~one every 1-2 s over a close 1000-man
-    // melee, fading out fast with distance and zoom.
-    st.ambient_acc += men_near * dt * 0.0008 * (0.4 + 0.6 * zoom_att);
+    // melee, fading out fast with distance and zoom (zoom shapes the
+    // volume below, not this rate).
+    st.ambient_acc += men_near * dt * 0.0008;
     st.ambient_acc = st.ambient_acc.min(2.0);
     let mut n = st.ambient_acc.floor() as u32;
     st.ambient_acc -= n as f32;
