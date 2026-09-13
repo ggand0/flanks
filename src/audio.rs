@@ -83,6 +83,7 @@ impl Plugin for BattleAudioPlugin {
                 (
                     update_beds,
                     combat_one_shots,
+                    melee_vox,
                     archer_one_shots,
                     arrow_fly_loops,
                     event_cues,
@@ -112,6 +113,13 @@ struct AudioBank {
     /// Victory cheer when an ENEMY regiment breaks (the _celebrate
     /// takes read as "we broke them", not rally-from-rout).
     vox_cheer: Vec<Handle<AudioSource>>,
+    /// Melee human layer (sfx_melee/, M2TW soldier_voice vocals):
+    /// attacker effort grunts and screams, victim hit grunts, and
+    /// sustained battle screams over a locked fight.
+    melee_attack_grunt: Vec<Handle<AudioSource>>,
+    melee_attack_scream: Vec<Handle<AudioSource>>,
+    melee_hit_grunt: Vec<Handle<AudioSource>>,
+    melee_battle_scream: Vec<Handle<AudioSource>>,
     /// Single-man charge yells (sfx_charge/, M2TW Individual_Charge:
     /// one in five charging soldiers screams his own clip).
     yell_charge: Vec<Handle<AudioSource>>,
@@ -192,6 +200,71 @@ fn setup_audio(mut commands: Commands, assets: Res<AssetServer>) {
         vox_cheer: load_set(&[
             "sfx_new/vox_rally_03_celebrate",
             "sfx_new/vox_rally_04_celebrate",
+        ]),
+        melee_attack_grunt: load_set(&[
+            "sfx_melee/attack_grunts/attack_grunt0",
+            "sfx_melee/attack_grunts/attack_grunt_knight0",
+            "sfx_melee/attack_grunts/attack_grunt_knight1",
+            "sfx_melee/attack_grunts/attack_grunt_knight2",
+            "sfx_melee/attack_grunts/attack_grunt_knight3",
+            "sfx_melee/attack_grunts/attack_grunt_knight4",
+            "sfx_melee/attack_grunts/attack_grunt_knight5",
+            "sfx_melee/attack_grunts/attack_grunt_knight6",
+            "sfx_melee/attack_grunts/attack_grunt_knight7",
+            "sfx_melee/attack_grunts/attack_grunt_knight8",
+            "sfx_melee/attack_grunts/attack_grunt_knight9",
+            "sfx_melee/attack_grunts/attack_grunt_knight10",
+            "sfx_melee/attack_grunts/attack_grunt_knight11",
+            "sfx_melee/attack_grunts/attack_grunt_old_knight0",
+            "sfx_melee/attack_grunts/attack_grunt_old_knight1",
+            "sfx_melee/attack_grunts/attack_grunt_old_knight2",
+            "sfx_melee/attack_grunts/attack_grunt_young_knight0",
+            "sfx_melee/attack_grunts/attack_grunt_young_knight1",
+            "sfx_melee/attack_grunts/attack_grunt_young_knight2",
+            "sfx_melee/attack_grunts/attack_grunt_young_knight3",
+            "sfx_melee/attack_grunts/attack_grunt_young_knight4",
+        ]),
+        melee_attack_scream: load_set(&[
+            "sfx_melee/attack_screams/attack_scream0_bitfunny",
+            "sfx_melee/attack_screams/attack_scream1_young",
+            "sfx_melee/attack_screams/attack_scream2_good",
+            "sfx_melee/attack_screams/attack_scream3",
+            "sfx_melee/attack_screams/attack_scream4",
+            "sfx_melee/attack_screams/attack_scream5",
+            "sfx_melee/attack_screams/attack_scream6",
+            "sfx_melee/attack_screams/attack_scream7",
+            "sfx_melee/attack_screams/attack_scream_young0",
+            "sfx_melee/attack_screams/attack_scream_young1",
+            "sfx_melee/attack_screams/attack_scream_young2",
+            "sfx_melee/attack_screams/attack_scream_young3",
+        ]),
+        melee_hit_grunt: load_set(&[
+            "sfx_melee/hit_grunts/choked_groan(big_damage)1",
+            "sfx_melee/hit_grunts/damage_gasp0",
+            "sfx_melee/hit_grunts/damage_gasp1",
+            "sfx_melee/hit_grunts/damage_gasp2",
+            "sfx_melee/hit_grunts/damage_grunt0",
+            "sfx_melee/hit_grunts/damage_grunt2",
+            "sfx_melee/hit_grunts/damage_grunt3",
+            "sfx_melee/hit_grunts/damage_grunt4",
+            "sfx_melee/hit_grunts/damage_grunt6",
+            "sfx_melee/hit_grunts/damage_grunt7",
+            "sfx_melee/hit_grunts/damage_grunt8",
+            "sfx_melee/hit_grunts/damage_grunt9",
+            "sfx_melee/hit_grunts/damage_grunt10",
+            "sfx_melee/hit_grunts/damage_grunt11",
+            "sfx_melee/hit_grunts/damage_grunt12",
+            "sfx_melee/hit_grunts/stabbed0",
+        ]),
+        melee_battle_scream: load_set(&[
+            "sfx_melee/battle_screams/battle_scream0",
+            "sfx_melee/battle_screams/battle_scream1",
+            "sfx_melee/battle_screams/battle_scream3",
+            "sfx_melee/battle_screams/battle_scream4",
+            "sfx_melee/battle_screams/battle_scream6",
+            "sfx_melee/battle_screams/battle_scream7",
+            "sfx_melee/battle_screams/battle_scream8",
+            "sfx_melee/battle_screams/battle_scream9",
         ]),
         // The old vox_warcry crowd clips are benched: the charge is
         // layered from these pools now (devlog 0069).
@@ -1075,6 +1148,115 @@ fn charge_vox(
                     * zoom_att
                     * bv,
                 0.90 + 0.20 * hash01(seed ^ 0x29),
+            );
+        }
+    }
+}
+
+/// State for `melee_vox`, bundled into one Local.
+#[derive(Default)]
+struct MeleeVoxState {
+    hit_acc: f32,
+    ambient_acc: f32,
+    frame: u32,
+}
+
+/// The melee human layer (M2TW soldier_voice vocals, devlog 0070):
+/// men, not steel, carry the sound of a fight. Two feeds. Per-HIT
+/// vocals ride the same sim hit counter as the clangs — each spawn
+/// picks the attacker's grunt, the victim's grunt, or the attacker's
+/// scream at the M2TW probability ratio (.4 / .25 / .25). A slow
+/// ambient stream of battle screams (M2TW p .2, the loudest clips)
+/// comes from the mass of ENGAGED men near the camera. M2TW plays
+/// all of these at tiny mindist (0.75-2 m) — a strictly close-up
+/// layer, so zoom attenuates it harder than the beds.
+#[allow(clippy::too_many_arguments)] // bevy system params
+fn melee_vox(
+    mut commands: Commands,
+    bank: Option<Res<AudioBank>>,
+    stats: Res<SimStats>,
+    groups: Res<Groups>,
+    camera: Query<&RtsCamera>,
+    time: Res<Time>,
+    virt_time: Res<Time<Virtual>>,
+    settings: Res<crate::settings::Settings>,
+    playing: Query<(), (With<AudioPlayer>, Without<Bed>)>,
+    mut st: Local<MeleeVoxState>,
+) {
+    let Some(bank) = bank else { return };
+    let Ok(cam) = camera.single() else { return };
+    if virt_time.is_paused() {
+        return;
+    }
+    st.frame = st.frame.wrapping_add(1);
+    let dt = time.delta_secs();
+    let bv = battle_vol(&settings);
+    let zoom_att = zoom_attenuation(cam.distance);
+    let focus = Vec2::new(cam.focus.x, cam.focus.z);
+    let hear = 200.0 + cam.distance * 0.4;
+
+    // Nearest engaged regiment (the per-hit prox) and the
+    // prox-squared-weighted engaged mass (the ambient feed).
+    let mut min_dist = f32::MAX;
+    let mut men_near = 0.0f32;
+    for gd in groups.list.iter().filter(|g| g.engaged && g.count > 0) {
+        let d = gd.centroid.distance(focus);
+        min_dist = min_dist.min(d);
+        let p = (1.0 - d / hear).clamp(0.0, 1.0);
+        men_near += gd.count as f32 * p * p;
+    }
+    let prox = if min_dist == f32::MAX {
+        0.0
+    } else {
+        (1.0 - min_dist / hear).clamp(0.0, 1.0)
+    };
+    let mut allowance = MAX_LIVE_ONE_SHOTS.saturating_sub(playing.iter().count()) as u32;
+
+    // Per-hit vocals: a slightly denser budget than the clangs
+    // (0.035 vs 0.02 of hits) — in M2TW the voices outnumber the
+    // steel. Whiffed swings go unheard (the sim only counts hits);
+    // acceptable undercount.
+    st.hit_acc += stats.events as f32 * 30.0 * dt * 0.035 * prox * prox * zoom_att;
+    st.hit_acc = st.hit_acc.min(4.0);
+    let mut n = st.hit_acc.floor() as u32;
+    st.hit_acc -= n as f32;
+    n = n.min(3).min(allowance);
+    allowance -= n;
+    for k in 0..n {
+        let seed = st.frame.wrapping_mul(241) ^ k ^ 0xC3;
+        let r = hash01(seed ^ 0xD1);
+        let (set, vol) = if r < 0.45 {
+            (&bank.melee_attack_grunt, 0.16 + 0.06 * hash01(seed ^ 0x1A))
+        } else if r < 0.73 {
+            (&bank.melee_hit_grunt, 0.18 + 0.06 * hash01(seed ^ 0x2B))
+        } else {
+            (&bank.melee_attack_scream, 0.22 + 0.08 * hash01(seed ^ 0x3C))
+        };
+        if let Some(h) = pick(set, seed) {
+            one_shot(
+                &mut commands,
+                h,
+                vol * (0.25 + 0.75 * prox) * zoom_att * bv,
+                0.92 + 0.16 * hash01(seed ^ 0x4D),
+            );
+        }
+    }
+
+    // Ambient battle screams: ~one every 1-2 s over a close 1000-man
+    // melee, fading out fast with distance and zoom.
+    st.ambient_acc += men_near * dt * 0.0008 * (0.4 + 0.6 * zoom_att);
+    st.ambient_acc = st.ambient_acc.min(2.0);
+    let mut n = st.ambient_acc.floor() as u32;
+    st.ambient_acc -= n as f32;
+    n = n.min(1).min(allowance);
+    for k in 0..n {
+        let seed = st.frame.wrapping_mul(263) ^ k ^ 0xE5;
+        if let Some(h) = pick(&bank.melee_battle_scream, seed) {
+            one_shot(
+                &mut commands,
+                h,
+                (0.26 + 0.08 * hash01(seed ^ 0x5E)) * (0.25 + 0.75 * prox) * zoom_att * bv,
+                0.92 + 0.16 * hash01(seed ^ 0x6F),
             );
         }
     }
