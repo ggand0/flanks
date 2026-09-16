@@ -88,6 +88,7 @@ impl Plugin for BattleAudioPlugin {
                     arrow_fly_loops,
                     event_cues,
                     charge_vox,
+                    celebrate_vox,
                 )
                     .chain()
                     .run_if(in_state(GameState::Battle)),
@@ -110,9 +111,12 @@ struct AudioBank {
     death: Vec<Handle<AudioSource>>,
     vox_rout: Vec<Handle<AudioSource>>,
     vox_rally: Vec<Handle<AudioSource>>,
-    /// Victory cheer when an ENEMY regiment breaks (the _celebrate
-    /// takes read as "we broke them", not rally-from-rout).
-    vox_cheer: Vec<Handle<AudioSource>>,
+    /// Rolling group cheers while a regiment CELEBRATES (sfx_celebrate/,
+    /// M2TW unit_celebrate state bank), size-banded like the charge
+    /// sheets, plus single-man victory whoops over them.
+    celebrate_small: Vec<Handle<AudioSource>>,
+    celebrate_large: Vec<Handle<AudioSource>>,
+    celebrate_whoop: Vec<Handle<AudioSource>>,
     /// Melee human layer (sfx_melee/, M2TW soldier_voice vocals):
     /// attacker effort grunts and screams, victim hit grunts, and
     /// sustained battle screams over a locked fight.
@@ -197,9 +201,34 @@ fn setup_audio(mut commands: Commands, assets: Res<AssetServer>) {
         ]),
         vox_rout: load_set(&["vox_rout_01", "vox_rout_02", "vox_rout_03"]),
         vox_rally: load_set(&["vox_rally_01", "vox_rally_02"]),
-        vox_cheer: load_set(&[
-            "sfx_new/vox_rally_03_celebrate",
-            "sfx_new/vox_rally_04_celebrate",
+        // The sfx_new/vox_rally_03/04_celebrate one-shots are benched
+        // (owner: superseded); the celebrate state cheers from these.
+        celebrate_small: load_set(&[
+            "sfx_celebrate/group_cheer_small_01_mocking",
+            "sfx_celebrate/group_cheer_small_02_mocking",
+            "sfx_celebrate/group_cheer_small_04_laughing",
+            "sfx_celebrate/group_cheer_small_05_laughing",
+            "sfx_celebrate/group_cheer_small_06_laughing",
+            "sfx_celebrate/group_cheer_small_07_joyous_shouts",
+            "sfx_celebrate/group_cheer_small_08_joyous_shouts",
+        ]),
+        celebrate_large: load_set(&[
+            "sfx_celebrate/group_cheer_large_01",
+            "sfx_celebrate/group_cheer_large_02_short",
+            "sfx_celebrate/group_cheer_large_03_ok",
+            "sfx_celebrate/group_cheer_large_04",
+            "sfx_celebrate/group_cheer_large_05_ok",
+        ]),
+        // vox_whoop_04 benched by its own filename (skipfornow).
+        celebrate_whoop: load_set(&[
+            "sfx_celebrate/vox_whoop_01",
+            "sfx_celebrate/vox_whoop_02_joyous_shout",
+            "sfx_celebrate/vox_whoop_03_laugh",
+            "sfx_celebrate/vox_whoop_05_knight_laugh",
+            "sfx_celebrate/vox_whoop_06_cheer_yeah",
+            "sfx_celebrate/vox_whoop_07_roar_yeah",
+            "sfx_celebrate/vox_whoop_08_knight_shout_yes",
+            "sfx_celebrate/vox_whoop_09_knight_shout_yeaa",
         ]),
         melee_attack_grunt: load_set(&[
             "sfx_melee/attack_grunts/attack_grunt0",
@@ -981,7 +1010,6 @@ fn event_cues(
     }
 
     let mut new_break_own = false;
-    let mut new_break_enemy = false;
     let mut new_break_any = false;
     let mut new_rally = false;
     for (g, gd) in groups.list.iter().enumerate() {
@@ -994,8 +1022,6 @@ fn event_cues(
             new_break_any = true;
             if gd.team == 0 {
                 new_break_own = true;
-            } else {
-                new_break_enemy = true;
             }
         }
         if state == 0 && st.prev_state[g] == 1 {
@@ -1030,12 +1056,8 @@ fn event_cues(
             if new_break_own {
                 one_shot(&mut commands, bank.horn_rout.clone(), 0.5 * bv, 1.0);
             }
-            // Victors roar over the enemy's panic (TW moment).
-            if new_break_enemy
-                && let Some(h) = pick(&bank.vox_cheer, seed ^ 0xBB)
-            {
-                one_shot(&mut commands, h, 0.5 * bv, 1.0);
-            }
+            // The victors' roar moved to celebrate_vox: the M2TW cheer
+            // is a STATE (the last nearby foe gone), not a break edge.
             st.vox_gate = 1.5;
         } else if new_rally {
             if let Some(h) = pick(&bank.vox_rally, seed ^ 0x77) {
@@ -1166,6 +1188,112 @@ fn charge_vox(
                     * zoom_att
                     * bv,
                 0.90 + 0.20 * hash01(seed ^ 0x29),
+            );
+        }
+    }
+}
+
+/// State for `celebrate_vox`, bundled into one Local.
+#[derive(Default)]
+struct CelebrateVoxState {
+    whoop_acc: f32,
+    /// Per-regiment cheer-sheet clock (seconds until the next sheet).
+    sheet_t: Vec<f32>,
+    frame: u32,
+}
+
+/// Victory celebration (M2TW unit_celebrate state bank, devlog 0070):
+/// while a regiment's `celebrate` window runs (the last nearby foe
+/// routed or died, ~5 s, frontline.rs), it cheers as a STATE — a
+/// rolling size-banded group cheer per regiment, first sheet on the
+/// edge, retriggered so the 4-6 s clips overlap (M2TW: fadein 1
+/// fadeout 3, randomdelay 1, FULL volume — the loudest group event
+/// in the bank set), with single-man whoops budgeted over it
+/// (Individual_Celebrate p .08).
+#[allow(clippy::too_many_arguments)] // bevy system params
+fn celebrate_vox(
+    mut commands: Commands,
+    bank: Option<Res<AudioBank>>,
+    groups: Res<Groups>,
+    camera: Query<&RtsCamera>,
+    time: Res<Time>,
+    virt_time: Res<Time<Virtual>>,
+    settings: Res<crate::settings::Settings>,
+    playing: Query<(), (With<AudioPlayer>, Without<Bed>)>,
+    mut st: Local<CelebrateVoxState>,
+) {
+    let Some(bank) = bank else { return };
+    let Ok(cam) = camera.single() else { return };
+    if virt_time.is_paused() {
+        return;
+    }
+    st.frame = st.frame.wrapping_add(1);
+    let dt = time.delta_secs();
+    let bv = battle_vol(&settings);
+    let zoom_att = zoom_attenuation(cam.distance);
+    let focus = Vec2::new(cam.focus.x, cam.focus.z);
+    let hear = 220.0 + cam.distance * 0.5;
+    let mut allowance = MAX_LIVE_ONE_SHOTS.saturating_sub(playing.iter().count()) as u32;
+    st.sheet_t.resize(groups.list.len(), 0.0);
+
+    let mut men_near = 0.0f32;
+    let mut best_prox = 0.0f32;
+    for (g, gd) in groups.list.iter().enumerate() {
+        if gd.celebrate == 0 || gd.count == 0 {
+            // A finished cheer resets its clock: the next one opens
+            // with an immediate sheet on the celebrate edge.
+            st.sheet_t[g] = 0.0;
+            continue;
+        }
+        let prox = (1.0 - gd.centroid.distance(focus) / hear).clamp(0.0, 1.0);
+        men_near += gd.count as f32 * prox * prox;
+        best_prox = best_prox.max(prox);
+
+        st.sheet_t[g] -= dt;
+        if st.sheet_t[g] <= 0.0 {
+            let seed = st.frame.wrapping_mul(307) ^ (g as u32).wrapping_mul(0x9E37);
+            if prox > 0.05 && allowance > 0 {
+                let set = if gd.count >= 300 {
+                    &bank.celebrate_large
+                } else {
+                    &bank.celebrate_small
+                };
+                if let Some(h) = pick(set, seed) {
+                    // M2TW plays this bank at full volume: the loudest
+                    // sheet in our ledger, above the charge sheets.
+                    one_shot(
+                        &mut commands,
+                        h,
+                        0.40 * (0.3 + 0.7 * prox) * zoom_att.max(0.5) * bv,
+                        0.96 + 0.08 * hash01(seed ^ 0x51),
+                    );
+                    allowance -= 1;
+                }
+            }
+            // Retrigger under the clip length so the cheers roll.
+            st.sheet_t[g] = 2.5 + 1.0 * hash01(seed ^ 0x62);
+        }
+    }
+
+    // Individual whoops: M2TW p .08 per man, spread over the 5 s
+    // celebrate window, proximity-thinned.
+    const WHOOP_RATE_CAP: f32 = 10.0;
+    st.whoop_acc += (men_near * (0.08 / 5.0)).min(WHOOP_RATE_CAP) * dt;
+    st.whoop_acc = st.whoop_acc.min(2.0);
+    let mut n = st.whoop_acc.floor() as u32;
+    st.whoop_acc -= n as f32;
+    n = n.min(2).min(allowance);
+    for k in 0..n {
+        let seed = st.frame.wrapping_mul(311) ^ k ^ 0xA7;
+        if let Some(h) = pick(&bank.celebrate_whoop, seed) {
+            one_shot(
+                &mut commands,
+                h,
+                (0.22 + 0.08 * hash01(seed ^ 0x73))
+                    * (0.25 + 0.75 * best_prox)
+                    * zoom_att
+                    * bv,
+                0.92 + 0.16 * hash01(seed ^ 0x84),
             );
         }
     }
