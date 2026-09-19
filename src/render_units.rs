@@ -312,8 +312,8 @@ impl Plugin for UnitRenderPlugin {
 }
 
 fn setup_unit_mesh(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
-    // One instance entity per unit kind, each with its own code-built
-    // low-poly mesh. Instance positions are not the entity's transform;
+    // One instance entity per unit kind AND detail level, each with its
+    // own code-built mesh. Instance positions are not the entity's transform;
     // built-in frustum culling would cull all instances at once, so it
     // stays disabled and we cull per-instance in sync_instance_data.
     //
@@ -323,16 +323,14 @@ fn setup_unit_mesh(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
     // `SortedRenderPhase::render_range` skips every item after the first —
     // its draw function never runs and that bucket's units silently vanish
     // (the "LOD far bucket invisible" bug, devlog 0013).
-    let kind_meshes = [
-        crate::unit_meshes::build_knight(),
-        crate::unit_meshes::build_man_at_arms(),
-        crate::unit_meshes::build_spearman(),
-        crate::unit_meshes::build_archer(),
-    ];
-    for (kind, mesh) in kind_meshes.into_iter().enumerate() {
-        let handle = meshes.add(mesh);
+    for kind in 0..crate::unit_types::NUM_KINDS {
+        let lods = crate::unit_meshes::build_kind_lods(kind);
+        let tris: Vec<usize> =
+            lods.iter().map(|m| m.indices().map_or(0, |i| i.len() / 3)).collect();
+        info!("unit meshes: kind {kind} tris per level {tris:?}");
+        let handles = lods.map(|mesh| meshes.add(mesh));
         // One live bucket per detail level.
-        for lod in 0..NUM_LODS {
+        for (lod, handle) in handles.iter().enumerate() {
             commands.spawn((
                 Mesh3d(handle.clone()),
                 InstanceMaterialData::default(),
@@ -341,9 +339,9 @@ fn setup_unit_mesh(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
                 NoAutomaticBatching,
             ));
         }
-        // Matching corpse bucket: same mesh, static instance list.
+        // Matching corpse bucket: the full mesh, static instance list.
         commands.spawn((
-            Mesh3d(handle),
+            Mesh3d(handles[0].clone()),
             InstanceMaterialData::default(),
             CorpseBucket(kind),
             NoFrustumCulling,
