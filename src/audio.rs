@@ -89,6 +89,7 @@ impl Plugin for BattleAudioPlugin {
                     event_cues,
                     charge_vox,
                     celebrate_vox,
+                    rout_vox,
                 )
                     .chain()
                     .run_if(in_state(GameState::Battle)),
@@ -110,7 +111,13 @@ struct AudioBank {
     damage: Vec<Handle<AudioSource>>,
     death: Vec<Handle<AudioSource>>,
     vox_rout: Vec<Handle<AudioSource>>,
-    vox_rally: Vec<Handle<AudioSource>>,
+    /// Rout soundscape (sfx_rout/, owner's movie-research direction +
+    /// M2TW Individual_Retreat): commanders shouting Retreat/Withdraw
+    /// over a mostly silent fleeing mass, panic screams only in the
+    /// first moments of a break, massed running feet underneath.
+    rout_shout: Vec<Handle<AudioSource>>,
+    rout_panic: Vec<Handle<AudioSource>>,
+    feet_wash: Vec<Handle<AudioSource>>,
     /// Rolling group cheers while a regiment CELEBRATES (sfx_celebrate/,
     /// M2TW unit_celebrate state bank), size-banded like the charge
     /// sheets, plus single-man victory whoops over them.
@@ -199,8 +206,38 @@ fn setup_audio(mut commands: Commands, assets: Res<AssetServer>) {
             "sfx_death_04",
             "sfx_death_05",
         ]),
-        vox_rout: load_set(&["vox_rout_01", "vox_rout_02", "vox_rout_03"]),
-        vox_rally: load_set(&["vox_rally_01", "vox_rally_02"]),
+        // vox_rally_01/02 are benched (owner: unusable, use nowhere).
+        vox_rout: load_set(&[
+            "vox_rout_01",
+            "vox_rout_02",
+            "vox_rout_03",
+            "sfx_rout/vox_rout_04",
+            "sfx_rout/vox_rout_05",
+        ]),
+        rout_shout: load_set(&[
+            "sfx_rout/fallback0",
+            "sfx_rout/fallback1",
+            "sfx_rout/fallback2",
+            "sfx_rout/retreat0",
+            "sfx_rout/retreat1",
+            "sfx_rout/run_away!0",
+            "sfx_rout/run_away!1_funny",
+            "sfx_rout/withdraw0",
+            "sfx_rout/withdraw1",
+            "sfx_rout/withdraw2",
+        ]),
+        rout_panic: load_set(&[
+            "sfx_rout/vox_panic_01",
+            "sfx_rout/vox_panic_02",
+            "sfx_rout/vox_panic_03",
+        ]),
+        // Massed washes layered from the single-man source loops by
+        // tmp/build-feet-wash.sh (ElevenLabs would only produce one
+        // or two runners per take).
+        feet_wash: load_set(&[
+            "sfx_rout/feet_run_wash_mass_01",
+            "sfx_rout/feet_run_wash_mass_02",
+        ]),
         // The sfx_new/vox_rally_03/04_celebrate one-shots are benched
         // (owner: superseded); the celebrate state cheers from these.
         celebrate_small: load_set(&[
@@ -1011,7 +1048,6 @@ fn event_cues(
 
     let mut new_break_own = false;
     let mut new_break_any = false;
-    let mut new_rally = false;
     for (g, gd) in groups.list.iter().enumerate() {
         let state = match gd.state {
             RegState::Steady => 0u8,
@@ -1023,9 +1059,6 @@ fn event_cues(
             if gd.team == 0 {
                 new_break_own = true;
             }
-        }
-        if state == 0 && st.prev_state[g] == 1 {
-            new_rally = true;
         }
         st.prev_state[g] = state;
     }
@@ -1058,11 +1091,8 @@ fn event_cues(
             }
             // The victors' roar moved to celebrate_vox: the M2TW cheer
             // is a STATE (the last nearby foe gone), not a break edge.
-            st.vox_gate = 1.5;
-        } else if new_rally {
-            if let Some(h) = pick(&bank.vox_rally, seed ^ 0x77) {
-                one_shot(&mut commands, h, 0.5 * bv, 1.0);
-            }
+            // Rally has no vox for now (owner benched the old clips);
+            // a rally cue needs a fresh asset first.
             st.vox_gate = 1.5;
         }
     }
@@ -1188,6 +1218,145 @@ fn charge_vox(
                     * zoom_att
                     * bv,
                 0.90 + 0.20 * hash01(seed ^ 0x29),
+            );
+        }
+    }
+}
+
+/// State for `rout_vox`, bundled into one Local.
+#[derive(Default)]
+struct RoutVoxState {
+    prev_broken: Vec<bool>,
+    /// Seconds of the initial-panic window left, per regiment.
+    panic_left: Vec<f32>,
+    /// Per-regiment feet-wash clock (seconds until the next wash).
+    wash_t: Vec<f32>,
+    panic_acc: f32,
+    shout_acc: f32,
+    frame: u32,
+}
+
+/// The rout soundscape. Owner's direction from film retreats
+/// (Napoleon 2023, The Patriot), matching the M2TW config: after the
+/// first panicked moments men flee mostly SILENT — what carries is
+/// officers shouting Retreat / Withdraw / Fall back (M2TW
+/// Individual_Retreat is exactly such voice lines, sparse at p .08)
+/// and the drumming feet of the running mass (unit_run bank; M2TW's
+/// own group retreat sheet is benched in its config, so none here
+/// either). Three layers per BROKEN regiment: panic screams only
+/// inside a 7 s window after the break, sparse command shouts while
+/// any rout runs in earshot, and a rolling feet wash underneath.
+/// The break EDGE itself (crowd vox + horn) stays in event_cues.
+#[allow(clippy::too_many_arguments)] // bevy system params
+fn rout_vox(
+    mut commands: Commands,
+    bank: Option<Res<AudioBank>>,
+    groups: Res<Groups>,
+    camera: Query<&RtsCamera>,
+    time: Res<Time>,
+    virt_time: Res<Time<Virtual>>,
+    settings: Res<crate::settings::Settings>,
+    playing: Query<(), (With<AudioPlayer>, Without<Bed>)>,
+    mut st: Local<RoutVoxState>,
+) {
+    let Some(bank) = bank else { return };
+    let Ok(cam) = camera.single() else { return };
+    if virt_time.is_paused() {
+        return;
+    }
+    st.frame = st.frame.wrapping_add(1);
+    let dt = time.delta_secs();
+    let bv = battle_vol(&settings);
+    let zoom_att = zoom_attenuation(cam.distance);
+    let focus = Vec2::new(cam.focus.x, cam.focus.z);
+    let hear = 220.0 + cam.distance * 0.5;
+    let mut allowance = MAX_LIVE_ONE_SHOTS.saturating_sub(playing.iter().count()) as u32;
+    let n_groups = groups.list.len();
+    st.prev_broken.resize(n_groups, false);
+    st.panic_left.resize(n_groups, 0.0);
+    st.wash_t.resize(n_groups, 0.0);
+
+    let mut panic_men = 0.0f32;
+    let mut best_prox = 0.0f32;
+    for (g, gd) in groups.list.iter().enumerate() {
+        let broken = gd.state.is_broken() && gd.count > 0;
+        if broken && !st.prev_broken[g] {
+            st.panic_left[g] = 7.0;
+        }
+        st.prev_broken[g] = broken;
+        if !broken {
+            st.panic_left[g] = 0.0;
+            st.wash_t[g] = 0.0;
+            continue;
+        }
+        st.panic_left[g] = (st.panic_left[g] - dt).max(0.0);
+        let prox = (1.0 - gd.centroid.distance(focus) / hear).clamp(0.0, 1.0);
+        best_prox = best_prox.max(prox);
+        if st.panic_left[g] > 0.0 {
+            panic_men += gd.count as f32 * prox * prox;
+        }
+
+        // Feet wash: rolling 6 s clips per fleeing regiment, first on
+        // the break edge, sized by regiment strength.
+        st.wash_t[g] -= dt;
+        if st.wash_t[g] <= 0.0 {
+            let seed = st.frame.wrapping_mul(331) ^ (g as u32).wrapping_mul(0x9E37);
+            if prox > 0.05
+                && allowance > 0
+                && let Some(h) = pick(&bank.feet_wash, seed)
+            {
+                let size = (gd.count as f32 / 300.0).min(1.0);
+                one_shot(
+                    &mut commands,
+                    h,
+                    0.20 * (0.5 + 0.5 * size)
+                        * (0.3 + 0.7 * prox)
+                        * zoom_att.max(0.5)
+                        * bv,
+                    0.94 + 0.12 * hash01(seed ^ 0x91),
+                );
+                allowance -= 1;
+            }
+            st.wash_t[g] = 3.0 + 1.0 * hash01(seed ^ 0xA2);
+        }
+    }
+
+    // Initial panic: screams only in the first moments of a break,
+    // then the mass goes quiet (the film observation).
+    st.panic_acc += (panic_men * 0.00066).min(1.5) * dt;
+    st.panic_acc = st.panic_acc.min(2.0);
+    let mut n = st.panic_acc.floor() as u32;
+    st.panic_acc -= n as f32;
+    n = n.min(1).min(allowance);
+    allowance -= n;
+    for k in 0..n {
+        let seed = st.frame.wrapping_mul(347) ^ k ^ 0xB3;
+        if let Some(h) = pick(&bank.rout_panic, seed) {
+            one_shot(
+                &mut commands,
+                h,
+                (0.24 + 0.08 * hash01(seed ^ 0xC4)) * (0.25 + 0.75 * best_prox) * zoom_att * bv,
+                0.92 + 0.16 * hash01(seed ^ 0xD5),
+            );
+        }
+    }
+
+    // Command shouts: one officer voice every ~3 s while any rout
+    // runs in earshot — not per man, and never a machine gun during
+    // a mass collapse.
+    st.shout_acc += best_prox * 0.35 * dt;
+    st.shout_acc = st.shout_acc.min(1.5);
+    let mut n = st.shout_acc.floor() as u32;
+    st.shout_acc -= n as f32;
+    n = n.min(1).min(allowance);
+    for k in 0..n {
+        let seed = st.frame.wrapping_mul(353) ^ k ^ 0xE6;
+        if let Some(h) = pick(&bank.rout_shout, seed) {
+            one_shot(
+                &mut commands,
+                h,
+                (0.30 + 0.08 * hash01(seed ^ 0xF7)) * (0.25 + 0.75 * best_prox) * zoom_att * bv,
+                0.94 + 0.12 * hash01(seed ^ 0x19),
             );
         }
     }
