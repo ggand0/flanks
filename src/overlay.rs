@@ -237,7 +237,7 @@ fn update_overlay(
     };
     for mut text in &mut query {
         text.0 = format!(
-            "{fps:>5.0} fps  {frame_ms:.2} ms\n{} units, drawn {} [{}] (frustum culled)\nsim tick: grid {:.2} ms, step {:.2} ms, field {:.2} ms, audit {:.2} ms | sync {:.2} ms\n{} groups ({} engaged, {} broken), {} selected\nblue {} ({} lost, {} fled)  orange {} ({} lost, {} fled){banner}",
+            "{fps:>5.0} fps  {frame_ms:.2} ms\n{} units, drawn {} [{}] lod {:?} (frustum culled)\nsim tick: grid {:.2} ms, step {:.2} ms, field {:.2} ms, audit {:.2} ms | sync {:.2} ms\n{} groups ({} engaged, {} broken), {} selected\nblue {} ({} lost, {} fled)  orange {} ({} lost, {} fled){banner}",
             units.len(),
             render_counts.drawn,
             render_counts
@@ -246,6 +246,7 @@ fn update_overlay(
                 .map(|n| n.to_string())
                 .collect::<Vec<_>>()
                 .join("/"),
+            render_counts.lod_drawn,
             stats.grid_ms,
             stats.step_ms,
             stats.field_ms,
@@ -270,7 +271,7 @@ fn update_overlay(
     if *log_timer >= 2.0 {
         *log_timer = 0.0;
         info!(
-            "fps: {fps:.0} ({frame_ms:.2} ms), units: {} (blue {} / orange {}), sim: grid {:.2} step {:.2} field {:.2} audit {:.2} sync {:.2}, hits/tick: {}, drawn: {} [{}], nn min/avg: {:.2}/{:.2}, move avg: {:.3} m/tick",
+            "fps: {fps:.0} ({frame_ms:.2} ms), units: {} (blue {} / orange {}), sim: grid {:.2} step {:.2} field {:.2} audit {:.2} sync {:.2}, hits/tick: {}, drawn: {} [{}], nn min/avg: {:.2}/{:.2}, move avg: {:.3} m/tick, lod: {:?}",
             units.len(),
             combat.alive[0],
             combat.alive[1],
@@ -289,7 +290,8 @@ fn update_overlay(
                 .join("/"),
             stats.nn_min,
             stats.nn_avg,
-            stats.move_avg
+            stats.move_avg,
+            render_counts.lod_drawn
         );
         for diag in diagnostics.iter() {
             let path = diag.path().as_str();

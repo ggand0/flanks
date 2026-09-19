@@ -49,8 +49,10 @@ const CULL_RADIUS: f32 = 2.5;
 pub struct RenderCounts {
     pub drawn: usize,
     pub total: usize,
-    /// Per-bucket drawn counts (bucket = team today, unit type later).
+    /// Drawn counts per unit kind (summed over detail levels).
     pub bucket_drawn: Vec<usize>,
+    /// Drawn counts per detail level (summed over kinds).
+    pub lod_drawn: [usize; NUM_LODS],
     /// Cost of sync_instance_data this frame (cull + bucket build).
     pub sync_ms: f32,
 }
@@ -75,10 +77,111 @@ pub struct InstanceData {
 #[derive(Component, Deref, DerefMut, Default)]
 pub struct InstanceMaterialData(pub Vec<InstanceData>);
 
-/// One instanced draw per bucket. Buckets are keyed by unit kind: one
-/// low-poly mesh per kind, team identity stays per-instance color.
+/// One instanced draw per bucket. Buckets are keyed by unit kind AND
+/// detail level (`bucket_of`): one mesh per pair, team identity stays
+/// per-instance color.
 #[derive(Component)]
 pub struct InstanceBucket(pub usize);
+
+/// Detail levels per unit kind: L0 is the full mesh, the last level a
+/// couple of blocks for soldiers a few pixels tall.
+pub const NUM_LODS: usize = 4;
+
+/// Starting level thresholds: the minimum on-screen soldier height in
+/// pixels for L0, L1 and L2. Anything smaller draws the last level.
+const LOD_PX_DEFAULT: [f32; NUM_LODS - 1] = [28.0, 12.0, 3.0];
+/// Per-soldier threshold spread (+-10% of distance, from the stable anim
+/// seed): a regiment changes level as a scattered band, never as a line
+/// sweeping across the ranks.
+const LOD_JITTER: f32 = 0.2;
+/// Hysteresis around each threshold: a soldier jostling right at a
+/// boundary keeps his level instead of flickering between two meshes.
+const LOD_HYSTERESIS: f32 = 0.04;
+/// FL_LOD_DEBUG tints for L1..L3 (L0 stays untinted).
+const LOD_DEBUG_TINT: [[f32; 3]; NUM_LODS] =
+    [[1.0, 1.0, 1.0], [0.2, 1.0, 0.3], [1.0, 0.9, 0.1], [1.0, 0.15, 0.1]];
+
+/// Level-of-detail settings. A level is picked from the soldier's
+/// projected HEIGHT IN PIXELS, not raw distance, so the cost follows the
+/// pixels a player actually has: resolution and field of view need no
+/// retuning.
+#[derive(Resource)]
+pub struct LodConfig {
+    /// Per kind: minimum on-screen height (px) for L0, L1, L2. A zero
+    /// disables that switch. Per kind so an authored mesh set can carry
+    /// its own numbers next to a code-built one.
+    pub px: [[f32; NUM_LODS - 1]; crate::unit_types::NUM_KINDS],
+    /// FL_LOD_DEBUG=1: tint soldiers by level.
+    pub debug: bool,
+}
+
+impl Default for LodConfig {
+    /// FL_LOD=0 draws everything at L0 (the pre-LOD renderer, for A/B
+    /// checks). FL_LOD_PX=a,b,c overrides the thresholds for feel passes.
+    fn default() -> Self {
+        let mut px = LOD_PX_DEFAULT;
+        if let Ok(v) = std::env::var("FL_LOD_PX") {
+            let parsed: Vec<f32> = v.split(',').filter_map(|t| t.trim().parse().ok()).collect();
+            match <[f32; NUM_LODS - 1]>::try_from(parsed) {
+                Ok(p) => px = p,
+                Err(_) => warn!("FL_LOD_PX wants {} comma-separated numbers", NUM_LODS - 1),
+            }
+        }
+        if std::env::var("FL_LOD").is_ok_and(|v| v == "0") {
+            px = [0.0; NUM_LODS - 1];
+        }
+        Self {
+            px: [px; crate::unit_types::NUM_KINDS],
+            debug: std::env::var("FL_LOD_DEBUG").is_ok(),
+        }
+    }
+}
+
+/// This frame's level switch distances, squared, per kind. Two extra
+/// sets widened and narrowed by the hysteresis bound the level a moving
+/// soldier may hold.
+struct LodBands {
+    plain: [[f32; NUM_LODS - 1]; crate::unit_types::NUM_KINDS],
+    fine: [[f32; NUM_LODS - 1]; crate::unit_types::NUM_KINDS],
+    coarse: [[f32; NUM_LODS - 1]; crate::unit_types::NUM_KINDS],
+}
+
+impl LodBands {
+    /// `px_per_unit` = pixels covered by 1 m at 1 m distance (0 when the
+    /// projection has no perspective: everything stays L0).
+    fn new(cfg: &LodConfig, px_per_unit: f32) -> Self {
+        let mut bands = Self {
+            plain: [[f32::INFINITY; NUM_LODS - 1]; crate::unit_types::NUM_KINDS],
+            fine: [[f32::INFINITY; NUM_LODS - 1]; crate::unit_types::NUM_KINDS],
+            coarse: [[f32::INFINITY; NUM_LODS - 1]; crate::unit_types::NUM_KINDS],
+        };
+        for (kind, px) in cfg.px.iter().enumerate() {
+            let height = 2.0 * crate::unit_types::TYPES[kind].half_height;
+            for (j, px) in px.iter().enumerate() {
+                if px_per_unit > 0.0 && *px > 0.0 {
+                    // A soldier is `px` tall at this distance.
+                    let d = height * px_per_unit / px;
+                    bands.plain[kind][j] = d * d;
+                    bands.fine[kind][j] = (d * (1.0 + LOD_HYSTERESIS)).powi(2);
+                    bands.coarse[kind][j] = (d * (1.0 - LOD_HYSTERESIS)).powi(2);
+                }
+            }
+        }
+        bands
+    }
+
+    /// Level for a squared distance: the farthest threshold passed wins.
+    #[inline]
+    fn level(thresholds: &[f32; NUM_LODS - 1], d2: f32) -> u8 {
+        let mut lod = 0;
+        for (j, t2) in thresholds.iter().enumerate() {
+            if d2 > *t2 {
+                lod = j as u8 + 1;
+            }
+        }
+        lod
+    }
+}
 
 /// Static instance bucket for fallen soldiers (one per kind). Not part of
 /// the live sync — refreshed only when `Corpses` changes.
@@ -134,13 +237,13 @@ fn sync_corpses(
     }
 }
 
-/// Number of instance buckets (== instance entities == draw calls).
-pub const NUM_BUCKETS: usize = crate::unit_types::NUM_KINDS;
+/// Number of live instance buckets (== instance entities == draw calls).
+pub const NUM_BUCKETS: usize = crate::unit_types::NUM_KINDS * NUM_LODS;
 
-/// Which bucket a unit renders in.
+/// Which bucket a soldier of `kind` renders in at detail level `lod`.
 #[inline]
-fn bucket_of(units: &Units, i: usize) -> usize {
-    units.kind[i] as usize
+fn bucket_of(kind: usize, lod: usize) -> usize {
+    kind * NUM_LODS + lod
 }
 
 impl SyncComponent for InstanceMaterialData {
@@ -177,6 +280,7 @@ impl Plugin for UnitRenderPlugin {
         // get a render-world twin (ExtractComponentPlugin used to do this).
         app.add_plugins(SyncComponentPlugin::<InstanceMaterialData>::default())
             .init_resource::<RenderCounts>()
+            .init_resource::<LodConfig>()
             .init_resource::<Corpses>()
             .add_systems(Startup, setup_unit_mesh)
             // Must run after the camera moves: culling builds a FRESH
@@ -225,20 +329,23 @@ fn setup_unit_mesh(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
         crate::unit_meshes::build_spearman(),
         crate::unit_meshes::build_archer(),
     ];
-    for (bucket, mesh) in kind_meshes.into_iter().enumerate() {
+    for (kind, mesh) in kind_meshes.into_iter().enumerate() {
         let handle = meshes.add(mesh);
-        commands.spawn((
-            Mesh3d(handle.clone()),
-            InstanceMaterialData::default(),
-            InstanceBucket(bucket),
-            NoFrustumCulling,
-            NoAutomaticBatching,
-        ));
+        // One live bucket per detail level.
+        for lod in 0..NUM_LODS {
+            commands.spawn((
+                Mesh3d(handle.clone()),
+                InstanceMaterialData::default(),
+                InstanceBucket(bucket_of(kind, lod)),
+                NoFrustumCulling,
+                NoAutomaticBatching,
+            ));
+        }
         // Matching corpse bucket: same mesh, static instance list.
         commands.spawn((
             Mesh3d(handle),
             InstanceMaterialData::default(),
-            CorpseBucket(bucket),
+            CorpseBucket(kind),
             NoFrustumCulling,
             NoAutomaticBatching,
         ));
@@ -262,6 +369,19 @@ const SYNC_CHUNK: usize = 16_384;
 ///     unit (~0.35 s) before emission so poses never snap.
 const CELEBRATE_BASE: f32 = 6.0;
 
+/// Per-soldier render state carried between frames, index-aligned with
+/// `Units`. Indices shuffle on death-sweep swap-removes: a one-frame
+/// inherited value is invisible.
+#[derive(Default)]
+struct SmoothState {
+    walk: Vec<f32>,
+    band: Vec<f32>,
+    march: Vec<f32>,
+    wall: Vec<f32>,
+    /// Detail level last frame (hysteresis).
+    lod: Vec<u8>,
+}
+
 #[allow(clippy::too_many_arguments)] // bevy system params
 fn sync_instance_data(
     units: Res<Units>,
@@ -270,19 +390,17 @@ fn sync_instance_data(
     groups: Res<crate::orders::Groups>,
     time: Res<Time>,
     fixed_time: Res<Time<Fixed>>,
-    camera: Query<(&Projection, &Transform), With<Camera3d>>,
+    lod_cfg: Res<LodConfig>,
+    camera: Query<(&Camera, &Projection, &Transform), With<Camera3d>>,
     mut query: Query<(&InstanceBucket, &mut InstanceMaterialData)>,
     mut counts: ResMut<RenderCounts>,
     mut no_cull: Local<Option<bool>>,
     mut scratch: Local<Vec<[Vec<InstanceData>; NUM_BUCKETS]>>,
-    mut walk_ema: Local<Vec<f32>>,
-    mut band_ema: Local<Vec<f32>>,
-    mut march_ema: Local<Vec<f32>>,
-    mut wall_ema: Local<Vec<f32>>,
+    mut smooth: Local<SmoothState>,
 ) {
     let _span = info_span!("sync_instances").entered();
     let t0 = std::time::Instant::now();
-    let Ok((projection, cam_tf)) = camera.single() else {
+    let Ok((cam, projection, cam_tf)) = camera.single() else {
         return;
     };
     // Bucket id -> instance vec, indexable during the unit sweep.
@@ -301,6 +419,20 @@ fn sync_instance_data(
     let frustum = Frustum(ViewFrustum::from_clip_from_world(&clip_from_world));
     let cull = !*no_cull.get_or_insert_with(|| std::env::var("FL_NO_CULL").is_ok());
     let alpha = fixed_time.overstep_fraction();
+    // Detail levels: a soldier of height H at distance d covers
+    // H * px_per_unit / d pixels, from the live field of view and
+    // viewport height. Euclidean distance to the camera, not view depth:
+    // turning the camera in place then never changes a level.
+    let px_per_unit = match (projection, cam.physical_viewport_size()) {
+        (Projection::Perspective(p), Some(size)) => {
+            size.y as f32 / (2.0 * (p.fov * 0.5).tan())
+        }
+        _ => 0.0,
+    };
+    let bands = LodBands::new(&lod_cfg, px_per_unit);
+    let bands = &bands;
+    let lod_debug = lod_cfg.debug;
+    let cam_pos = cam_tf.translation;
 
     const HIGHLIGHT: [f32; 4] = [1.0, 1.0, 0.55, 1.0];
     // Attack-preview tint: the enemy regiment a right-click would target.
@@ -397,10 +529,12 @@ fn sync_instance_data(
     // walk cycle on/off, which reads as sliding with a twitch. Indices
     // shuffle on death-sweep swap-removes — a one-frame inherited value
     // is invisible.
-    walk_ema.resize(units.len(), 0.0);
-    band_ema.resize(units.len(), 0.0);
-    march_ema.resize(units.len(), 0.0);
-    wall_ema.resize(units.len(), 0.0);
+    let smooth = &mut *smooth;
+    smooth.walk.resize(units.len(), 0.0);
+    smooth.band.resize(units.len(), 0.0);
+    smooth.march.resize(units.len(), 0.0);
+    smooth.wall.resize(units.len(), 0.0);
+    smooth.lod.resize(units.len(), 0);
     let ema_k = (time.delta_secs() / 0.25).min(1.0);
     // Stance tiers are per-regiment and snap; the POSE blends (~0.35 s).
     let band_k = (time.delta_secs() / 0.35).min(1.0);
@@ -408,12 +542,16 @@ fn sync_instance_data(
     // deliberate act, not a snap).
     let march_k = (time.delta_secs() / 0.5).min(1.0);
     bevy::tasks::ComputeTaskPool::get().scope(|scope| {
-        for (ci, ((((chunk_scratch, ema_chunk), band_chunk), march_chunk), wall_chunk)) in scratch
+        for (
+            ci,
+            (((((chunk_scratch, ema_chunk), band_chunk), march_chunk), wall_chunk), lod_chunk),
+        ) in scratch
             .iter_mut()
-            .zip(walk_ema.chunks_mut(SYNC_CHUNK))
-            .zip(band_ema.chunks_mut(SYNC_CHUNK))
-            .zip(march_ema.chunks_mut(SYNC_CHUNK))
-            .zip(wall_ema.chunks_mut(SYNC_CHUNK))
+            .zip(smooth.walk.chunks_mut(SYNC_CHUNK))
+            .zip(smooth.band.chunks_mut(SYNC_CHUNK))
+            .zip(smooth.march.chunks_mut(SYNC_CHUNK))
+            .zip(smooth.wall.chunks_mut(SYNC_CHUNK))
+            .zip(smooth.lod.chunks_mut(SYNC_CHUNK))
             .enumerate()
             .take(n_chunks)
         {
@@ -452,6 +590,20 @@ fn sync_instance_data(
                     if cull && !frustum.intersects_sphere(&sphere, false) {
                         continue;
                     }
+                    // Detail level: jittered distance against this
+                    // frame's thresholds, held inside the hysteresis
+                    // bounds. Indices shuffle on death-sweep swap-removes
+                    // and culled soldiers skip this. A stale previous
+                    // level is pulled back inside the bounds at once.
+                    let kind = units.kind[i] as usize;
+                    let jitter = 1.0 - 0.5 * LOD_JITTER + LOD_JITTER * units.color[i][3];
+                    let d2 = position.distance_squared(cam_pos) * jitter * jitter;
+                    let lod = &mut lod_chunk[i - start];
+                    *lod = (*lod).clamp(
+                        LodBands::level(&bands.fine[kind], d2),
+                        LodBands::level(&bands.coarse[kind], d2),
+                    );
+                    let lod = *lod as usize;
                     let mut color = units.color[i];
                     if broken.get(units.group[i] as usize).copied().unwrap_or(false) {
                         let gray =
@@ -472,6 +624,12 @@ fn sync_instance_data(
                     } else if hover_enemy == Some(units.group[i]) {
                         for c in 0..3 {
                             color[c] = color[c] * 0.45 + HOSTILE[c] * 0.55;
+                        }
+                    }
+                    if lod_debug && lod > 0 {
+                        // rgb only: alpha is the anim seed.
+                        for (c, tint) in color.iter_mut().zip(LOD_DEBUG_TINT[lod]) {
+                            *c = *c * 0.4 + tint * 0.6;
                         }
                     }
                     // Walk amount from ACTUAL per-tick displacement, not
@@ -561,7 +719,7 @@ fn sync_instance_data(
                     } else {
                         0.0
                     };
-                    chunk_scratch[bucket_of(units, i)].push(InstanceData {
+                    chunk_scratch[bucket_of(kind, lod)].push(InstanceData {
                         position,
                         scale: 1.0,
                         color,
@@ -585,10 +743,17 @@ fn sync_instance_data(
     }
     counts.drawn = buckets.iter().map(|(_, d)| d.len()).sum();
     counts.total = units.len();
+    // Buckets are kind-major: per-kind counts sum each run of levels,
+    // per-level counts sum across kinds.
     counts.bucket_drawn.clear();
-    counts
-        .bucket_drawn
-        .extend(buckets.iter().map(|(_, d)| d.len()));
+    counts.bucket_drawn.extend(
+        buckets
+            .chunks(NUM_LODS)
+            .map(|levels| levels.iter().map(|(_, d)| d.len()).sum::<usize>()),
+    );
+    counts.lod_drawn = std::array::from_fn(|lod| {
+        buckets.iter().skip(lod).step_by(NUM_LODS).map(|(_, d)| d.len()).sum()
+    });
     counts.sync_ms = t0.elapsed().as_secs_f32() * 1000.0;
 }
 
@@ -810,6 +975,10 @@ impl<P: PhaseItem> RenderCommand<P> for DrawMeshInstanced {
         let Some(instance_buffer) = instance_buffer else {
             return RenderCommandResult::Skip;
         };
+        // Most kind-by-level buckets are empty in any one view.
+        if instance_buffer.length == 0 {
+            return RenderCommandResult::Skip;
+        }
         let Some(vertex_buffer_slice) =
             mesh_allocator.mesh_vertex_slice(&mesh_instance.mesh_asset_id())
         else {
