@@ -67,6 +67,14 @@ const TUNIC: [f32; 4] = [0.32, 0.34, 0.24, 0.85];
 /// Archer hose: dark brown wool.
 const HOSE: [f32; 4] = [0.36, 0.30, 0.22, 0.0];
 
+/// FL_MESH_TESS=n: render perf probe. Splits every cuboid face into an
+/// n x n grid: same silhouette, tris x n^2. Prices denser authored
+/// meshes on the real pipeline before any asset exists.
+fn mesh_tess() -> usize {
+    static T: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *T.get_or_init(|| crate::util::env_or("FL_MESH_TESS", 1_usize).clamp(1, 16))
+}
+
 struct MeshBuf {
     pos: Vec<[f32; 3]>,
     nrm: Vec<[f32; 3]>,
@@ -97,6 +105,9 @@ impl MeshBuf {
             ([0.0, 0.0, 1.0], [0, 1]),  // +Z, spanned by x,y
             ([0.0, 0.0, -1.0], [0, 1]), // -Z
         ];
+        // Each face is a t x t grid of quads (t = 1 outside the probe).
+        let t = mesh_tess();
+        let stride = t as u32 + 1;
         for (n, span) in FACES {
             let base = self.pos.len() as u32;
             let normal = Vec3::from_array(n);
@@ -105,22 +116,28 @@ impl MeshBuf {
             let mut v_axis = Vec3::ZERO;
             u_axis[span[0]] = half[span[0]];
             v_axis[span[1]] = half[span[1]];
-            for (su, sv) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
-                let p = face_center + u_axis * su + v_axis * sv;
-                self.pos.push(p.to_array());
-                self.nrm.push(n);
-                self.uv.push([part, pivot_y]);
-                self.col.push(col);
+            for j in 0..=t {
+                for i in 0..=t {
+                    let su = -1.0 + 2.0 * i as f32 / t as f32;
+                    let sv = -1.0 + 2.0 * j as f32 / t as f32;
+                    let p = face_center + u_axis * su + v_axis * sv;
+                    self.pos.push(p.to_array());
+                    self.nrm.push(n);
+                    self.uv.push([part, pivot_y]);
+                    self.col.push(col);
+                }
             }
             // Winding so the face is CCW seen from outside: flip when the
             // (u, v) basis cross-product points against the face normal.
             let flip = u_axis.cross(v_axis).dot(normal) < 0.0;
-            let quad = if flip {
-                [0, 2, 1, 0, 3, 2]
-            } else {
-                [0, 1, 2, 0, 2, 3]
-            };
-            self.idx.extend(quad.map(|k| base + k));
+            for j in 0..t as u32 {
+                for i in 0..t as u32 {
+                    let a = base + j * stride + i;
+                    let (b, c, d) = (a + 1, a + stride + 1, a + stride);
+                    let quad = if flip { [a, c, b, a, d, c] } else { [a, b, c, a, c, d] };
+                    self.idx.extend(quad);
+                }
+            }
         }
     }
 
