@@ -79,18 +79,21 @@ fn control_camera(
         return;
     };
 
-    // Pan in the camera's yaw frame, speed scales with zoom.
+    // Pan in the camera's yaw frame, speed scales with zoom. Ctrl is a
+    // command modifier (Ctrl+A select all etc.): no panning under it.
+    let ctrl =
+        keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
     let mut pan = Vec2::ZERO;
-    if keys.pressed(KeyCode::KeyW) {
+    if !ctrl && keys.pressed(KeyCode::KeyW) {
         pan.y -= 1.0;
     }
-    if keys.pressed(KeyCode::KeyS) {
+    if !ctrl && keys.pressed(KeyCode::KeyS) {
         pan.y += 1.0;
     }
-    if keys.pressed(KeyCode::KeyA) {
+    if !ctrl && keys.pressed(KeyCode::KeyA) {
         pan.x -= 1.0;
     }
-    if keys.pressed(KeyCode::KeyD) {
+    if !ctrl && keys.pressed(KeyCode::KeyD) {
         pan.x += 1.0;
     }
     // Screen-edge pan — only when no key pan is active (opposing inputs
