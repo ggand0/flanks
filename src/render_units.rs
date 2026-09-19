@@ -53,6 +53,8 @@ pub struct RenderCounts {
     pub bucket_drawn: Vec<usize>,
     /// Drawn counts per detail level (summed over kinds).
     pub lod_drawn: [usize; NUM_LODS],
+    /// Fallen soldiers drawn this frame. The counts above are the living.
+    pub corpses_drawn: usize,
     /// Cost of sync_instance_data this frame (cull + bucket build).
     pub sync_ms: f32,
 }
@@ -146,6 +148,23 @@ struct LodBands {
     coarse: [[f32; NUM_LODS - 1]; crate::unit_types::NUM_KINDS],
 }
 
+/// Per-soldier multiplier on the level switch distance, from the stable
+/// anim seed in `color.a`.
+#[inline]
+fn lod_jitter(seed: f32) -> f32 {
+    1.0 - 0.5 * LOD_JITTER + LOD_JITTER * seed
+}
+
+/// FL_LOD_DEBUG: tint rgb by level. Alpha is the anim seed, not opacity.
+#[inline]
+fn lod_debug_tint(color: &mut [f32; 4], lod: usize) {
+    if lod > 0 {
+        for (c, tint) in color.iter_mut().zip(LOD_DEBUG_TINT[lod]) {
+            *c = *c * 0.4 + tint * 0.6;
+        }
+    }
+}
+
 impl LodBands {
     /// `px_per_unit` = pixels covered by 1 m at 1 m distance (0 when the
     /// projection has no perspective: everything stays L0).
@@ -183,22 +202,19 @@ impl LodBands {
     }
 }
 
-/// Static instance bucket for fallen soldiers (one per kind). Not part of
-/// the live sync — refreshed only when `Corpses` changes.
-#[derive(Component)]
-pub struct CorpseBucket(pub usize);
-
 /// Per-kind corpse cap (ring-buffered: oldest bodies fade from the field).
 pub const CORPSE_CAP: usize = 25_000;
 
 /// Fallen soldiers left where they died: their final topple pose, frozen.
-/// Fed by the death sweep, drawn as static instance buckets, never
-/// simulated — the battlefield keeps the story of where the lines stood.
+/// Fed by the death sweep, never simulated: the battlefield keeps the
+/// story of where the lines stood. A body is an ordinary instance with
+/// its death played out, so each frame the instance sync culls the
+/// fallen, picks their detail level and draws them from the same
+/// kind-by-level buckets as the living.
 #[derive(Resource, Default)]
 pub struct Corpses {
     data: [Vec<InstanceData>; crate::unit_types::NUM_KINDS],
     cursor: [usize; crate::unit_types::NUM_KINDS],
-    dirty: bool,
 }
 
 impl Corpses {
@@ -210,7 +226,6 @@ impl Corpses {
             v[self.cursor[kind]] = inst;
             self.cursor[kind] = (self.cursor[kind] + 1) % CORPSE_CAP;
         }
-        self.dirty = true;
     }
 
     pub fn clear(&mut self) {
@@ -218,26 +233,10 @@ impl Corpses {
             v.clear();
         }
         self.cursor = [0; crate::unit_types::NUM_KINDS];
-        self.dirty = true;
     }
 }
 
-/// Copy corpse data into the corpse buckets when it changed.
-fn sync_corpses(
-    mut corpses: ResMut<Corpses>,
-    mut query: Query<(&CorpseBucket, &mut InstanceMaterialData)>,
-) {
-    if !corpses.dirty {
-        return;
-    }
-    corpses.dirty = false;
-    for (bucket, mut data) in &mut query {
-        data.0.clear();
-        data.0.extend_from_slice(&corpses.data[bucket.0]);
-    }
-}
-
-/// Number of live instance buckets (== instance entities == draw calls).
+/// Number of instance buckets (== instance entities == draw calls).
 pub const NUM_BUCKETS: usize = crate::unit_types::NUM_KINDS * NUM_LODS;
 
 /// Which bucket a soldier of `kind` renders in at detail level `lod`.
@@ -288,10 +287,7 @@ impl Plugin for UnitRenderPlugin {
             // component is one frame stale — visible pop while panning).
             .add_systems(
                 Update,
-                (
-                    sync_instance_data.after(crate::camera::apply_camera_transform),
-                    sync_corpses,
-                ),
+                sync_instance_data.after(crate::camera::apply_camera_transform),
             );
         app.sub_app_mut(RenderApp)
             .add_systems(ExtractSchedule, extract_instance_data)
@@ -328,25 +324,16 @@ fn setup_unit_mesh(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
         let tris: Vec<usize> =
             lods.iter().map(|m| m.indices().map_or(0, |i| i.len() / 3)).collect();
         info!("unit meshes: kind {kind} tris per level {tris:?}");
-        let handles = lods.map(|mesh| meshes.add(mesh));
-        // One live bucket per detail level.
-        for (lod, handle) in handles.iter().enumerate() {
+        // One bucket per detail level, shared by the living and the fallen.
+        for (lod, mesh) in lods.into_iter().enumerate() {
             commands.spawn((
-                Mesh3d(handle.clone()),
+                Mesh3d(meshes.add(mesh)),
                 InstanceMaterialData::default(),
                 InstanceBucket(bucket_of(kind, lod)),
                 NoFrustumCulling,
                 NoAutomaticBatching,
             ));
         }
-        // Matching corpse bucket: the full mesh, static instance list.
-        commands.spawn((
-            Mesh3d(handles[0].clone()),
-            InstanceMaterialData::default(),
-            CorpseBucket(kind),
-            NoFrustumCulling,
-            NoAutomaticBatching,
-        ));
     }
 }
 
@@ -389,11 +376,13 @@ fn sync_instance_data(
     time: Res<Time>,
     fixed_time: Res<Time<Fixed>>,
     lod_cfg: Res<LodConfig>,
+    corpses: Res<Corpses>,
     camera: Query<(&Camera, &Projection, &Transform), With<Camera3d>>,
     mut query: Query<(&InstanceBucket, &mut InstanceMaterialData)>,
     mut counts: ResMut<RenderCounts>,
     mut no_cull: Local<Option<bool>>,
     mut scratch: Local<Vec<[Vec<InstanceData>; NUM_BUCKETS]>>,
+    mut corpse_scratch: Local<Vec<[Vec<InstanceData>; NUM_LODS]>>,
     mut smooth: Local<SmoothState>,
 ) {
     let _span = info_span!("sync_instances").entered();
@@ -533,6 +522,18 @@ fn sync_instance_data(
     smooth.march.resize(units.len(), 0.0);
     smooth.wall.resize(units.len(), 0.0);
     smooth.lod.resize(units.len(), 0);
+    // The fallen: one job per SYNC_CHUNK of each kind's list, run next to
+    // the unit chunks. Their instance data is frozen, so a job is only a
+    // cull, a level pick and a copy. No hysteresis: bodies do not move.
+    let corpse_jobs: Vec<(usize, &[InstanceData])> = corpses
+        .data
+        .iter()
+        .enumerate()
+        .flat_map(|(kind, bodies)| bodies.chunks(SYNC_CHUNK).map(move |c| (kind, c)))
+        .collect();
+    if corpse_scratch.len() < corpse_jobs.len() {
+        corpse_scratch.resize_with(corpse_jobs.len(), Default::default);
+    }
     let ema_k = (time.delta_secs() / 0.25).min(1.0);
     // Stance tiers are per-regiment and snap; the POSE blends (~0.35 s).
     let band_k = (time.delta_secs() / 0.35).min(1.0);
@@ -594,7 +595,7 @@ fn sync_instance_data(
                     // and culled soldiers skip this. A stale previous
                     // level is pulled back inside the bounds at once.
                     let kind = units.kind[i] as usize;
-                    let jitter = 1.0 - 0.5 * LOD_JITTER + LOD_JITTER * units.color[i][3];
+                    let jitter = lod_jitter(units.color[i][3]);
                     let d2 = position.distance_squared(cam_pos) * jitter * jitter;
                     let lod = &mut lod_chunk[i - start];
                     *lod = (*lod).clamp(
@@ -624,11 +625,8 @@ fn sync_instance_data(
                             color[c] = color[c] * 0.45 + HOSTILE[c] * 0.55;
                         }
                     }
-                    if lod_debug && lod > 0 {
-                        // rgb only: alpha is the anim seed.
-                        for (c, tint) in color.iter_mut().zip(LOD_DEBUG_TINT[lod]) {
-                            *c = *c * 0.4 + tint * 0.6;
-                        }
+                    if lod_debug {
+                        lod_debug_tint(&mut color, lod);
                     }
                     // Walk amount from ACTUAL per-tick displacement, not
                     // velocity: press shoves move bodies through positional
@@ -732,6 +730,30 @@ fn sync_instance_data(
                 }
             });
         }
+        for ((kind, bodies), out) in corpse_jobs.iter().copied().zip(corpse_scratch.iter_mut()) {
+            scope.spawn(async move {
+                for vec in out.iter_mut() {
+                    vec.clear();
+                }
+                for body in bodies {
+                    let sphere = Sphere {
+                        center: body.position.into(),
+                        radius: CULL_RADIUS,
+                    };
+                    if cull && !frustum.intersects_sphere(&sphere, false) {
+                        continue;
+                    }
+                    let jitter = lod_jitter(body.color[3]);
+                    let d2 = body.position.distance_squared(cam_pos) * jitter * jitter;
+                    let lod = LodBands::level(&bands.plain[kind], d2) as usize;
+                    let mut body = *body;
+                    if lod_debug {
+                        lod_debug_tint(&mut body.color, lod);
+                    }
+                    out[lod].push(body);
+                }
+            });
+        }
     });
     for (b, (_, data)) in buckets.iter_mut().enumerate() {
         data.clear();
@@ -739,6 +761,7 @@ fn sync_instance_data(
             data.extend_from_slice(&chunk_scratch[b]);
         }
     }
+    // Counts cover the living, read before the fallen join the buckets.
     counts.drawn = buckets.iter().map(|(_, d)| d.len()).sum();
     counts.total = units.len();
     // Buckets are kind-major: per-kind counts sum each run of levels,
@@ -752,6 +775,13 @@ fn sync_instance_data(
     counts.lod_drawn = std::array::from_fn(|lod| {
         buckets.iter().skip(lod).step_by(NUM_LODS).map(|(_, d)| d.len()).sum()
     });
+    counts.corpses_drawn = 0;
+    for ((kind, _), out) in corpse_jobs.iter().zip(corpse_scratch.iter()) {
+        for (lod, bodies) in out.iter().enumerate() {
+            buckets[bucket_of(*kind, lod)].1.extend_from_slice(bodies);
+            counts.corpses_drawn += bodies.len();
+        }
+    }
     counts.sync_ms = t0.elapsed().as_secs_f32() * 1000.0;
 }
 
