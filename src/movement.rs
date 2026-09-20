@@ -1698,6 +1698,36 @@ pub fn step_sim(
         stats.audit_ms = audit_t0.elapsed().as_secs_f32() * 1000.0;
     }
 
+    // FL_HASH: FNV-1a fingerprint of the sim state on a fixed tick
+    // cadence (every 150 ticks, or every FL_HASH=n ticks) — the
+    // bit-identity gate for refactors and optimizations. Log samplers
+    // ride wall time, so the same binary logs different casualty digits
+    // run to run and log diffs prove nothing. Equal hashes at equal
+    // ticks do.
+    static HASH_EVERY: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    let hash_every = *HASH_EVERY.get_or_init(|| {
+        let n: u32 = std::env::var("FL_HASH").ok()?.parse().unwrap_or(0);
+        Some(if n > 1 { n } else { 150 })
+    });
+    if let Some(every) = hash_every
+        && (*tick).is_multiple_of(every)
+    {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for i in 0..pos.len() {
+            for v in [
+                pos[i].x.to_bits(),
+                pos[i].z.to_bits(),
+                yaw[i].to_bits(),
+                hp[i].to_bits(),
+                u32::from_le_bytes([death_t[i], swing[i], swing_t[i], ammo[i]]),
+            ] {
+                h ^= v as u64;
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        info!("[hash] tick {} n {} state {:016x}", *tick, pos.len(), h);
+    }
+
     // Spike attribution: name any tick that blows past the norm, with
     // component costs inline — lag hunting works on facts, and the
     // audit above runs every 60 ticks inside this same system, so an
