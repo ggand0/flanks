@@ -249,8 +249,10 @@ impl Plugin for MovementPlugin {
             .init_resource::<SharedTerrain>()
             .add_systems(
                 FixedUpdate,
-                (refresh_shared_terrain, step_sim)
-                    .chain()
+                (
+                    (refresh_shared_terrain, step_sim).chain(),
+                    kick_tick.after(crate::orders::clear_arrived_orders),
+                )
                     .in_set(crate::game_state::SimSet),
             )
             .add_systems(Update, toggle_debug_viz);
@@ -337,13 +339,79 @@ pub struct TickJob {
     step_ms: f32,
 }
 
-/// Recycled job buffers and the tick counter. The counter lives here,
-/// not in a `Local`, because prep (which seeds the per-tick hashes) and
-/// the apply both need it.
+/// Dedicated OS thread that runs tick jobs. NOT a bevy task: a system
+/// that parks waiting for a pooled job can deadlock, because every worker
+/// allowed to start that job may itself be parked inside a system task
+/// (executor priority inversion, caught live with gdb, devlog 0050). A
+/// dedicated thread is always runnable, a panic in the job surfaces as a
+/// crash instead of a silent hang, and its scopes never tick the shared
+/// executor (`util::sim_scope`), so it cannot steal a parked system and
+/// close the cycle from the other side.
+struct TickWorker {
+    to_worker: std::sync::Mutex<std::sync::mpsc::Sender<Box<TickJob>>>,
+    from_worker: std::sync::Mutex<std::sync::mpsc::Receiver<Box<TickJob>>>,
+}
+
+impl Default for TickWorker {
+    fn default() -> Self {
+        let (to_worker, jobs) = std::sync::mpsc::channel::<Box<TickJob>>();
+        let (results, from_worker) = std::sync::mpsc::channel::<Box<TickJob>>();
+        std::thread::Builder::new()
+            .name("sim tick worker".into())
+            .spawn(move || {
+                crate::util::mark_sim_worker();
+                while let Ok(mut job) = jobs.recv() {
+                    run_tick_job(&mut job);
+                    if results.send(job).is_err() {
+                        return;
+                    }
+                }
+            })
+            .expect("spawn sim tick worker");
+        Self {
+            to_worker: std::sync::Mutex::new(to_worker),
+            from_worker: std::sync::Mutex::new(from_worker),
+        }
+    }
+}
+
+/// The in-flight tick job, recycled job buffers and the tick counter. The
+/// counter lives here, not in a `Local`, because the kick (whose prep
+/// seeds the per-tick hashes) and the apply both need it.
 #[derive(Resource, Default)]
 pub struct TickPipeline {
+    worker: Option<TickWorker>,
+    in_flight: bool,
     scratch: Option<Box<TickJob>>,
     pub tick: u32,
+}
+
+impl TickPipeline {
+    /// Block until the in-flight job is done and take it. Normally it
+    /// finished long ago: a straggler waits here, inside the fixed tick,
+    /// instead of stretching a render frame mid-computation.
+    fn take_in_flight(&mut self) -> Option<Box<TickJob>> {
+        if !self.in_flight {
+            return None;
+        }
+        // Waiting here ON the worker thread would wait for a job that
+        // thread can never finish. Fail loudly, never hang.
+        assert!(
+            !crate::util::on_sim_worker(),
+            "a bevy system is running on the sim tick worker thread: a sim kernel scope bypassed util::sim_scope"
+        );
+        self.in_flight = false;
+        let worker = self.worker.as_ref().expect("worker exists while a job is in flight");
+        Some(worker.from_worker.lock().unwrap().recv().expect("sim tick worker alive"))
+    }
+}
+
+/// FL_PIPELINE=0 computes every tick inline inside FixedUpdate, exactly
+/// as the sim ran before the tick left the frame path: the fallback and
+/// the A/B knob, bit-identical by FL_HASH.
+fn pipeline_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("FL_PIPELINE").is_ok_and(|v| v == "0"))
 }
 
 /// `Arc` snapshot of the terrain for the tick job. Refreshed from the ECS
@@ -763,7 +831,8 @@ fn prepare_tick(
 /// Run one kinematic tick on the job's owned data: grid rebuild, then the
 /// parallel integrate. No ECS access, so it can run on any thread. The
 /// kernel below is the long-standing integrate loop, verbatim: only the
-/// binding preamble changed when the tick became a job.
+/// binding preamble changed when the tick became a job. Every scope in
+/// here, the grid rebuild's included, goes through `util::sim_scope`.
 fn run_tick_job(job: &mut TickJob) {
     let terrain_arc = job.terrain.clone().expect("terrain snapshot set at prep");
     let terrain: &Terrain = &terrain_arc;
@@ -850,7 +919,7 @@ fn run_tick_job(job: &mut TickJob) {
     let blocks = &*blocks;
     let pos = pos_out;
     let integrate_span = info_span!("integrate").entered();
-    ComputeTaskPool::get().scope(|scope| {
+    crate::util::sim_scope(|scope| {
         for (ci, chunk) in pos
             .chunks_mut(CHUNK)
             .zip(vel.chunks_mut(CHUNK))
@@ -1665,24 +1734,43 @@ pub fn step_sim(
     mut pipeline: ResMut<TickPipeline>,
     mut dir_stats: ResMut<DirTestStats>,
 ) {
+    // Take the finished background job. A job computed from an older
+    // world (a new battle started while it ran) carries indices that
+    // mean nothing here: recycle its buffers and drop the result.
+    let finished = match pipeline.take_in_flight() {
+        Some(job) if job.generation == units.generation && !units.pos.is_empty() => Some(job),
+        Some(stale) => {
+            pipeline.scratch = Some(stale);
+            None
+        }
+        None => None,
+    };
     if units.pos.is_empty() {
         return;
     }
-    let Some(terrain_arc) = shared_terrain.0.as_ref() else {
-        return;
+    // No job waiting (the first tick of a battle, FL_PIPELINE=0, or a
+    // stale one dropped above): compute this tick inline.
+    let mut job = match finished {
+        Some(job) => job,
+        None => {
+            let Some(terrain_arc) = shared_terrain.0.as_ref() else {
+                return;
+            };
+            let mut job = pipeline.scratch.take().unwrap_or_default();
+            prepare_tick(
+                &mut job,
+                &units,
+                &mut groups,
+                &tracks,
+                terrain_arc,
+                time.delta_secs(),
+                scale.0,
+                pipeline.tick,
+            );
+            run_tick_job(&mut job);
+            job
+        }
     };
-    let mut job = pipeline.scratch.take().unwrap_or_default();
-    prepare_tick(
-        &mut job,
-        &units,
-        &mut groups,
-        &tracks,
-        terrain_arc,
-        time.delta_secs(),
-        scale.0,
-        pipeline.tick,
-    );
-    run_tick_job(&mut job);
 
     // INSTALL: the completed tick becomes the live state. pos_prev <-
     // the state at tick start, pos <- the new kinematics, the
@@ -2013,6 +2101,46 @@ pub fn step_sim(
     }
 
     pipeline.scratch = Some(job);
+}
+
+/// Kick the next tick's job once this tick is completely over: after the
+/// arrows, the deaths (whose sweep reindexes every column), fatigue,
+/// morale and order clearing. The job then owns a consistent copy of the
+/// world, and nothing writes the soldier columns again before the next
+/// `step_sim` installs the result. It computes while render frames go by,
+/// so a slow tick delays its own completion inside the 33 ms budget
+/// instead of stretching a frame. Regiment commands are read here, one
+/// tick ahead of the install: orders quantize to the tick, as in a
+/// lockstep sim.
+pub fn kick_tick(
+    units: Res<Units>,
+    mut groups: ResMut<Groups>,
+    tracks: Res<crate::arrows::RegTracks>,
+    shared_terrain: Res<SharedTerrain>,
+    scale: Res<CombatScale>,
+    time: Res<Time>,
+    mut pipeline: ResMut<TickPipeline>,
+) {
+    if !pipeline_enabled() || units.pos.is_empty() || pipeline.in_flight {
+        return;
+    }
+    let Some(terrain_arc) = shared_terrain.0.as_ref() else {
+        return;
+    };
+    let mut job = pipeline.scratch.take().unwrap_or_default();
+    prepare_tick(
+        &mut job,
+        &units,
+        &mut groups,
+        &tracks,
+        terrain_arc,
+        time.delta_secs(),
+        scale.0,
+        pipeline.tick,
+    );
+    let worker = pipeline.worker.get_or_insert_with(TickWorker::default);
+    worker.to_worker.lock().unwrap().send(job).expect("sim tick worker alive");
+    pipeline.in_flight = true;
 }
 
 fn toggle_debug_viz(keys: Res<ButtonInput<KeyCode>>, mut viz: ResMut<DebugViz>) {
