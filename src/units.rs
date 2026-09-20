@@ -48,6 +48,10 @@ pub struct Units {
     /// Arrows left (archers; 0 for melee kinds). Decremented on loose;
     /// an empty quiver means melee only.
     pub ammo: Vec<u8>,
+    /// Bumped every time a battle rebuilds this world. A sim tick job
+    /// computed from an older world carries indices that mean nothing
+    /// here: movement.rs drops it instead of installing it.
+    pub generation: u64,
 }
 
 /// Swing states (the `swing` column, low bits) + the charge flag bit.

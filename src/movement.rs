@@ -245,60 +245,160 @@ impl Plugin for MovementPlugin {
             .init_resource::<DirTestStats>()
             .insert_resource(DebugViz(true))
             .init_resource::<SpatialGrid>()
-            .add_systems(FixedUpdate, step_sim.in_set(crate::game_state::SimSet))
+            .init_resource::<TickPipeline>()
+            .init_resource::<SharedTerrain>()
+            .add_systems(
+                FixedUpdate,
+                (refresh_shared_terrain, step_sim)
+                    .chain()
+                    .in_set(crate::game_state::SimSet),
+            )
             .add_systems(Update, toggle_debug_viz);
     }
 }
 
-#[allow(clippy::too_many_arguments)] // bevy system params
-pub fn step_sim(
-    mut units: ResMut<Units>,
-    mut grid: ResMut<SpatialGrid>,
-    mut damage: ResMut<DamageBuffers>,
-    (mut arrow_spawns, tracks): (
-        ResMut<crate::arrows::ArrowSpawns>,
-        Res<crate::arrows::RegTracks>,
-    ),
-    mut cstats: ResMut<crate::combat::CombatStats>,
-    mut groups: ResMut<Groups>,
-    terrain: Res<Terrain>,
-    scale: Res<CombatScale>,
-    time: Res<Time>,
-    mut stats: ResMut<SimStats>,
-    mut tick: Local<u32>,
-    mut wall_flags: Local<Vec<bool>>,
-    mut broken_flags: Local<Vec<bool>>,
-    mut mover_flags: Local<Vec<bool>>,
-    mut dir_stats: ResMut<DirTestStats>,
-    mut yaw_snapshot: Local<Vec<f32>>,
-) {
-    let dt = time.delta_secs();
-    let Units {
-        pos,
-        pos_prev,
-        vel,
-        speed,
-        team,
-        kind,
-        yaw,
-        yaw_prev,
-        group,
-        hp,
-        target,
-        swing,
-        swing_t,
-        flash,
-        death_t,
-        home,
-        ammo,
-        ..
-    } = &mut *units;
-    if pos.is_empty() {
-        return;
-    }
+/// What an archer regiment's bows shoot at this tick (regiment-level
+/// fire solution, resolved in `prepare_tick`).
+struct ShootAt {
+    c: Vec2,
+    vel: Vec2,
+    r: f32,
+    /// Target regiment (index into `Groups::list`): the per-shot
+    /// aim picks one of its living soldiers.
+    t: usize,
+}
 
-    // pos_prev becomes the state at tick start; pos is fully rewritten below.
-    std::mem::swap(pos, pos_prev);
+/// Everything one kinematic tick owns: copies of the input state, the
+/// per-regiment command snapshot, and the output buffers. Fully
+/// self-contained, so the tick can run on a worker thread while the main
+/// world keeps rendering the last completed tick — nothing borrows ECS
+/// data across frames. Per-soldier buffers are recycled tick to tick
+/// (swapped at install, clear + extend at prep).
+#[derive(Default)]
+pub struct TickJob {
+    // Tick-start positions (the kernel's `pos_prev`) and the new ones.
+    pos_in: Vec<Vec3>,
+    pos_out: Vec<Vec3>,
+    // Read-only column copies (the death sweep swap-removes the live
+    // columns between ticks, so the job cannot share them).
+    speed: Vec<f32>,
+    team: Vec<u8>,
+    kind: Vec<u8>,
+    group: Vec<u32>,
+    home: Vec<Vec2>,
+    // Read-modify-write columns: copied in at prep, swapped out at install.
+    vel: Vec<Vec3>,
+    yaw: Vec<f32>,
+    yaw_prev: Vec<f32>,
+    target: Vec<u32>,
+    swing: Vec<u8>,
+    swing_t: Vec<u8>,
+    flash: Vec<u8>,
+    death_t: Vec<u8>,
+    ammo: Vec<u8>,
+    // Per-regiment command snapshot, taken at prep.
+    orders: Vec<Option<Vec2>>,
+    anchors: Vec<Vec2>,
+    reg_broken: Vec<bool>,
+    reg_mover: Vec<bool>,
+    press: Vec<bool>,
+    hold: Vec<bool>,
+    threat: Vec<Vec2>,
+    form_face: Vec<Vec2>,
+    wall: Vec<u8>,
+    charging: Vec<bool>,
+    fat_speed: Vec<f32>,
+    fat_nocharge: Vec<bool>,
+    shoot_at: Vec<Option<ShootAt>>,
+    target_members: Vec<Vec<u32>>,
+    blocks: [Vec<(Vec2, f32, f32)>; 2],
+    faces_spearwall: [bool; 2],
+    // Per-soldier prep products.
+    wall_flags: Vec<bool>,
+    broken_flags: Vec<bool>,
+    mover_flags: Vec<bool>,
+    yaw_snapshot: Vec<f32>,
+    // Outputs beyond the columns: the grid the tick built, landed swings
+    // and loosed arrows per chunk. All swapped into their resources at
+    // install.
+    grid: SpatialGrid,
+    events: Vec<Vec<DamageEvent>>,
+    arrow_spawns: Vec<Vec<crate::arrows::ArrowSpawn>>,
+    terrain: Option<std::sync::Arc<Terrain>>,
+    dt: f32,
+    combat_scale: f32,
+    tick_seed: u32,
+    rf: bool,
+    bounds_min: Vec2,
+    bounds_max: Vec2,
+    /// `Units::generation` at prep: a job from a dead world is dropped.
+    generation: u64,
+    grid_ms: f32,
+    step_ms: f32,
+}
+
+/// Recycled job buffers and the tick counter. The counter lives here,
+/// not in a `Local`, because prep (which seeds the per-tick hashes) and
+/// the apply both need it.
+#[derive(Resource, Default)]
+pub struct TickPipeline {
+    scratch: Option<Box<TickJob>>,
+    pub tick: u32,
+}
+
+/// `Arc` snapshot of the terrain for the tick job. Refreshed from the ECS
+/// resource whenever it changes: terrain is static in battle, so this
+/// clones once per map in practice. A job sees a terrain edit one tick
+/// late.
+#[derive(Resource, Default)]
+pub struct SharedTerrain(pub Option<std::sync::Arc<Terrain>>);
+
+pub fn refresh_shared_terrain(terrain: Res<Terrain>, mut shared: ResMut<SharedTerrain>) {
+    if terrain.is_changed() || shared.0.is_none() {
+        shared.0 = Some(std::sync::Arc::new(terrain.clone()));
+    }
+}
+
+/// Fill `job` from the live world: column copies, the per-regiment
+/// command snapshot, the archers' fire solutions and scalars. This is
+/// the serial prep that used to open `step_sim`. It also makes the two
+/// regiment writes that prep always made: the stand-off anchor snap and
+/// the `firing` flag.
+#[allow(clippy::too_many_arguments)]
+fn prepare_tick(
+    job: &mut TickJob,
+    units: &Units,
+    groups: &mut Groups,
+    tracks: &crate::arrows::RegTracks,
+    terrain_arc: &std::sync::Arc<Terrain>,
+    dt: f32,
+    combat_scale: f32,
+    tick: u32,
+) {
+    job.generation = units.generation;
+    job.dt = dt;
+    job.combat_scale = combat_scale;
+    job.terrain = Some(terrain_arc.clone());
+    let terrain: &Terrain = terrain_arc;
+
+    macro_rules! copy_col {
+        ($($dst:ident <- $src:ident),*) => {$(
+            job.$dst.clear();
+            job.$dst.extend_from_slice(&units.$src);
+        )*};
+    }
+    // pos_in is the state at tick start; pos_out is fully rewritten by
+    // the integrate.
+    copy_col!(
+        pos_in <- pos, speed <- speed, team <- team, kind <- kind, group <- group,
+        home <- home, vel <- vel, yaw <- yaw, yaw_prev <- yaw_prev, target <- target,
+        swing <- swing, swing_t <- swing_t, flash <- flash, death_t <- death_t, ammo <- ammo
+    );
+    job.pos_out.clear();
+    job.pos_out.resize(units.pos.len(), Vec3::ZERO);
+    let pos_prev = &units.pos[..];
+    let group = &units.group[..];
+    let death_t = &units.death_t[..];
 
     // Per-unit wall flag for the grid meta (same-team wall pairs pack
     // tighter in the separation below).
@@ -307,8 +407,8 @@ pub fn step_sim(
         .iter()
         .map(|g| crate::formation::wall_kind(g) != 0)
         .collect();
-    wall_flags.clear();
-    wall_flags.extend(group.iter().map(|&g| group_wall[g as usize]));
+    job.wall_flags.clear();
+    job.wall_flags.extend(group.iter().map(|&g| group_wall[g as usize]));
     // Pass-through flags for the grid meta (FL_RECTFIGHT): a BROKEN
     // man is a fleeing body, and a man of a MOVE-ordered regiment is a
     // body deliberately passing through (the engine's explicit
@@ -322,10 +422,10 @@ pub fn step_sim(
         .iter()
         .map(|g| !g.state.is_broken() && matches!(g.order, Some(crate::orders::Order::Move(_))))
         .collect();
-    broken_flags.clear();
-    broken_flags.extend(group.iter().map(|&g| group_broken[g as usize]));
-    mover_flags.clear();
-    mover_flags.extend(group.iter().map(|&g| group_mover[g as usize]));
+    job.broken_flags.clear();
+    job.broken_flags.extend(group.iter().map(|&g| group_broken[g as usize]));
+    job.mover_flags.clear();
+    job.mover_flags.extend(group.iter().map(|&g| group_mover[g as usize]));
     // No packing rule for fighting regiments: vanilla M2TW keeps its
     // formation grid (and observably LOOSENS it) during melee — the
     // fighting crowd's spacing is slots + body collision, nothing
@@ -334,14 +434,6 @@ pub fn step_sim(
     // a pressed front's gaps shrank to ~1.05 m against 0.95 m bodies
     // and symmetric fights collapsed to a two-rank duel line.
     let rf = crate::formation::rectfight();
-
-    let t0 = Instant::now();
-    {
-        let _span = info_span!("grid_rebuild").entered();
-        grid.rebuild(pos_prev, team, kind, death_t, &wall_flags, &broken_flags, &mover_flags);
-    }
-    let t1 = Instant::now();
-    stats.grid_ms = (t1 - t0).as_secs_f32() * 1000.0;
 
     // ---- Archer fire solutions (regiment level). An attack order for a
     // ranged regiment is a FIRE order, not a melee charge: the regiment
@@ -375,14 +467,6 @@ pub fn step_sim(
     // target once standing off, else fire-at-will's nearest live enemy
     // regiment in range. Regiments in melee or on the march don't volley
     // (M2TW: foot archers halt to shoot; fire-at-will pauses on the move).
-    struct ShootAt {
-        c: Vec2,
-        vel: Vec2,
-        r: f32,
-        /// Target regiment (index into `Groups::list`): the per-shot
-        /// aim picks one of its living soldiers.
-        t: usize,
-    }
     let shoot_at: Vec<Option<ShootAt>> = (0..n_groups)
         .map(|g| {
             let gd = &groups.list[g];
@@ -467,8 +551,6 @@ pub fn step_sim(
             }
         }
     }
-    let target_members = &target_members[..];
-    let shoot_at = &shoot_at[..];
     // Friendly blocks per team for the loft-over-friendlies check: every
     // live formed regiment as a disc with a clearance ceiling. A
     // shooter's own regiment is in here too — that is what makes rear
@@ -487,16 +569,7 @@ pub fn step_sim(
             })
             .collect()
     });
-    let blocks = &blocks;
 
-    let grid = &*grid;
-    let terrain = &*terrain;
-    let pos_prev = &pos_prev[..];
-    let speed = &speed[..];
-    let team = &team[..];
-    let kind = &kind[..];
-    let group = &group[..];
-    let home = &home[..];
     // Orders resolved to this tick's destination (attack orders chase
     // their target regiment's current centroid). FL_RECTFIGHT: an
     // ENGAGED attack order stops chasing — the frame froze where
@@ -581,11 +654,7 @@ pub fn step_sim(
             goal
         })
         .collect();
-    let orders = &orders[..];
     let anchors: Vec<Vec2> = groups.list.iter().map(|g| g.anchor).collect();
-    let anchors = &anchors[..];
-    let broken = &group_broken[..];
-    let group_mover = &group_mover[..];
     // Regiments in combat-watch range of an enemy (sparse-fight
     // acquisition): order type is irrelevant — a Move-order fight that
     // went sparse stalls exactly the same way. HOLD regiments never
@@ -595,14 +664,11 @@ pub fn step_sim(
         .iter()
         .map(|g| (g.enemy_near || g.engaged) && !g.hold)
         .collect();
-    let press = &press[..];
     // Hold-position leash: units of a held regiment close only the last
     // step to a swing (no chasing across open ground).
     let hold: Vec<bool> = groups.list.iter().map(|g| g.hold).collect();
-    let hold = &hold[..];
     // Direction to the nearest enemy regiment (brace facing).
     let threat: Vec<Vec2> = groups.list.iter().map(|g| g.threat_dir).collect();
-    let threat = &threat[..];
     // Formation facing for standing units (ZERO = no claim): a formed
     // regiment DRESSES to its ordered facing when nothing is nearer to
     // worry about — without this, units kept the yaw of their last
@@ -618,15 +684,12 @@ pub fn step_sim(
             }
         })
         .collect();
-    let form_face = &form_face[..];
     // Wall stance per regiment (0 none / 1 shieldwall / 2 spearwall):
     // slower advance, damage model tweaks in the events + apply pass.
     let wall: Vec<u8> = groups.list.iter().map(crate::formation::wall_kind).collect();
-    let wall = &wall[..];
     // Charge phase: the run home (speed boost feeds the per-unit
     // SWING_CHARGE predicate too — momentum the sim can see).
     let charging: Vec<bool> = groups.list.iter().map(|g| g.charging).collect();
-    let charging = &charging[..];
     // Fatigue locomotion: tired legs are slow legs, and exhausted
     // regiments cannot sprint the charge home (MTW1 "cannot run or
     // charge"; fleeing men tire too — pursuit catches them).
@@ -635,13 +698,11 @@ pub fn step_sim(
         .iter()
         .map(|g| crate::fatigue::speed_mult(g.fatigue))
         .collect();
-    let fat_speed = &fat_speed[..];
     let fat_nocharge: Vec<bool> = groups
         .list
         .iter()
         .map(|g| crate::fatigue::cannot_charge(g.fatigue))
         .collect();
-    let fat_nocharge = &fat_nocharge[..];
     let bounds_min = terrain.min() + 4.0;
     let bounds_max = terrain.max() - 4.0;
 
@@ -660,21 +721,134 @@ pub fn step_sim(
     // into &mut chunks there. The spear-line hazard reads the SPEARMAN's
     // facing from the charger's side of the scan; no spearwalls anywhere,
     // no copy.
-    yaw_snapshot.clear();
+    job.yaw_snapshot.clear();
     if faces_spearwall[0] || faces_spearwall[1] {
-        yaw_snapshot.extend_from_slice(yaw);
+        job.yaw_snapshot.extend_from_slice(&units.yaw);
     }
-    let yaw_snap = &yaw_snapshot[..];
 
-    let combat_scale = scale.0;
-    let n_chunks = pos.len().div_ceil(CHUNK);
-    if damage.0.len() < n_chunks {
-        damage.0.resize_with(n_chunks, Vec::new);
+    let n_chunks = units.pos.len().div_ceil(CHUNK);
+    if job.events.len() < n_chunks {
+        job.events.resize_with(n_chunks, Vec::new);
     }
-    if arrow_spawns.0.len() < n_chunks {
-        arrow_spawns.0.resize_with(n_chunks, Vec::new);
+    if job.arrow_spawns.len() < n_chunks {
+        job.arrow_spawns.resize_with(n_chunks, Vec::new);
     }
-    let tick_seed = tick.wrapping_mul(0x9E37_79B1);
+    // Spawn buffers come back drained from arrows.rs. A job dropped as
+    // stale never got that far.
+    for buf in &mut job.arrow_spawns {
+        buf.clear();
+    }
+    job.tick_seed = tick.wrapping_mul(0x9E37_79B1);
+    job.rf = rf;
+    job.bounds_min = bounds_min;
+    job.bounds_max = bounds_max;
+    job.faces_spearwall = faces_spearwall;
+    job.orders = orders;
+    job.anchors = anchors;
+    job.reg_broken = group_broken;
+    job.reg_mover = group_mover;
+    job.press = press;
+    job.hold = hold;
+    job.threat = threat;
+    job.form_face = form_face;
+    job.wall = wall;
+    job.charging = charging;
+    job.fat_speed = fat_speed;
+    job.fat_nocharge = fat_nocharge;
+    job.shoot_at = shoot_at;
+    job.target_members = target_members;
+    job.blocks = blocks;
+}
+
+/// Run one kinematic tick on the job's owned data: grid rebuild, then the
+/// parallel integrate. No ECS access, so it can run on any thread. The
+/// kernel below is the long-standing integrate loop, verbatim: only the
+/// binding preamble changed when the tick became a job.
+fn run_tick_job(job: &mut TickJob) {
+    let terrain_arc = job.terrain.clone().expect("terrain snapshot set at prep");
+    let terrain: &Terrain = &terrain_arc;
+    let dt = job.dt;
+    let tick_seed = job.tick_seed;
+    let rf = job.rf;
+    let bounds_min = job.bounds_min;
+    let bounds_max = job.bounds_max;
+    let faces_spearwall = job.faces_spearwall;
+    let TickJob {
+        pos_in,
+        pos_out,
+        vel,
+        yaw,
+        yaw_prev,
+        target,
+        swing,
+        swing_t,
+        flash,
+        death_t,
+        ammo,
+        speed,
+        team,
+        kind,
+        group,
+        home,
+        orders,
+        anchors,
+        reg_broken,
+        reg_mover,
+        press,
+        hold,
+        threat,
+        form_face,
+        wall,
+        charging,
+        fat_speed,
+        fat_nocharge,
+        shoot_at,
+        target_members,
+        blocks,
+        wall_flags,
+        broken_flags,
+        mover_flags,
+        yaw_snapshot,
+        grid,
+        events,
+        arrow_spawns,
+        grid_ms,
+        step_ms,
+        ..
+    } = job;
+
+    let t0 = Instant::now();
+    {
+        let _span = info_span!("grid_rebuild").entered();
+        grid.rebuild(pos_in, team, kind, death_t, wall_flags, broken_flags, mover_flags);
+    }
+    let t1 = Instant::now();
+    *grid_ms = (t1 - t0).as_secs_f32() * 1000.0;
+
+    let grid = &*grid;
+    let pos_prev = &pos_in[..];
+    let speed = &speed[..];
+    let team = &team[..];
+    let kind = &kind[..];
+    let group = &group[..];
+    let home = &home[..];
+    let yaw_snap = &yaw_snapshot[..];
+    let orders = &orders[..];
+    let anchors = &anchors[..];
+    let broken = &reg_broken[..];
+    let group_mover = &reg_mover[..];
+    let press = &press[..];
+    let hold = &hold[..];
+    let threat = &threat[..];
+    let form_face = &form_face[..];
+    let wall = &wall[..];
+    let charging = &charging[..];
+    let fat_speed = &fat_speed[..];
+    let fat_nocharge = &fat_nocharge[..];
+    let shoot_at = &shoot_at[..];
+    let target_members = &target_members[..];
+    let blocks = &*blocks;
+    let pos = pos_out;
     let integrate_span = info_span!("integrate").entered();
     ComputeTaskPool::get().scope(|scope| {
         for (ci, chunk) in pos
@@ -687,9 +861,9 @@ pub fn step_sim(
             .zip(swing_t.chunks_mut(CHUNK))
             .zip(flash.chunks_mut(CHUNK))
             .zip(death_t.chunks_mut(CHUNK))
-            .zip(&mut damage.0)
+            .zip(events.iter_mut())
             .zip(ammo.chunks_mut(CHUNK))
-            .zip(&mut arrow_spawns.0)
+            .zip(arrow_spawns.iter_mut())
             .enumerate()
         {
             let (((((((((((p_chunk, v_chunk), yaw_chunk), yawp_chunk), tgt_chunk), sw_chunk),
@@ -1470,7 +1644,97 @@ pub fn step_sim(
         }
     });
     drop(integrate_span);
-    stats.step_ms = t1.elapsed().as_secs_f32() * 1000.0;
+    *step_ms = t1.elapsed().as_secs_f32() * 1000.0;
+}
+
+#[allow(clippy::too_many_arguments)] // bevy system params
+pub fn step_sim(
+    mut units: ResMut<Units>,
+    mut grid: ResMut<SpatialGrid>,
+    mut damage: ResMut<DamageBuffers>,
+    (mut arrow_spawns, tracks): (
+        ResMut<crate::arrows::ArrowSpawns>,
+        Res<crate::arrows::RegTracks>,
+    ),
+    mut cstats: ResMut<crate::combat::CombatStats>,
+    mut groups: ResMut<Groups>,
+    (terrain, shared_terrain): (Res<Terrain>, Res<SharedTerrain>),
+    scale: Res<CombatScale>,
+    time: Res<Time>,
+    mut stats: ResMut<SimStats>,
+    mut pipeline: ResMut<TickPipeline>,
+    mut dir_stats: ResMut<DirTestStats>,
+) {
+    if units.pos.is_empty() {
+        return;
+    }
+    let Some(terrain_arc) = shared_terrain.0.as_ref() else {
+        return;
+    };
+    let mut job = pipeline.scratch.take().unwrap_or_default();
+    prepare_tick(
+        &mut job,
+        &units,
+        &mut groups,
+        &tracks,
+        terrain_arc,
+        time.delta_secs(),
+        scale.0,
+        pipeline.tick,
+    );
+    run_tick_job(&mut job);
+
+    // INSTALL: the completed tick becomes the live state. pos_prev <-
+    // the state at tick start, pos <- the new kinematics, the
+    // read-modify-write columns swap in, and the job keeps last tick's
+    // buffers for recycling at the next prep.
+    {
+        let u = &mut *units;
+        std::mem::swap(&mut u.pos, &mut u.pos_prev);
+        std::mem::swap(&mut u.pos, &mut job.pos_out);
+        std::mem::swap(&mut u.vel, &mut job.vel);
+        std::mem::swap(&mut u.yaw, &mut job.yaw);
+        std::mem::swap(&mut u.yaw_prev, &mut job.yaw_prev);
+        std::mem::swap(&mut u.target, &mut job.target);
+        std::mem::swap(&mut u.swing, &mut job.swing);
+        std::mem::swap(&mut u.swing_t, &mut job.swing_t);
+        std::mem::swap(&mut u.flash, &mut job.flash);
+        std::mem::swap(&mut u.death_t, &mut job.death_t);
+        std::mem::swap(&mut u.ammo, &mut job.ammo);
+    }
+    std::mem::swap(&mut *grid, &mut job.grid);
+    std::mem::swap(&mut damage.0, &mut job.events);
+    std::mem::swap(&mut arrow_spawns.0, &mut job.arrow_spawns);
+    stats.grid_ms = job.grid_ms;
+    stats.step_ms = job.step_ms;
+
+    let Units {
+        pos,
+        pos_prev,
+        team,
+        kind,
+        yaw,
+        group,
+        hp,
+        swing,
+        swing_t,
+        flash,
+        death_t,
+        ammo,
+        ..
+    } = &mut *units;
+    let team = &team[..];
+    let kind = &kind[..];
+    let group = &group[..];
+    let wall = &job.wall[..];
+    let fat_nocharge = &job.fat_nocharge[..];
+    let bounds_min = job.bounds_min;
+    let bounds_max = job.bounds_max;
+    let combat_scale = job.combat_scale;
+    let tick_seed = job.tick_seed;
+    let terrain = &*terrain;
+    let grid = &*grid;
+    let tick = &mut pipeline.tick;
 
     // Serial damage apply: deterministic (chunk order), race-free, and the
     // single place where hp transitions to death. A swing whiffs when its
@@ -1747,6 +2011,8 @@ pub fn step_sim(
             pos.len(),
         );
     }
+
+    pipeline.scratch = Some(job);
 }
 
 fn toggle_debug_viz(keys: Res<ButtonInput<KeyCode>>, mut viz: ResMut<DebugViz>) {

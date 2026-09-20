@@ -26,7 +26,7 @@ pub fn map_is_classic() -> bool {
     *ON.get_or_init(|| !std::env::var("FL_MAP").is_ok_and(|v| v == "river"))
 }
 
-#[derive(Resource)]
+#[derive(Resource, Clone)]
 pub struct Terrain {
     /// Vertex heights, row-major [z][x].
     heights: Vec<f32>,

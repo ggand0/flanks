@@ -643,7 +643,11 @@ pub fn setup_battle(
         ResMut<crate::arrows::StuckArrows>,
     ),
 ) {
+    // A new world: any sim tick job still computing on the old one is
+    // recognized as stale by the generation and dropped.
+    let generation = units.generation.wrapping_add(1);
     *units = Units::default();
+    units.generation = generation;
     *stats = CombatStats::default();
     *dir_stats = DirTestStats::default();
     *selection = Selection::default();
