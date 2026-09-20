@@ -21,6 +21,64 @@ struct InspectPanel;
 #[derive(Component)]
 struct InspectText;
 
+/// Sim ticks run since the last render frame. More than one means the
+/// fixed clock is catching up after an overrun frame. The FL_CATCHUP
+/// clamp (main.rs) bounds the burst, so a played session should never
+/// log more than the clamp allows.
+#[derive(Resource, Default)]
+struct TicksThisFrame(u32);
+
+fn count_sim_tick(mut ticks: ResMut<TicksThisFrame>) {
+    ticks.0 += 1;
+}
+
+/// Frame pacing over one log period: frame intervals split by whether
+/// the frame carried a sim tick, and the time the fixed tick itself held
+/// the frame. The fps average cannot show a pattern that alternates
+/// between short and long frames. This does.
+#[derive(Resource, Default)]
+struct FramePacing {
+    plain_ms: Vec<f32>,
+    tick_ms: Vec<f32>,
+    /// Wall time between FixedFirst and FixedLast, summed per frame.
+    fixed_ms: Vec<f32>,
+    fixed_start: Option<std::time::Instant>,
+    fixed_this_frame: f32,
+    last_frame: Option<std::time::Instant>,
+}
+
+fn fixed_begin(mut pacing: ResMut<FramePacing>) {
+    pacing.fixed_start = Some(std::time::Instant::now());
+}
+
+fn fixed_end(mut pacing: ResMut<FramePacing>) {
+    if let Some(t0) = pacing.fixed_start.take() {
+        pacing.fixed_this_frame += t0.elapsed().as_secs_f32() * 1000.0;
+    }
+}
+
+/// Runs once per frame in Update, after this frame's fixed ticks: the
+/// interval since the last call therefore contains this frame's
+/// FixedUpdate, and is filed under this frame's tick count.
+fn report_catchup(mut ticks: ResMut<TicksThisFrame>, mut pacing: ResMut<FramePacing>) {
+    if ticks.0 > 1 {
+        info!("[catchup] {} sim ticks in one frame", ticks.0);
+    }
+    let now = std::time::Instant::now();
+    if let Some(last) = pacing.last_frame.replace(now) {
+        let ms = (now - last).as_secs_f32() * 1000.0;
+        if ticks.0 > 0 {
+            pacing.tick_ms.push(ms);
+            let fixed = pacing.fixed_this_frame;
+            pacing.fixed_ms.push(fixed);
+        } else {
+            pacing.plain_ms.push(ms);
+        }
+    }
+    pacing.fixed_this_frame = 0.0;
+    ticks.0 = 0;
+}
+
 pub struct OverlayPlugin;
 
 impl Plugin for OverlayPlugin {
@@ -34,9 +92,17 @@ impl Plugin for OverlayPlugin {
                 OnEnter(crate::game_state::GameState::Battle),
                 show_overlay,
             )
+            .init_resource::<TicksThisFrame>()
+            .init_resource::<FramePacing>()
+            .add_systems(
+                FixedUpdate,
+                count_sim_tick.in_set(crate::game_state::SimSet),
+            )
+            .add_systems(FixedFirst, fixed_begin)
+            .add_systems(FixedLast, fixed_end)
             .add_systems(
                 Update,
-                (update_overlay, update_inspect_panel)
+                (update_overlay, update_inspect_panel, report_catchup)
                     .run_if(in_state(crate::game_state::GameState::Battle)),
             )
             .add_systems(
@@ -219,6 +285,7 @@ fn update_overlay(
     mut query: Query<&mut Text, With<OverlayText>>,
     time: Res<Time>,
     mut log_timer: Local<f32>,
+    mut pacing: ResMut<FramePacing>,
 ) {
     let fps = diagnostics
         .get(&FrameTimeDiagnosticsPlugin::FPS)
@@ -295,6 +362,30 @@ fn update_overlay(
             render_counts.lod_drawn,
             render_counts.corpses_drawn
         );
+        // Frame pacing over this log period, split by whether the frame
+        // carried a sim tick. The average above hides a pattern that
+        // alternates between short and long frames; this shows it.
+        let summary = |ms: &mut Vec<f32>| {
+            ms.sort_by(|a, b| a.total_cmp(b));
+            let at = |q: f32| ms.get(((ms.len().max(1) - 1) as f32 * q) as usize).copied();
+            format!(
+                "p50 {:.1} p90 {:.1} max {:.1} (n {})",
+                at(0.5).unwrap_or(0.0),
+                at(0.9).unwrap_or(0.0),
+                at(1.0).unwrap_or(0.0),
+                ms.len()
+            )
+        };
+        let pacing = &mut *pacing;
+        info!(
+            "  frame ms without a tick: {} | with a tick: {} | inside the fixed tick: {}",
+            summary(&mut pacing.plain_ms),
+            summary(&mut pacing.tick_ms),
+            summary(&mut pacing.fixed_ms)
+        );
+        pacing.plain_ms.clear();
+        pacing.tick_ms.clear();
+        pacing.fixed_ms.clear();
         for diag in diagnostics.iter() {
             let path = diag.path().as_str();
             if path.starts_with("render/")
