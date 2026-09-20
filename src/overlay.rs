@@ -287,14 +287,15 @@ fn update_overlay(
     mut log_timer: Local<f32>,
     mut pacing: ResMut<FramePacing>,
 ) {
-    let fps = diagnostics
-        .get(&FrameTimeDiagnosticsPlugin::FPS)
-        .and_then(|d| d.smoothed())
-        .unwrap_or(0.0);
+    // Mean frame time over the diagnostic's history (about two seconds),
+    // and the rate that mean implies. The smoothed values chase the
+    // latest frame: frames that carry a sim tick are longer than the
+    // ones between them, so the readout flickered between two rates.
     let frame_ms = diagnostics
         .get(&FrameTimeDiagnosticsPlugin::FRAME_TIME)
-        .and_then(|d| d.smoothed())
+        .and_then(|d| d.average())
         .unwrap_or(0.0);
+    let fps = if frame_ms > 0.0 { 1000.0 / frame_ms } else { 0.0 };
 
     let banner = match outcome.0 {
         Some(0) => "\n=== VICTORY: the enemy army is broken ===",
