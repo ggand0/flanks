@@ -12,10 +12,20 @@
 //!
 //! Local convention: origin at mid-body, +Z is forward (yaw 0), feet at
 //! y = -half_height (matching `TYPES[kind]`).
+//!
+//! Every kind builds at `NUM_LODS` detail levels. L0 is the full mesh.
+//! L1 merges and drops what is under about a pixel in its band. L2 is
+//! six blocks: torso, head, two legs, weapon, shield. L3 is a body block
+//! and a head block. The main masses keep their size and position at
+//! every level, surviving parts keep their part id and pivot (so poses
+//! match across a switch), and merged blocks take the area-weighted
+//! material of what they replace (`blend`), so a regiment keeps its hue.
 
 use bevy::asset::RenderAssetUsages;
 use bevy::mesh::{Indices, Mesh, PrimitiveTopology};
 use bevy::prelude::*;
+
+use crate::render_units::NUM_LODS;
 
 /// Body part ids (uv.x). Keep in sync with unit_instancing.wgsl.
 const PART_BODY: f32 = 0.0;
@@ -67,7 +77,48 @@ const TUNIC: [f32; 4] = [0.32, 0.34, 0.24, 0.85];
 /// Archer hose: dark brown wool.
 const HOSE: [f32; 4] = [0.36, 0.30, 0.22, 0.0];
 
+/// FL_MESH_TESS=n: render perf probe. Splits every cuboid face into an
+/// n x n grid: same silhouette, tris x n^2. Prices denser authored
+/// meshes on the real pipeline before any asset exists.
+fn mesh_tess() -> usize {
+    static T: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *T.get_or_init(|| crate::util::env_or("FL_MESH_TESS", 1_usize).clamp(1, 16))
+}
+
+/// FL_LOD_WEAPON=f: feel probe. Thickens the L2 weapon block by `f` so
+/// blades and shafts stay readable at mid zoom, the way distant M2TW
+/// sprites exaggerate them. Default 1 matches the full mesh exactly.
+fn weapon_fat() -> f32 {
+    static F: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *F.get_or_init(|| crate::util::env_or("FL_LOD_WEAPON", 1.0_f32).clamp(1.0, 4.0))
+}
+
+/// Area-weighted material for a far-level block that replaces several
+/// surfaces. The shader shows `mix(rgb, team, a)`: the team amount
+/// averages directly, and rgb averages by its VISIBLE share (1 - a).
+/// Weights are areas as the battle camera sees them, looking down at
+/// about 50 degrees: top faces count for more than fronts, and legs
+/// are half hidden under the torso.
+fn blend(parts: &[([f32; 4], f32)]) -> [f32; 4] {
+    let total: f32 = parts.iter().map(|(_, w)| w).sum();
+    let mut out = [0.0; 4];
+    for (c, w) in parts {
+        let w = w / total;
+        out[3] += w * c[3];
+        for k in 0..3 {
+            out[k] += w * c[k] * (1.0 - c[3]);
+        }
+    }
+    let visible = (1.0 - out[3]).max(1e-4);
+    for c in out.iter_mut().take(3) {
+        *c /= visible;
+    }
+    out
+}
+
 struct MeshBuf {
+    /// Face grid size: the FL_MESH_TESS probe on L0, 1 everywhere else.
+    tess: usize,
     pos: Vec<[f32; 3]>,
     nrm: Vec<[f32; 3]>,
     uv: Vec<[f32; 2]>,
@@ -76,8 +127,19 @@ struct MeshBuf {
 }
 
 impl MeshBuf {
+    /// Buffer for a soldier mesh at detail level `lod`. A dense L0 over
+    /// plain far levels is the shape of an authored mesh set: the
+    /// FL_MESH_TESS probe prices exactly that.
+    fn for_level(lod: usize) -> Self {
+        Self {
+            tess: if lod == 0 { mesh_tess() } else { 1 },
+            ..Self::new()
+        }
+    }
+
     fn new() -> Self {
         Self {
+            tess: 1,
             pos: Vec::new(),
             nrm: Vec::new(),
             uv: Vec::new(),
@@ -97,6 +159,9 @@ impl MeshBuf {
             ([0.0, 0.0, 1.0], [0, 1]),  // +Z, spanned by x,y
             ([0.0, 0.0, -1.0], [0, 1]), // -Z
         ];
+        // Each face is a t x t grid of quads (t = 1 outside the probe).
+        let t = self.tess;
+        let stride = t as u32 + 1;
         for (n, span) in FACES {
             let base = self.pos.len() as u32;
             let normal = Vec3::from_array(n);
@@ -105,22 +170,28 @@ impl MeshBuf {
             let mut v_axis = Vec3::ZERO;
             u_axis[span[0]] = half[span[0]];
             v_axis[span[1]] = half[span[1]];
-            for (su, sv) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
-                let p = face_center + u_axis * su + v_axis * sv;
-                self.pos.push(p.to_array());
-                self.nrm.push(n);
-                self.uv.push([part, pivot_y]);
-                self.col.push(col);
+            for j in 0..=t {
+                for i in 0..=t {
+                    let su = -1.0 + 2.0 * i as f32 / t as f32;
+                    let sv = -1.0 + 2.0 * j as f32 / t as f32;
+                    let p = face_center + u_axis * su + v_axis * sv;
+                    self.pos.push(p.to_array());
+                    self.nrm.push(n);
+                    self.uv.push([part, pivot_y]);
+                    self.col.push(col);
+                }
             }
             // Winding so the face is CCW seen from outside: flip when the
             // (u, v) basis cross-product points against the face normal.
             let flip = u_axis.cross(v_axis).dot(normal) < 0.0;
-            let quad = if flip {
-                [0, 2, 1, 0, 3, 2]
-            } else {
-                [0, 1, 2, 0, 2, 3]
-            };
-            self.idx.extend(quad.map(|k| base + k));
+            for j in 0..t as u32 {
+                for i in 0..t as u32 {
+                    let a = base + j * stride + i;
+                    let (b, c, d) = (a + 1, a + stride + 1, a + stride);
+                    let quad = if flip { [a, c, b, a, d, c] } else { [a, b, c, a, c, d] };
+                    self.idx.extend(quad);
+                }
+            }
         }
     }
 
@@ -214,6 +285,23 @@ impl MeshBuf {
     }
 }
 
+impl MeshBuf {
+    /// Far-level sword: blade and tip as ONE block on the sword arm, no
+    /// grip or crossguard. Same reach as `sword`, so the swing reads the
+    /// same. `fat` thickens the two thin sides (`weapon_fat`).
+    fn blade(&mut self, hand: Vec3, blade_len: f32, scale: f32, pivot_y: f32, fat: f32) {
+        let s = scale;
+        let len = blade_len + 0.07 * s;
+        self.cuboid(
+            hand + Vec3::new(0.0, 0.0, 0.04 * s + len / 2.0),
+            Vec3::new(0.042 * s * fat, 0.014 * s * fat, len / 2.0),
+            PART_ARM,
+            pivot_y,
+            BLADE,
+        );
+    }
+}
+
 fn build(m: MeshBuf) -> Mesh {
     Mesh::new(
         PrimitiveTopology::TriangleList,
@@ -228,11 +316,28 @@ fn build(m: MeshBuf) -> Mesh {
 
 /// Heavy knight: broad steel-and-tabard chest over narrow hips, pauldrons,
 /// full helm with nose guard, tall team-colored kite shield, arming sword.
-/// 17 cuboids, 204 tris. Height 1.1 m (half_height 0.55).
-pub fn build_knight() -> Mesh {
-    let mut m = MeshBuf::new();
+/// 17 cuboids, 204 tris at L0 (then 120 / 72 / 24). Height 1.1 m
+/// (half_height 0.55).
+pub fn build_knight(lod: usize) -> Mesh {
+    let mut m = MeshBuf::for_level(lod);
     let hip_pivot = -0.18;
     let shoulder = 0.16;
+    // Far levels: head block and flared crown as one steel helm.
+    let helm = (Vec3::new(0.0, 0.355, 0.0), Vec3::new(0.115, 0.125, 0.115));
+    let shield = (Vec3::new(-0.345, -0.02, 0.09), Vec3::new(0.03, 0.26, 0.17));
+    let hand = Vec3::new(0.285, shoulder - 0.02, 0.28);
+    if lod >= 3 {
+        // L3: legs, tabard, pauldrons and shield as one body block.
+        m.cuboid(
+            Vec3::new(0.0, -0.155, 0.0),
+            Vec3::new(0.214, 0.395, 0.12),
+            PART_BODY,
+            0.0,
+            blend(&[(DARK_STEEL, 0.21), (TEAM, 0.61), (STEEL, 0.18)]),
+        );
+        m.cuboid(helm.0, helm.1, PART_BODY, 0.0, STEEL);
+        return build(m);
+    }
     // armored legs (walk-swing parts)
     m.cuboid(
         Vec3::new(-0.115, -0.38, 0.0),
@@ -248,6 +353,20 @@ pub fn build_knight() -> Mesh {
         hip_pivot,
         DARK_STEEL,
     );
+    if lod == 2 {
+        // L2: hips, chest, pauldrons and arms as one torso.
+        m.cuboid(
+            Vec3::new(0.0, 0.0125, 0.0),
+            Vec3::new(0.25, 0.2275, 0.135),
+            PART_BODY,
+            0.0,
+            blend(&[(TEAM, 0.77), (STEEL, 0.23)]),
+        );
+        m.cuboid(helm.0, helm.1, PART_BODY, 0.0, STEEL);
+        m.cuboid(shield.0, shield.1, PART_SHIELD, shoulder, TEAM);
+        m.blade(hand, 0.42, 1.2, shoulder, weapon_fat());
+        return build(m);
+    }
     // hips (team tabard) -> broad chest (team tabard over armor)
     m.cuboid(
         Vec3::new(0.0, -0.10, 0.0),
@@ -278,6 +397,21 @@ pub fn build_knight() -> Mesh {
         0.0,
         STEEL,
     );
+    if lod == 1 {
+        // L1: one-block helm, shield without its arm stub, sleeve and
+        // vambrace as one arm, plain blade.
+        m.cuboid(helm.0, helm.1, PART_BODY, 0.0, STEEL);
+        m.cuboid(shield.0, shield.1, PART_SHIELD, shoulder, TEAM);
+        m.cuboid(
+            Vec3::new(0.285, shoulder - 0.02, 0.105),
+            Vec3::new(0.06, 0.06, 0.155),
+            PART_ARM,
+            shoulder,
+            blend(&[(TEAM, 0.6), (DARK_STEEL, 0.4)]),
+        );
+        m.blade(hand, 0.42, 1.2, shoulder, 1.0);
+        return build(m);
+    }
     // full steel helm: head block + flared crown + nose guard
     m.cuboid(
         Vec3::new(0.0, 0.335, 0.0),
@@ -335,12 +469,28 @@ pub fn build_knight() -> Mesh {
 }
 
 /// Light man-at-arms: slim tunic, bare face under a steel kettle hat,
-/// wooden buckler, shorter sword. 16 cuboids, 192 tris. Height 1.0 m
-/// (half_height 0.50).
-pub fn build_man_at_arms() -> Mesh {
-    let mut m = MeshBuf::new();
+/// wooden buckler, shorter sword. 15 cuboids, 180 tris at L0 (then
+/// 120 / 72 / 24). Height 1.0 m (half_height 0.50).
+pub fn build_man_at_arms(lod: usize) -> Mesh {
+    let mut m = MeshBuf::for_level(lod);
     let hip_pivot = -0.16;
     let shoulder = 0.14;
+    // Far levels: bare face and kettle hat as one head block.
+    let head = (Vec3::new(0.0, 0.3325, 0.0), Vec3::new(0.11, 0.1275, 0.11));
+    let head_col = blend(&[(SKIN, 0.25), (STEEL, 0.75)]);
+    let buckler = (Vec3::new(-0.265, 0.04, 0.10), Vec3::new(0.022, 0.11, 0.11));
+    let hand = Vec3::new(0.22, shoulder - 0.02, 0.235);
+    if lod >= 3 {
+        m.cuboid(
+            Vec3::new(0.0, -0.155, 0.0),
+            Vec3::new(0.152, 0.345, 0.095),
+            PART_BODY,
+            0.0,
+            blend(&[(PANTS, 0.38), (TEAM, 0.57), (WOOD, 0.05)]),
+        );
+        m.cuboid(head.0, head.1, PART_BODY, 0.0, head_col);
+        return build(m);
+    }
     // cloth legs
     m.cuboid(
         Vec3::new(-0.09, -0.345, 0.0),
@@ -356,6 +506,19 @@ pub fn build_man_at_arms() -> Mesh {
         hip_pivot,
         PANTS,
     );
+    if lod == 2 {
+        m.cuboid(
+            Vec3::new(0.0, 0.005, 0.0),
+            Vec3::new(0.18, 0.185, 0.10),
+            PART_BODY,
+            0.0,
+            TEAM,
+        );
+        m.cuboid(head.0, head.1, PART_BODY, 0.0, head_col);
+        m.cuboid(buckler.0, buckler.1, PART_SHIELD, shoulder, WOOD);
+        m.blade(hand, 0.30, 1.0, shoulder, weapon_fat());
+        return build(m);
+    }
     // hips -> tunic chest (team cloth, slimmer than the knight)
     m.cuboid(
         Vec3::new(0.0, -0.08, 0.0),
@@ -393,6 +556,20 @@ pub fn build_man_at_arms() -> Mesh {
         0.0,
         STEEL,
     );
+    if lod == 1 {
+        // L1 keeps the face and the kettle hat (the kind's tell from
+        // above): buckler without its stub, sleeve and hand as one arm.
+        m.cuboid(buckler.0, buckler.1, PART_SHIELD, shoulder, WOOD);
+        m.cuboid(
+            Vec3::new(0.22, shoulder - 0.02, 0.09),
+            Vec3::new(0.05, 0.05, 0.13),
+            PART_ARM,
+            shoulder,
+            blend(&[(TEAM, 0.65), (SKIN, 0.35)]),
+        );
+        m.blade(hand, 0.30, 1.0, shoulder, 1.0);
+        return build(m);
+    }
     // buckler arm stub (cloth sleeve) + small wooden buckler
     m.cuboid(
         Vec3::new(-0.225, 0.04, 0.03),
@@ -430,12 +607,27 @@ pub fn build_man_at_arms() -> Mesh {
 /// Spear infantry: chainmail hauberk under a team surcoat, bare face in a
 /// wide-brim steel kettle hat over a mail coif, round team shield, and a
 /// tall spear carried VERTICAL (the shader levels it at the enemy and
-/// thrusts it on the stab). 17 cuboids, 204 tris. Height 1.0 m
-/// (half_height 0.50).
-pub fn build_spearman() -> Mesh {
-    let mut m = MeshBuf::new();
+/// thrusts it on the stab). 17 cuboids, 204 tris at L0 (then 132 / 72 /
+/// 24). Height 1.0 m (half_height 0.50).
+pub fn build_spearman(lod: usize) -> Mesh {
+    let mut m = MeshBuf::for_level(lod);
     let hip_pivot = -0.16;
     let shoulder = 0.14;
+    // Far levels: coif, face and kettle hat as one head block.
+    let head = (Vec3::new(0.0, 0.327, 0.0), Vec3::new(0.115, 0.14, 0.115));
+    let head_col = blend(&[(SKIN, 0.2), (STEEL, 0.72), (CHAIN, 0.08)]);
+    let shield = (Vec3::new(-0.27, 0.04, 0.09), Vec3::new(0.022, 0.13, 0.13));
+    if lod >= 3 {
+        m.cuboid(
+            Vec3::new(0.0, -0.155, 0.0),
+            Vec3::new(0.157, 0.345, 0.10),
+            PART_BODY,
+            0.0,
+            blend(&[(PANTS, 0.34), (CHAIN, 0.24), (TEAM, 0.42)]),
+        );
+        m.cuboid(head.0, head.1, PART_BODY, 0.0, head_col);
+        return build(m);
+    }
     // cloth legs
     m.cuboid(
         Vec3::new(-0.09, -0.345, 0.0),
@@ -451,6 +643,28 @@ pub fn build_spearman() -> Mesh {
         hip_pivot,
         PANTS,
     );
+    if lod == 2 {
+        m.cuboid(
+            Vec3::new(0.0, 0.005, 0.0),
+            Vec3::new(0.175, 0.185, 0.105),
+            PART_BODY,
+            0.0,
+            blend(&[(CHAIN, 0.45), (TEAM, 0.55)]),
+        );
+        m.cuboid(head.0, head.1, PART_BODY, 0.0, head_col);
+        m.cuboid(shield.0, shield.1, PART_SHIELD, shoulder, TEAM);
+        // Shaft, blade and ferrule as one upright block: a leveled line
+        // of these still reads as a brace at mid zoom.
+        let fat = weapon_fat();
+        m.cuboid(
+            Vec3::new(0.24, 0.506, 0.10),
+            Vec3::new(0.024 * fat, 0.864, 0.024 * fat),
+            PART_SPEAR_ARM,
+            shoulder,
+            blend(&[(WOOD, 0.87), (BLADE, 0.13)]),
+        );
+        return build(m);
+    }
     // chainmail hauberk hem -> team surcoat chest
     m.cuboid(
         Vec3::new(0.0, -0.08, 0.0),
@@ -466,14 +680,16 @@ pub fn build_spearman() -> Mesh {
         0.0,
         TEAM,
     );
-    // mail coif collar + bare face
-    m.cuboid(
-        Vec3::new(0.0, 0.215, 0.0),
-        Vec3::new(0.115, 0.03, 0.115),
-        PART_BODY,
-        0.0,
-        CHAIN,
-    );
+    // mail coif collar (L0 only) + bare face
+    if lod == 0 {
+        m.cuboid(
+            Vec3::new(0.0, 0.215, 0.0),
+            Vec3::new(0.115, 0.03, 0.115),
+            PART_BODY,
+            0.0,
+            CHAIN,
+        );
+    }
     m.cuboid(
         Vec3::new(0.0, 0.30, 0.0),
         Vec3::new(0.095, 0.095, 0.095),
@@ -496,6 +712,33 @@ pub fn build_spearman() -> Mesh {
         0.0,
         STEEL,
     );
+    if lod == 1 {
+        // L1 keeps face and kettle hat: shield without stub and boss,
+        // sleeve and hand as one arm, blade and tip as one spearhead.
+        m.cuboid(shield.0, shield.1, PART_SHIELD, shoulder, TEAM);
+        m.cuboid(
+            Vec3::new(0.228, shoulder - 0.02, 0.06),
+            Vec3::new(0.055, 0.055, 0.095),
+            PART_SPEAR_ARM,
+            shoulder,
+            blend(&[(CHAIN, 0.7), (SKIN, 0.3)]),
+        );
+        m.cuboid(
+            Vec3::new(0.24, 0.40, 0.10),
+            Vec3::new(0.024, 0.75, 0.024),
+            PART_SPEAR_ARM,
+            shoulder,
+            WOOD,
+        );
+        m.cuboid(
+            Vec3::new(0.24, 1.26, 0.10),
+            Vec3::new(0.03, 0.11, 0.013),
+            PART_SPEAR_ARM,
+            shoulder,
+            BLADE,
+        );
+        return build(m);
+    }
     // shield arm (mail sleeve) + round team shield with a steel boss
     m.cuboid(
         Vec3::new(-0.225, 0.04, 0.03),
@@ -578,13 +821,143 @@ pub fn build_spearman() -> Mesh {
 /// Sherwood archers: all-green forester — plain hip-length tunic
 /// (green with a whisper of team dye), long sleeves, leather belt,
 /// brown hose, low shoes, back quiver with the fletching fan, leather
-/// bracer on the bow arm. 42 cuboids, ~500 tris. Height ~1.0 m
-/// (half_height 0.50; the arrow fan overtops it like the spearman's
-/// point).
-pub fn build_archer() -> Mesh {
-    let mut m = MeshBuf::new();
+/// bracer on the bow arm. 42 cuboids, ~500 tris at L0 (then 168 / 72 /
+/// 24). Height ~1.0 m (half_height 0.50; the arrow fan overtops it like
+/// the spearman's point). The far levels keep the three tells as long
+/// as each is more than a speck: bow and string to L1, stave and fan to
+/// L2, the hood color to L3.
+pub fn build_archer(lod: usize) -> Mesh {
+    let mut m = MeshBuf::for_level(lod);
     let hip_pivot = -0.16;
     let shoulder = 0.14;
+    if lod >= 1 {
+        // Far levels: face and wrapped hood as one head block.
+        let head = (Vec3::new(0.0, 0.305, -0.01), Vec3::new(0.11, 0.113, 0.10));
+        let head_col = blend(&[(HOOD, 0.8), (SKIN, 0.2)]);
+        let stave = (Vec3::new(-0.262, 0.11, 0.16), Vec3::new(0.02, 0.475, 0.02));
+        let fan = (Vec3::new(0.155, 0.47, -0.15), Vec3::new(0.062, 0.075, 0.03));
+        if lod >= 3 {
+            m.cuboid(
+                Vec3::new(0.0, -0.145, 0.0),
+                Vec3::new(0.159, 0.365, 0.10),
+                PART_BODY,
+                0.0,
+                blend(&[(HOSE, 0.33), (LEATHER, 0.07), (TUNIC, 0.60)]),
+            );
+            m.cuboid(head.0, head.1, PART_BODY, 0.0, head_col);
+            return build(m);
+        }
+        // hose and shoe as one leg
+        let leg_col = blend(&[(HOSE, 0.8), (LEATHER, 0.2)]);
+        for (x, part) in [(-0.09, PART_LEG_L), (0.09, PART_LEG_R)] {
+            m.cuboid(
+                Vec3::new(x, -0.335, 0.004),
+                Vec3::new(0.067, 0.175, 0.085),
+                part,
+                hip_pivot,
+                leg_col,
+            );
+        }
+        if lod == 2 {
+            m.cuboid(
+                Vec3::new(0.0, 0.011, 0.0),
+                Vec3::new(0.175, 0.209, 0.105),
+                PART_BODY,
+                0.0,
+                blend(&[(TUNIC, 0.8), (HOOD, 0.2)]),
+            );
+            m.cuboid(head.0, head.1, PART_BODY, 0.0, head_col);
+            let fat = weapon_fat();
+            m.cuboid(
+                stave.0,
+                Vec3::new(stave.1.x * fat, stave.1.y, stave.1.z * fat),
+                PART_BOW_ARM,
+                shoulder,
+                BOW_WOOD,
+            );
+            m.cuboid(fan.0, fan.1, PART_BODY, 0.0, FLETCH);
+            return build(m);
+        }
+        // L1: tunic chest, skirt with its hem, the hood's shoulder
+        // mantle as one slab
+        m.cuboid(
+            Vec3::new(0.0, 0.09, 0.0),
+            Vec3::new(0.165, 0.10, 0.105),
+            PART_BODY,
+            0.0,
+            TUNIC,
+        );
+        m.cuboid(
+            Vec3::new(0.0, -0.1065, 0.0),
+            Vec3::new(0.157, 0.0915, 0.106),
+            PART_BODY,
+            0.0,
+            blend(&[(TUNIC, 0.85), (HOOD, 0.15)]),
+        );
+        m.cuboid(
+            Vec3::new(0.0, 0.19, -0.013),
+            Vec3::new(0.24, 0.03, 0.11),
+            PART_BODY,
+            0.0,
+            HOOD,
+        );
+        // open face, the hood as one block set back behind it
+        m.cuboid(
+            Vec3::new(0.0, 0.30, 0.005),
+            Vec3::new(0.09, 0.09, 0.09),
+            PART_BODY,
+            0.0,
+            SKIN,
+        );
+        m.cuboid(
+            Vec3::new(0.0, 0.305, -0.02),
+            Vec3::new(0.112, 0.113, 0.095),
+            PART_BODY,
+            0.0,
+            HOOD,
+        );
+        // quiver, the three shafts as one slat, the fletching fan
+        m.cuboid(
+            Vec3::new(0.155, 0.03, -0.14),
+            Vec3::new(0.045, 0.15, 0.045),
+            PART_BODY,
+            0.0,
+            LEATHER,
+        );
+        m.cuboid(
+            Vec3::new(0.155, 0.30, -0.15),
+            Vec3::new(0.045, 0.12, 0.011),
+            PART_BODY,
+            0.0,
+            WOOD,
+        );
+        m.cuboid(fan.0, fan.1, PART_BODY, 0.0, FLETCH);
+        // bow arm as one block, straight stave, the bright string
+        m.cuboid(
+            Vec3::new(-0.222, shoulder - 0.015, 0.0865),
+            Vec3::new(0.05, 0.046, 0.1015),
+            PART_BOW_ARM,
+            shoulder,
+            blend(&[(TUNIC, 0.6), (LEATHER, 0.2), (SKIN, 0.2)]),
+        );
+        m.cuboid(stave.0, stave.1, PART_BOW_ARM, shoulder, BOW_WOOD);
+        m.cuboid(
+            Vec3::new(-0.335, 0.11, 0.16),
+            Vec3::new(0.007, 0.46, 0.007),
+            PART_BOW_ARM,
+            shoulder,
+            STRING,
+        );
+        // draw arm as one block
+        m.cuboid(
+            Vec3::new(0.22, shoulder - 0.015, 0.085),
+            Vec3::new(0.05, 0.046, 0.105),
+            PART_ARM,
+            shoulder,
+            blend(&[(TUNIC, 0.75), (SKIN, 0.25)]),
+        );
+        return build(m);
+    }
     // brown hose and low leather shoes
     m.cuboid(
         Vec3::new(-0.09, -0.30, 0.0),
@@ -884,6 +1257,17 @@ pub fn build_archer() -> Mesh {
         SKIN,
     );
     build(m)
+}
+
+/// All detail levels of one unit kind, L0 first.
+pub fn build_kind_lods(kind: usize) -> [Mesh; NUM_LODS] {
+    let builder: fn(usize) -> Mesh = match kind as u8 {
+        crate::unit_types::KIND_HEAVY => build_knight,
+        crate::unit_types::KIND_LIGHT => build_man_at_arms,
+        crate::unit_types::KIND_SPEAR => build_spearman,
+        _ => build_archer,
+    };
+    std::array::from_fn(builder)
 }
 
 /// Arrow projectile: shaft + head + fletching along +Z (flight
