@@ -226,3 +226,4 @@ assets_dev/
 # local scratch (not committed)
 tmp/
 docs/plans/
+docs/internal/

@@ -147,6 +147,7 @@ fn control_camera(
 pub fn apply_camera_transform(
     mut query: Query<(&mut RtsCamera, &mut Transform)>,
     terrain: Res<crate::terrain::Terrain>,
+    time: Res<Time>,
 ) {
     let Ok((mut cam, mut transform)) = query.single_mut() else {
         return;
@@ -160,6 +161,14 @@ pub fn apply_camera_transform(
         cam.yaw = crate::util::env_or("FL_CAM_YAW", 0.0);
         cam.pitch = crate::util::env_or("FL_CAM_PITCH", 0.9);
         cam.distance = crate::util::env_or("FL_CAM_DIST", 280.0);
+        // FL_CAM_SWEEP=s: every s seconds the locked camera jumps between
+        // the close-up (40 m) and the whole field (900 m), the worst case
+        // of a sudden zoom, so frame time under camera changes can be
+        // measured from a log instead of by hand.
+        let sweep = crate::util::env_or("FL_CAM_SWEEP", 0.0_f32);
+        if sweep > 0.0 && (time.elapsed_secs() / sweep) as u32 % 2 == 1 {
+            cam.distance = 900.0;
+        }
         cam.target_distance = cam.distance;
     }
     let min = terrain.min();
