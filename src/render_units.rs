@@ -254,11 +254,18 @@ impl SyncComponent for InstanceMaterialData {
 #[derive(Component, Default)]
 struct ExtractedInstances(Vec<InstanceData>);
 
+/// Last frame's cost of the two instance data copies, in microseconds,
+/// for the overlay's frame breakdown. Extract runs on the main thread at
+/// the render sync point, prepare on the render thread.
+pub static EXTRACT_US: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+pub static PREPARE_US: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 fn extract_instance_data(
     main_entities: Extract<Query<(&RenderEntity, &InstanceMaterialData)>>,
     mut extracted: Query<&mut ExtractedInstances>,
     mut commands: Commands,
 ) {
+    let t0 = std::time::Instant::now();
     for (render_entity, data) in &main_entities {
         let e = render_entity.id();
         if let Ok(mut ex) = extracted.get_mut(e) {
@@ -268,6 +275,10 @@ fn extract_instance_data(
             commands.entity(e).insert(ExtractedInstances(data.0.clone()));
         }
     }
+    EXTRACT_US.store(
+        t0.elapsed().as_micros() as u32,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 pub struct UnitRenderPlugin;
@@ -872,6 +883,7 @@ fn prepare_instance_buffers(
     render_device: Res<RenderDevice>,
     queue: Res<RenderQueue>,
 ) {
+    let t0 = std::time::Instant::now();
     for (entity, instances, existing) in &mut query {
         let n = instances.0.len();
         match existing {
@@ -900,6 +912,10 @@ fn prepare_instance_buffers(
             }
         }
     }
+    PREPARE_US.store(
+        t0.elapsed().as_micros() as u32,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 #[derive(Resource)]

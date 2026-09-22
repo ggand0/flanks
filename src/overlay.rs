@@ -79,6 +79,60 @@ fn report_catchup(mut ticks: ResMut<TicksThisFrame>, mut pacing: ResMut<FramePac
     ticks.0 = 0;
 }
 
+/// Main-thread time per frame in three legs, plus the two copies the
+/// render side makes of the instance data. Answers where the CPU frame
+/// goes at a given army size, without a tracing build.
+#[derive(Resource, Default)]
+struct FramePhases {
+    first: Option<std::time::Instant>,
+    after_fixed: Option<std::time::Instant>,
+    last: Option<std::time::Instant>,
+    /// First to the end of the fixed loop: input plus every sim tick
+    /// this frame ran.
+    fixed_leg: Vec<f32>,
+    /// End of the fixed loop to Last: Update and PostUpdate (instance
+    /// sync, UI, transforms).
+    update_leg: Vec<f32>,
+    /// Last to the next First: extract into the render world plus the
+    /// wait for the render thread to release the previous frame.
+    gap_leg: Vec<f32>,
+    /// The extract memcpy of the instance buckets (main thread).
+    extract: Vec<f32>,
+    /// prepare_instance_buffers on the render thread (write_buffer).
+    prepare: Vec<f32>,
+}
+
+fn phase_first(mut ph: ResMut<FramePhases>) {
+    let now = std::time::Instant::now();
+    if let Some(last) = ph.last {
+        ph.gap_leg.push((now - last).as_secs_f32() * 1000.0);
+    }
+    ph.first = Some(now);
+}
+
+fn phase_after_fixed(mut ph: ResMut<FramePhases>) {
+    let now = std::time::Instant::now();
+    if let Some(first) = ph.first {
+        ph.fixed_leg.push((now - first).as_secs_f32() * 1000.0);
+    }
+    ph.after_fixed = Some(now);
+}
+
+fn phase_last(mut ph: ResMut<FramePhases>) {
+    let now = std::time::Instant::now();
+    if let Some(after) = ph.after_fixed {
+        ph.update_leg.push((now - after).as_secs_f32() * 1000.0);
+    }
+    ph.last = Some(now);
+    let us = |a: &std::sync::atomic::AtomicU32| {
+        a.load(std::sync::atomic::Ordering::Relaxed) as f32 / 1000.0
+    };
+    let e = us(&crate::render_units::EXTRACT_US);
+    let p = us(&crate::render_units::PREPARE_US);
+    ph.extract.push(e);
+    ph.prepare.push(p);
+}
+
 pub struct OverlayPlugin;
 
 impl Plugin for OverlayPlugin {
@@ -94,6 +148,21 @@ impl Plugin for OverlayPlugin {
             )
             .init_resource::<TicksThisFrame>()
             .init_resource::<FramePacing>()
+            .init_resource::<FramePhases>()
+            .add_systems(
+                First,
+                phase_first.run_if(in_state(crate::game_state::GameState::Battle)),
+            )
+            .add_systems(
+                RunFixedMainLoop,
+                phase_after_fixed
+                    .in_set(bevy::app::RunFixedMainLoopSystems::AfterFixedMainLoop)
+                    .run_if(in_state(crate::game_state::GameState::Battle)),
+            )
+            .add_systems(
+                Last,
+                phase_last.run_if(in_state(crate::game_state::GameState::Battle)),
+            )
             .add_systems(
                 FixedUpdate,
                 count_sim_tick.in_set(crate::game_state::SimSet),
@@ -286,6 +355,7 @@ fn update_overlay(
     time: Res<Time>,
     mut log_timer: Local<f32>,
     mut pacing: ResMut<FramePacing>,
+    mut phases: ResMut<FramePhases>,
 ) {
     // Mean frame time over the diagnostic's history (about two seconds),
     // and the rate that mean implies. The smoothed values chase the
@@ -387,6 +457,20 @@ fn update_overlay(
         pacing.plain_ms.clear();
         pacing.tick_ms.clear();
         pacing.fixed_ms.clear();
+        let ph = &mut *phases;
+        info!(
+            "  main thread ms: fixed loop {} | update+post {} | extract+wait render {} || instance copies: extract {} | write_buffer (render thread) {}",
+            summary(&mut ph.fixed_leg),
+            summary(&mut ph.update_leg),
+            summary(&mut ph.gap_leg),
+            summary(&mut ph.extract),
+            summary(&mut ph.prepare)
+        );
+        ph.fixed_leg.clear();
+        ph.update_leg.clear();
+        ph.gap_leg.clear();
+        ph.extract.clear();
+        ph.prepare.clear();
         for diag in diagnostics.iter() {
             let path = diag.path().as_str();
             if path.starts_with("render/")
