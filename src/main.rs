@@ -21,6 +21,7 @@ mod settings;
 mod spatial;
 mod terrain;
 mod unit_cards;
+mod unit_glb;
 mod unit_meshes;
 mod unit_types;
 mod units;

@@ -11,6 +11,9 @@ license = "MIT OR Apache-2.0"
 bevy = { version = "0.19", features = ["mp3", "wav"] }
 bytemuck = { version = "1", features = ["derive"] }
 dirs = "6.0.0"
+# Reading unit models (src/unit_glb.rs). Same crate and feature set bevy's
+# own glTF loader already pulls in, so this costs no extra build.
+gltf = { version = "1.4", default-features = false, features = ["names", "utils"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_yaml_ng = "0.10.0"
 

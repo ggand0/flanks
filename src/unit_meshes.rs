@@ -99,7 +99,7 @@ fn weapon_fat() -> f32 {
 /// Weights are areas as the battle camera sees them, looking down at
 /// about 50 degrees: top faces count for more than fronts, and legs
 /// are half hidden under the torso.
-fn blend(parts: &[([f32; 4], f32)]) -> [f32; 4] {
+pub(crate) fn blend(parts: &[([f32; 4], f32)]) -> [f32; 4] {
     let total: f32 = parts.iter().map(|(_, w)| w).sum();
     let mut out = [0.0; 4];
     for (c, w) in parts {
@@ -116,7 +116,7 @@ fn blend(parts: &[([f32; 4], f32)]) -> [f32; 4] {
     out
 }
 
-struct MeshBuf {
+pub(crate) struct MeshBuf {
     /// Face grid size: the FL_MESH_TESS probe on L0, 1 everywhere else.
     tess: usize,
     pos: Vec<[f32; 3]>,
@@ -137,7 +137,7 @@ impl MeshBuf {
         }
     }
 
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             tess: 1,
             pos: Vec::new(),
@@ -150,7 +150,14 @@ impl MeshBuf {
 
     /// Axis-aligned cuboid: 24 verts (4 per face, per-face normals),
     /// 12 tris. `part`/`pivot_y` ride in the UV channel for shader anim.
-    fn cuboid(&mut self, center: Vec3, half: Vec3, part: f32, pivot_y: f32, col: [f32; 4]) {
+    pub(crate) fn cuboid(
+        &mut self,
+        center: Vec3,
+        half: Vec3,
+        part: f32,
+        pivot_y: f32,
+        col: [f32; 4],
+    ) {
         const FACES: [([f32; 3], [usize; 2]); 6] = [
             ([1.0, 0.0, 0.0], [1, 2]),  // +X, spanned by y,z
             ([-1.0, 0.0, 0.0], [1, 2]), // -X
@@ -302,7 +309,7 @@ impl MeshBuf {
     }
 }
 
-fn build(m: MeshBuf) -> Mesh {
+pub(crate) fn build(m: MeshBuf) -> Mesh {
     Mesh::new(
         PrimitiveTopology::TriangleList,
         RenderAssetUsages::RENDER_WORLD,

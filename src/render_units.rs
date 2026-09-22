@@ -413,7 +413,7 @@ fn setup_unit_mesh(
     // its draw function never runs and that bucket's units silently vanish
     // (the "LOD far bucket invisible" bug, devlog 0013).
     for kind in 0..crate::unit_types::NUM_KINDS {
-        let lods = crate::unit_meshes::build_kind_lods(kind);
+        let lods = crate::unit_glb::kind_lods(kind);
         let tris: Vec<usize> =
             lods.iter().map(|m| m.indices().map_or(0, |i| i.len() / 3)).collect();
         info!("unit meshes: kind {kind} tris per level {tris:?}");
