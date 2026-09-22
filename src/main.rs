@@ -98,6 +98,19 @@ fn main() {
             picker::PickerPlugin,
         ))
         .insert_resource(Time::<Fixed>::from_hz(30.0))
+        // A frame that overruns makes the fixed clock owe catch-up sim
+        // ticks, which Bevy runs back to back the next frame (default
+        // max_delta 250 ms = up to 7 ticks at 30 Hz). Every tick after
+        // the first in a frame has to wait for its job in full, so the
+        // burst overruns the frame it lands in and one slow frame
+        // snowballs into a felt lag spike. Clamping virtual time to
+        // FL_CATCHUP tick periods (default 2) caps the burst. Time past
+        // the clamp is dropped: a stall plays as a moment of slow motion.
+        .insert_resource(Time::<Virtual>::from_max_delta(
+            std::time::Duration::from_secs_f64(
+                crate::util::env_or("FL_CATCHUP", 2_u32).max(1) as f64 / 30.0,
+            ),
+        ))
         .insert_resource(ClearColor(Color::srgb(0.62, 0.70, 0.78)))
         .add_systems(Startup, setup_world)
         .run();

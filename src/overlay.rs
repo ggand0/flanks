@@ -21,6 +21,126 @@ struct InspectPanel;
 #[derive(Component)]
 struct InspectText;
 
+/// Sim ticks run since the last render frame. More than one means the
+/// fixed clock is catching up after an overrun frame. The FL_CATCHUP
+/// clamp (main.rs) bounds the burst, so a played session should never
+/// log more than the clamp allows.
+#[derive(Resource, Default)]
+struct TicksThisFrame(u32);
+
+fn count_sim_tick(mut ticks: ResMut<TicksThisFrame>) {
+    ticks.0 += 1;
+}
+
+/// Frame pacing over one log period: frame intervals split by whether
+/// the frame carried a sim tick, and the time the fixed tick itself held
+/// the frame. The fps average cannot show a pattern that alternates
+/// between short and long frames. This does.
+#[derive(Resource, Default)]
+struct FramePacing {
+    plain_ms: Vec<f32>,
+    tick_ms: Vec<f32>,
+    /// Wall time between FixedFirst and FixedLast, summed per frame.
+    fixed_ms: Vec<f32>,
+    fixed_start: Option<std::time::Instant>,
+    fixed_this_frame: f32,
+    last_frame: Option<std::time::Instant>,
+}
+
+fn fixed_begin(mut pacing: ResMut<FramePacing>) {
+    pacing.fixed_start = Some(std::time::Instant::now());
+}
+
+fn fixed_end(mut pacing: ResMut<FramePacing>) {
+    if let Some(t0) = pacing.fixed_start.take() {
+        pacing.fixed_this_frame += t0.elapsed().as_secs_f32() * 1000.0;
+    }
+}
+
+/// Runs once per frame in Update, after this frame's fixed ticks: the
+/// interval since the last call therefore contains this frame's
+/// FixedUpdate, and is filed under this frame's tick count.
+fn report_catchup(mut ticks: ResMut<TicksThisFrame>, mut pacing: ResMut<FramePacing>) {
+    if ticks.0 > 1 {
+        info!("[catchup] {} sim ticks in one frame", ticks.0);
+    }
+    let now = std::time::Instant::now();
+    if let Some(last) = pacing.last_frame.replace(now) {
+        let ms = (now - last).as_secs_f32() * 1000.0;
+        if ticks.0 > 0 {
+            pacing.tick_ms.push(ms);
+            let fixed = pacing.fixed_this_frame;
+            pacing.fixed_ms.push(fixed);
+        } else {
+            pacing.plain_ms.push(ms);
+        }
+    }
+    pacing.fixed_this_frame = 0.0;
+    ticks.0 = 0;
+}
+
+/// Main-thread time per frame in three legs, plus the two copies the
+/// render side makes of the instance data. Answers where the CPU frame
+/// goes at a given army size, without a tracing build.
+#[derive(Resource, Default)]
+struct FramePhases {
+    first: Option<std::time::Instant>,
+    after_fixed: Option<std::time::Instant>,
+    last: Option<std::time::Instant>,
+    /// First to the end of the fixed loop: input plus every sim tick
+    /// this frame ran.
+    fixed_leg: Vec<f32>,
+    /// End of the fixed loop to Last: Update and PostUpdate (instance
+    /// sync, UI, transforms).
+    update_leg: Vec<f32>,
+    /// Last to the next First: extract into the render world plus the
+    /// wait for the render thread to release the previous frame.
+    gap_leg: Vec<f32>,
+    /// The extract memcpy of the instance buckets (main thread).
+    extract: Vec<f32>,
+    /// prepare_instance_buffers on the render thread (write_buffer).
+    prepare: Vec<f32>,
+}
+
+fn phase_first(mut ph: ResMut<FramePhases>) {
+    let now = std::time::Instant::now();
+    if let Some(last) = ph.last {
+        ph.gap_leg.push((now - last).as_secs_f32() * 1000.0);
+    }
+    ph.first = Some(now);
+}
+
+fn phase_after_fixed(mut ph: ResMut<FramePhases>) {
+    let now = std::time::Instant::now();
+    if let Some(first) = ph.first {
+        ph.fixed_leg.push((now - first).as_secs_f32() * 1000.0);
+    }
+    ph.after_fixed = Some(now);
+}
+
+fn phase_last(mut ph: ResMut<FramePhases>) {
+    let now = std::time::Instant::now();
+    if let Some(after) = ph.after_fixed {
+        ph.update_leg.push((now - after).as_secs_f32() * 1000.0);
+    }
+    ph.last = Some(now);
+    let us = |a: &std::sync::atomic::AtomicU32| {
+        a.load(std::sync::atomic::Ordering::Relaxed) as f32 / 1000.0
+    };
+    let e = us(&crate::render_units::EXTRACT_US);
+    let p = us(&crate::render_units::PREPARE_US);
+    ph.extract.push(e);
+    ph.prepare.push(p);
+}
+
+/// The fixed-tick clock runs in every state and the phase marks keep
+/// their last stamps across the menu, so without a reset the first
+/// samples of a battle would carry menu time.
+fn reset_frame_stats(mut pacing: ResMut<FramePacing>, mut phases: ResMut<FramePhases>) {
+    *pacing = FramePacing::default();
+    *phases = FramePhases::default();
+}
+
 pub struct OverlayPlugin;
 
 impl Plugin for OverlayPlugin {
@@ -32,11 +152,34 @@ impl Plugin for OverlayPlugin {
             .add_systems(Startup, (spawn_overlay, spawn_inspect_panel))
             .add_systems(
                 OnEnter(crate::game_state::GameState::Battle),
-                show_overlay,
+                (show_overlay, reset_frame_stats),
+            )
+            .init_resource::<TicksThisFrame>()
+            .init_resource::<FramePacing>()
+            .init_resource::<FramePhases>()
+            .add_systems(
+                First,
+                phase_first.run_if(in_state(crate::game_state::GameState::Battle)),
             )
             .add_systems(
+                RunFixedMainLoop,
+                phase_after_fixed
+                    .in_set(bevy::app::RunFixedMainLoopSystems::AfterFixedMainLoop)
+                    .run_if(in_state(crate::game_state::GameState::Battle)),
+            )
+            .add_systems(
+                Last,
+                phase_last.run_if(in_state(crate::game_state::GameState::Battle)),
+            )
+            .add_systems(
+                FixedUpdate,
+                count_sim_tick.in_set(crate::game_state::SimSet),
+            )
+            .add_systems(FixedFirst, fixed_begin)
+            .add_systems(FixedLast, fixed_end)
+            .add_systems(
                 Update,
-                (update_overlay, update_inspect_panel)
+                (update_overlay, update_inspect_panel, report_catchup)
                     .run_if(in_state(crate::game_state::GameState::Battle)),
             )
             .add_systems(
@@ -219,15 +362,18 @@ fn update_overlay(
     mut query: Query<&mut Text, With<OverlayText>>,
     time: Res<Time>,
     mut log_timer: Local<f32>,
+    mut pacing: ResMut<FramePacing>,
+    mut phases: ResMut<FramePhases>,
 ) {
-    let fps = diagnostics
-        .get(&FrameTimeDiagnosticsPlugin::FPS)
-        .and_then(|d| d.smoothed())
-        .unwrap_or(0.0);
+    // Mean frame time over the diagnostic's history (about two seconds),
+    // and the rate that mean implies. The smoothed values chase the
+    // latest frame: frames that carry a sim tick are longer than the
+    // ones between them, so the readout flickered between two rates.
     let frame_ms = diagnostics
         .get(&FrameTimeDiagnosticsPlugin::FRAME_TIME)
-        .and_then(|d| d.smoothed())
+        .and_then(|d| d.average())
         .unwrap_or(0.0);
+    let fps = if frame_ms > 0.0 { 1000.0 / frame_ms } else { 0.0 };
 
     let banner = match outcome.0 {
         Some(0) => "\n=== VICTORY: the enemy army is broken ===",
@@ -295,6 +441,44 @@ fn update_overlay(
             render_counts.lod_drawn,
             render_counts.corpses_drawn
         );
+        // Frame pacing over this log period, split by whether the frame
+        // carried a sim tick. The average above hides a pattern that
+        // alternates between short and long frames; this shows it.
+        let summary = |ms: &mut Vec<f32>| {
+            ms.sort_by(|a, b| a.total_cmp(b));
+            let at = |q: f32| ms.get(((ms.len().max(1) - 1) as f32 * q) as usize).copied();
+            format!(
+                "p50 {:.1} p90 {:.1} max {:.1} (n {})",
+                at(0.5).unwrap_or(0.0),
+                at(0.9).unwrap_or(0.0),
+                at(1.0).unwrap_or(0.0),
+                ms.len()
+            )
+        };
+        let pacing = &mut *pacing;
+        info!(
+            "  frame ms without a tick: {} | with a tick: {} | inside the fixed tick: {}",
+            summary(&mut pacing.plain_ms),
+            summary(&mut pacing.tick_ms),
+            summary(&mut pacing.fixed_ms)
+        );
+        pacing.plain_ms.clear();
+        pacing.tick_ms.clear();
+        pacing.fixed_ms.clear();
+        let ph = &mut *phases;
+        info!(
+            "  main thread ms: fixed loop {} | update+post {} | extract+wait render {} || instance copies: extract {} | write_buffer (render thread) {}",
+            summary(&mut ph.fixed_leg),
+            summary(&mut ph.update_leg),
+            summary(&mut ph.gap_leg),
+            summary(&mut ph.extract),
+            summary(&mut ph.prepare)
+        );
+        ph.fixed_leg.clear();
+        ph.update_leg.clear();
+        ph.gap_leg.clear();
+        ph.extract.clear();
+        ph.prepare.clear();
         for diag in diagnostics.iter() {
             let path = diag.path().as_str();
             if path.starts_with("render/")

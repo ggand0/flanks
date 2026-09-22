@@ -15,7 +15,6 @@
 //! integrate body too.
 
 use bevy::prelude::*;
-use bevy::tasks::ComputeTaskPool;
 
 pub const CELL_SIZE: f32 = 1.5;
 /// Grid never exceeds this many cells per axis (memory guard).
@@ -124,7 +123,7 @@ impl SpatialGrid {
         self.hists.resize(n_chunks, Vec::new());
 
         // Count pass: per-chunk histograms + cached per-unit cell index.
-        ComputeTaskPool::get().scope(|scope| {
+        crate::util::sim_scope(|scope| {
             for (pos_chunk, (cell_chunk, hist)) in positions
                 .chunks(REBUILD_CHUNK)
                 .zip(self.cell_of.chunks_mut(REBUILD_CHUNK).zip(&mut self.hists))
@@ -162,7 +161,7 @@ impl SpatialGrid {
         self.sorted.resize(n, SortedUnit::default());
         let out = SharedOut(self.sorted.as_mut_ptr());
         let out = &out;
-        ComputeTaskPool::get().scope(|scope| {
+        crate::util::sim_scope(|scope| {
             for (t, (pos_chunk, (cell_chunk, hist))) in positions
                 .chunks(REBUILD_CHUNK)
                 .zip(self.cell_of.chunks(REBUILD_CHUNK).zip(&mut self.hists))
