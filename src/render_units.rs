@@ -263,6 +263,27 @@ pub(crate) struct ExtractedInstances(Vec<InstanceData>);
 /// the render sync point, prepare on the render thread.
 pub static EXTRACT_US: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 pub static PREPARE_US: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Wall time of the render thread's frame, first render system to last,
+/// in microseconds. Under pipelined rendering the main thread waits for
+/// this at the end of its own frame, so it is the other half of the
+/// `extract+wait render` leg.
+pub static RENDER_US: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+#[derive(Resource, Default)]
+struct RenderFrameClock(Option<std::time::Instant>);
+
+fn render_frame_begin(mut clock: ResMut<RenderFrameClock>) {
+    clock.0 = Some(std::time::Instant::now());
+}
+
+fn render_frame_end(clock: Res<RenderFrameClock>) {
+    if let Some(t0) = clock.0 {
+        RENDER_US.store(
+            t0.elapsed().as_micros() as u32,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+}
 
 fn extract_instance_data(
     main_entities: Extract<Query<(&RenderEntity, &InstanceMaterialData)>>,
@@ -308,7 +329,15 @@ impl Plugin for UnitRenderPlugin {
                     .run_if(cpu_sync),
             );
         app.sub_app_mut(RenderApp)
+            .init_resource::<RenderFrameClock>()
             .add_systems(ExtractSchedule, extract_instance_data)
+            .add_systems(
+                Render,
+                (
+                    render_frame_begin.in_set(RenderSystems::ExtractCommands),
+                    render_frame_end.in_set(RenderSystems::PostCleanup),
+                ),
+            )
             .add_render_command::<Transparent3d, DrawCustom>()
             .init_resource::<SpecializedMeshPipelines<CustomPipeline>>()
             .init_resource::<SpecializedRenderPipelines<CustomPipeline>>()

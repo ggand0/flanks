@@ -100,6 +100,8 @@ struct FramePhases {
     extract: Vec<f32>,
     /// prepare_instance_buffers on the render thread (write_buffer).
     prepare: Vec<f32>,
+    /// The render thread's frame, first render system to last.
+    render: Vec<f32>,
 }
 
 fn phase_first(mut ph: ResMut<FramePhases>) {
@@ -129,8 +131,10 @@ fn phase_last(mut ph: ResMut<FramePhases>) {
     };
     let e = us(&crate::render_units::EXTRACT_US);
     let p = us(&crate::render_units::PREPARE_US);
+    let r = us(&crate::render_units::RENDER_US);
     ph.extract.push(e);
     ph.prepare.push(p);
+    ph.render.push(r);
 }
 
 /// The fixed-tick clock runs in every state and the phase marks keep
@@ -467,18 +471,20 @@ fn update_overlay(
         pacing.fixed_ms.clear();
         let ph = &mut *phases;
         info!(
-            "  main thread ms: fixed loop {} | update+post {} | extract+wait render {} || instance copies: extract {} | write_buffer (render thread) {}",
+            "  main thread ms: fixed loop {} | update+post {} | extract+wait render {} || instance copies: extract {} | write_buffer (render thread) {} || render thread frame {}",
             summary(&mut ph.fixed_leg),
             summary(&mut ph.update_leg),
             summary(&mut ph.gap_leg),
             summary(&mut ph.extract),
-            summary(&mut ph.prepare)
+            summary(&mut ph.prepare),
+            summary(&mut ph.render)
         );
         ph.fixed_leg.clear();
         ph.update_leg.clear();
         ph.gap_leg.clear();
         ph.extract.clear();
         ph.prepare.clear();
+        ph.render.clear();
         for diag in diagnostics.iter() {
             let path = diag.path().as_str();
             if path.starts_with("render/")
