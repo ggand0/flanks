@@ -39,7 +39,7 @@ use bevy::math::primitives::ViewFrustum;
 use bytemuck::{Pod, Zeroable};
 
 use crate::render_units_gpu::{
-    GpuSyncConfig, GpuUnitBuffers, GpuUnitInput, PullMeshGpu, PulledBucketGpu, cpu_sync,
+    GpuSyncConfig, GpuUnitBuffers, GpuUnitInput, PullMeshGpu, PulledBucketGpu, cpu_sweep,
     pull_mesh_for,
 };
 use crate::units::Units;
@@ -61,6 +61,33 @@ pub struct RenderCounts {
     pub corpses_drawn: usize,
     /// Cost of sync_instance_data this frame (cull + bucket build).
     pub sync_ms: f32,
+    /// FL_GPU_CHECK: what the CPU sweep would have drawn on recent frames,
+    /// as (frame, living per bucket, fallen per bucket), for the GPU
+    /// readback to compare against.
+    pub check: std::collections::VecDeque<(u32, [u32; NUM_BUCKETS], [u32; NUM_BUCKETS])>,
+}
+
+impl RenderCounts {
+    /// The display counts from per-bucket living and fallen counts.
+    /// Buckets are kind-major: per-kind counts sum each run of levels,
+    /// per-level counts sum across kinds.
+    pub(crate) fn set_from_buckets(
+        &mut self,
+        living: &[u32; NUM_BUCKETS],
+        fallen: &[u32; NUM_BUCKETS],
+    ) {
+        self.drawn = living.iter().map(|&n| n as usize).sum();
+        self.bucket_drawn.clear();
+        self.bucket_drawn.extend(
+            living
+                .chunks(NUM_LODS)
+                .map(|levels| levels.iter().map(|&n| n as usize).sum::<usize>()),
+        );
+        self.lod_drawn = std::array::from_fn(|lod| {
+            living.iter().skip(lod).step_by(NUM_LODS).map(|&n| n as usize).sum()
+        });
+        self.corpses_drawn = fallen.iter().map(|&n| n as usize).sum();
+    }
 }
 
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -340,7 +367,7 @@ impl Plugin for UnitRenderPlugin {
                 Update,
                 sync_instance_data
                     .after(crate::camera::apply_camera_transform)
-                    .run_if(cpu_sync),
+                    .run_if(cpu_sweep),
             );
         app.sub_app_mut(RenderApp)
             .init_resource::<RenderFrameClock>()
@@ -511,6 +538,7 @@ fn sync_instance_data(
     mut scratch: Local<Vec<[Vec<InstanceData>; NUM_BUCKETS]>>,
     mut corpse_scratch: Local<Vec<[Vec<InstanceData>; NUM_LODS]>>,
     mut smooth: Local<SmoothState>,
+    (gpu, frame): (Res<GpuSyncConfig>, Res<bevy::diagnostic::FrameCount>),
 ) {
     let _span = info_span!("sync_instances").entered();
     let t0 = std::time::Instant::now();
@@ -830,26 +858,26 @@ fn sync_instance_data(
             data.extend_from_slice(&chunk_scratch[b]);
         }
     }
-    // Counts cover the living, read before the fallen join the buckets.
-    counts.drawn = buckets.iter().map(|(_, d)| d.len()).sum();
-    counts.total = units.len();
-    // Buckets are kind-major: per-kind counts sum each run of levels,
-    // per-level counts sum across kinds.
-    counts.bucket_drawn.clear();
-    counts.bucket_drawn.extend(
-        buckets
-            .chunks(NUM_LODS)
-            .map(|levels| levels.iter().map(|(_, d)| d.len()).sum::<usize>()),
-    );
-    counts.lod_drawn = std::array::from_fn(|lod| {
-        buckets.iter().skip(lod).step_by(NUM_LODS).map(|(_, d)| d.len()).sum()
-    });
-    counts.corpses_drawn = 0;
+    // Per-bucket counts: the living, read before the fallen join the
+    // buckets, and the fallen as they join.
+    let living: [u32; NUM_BUCKETS] = std::array::from_fn(|b| buckets[b].1.len() as u32);
+    let mut fallen = [0u32; NUM_BUCKETS];
     for ((kind, _), out) in corpse_jobs.iter().zip(corpse_scratch.iter()) {
         for (lod, bodies) in out.iter().enumerate() {
             buckets[bucket_of(*kind, lod)].1.extend_from_slice(bodies);
-            counts.corpses_drawn += bodies.len();
+            fallen[bucket_of(*kind, lod)] += bodies.len() as u32;
         }
+    }
+    counts.total = units.len();
+    if gpu.enabled && gpu.check {
+        // FL_GPU_CHECK: the GPU path owns the display. This sweep only
+        // records what it would have drawn, for the readback to compare.
+        counts.check.push_back((frame.0, living, fallen));
+        while counts.check.len() > 8 {
+            counts.check.pop_front();
+        }
+    } else {
+        counts.set_from_buckets(&living, &fallen);
     }
     counts.sync_ms = t0.elapsed().as_secs_f32() * 1000.0;
 }

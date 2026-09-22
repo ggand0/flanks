@@ -74,7 +74,7 @@ struct Params {
     corpse_base: u32,
     corpse_len: vec4<u32>,
     corpse_cap: u32,
-    tick: u32,
+    frame: u32,
     pad0: u32,
     pad1: u32,
     // [kind * 3 + set]: set 0 fine, 1 coarse, 2 plain. xyz = squared
@@ -103,6 +103,9 @@ struct DrawArgs {
 // 0..16 soldiers per bucket (living and fallen), 16..32 the fallen alone.
 @group(0) @binding(6) var<storage, read_write> counts: array<atomic<u32>, 32>;
 @group(0) @binding(7) var<storage, read_write> args: array<DrawArgs, 16>;
+// Copied back to the CPU by Bevy's readback plugin: the 32 counts, the
+// frame stamp and the soldier count.
+@group(0) @binding(8) var<storage, read_write> readback: array<u32, 36>;
 
 const CULL_RADIUS: f32 = 2.5;
 const LOD_JITTER: f32 = 0.2;
@@ -318,5 +321,12 @@ fn build(@builtin(global_invocation_id) gid: vec3<u32>) {
 @compute @workgroup_size(16)
 fn finalize(@builtin(local_invocation_index) b: u32) {
     let count = atomicLoad(&counts[b]);
+    let fallen = atomicLoad(&counts[16u + b]);
     args[b] = DrawArgs(count * params.buckets[b].y, 1u, 0u, 0u);
+    readback[b] = count;
+    readback[16u + b] = fallen;
+    if b == 0u {
+        readback[32u] = params.frame;
+        readback[33u] = params.n;
+    }
 }

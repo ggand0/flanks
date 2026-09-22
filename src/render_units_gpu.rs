@@ -11,15 +11,19 @@
 //! `FL_GPU_SYNC=1` turns this path on. Unset it keeps the CPU path in
 //! render_units.rs, which stays complete as the A/B and the fallback.
 
-use bevy::asset::{embedded_asset, load_embedded_asset};
+use bevy::asset::{RenderAssetUsages, embedded_asset, load_embedded_asset};
 use bevy::core_pipeline::{Core3d, Core3dSystems};
+use bevy::diagnostic::FrameCount;
 use bevy::math::primitives::ViewFrustum;
 use bevy::prelude::*;
 use bevy::render::{
     Extract, ExtractSchedule, MainWorld, Render, RenderApp, RenderStartup, RenderSystems,
     diagnostic::RecordDiagnostics,
+    gpu_readback::{Readback, ReadbackComplete},
+    render_asset::RenderAssets,
     render_resource::*,
     renderer::{RenderAdapter, RenderContext, RenderDevice, RenderQueue},
+    storage::{GpuShaderBuffer, ShaderBuffer},
     sync_world::RenderEntity,
 };
 use bytemuck::{Pod, Zeroable};
@@ -37,15 +41,23 @@ use crate::unit_types::NUM_KINDS;
 #[derive(Resource, Clone, Copy)]
 pub struct GpuSyncConfig {
     pub enabled: bool,
+    /// FL_GPU_CHECK=1: the CPU sweep runs too and its per-bucket counts
+    /// are compared with the GPU's on the same frame.
+    pub check: bool,
 }
 
 pub fn gpu_sync(cfg: Res<GpuSyncConfig>) -> bool {
     cfg.enabled
 }
 
-pub fn cpu_sync(cfg: Res<GpuSyncConfig>) -> bool {
-    !cfg.enabled
+/// The CPU sweep runs on the CPU path, and next to the GPU path in check mode.
+pub fn cpu_sweep(cfg: Res<GpuSyncConfig>) -> bool {
+    !cfg.enabled || cfg.check
 }
+
+/// Words of the counts readback: 16 bucket totals, 16 fallen per bucket,
+/// the frame stamp, the soldier count.
+const READBACK_WORDS: usize = 36;
 
 /// Per-tick snapshot of one soldier, 56 bytes, every field exact. All
 /// scalars, so the WGSL struct (`Soldier` in unit_build.wgsl) has the same
@@ -99,7 +111,8 @@ pub struct BuildParams {
     corpse_base: u32,
     corpse_len: UVec4,
     corpse_cap: u32,
-    tick: u32,
+    /// The frame this pass belongs to, stamped into the readback.
+    frame: u32,
     pad0: u32,
     pad1: u32,
     /// [kind * 3 + set]: set 0 fine, 1 coarse, 2 plain.
@@ -215,6 +228,7 @@ fn build_frame_params(
     mut frame: ResMut<GpuFrameInput>,
     mut counts: ResMut<RenderCounts>,
     mut no_cull: Local<Option<bool>>,
+    frame_count: Res<FrameCount>,
 ) {
     let t0 = std::time::Instant::now();
     let Ok((cam, projection, cam_tf)) = camera.single() else {
@@ -286,13 +300,92 @@ fn build_frame_params(
         crate::movement::HIT_STAGGER_TICKS as f32,
         CELEBRATE_BASE,
     );
-    p.tick = snap.tick;
+    p.frame = frame_count.0;
     frame.params = p;
     frame.lod_debug = lod_cfg.debug;
 
     counts.total = units.len();
     let pack_ms = if snap.fresh { snap.pack_ms } else { 0.0 };
     counts.sync_ms = pack_ms + t0.elapsed().as_secs_f32() * 1000.0;
+}
+
+/// The counts readback buffer: a storage buffer asset the compute pass
+/// writes and Bevy's readback plugin copies back, one to two frames late.
+/// Debug and overlay only, nothing in the game reads it.
+#[derive(Resource)]
+pub struct CountsReadback {
+    handle: Handle<ShaderBuffer>,
+}
+
+fn setup_counts_readback(mut commands: Commands, mut buffers: ResMut<Assets<ShaderBuffer>>) {
+    let mut buffer = ShaderBuffer::with_size(READBACK_WORDS * 4, RenderAssetUsages::RENDER_WORLD);
+    buffer.buffer_description.label = Some("unit bucket counts readback");
+    buffer.buffer_description.usage =
+        BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC;
+    let handle = buffers.add(buffer);
+    commands
+        .spawn(Readback::buffer(handle.clone()))
+        .observe(on_counts_readback);
+    commands.insert_resource(CountsReadback { handle });
+}
+
+#[derive(Default)]
+struct CheckStats {
+    compared: u32,
+    mismatched: u32,
+    worst: u32,
+    detailed: u32,
+}
+
+/// A readback landed: fill the overlay counts, and in check mode compare
+/// them with what the CPU sweep recorded for the same frame.
+fn on_counts_readback(
+    event: On<ReadbackComplete>,
+    cfg: Res<GpuSyncConfig>,
+    mut counts: ResMut<RenderCounts>,
+    mut stats: Local<CheckStats>,
+) {
+    let words: Vec<u32> = event
+        .data
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    if words.len() < READBACK_WORDS {
+        return;
+    }
+    let fallen: [u32; NUM_BUCKETS] = std::array::from_fn(|b| words[NUM_BUCKETS + b]);
+    let living: [u32; NUM_BUCKETS] = std::array::from_fn(|b| words[b].saturating_sub(fallen[b]));
+    let frame = words[2 * NUM_BUCKETS];
+    counts.set_from_buckets(&living, &fallen);
+    if !cfg.check {
+        return;
+    }
+    let Some(&(_, cpu_living, cpu_fallen)) = counts.check.iter().find(|e| e.0 == frame) else {
+        return;
+    };
+    let mut worst = 0u32;
+    for b in 0..NUM_BUCKETS {
+        worst = worst
+            .max(living[b].abs_diff(cpu_living[b]))
+            .max(fallen[b].abs_diff(cpu_fallen[b]));
+    }
+    stats.compared += 1;
+    if worst > 0 {
+        stats.mismatched += 1;
+        stats.worst = stats.worst.max(worst);
+        if stats.detailed < 5 {
+            stats.detailed += 1;
+            warn!(
+                "[gpu check] frame {frame}: gpu living {living:?} fallen {fallen:?} | cpu living {cpu_living:?} fallen {cpu_fallen:?}"
+            );
+        }
+    }
+    if stats.compared.is_multiple_of(300) {
+        info!(
+            "[gpu check] {} frames compared, {} differed, worst bucket difference {}",
+            stats.compared, stats.mismatched, stats.worst
+        );
+    }
 }
 
 /// One mesh corner as the pulled draw reads it from a storage buffer
@@ -406,6 +499,7 @@ pub struct GpuUnitInput {
     corpse_len: [u32; NUM_KINDS],
     /// Scratch for coalesced corpse uploads.
     corpse_run: Vec<InstanceData>,
+    readback: Option<Handle<ShaderBuffer>>,
 }
 
 /// Swap the snapshot into the render world and copy the small per-frame
@@ -438,6 +532,11 @@ fn extract_gpu_units(mut main_world: ResMut<MainWorld>, mut input: ResMut<GpuUni
     input.regiments.clear();
     input.regiments.extend_from_slice(&frame.regiments);
     input.lod_debug = frame.lod_debug;
+    if input.readback.is_none() {
+        input.readback = main_world
+            .get_resource::<CountsReadback>()
+            .map(|r| r.handle.clone());
+    }
 }
 
 /// The compute pipelines and their bind group layout.
@@ -461,6 +560,7 @@ fn init_gpu_unit_pipelines(
                 binding_types::uniform_buffer::<BuildParams>(false),
                 binding_types::storage_buffer_read_only_sized(false, None),
                 binding_types::storage_buffer_read_only_sized(false, None),
+                binding_types::storage_buffer_sized(false, None),
                 binding_types::storage_buffer_sized(false, None),
                 binding_types::storage_buffer_sized(false, None),
                 binding_types::storage_buffer_sized(false, None),
@@ -577,6 +677,9 @@ pub struct GpuUnitBuffers {
     pub alloc: Option<UnitAlloc>,
     params: UniformBuffer<BuildParams>,
     bind_group: Option<BindGroup>,
+    /// The readback buffer the bind group holds. The asset can be
+    /// recreated, and then the bind group follows.
+    bound_readback: Option<BufferId>,
     /// Bumped whenever a buffer bound by a draw bind group is recreated.
     pub generation: u32,
     /// Threads of this frame's build dispatch.
@@ -594,6 +697,7 @@ fn prepare_gpu_units(
     pipeline_cache: Res<PipelineCache>,
     device: Res<RenderDevice>,
     queue: Res<RenderQueue>,
+    gpu_buffers: Res<RenderAssets<GpuShaderBuffer>>,
 ) {
     if !input.enabled {
         return;
@@ -684,6 +788,16 @@ fn prepare_gpu_units(
     buffers.params.write_buffer(&device, &queue);
     buffers.threads = n as u32 + input.corpse_len.iter().sum::<u32>();
 
+    // The readback asset arrives a frame or two after startup. No bind
+    // group until then, so the pass waits and nothing draws.
+    let Some(readback) = input.readback.as_ref().and_then(|h| gpu_buffers.get(h)) else {
+        buffers.bind_group = None;
+        return;
+    };
+    if buffers.bound_readback != Some(readback.buffer.id()) {
+        buffers.bound_readback = Some(readback.buffer.id());
+        buffers.bind_group = None;
+    }
     if buffers.bind_group.is_none() {
         buffers.bind_group = Some(device.create_bind_group(
             "unit build bind group",
@@ -697,6 +811,7 @@ fn prepare_gpu_units(
                 alloc.index_list.as_entire_binding(),
                 alloc.counts.as_entire_binding(),
                 alloc.args.as_entire_binding(),
+                readback.buffer.as_entire_binding(),
             )),
         ));
     }
@@ -785,6 +900,7 @@ impl Plugin for GpuUnitRenderPlugin {
         embedded_asset!(app, "shaders/unit_build.wgsl");
         app.init_resource::<SoldierSnapshot>()
             .init_resource::<GpuFrameInput>()
+            .add_systems(Startup, setup_counts_readback.run_if(gpu_sync))
             .add_systems(
                 PostUpdate,
                 (pack_soldier_snapshot, build_frame_params)
@@ -818,6 +934,7 @@ impl Plugin for GpuUnitRenderPlugin {
     /// downlevel backend can lack the first, and then the CPU path stays.
     fn finish(&self, app: &mut App) {
         let requested = std::env::var("FL_GPU_SYNC").is_ok_and(|v| v == "1");
+        let check = std::env::var("FL_GPU_CHECK").is_ok();
         let supported = match (
             app.world().get_resource::<RenderAdapter>(),
             app.world().get_resource::<RenderDevice>(),
@@ -837,8 +954,12 @@ impl Plugin for GpuUnitRenderPlugin {
         if requested && supported {
             info!("FL_GPU_SYNC: unit render data built on the GPU");
         }
+        if check && requested && supported {
+            info!("FL_GPU_CHECK: the CPU sweep runs too, counts compared per frame");
+        }
         app.insert_resource(GpuSyncConfig {
             enabled: requested && supported,
+            check,
         });
     }
 }
