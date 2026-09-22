@@ -8,7 +8,7 @@
 //! his kind-by-level index list. The list counts become indirect draw
 //! arguments and each bucket draws with one pulled, non-instanced draw.
 //!
-//! `FL_GPU_SYNC=1` turns this path on. Unset it keeps the CPU path in
+//! This is the default path. `FL_GPU_SYNC=0` keeps the CPU path in
 //! render_units.rs, which stays complete as the A/B and the fallback.
 
 use bevy::asset::{RenderAssetUsages, embedded_asset, load_embedded_asset};
@@ -933,7 +933,7 @@ impl Plugin for GpuUnitRenderPlugin {
     /// the vertex stage, atomics and indirect draws are core WebGPU, but a
     /// downlevel backend can lack the first, and then the CPU path stays.
     fn finish(&self, app: &mut App) {
-        let requested = std::env::var("FL_GPU_SYNC").is_ok_and(|v| v == "1");
+        let requested = !std::env::var("FL_GPU_SYNC").is_ok_and(|v| v == "0");
         let check = std::env::var("FL_GPU_CHECK").is_ok();
         let supported = match (
             app.world().get_resource::<RenderAdapter>(),
@@ -949,10 +949,10 @@ impl Plugin for GpuUnitRenderPlugin {
             _ => false,
         };
         if requested && !supported {
-            warn!("FL_GPU_SYNC=1 but this device lacks vertex storage buffers: CPU path");
+            warn!("this device lacks vertex storage buffers: the CPU unit path runs instead");
         }
         if requested && supported {
-            info!("FL_GPU_SYNC: unit render data built on the GPU");
+            info!("unit render data built on the GPU (FL_GPU_SYNC=0 for the CPU path)");
         }
         if check && requested && supported {
             info!("FL_GPU_CHECK: the CPU sweep runs too, counts compared per frame");
