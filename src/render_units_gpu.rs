@@ -25,9 +25,9 @@ use bevy::render::{
 use bytemuck::{Pod, Zeroable};
 
 use crate::render_units::{
-    CELEBRATE_BASE, CORPSE_CAP, CustomPipeline, InstanceBucket, LodBands, LodConfig, NUM_BUCKETS,
-    NUM_LODS, RenderCounts, SYNC_CHUNK, celebrate_progress, march_signal, regiment_phase, stance_tier,
-    wall_signal,
+    CELEBRATE_BASE, CORPSE_CAP, Corpses, CustomPipeline, InstanceBucket, InstanceData, LodBands,
+    LodConfig, NUM_BUCKETS, NUM_LODS, RenderCounts, SYNC_CHUNK, celebrate_progress, march_signal,
+    regiment_phase, stance_tier, wall_signal,
 };
 use crate::units::Units;
 use crate::unit_types::NUM_KINDS;
@@ -400,6 +400,12 @@ pub struct GpuUnitInput {
     params: BuildParams,
     regiments: Vec<RegimentRecord>,
     pub lod_debug: bool,
+    /// Bodies that fell since the last frame: slot in the corpse region
+    /// and the frozen record. Sorted by slot in prepare.
+    corpse_pending: Vec<(u32, InstanceData)>,
+    corpse_len: [u32; NUM_KINDS],
+    /// Scratch for coalesced corpse uploads.
+    corpse_run: Vec<InstanceData>,
 }
 
 /// Swap the snapshot into the render world and copy the small per-frame
@@ -407,6 +413,13 @@ pub struct GpuUnitInput {
 fn extract_gpu_units(mut main_world: ResMut<MainWorld>, mut input: ResMut<GpuUnitInput>) {
     let enabled = main_world.resource::<GpuSyncConfig>().enabled;
     input.enabled = enabled;
+    {
+        // Drained in every mode, so the list cannot grow on the CPU path.
+        let mut corpses = main_world.resource_mut::<Corpses>();
+        input.corpse_pending.clear();
+        std::mem::swap(&mut corpses.pending, &mut input.corpse_pending);
+        input.corpse_len = std::array::from_fn(|k| corpses.len(k) as u32);
+    }
     if !enabled {
         return;
     }
@@ -628,6 +641,35 @@ fn prepare_gpu_units(
         queue.write_buffer(&alloc.regiments, 0, bytemuck::cast_slice(&input.regiments));
     }
 
+    // The fallen: each new body lands in its ring slot of the corpse
+    // region, once. Slots of one tick are mostly consecutive, so runs of
+    // them go up in one write.
+    if !input.corpse_pending.is_empty() {
+        let record = size_of::<InstanceData>();
+        let region = alloc.live_cap * record;
+        let GpuUnitInput {
+            corpse_pending,
+            corpse_run,
+            ..
+        } = &mut *input;
+        corpse_pending.sort_unstable_by_key(|(slot, _)| *slot);
+        let mut start = 0;
+        while start < corpse_pending.len() {
+            let mut end = start + 1;
+            while end < corpse_pending.len()
+                && corpse_pending[end].0 == corpse_pending[end - 1].0 + 1
+            {
+                end += 1;
+            }
+            corpse_run.clear();
+            corpse_run.extend(corpse_pending[start..end].iter().map(|(_, r)| *r));
+            let offset = region + corpse_pending[start].0 as usize * record;
+            queue.write_buffer(&alloc.records, offset as u64, bytemuck::cast_slice(corpse_run));
+            start = end;
+        }
+        corpse_pending.clear();
+    }
+
     let mut info = [[0u32; 4]; NUM_BUCKETS];
     for mesh in &meshes {
         info[mesh.bucket] = [alloc.bases[mesh.bucket], mesh.count, 0, 0];
@@ -636,11 +678,11 @@ fn prepare_gpu_units(
     let mut params = input.params;
     params.corpse_base = alloc.live_cap as u32;
     params.corpse_cap = CORPSE_CAP as u32;
-    params.corpse_len = UVec4::ZERO;
+    params.corpse_len = UVec4::from_array(input.corpse_len);
     params.buckets = info.map(UVec4::from_array);
     buffers.params.set(params);
     buffers.params.write_buffer(&device, &queue);
-    buffers.threads = n as u32;
+    buffers.threads = n as u32 + input.corpse_len.iter().sum::<u32>();
 
     if buffers.bind_group.is_none() {
         buffers.bind_group = Some(device.create_bind_group(

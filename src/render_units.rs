@@ -219,17 +219,25 @@ pub const CORPSE_CAP: usize = 25_000;
 pub struct Corpses {
     data: [Vec<InstanceData>; crate::unit_types::NUM_KINDS],
     cursor: [usize; crate::unit_types::NUM_KINDS],
+    /// GPU path: bodies added since the last extract, as the slot they
+    /// took in the GPU corpse region (`kind * CORPSE_CAP + ring index`)
+    /// and the frozen record. Drained every frame.
+    pub(crate) pending: Vec<(u32, InstanceData)>,
 }
 
 impl Corpses {
     pub fn push(&mut self, kind: usize, inst: InstanceData) {
         let v = &mut self.data[kind];
-        if v.len() < CORPSE_CAP {
+        let index = if v.len() < CORPSE_CAP {
             v.push(inst);
+            v.len() - 1
         } else {
-            v[self.cursor[kind]] = inst;
-            self.cursor[kind] = (self.cursor[kind] + 1) % CORPSE_CAP;
-        }
+            let index = self.cursor[kind];
+            v[index] = inst;
+            self.cursor[kind] = (index + 1) % CORPSE_CAP;
+            index
+        };
+        self.pending.push(((kind * CORPSE_CAP + index) as u32, inst));
     }
 
     pub fn clear(&mut self) {
@@ -237,6 +245,12 @@ impl Corpses {
             v.clear();
         }
         self.cursor = [0; crate::unit_types::NUM_KINDS];
+        self.pending.clear();
+    }
+
+    /// Bodies of a kind on the field, at most `CORPSE_CAP`.
+    pub(crate) fn len(&self, kind: usize) -> usize {
+        self.data[kind].len()
     }
 }
 
