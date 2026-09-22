@@ -133,6 +133,14 @@ fn phase_last(mut ph: ResMut<FramePhases>) {
     ph.prepare.push(p);
 }
 
+/// The fixed-tick clock runs in every state and the phase marks keep
+/// their last stamps across the menu, so without a reset the first
+/// samples of a battle would carry menu time.
+fn reset_frame_stats(mut pacing: ResMut<FramePacing>, mut phases: ResMut<FramePhases>) {
+    *pacing = FramePacing::default();
+    *phases = FramePhases::default();
+}
+
 pub struct OverlayPlugin;
 
 impl Plugin for OverlayPlugin {
@@ -144,7 +152,7 @@ impl Plugin for OverlayPlugin {
             .add_systems(Startup, (spawn_overlay, spawn_inspect_panel))
             .add_systems(
                 OnEnter(crate::game_state::GameState::Battle),
-                show_overlay,
+                (show_overlay, reset_frame_stats),
             )
             .init_resource::<TicksThisFrame>()
             .init_resource::<FramePacing>()
