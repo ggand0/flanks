@@ -59,6 +59,72 @@ fn pitch_normal(n: vec3<f32>, ang: f32) -> vec3<f32> {
 
 @vertex
 fn vertex(vertex: Vertex) -> VertexOutput {
+    return unit_vertex(vertex);
+}
+
+#ifdef VERTEX_PULL
+// GPU-built path (render_units_gpu.rs): ONE plain draw of soldiers *
+// PULL_VERTS vertices per bucket, no vertex buffers, no instances. The
+// soldier's record comes through the bucket's index list, the mesh corner
+// from the expanded level mesh. Same pose code as the instanced entry, so
+// the two paths cannot look different.
+struct PullInstance {
+    pos_scale: vec4<f32>,
+    color: vec4<f32>,
+    anim: vec4<f32>,
+    anim2: vec4<f32>,
+};
+
+// The level mesh with its index list expanded (render_units_gpu.rs PullVertex).
+struct PullVertex {
+    position: vec3<f32>,
+    part: f32,
+    normal: vec3<f32>,
+    pivot: f32,
+    color: vec4<f32>,
+};
+
+@group(3) @binding(0) var<storage, read> pull_records: array<PullInstance>;
+@group(3) @binding(1) var<storage, read> pull_index: array<u32>;
+@group(3) @binding(2) var<storage, read> pull_vertices: array<PullVertex>;
+// Per bucket: x = first index slot, y = corners per soldier.
+@group(3) @binding(3) var<storage, read> pull_buckets: array<vec4<u32>>;
+
+@vertex
+fn vertex_pull(@builtin(vertex_index) index: u32) -> VertexOutput {
+    let soldier = index / #{PULL_VERTS}u;
+    let corner = index - soldier * #{PULL_VERTS}u;
+    let entry = pull_index[pull_buckets[#{PULL_BUCKET}u].x + soldier];
+    var inst = pull_records[entry & 0x3fffffffu];
+#ifdef LOD_DEBUG
+    // FL_LOD_DEBUG: tint by level (L1 green, L2 yellow, L3 red), the
+    // level rides the top two bits of the index entry.
+    let lod = entry >> 30u;
+    if lod > 0u {
+        var tint = vec3<f32>(1.0, 0.15, 0.1);
+        if lod == 1u {
+            tint = vec3<f32>(0.2, 1.0, 0.3);
+        } else if lod == 2u {
+            tint = vec3<f32>(1.0, 0.9, 0.1);
+        }
+        inst.color = vec4<f32>(inst.color.rgb * 0.4 + tint * 0.6, inst.color.a);
+    }
+#endif
+    let v = pull_vertices[corner];
+    return unit_vertex(Vertex(
+        v.position,
+        v.normal,
+        vec2<f32>(v.part, v.pivot),
+        v.color,
+        inst.pos_scale,
+        inst.color,
+        inst.anim,
+        inst.anim2,
+    ));
+}
+#endif
+
+fn unit_vertex(vertex: Vertex) -> VertexOutput {
     let yaw = vertex.i_anim.x;
     let moving = vertex.i_anim.y;
     // Positive z: attack progress. The 2s digit is the swing STYLE

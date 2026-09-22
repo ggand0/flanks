@@ -15,6 +15,7 @@ mod overlay;
 mod picker;
 mod regiments;
 mod render_units;
+mod render_units_gpu;
 mod selection;
 mod settings;
 mod spatial;
@@ -28,7 +29,6 @@ mod vegetation;
 mod water;
 
 use bevy::prelude::*;
-
 use bevy::render::RenderPlugin;
 use bevy::render::settings::{InstanceFlags, WgpuSettings};
 
@@ -48,6 +48,7 @@ fn wgpu_settings() -> WgpuSettings {
     settings.instance_flags = settings.instance_flags.with_env();
     settings
 }
+
 fn main() {
     // Load before the App so the window opens with the saved video
     // settings instead of switching modes one frame in.
@@ -85,11 +86,11 @@ fn main() {
                 .set(AssetPlugin {
                     file_path: concat!(env!("CARGO_MANIFEST_DIR"), "/assets").into(),
                     ..default()
-                }),
                 })
                 .set(RenderPlugin {
                     render_creation: wgpu_settings().into(),
                     ..default()
+                }),
         )
         .insert_resource(user_settings)
         .add_plugins(game_state::GameShellPlugin)

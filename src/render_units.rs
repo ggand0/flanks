@@ -38,6 +38,10 @@ use bevy::camera::primitives::{Frustum, Sphere};
 use bevy::math::primitives::ViewFrustum;
 use bytemuck::{Pod, Zeroable};
 
+use crate::render_units_gpu::{
+    GpuSyncConfig, GpuUnitBuffers, GpuUnitInput, PullMeshGpu, PulledBucketGpu, cpu_sync,
+    pull_mesh_for,
+};
 use crate::units::Units;
 
 /// Bounding-sphere radius for per-instance frustum culling: cube diagonal
@@ -142,10 +146,10 @@ impl Default for LodConfig {
 /// This frame's level switch distances, squared, per kind. Two extra
 /// sets widened and narrowed by the hysteresis bound the level a moving
 /// soldier may hold.
-struct LodBands {
-    plain: [[f32; NUM_LODS - 1]; crate::unit_types::NUM_KINDS],
-    fine: [[f32; NUM_LODS - 1]; crate::unit_types::NUM_KINDS],
-    coarse: [[f32; NUM_LODS - 1]; crate::unit_types::NUM_KINDS],
+pub(crate) struct LodBands {
+    pub(crate) plain: [[f32; NUM_LODS - 1]; crate::unit_types::NUM_KINDS],
+    pub(crate) fine: [[f32; NUM_LODS - 1]; crate::unit_types::NUM_KINDS],
+    pub(crate) coarse: [[f32; NUM_LODS - 1]; crate::unit_types::NUM_KINDS],
 }
 
 /// Per-soldier multiplier on the level switch distance, from the stable
@@ -168,7 +172,7 @@ fn lod_debug_tint(color: &mut [f32; 4], lod: usize) {
 impl LodBands {
     /// `px_per_unit` = pixels covered by 1 m at 1 m distance (0 when the
     /// projection has no perspective: everything stays L0).
-    fn new(cfg: &LodConfig, px_per_unit: f32) -> Self {
+    pub(crate) fn new(cfg: &LodConfig, px_per_unit: f32) -> Self {
         let mut bands = Self {
             plain: [[f32::INFINITY; NUM_LODS - 1]; crate::unit_types::NUM_KINDS],
             fine: [[f32::INFINITY; NUM_LODS - 1]; crate::unit_types::NUM_KINDS],
@@ -252,7 +256,7 @@ impl SyncComponent for InstanceMaterialData {
 /// Render-world copy of the instance data. Persistent component: the Vec's
 /// allocation is reused every frame (extraction copies into it, no clone).
 #[derive(Component, Default)]
-struct ExtractedInstances(Vec<InstanceData>);
+pub(crate) struct ExtractedInstances(Vec<InstanceData>);
 
 /// Last frame's cost of the two instance data copies, in microseconds,
 /// for the overlay's frame breakdown. Extract runs on the main thread at
@@ -292,18 +296,22 @@ impl Plugin for UnitRenderPlugin {
             .init_resource::<RenderCounts>()
             .init_resource::<LodConfig>()
             .init_resource::<Corpses>()
+            .add_plugins(crate::render_units_gpu::GpuUnitRenderPlugin)
             .add_systems(Startup, setup_unit_mesh)
             // Must run after the camera moves: culling builds a FRESH
             // frustum from this frame's camera transform (the Frustum
             // component is one frame stale — visible pop while panning).
             .add_systems(
                 Update,
-                sync_instance_data.after(crate::camera::apply_camera_transform),
+                sync_instance_data
+                    .after(crate::camera::apply_camera_transform)
+                    .run_if(cpu_sync),
             );
         app.sub_app_mut(RenderApp)
             .add_systems(ExtractSchedule, extract_instance_data)
             .add_render_command::<Transparent3d, DrawCustom>()
             .init_resource::<SpecializedMeshPipelines<CustomPipeline>>()
+            .init_resource::<SpecializedRenderPipelines<CustomPipeline>>()
             .add_systems(
                 RenderStartup,
                 init_custom_pipeline.after(MeshPipelineSystems),
@@ -318,7 +326,11 @@ impl Plugin for UnitRenderPlugin {
     }
 }
 
-fn setup_unit_mesh(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
+fn setup_unit_mesh(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    gpu: Res<GpuSyncConfig>,
+) {
     // One instance entity per unit kind AND detail level, each with its
     // own code-built mesh. Instance positions are not the entity's transform;
     // built-in frustum culling would cull all instances at once, so it
@@ -337,13 +349,20 @@ fn setup_unit_mesh(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
         info!("unit meshes: kind {kind} tris per level {tris:?}");
         // One bucket per detail level, shared by the living and the fallen.
         for (lod, mesh) in lods.into_iter().enumerate() {
-            commands.spawn((
+            let bucket = InstanceBucket(bucket_of(kind, lod));
+            // GPU mode: the bucket also carries its expanded mesh for the
+            // pulled draw. Its instance data stays, and stays empty.
+            let pulled = pull_mesh_for(&mesh, &bucket, &gpu);
+            let mut entity = commands.spawn((
                 Mesh3d(meshes.add(mesh)),
                 InstanceMaterialData::default(),
-                InstanceBucket(bucket_of(kind, lod)),
+                bucket,
                 NoFrustumCulling,
                 NoAutomaticBatching,
             ));
+            if let Some(pulled) = pulled {
+                entity.insert(pulled);
+            }
         }
     }
 }
@@ -353,7 +372,7 @@ fn setup_unit_mesh(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
 /// selection. Culling is strictly visibility: a unit is skipped only when
 /// its bounding sphere is outside the camera frustum.
 /// Units per parallel sync chunk.
-const SYNC_CHUNK: usize = 16_384;
+pub(crate) const SYNC_CHUNK: usize = 16_384;
 
 /// Anim z-channel encoding — the ONE authoritative map (keep in sync
 /// with unit_instancing.wgsl, which decodes it):
@@ -363,7 +382,61 @@ const SYNC_CHUNK: usize = 16_384;
 ///   z < 0: stance-band magnitude — tiers 0.25 enemy-near, 0.5 fighting
 ///     wavering, 0.65 fighting confident, 1.0 charging — smoothed per
 ///     unit (~0.35 s) before emission so poses never snap.
-const CELEBRATE_BASE: f32 = 6.0;
+pub(crate) const CELEBRATE_BASE: f32 = 6.0;
+
+/// Battle stance tier of a regiment, the negative anim z band: 0.25 =
+/// enemy in watch range (standing units brace), 0.5 = fighting but
+/// wavering (morale low, braces, no taunts), 0.65 = fighting confident,
+/// 1.0 = charging (sprint lean and stride). Plain moves carry lowered.
+/// Both render paths read these helpers, so they can never disagree.
+pub(crate) fn stance_tier(g: &crate::orders::GroupData) -> f32 {
+    if g.charging {
+        1.0
+    } else if g.engaged || matches!(g.order, Some(crate::orders::Order::Attack(_))) {
+        if crate::morale::band(g) == crate::morale::Band::Steady { 0.65 } else { 0.5 }
+    } else if g.enemy_near {
+        0.25
+    } else {
+        0.0
+    }
+}
+
+/// Victory cheer progress 0..1, negative when the regiment is not
+/// celebrating. Rides the positive band as CELEBRATE_BASE + progress so
+/// the shader can ease in and out.
+pub(crate) fn celebrate_progress(g: &crate::orders::GroupData) -> f32 {
+    if g.celebrate > 0 {
+        1.0 - g.celebrate as f32 / crate::frontline::CELEBRATE_TICKS as f32
+    } else {
+        -1.0
+    }
+}
+
+/// March-in-step: a formed Rect regiment moving under orders walks on a
+/// SHARED phase. Contact, the charge sprint and routs break step.
+pub(crate) fn march_signal(g: &crate::orders::GroupData) -> f32 {
+    let formed = g.shape == crate::formation::FormShape::Rect
+        && g.order.is_some()
+        && !g.engaged
+        && !g.charging
+        && !g.state.is_broken();
+    if formed { 1.0 } else { 0.0 }
+}
+
+/// Wall stance (shieldwall or spearwall by kind, the bucket knows which).
+pub(crate) fn wall_signal(g: &crate::orders::GroupData) -> f32 {
+    if g.spacing == crate::formation::FormSpacing::Wall && !g.state.is_broken() {
+        1.0
+    } else {
+        0.0
+    }
+}
+
+/// Per-regiment walk-phase offset so two marching regiments are not in
+/// step with EACH OTHER.
+pub(crate) fn regiment_phase(g: usize) -> f32 {
+    crate::units::hash01(g as u32 ^ 0x51ED_BEEF) * std::f32::consts::TAU
+}
 
 /// Per-soldier render state carried between frames, index-aligned with
 /// `Units`. Indices shuffle on death-sweep swap-removes: a one-frame
@@ -440,75 +513,17 @@ fn sync_instance_data(
     // Broken regiments render desaturated (no extra instance data needed).
     let broken: Vec<bool> = groups.list.iter().map(|g| g.state.is_broken()).collect();
     let broken = &broken[..];
-    // Battle stance (negative lunge band): 0.25 = enemy in watch range
-    // (standing units brace), 0.5 = fighting but WAVERING (morale low —
-    // braces, no taunts), 0.65 = fighting confident (taunts allowed),
-    // 1.0 = charging (sprint lean/stride). Plain moves carry lowered.
-    let stance: Vec<f32> = groups
-        .list
-        .iter()
-        .map(|g| {
-            if g.charging {
-                1.0
-            } else if g.engaged || matches!(g.order, Some(crate::orders::Order::Attack(_))) {
-                if crate::morale::band(g) == crate::morale::Band::Steady { 0.65 } else { 0.5 }
-            } else if g.enemy_near {
-                0.25
-            } else {
-                0.0
-            }
-        })
-        .collect();
+    // One value per regiment: stance tier, cheer progress, march and
+    // wall signals, walk phase offset. Shared with the GPU path.
+    let stance: Vec<f32> = groups.list.iter().map(stance_tier).collect();
     let stance = &stance[..];
-    // Victory cheer progress 0..1 (-1 = not celebrating). Rides the
-    // positive band as 6 + progress so the shader can ease in/out — a
-    // celebrating regiment has no one left to swing at.
-    let celebrating: Vec<f32> = groups
-        .list
-        .iter()
-        .map(|g| {
-            if g.celebrate > 0 {
-                1.0 - g.celebrate as f32 / crate::frontline::CELEBRATE_TICKS as f32
-            } else {
-                -1.0
-            }
-        })
-        .collect();
+    let celebrating: Vec<f32> = groups.list.iter().map(celebrate_progress).collect();
     let celebrating = &celebrating[..];
-    // March-in-step: a formed Rect regiment moving under orders walks on a
-    // SHARED phase (soldiers in step). Contact, the charge sprint, and
-    // routs break step; the per-unit EMA below blends in/out smoothly.
-    let marching: Vec<f32> = groups
-        .list
-        .iter()
-        .map(|g| {
-            let formed = g.shape == crate::formation::FormShape::Rect
-                && g.order.is_some()
-                && !g.engaged
-                && !g.charging
-                && !g.state.is_broken();
-            if formed { 1.0 } else { 0.0 }
-        })
-        .collect();
+    let marching: Vec<f32> = groups.list.iter().map(march_signal).collect();
     let marching = &marching[..];
-    // Wall stance (shieldwall / spearwall by kind — the bucket knows).
-    let walled: Vec<f32> = groups
-        .list
-        .iter()
-        .map(|g| {
-            if g.spacing == crate::formation::FormSpacing::Wall && !g.state.is_broken() {
-                1.0
-            } else {
-                0.0
-            }
-        })
-        .collect();
+    let walled: Vec<f32> = groups.list.iter().map(wall_signal).collect();
     let walled = &walled[..];
-    // Per-regiment walk-phase offset so two marching regiments aren't in
-    // step with EACH OTHER.
-    let reg_phase: Vec<f32> = (0..groups.list.len())
-        .map(|g| crate::units::hash01(g as u32 ^ 0x51ED_BEEF) * std::f32::consts::TAU)
-        .collect();
+    let reg_phase: Vec<f32> = (0..groups.list.len()).map(regiment_phase).collect();
     let reg_phase = &reg_phase[..];
 
     // Parallel cull + bucket build into per-chunk scratch, then one memcpy
@@ -801,18 +816,21 @@ fn queue_custom(
     transparent_3d_draw_functions: Res<DrawFunctions<Transparent3d>>,
     custom_pipeline: Res<CustomPipeline>,
     mut pipelines: ResMut<SpecializedMeshPipelines<CustomPipeline>>,
+    mut pull_pipelines: ResMut<SpecializedRenderPipelines<CustomPipeline>>,
     pipeline_cache: Res<PipelineCache>,
     meshes: Res<RenderAssets<RenderMesh>>,
     render_mesh_instances: Res<RenderMeshInstances>,
     maybe_batched_instance_buffers: Option<
         Res<BatchedInstanceBuffers<MeshUniform, MeshInputUniform>>,
     >,
-    material_meshes: Query<(Entity, &MainEntity), With<ExtractedInstances>>,
+    material_meshes: Query<(Entity, &MainEntity, Option<&PullMeshGpu>), With<ExtractedInstances>>,
+    gpu_input: Option<Res<GpuUnitInput>>,
     mut transparent_render_phases: ResMut<ViewSortedRenderPhases<Transparent3d>>,
     views: Query<&ExtractedView>,
     view_key_cache: Res<ViewKeyCache>,
 ) {
     let draw_custom = transparent_3d_draw_functions.read().id::<DrawCustom>();
+    let lod_debug = gpu_input.is_some_and(|g| g.lod_debug);
 
     for view in &views {
         let Some(transparent_phase) = transparent_render_phases.get_mut(&view.retained_view_entity)
@@ -824,7 +842,7 @@ fn queue_custom(
             continue;
         };
 
-        for (entity, main_entity) in &material_meshes {
+        for (entity, main_entity, pull_mesh) in &material_meshes {
             let Some(mesh_instance) = render_mesh_instances.render_mesh_queue_data(*main_entity)
             else {
                 continue;
@@ -837,9 +855,23 @@ fn queue_custom(
                     mesh.primitive_topology(),
                     mesh.index_format(),
                 );
-            let pipeline = pipelines
-                .specialize(&pipeline_cache, &custom_pipeline, key, &mesh.layout)
-                .unwrap();
+            let pipeline = match pull_mesh {
+                // GPU mode: the pulled variant, no vertex buffers.
+                Some(pull_mesh) => pull_pipelines.specialize(
+                    &pipeline_cache,
+                    &custom_pipeline,
+                    PullPipelineKey {
+                        mesh: key,
+                        layout: mesh.layout.clone(),
+                        verts: pull_mesh.count,
+                        bucket: pull_mesh.bucket as u32,
+                        lod_debug,
+                    },
+                ),
+                None => pipelines
+                    .specialize(&pipeline_cache, &custom_pipeline, key, &mesh.layout)
+                    .unwrap(),
+            };
             transparent_phase.add_retained(Transparent3d {
                 sorting_info: TransparentSortingInfo3d::Sorted {
                     mesh_center: pbr::get_mesh_instance_world_from_local(
@@ -869,7 +901,7 @@ fn queue_custom(
 }
 
 #[derive(Component)]
-struct InstanceBuffer {
+pub(crate) struct InstanceBuffer {
     buffer: Buffer,
     length: usize,
     capacity: usize,
@@ -877,7 +909,7 @@ struct InstanceBuffer {
 
 /// Persistent GPU buffer per instance entity: written in place each frame,
 /// reallocated (with slack) only on growth past capacity.
-fn prepare_instance_buffers(
+pub(crate) fn prepare_instance_buffers(
     mut commands: Commands,
     mut query: Query<(Entity, &ExtractedInstances, Option<&mut InstanceBuffer>)>,
     render_device: Res<RenderDevice>,
@@ -919,9 +951,12 @@ fn prepare_instance_buffers(
 }
 
 #[derive(Resource)]
-struct CustomPipeline {
+pub(crate) struct CustomPipeline {
     shader: Handle<Shader>,
     mesh_pipeline: MeshPipeline,
+    /// Group 3 of a pulled bucket: the instance records, the index list,
+    /// the bucket's mesh corners, the bucket table.
+    pub(crate) pull_layout: BindGroupLayoutDescriptor,
 }
 
 fn init_custom_pipeline(
@@ -932,7 +967,63 @@ fn init_custom_pipeline(
     commands.insert_resource(CustomPipeline {
         shader: load_embedded_asset!(asset_server.as_ref(), "shaders/unit_instancing.wgsl"),
         mesh_pipeline: mesh_pipeline.clone(),
+        pull_layout: BindGroupLayoutDescriptor::new(
+            "unit pull layout",
+            &BindGroupLayoutEntries::sequential(
+                ShaderStages::VERTEX,
+                (
+                    binding_types::storage_buffer_read_only_sized(false, None),
+                    binding_types::storage_buffer_read_only_sized(false, None),
+                    binding_types::storage_buffer_read_only_sized(false, None),
+                    binding_types::storage_buffer_read_only_sized(false, None),
+                ),
+            ),
+        ),
     });
+}
+
+/// Pipeline variant of a pulled bucket. It has NO vertex buffers, and
+/// `SpecializedMeshPipelines` caches by vertex buffer 0, so it goes
+/// through the plain render pipeline specializer with the mesh layout
+/// riding in the key.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(crate) struct PullPipelineKey {
+    mesh: MeshPipelineKey,
+    layout: MeshVertexBufferLayoutRef,
+    /// Corners per soldier. A shader constant, so the soldier lookup
+    /// divides by a literal.
+    verts: u32,
+    /// The bucket this pipeline draws, also a shader constant.
+    bucket: u32,
+    /// FL_LOD_DEBUG: tint by level in the vertex shader.
+    lod_debug: bool,
+}
+
+impl SpecializedRenderPipeline for CustomPipeline {
+    type Key = PullPipelineKey;
+
+    fn specialize(&self, key: Self::Key) -> RenderPipelineDescriptor {
+        // Same targets, depth and view bindings as the instanced variant.
+        let mut descriptor = self
+            .mesh_pipeline
+            .specialize(key.mesh, &key.layout)
+            .expect("unit meshes carry every attribute the mesh pipeline asks for");
+
+        descriptor.vertex.shader = self.shader.clone();
+        descriptor.fragment.as_mut().unwrap().shader = self.shader.clone();
+        // The shader pulls mesh and soldier from group 3 by vertex index.
+        descriptor.vertex.buffers.clear();
+        descriptor.vertex.entry_point = Some("vertex_pull".into());
+        let defs = &mut descriptor.vertex.shader_defs;
+        defs.push("VERTEX_PULL".into());
+        defs.push(bevy::shader::ShaderDefVal::UInt("PULL_VERTS".into(), key.verts));
+        defs.push(bevy::shader::ShaderDefVal::UInt("PULL_BUCKET".into(), key.bucket));
+        if key.lod_debug {
+            defs.push("LOD_DEBUG".into());
+        }
+        descriptor.set_layout(3, self.pull_layout.clone());
+        descriptor
+    }
 }
 
 impl SpecializedMeshPipeline for CustomPipeline {
@@ -994,20 +1085,36 @@ impl<P: PhaseItem> RenderCommand<P> for DrawMeshInstanced {
         SRes<RenderAssets<RenderMesh>>,
         SRes<RenderMeshInstances>,
         SRes<MeshAllocator>,
+        SRes<GpuUnitBuffers>,
     );
     type ViewQuery = ();
-    type ItemQuery = Read<InstanceBuffer>;
+    type ItemQuery = (Option<Read<InstanceBuffer>>, Option<Read<PulledBucketGpu>>);
 
     #[inline]
     fn render<'w>(
         item: &P,
         _view: (),
-        instance_buffer: Option<&'w InstanceBuffer>,
-        (meshes, render_mesh_instances, mesh_allocator): SystemParamItem<'w, '_, Self::Param>,
+        bucket: Option<(Option<&'w InstanceBuffer>, Option<&'w PulledBucketGpu>)>,
+        (meshes, render_mesh_instances, mesh_allocator, gpu): SystemParamItem<'w, '_, Self::Param>,
         pass: &mut TrackedRenderPass<'w>,
     ) -> RenderCommandResult {
         // A borrow check workaround.
         let mesh_allocator = mesh_allocator.into_inner();
+
+        let Some((instance_buffer, pulled)) = bucket else {
+            return RenderCommandResult::Skip;
+        };
+        // GPU mode: ONE plain draw over every corner of every soldier in
+        // the bucket. The count comes from the indirect buffer the compute
+        // pass wrote, no vertex buffers, no instances.
+        if let Some(pulled) = pulled {
+            let Some(alloc) = &gpu.into_inner().alloc else {
+                return RenderCommandResult::Skip;
+            };
+            pass.set_bind_group(3, &pulled.bind_group, &[]);
+            pass.draw_indirect(&alloc.args, pulled.bucket as u64 * 16);
+            return RenderCommandResult::Success;
+        }
 
         let Some(mesh_instance) = render_mesh_instances.render_mesh_queue_data(item.main_entity())
         else {
