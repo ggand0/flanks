@@ -29,6 +29,25 @@ mod water;
 
 use bevy::prelude::*;
 
+use bevy::render::RenderPlugin;
+use bevy::render::settings::{InstanceFlags, WgpuSettings};
+
+/// Bevy's defaults minus wgpu's GPU-side validation of indirect draws.
+/// Bevy strips that flag only when DX12 is not among the enabled
+/// backends, and the default backend set names every backend, so on
+/// Linux the check stays on. It injects a validation compute pass with a
+/// fresh staging buffer into every render pass that draws indirectly,
+/// and on the dev box that pinned the frame to the display refresh:
+/// 60 fps with 20k soldiers on the GPU path, 300 fps without the check.
+/// The unit draw arguments come from our own compute shader, from
+/// counters bounded by the buffer layout. `WGPU_VALIDATION_INDIRECT_CALL=1`
+/// turns the check back on for debugging.
+fn wgpu_settings() -> WgpuSettings {
+    let mut settings = WgpuSettings::default();
+    settings.instance_flags.remove(InstanceFlags::VALIDATION_INDIRECT_CALL);
+    settings.instance_flags = settings.instance_flags.with_env();
+    settings
+}
 fn main() {
     // Load before the App so the window opens with the saved video
     // settings instead of switching modes one frame in.
@@ -67,6 +86,10 @@ fn main() {
                     file_path: concat!(env!("CARGO_MANIFEST_DIR"), "/assets").into(),
                     ..default()
                 }),
+                })
+                .set(RenderPlugin {
+                    render_creation: wgpu_settings().into(),
+                    ..default()
         )
         .insert_resource(user_settings)
         .add_plugins(game_state::GameShellPlugin)
