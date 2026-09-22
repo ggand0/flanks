@@ -135,8 +135,6 @@ pub struct SoldierSnapshot {
     pub records: Vec<GpuSoldier>,
     pub n: u32,
     pub kind_counts: [u32; NUM_KINDS],
-    pub generation: u64,
-    pub tick: u32,
     /// A new snapshot waits for extract.
     pub fresh: bool,
     pub pack_ms: f32,
@@ -155,11 +153,7 @@ pub struct GpuFrameInput {
 /// when `Units` changed, so frames without a tick pack nothing. Parallel
 /// on the compute pool. Not reachable from the tick job, so a plain scope
 /// is correct here.
-fn pack_soldier_snapshot(
-    units: Res<Units>,
-    pipeline: Res<crate::movement::TickPipeline>,
-    mut snap: ResMut<SoldierSnapshot>,
-) {
+fn pack_soldier_snapshot(units: Res<Units>, mut snap: ResMut<SoldierSnapshot>) {
     if !units.is_changed() {
         return;
     }
@@ -181,8 +175,6 @@ fn pack_soldier_snapshot(
     }
     snap.n = n as u32;
     snap.kind_counts = kind_counts;
-    snap.generation = units.generation;
-    snap.tick = pipeline.tick;
     snap.fresh = true;
     snap.pack_ms = t0.elapsed().as_secs_f32() * 1000.0;
 }
