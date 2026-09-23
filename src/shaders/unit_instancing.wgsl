@@ -54,13 +54,170 @@ fn gait_rate(speed: f32) -> f32 {
     return 1.0 + 0.16 * speed;
 }
 
-// Hip swing half angle at full stride.
-const GAIT_SWING: f32 = 0.60;
-// Where a foot lands ahead of the hip, as a share of how far behind the
-// hip it leaves the ground.
-const GAIT_FRONT: f32 = 0.5;
+// Ground a planted foot sweeps at full stride, in legs, and where it
+// lands ahead of the hip as a share of how far behind it leaves.
+const GAIT_SWEEP: f32 = 0.85;
+const GAIT_FRONT: f32 = 0.6;
 // The longest share of the cycle a foot stays down, a walk's.
 const GAIT_DUTY_MAX: f32 = 0.62;
+// Knee and ankle as a share of the leg down from the hip, and the ball
+// of the foot ahead of the ankle, measured on the knight's leg.
+const KNEE: f32 = 0.50;
+const ANKLE: f32 = 0.90;
+const BALL: f32 = 0.13;
+
+// One soldier's gait this frame, the same for all his vertices.
+struct Gait {
+    leg: f32,
+    // Share of the cycle a foot is down.
+    duty: f32,
+    // 0 standing, 1 at full stride.
+    stride: f32,
+    // Ground a planted foot sweeps, and how far behind the hip it leaves.
+    sweep: f32,
+    reach: f32,
+    // 1 when both feet leave the ground between steps, 0 for a walk.
+    run: f32,
+};
+
+// A planted foot travels back under the hip for `duty` of the cycle and
+// covers the ground the soldier covers meanwhile, `speed * duty / rate`.
+// At speed that is the full sweep and the foot is down briefly, a run.
+// Slower, the foot stays down longer, up to a walk's share, and below
+// that the stride shortens. Either way the foot holds the ground.
+fn gait_at(speed: f32, leg: f32) -> Gait {
+    let rate = gait_rate(speed);
+    let full = GAIT_SWEEP * leg;
+    let duty = min(full * rate / max(speed, 1e-3), GAIT_DUTY_MAX);
+    let sweep = speed * duty / rate;
+    return Gait(
+        leg,
+        duty,
+        sweep / max(full, 1e-4),
+        sweep,
+        sweep / (1.0 + GAIT_FRONT),
+        1.0 - smoothstep(0.25, 0.55, duty),
+    );
+}
+
+// Hip drop at step phase q, 0 at touchdown. A walk vaults over the
+// planted leg and is lowest when the front foot is furthest ahead. A run
+// is lowest at mid-stance, where the knee takes the landing, and highest
+// in the air between steps.
+fn gait_dip(q: f32, g: Gait) -> f32 {
+    let chain = ANKLE * g.leg;
+    let front = GAIT_FRONT * g.reach;
+    let walk = (chain - sqrt(max(chain * chain - front * front, 0.0))) * (0.5 + 0.5 * cos(TAU * q))
+        + 0.015 * g.stride * g.leg;
+    let run = g.stride * g.leg * (0.05 + 0.025 * (0.5 + 0.5 * cos(TAU * (q - g.duty))));
+    return mix(walk, run, g.run);
+}
+
+// A (z, y) offset turned by a pitch angle, + taking +z toward +y.
+fn pitch2(v: vec2<f32>, ang: f32) -> vec2<f32> {
+    let c = cos(ang);
+    let s = sin(ang);
+    return vec2<f32>(v.x * c - v.y * s, v.y * c + v.x * s);
+}
+
+fn wrap_pi(x: f32) -> f32 {
+    return x - TAU * floor((x + PI) / TAU);
+}
+
+// The smallest heel lift, zero or negative, that brings the ankle within
+// r of the hip while the foot pivots on its ball at (bz, by). The ankle's
+// squared distance from the hip is a constant plus
+// `ka * cos(lift) + kb * sin(lift)`, and `kc` is what that sum may reach.
+fn heel_lift(bz: f32, by: f32, a: f32, b: f32, r: f32) -> f32 {
+    let ka = 2.0 * (a * by - b * bz);
+    let kb = -2.0 * (a * bz + b * by);
+    let kc = r * r - (bz * bz + by * by + a * a + b * b);
+    if ka <= kc {
+        return 0.0;
+    }
+    let n = length(vec2<f32>(ka, kb));
+    if abs(kc) > n {
+        return -1.2;
+    }
+    let delta = atan2(kb, ka);
+    let w = acos(kc / n);
+    // Of the two roots, the heel-up one nearest a flat foot.
+    let r1 = wrap_pi(delta - w);
+    let r2 = wrap_pi(delta + w);
+    var lift = -1.2;
+    if r1 <= 0.0 {
+        lift = max(lift, r1);
+    }
+    if r2 <= 0.0 {
+        lift = max(lift, r2);
+    }
+    return lift;
+}
+
+// Ankle (z, y) from the hip, and the foot's pitch, at share s of the
+// stance. The ball of the foot is planted and sweeps back with the
+// ground. The heel rises once a flat foot would pull the knee straight,
+// and a runner also points the foot to push off.
+fn stance_ankle(s: f32, g: Gait, dip: f32) -> vec3<f32> {
+    let a = (1.0 - ANKLE) * g.leg;
+    let b = BALL * g.leg;
+    let ground = dip - g.leg;
+    let ball = b + g.reach * (GAIT_FRONT - (1.0 + GAIT_FRONT) * s);
+    // Only a foot behind the hip rises onto its ball, easing in as it
+    // passes under.
+    let need = heel_lift(ball, ground, a, b, 0.985 * ANKLE * g.leg)
+        * (1.0 - smoothstep(-0.08 * g.leg, 0.0, ball));
+    let push = -0.75 * g.run * g.stride * smoothstep(0.3, 1.0, s);
+    let pitch = min(need, push);
+    return vec3<f32>(vec2<f32>(ball, ground) + pitch2(vec2<f32>(-b, a), pitch), pitch);
+}
+
+fn hermite(p0: f32, m0: f32, p1: f32, m1: f32, u: f32) -> f32 {
+    let u2 = u * u;
+    let u3 = u2 * u;
+    return (2.0 * u3 - 3.0 * u2 + 1.0) * p0 + (u3 - 2.0 * u2 + u) * m0
+        + (3.0 * u2 - 2.0 * u3) * p1 + (u3 - u2) * m1;
+}
+
+// Thigh angle (+ forward) and knee flex that put the ankle at (z, y)
+// from the hip.
+fn leg_ik(ankle: vec2<f32>, leg: f32) -> vec2<f32> {
+    let l1 = KNEE * leg;
+    let l2 = (ANKLE - KNEE) * leg;
+    let d = clamp(length(ankle), abs(l1 - l2) + 1e-4, l1 + l2 - 1e-6);
+    let inner = acos(clamp((l1 * l1 + l2 * l2 - d * d) / (2.0 * l1 * l2), -1.0, 1.0));
+    let lead = acos(clamp((l1 * l1 + d * d - l2 * l2) / (2.0 * l1 * d), -1.0, 1.0));
+    return vec2<f32>(atan2(ankle.x, -ankle.y) + lead, PI - inner);
+}
+
+// Thigh, knee flex and the foot's pitch for a leg at phase p of its
+// cycle, touchdown at 0.
+fn leg_pose(p: f32, g: Gait) -> vec3<f32> {
+    if p < g.duty {
+        let st = stance_ankle(p / g.duty, g, gait_dip(fract(2.0 * p), g));
+        return vec3<f32>(leg_ik(st.xy, g.leg), st.z);
+    }
+    let u = (p - g.duty) / (1.0 - g.duty);
+    // Toe-off and touchdown, each at the hip height of its own moment.
+    let off = stance_ankle(1.0, g, gait_dip(fract(2.0 * g.duty), g));
+    let land = stance_ankle(0.0, g, gait_dip(0.0, g));
+    // The foot leaves still travelling back and lands already sweeping
+    // back, at a share of the stance speed. Between, it lifts early,
+    // heel toward the seat, and reaches forward.
+    let m = -g.sweep / g.duty * (1.0 - g.duty);
+    let z = hermite(off.x, 0.30 * m, land.x, 0.20 * m, u);
+    let lift = g.stride * g.leg * 0.34 * (0.25 + 0.75 * g.run)
+        * sin(PI * pow(max(u, 1e-6), 0.7565));
+    let y = mix(off.y, land.y, smoothstep(0.0, 1.0, u)) + lift;
+    let pose = leg_ik(vec2<f32>(z, y), g.leg);
+    // In the air the foot is set against the shin: it leaves pointed,
+    // hangs about square to the shin and comes down flat.
+    let at_off = leg_ik(off.xy, g.leg);
+    let at_land = leg_ik(land.xy, g.leg);
+    var rel = mix(off.z - (at_off.x - at_off.y), 0.05, smoothstep(0.0, 0.45, u));
+    rel = mix(rel, at_land.y - at_land.x, smoothstep(0.55, 1.0, u));
+    return vec3<f32>(pose, pose.x - pose.y + rel);
+}
 
 fn rot_y(p: vec3<f32>, c: f32, s: f32) -> vec3<f32> {
     return vec3<f32>(p.x * c + p.z * s, p.y, -p.x * s + p.z * c);
@@ -202,38 +359,16 @@ fn unit_vertex(vertex: Vertex) -> VertexOutput {
 
     let wall = vertex.i_anim2.y;
     // Gait. The phase counts cycles of two steps, offset per soldier so
-    // a block does not move in lockstep. A planted foot travels back
-    // under the hip for `duty` of the cycle and has to cover the ground
-    // the soldier covers meanwhile, `speed * duty / rate`. At speed that
-    // is the full stride and the foot is down briefly, which is a run.
-    // Slower, the foot stays down longer, up to a walk's share, and
-    // below that the stride shortens. Either way the foot holds the
-    // ground.
+    // a block does not move in lockstep.
     let leg = vertex.i_anim2.x;
     let gait = fract(vertex.i_anim2.z + seed);
-    let rate = gait_rate(speed);
-    let full = (1.0 + GAIT_FRONT) * leg * sin(GAIT_SWING);
-    let duty = min(full * rate / max(speed, 1e-3), GAIT_DUTY_MAX);
-    let sweep = speed * duty / rate;
-    // 0 standing, 1 at full stride.
-    let stride = sweep / max(full, 1e-4);
-    // How far behind the hip the planted foot leaves the ground.
-    let reach = sweep / (1.0 + GAIT_FRONT);
-    // 1 when both feet leave the ground between steps, 0 for a walk.
-    let run = 1.0 - smoothstep(0.25, 0.55, duty);
+    let g = gait_at(speed, leg);
+    let run = g.run;
     // The step wave the arms counter, and the idle wobble, which is the
     // one oscillator that is not locomotion.
     let limb = cos(TAU * gait);
     let wobble = globals.time * 9.0 + seed * TAU;
-    // Hip drop. A walk vaults over the planted leg, lowest when the feet
-    // are furthest apart. A run is lowest at mid-stance, where the knee
-    // takes the landing, and highest in the air between steps. q is the
-    // step phase, 0 at touchdown.
-    let q = fract(2.0 * gait);
-    let walk_dip =
-        (leg - sqrt(max(leg * leg - reach * reach, 0.0))) * (0.5 + 0.5 * cos(TAU * q));
-    let run_dip = stride * leg * (0.03 + 0.07 * (0.5 + 0.5 * cos(TAU * (q - duty))));
-    let dip = mix(walk_dip, run_dip, run);
+    let dip = gait_dip(fract(2.0 * gait), g);
 
     // --- Part animation (rotations around the part pivot) ---
     if part > 6.5 {
@@ -264,7 +399,7 @@ fn unit_vertex(vertex: Vertex) -> VertexOutput {
         // (Spear bucket: same fronting reads as the spearwall's off-hand
         // cover behind the leveled spears.) On the move it swings against
         // the weapon arm, except in a wall.
-        let sway = -(0.12 + 0.20 * run) * moving * limb * (1.0 - wall);
+        let sway = -0.06 * moving * limb * (1.0 - wall);
         local = pitch_about(local, pivot, sway);
         normal = pitch_normal(normal, sway);
         if wall > 0.001 {
@@ -297,44 +432,29 @@ fn unit_vertex(vertex: Vertex) -> VertexOutput {
     } else if part > 1.5 {
         // Corpses carry no leg length and keep the legs they fell with.
         if leg > 0.0 {
-            // Legs, two bones each, posed from where the foot has to be.
-            // Planted, it sweeps from `GAIT_FRONT * reach` ahead of the
-            // hip to `reach` behind. Swinging, it lifts and comes forward
-            // again. The knee bends by however far the foot sits inside
-            // the leg's length.
+            // Hip, knee and ankle, posed by `leg_pose`. Knee and ankle
+            // bend over a band around each joint, so the mesh bends
+            // instead of tearing.
             let side = select(1.0, -1.0, part > 2.5);
-            let p = fract(gait + select(0.0, 0.5, part > 2.5));
-            var fz = 0.0;
-            var fy = dip - leg;
-            if p < duty {
-                fz = reach * (GAIT_FRONT - (1.0 + GAIT_FRONT) * p / duty);
-            } else {
-                let t = (p - duty) / (1.0 - duty);
-                fz = reach * mix(-1.0, GAIT_FRONT, smoothstep(0.0, 1.0, t));
-                // A runner tucks the heel up under him, a walker barely lifts.
-                fy += stride * leg * (0.08 + 0.24 * run) * sin(PI * t);
-            }
+            let pose = leg_pose(fract(gait + select(0.0, 0.5, part > 2.5)), g);
             // A braced or walled stance splits the feet, one forward one back.
-            fz += (0.32 * brace + 0.22 * wall * (1.0 - moving)) * side * leg;
-            let far = clamp(length(vec2<f32>(fz, fy)), 0.25 * leg, leg);
-            let flex = 2.0 * acos(min(far / leg, 1.0));
-            let thigh = atan2(fz, -fy) + 0.5 * flex;
+            let thigh = pose.x + (0.32 * brace + 0.22 * wall * (1.0 - moving)) * side;
+            let flex = pose.y;
             local = pitch_about(local, pivot, thigh);
             normal = pitch_normal(normal, thigh);
-            // Below the knee the leg folds back by the flex, blended over a
-            // band around the joint so the mesh bends instead of tearing.
             let down = clamp((pivot - vertex.position.y) / leg, 0.0, 1.0);
-            let shin = smoothstep(0.38, 0.62, down);
-            if shin > 0.001 {
-                let knee = 0.5 * leg;
-                local = pitch_about_at(
-                    local,
-                    pivot - knee * cos(thigh),
-                    knee * sin(thigh),
-                    -flex * shin,
-                );
-                normal = pitch_normal(normal, -flex * shin);
-            }
+            let knee = KNEE * leg;
+            let kz = knee * sin(thigh);
+            let ky = pivot - knee * cos(thigh);
+            let bend = -flex * smoothstep(KNEE - 0.1, KNEE + 0.1, down);
+            local = pitch_about_at(local, ky, kz, bend);
+            normal = pitch_normal(normal, bend);
+            // The foot turns about the ankle to the pitch the pose asks for.
+            let shin = thigh - flex;
+            let shank = (ANKLE - KNEE) * leg;
+            let foot = (pose.z - shin) * smoothstep(ANKLE - 0.06, ANKLE + 0.02, down);
+            local = pitch_about_at(local, ky - shank * cos(shin), kz + shank * sin(shin), foot);
+            normal = pitch_normal(normal, foot);
         }
     } else if part > 0.5 {
         // Sword arm. Three per-unit attack styles (stable seed pick), all
@@ -343,8 +463,8 @@ fn unit_vertex(vertex: Vertex) -> VertexOutput {
         // stab, horizontal slash.
         let raise = smoothstep(0.0, 0.8, lunge);
         let chop = smoothstep(0.85, 1.0, lunge);
-        // The arm counters the legs, and pumps harder at a run.
-        let sway = (0.18 + 0.30 * run) * moving * limb * (1.0 - raise);
+        // The arm counters the legs. A runner holds the blade steadier.
+        let sway = (0.18 - 0.06 * run) * moving * limb * (1.0 - raise);
         // Ordinary moves carry the blade lowered at the side; battle
         // stance levels it at the enemy (slightly above horizontal),
         // and even a watch-range advance (`ready`) brings it most of
@@ -389,6 +509,16 @@ fn unit_vertex(vertex: Vertex) -> VertexOutput {
         ang += sway + carry + ang_taunt + 0.6 * brace;
         local = pitch_about(local, pivot, ang);
         normal = pitch_normal(normal, ang);
+    }
+
+    // The shoulders turn against the legs and the upper body shifts over
+    // the planted foot, easing in up the torso so the hips stay square.
+    if part < 1.5 || (part > 3.5 && part < 6.5) {
+        let w = select(1.0, smoothstep(0.0, 0.25, vertex.position.y), part < 0.5);
+        let turn = -0.10 * g.run * g.stride * limb * w;
+        local = rot_y(local, cos(turn), sin(turn));
+        normal = rot_y(normal, cos(turn), sin(turn));
+        local.x -= 0.02 * leg * g.run * g.stride * cos(TAU * (gait - 0.5 * g.duty)) * w;
     }
 
     // The body rides the hip drop from the gait. A runner leans as far
