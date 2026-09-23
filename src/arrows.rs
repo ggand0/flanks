@@ -183,7 +183,7 @@ impl Plugin for ArrowsPlugin {
 /// one for the ground litter. Same NoAutomaticBatching requirement as
 /// the unit buckets (devlog 0013).
 fn setup_arrow_buckets(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
-    let mesh = meshes.add(crate::unit_meshes::build_arrow());
+    let mesh = meshes.add(crate::unit_glb::arrow_mesh());
     commands.spawn((
         Mesh3d(mesh.clone()),
         InstanceMaterialData::default(),

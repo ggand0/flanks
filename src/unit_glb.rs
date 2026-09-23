@@ -139,6 +139,82 @@ impl KindMeshes {
     }
 }
 
+/// The arrow in flight and in the ground: `arrow.glb` when it is there,
+/// else the code-built arrow. The model is scaled to the code-built
+/// arrow's length, which is longer than a real arrow beside a soldier so
+/// a volley reads at battle zoom.
+pub fn arrow_mesh() -> Mesh {
+    let code = crate::unit_meshes::build_arrow();
+    let code_only = std::env::var("FL_UNIT_MESH").is_ok_and(|v| v == "code");
+    let Some(path) = (!code_only).then(|| model_file("arrow")).flatten() else {
+        return code;
+    };
+    let length = mesh_length(&code);
+    match import_arrow(&path, length) {
+        Ok(mesh) => {
+            info!("arrow: imported {}, scaled to {length:.2} long", path.display());
+            mesh
+        }
+        Err(e) => {
+            error!("{} is not usable, the code-built arrow stands in: {e}", path.display());
+            code
+        }
+    }
+}
+
+/// A mesh's extent along +Z, the arrow's flight axis.
+fn mesh_length(mesh: &Mesh) -> f32 {
+    use bevy::mesh::VertexAttributeValues as V;
+    let Some(V::Float32x3(pos)) = mesh.attribute(Mesh::ATTRIBUTE_POSITION) else {
+        return 0.0;
+    };
+    let (lo, hi) = pos.iter().fold((f32::MAX, f32::MIN), |(lo, hi), p| (lo.min(p[2]), hi.max(p[2])));
+    hi - lo
+}
+
+/// Read the arrow's `L0`: one rigid part, id 7, vertex coloured, metres
+/// along +Z, origin at the shaft's middle. Scaled to `length`.
+fn import_arrow(path: &Path, length: f32) -> Fallible<Mesh> {
+    let bytes = std::fs::read(path).map_err(|e| format!("cannot read it: {e}"))?;
+    let gltf = gltf::Gltf::from_slice(&bytes).map_err(|e| format!("not valid glTF: {e}"))?;
+    let blob = gltf.blob.as_deref();
+    let scene = gltf
+        .document
+        .default_scene()
+        .or_else(|| gltf.document.scenes().next())
+        .ok_or("the file has no scene")?;
+    let mut level = Level::default();
+    let mut stack: Vec<(gltf::Node, Mat4)> = scene.nodes().map(|n| (n, Mat4::IDENTITY)).collect();
+    while let Some((node, parent)) = stack.pop() {
+        let xf = parent * Mat4::from_cols_array_2d(&node.transform().matrix());
+        for child in node.children() {
+            stack.push((child, xf));
+        }
+        if node.name() != Some("L0") {
+            continue;
+        }
+        let Some(mesh) = node.mesh() else { continue };
+        for prim in mesh.primitives() {
+            read_primitive(&mut level, &prim, blob, xf, None)?;
+        }
+    }
+    if level.pos.is_empty() {
+        return Err("no node named L0".into());
+    }
+    if level.part.iter().any(|p| (p - 7.0).abs() > 1e-3) {
+        return Err("a vertex carries a part id other than 7, the arrow's".into());
+    }
+    let (lo, hi) = level.pos.iter().fold((f32::MAX, f32::MIN), |(lo, hi), p| (lo.min(p.z), hi.max(p.z)));
+    if hi - lo <= 0.0 {
+        return Err("the arrow has no length along +Z".into());
+    }
+    let scale = length / (hi - lo);
+    for p in &mut level.pos {
+        *p *= scale;
+    }
+    Ok(level_mesh(&level))
+}
+
 /// The mesh set a kind renders with: the imported model when its file
 /// is there, the code-built set otherwise. `FL_UNIT_MESH=code` keeps the
 /// code-built set either way, which is the A/B against an import. A file
@@ -163,8 +239,13 @@ pub fn kind_lods(kind: usize) -> KindMeshes {
 /// shipped asset, then the working copy the asset track writes. Paths are
 /// anchored at the crate root, the way the asset plugin anchors `assets/`.
 fn model_path(kind: usize) -> Option<PathBuf> {
+    model_file(KIND_FILE[kind])
+}
+
+/// A model file by name: the one `FL_GLB_<NAME>` names, then the shipped
+/// asset, then the working copy.
+fn model_file(name: &str) -> Option<PathBuf> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let name = KIND_FILE[kind];
     let var = format!("FL_GLB_{}", name.to_uppercase());
     if let Ok(named) = std::env::var(&var) {
         let named = root.join(named);
