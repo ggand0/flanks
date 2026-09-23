@@ -25,6 +25,9 @@ A rebuild matches the committed GLB in every exported mesh attribute and node.
 
 ## Renderer contract
 
+The following contract describes the knight. The spearman v3 prototype and
+its proposed part additions are documented in [spearman/README.md](spearman/README.md).
+
 - +Y up, +Z forward, origin on the ground. The engine handles display scale and any anatomical mirroring.
 - `TEXCOORD_0`: packed atlas UVs. `TEXCOORD_1`: `(part ID, pivot height in metres)`; do not invert the height again.
 - IDs: body 0, weapon arm 1, left leg 2, right leg 3, shield arm 5, the sword 8.
@@ -39,3 +42,11 @@ base = atlas.rgb * mix(vec3(1), team_tint, atlas.a)
 ```
 
 The shared atlas uses 16 MiB as RGBA8, about 21.3 MiB with full mips. There are no normal maps or animation clips. Geometry, patterns and material tiles were generated for this project; no external model or reference-image pixels are included.
+
+## Spearman v3 arm prototype
+
+`spearman/` contains the complete L0 generator, original texture inputs, stab
+pose tables and full-cycle validation scripts. Outputs go to ignored
+`assets_dev/spearman/rebuild_v3/`; the scripts do not replace the installed GLB.
+The model uses new forearm and hand parts and requires loader/shader integration.
+See [the spearman README](spearman/README.md) for build commands and measurements.

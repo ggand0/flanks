@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Spearman v3 · stab review</title>
+<style>
+  :root { color-scheme: dark; font: 16px/1.6 system-ui, sans-serif; background:#182027; color:#e7edf1 }
+  body { max-width:1400px; margin:32px auto; padding:0 24px }
+  h1 { font-size:28px; margin:0 } p { color:#b9c8d2 }
+  video { width:100%; background:#34404a; border-radius:8px }
+  .controls { display:flex; gap:16px; align-items:center; flex-wrap:wrap; margin:14px 0 }
+  button,select { font:inherit; color:inherit; background:#2a3944; border:1px solid #597182; border-radius:6px; padding:7px 16px }
+  input { flex:1; min-width:240px } a { color:#9ac9f1 }
+  .numbers { display:flex; flex-wrap:wrap; gap:28px; padding:16px 0 }
+  strong { color:#fff } small { color:#a6bac8 }
+</style>
+<h1>Spearman v3 — stab review</h1>
+<p>Side view on the left, oblique view on the right. Draw back → thrust → recover.</p>
+<video id="clip" src="spear_stab.mp4" controls loop muted playsinline preload="auto"></video>
+<div class="controls">
+  <button id="toggle">Play</button>
+  <label>Speed <select id="speed"><option value="1">Normal</option><option value=".5">½ speed</option><option value=".25">¼ speed</option></select></label>
+  <button id="prev" aria-label="Previous frame">−1 frame</button>
+  <button id="next" aria-label="Next frame">+1 frame</button>
+  <input id="scrub" aria-label="Scrub animation" type="range" min="0" max="47" value="0" step="1">
+  <span id="phase">Guard</span>
+</div>
+<div class="numbers">
+  <span><strong>49.5 cm</strong> forward stroke</span>
+  <span><strong>45 cm</strong> butt to hand</span>
+  <span><strong>2,504</strong> sampled poses checked</span>
+  <span><strong>2,954</strong> L0 triangles</span>
+</div>
+<p>Asset-side prototype. Game integration and L1–L3 review remain pending.</p>
+<p><a href="motion_validation.json">Measurements and pivots</a> · <a href="spear_stab_review.blend">Playable Blender scene</a></p>
+<script>
+  const video=document.querySelector('#clip'),scrub=document.querySelector('#scrub');
+  const toggle=document.querySelector('#toggle');
+  function update(){
+    const frame=Math.min(47,Math.round(video.currentTime*30));
+    scrub.value=frame;
+    document.querySelector('#phase').textContent=frame<9?'Guard':frame<15?'Draw back':frame<19?'Thrust':frame<22?'Strike':frame<37?'Recover':'Guard';
+    toggle.textContent=video.paused?'Play':'Pause';
+  }
+  toggle.onclick=()=>video.paused?video.play():video.pause();
+  document.querySelector('#speed').onchange=e=>video.playbackRate=Number(e.target.value);
+  function seek(frame){video.pause();video.currentTime=((frame+48)%48)/30;update()}
+  scrub.oninput=()=>seek(Number(scrub.value));
+  document.querySelector('#prev').onclick=()=>seek(Math.round(video.currentTime*30)-1);
+  document.querySelector('#next').onclick=()=>seek(Math.round(video.currentTime*30)+1);
+  for(const name of ['timeupdate','play','pause','seeked'])video.addEventListener(name,update);
+</script>
+</html>
