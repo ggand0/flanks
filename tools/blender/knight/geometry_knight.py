@@ -16,9 +16,13 @@ import bmesh
 from mathutils import Vector
 
 PARTS = {"body": 0, "arm_weapon": 1, "leg_l": 2, "leg_r": 3,
-         "arm_spear": 4, "arm_shield": 5, "arm_bow": 6}
+         "arm_spear": 4, "arm_shield": 5, "arm_bow": 6, "weapon": 8}
+# The weapon's pivot is the centre of its grip, where the wrist turns it.
 PIVOTS = {"leg_l": (0.115, 0, 0.91), "leg_r": (-0.115, 0, 0.91),
-          "arm_weapon": (-0.224, 0, 1.435), "arm_shield": (0.224, 0, 1.435)}
+          "arm_weapon": (-0.224, 0, 1.435), "arm_shield": (0.224, 0, 1.435),
+          "weapon": (-0.40, -0.21, 1.084)}
+# Joints inside a part, exported as `joint_<name>` empties.
+JOINTS = {"elbow": (-0.337, -0.012, 1.215)}
 
 # Linear RGB plus team blend amount. Opaque even when team amount is zero.
 MAIL = (0.075, 0.088, 0.099, 0.0)
@@ -346,7 +350,7 @@ def build():
     for u,z in [(-.192,1.385),(.192,1.385),(-.179,1.164),(.179,1.164),(0,.79)]:
         g.stud(shield(u,z,.01),.004,BRASS,normal)
 
-    g.part,g.label="arm_weapon","arming_sword"
+    g.part,g.label="weapon","arming_sword"
     x,z=-.40,1.084
     # Grip behind the guard. A flattened diamond blade has a real ridge.
     g.tube([(x,-.175,z),(x,-.298,z)],[.018,.015],8,LEATHER)

@@ -27,8 +27,8 @@ A rebuild matches the committed GLB in every exported mesh attribute and node.
 
 - +Y up, +Z forward, origin on the ground. The engine handles display scale and any anatomical mirroring.
 - `TEXCOORD_0`: packed atlas UVs. `TEXCOORD_1`: `(part ID, pivot height in metres)`; do not invert the height again.
-- IDs: body 0, weapon arm 1, left leg 2, right leg 3, shield arm 5.
-- Pivot nodes: hips `(±0.115, 0.910, 0)`; weapon shoulder `(-0.224, 1.435, 0)`; shield shoulder `(0.224, 1.435, 0)`.
+- IDs: body 0, weapon arm 1, left leg 2, right leg 3, shield arm 5, the sword 8.
+- Pivot nodes: hips `(±0.115, 0.910, 0)`; weapon shoulder `(-0.224, 1.435, 0)`; shield shoulder `(0.224, 1.435, 0)`; the sword's grip `pivot_weapon` `(-0.40, 1.084, 0.21)`. The `joint_elbow` empty at `(-0.337, 1.215, 0.012)` is where the engine bends the weapon arm.
 - `COLOR_0`: VEC4, white RGB and preserved vertex team alpha. Use atlas alpha for the textured path, including untinted woven trim within the cloth.
 - Atlas RGB is sRGB color with local AO; alpha is a linear team mask, **not transparency**. Keep the material opaque and retain RGB where the mask is zero.
 

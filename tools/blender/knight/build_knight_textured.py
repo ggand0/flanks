@@ -235,7 +235,7 @@ def verify(obj,path,size):
     assert min(c[3] for c in colors)==0 and max(c[3] for c in colors)==1
     _,uv=glb_inspect.accessor_values(doc,blob,attrs['TEXCOORD_1'])
     pairs=sorted({tuple(round(c,6) for c in v) for v in uv})
-    expected=sorted([(0.,0.),(1.,1.435),(2.,.91),(3.,.91),(5.,1.435)])
+    expected=sorted([(0.,0.),(1.,1.435),(2.,.91),(3.,.91),(5.,1.435),(8.,1.084)])
     assert pairs==expected,(pairs,expected)
     _,uv0=glb_inspect.accessor_values(doc,blob,attrs['TEXCOORD_0'])
     assert len(set(uv0))>100
@@ -245,10 +245,10 @@ def verify(obj,path,size):
     assert abs(min(p[1] for p in position))<1e-5
     triangles=doc['accessors'][primitive['indices']]['count']//3
     assert 2000<=triangles<=3000
-    pivots={n['name']:n['translation'] for n in doc['nodes'] if n.get('name','').startswith('pivot_')}
-    assert len(pivots)==4
-    for part,(x,y,z) in geo.PIVOTS.items():
-        assert all(abs(a-b)<1e-5 for a,b in zip(pivots['pivot_'+part],(x,z,-y)))
+    pivots={n['name']:n['translation'] for n in doc['nodes'] if n.get('name','').startswith(('pivot_','joint_'))}
+    assert len(pivots)==len(geo.PIVOTS)+len(geo.JOINTS)
+    for name,(x,y,z) in [('pivot_'+k,v) for k,v in geo.PIVOTS.items()]+[('joint_'+k,v) for k,v in geo.JOINTS.items()]:
+        assert all(abs(a-b)<1e-5 for a,b in zip(pivots[name],(x,z,-y)))
     image=doc['images'][0]
     assert image['mimeType']=='image/png'
     view=doc['bufferViews'][image['bufferView']]
@@ -401,8 +401,8 @@ def main():
     for attribute in obj.data.color_attributes:
         print('SOURCE_COLOR',attribute.name,'alpha',sorted({round(c.color[3],3) for c in attribute.data}),flush=True)
     print('ACTIVE_COLOR',obj.data.color_attributes.active_color.name,flush=True)
-    for part,loc in geo.PIVOTS.items():
-        empty=bpy.data.objects.new('pivot_'+part,None)
+    for name,loc in [('pivot_'+k,v) for k,v in geo.PIVOTS.items()]+[('joint_'+k,v) for k,v in geo.JOINTS.items()]:
+        empty=bpy.data.objects.new(name,None)
         empty.location=loc
         empty.empty_display_size=.045
         scene.collection.objects.link(empty)
