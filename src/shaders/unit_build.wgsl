@@ -57,6 +57,10 @@ struct Smooth {
     // The swing byte of the current or last attack, and 1 << 8 when he
     // was winding up last frame.
     swing: u32,
+    // Seconds left of the release, reload and hold after his last shot.
+    shot: f32,
+    // How far his bow is up toward the drawn ready pose, 0 to 1.
+    bow: f32,
 };
 
 // Per-regiment pose signals for this frame (render_units_gpu.rs
@@ -95,6 +99,10 @@ struct Params {
     consts: vec4<f32>,
     // FOLLOW_S, FOLLOW_BASE, FOLLOW_SPAN, REWIND_S (render_units.rs).
     attack: vec4<f32>,
+    // RELEASE_S, RELOAD_S, HOLD_S, BOW_WALK_MS (render_units.rs).
+    shot: vec4<f32>,
+    // BOW_RISE_S, BOW_FALL_S, CANCEL_TICKS, RANGED_BASE.
+    bow: vec4<f32>,
     // x = first index slot of the bucket, y = mesh corners per soldier.
     buckets: array<vec4<u32>, 16>,
 };
@@ -213,7 +221,9 @@ fn build_soldier(i: u32) {
     // The attack on anim z, 0 when he is not attacking, as in
     // render_units.rs `attack_signal`.
     let follow_s = params.attack.x;
+    let shot_s = params.shot.x + params.shot.y + params.shot.z;
     let winding = (swing & SWING_STATE_MASK) == SWING_WINDUP && death_t == 0.0;
+    sm.shot = max(sm.shot - params.dt, 0.0);
     if winding {
         var w = params.windup[kind];
         if (swing & SWING_RANGED) != 0u {
@@ -221,29 +231,56 @@ fn build_soldier(i: u32) {
         }
         sm.atk = clamp((w - swing_t + params.alpha) / (w + 1.0), 0.0, 1.0);
         sm.swing = swing;
+        sm.shot = 0.0;
     } else if (sm.swing & 256u) != 0u
         && (swing & SWING_STATE_MASK) == SWING_RECOVER
-        && (swing & SWING_STAGGERED) == 0u {
-        sm.follow = follow_s;
+        && (swing & SWING_STAGGERED) == 0u
+        && ((sm.swing & SWING_RANGED) == 0u || swing_t > params.bow.z) {
+        if (sm.swing & SWING_RANGED) != 0u {
+            sm.shot = shot_s;
+        } else {
+            sm.follow = follow_s;
+        }
         sm.atk = 0.0;
     } else {
         sm.follow = max(sm.follow - params.dt, 0.0);
         sm.atk = max(sm.atk - params.dt / params.attack.w, 0.0);
     }
     sm.swing = (sm.swing & 0xffu) | select(0u, 256u, winding);
+    let ranged = (sm.swing & SWING_RANGED) != 0u;
+    let shooting = (winding && ranged) || sm.shot > 0.0;
+    var up = 0.0;
+    if shooting && death_t == 0.0 && sm.walk < params.shot.w {
+        up = 1.0;
+    }
+    sm.bow = clamp(
+        sm.bow + clamp(up - sm.bow, -params.dt / params.bow.y, params.dt / params.bow.x),
+        0.0,
+        1.0,
+    );
     var digit = f32((sm.swing & SWING_STYLE_MASK) >> SWING_STYLE_SHIFT);
     if (sm.swing & SWING_CHARGE) != 0u {
         digit += 3.0;
     }
     var attack = 0.0;
-    if sm.follow > 0.0 {
+    if sm.shot > 0.0 {
+        let t = shot_s - sm.shot;
+        attack = params.bow.w;
+        if t < params.shot.x {
+            attack = params.bow.w + 2.0 + t / params.shot.x;
+        } else if t < params.shot.x + params.shot.y {
+            attack = params.bow.w + 4.0 + (t - params.shot.x) / params.shot.y;
+        }
+    } else if ranged && (sm.atk > 0.0 || sm.bow > 0.0) {
+        attack = params.bow.w + sm.atk;
+    } else if sm.follow > 0.0 {
         attack = digit * 2.0 + params.attack.y + params.attack.z * (1.0 - sm.follow / follow_s);
     } else if sm.atk > 0.0 {
         attack = digit * 2.0 + sm.atk;
     }
 
     var tier = reg.stance;
-    if attack > 0.0 && (sm.swing & SWING_RANGED) == 0u {
+    if attack > 0.0 && attack < params.bow.w && (sm.swing & SWING_RANGED) == 0u {
         tier = max(tier, params.fighting);
     }
     sm.band += (tier - sm.band) * params.k_band;
@@ -301,7 +338,7 @@ fn build_soldier(i: u32) {
     }
 
     records[i] = Record(
-        vec4<f32>(position, 1.0),
+        vec4<f32>(position, sm.bow),
         vec4<f32>(rgb, s.seed),
         vec4<f32>(yaw, sm.walk, lunge, fx),
         vec4<f32>(sm.band, sm.wall, sm.gait, stagger),

@@ -95,7 +95,10 @@ impl RenderCounts {
 #[repr(C)]
 pub struct InstanceData {
     pub position: Vec3,
-    pub scale: f32,
+    /// An arrow's uniform scale. For a soldier, how far his bow is up
+    /// from the carry toward the drawn ready pose, 0 to 1: `Smooth::bow`,
+    /// 0 for every kind without a bow rig.
+    pub w: f32,
     /// rgb = team color; a = stable per-unit anim seed (NOT opacity).
     pub color: [f32; 4],
     /// x = yaw, y = ground speed m/s, z = attack or cheer
@@ -347,7 +350,7 @@ fn extract_instance_data(
                 entity.insert(ExtractedAtlas(atlas.0.id()));
             }
             if let Some(rig) = rig {
-                entity.insert(*rig);
+                entity.insert(rig.clone());
             }
         }
     }
@@ -433,11 +436,11 @@ fn setup_unit_mesh(
         // the figure's height when it has no legs.
         rig.leg = crate::gait::measure(&lods[0])
             .unwrap_or(crate::unit_types::half_height(kind));
-        let rig = UnitRig(rig);
+        let rig = UnitRig { rig, clips: std::sync::Arc::new(model.clips) };
         let atlas = model.atlas.map(|image| images.add(image));
         let tris: Vec<usize> =
             lods.iter().map(|m| m.indices().map_or(0, |i| i.len() / 3)).collect();
-        info!("unit meshes: kind {kind} tris per level {tris:?}, leg {:.2} m", rig.0.leg);
+        info!("unit meshes: kind {kind} tris per level {tris:?}, leg {:.2} m", rig.rig.leg);
         // One bucket per detail level, shared by the living and the fallen.
         for (lod, mesh) in lods.into_iter().enumerate() {
             let bucket = InstanceBucket(bucket_of(kind, lod));
@@ -448,7 +451,7 @@ fn setup_unit_mesh(
                 Mesh3d(meshes.add(mesh)),
                 InstanceMaterialData::default(),
                 bucket,
-                rig,
+                rig.clone(),
                 NoFrustumCulling,
                 NoAutomaticBatching,
             ));
@@ -471,14 +474,22 @@ pub(crate) struct UnitAtlas(pub Handle<Image>);
 #[derive(Component, Clone, Copy)]
 pub(crate) struct ExtractedAtlas(pub AssetId<Image>);
 
-/// The weapon arm rig of a bucket's kind (unit_meshes.rs `Rig`). The
+/// The rig of a bucket's kind (unit_meshes.rs `Rig`) and an archer's
+/// shot tables (`unit_glb.rs` `Shots`), shared by the kind's buckets. The
 /// arrow buckets have none.
-#[derive(Component, Clone, Copy)]
-pub(crate) struct UnitRig(pub crate::unit_meshes::Rig);
+#[derive(Component, Clone)]
+pub(crate) struct UnitRig {
+    pub rig: crate::unit_meshes::Rig,
+    pub clips: std::sync::Arc<Vec<[f32; 4]>>,
+}
 
-/// Render world: a bucket's rig as the uniform its draws bind.
+/// Render world: a bucket's rig as the uniform its draws bind, and its
+/// shot tables as a storage buffer.
 #[derive(Component)]
-pub(crate) struct RigBuffer(pub Buffer);
+pub(crate) struct RigBuffer {
+    pub rig: Buffer,
+    pub clips: Buffer,
+}
 
 /// Copy the SoA sim state into the instance buffer (main world side):
 /// interpolate between fixed ticks, frustum-cull per instance, tint the
@@ -494,9 +505,30 @@ pub(crate) const SYNC_CHUNK: usize = 16_384;
 ///     digit is the swing style (0 stab, 1 classic swing, 2 slash,
 ///     benched), plus 3 on a charging blow. Progress is the wind-up,
 ///     0..1 linear in time, or from FOLLOW_BASE the follow-through;
-///   z >= CELEBRATE_BASE: victory cheer, fraction = progress 0..1.
+///   z >= CELEBRATE_BASE: victory cheer, fraction = progress 0..1;
+///   z >= RANGED_BASE: a bow shot, RANGED_BASE + clip * 2 + progress,
+///     clip 0 the raise, 1 the release, 2 the reload.
 /// The stance band rides anim2.x.
 pub(crate) const CELEBRATE_BASE: f32 = 12.0;
+pub(crate) const RANGED_BASE: f32 = 16.0;
+
+/// Seconds a shot's release plays after the loose, then its reload
+/// (tools/blender/archer/motion.py). The loose is the sim's and the rest
+/// of the cycle runs on the renderer's clock. Together they take the
+/// shortest reload the sim draws, 0.8 x RELOAD_TICKS (6.4 s).
+pub(crate) const RELEASE_S: f32 = 0.6;
+pub(crate) const RELOAD_S: f32 = 5.8;
+/// After the reload the archer holds his drawn bow for the next shot this
+/// long, which covers the longest reload the sim draws, then lowers it.
+pub(crate) const HOLD_S: f32 = 2.5;
+/// The whole cycle after a loose.
+const SHOT_S: f32 = RELEASE_S + RELOAD_S + HOLD_S;
+/// Seconds to bring the bow up from the carry to the drawn ready pose,
+/// and to lower it again.
+pub(crate) const BOW_RISE_S: f32 = 0.4;
+pub(crate) const BOW_FALL_S: f32 = 0.5;
+/// Above this ground speed, m/s, an archer carries his bow.
+pub(crate) const BOW_WALK_MS: f32 = 0.6;
 
 /// A blow lands, then the arm comes back over this many seconds.
 pub(crate) const FOLLOW_S: f32 = 0.6;
@@ -575,17 +607,24 @@ struct Smooth {
     swing: u8,
     /// Whether he was winding up last frame.
     winding: bool,
+    /// Seconds left of the release, reload and hold after his last shot.
+    shot: f32,
+    /// How far his bow is up toward the drawn ready pose, 0 to 1.
+    bow: f32,
 }
 
 /// One soldier's attack on anim z (CELEBRATE_BASE), 0 when he is not
 /// attacking, and his attack state carried on. The sim goes from wind-up
-/// to recovery on the tick the blow lands, so the follow-through is the
-/// renderer's: it plays for FOLLOW_S after that turn. A wind-up that ends
-/// any other way, by a stagger or death, goes back the way it came.
-/// Same steps as `build_soldier` in unit_build.wgsl.
+/// to recovery on the tick the blow lands or the arrow leaves, so what
+/// follows is the renderer's: a blow's follow-through for FOLLOW_S, a
+/// shot's release, reload and hold (SHOT_S). A melee wind-up that ends any
+/// other way, by a stagger or death, goes back the way it came, and so
+/// does a draw whose target went away. Same steps as `build_soldier` in
+/// unit_build.wgsl.
 fn attack_signal(sm: &mut Smooth, sw: u8, swing_t: u8, kind: usize, dying: bool, alpha: f32, dt: f32) -> f32 {
     use crate::units::{SWING_RANGED, SWING_RECOVER, SWING_STAGGERED, SWING_STATE_MASK, SWING_WINDUP};
     let winding = sw & SWING_STATE_MASK == SWING_WINDUP && !dying;
+    sm.shot = (sm.shot - dt).max(0.0);
     if winding {
         // A bow draw runs on the missile draw time, not the melee wind-up.
         let w = if sw & SWING_RANGED != 0 {
@@ -598,16 +637,42 @@ fn attack_signal(sm: &mut Smooth, sw: u8, swing_t: u8, kind: usize, dying: bool,
         // jitter can put swing_t above the draw time.
         sm.atk = ((w - swing_t as f32 + alpha) / (w + 1.0)).clamp(0.0, 1.0);
         sm.swing = sw;
-    } else if sm.winding && sw & SWING_STATE_MASK == SWING_RECOVER && sw & SWING_STAGGERED == 0 {
-        sm.follow = FOLLOW_S;
+        sm.shot = 0.0;
+    } else if sm.winding
+        && sw & SWING_STATE_MASK == SWING_RECOVER
+        && sw & SWING_STAGGERED == 0
+        && (sm.swing & SWING_RANGED == 0 || swing_t > crate::unit_types::missile::CANCEL_TICKS)
+    {
+        if sm.swing & SWING_RANGED != 0 {
+            sm.shot = SHOT_S;
+        } else {
+            sm.follow = FOLLOW_S;
+        }
         sm.atk = 0.0;
     } else {
         sm.follow = (sm.follow - dt).max(0.0);
         sm.atk = (sm.atk - dt / REWIND_S).max(0.0);
     }
     sm.winding = winding;
+    // The bow comes up while he shoots standing, and goes down otherwise.
+    let ranged = sm.swing & SWING_RANGED != 0;
+    let shooting = (winding && ranged) || sm.shot > 0.0;
+    let up = if shooting && !dying && sm.walk < BOW_WALK_MS { 1.0 } else { 0.0 };
+    sm.bow = (sm.bow + (up - sm.bow).clamp(-dt / BOW_FALL_S, dt / BOW_RISE_S)).clamp(0.0, 1.0);
     let digit = attack_digit(sm.swing);
-    if sm.follow > 0.0 {
+    if sm.shot > 0.0 {
+        let t = SHOT_S - sm.shot;
+        if t < RELEASE_S {
+            RANGED_BASE + 2.0 + t / RELEASE_S
+        } else if t < RELEASE_S + RELOAD_S {
+            RANGED_BASE + 4.0 + (t - RELEASE_S) / RELOAD_S
+        } else {
+            // Holding the drawn bow: the raise at its start.
+            RANGED_BASE
+        }
+    } else if ranged && (sm.atk > 0.0 || sm.bow > 0.0) {
+        RANGED_BASE + sm.atk
+    } else if sm.follow > 0.0 {
         digit * 2.0 + FOLLOW_BASE + FOLLOW_SPAN * (1.0 - sm.follow / FOLLOW_S)
     } else if sm.atk > 0.0 {
         digit * 2.0 + sm.atk
@@ -761,7 +826,10 @@ fn sync_instance_data(
                     let attack =
                         attack_signal(sm, sw, units.swing_t[i], kind, dying, alpha, dt);
                     let mut tier = stance.get(gi).copied().unwrap_or(0.0);
-                    if attack > 0.0 && sm.swing & crate::units::SWING_RANGED == 0 {
+                    if attack > 0.0
+                        && attack < RANGED_BASE
+                        && sm.swing & crate::units::SWING_RANGED == 0
+                    {
                         tier = tier.max(BAND_FIGHTING);
                     }
                     sm.band += (tier - sm.band) * band_k;
@@ -847,7 +915,7 @@ fn sync_instance_data(
                     };
                     chunk_scratch[bucket_of(kind, lod)].push(InstanceData {
                         position,
-                        scale: 1.0,
+                        w: sm.bow,
                         color,
                         anim: [yaw, sm.walk, lunge, fx],
                         anim2: [sm.band, sm.wall, sm.gait, stagger],
@@ -1099,6 +1167,10 @@ fn init_custom_pipeline(
     let rig = || {
         binding_types::uniform_buffer_sized(false, None).visibility(ShaderStages::VERTEX)
     };
+    let clips = || {
+        binding_types::storage_buffer_read_only_sized(false, None)
+            .visibility(ShaderStages::VERTEX)
+    };
     let blank = device.create_texture_with_data(
         &queue,
         &TextureDescriptor {
@@ -1139,6 +1211,7 @@ fn init_custom_pipeline(
                             .visibility(ShaderStages::FRAGMENT),
                     ),
                     (6, rig()),
+                    (7, clips()),
                 ),
             ),
         ),
@@ -1150,6 +1223,7 @@ fn init_custom_pipeline(
                     (4, binding_types::texture_2d(TextureSampleType::Float { filterable: true })),
                     (5, binding_types::sampler(SamplerBindingType::Filtering)),
                     (6, rig()),
+                    (7, clips()),
                 ),
             ),
         ),
@@ -1164,15 +1238,25 @@ fn prepare_rig_buffers(
     device: Res<RenderDevice>,
     buckets: Query<(Entity, Option<&UnitRig>), (With<ExtractedInstances>, Without<RigBuffer>)>,
 ) {
-    for (entity, rig) in &buckets {
-        let rig = rig.map(|r| r.0).unwrap_or_default();
-        commands.entity(entity).insert(RigBuffer(device.create_buffer_with_data(
-            &BufferInitDescriptor {
+    for (entity, unit_rig) in &buckets {
+        let rig = unit_rig.map(|r| r.rig).unwrap_or_default();
+        // A storage binding cannot be empty.
+        let clips: &[[f32; 4]] = match unit_rig {
+            Some(r) if !r.clips.is_empty() => &r.clips,
+            _ => &[[0.0; 4]],
+        };
+        commands.entity(entity).insert(RigBuffer {
+            rig: device.create_buffer_with_data(&BufferInitDescriptor {
                 label: Some("unit rig"),
                 contents: bytemuck::bytes_of(&rig),
                 usage: BufferUsages::UNIFORM,
-            },
-        )));
+            }),
+            clips: device.create_buffer_with_data(&BufferInitDescriptor {
+                label: Some("unit shot tables"),
+                contents: bytemuck::cast_slice(clips),
+                usage: BufferUsages::STORAGE,
+            }),
+        });
     }
 }
 
@@ -1208,7 +1292,8 @@ fn prepare_bucket_bind_groups(
             &BindGroupEntries::with_indices((
                 (4, view),
                 (5, sampler),
-                (6, rig.0.as_entire_binding()),
+                (6, rig.rig.as_entire_binding()),
+                (7, rig.clips.as_entire_binding()),
             )),
         );
         commands.entity(entity).insert(BucketBindGroup {

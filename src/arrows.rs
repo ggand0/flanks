@@ -429,7 +429,7 @@ fn update_arrows(
             let center = Vec3::new(p.x, ground, p.z) - dir * 0.16;
             stuck.push(InstanceData {
                 position: center,
-                scale: 1.0,
+                w: 1.0,
                 color: [1.0, 1.0, 1.0, 0.0],
                 anim: [yaw, 0.0, 0.0, 0.0],
                 anim2: [0.0, 0.0, pitch, 0.0],
@@ -636,7 +636,7 @@ fn sync_arrow_instances(
             position: p,
             // Flying arrows draw a third oversized: a volley must READ
             // at battle zoom (the ground litter stays true-scale).
-            scale: 1.35,
+            w: 1.35,
             color: [1.0, 1.0, 1.0, 0.0],
             anim: [yaw, 0.0, 0.0, 0.0],
             anim2: [0.0, 0.0, pitch, 0.0],

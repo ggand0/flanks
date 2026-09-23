@@ -30,10 +30,10 @@ use bevy::render::{
 use bytemuck::{Pod, Zeroable};
 
 use crate::render_units::{
-    BAND_FIGHTING, CELEBRATE_BASE, CORPSE_CAP, Corpses, CustomPipeline, ExtractedAtlas,
-    FOLLOW_BASE, FOLLOW_S, FOLLOW_SPAN, InstanceBucket, InstanceData, LodBands, RigBuffer,
-    LodConfig, NUM_BUCKETS, NUM_LODS, REWIND_S, RenderCounts, SYNC_CHUNK, celebrate_progress,
-    stance_tier, wall_signal,
+    BAND_FIGHTING, BOW_FALL_S, BOW_RISE_S, BOW_WALK_MS, CELEBRATE_BASE, CORPSE_CAP, Corpses,
+    CustomPipeline, ExtractedAtlas, FOLLOW_BASE, FOLLOW_S, FOLLOW_SPAN, HOLD_S, InstanceBucket,
+    InstanceData, LodBands, LodConfig, NUM_BUCKETS, NUM_LODS, RANGED_BASE, RELEASE_S, RELOAD_S,
+    REWIND_S, RenderCounts, RigBuffer, SYNC_CHUNK, celebrate_progress, stance_tier, wall_signal,
 };
 use crate::units::Units;
 use crate::unit_types::NUM_KINDS;
@@ -124,6 +124,10 @@ pub struct BuildParams {
     consts: Vec4,
     /// FOLLOW_S, FOLLOW_BASE, FOLLOW_SPAN, REWIND_S (render_units.rs).
     attack: Vec4,
+    /// RELEASE_S, RELOAD_S, HOLD_S, BOW_WALK_MS (render_units.rs).
+    shot: Vec4,
+    /// BOW_RISE_S, BOW_FALL_S, CANCEL_TICKS, RANGED_BASE.
+    bow: Vec4,
     /// x = first index slot of the bucket, y = mesh corners per soldier.
     buckets: [UVec4; NUM_BUCKETS],
 }
@@ -297,6 +301,13 @@ fn build_frame_params(
     p.dt = dt;
     p.fighting = BAND_FIGHTING;
     p.attack = Vec4::new(FOLLOW_S, FOLLOW_BASE, FOLLOW_SPAN, REWIND_S);
+    p.shot = Vec4::new(RELEASE_S, RELOAD_S, HOLD_S, BOW_WALK_MS);
+    p.bow = Vec4::new(
+        BOW_RISE_S,
+        BOW_FALL_S,
+        crate::unit_types::missile::CANCEL_TICKS as f32,
+        RANGED_BASE,
+    );
     p.frame = frame_count.0;
     frame.params = p;
     frame.lod_debug = lod_cfg.debug;
@@ -665,7 +676,7 @@ impl UnitAlloc {
                 (live_cap + NUM_KINDS * CORPSE_CAP) * size_of::<crate::render_units::InstanceData>(),
                 BufferUsages::COPY_DST,
             ),
-            smooth: storage_buffer(device, "unit smoothing", live_cap * 32, BufferUsages::empty()),
+            smooth: storage_buffer(device, "unit smoothing", live_cap * 40, BufferUsages::empty()),
             index_list: storage_buffer(device, "unit index list", total * 4, BufferUsages::empty()),
             kind_cap,
             bases,
@@ -877,7 +888,8 @@ fn prepare_pull_bind_groups(
                 (3, alloc.bucket_info.as_entire_binding()),
                 (4, view),
                 (5, sampler),
-                (6, rig.0.as_entire_binding()),
+                (6, rig.rig.as_entire_binding()),
+                (7, rig.clips.as_entire_binding()),
             )),
         );
         commands.entity(entity).insert(PulledBucketGpu {

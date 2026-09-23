@@ -7,14 +7,18 @@ struct Vertex {
     // NOT texture coords: x = body part id (0 body, 1 sword arm,
     // 2 left leg, 3 right leg, 4 spear arm, 5 shield arm, 6 bow arm,
     // 7 arrow, 8 weapon, 9 and 10 a jointed weapon arm's forearm and
-    // hand), y = the part's pivot height.
+    // hand, and an archer's bow rig: 11 and 12 the bow forearm and hand,
+    // 13 and 17 the string halves, 14 and 15 the limbs, 16 the held
+    // arrow, 18 head, 19 torso), y = the part's pivot height.
     @location(2) part_pivot: vec2<f32>,
     // Where the vertex samples the kind's atlas (zero without one).
     @location(3) atlas_uv: vec2<f32>,
     // Part material: rgb = fixed color, a = team-color blend amount.
     @location(5) v_color: vec4<f32>,
 
-    // Per-instance: xyz = world position, w = uniform scale.
+    // Per-instance: xyz = world position. w = an arrow's uniform scale,
+    // or how far a soldier's bow is up from the carry toward the drawn
+    // ready pose, 0 to 1 (render_units.rs InstanceData).
     @location(8) i_pos_scale: vec4<f32>,
     // rgb = team color, a = stable per-unit anim seed (not opacity).
     @location(9) i_color: vec4<f32>,
@@ -75,8 +79,40 @@ struct Rig {
     // and how far the weapon is levelled. windup[0] is the guard.
     windup: array<vec4<f32>, 33>,
     recover: array<vec4<f32>, 33>,
+    bow: Bow,
+};
+
+// An archer's jointed arms and strung bow (unit_meshes.rs `Bow`), local
+// space.
+struct Bow {
+    // The drawing arm's shoulder, elbow and wrist.
+    draw: array<vec4<f32>, 3>,
+    // The bow arm's shoulder, elbow and wrist, and the bow's grip.
+    hold: array<vec4<f32>, 4>,
+    // Where the upper and lower limbs bend.
+    limbs: array<vec4<f32>, 2>,
+    // The string's ends at rest, upper then lower.
+    tips: array<vec4<f32>, 2>,
+    // The nock at rest, where the string halves and the arrow turn.
+    nock: vec4<f32>,
+    neck: vec4<f32>,
+    waist: vec4<f32>,
+    // x = each string half's length, y = how far the arrow passes beside
+    // the grip, z = share of the reload before the next arrow shows,
+    // w = 1 when the kind has this rig.
+    params: vec4<f32>,
+    // Start (in vec4s) and sample count of each table in `clips`:
+    // (raise, release) then (reload, the reload's free-arrow rows).
+    clips: array<vec4<u32>, 2>,
 };
 @group(3) @binding(6) var<uniform> rig: Rig;
+// The shot tables of this bucket's kind (unit_glb.rs `Shots::buffer`).
+// A pose is 8 vec4s: six joint turns as xyzw quaternions (the drawing
+// arm's shoulder, elbow and wrist, then the bow arm's), (bow yaw, limb
+// bend, arrow shown, body yaw), (torso pitch, bow pitch). A free-arrow
+// row is 2: (nock position, how far it has settled onto the string),
+// then its turn.
+@group(3) @binding(7) var<storage, read> clips: array<vec4<f32>>;
 
 // Standing brace pose (split legs, crouch, raised guard): read as
 // weird in play-testing, benched but kept — set to 1.0 to re-enable.
@@ -348,6 +384,197 @@ fn pitch_normal(n: vec3<f32>, ang: f32) -> vec3<f32> {
     return vec3<f32>(n.x, n.y * c + n.z * s, -n.y * s + n.z * c);
 }
 
+const QI: vec4<f32> = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+
+fn qmul(a: vec4<f32>, b: vec4<f32>) -> vec4<f32> {
+    return vec4<f32>(a.w * b.xyz + b.w * a.xyz + cross(a.xyz, b.xyz), a.w * b.w - dot(a.xyz, b.xyz));
+}
+
+fn qrot(q: vec4<f32>, v: vec3<f32>) -> vec3<f32> {
+    let t = 2.0 * cross(q.xyz, v);
+    return v + q.w * t + cross(q.xyz, t);
+}
+
+// Turns about +X and +Y, right-handed.
+fn qx(a: f32) -> vec4<f32> {
+    return vec4<f32>(sin(0.5 * a), 0.0, 0.0, cos(0.5 * a));
+}
+
+fn qy(a: f32) -> vec4<f32> {
+    return vec4<f32>(0.0, sin(0.5 * a), 0.0, cos(0.5 * a));
+}
+
+// The shortest turn taking unit direction a onto b.
+fn qalign(a: vec3<f32>, b: vec3<f32>) -> vec4<f32> {
+    return normalize(vec4<f32>(cross(a, b), 1.0 + dot(a, b)));
+}
+
+// Where a shot is in its table: the first of the two poses it lies
+// between, how far toward the second, and where the table starts.
+struct ShotAt {
+    at: u32,
+    i: u32,
+    f: f32,
+};
+
+fn shot_at(clip: u32, x: f32) -> ShotAt {
+    var span = rig.bow.clips[0].xy;
+    if clip == 1u {
+        span = rig.bow.clips[0].zw;
+    } else if clip == 2u {
+        span = rig.bow.clips[1].xy;
+    }
+    let t = clamp(x, 0.0, 1.0) * f32(span.y - 1u);
+    let i = min(u32(t), span.y - 2u);
+    return ShotAt(span.x, i, t - f32(i));
+}
+
+// Joint turn j of a shot, blended from the carry by w.
+fn shot_turn(s: ShotAt, j: u32, w: f32) -> vec4<f32> {
+    let a = clips[s.at + s.i * 8u + j];
+    var b = clips[s.at + (s.i + 1u) * 8u + j];
+    b = select(b, -b, dot(a, b) < 0.0);
+    var q = normalize(mix(a, b, s.f));
+    q = select(q, -q, q.w < 0.0);
+    return normalize(mix(QI, q, w));
+}
+
+// Scalar row k of a shot (0: bow yaw, limb bend, arrow shown, body yaw;
+// 1: torso pitch, bow pitch).
+fn shot_scalars(s: ShotAt, k: u32) -> vec4<f32> {
+    return mix(clips[s.at + s.i * 8u + 6u + k], clips[s.at + (s.i + 1u) * 8u + 6u + k], s.f);
+}
+
+struct Posed {
+    pos: vec3<f32>,
+    // The part's turn, for its normals.
+    turn: vec4<f32>,
+};
+
+// One vertex of an archer's bow rig, posed by shot `clip` at progress x
+// and blended from the carry by w: the arm chains, bow, string and arrow
+// as tools/blender/archer/motion.py `transforms` builds them, then the
+// body's yaw and the torso's pitch about the waist. The rigid march and
+// cheer swings of the old arms, draw_ang and bow_ang, fade out as the
+// bow comes up.
+fn bow_pose(part: f32, p: vec3<f32>, clip: u32, x: f32, w: f32, draw_ang: f32, bow_ang: f32) -> Posed {
+    let s = shot_at(clip, x);
+    let lead = shot_scalars(s, 0u) * w;
+    let tail = shot_scalars(s, 1u) * w;
+    let body = qy(lead.w);
+    let pitch = qx(-tail.x);
+    let waist = rig.bow.waist.xyz;
+    if abs(part - 18.0) < 0.5 {
+        // The head rides the torso but keeps facing the shot.
+        let neck = rig.bow.neck.xyz;
+        let moved = waist + qrot(pitch, qrot(body, neck) - waist);
+        return Posed(moved + qrot(pitch, p - neck), pitch);
+    }
+    var at = p;
+    var turn = QI;
+    let drawing = abs(part - 1.0) < 0.5 || abs(part - 9.0) < 0.5 || abs(part - 10.0) < 0.5;
+    if drawing || (part > 5.5 && part < 17.5 && !(part > 6.5 && part < 7.5)) {
+        // Shoulder, elbow and wrist, each carrying the next.
+        var first = 0u;
+        var joints = array<vec3<f32>, 3>(rig.bow.draw[0].xyz, rig.bow.draw[1].xyz, rig.bow.draw[2].xyz);
+        if !drawing {
+            first = 3u;
+            joints = array<vec3<f32>, 3>(rig.bow.hold[0].xyz, rig.bow.hold[1].xyz, rig.bow.hold[2].xyz);
+        }
+        let q1 = shot_turn(s, first, w);
+        let q2 = qmul(q1, shot_turn(s, first + 1u, w));
+        let q3 = qmul(q2, shot_turn(s, first + 2u, w));
+        let elbow = joints[0] + qrot(q1, joints[1] - joints[0]);
+        let wrist = elbow + qrot(q2, joints[2] - joints[1]);
+        if abs(part - 1.0) < 0.5 || abs(part - 6.0) < 0.5 {
+            at = joints[0] + qrot(q1, p - joints[0]);
+            turn = q1;
+        } else if abs(part - 9.0) < 0.5 || abs(part - 11.0) < 0.5 {
+            at = elbow + qrot(q2, p - joints[1]);
+            turn = q2;
+        } else if abs(part - 10.0) < 0.5 || abs(part - 12.0) < 0.5 {
+            at = wrist + qrot(q3, p - joints[2]);
+            turn = q3;
+        } else {
+            // The bow in the bow hand, with its own yaw and pitch.
+            let g = rig.bow.hold[3].xyz;
+            let grip = wrist + qrot(q3, g - joints[2]);
+            let held = qmul(qmul(vec4<f32>(-body.xyz, body.w), qx(-tail.y)), qy(lead.x));
+            if abs(part - 8.0) < 0.5 {
+                at = grip + qrot(held, p - g);
+                turn = held;
+            } else {
+                // The limbs bend opposite ways about their own ends of
+                // the grip, and each string half keeps its length from
+                // its tip to where the two meet.
+                let upper = qmul(held, qx(-lead.y));
+                let lower = qmul(held, qx(lead.y));
+                let l0 = rig.bow.limbs[0].xyz;
+                let l1 = rig.bow.limbs[1].xyz;
+                let top = grip + qrot(held, l0 - g) + qrot(upper, rig.bow.tips[0].xyz - l0);
+                let bottom = grip + qrot(held, l1 - g) + qrot(lower, rig.bow.tips[1].xyz - l1);
+                let half = 0.5 * length(top - bottom);
+                let sag = sqrt(max(rig.bow.params.x * rig.bow.params.x - half * half, 0.0));
+                let nock = 0.5 * (top + bottom) - qrot(held, vec3<f32>(0.0, 0.0, sag));
+                let rest = rig.bow.nock.xyz;
+                if abs(part - 14.0) < 0.5 {
+                    at = grip + qrot(held, l0 - g) + qrot(upper, p - l0);
+                    turn = upper;
+                } else if abs(part - 15.0) < 0.5 {
+                    at = grip + qrot(held, l1 - g) + qrot(lower, p - l1);
+                    turn = lower;
+                } else if abs(part - 13.0) < 0.5 {
+                    turn = qalign(normalize(rig.bow.tips[0].xyz - rest), normalize(top - nock));
+                    at = nock + qrot(turn, p - rest);
+                } else if abs(part - 17.0) < 0.5 {
+                    turn = qalign(normalize(rig.bow.tips[1].xyz - rest), normalize(bottom - nock));
+                    at = nock + qrot(turn, p - rest);
+                } else {
+                    // The held arrow lies from the nock to beside the grip.
+                    // In the reload it comes out of the quiver free and
+                    // settles onto the string.
+                    turn = qalign(
+                        vec3<f32>(0.0, 0.0, 1.0),
+                        normalize(grip + qrot(held, vec3<f32>(rig.bow.params.y, 0.0, 0.0)) - nock),
+                    );
+                    var origin = nock;
+                    var shown = clips[s.at + s.i * 8u + 6u].z > 0.5;
+                    if clip == 2u {
+                        shown = x >= rig.bow.params.z;
+                        let row = rig.bow.clips[1].z + s.i * 2u;
+                        let a = clips[row];
+                        let b = clips[row + 2u];
+                        let settled = mix(a.w, b.w, s.f);
+                        let qa = clips[row + 1u];
+                        var qb = clips[row + 3u];
+                        qb = select(qb, -qb, dot(qa, qb) < 0.0);
+                        var free = normalize(mix(qa, qb, s.f));
+                        free = select(free, -free, dot(free, turn) < 0.0);
+                        turn = normalize(mix(free, turn, settled));
+                        origin = mix(mix(a.xyz, b.xyz, s.f), nock, settled);
+                        // A free arrow follows the reload's hand, which is only
+                        // there with the bow fully up.
+                        shown = shown && (settled > 0.999 || w > 0.999);
+                    }
+                    at = select(nock, origin + qrot(turn, p - rest), shown && w > 0.5);
+                }
+            }
+        }
+        // The old rigid swings, about the shoulder, fading as the bow
+        // comes up.
+        var ang = bow_ang;
+        if drawing {
+            ang = draw_ang;
+        }
+        let swing = qx(-ang * (1.0 - w));
+        at = joints[0] + qrot(swing, at - joints[0]);
+        turn = qmul(swing, turn);
+    }
+    // The upper body turns side-on about the vertical axis and leans at
+    // the waist.
+    return Posed(waist + qrot(pitch, qrot(body, at) - waist), qmul(pitch, qmul(body, turn)));
+}
+
 @vertex
 fn vertex(vertex: Vertex) -> VertexOutput {
     return unit_vertex(vertex);
@@ -423,11 +650,38 @@ fn unit_vertex(vertex: Vertex) -> VertexOutput {
     let yaw = vertex.i_anim.x;
     let speed = vertex.i_anim.y;
     let moving = walk_gate(speed);
+    // A bow shot from 16: clip * 2 + progress, clip 0 the raise, 1 the
+    // release, 2 the reload (render_units.rs RANGED_BASE). A kind with a
+    // bow rig plays it from its tables. Without one the draw arms read it
+    // as a stab: the raise is the wind-up and the release the
+    // follow-through.
+    let bow_rig = rig.bow.params.w > 0.5;
+    let zraw = max(vertex.i_anim.z, 0.0);
+    let shooting = zraw > 15.5;
+    let shot_clip = floor((zraw - 16.0) * 0.5 + 0.001);
+    let shot_x = clamp(zraw - 16.0 - shot_clip * 2.0, 0.0, 1.0);
+    var zpos = zraw;
+    if shooting {
+        zpos = 0.0;
+        if !bow_rig && shot_clip < 0.5 {
+            zpos = shot_x;
+        } else if !bow_rig && shot_clip < 1.5 {
+            zpos = 1.4 + 0.59 * shot_x;
+        }
+    }
+    // How far the bow is up from the carry toward the drawn ready pose,
+    // and the clip it poses: between shots, the raise at its start.
+    let bow_w = select(0.0, smoothstep(0.0, 1.0, vertex.i_pos_scale.w), bow_rig);
+    var clip = 0u;
+    var clip_x = 0.0;
+    if shooting {
+        clip = u32(clamp(shot_clip, 0.0, 2.0));
+        clip_x = shot_x;
+    }
     // Attack: the 2s digit is the swing style (0 stab, 1 classic swing,
     // 2 slash), plus 3 on a charging blow. The remainder is the wind-up,
     // 0..1 linear in time, or from 1.4 the follow-through after the blow
     // landed (render_units.rs FOLLOW_BASE). From 12 the victory cheer.
-    let zpos = max(vertex.i_anim.z, 0.0);
     let cheering = zpos > 11.5;
     let digit = floor(zpos * 0.5 + 0.001);
     let charge = digit > 2.5 && !cheering;
@@ -500,7 +754,22 @@ fn unit_vertex(vertex: Vertex) -> VertexOutput {
     let dip = gait_dip(fract(2.0 * gait), g);
 
     // --- Part animation (rotations around the part pivot) ---
-    if rig.chain > 0.5 && (abs(part - rig.arm) < 0.5 || (part > 7.5 && part < 10.5)) {
+    if bow_rig && (abs(part - 1.0) < 0.5 || abs(part - 6.0) < 0.5 || (part > 7.5 && part < 19.5)) {
+        // An archer's bow rig. A shot plays its clip, and between shots
+        // the drawn ready pose (the raise at its start) eases in and out
+        // with the bow. The drawing arm keeps the old march, cheer and
+        // melee swings and the bow arm its march and cheer swings, rigid
+        // about each shoulder, while the bow is down.
+        let sway = (0.18 - 0.06 * run) * moving * limb * (1.0 - raise);
+        let carry = mix(-0.55, 0.25, max(stance, ready * 0.75)) * moving * (1.0 - raise);
+        var draw_ang = select(1.9 * raise - 2.5 * chop, 0.55 * raise - 0.45 * chop, style < 0.5);
+        draw_ang = select(draw_ang, celebrate * (1.75 + 0.35 * sin(wobble)), celebrate > 0.001);
+        draw_ang += sway + carry + 0.6 * brace;
+        let bow_ang = -0.06 * moving * limb + celebrate * (1.5 + 0.3 * sin(wobble));
+        let posed = bow_pose(part, local, clip, clip_x, bow_w, draw_ang, bow_ang);
+        local = posed.pos;
+        normal = qrot(posed.turn, normal);
+    } else if rig.chain > 0.5 && (abs(part - rig.arm) < 0.5 || (part > 7.5 && part < 10.5)) {
         // A jointed weapon arm: upper arm, forearm and hand turn at the
         // shoulder, elbow and wrist, each carrying the next, and the
         // weapon turns and slides through the hand. The rest pose is the
@@ -765,10 +1034,22 @@ fn unit_vertex(vertex: Vertex) -> VertexOutput {
         normal = pitch_normal(normal, ang);
     }
 
+    // An archer's hips and legs turn side-on with his body as his bow
+    // comes up. The rest of his body turned in `bow_pose`.
+    if bow_rig && bow_w > 0.0 && (part < 0.5 || (part > 1.5 && part < 3.5)) {
+        let body = qy(shot_scalars(shot_at(clip, clip_x), 0u).w * bow_w);
+        local = qrot(body, local);
+        normal = qrot(body, normal);
+    }
+
     // The shoulders turn against the legs and the upper body shifts over
     // the planted foot, easing in up the torso so the hips stay square.
-    if part < 1.5 || (part > 3.5 && part < 6.5) || (part > 7.5 && part < 10.5) {
-        let w = select(1.0, smoothstep(0.0, 0.25, vertex.position.y), part < 0.5);
+    if part < 1.5 || (part > 3.5 && part < 6.5) || (part > 7.5 && part < 19.5) {
+        let w = select(
+            1.0,
+            smoothstep(0.0, 0.25, vertex.position.y),
+            part < 0.5 || abs(part - 19.0) < 0.5,
+        );
         let turn = 0.10 * g.run * g.stride * limb * w;
         local = rot_y(local, cos(turn), sin(turn));
         normal = rot_y(normal, cos(turn), sin(turn));
@@ -840,7 +1121,7 @@ fn unit_vertex(vertex: Vertex) -> VertexOutput {
     // crouch on the advance too.
     let hop = 0.06 * celebrate * max(sin(wobble), 0.0);
     // Wall stance carries a slight crouch (the planted, braced line).
-    let position = local * vertex.i_pos_scale.w
+    let position = local * select(1.0, vertex.i_pos_scale.w, part > 6.5 && part < 7.5)
         + vertex.i_pos_scale.xyz
         + vec3<f32>(
             0.0,

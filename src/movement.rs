@@ -1314,7 +1314,7 @@ fn run_tick_job(job: &mut TickJob) {
                                     // Target gone mid-draw: ease off and
                                     // reassess shortly.
                                     sw_chunk[j] = crate::units::SWING_RECOVER;
-                                    swt_chunk[j] = 20;
+                                    swt_chunk[j] = crate::unit_types::missile::CANCEL_TICKS;
                                 }
                             }
                             crate::units::SWING_WINDUP => {

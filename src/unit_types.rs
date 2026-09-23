@@ -43,6 +43,10 @@ pub mod missile {
     /// Reload between volleys: 8 s -> a ~9.5 s cycle, matching the
     /// animation-bound ~10 s / "6 volleys a minute" M2TW longbow cycle.
     pub const RELOAD_TICKS: u8 = 240;
+    /// Pause after a draw whose target went away before the loose. Far
+    /// shorter than any reload, which is how the renderer tells the two
+    /// apart.
+    pub const CANCEL_TICKS: u8 = 20;
     /// Launch speed band the arc solver may use (verbatim `velocity 20 48`).
     pub const SPEED_MIN: f32 = 20.0;
     pub const SPEED_MAX: f32 = 48.0;

@@ -26,7 +26,10 @@
 //! A weapon arm split into upper arm, forearm and hand is posed by
 //! attack tables that ship next to the model, `<kind>.stab.json`, which
 //! the build scripts in tools/blender write. Without them the arm bends
-//! at the elbow as one piece.
+//! at the elbow as one piece. An archer with jointed arms, a strung bow,
+//! a held arrow and a separate head and torso shoots from the tables in
+//! `<kind>.shoot.json`. Without them the parts join the arm, bow arm or
+//! body they belong to, and the archer shoots as a rigid figure.
 //!
 //! `FL_UNIT_MESH=code` keeps the code-built meshes and `FL_GLB_FAR=code`
 //! fills only the missing levels from them. `FL_GLB_<KIND>=path` loads
@@ -52,9 +55,9 @@ type Fallible<T> = Result<T, String>;
 const KIND_FILE: [&str; NUM_KINDS] = ["knight", "man_at_arms", "spearman", "archer"];
 
 /// Part id to the name its pivot empty carries (`pivot_<part>`), in the
-/// order unit_meshes.rs and the vertex shader use. Id 7 is the arrow,
-/// which no model carries.
-const PART_NAMES: [&str; 11] = [
+/// order unit_meshes.rs and the vertex shader use. Id 7 is the arrow in
+/// flight, which no model carries.
+const PART_NAMES: [&str; 20] = [
     "body",
     "arm_weapon",
     "leg_l",
@@ -66,7 +69,28 @@ const PART_NAMES: [&str; 11] = [
     "weapon",
     "forearm_spear",
     "hand_spear",
+    "forearm_bow",
+    "hand_bow",
+    "bow_string",
+    "bow_upper",
+    "bow_lower",
+    "arrow",
+    "bow_string_lower",
+    "head",
+    "torso",
 ];
+
+/// Other names a part goes by: an archer's drawing forearm and hand take
+/// the ids of a spearman's.
+const PART_ALIASES: [(&str, usize); 2] = [("forearm_draw", 9), ("hand_draw", 10)];
+
+/// The part id a `pivot_<name>` empty belongs to.
+fn part_id(name: &str) -> Option<usize> {
+    PART_NAMES
+        .iter()
+        .position(|q| !q.is_empty() && *q == name)
+        .or_else(|| PART_ALIASES.iter().find(|(n, _)| *n == name).map(|(_, id)| *id))
+}
 
 /// The held weapon's part id (unit_meshes.rs PART_WEAPON).
 const WEAPON: usize = 8;
@@ -89,8 +113,8 @@ const SLABS: [(usize, usize); NUM_LODS] = [(0, 0), (8, 4), (3, 2), (3, 0)];
 /// the silhouette at some angles.
 const MIN_HALF: f32 = 0.005;
 
-/// A kind's meshes, the texture atlas its imported levels sample, and its
-/// weapon arm's rig.
+/// A kind's meshes, the texture atlas its imported levels sample, its
+/// rig, and the shot tables of an archer's bow rig (empty without one).
 pub struct KindMeshes {
     pub lods: [Mesh; NUM_LODS],
     /// The model's base colour atlas: sRGB colour, alpha the team tint
@@ -100,6 +124,7 @@ pub struct KindMeshes {
     /// their colour per vertex.
     pub textured: [bool; NUM_LODS],
     pub rig: Rig,
+    pub clips: Vec<[f32; 4]>,
 }
 
 impl KindMeshes {
@@ -109,6 +134,7 @@ impl KindMeshes {
             atlas: None,
             textured: [false; NUM_LODS],
             rig: crate::unit_meshes::code_rig(kind),
+            clips: Vec::new(),
         }
     }
 }
@@ -179,11 +205,13 @@ impl Level {
     /// holds above his head: a spearman's spear stands 0.7 m higher.
     fn y_range(&self) -> (f32, f32) {
         let ground = self.pos.iter().fold(f32::MAX, |lo, p| lo.min(p.y));
+        // The figure's height is its trunk's: a spear or a bow held
+        // upright reaches higher.
         let top = |body: bool| {
             self.pos
                 .iter()
                 .zip(&self.part)
-                .filter(|(_, part)| !body || part.round() == 0.0)
+                .filter(|(_, part)| !body || is_trunk(**part))
                 .fold(f32::MIN, |hi, (p, _)| hi.max(p.y))
         };
         let body = top(true);
@@ -221,7 +249,7 @@ fn import(kind: usize, path: &Path) -> Fallible<KindMeshes> {
         let Some(name) = node.name() else { continue };
         if let Some(part) = name
             .strip_prefix("pivot_")
-            .and_then(|p| PART_NAMES.iter().position(|q| !q.is_empty() && *q == p))
+            .and_then(part_id)
         {
             pivot_nodes.push((part, xf.w_axis.y));
         }
@@ -261,7 +289,11 @@ fn import(kind: usize, path: &Path) -> Fallible<KindMeshes> {
         to_local(level, scale, half_height);
     }
     let local = |p: Vec3| [scale * p.y - half_height, scale * p.z];
-    let rig = arm_rig(&mut levels, &empties, local, scale, path, name);
+    let local3 = |p: Vec3| Vec3::new(scale * p.x, scale * p.y - half_height, scale * p.z);
+    let (rig, clips) = match bow_rig(&mut levels, &empties, local3, scale, path, name) {
+        Some(bow) => bow,
+        None => (arm_rig(&mut levels, &empties, local, scale, path, name), Vec::new()),
+    };
 
     let imported: Vec<usize> = (0..NUM_LODS).filter(|l| levels[*l].is_some()).collect();
     let tris: Vec<usize> = levels.iter().map(|l| l.as_ref().map_or(0, Level::tris)).collect();
@@ -312,6 +344,7 @@ fn import(kind: usize, path: &Path) -> Fallible<KindMeshes> {
         atlas,
         textured,
         rig,
+        clips,
     })
 }
 
@@ -446,6 +479,295 @@ fn fold(levels: &mut [Option<Level>; NUM_LODS], parts: &[usize], arm: usize) {
             }
         }
     }
+}
+
+/// Every part an archer's bow rig moves: the drawing arm, the bow arm,
+/// the bow's grip, limbs and string halves, the held arrow, head and
+/// torso.
+const BOW_RIG: [usize; 14] = [1, 9, 10, 6, 11, 12, 8, 13, 14, 15, 16, 17, 18, 19];
+
+/// Each string half from the nock to its tip, and how far the nocked
+/// arrow passes beside the bow's grip, in authoring metres
+/// (tools/blender/archer/motion.py `TOP` and `transforms`).
+const STRING_HALF_M: f32 = 0.87;
+const ARROW_BESIDE_GRIP_M: f32 = 0.020;
+
+/// An archer's bow rig and its shot tables. None when the model has no
+/// bow rig parts. A model that has them but cannot use them loses them
+/// into the arm, bow arm or body they belong to, logs why, and gets None
+/// as well.
+fn bow_rig(
+    levels: &mut [Option<Level>; NUM_LODS],
+    empties: &[(String, Vec3)],
+    local: impl Fn(Vec3) -> Vec3,
+    scale: f32,
+    path: &Path,
+    name: &str,
+) -> Option<(Rig, Vec<[f32; 4]>)> {
+    let level = finest_local(levels);
+    if !level.part.iter().any(|p| (11..=19).contains(&(p.round() as usize))) {
+        return None;
+    }
+    match build_bow(level, empties, &local, scale, path) {
+        Ok(bow) => {
+            info!("{name}: bow rig, shots from {}", shoot_path(path).display());
+            Some(bow)
+        }
+        Err(e) => {
+            warn!("{name}: {e}, so the bow rig's parts join the arms and body");
+            fold(levels, &[9, 10], 1);
+            fold(levels, &[11, 12, 8, 13, 14, 15, 16, 17], 6);
+            fold(levels, &[18, 19], 0);
+            None
+        }
+    }
+}
+
+fn build_bow(
+    level: &Level,
+    empties: &[(String, Vec3)],
+    local: &impl Fn(Vec3) -> Vec3,
+    scale: f32,
+    path: &Path,
+) -> Fallible<(Rig, Vec<[f32; 4]>)> {
+    let has = |part: usize| level.part.iter().any(|p| p.round() as usize == part);
+    if let Some(part) = BOW_RIG.iter().find(|&&p| !has(p)) {
+        return Err(format!("the bow rig has no {} part", PART_NAMES[*part]));
+    }
+    let file_path = shoot_path(path);
+    let shots = read_shoot(&file_path)?;
+    // Each joint is the pivot empty the file names for its part, and it
+    // has to sit where the file's tables were built.
+    let joint = |part: usize| -> Fallible<Vec3> {
+        let key = part.to_string();
+        let part_name = shots
+            .parts
+            .get(&key)
+            .ok_or_else(|| format!("{} names no part {part}", file_path.display()))?;
+        let at = empties
+            .iter()
+            .find(|(n, _)| n.strip_prefix("pivot_") == Some(part_name.as_str()))
+            .map(|(_, p)| *p)
+            .ok_or_else(|| format!("no pivot_{part_name} empty"))?;
+        let authored = shots
+            .joints
+            .get(&key)
+            .ok_or_else(|| format!("{} has no joint for {part_name}", file_path.display()))?;
+        if at.distance(Vec3::from_array(*authored)) > 1e-3 {
+            return Err(format!(
+                "{} puts the {part_name} joint at {authored:?}, the model at {at}",
+                file_path.display()
+            ));
+        }
+        Ok(at)
+    };
+    let v4 = |p: Vec3| {
+        let q = local(p);
+        [q.x, q.y, q.z, 0.0]
+    };
+    let nock = joint(13)?;
+    // The string halves are rigid, so their length is the rig's.
+    let reach = level
+        .pos
+        .iter()
+        .zip(&level.part)
+        .filter(|(_, p)| p.round() as usize == 13)
+        .map(|(v, _)| v.distance(local(nock)))
+        .fold(0.0f32, f32::max);
+    if (reach - scale * STRING_HALF_M).abs() > scale * 0.02 {
+        return Err(format!(
+            "the upper string reaches {:.3} m from the nock, the rig's string half is {STRING_HALF_M} m",
+            reach / scale
+        ));
+    }
+    let half = Vec3::new(0.0, STRING_HALF_M, 0.0);
+    let clips = shots.layout();
+    let bow = crate::unit_meshes::Bow {
+        draw: [v4(joint(1)?), v4(joint(9)?), v4(joint(10)?)],
+        hold: [v4(joint(6)?), v4(joint(11)?), v4(joint(12)?), v4(joint(8)?)],
+        limbs: [v4(joint(14)?), v4(joint(15)?)],
+        tips: [v4(nock + half), v4(nock - half)],
+        nock: v4(nock),
+        neck: v4(joint(18)?),
+        waist: v4(joint(19)?),
+        params: [scale * STRING_HALF_M, scale * ARROW_BESIDE_GRIP_M, shots.pickup, 1.0],
+        clips: clips.offsets,
+    };
+    let rig = Rig { bow, ..Rig::default() };
+    Ok((rig, shots.buffer(&clips, local)))
+}
+
+/// The shot tables of a model with a bow rig, next to it.
+fn shoot_path(model: &Path) -> PathBuf {
+    model.with_extension("shoot.json")
+}
+
+/// A bow rig's shots as the build scripts write them
+/// (tools/blender/archer/motion.py `export`). Each pose holds six local
+/// rotations as xyzw quaternions (the drawing arm's shoulder, elbow and
+/// wrist, then the bow arm's), and then bow yaw, limb bend, arrow shown,
+/// body yaw, torso pitch and bow pitch.
+#[derive(serde::Deserialize)]
+struct ShootFile {
+    version: u32,
+    parts: std::collections::HashMap<String, String>,
+    joints: std::collections::HashMap<String, [f32; 3]>,
+    durations: std::collections::HashMap<String, f32>,
+    events: std::collections::HashMap<String, Vec<ShootEvent>>,
+    /// The reload's arrow while it is out of the quiver: nock position
+    /// and orientation in the torso's frame, and how far it has settled
+    /// onto the string.
+    arrow_samples: std::collections::HashMap<String, Vec<[f32; 8]>>,
+    samples: std::collections::HashMap<String, Vec<[f32; 30]>>,
+}
+
+#[derive(serde::Deserialize)]
+struct ShootEvent {
+    time: f32,
+    event: String,
+}
+
+struct Shots {
+    parts: std::collections::HashMap<String, String>,
+    joints: std::collections::HashMap<String, [f32; 3]>,
+    raise: Vec<[f32; 30]>,
+    release: Vec<[f32; 30]>,
+    reload: Vec<[f32; 30]>,
+    arrow: Vec<[f32; 8]>,
+    /// Share of the reload before the next arrow shows.
+    pickup: f32,
+}
+
+/// Where each table sits in the clip buffer.
+struct ClipLayout {
+    offsets: [[u32; 4]; 2],
+}
+
+/// vec4s per pose in the clip buffer: six rotations and two of scalars.
+const POSE_VEC4S: usize = 8;
+
+impl Shots {
+    fn layout(&self) -> ClipLayout {
+        let raise = 0;
+        let release = raise + self.raise.len() * POSE_VEC4S;
+        let reload = release + self.release.len() * POSE_VEC4S;
+        let arrow = reload + self.reload.len() * POSE_VEC4S;
+        let n = |v: usize| v as u32;
+        ClipLayout {
+            offsets: [
+                [n(raise), n(self.raise.len()), n(release), n(self.release.len())],
+                [n(reload), n(self.reload.len()), n(arrow), n(self.arrow.len())],
+            ],
+        }
+    }
+
+    /// The tables as the shader reads them, positions in engine local
+    /// space.
+    fn buffer(&self, layout: &ClipLayout, local: &impl Fn(Vec3) -> Vec3) -> Vec<[f32; 4]> {
+        let mut out = Vec::new();
+        for table in [&self.raise, &self.release, &self.reload] {
+            for row in table.iter() {
+                for q in row[..24].chunks(4) {
+                    out.push([q[0], q[1], q[2], q[3]]);
+                }
+                out.push([row[24], row[25], row[26], row[27]]);
+                out.push([row[28], row[29], 0.0, 0.0]);
+            }
+        }
+        for row in &self.arrow {
+            let at = local(Vec3::new(row[0], row[1], row[2]));
+            out.push([at.x, at.y, at.z, row[7]]);
+            out.push([row[3], row[4], row[5], row[6]]);
+        }
+        debug_assert_eq!(out.len(), layout.offsets[1][2] as usize + self.arrow.len() * 2);
+        out
+    }
+}
+
+/// Read and check a bow rig's shot file.
+fn read_shoot(path: &Path) -> Fallible<Shots> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read its shot tables {}: {e}", path.display()))?;
+    let mut file: ShootFile = serde_json::from_str(&text)
+        .map_err(|e| format!("{} is not a shot file: {e}", path.display()))?;
+    if file.version != 3 {
+        return Err(format!("{} is version {}, the engine reads 3", path.display(), file.version));
+    }
+    let mut table = |clip: &str| -> Fallible<Vec<[f32; 30]>> {
+        let rows = file
+            .samples
+            .remove(clip)
+            .ok_or_else(|| format!("{} has no {clip} table", path.display()))?;
+        if rows.len() < 2 {
+            return Err(format!("{}: the {clip} table has {} poses", path.display(), rows.len()));
+        }
+        if rows.iter().flatten().any(|v| !v.is_finite()) {
+            return Err(format!("{}: the {clip} table has a pose that is not a number", path.display()));
+        }
+        Ok(rows)
+    };
+    let (raise, release, reload) = (table("raise")?, table("release")?, table("reload")?);
+    let arrow = file
+        .arrow_samples
+        .remove("reload")
+        .ok_or_else(|| format!("{} has no reload arrow table", path.display()))?;
+    if arrow.len() != reload.len() || arrow.iter().flatten().any(|v| !v.is_finite()) {
+        return Err(format!(
+            "{}: the reload arrow table has {} rows for {} poses",
+            path.display(),
+            arrow.len(),
+            reload.len()
+        ));
+    }
+    // The shot is a loop: raise, release, reload, and the reload ends
+    // where the next raise starts. Only the arrow is allowed to vanish at
+    // the loose.
+    let same = |a: &[f32; 30], b: &[f32; 30], skip: Option<usize>| {
+        let turns = (0..6).all(|j| {
+            let dot: f32 = (0..4).map(|k| a[j * 4 + k] * b[j * 4 + k]).sum();
+            dot.abs() > 1.0 - 1e-4
+        });
+        turns && (24..30).all(|i| Some(i) == skip || (a[i] - b[i]).abs() < 1e-3)
+    };
+    let last = |t: &Vec<[f32; 30]>| *t.last().expect("two poses or more");
+    for (from, to, a, b, skip) in [
+        ("raise", "release", last(&raise), release[0], Some(26)),
+        ("release", "reload", last(&release), reload[0], None),
+        ("reload", "raise", last(&reload), raise[0], None),
+    ] {
+        if !same(&a, &b, skip) {
+            return Err(format!("{}: the {from} table does not end where {to} starts", path.display()));
+        }
+    }
+    for (clip, engine) in [
+        ("release", crate::render_units::RELEASE_S),
+        ("reload", crate::render_units::RELOAD_S),
+    ] {
+        match file.durations.get(clip) {
+            Some(d) if (d - engine).abs() > 1e-3 => warn!(
+                "{}: the {clip} is authored over {d} s and plays over {engine} s",
+                path.display()
+            ),
+            Some(_) => {}
+            None => return Err(format!("{} gives no {clip} duration", path.display())),
+        }
+    }
+    let reload_s = file.durations.get("reload").copied().unwrap_or(crate::render_units::RELOAD_S);
+    let pickup = file
+        .events
+        .get("reload")
+        .and_then(|events| events.iter().find(|e| e.event == "arrow_emerges"))
+        .map(|e| e.time / reload_s)
+        .ok_or_else(|| format!("{} does not say when the next arrow shows", path.display()))?;
+    Ok(Shots {
+        parts: file.parts,
+        joints: file.joints,
+        raise,
+        release,
+        reload,
+        arrow,
+        pickup,
+    })
 }
 
 /// The attack tables of a model with a jointed arm, next to it.
@@ -1013,11 +1335,12 @@ fn visible_weights(level: &Level) -> Vec<f32> {
     weights
 }
 
-/// Body and legs, the parts a figure's mass sits in. The last level is
-/// one block stack, and an arm holding a sword out in front would double
-/// the width of every box if it counted toward them.
+/// Body, legs, and an archer's separate head and torso: the parts a
+/// figure's mass sits in. The last level is one block stack, and an arm
+/// holding a sword out in front would double the width of every box if
+/// it counted toward them.
 fn is_trunk(part: f32) -> bool {
-    matches!(part as u32, 0 | 2 | 3)
+    matches!(part.round() as u32, 0 | 2 | 3 | 18 | 19)
 }
 
 /// Build a far level from a finer one: every part is cut into slabs

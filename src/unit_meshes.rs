@@ -96,6 +96,35 @@ pub struct Rig {
     /// is the guard. The rest pose is the carry, all zero.
     pub windup: [[f32; 4]; ATTACK_SAMPLES],
     pub recover: [[f32; 4]; ATTACK_SAMPLES],
+    pub bow: Bow,
+}
+
+/// An archer's jointed arms and strung bow, in engine local space (xyz,
+/// w unused). Its shots play from tables in a separate buffer
+/// (`render_units.rs` `RigBuffer`), and `clips` says where they are.
+#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
+pub struct Bow {
+    /// The drawing arm's shoulder, elbow and wrist.
+    pub draw: [[f32; 4]; 3],
+    /// The bow arm's shoulder, elbow and wrist, and the bow's grip.
+    pub hold: [[f32; 4]; 4],
+    /// Where the upper and lower limbs bend.
+    pub limbs: [[f32; 4]; 2],
+    /// The string's ends at rest, upper then lower.
+    pub tips: [[f32; 4]; 2],
+    /// The nock at rest: where both string halves and the arrow turn.
+    pub nock: [f32; 4],
+    pub neck: [f32; 4],
+    pub waist: [f32; 4],
+    /// x = length of each string half, y = how far the arrow passes
+    /// beside the grip, z = share of the reload before the next arrow
+    /// shows, w = 1 when the kind has this rig.
+    pub params: [f32; 4],
+    /// Where each table starts in the clip buffer, in vec4s, and its
+    /// sample count: (raise, release) then (reload, the reload's
+    /// free-arrow rows).
+    pub clips: [[u32; 4]; 2],
 }
 
 impl Default for Rig {
@@ -105,7 +134,8 @@ impl Default for Rig {
 }
 
 impl Rig {
-    /// The same rig on a mesh scaled by `s` about the local origin.
+    /// The same rig on a mesh scaled by `s` about the local origin. Only
+    /// the code-built rigs are scaled this way, and they have no bow.
     pub fn scaled(mut self, s: f32) -> Self {
         for v in [&mut self.shoulder, &mut self.elbow, &mut self.wrist, &mut self.grip] {
             v[0] *= s;
