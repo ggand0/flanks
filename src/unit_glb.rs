@@ -201,12 +201,11 @@ impl Level {
     }
 
     /// Ground line and height, for the scale and the sanity checks. The
-    /// height is the top of the body part, not of whatever the soldier
-    /// holds above his head: a spearman's spear stands 0.7 m higher.
+    /// height is the top of the trunk (`is_trunk`), not of whatever the
+    /// soldier holds above his head: a spearman's spear stands 0.7 m
+    /// higher.
     fn y_range(&self) -> (f32, f32) {
         let ground = self.pos.iter().fold(f32::MAX, |lo, p| lo.min(p.y));
-        // The figure's height is its trunk's: a spear or a bow held
-        // upright reaches higher.
         let top = |body: bool| {
             self.pos
                 .iter()

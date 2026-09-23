@@ -455,7 +455,7 @@ struct Posed {
 // and blended from the carry by w: the arm chains, bow, string and arrow
 // as tools/blender/archer/motion.py `transforms` builds them, then the
 // body's yaw and the torso's pitch about the waist. The rigid march and
-// cheer swings of the old arms, draw_ang and bow_ang, fade out as the
+// cheer swings of unjointed arms, draw_ang and bow_ang, fade out as the
 // bow comes up.
 fn bow_pose(part: f32, p: vec3<f32>, clip: u32, x: f32, w: f32, draw_ang: f32, bow_ang: f32) -> Posed {
     let s = shot_at(clip, x);
@@ -560,8 +560,8 @@ fn bow_pose(part: f32, p: vec3<f32>, clip: u32, x: f32, w: f32, draw_ang: f32, b
                 }
             }
         }
-        // The old rigid swings, about the shoulder, fading as the bow
-        // comes up.
+        // The rigid swings about the shoulder, fading as the bow comes
+        // up.
         var ang = bow_ang;
         if drawing {
             ang = draw_ang;
@@ -707,7 +707,7 @@ fn unit_vertex(vertex: Vertex) -> VertexOutput {
     let raise = select(smoothstep(0.0, 0.55, wound), settle, following);
     let chop = select(smoothstep(0.55, 1.0, wound), settle, following);
     // Cheer: z = 12 + progress. Ease in over the first ~8% and back out
-    // over the last ~10% — poses must never snap in one frame.
+    // over the last ~10%, so a pose never snaps in one frame.
     let cele_t = clamp(zpos - 12.0, 0.0, 1.0);
     let celebrate = select(0.0, 1.0, cheering)
         * smoothstep(0.0, 0.08, cele_t)
@@ -757,9 +757,9 @@ fn unit_vertex(vertex: Vertex) -> VertexOutput {
     if bow_rig && (abs(part - 1.0) < 0.5 || abs(part - 6.0) < 0.5 || (part > 7.5 && part < 19.5)) {
         // An archer's bow rig. A shot plays its clip, and between shots
         // the drawn ready pose (the raise at its start) eases in and out
-        // with the bow. The drawing arm keeps the old march, cheer and
-        // melee swings and the bow arm its march and cheer swings, rigid
-        // about each shoulder, while the bow is down.
+        // with the bow. While the bow is down, the drawing arm swings
+        // rigidly about its shoulder on the march, in the cheer and in a
+        // melee blow, and the bow arm on the march and in the cheer.
         let sway = (0.18 - 0.06 * run) * moving * limb * (1.0 - raise);
         let carry = mix(-0.55, 0.25, max(stance, ready * 0.75)) * moving * (1.0 - raise);
         var draw_ang = select(1.9 * raise - 2.5 * chop, 0.55 * raise - 0.45 * chop, style < 0.5);

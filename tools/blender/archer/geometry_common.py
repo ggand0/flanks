@@ -154,7 +154,7 @@ class Geometry:
         self.add(points, [(0, 1, 4), (1, 2, 4), (2, 3, 4), (3, 0, 4)], color)
 
     def mail_link(self, center, normal, radius=0.009):
-        # Fine mail now lives in the texture atlas.
+        # Fine mail is in the texture atlas.
         pass
 
     def mesh(self, material):
