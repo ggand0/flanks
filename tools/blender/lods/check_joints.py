@@ -1,4 +1,4 @@
-"""Check L2 part overlap during 0 to 60 degree rigid rotations.
+"""Check L1 or L2 part overlap during 0 to 60 degree rigid rotations.
 
 blender --background --factory-startup --python-exit-code 1 \
   --python tools/blender/lods/check_joints.py -- candidate.blend
@@ -14,9 +14,10 @@ import math
 
 parser = argparse.ArgumentParser()
 parser.add_argument("blend", type=Path)
+parser.add_argument("--level", default="L2", choices=["L1", "L2"])
 args = parser.parse_args(sys.argv[sys.argv.index("--") + 1 :])
 bpy.ops.wm.open_mainfile(filepath=str(args.blend.resolve()))
-obj = bpy.data.objects["L2"]
+obj = bpy.data.objects[args.level]
 positions = [v.co.copy() for v in obj.data.vertices]
 parts = [obj.vertex_groups[v.groups[0].group].name for v in obj.data.vertices]
 faces = {
@@ -25,7 +26,7 @@ faces = {
 }
 kind = args.blend.stem
 parents = {"leg_l": "body", "leg_r": "body", "arm_shield": "body"}
-if kind == "man_at_arms":
+if kind in ("knight", "man_at_arms"):
     parents.update({"arm_weapon": "body", "weapon": "arm_weapon"})
 elif kind == "spearman":
     parents.update(

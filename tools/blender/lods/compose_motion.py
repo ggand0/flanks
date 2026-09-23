@@ -13,6 +13,7 @@ parser.add_argument("folder", type=Path)
 args = parser.parse_args()
 folder = args.folder.resolve()
 report = json.loads((folder / "motion_validation.json").read_text())
+levels = report.get("levels", ["L0", "L2"])
 font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 17)
 paired = folder / "motion_paired"
 paired.mkdir(exist_ok=True)
@@ -21,11 +22,11 @@ for frame in range(report["frames"]):
     draw = ImageDraw.Draw(canvas)
     draw.text(
         (15, 12),
-        f'{folder.parent.name.replace("_", " ").title()}    L0 / L2    frame {frame}',
+        f'{folder.parent.name.replace("_", " ").title()}    {" / ".join(levels)}    frame {frame}',
         font=font,
         fill="white",
     )
-    for column, level in enumerate(["L0", "L2"]):
+    for column, level in enumerate(levels):
         image = Image.open(folder / "motion_frames" / f"{level}_{frame:03d}.png")
         canvas.paste(image, (column * 320, 40), image)
     canvas.save(paired / f"{frame:03d}.png")

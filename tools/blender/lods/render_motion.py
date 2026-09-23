@@ -1,4 +1,4 @@
-"""Compare L0 and L2 through existing attack motions in headless Blender.
+"""Compare L0 with L1 or L2 through existing attacks in headless Blender.
 
 blender --background --factory-startup --python-exit-code 1 \
   --python tools/blender/lods/render_motion.py -- candidate.blend
@@ -20,11 +20,15 @@ import build_knight_textured as review
 parser = argparse.ArgumentParser()
 parser.add_argument("blend", type=Path)
 parser.add_argument("--check-only", action="store_true")
+parser.add_argument("--level", default="L2", choices=["L1", "L2"])
 args = parser.parse_args(sys.argv[sys.argv.index("--") + 1 :])
 folder = args.blend.resolve().parent
 kind = args.blend.stem
 bpy.ops.wm.open_mainfile(filepath=str(args.blend.resolve()))
-objects = [bpy.data.objects[name] for name in ["L0", "L2"]]
+objects = [bpy.data.objects[name] for name in ["L0", args.level]]
+for obj in bpy.data.objects:
+    if obj.type == "MESH":
+        obj.hide_render = obj not in objects
 positions, parts = {}, {}
 for obj in objects:
     positions[obj.name] = np.array(
@@ -39,7 +43,7 @@ nodes = {
     for o in bpy.data.objects
     if o.name.startswith(("pivot_", "joint_"))
 }
-if kind == "man_at_arms":
+if kind in ("knight", "man_at_arms"):
     source = Path(__file__).resolve().parent
     sys.path.insert(0, str(source))
     import sword_motion as motion_preview
@@ -156,16 +160,19 @@ report = {
     "frames": frames,
     "duration_seconds": float(frame_times[-1]),
     "motion_source": str(source),
-    "sidecar_matches_source": kind != "man_at_arms",
+    "sidecar_matches_source": None if kind in ("knight", "man_at_arms") else True,
+    "levels": ["L0", args.level],
     "render_backface_culling": True,
     "joint_overlap": {label: [] for label, _, _ in links},
 }
 low = objects[1]
 triangles = {
     pid: [
-        list(p.vertices) for p in low.data.polygons if parts["L2"][p.vertices[0]] == pid
+        list(p.vertices)
+        for p in low.data.polygons
+        if parts[args.level][p.vertices[0]] == pid
     ]
-    for pid in set(parts["L2"])
+    for pid in set(parts[args.level])
 }
 for frame in range(frames):
     for obj in objects:
@@ -173,7 +180,7 @@ for frame in range(frames):
         blender = posed[:, [0, 2, 1]] * [1, -1, 1]
         obj.data.vertices.foreach_set("co", blender.astype(np.float32).reshape(-1))
         obj.data.update()
-        if obj.name == "L2":
+        if obj.name == args.level:
             trees = {
                 pid: BVHTree.FromPolygons(blender.tolist(), faces, all_triangles=True)
                 for pid, faces in triangles.items()

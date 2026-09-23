@@ -1,6 +1,6 @@
 """Build closed LOD shapes and sample their colours from a source GLB atlas.
 
-Imported by the unit L2 build scripts. Coordinates in Blender use Z up.
+Imported by the unit LOD build scripts. Coordinates in Blender use Z up.
 """
 import json
 import hashlib
@@ -190,8 +190,8 @@ class Source:
         self.path = path
         self.doc, self.blob = glb_inspect.load(str(path))
         doc, blob = self.doc, self.blob
-        assert len(doc["meshes"]) == 1
-        self.primitive = doc["meshes"][0]["primitives"][0]
+        index = next(n["mesh"] for n in doc["nodes"] if n.get("name") == "L0")
+        self.primitive = doc["meshes"][index]["primitives"][0]
         attrs = self.primitive["attributes"]
         read = lambda index: np.array(glb_inspect.accessor_values(doc, blob, index)[1])
         self.positions_gltf = read(attrs["POSITION"])
@@ -369,7 +369,7 @@ def atlas_projection(obj, geometry, source, categories):
             q = barycentric_transform(
                 hit,
                 *[points[v] for v in triangle],
-                *[Vector((u, v, 0)) for u, v in coords]
+                *[Vector((u, v, 0)) for u, v in coords],
             )
             x = min(width - 1, max(0, int(q.x * width)))
             y = min(height - 1, max(0, int(q.y * height)))
@@ -383,12 +383,13 @@ def atlas_projection(obj, geometry, source, categories):
     return candidates
 
 
-def fit_visibility(obj, geometry, source, candidates, out):
+def fit_visibility(obj, geometry, source, candidates, out, match_global=False):
     """Match per-part visible means across eight facings without changing the atlas."""
     from measure_visibility import raster
 
     doc, blob = glb_inspect.load(str(out))
-    primitive = doc["meshes"][1]["primitives"][0]
+    levels = {n["name"]: doc["meshes"][n["mesh"]] for n in doc["nodes"] if "mesh" in n}
+    primitive = levels[obj.name]["primitives"][0]
     positions = np.array(
         glb_inspect.accessor_values(doc, blob, primitive["attributes"]["POSITION"])[1]
     )
@@ -400,13 +401,15 @@ def fit_visibility(obj, geometry, source, candidates, out):
     # Source pixels are stored bottom-up by Blender, glTF UVs are top-down.
     pixels = source.pixels[::-1]
     for azimuth in range(0, 360, 45):
-        rgba, parts = raster(doc, blob, doc["meshes"][0], azimuth, pixels)
+        rgba, parts = raster(doc, blob, levels["L0"], azimuth, pixels)
+        if obj.name == "L3":
+            parts = np.where(parts >= 0, 0, -1)
         for pid in np.unique(parts[parts >= 0]):
             values = rgba[parts == pid]
             source_sums[pid] = source_sums.get(pid, np.zeros(4)) + values.sum(axis=0)
             source_counts[pid] = source_counts.get(pid, 0) + len(values)
         _, _, faces = raster(
-            doc, blob, doc["meshes"][1], azimuth, pixels, face_indices=True
+            doc, blob, levels[obj.name], azimuth, pixels, face_indices=True
         )
         counts += np.bincount(faces[faces >= 0], minlength=len(triangles))
     lookup = {}
@@ -479,13 +482,48 @@ def fit_visibility(obj, geometry, source, candidates, out):
             "initial_mean": initial.tolist(),
             "fitted_mean": (weights @ values).tolist(),
         }
-    (out.parent / "colour_fit.json").write_text(json.dumps(report, indent=2) + "\n")
+    if match_global:
+        # Simplified parts cover different pixel shares even after matching each part.
+        # Fit the complete figure with the same component-restricted atlas samples.
+        weights = visibility / visibility.sum()
+        desired = sum(source_sums.values()) / sum(source_counts.values())
+        values = current_values()
+        initial = weights @ values
+        for iteration in range(4):
+            current = weights @ values
+            ratio = np.divide(desired, current, out=np.ones(4), where=current > 1e-8)
+            targets = np.clip(values * ratio, 0, 1)
+            for face_index, face in enumerate(obj.data.polygons):
+                if visibility[face_index] == 0:
+                    continue
+                uv, pool = candidates[labels[face_index]]
+                best = int(
+                    np.argmin(
+                        np.sum(
+                            (pool - targets[face_index]) ** 2 * [1, 1, 1, 0.7], axis=1
+                        )
+                    )
+                )
+                values[face_index] = pool[best]
+                for loop in face.loop_indices:
+                    uv0.data[loop].uv = uv[best]
+                    colors.data[loop].color = (1, 1, 1, float(pool[best, 3]))
+        report["whole_figure"] = {
+            "source_mean": desired.tolist(),
+            "initial_mean": initial.tolist(),
+            "fitted_mean": (weights @ values).tolist(),
+        }
+    report_name = (
+        "colour_fit.json" if obj.name == "L2" else f"{obj.name}_colour_fit.json"
+    )
+    (out.parent / report_name).write_text(json.dumps(report, indent=2) + "\n")
 
 
-def merge_level(source, level, out):
+def merge_level(source, level, out, level_name="L2"):
     doc, blob = glb_inspect.load(str(source))
     extra, data = glb_inspect.load(str(level))
     doc = deepcopy(doc)
+    assert not any(n.get("name") == level_name for n in doc["nodes"]), level_name
     accessor_offset = len(doc["accessors"])
     views = {}
     for index in sorted({a["bufferView"] for a in extra["accessors"]}):
@@ -501,7 +539,7 @@ def merge_level(source, level, out):
         accessor["bufferView"] = views[accessor["bufferView"]]
         doc["accessors"].append(accessor)
     mesh = deepcopy(extra["meshes"][0])
-    mesh["name"] = "L2"
+    mesh["name"] = level_name
     for primitive in mesh["primitives"]:
         primitive["material"] = 0
         primitive["indices"] += accessor_offset
@@ -509,7 +547,7 @@ def merge_level(source, level, out):
             key: value + accessor_offset
             for key, value in primitive["attributes"].items()
         }
-    doc["nodes"].append({"name": "L2", "mesh": len(doc["meshes"])})
+    doc["nodes"].append({"name": level_name, "mesh": len(doc["meshes"])})
     doc["meshes"].append(mesh)
     doc["scenes"][doc.get("scene", 0)]["nodes"].append(len(doc["nodes"]) - 1)
     doc["buffers"][0]["byteLength"] = len(blob)
