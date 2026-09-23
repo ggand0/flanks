@@ -1,0 +1,20 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Archer held pose and raise</title>
+<style>
+body{margin:24px auto;max-width:1280px;padding:0 20px;background:#171b21;color:#e6e8ec;font:16px system-ui}h1{font-size:24px}video{width:100%;background:#292e35}button,select{font:inherit;padding:7px 12px;margin:4px;background:#303846;color:inherit;border:1px solid #68758a;border-radius:4px}a{color:#a9c9ff}p{line-height:1.5}output{font-variant-numeric:tabular-nums}
+</style>
+<h1>Archer held pose and raise</h1>
+<p>Oblique view on the left, side view on the right. Hold a horizontal shooting pose, then raise the aim to 35 degrees over 1.5 seconds. The right arm stays fixed relative to the torso. No draw or release event.</p>
+<video id="v" controls preload="auto" src="archer_raise.mp4"></video>
+<div><button id="play">Play / pause</button><button id="restart">Restart</button><button id="prev">Previous frame</button><button id="next">Next frame</button><select id="speed" aria-label="Playback speed"><option value="0.25">0.25×</option><option value="0.5">0.5×</option><option value="1" selected>1×</option></select> <output id="clock"></output></div>
+<p><a href="archer_raise_review.blend">Playable Blender scene</a> · <a href="archer.glb">L0 model</a> · <a href="archer.raise.json">Joint tables</a> · <a href="motion_validation.json">Measurements</a></p>
+<p>This clip only raises a nocked bow; it does not pull the string or release an arrow.</p>
+<script>
+const v=document.getElementById('v');
+document.getElementById('play').onclick=()=>v.paused?v.play():v.pause();
+document.getElementById('restart').onclick=()=>{v.currentTime=0;v.play()};
+for(const [id,d] of [['prev',-1],['next',1]])document.getElementById(id).onclick=()=>{v.pause();v.currentTime=Math.max(0,Math.min(v.duration,(Math.round(v.currentTime*30)+d)/30))};
+document.getElementById('speed').onchange=e=>v.playbackRate=+e.target.value;
+v.ontimeupdate=()=>{const t=v.currentTime;document.getElementById('clock').textContent=t.toFixed(2)+' s · '+(t<.4?'Horizontal hold':t<=1.9?'Raise to 35°':'Raised hold')};
+</script>
