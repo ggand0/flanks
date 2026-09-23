@@ -156,9 +156,20 @@ impl Level {
         self.idx.len() / 3
     }
 
-    /// Model height and ground line, for the scale and the sanity checks.
+    /// Ground line and height, for the scale and the sanity checks. The
+    /// height is the top of the body part, not of whatever the soldier
+    /// holds above his head: a spearman's spear stands 0.7 m higher.
     fn y_range(&self) -> (f32, f32) {
-        self.pos.iter().fold((f32::MAX, f32::MIN), |(lo, hi), p| (lo.min(p.y), hi.max(p.y)))
+        let ground = self.pos.iter().fold(f32::MAX, |lo, p| lo.min(p.y));
+        let top = |body: bool| {
+            self.pos
+                .iter()
+                .zip(&self.part)
+                .filter(|(_, part)| !body || part.round() == 0.0)
+                .fold(f32::MIN, |hi, (p, _)| hi.max(p.y))
+        };
+        let body = top(true);
+        (ground, if body > f32::MIN { body } else { top(false) })
     }
 }
 
