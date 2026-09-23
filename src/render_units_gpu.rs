@@ -25,11 +25,13 @@ use bevy::render::{
     renderer::{RenderAdapter, RenderContext, RenderDevice, RenderQueue},
     storage::{GpuShaderBuffer, ShaderBuffer},
     sync_world::RenderEntity,
+    texture::GpuImage,
 };
 use bytemuck::{Pod, Zeroable};
 
 use crate::render_units::{
-    CELEBRATE_BASE, CORPSE_CAP, Corpses, CustomPipeline, InstanceBucket, InstanceData, LodBands,
+    CELEBRATE_BASE, CORPSE_CAP, Corpses, CustomPipeline, ExtractedAtlas, InstanceBucket,
+    InstanceData, LodBands,
     LodConfig, NUM_BUCKETS, NUM_LODS, RenderCounts, SYNC_CHUNK, celebrate_progress, stance_tier,
     wall_signal,
 };
@@ -391,7 +393,12 @@ struct PullVertex {
     part: f32,
     normal: [f32; 3],
     pivot: f32,
-    color: [f32; 4],
+    /// Vertex colour, unorm8 rgba.
+    color: u32,
+    /// Atlas coordinates, unorm16 each, then padding to the WGSL struct's
+    /// 48 bytes.
+    atlas_uv: u32,
+    pad: [u32; 2],
 }
 
 /// A bucket's level mesh with its index list expanded: the vertex shader
@@ -402,6 +409,18 @@ struct PullVertex {
 pub struct PullMesh {
     corners: Vec<PullVertex>,
     bucket: usize,
+}
+
+fn pack_unorm8(v: [f32; 4]) -> u32 {
+    v.iter()
+        .enumerate()
+        .map(|(k, c)| ((c.clamp(0.0, 1.0) * 255.0).round() as u32) << (8 * k))
+        .sum()
+}
+
+fn pack_unorm16(v: [f32; 2]) -> u32 {
+    let q = |c: f32| (c.clamp(0.0, 1.0) * 65535.0).round() as u32;
+    q(v[0]) | q(v[1]) << 16
 }
 
 impl PullMesh {
@@ -419,12 +438,17 @@ impl PullMesh {
         let Some(V::Float32x4(col)) = mesh.attribute(Mesh::ATTRIBUTE_COLOR) else {
             return None;
         };
+        let Some(V::Float32x2(atlas_uv)) = mesh.attribute(Mesh::ATTRIBUTE_UV_1) else {
+            return None;
+        };
         let corners = mesh.indices()?.iter().map(|i| PullVertex {
             position: pos[i],
             part: uv[i][0],
             normal: nrm[i],
             pivot: uv[i][1],
-            color: col[i],
+            color: pack_unorm8(col[i]),
+            atlas_uv: pack_unorm16(atlas_uv[i]),
+            pad: [0; 2],
         });
         Some(Self {
             corners: corners.collect(),
@@ -473,6 +497,8 @@ fn extract_pull_meshes(
 pub struct PulledBucketGpu {
     pub bind_group: BindGroup,
     generation: u32,
+    /// Bound to its own atlas, or has none. Otherwise it waits on the upload.
+    atlas_settled: bool,
     pub bucket: u32,
 }
 
@@ -822,28 +848,33 @@ fn prepare_pull_bind_groups(
     custom_pipeline: Res<CustomPipeline>,
     pipeline_cache: Res<PipelineCache>,
     device: Res<RenderDevice>,
-    meshes: Query<(Entity, &PullMeshGpu, Option<&PulledBucketGpu>)>,
+    images: Res<RenderAssets<GpuImage>>,
+    meshes: Query<(Entity, &PullMeshGpu, Option<&ExtractedAtlas>, Option<&PulledBucketGpu>)>,
 ) {
     let Some(alloc) = &buffers.alloc else {
         return;
     };
-    for (entity, mesh, existing) in &meshes {
-        if existing.is_some_and(|b| b.generation == buffers.generation) {
+    for (entity, mesh, atlas, existing) in &meshes {
+        if existing.is_some_and(|b| b.generation == buffers.generation && b.atlas_settled) {
             continue;
         }
+        let (view, sampler, atlas_settled) = custom_pipeline.atlas_for(atlas, &images);
         let bind_group = device.create_bind_group(
             "unit pull bind group",
             &pipeline_cache.get_bind_group_layout(&custom_pipeline.pull_layout),
-            &BindGroupEntries::sequential((
-                alloc.records.as_entire_binding(),
-                alloc.index_list.as_entire_binding(),
-                mesh.vertices.as_entire_binding(),
-                alloc.bucket_info.as_entire_binding(),
+            &BindGroupEntries::with_indices((
+                (0, alloc.records.as_entire_binding()),
+                (1, alloc.index_list.as_entire_binding()),
+                (2, mesh.vertices.as_entire_binding()),
+                (3, alloc.bucket_info.as_entire_binding()),
+                (4, view),
+                (5, sampler),
             )),
         );
         commands.entity(entity).insert(PulledBucketGpu {
             bind_group,
             generation: buffers.generation,
+            atlas_settled,
             bucket: mesh.bucket as u32,
         });
     }

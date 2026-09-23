@@ -8,6 +8,8 @@ struct Vertex {
     // 2 left leg, 3 right leg, 4 spear arm, 5 shield arm, 6 bow arm),
     // y = the part's pivot height.
     @location(2) part_pivot: vec2<f32>,
+    // Where the vertex samples the kind's atlas (zero without one).
+    @location(3) atlas_uv: vec2<f32>,
     // Part material: rgb = fixed color, a = team-color blend amount.
     @location(5) v_color: vec4<f32>,
 
@@ -28,8 +30,23 @@ struct Vertex {
 
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
+#ifdef UNIT_ATLAS
+    // rgb = lit vertex colour, a = hit flash.
     @location(0) color: vec4<f32>,
+    // rgb = team colour for the atlas mask, a = death darkening.
+    @location(1) team: vec4<f32>,
+    @location(2) atlas_uv: vec2<f32>,
+#else
+    @location(0) color: vec4<f32>,
+#endif
 };
+
+#ifdef UNIT_ATLAS
+// The kind's atlas: rgb colour, alpha the team tint mask. Only buckets
+// with an atlas compile this path (render_units.rs `atlas_defs`).
+@group(3) @binding(4) var unit_atlas: texture_2d<f32>;
+@group(3) @binding(5) var unit_atlas_sampler: sampler;
+#endif
 
 // Standing brace pose (split legs, crouch, raised guard): read as
 // weird in play-testing, benched but kept — set to 1.0 to re-enable.
@@ -271,7 +288,10 @@ struct PullVertex {
     part: f32,
     normal: vec3<f32>,
     pivot: f32,
-    color: vec4<f32>,
+    // unorm8 rgba.
+    color: u32,
+    // unorm16 each.
+    atlas_uv: u32,
 };
 
 @group(3) @binding(0) var<storage, read> pull_records: array<PullInstance>;
@@ -305,7 +325,8 @@ fn vertex_pull(@builtin(vertex_index) index: u32) -> VertexOutput {
         v.position,
         v.normal,
         vec2<f32>(v.part, v.pivot),
-        v.color,
+        unpack2x16unorm(v.atlas_uv),
+        unpack4x8unorm(v.color),
         inst.pos_scale,
         inst.color,
         inst.anim,
@@ -611,17 +632,35 @@ fn unit_vertex(vertex: Vertex) -> VertexOutput {
     let light = 0.30 + 0.20 * sky + 0.65 * ndl;
 
     // Part material blended with the team color (a = team amount), then
-    // hit flash lerps toward white and death darkens.
+    // hit flash lerps toward white and death darkens. With an atlas the
+    // fragment does the last two after sampling it.
     let base = mix(vertex.v_color.rgb, vertex.i_color.rgb, vertex.v_color.a);
     let flash = clamp(fx, 0.0, 1.0) * step(fx, 1.0);
+#ifdef UNIT_ATLAS
+    out.color = vec4<f32>(base * light, flash);
+    out.team = vec4<f32>(vertex.i_color.rgb, death);
+    out.atlas_uv = vertex.atlas_uv;
+#else
     var rgb = base * light;
     rgb = mix(rgb, vec3<f32>(1.0, 1.0, 1.0), flash * 0.8);
     rgb = rgb * (1.0 - 0.45 * death);
     out.color = vec4<f32>(rgb, 1.0);
+#endif
     return out;
 }
 
 @fragment
 fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
+#ifdef UNIT_ATLAS
+    // The atlas mask tints rather than replaces, so cloth keeps its weave
+    // under the team colour.
+    let texel = textureSample(unit_atlas, unit_atlas_sampler, in.atlas_uv);
+    let tint = mix(vec3<f32>(1.0), in.team.rgb, texel.a);
+    var rgb = in.color.rgb * texel.rgb * tint;
+    rgb = mix(rgb, vec3<f32>(1.0, 1.0, 1.0), in.color.a * 0.8);
+    rgb = rgb * (1.0 - 0.45 * in.team.a);
+    return vec4<f32>(rgb, 1.0);
+#else
     return in.color;
+#endif
 }

@@ -13,21 +13,31 @@
 //! swings it from there. The sim credits shield cover on +X, a mismatch
 //! older than this file.
 //!
+//! A model may carry one base colour texture, an atlas read through
+//! `TEXCOORD_0`. Its rgb is the colour and its alpha the team tint mask,
+//! and the vertex colour of a textured model is white. The atlas gets a
+//! mip chain at load and the shader tints it per pixel.
+//!
 //! Levels the file lacks are derived from its finest level: each part is
 //! cut into slabs along its longest axis and each slab becomes one box.
 //! Box colours are weighted by what the battle camera sees, because an
 //! area average lets the hidden mail under a surcoat turn a blue
-//! regiment grey.
+//! regiment grey. On a textured model they come from the atlas.
 //!
 //! `FL_UNIT_MESH=code` keeps the code-built meshes, `FL_GLB_FAR=code`
 //! fills only the missing levels from them, and `FL_GLB_MIRROR=0`
-//! imports the model as authored.
+//! imports the model as authored. `FL_GLB_<KIND>=path` loads another
+//! file for one kind, for example `FL_GLB_KNIGHT=path/to/knight.glb`.
 
 use std::path::{Path, PathBuf};
 
 use bevy::asset::RenderAssetUsages;
+use bevy::image::{
+    CompressedImageFormats, ImageFilterMode, ImageSampler, ImageSamplerDescriptor, ImageType,
+};
 use bevy::mesh::{Indices, Mesh, PrimitiveTopology};
 use bevy::prelude::*;
+use bevy::render::render_resource::TextureFormat;
 
 use crate::render_units::NUM_LODS;
 use crate::unit_meshes::{MeshBuf, blend};
@@ -64,32 +74,61 @@ const SLABS: [(usize, usize); NUM_LODS] = [(0, 0), (8, 4), (3, 2), (3, 0)];
 /// the silhouette at some angles.
 const MIN_HALF: f32 = 0.005;
 
+/// A kind's meshes and the texture atlas its imported levels sample.
+pub struct KindMeshes {
+    pub lods: [Mesh; NUM_LODS],
+    /// The model's base colour atlas: sRGB colour, alpha the team tint
+    /// mask, mip chain included.
+    pub atlas: Option<Image>,
+    /// Levels that sample the atlas. Derived and code-built levels carry
+    /// their colour per vertex.
+    pub textured: [bool; NUM_LODS],
+}
+
+impl KindMeshes {
+    fn code_built(kind: usize) -> Self {
+        Self {
+            lods: crate::unit_meshes::build_kind_lods(kind),
+            atlas: None,
+            textured: [false; NUM_LODS],
+        }
+    }
+}
+
 /// The mesh set a kind renders with: the imported model when its file
 /// is there, the code-built set otherwise. `FL_UNIT_MESH=code` keeps the
 /// code-built set either way, which is the A/B against an import. A file
 /// that is there but unusable logs an error and falls back, so a battle
 /// still runs on a half-exported model. Called once per kind at startup.
-pub fn kind_lods(kind: usize) -> [Mesh; NUM_LODS] {
+pub fn kind_lods(kind: usize) -> KindMeshes {
     let code_only = std::env::var("FL_UNIT_MESH").is_ok_and(|v| v == "code");
     let path = (!code_only).then(|| model_path(kind)).flatten();
     let Some(path) = path else {
-        return crate::unit_meshes::build_kind_lods(kind);
+        return KindMeshes::code_built(kind);
     };
     match import(kind, &path) {
-        Ok(meshes) => meshes,
+        Ok(model) => model,
         Err(e) => {
             error!("{} is not usable, the code-built mesh stands in: {e}", path.display());
-            crate::unit_meshes::build_kind_lods(kind)
+            KindMeshes::code_built(kind)
         }
     }
 }
 
-/// The model file of a kind: the shipped asset first, then the working
-/// copy the asset track writes. Paths are anchored at the crate root, the
-/// way the asset plugin anchors `assets/`.
+/// The model file of a kind: the file `FL_GLB_<KIND>` names, then the
+/// shipped asset, then the working copy the asset track writes. Paths are
+/// anchored at the crate root, the way the asset plugin anchors `assets/`.
 fn model_path(kind: usize) -> Option<PathBuf> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let name = KIND_FILE[kind];
+    let var = format!("FL_GLB_{}", name.to_uppercase());
+    if let Ok(named) = std::env::var(&var) {
+        let named = root.join(named);
+        if named.is_file() {
+            return Some(named);
+        }
+        warn!("{var}: {} is not a file", named.display());
+    }
     let shipped = root.join("assets/units").join(format!("{name}.glb"));
     if shipped.is_file() {
         return Some(shipped);
@@ -107,6 +146,8 @@ struct Level {
     part: Vec<f32>,
     pivot: Vec<f32>,
     col: Vec<[f32; 4]>,
+    /// Atlas coordinates, zero on an untextured model.
+    tex: Vec<[f32; 2]>,
     idx: Vec<u32>,
 }
 
@@ -122,11 +163,13 @@ impl Level {
 }
 
 /// Read a model and hand back its four levels, engine local space, ready
-/// to hand to `Mesh3d`.
-fn import(kind: usize, path: &Path) -> Fallible<[Mesh; NUM_LODS]> {
+/// to hand to `Mesh3d`, with its atlas.
+fn import(kind: usize, path: &Path) -> Fallible<KindMeshes> {
     let bytes = std::fs::read(path).map_err(|e| format!("cannot read it: {e}"))?;
     let gltf = gltf::Gltf::from_slice(&bytes).map_err(|e| format!("not valid glTF: {e}"))?;
     let blob = gltf.blob.as_deref();
+    let atlas = read_atlas(&gltf, blob, path)?;
+    let atlas_image = atlas.as_ref().map(|(image, _)| *image);
 
     // Level nodes and pivot empties, with the parent chain applied. A
     // stock Blender export leaves them at the scene root, but a model
@@ -155,7 +198,10 @@ fn import(kind: usize, path: &Path) -> Fallible<[Mesh; NUM_LODS]> {
         let Some(mesh) = node.mesh() else { continue };
         let level = levels[lod].get_or_insert_with(Level::default);
         for prim in mesh.primitives() {
-            read_primitive(level, &prim, blob, xf).map_err(|e| format!("node {name}: {e}"))?;
+            let tex_set =
+                atlas_set(&prim, atlas_image).map_err(|e| format!("node {name}: {e}"))?;
+            read_primitive(level, &prim, blob, xf, tex_set)
+                .map_err(|e| format!("node {name}: {e}"))?;
         }
     }
 
@@ -200,17 +246,55 @@ fn import(kind: usize, path: &Path) -> Fallible<[Mesh; NUM_LODS]> {
     // Levels the file does not carry are derived from the finest one it
     // does. That level is cloned because the array below empties `levels`
     // as it builds.
-    let source = levels.iter().flatten().next().cloned().expect("checked above");
+    let mut source = levels.iter().flatten().next().cloned().expect("checked above");
+    let textured: [bool; NUM_LODS] =
+        std::array::from_fn(|l| atlas.is_some() && levels[l].is_some());
+    let atlas = atlas.map(|(_, image)| image);
+    if let Some(image) = &atlas {
+        // A textured model's vertex colour is white. The atlas supplies the
+        // colour of the imported levels in the shader, and of the derived
+        // levels here.
+        source.col = atlas_vertex_colors(&source, image);
+        for level in levels.iter_mut().flatten() {
+            level.col.fill([1.0, 1.0, 1.0, 0.0]);
+        }
+        let size = image.texture_descriptor.size;
+        let mips = image.texture_descriptor.mip_level_count;
+        info!("{name}: atlas {}x{} with {mips} mip levels", size.width, size.height);
+    }
     let weights = visible_weights(&source);
     let code_far = std::env::var("FL_GLB_FAR").is_ok_and(|v| v == "code");
     let mut code = code_far.then(|| crate::unit_meshes::build_kind_lods(kind).map(Some));
-    Ok(std::array::from_fn(|lod| match levels[lod].take() {
+    let lods = std::array::from_fn(|lod| match levels[lod].take() {
         Some(level) => level_mesh(&level),
         None => match code.as_mut().and_then(|c| c[lod].take()) {
             Some(mesh) => mesh,
             None => derive_level(&source, &weights, lod),
         },
-    }))
+    });
+    Ok(KindMeshes {
+        lods,
+        atlas,
+        textured,
+    })
+}
+
+/// The atlas a primitive samples, as its `TEXCOORD` set: None when the
+/// model has no atlas. With an atlas, every primitive must read it.
+fn atlas_set(prim: &gltf::Primitive, atlas: Option<usize>) -> Fallible<Option<u32>> {
+    let Some(atlas) = atlas else {
+        return Ok(None);
+    };
+    let info = prim.material().pbr_metallic_roughness().base_color_texture();
+    match info {
+        Some(info) if info.texture().source().index() == atlas => match info.tex_coord() {
+            0 => Ok(Some(0)),
+            n => Err(format!(
+                "the atlas is read through TEXCOORD_{n}, the spec puts it in TEXCOORD_0"
+            )),
+        },
+        _ => Err("a primitive does not sample the model's atlas, one texture per model".into()),
+    }
 }
 
 /// `L0` to `L3` in a node name, the spec's level naming.
@@ -226,6 +310,7 @@ fn read_primitive(
     prim: &gltf::Primitive,
     blob: Option<&[u8]>,
     xf: Mat4,
+    tex_set: Option<u32>,
 ) -> Fallible<()> {
     use gltf::mesh::util::ReadColors;
     if prim.mode() != gltf::mesh::Mode::Triangles {
@@ -237,15 +322,29 @@ fn read_primitive(
     let uv = reader
         .read_tex_coords(1)
         .ok_or("no TEXCOORD_1: the build script must bake (part id, pivot height) into a second UV map")?;
-    let colors = reader
-        .read_colors(0)
-        .ok_or("no COLOR_0: export with export_vertex_color=\"ACTIVE\"")?;
-    if matches!(colors, ReadColors::RgbU8(_) | ReadColors::RgbU16(_) | ReadColors::RgbF32(_)) {
-        return Err(
-            "COLOR_0 is VEC3, so the team-colour amount in alpha was dropped: export with export_vertex_color=\"ACTIVE\""
-                .into(),
-        );
+    // A textured model takes its colour and team mask from the atlas, so
+    // only an untextured one needs COLOR_0, and needs its alpha.
+    let colors = reader.read_colors(0);
+    if tex_set.is_none() {
+        match &colors {
+            None => return Err("no COLOR_0: export with export_vertex_color=\"ACTIVE\"".into()),
+            Some(ReadColors::RgbU8(_) | ReadColors::RgbU16(_) | ReadColors::RgbF32(_)) => {
+                return Err(
+                    "COLOR_0 is VEC3, so the team-colour amount in alpha was dropped: export with export_vertex_color=\"ACTIVE\""
+                        .into(),
+                );
+            }
+            Some(_) => {}
+        }
     }
+    let tex = match tex_set {
+        Some(set) => Some(
+            reader
+                .read_tex_coords(set)
+                .ok_or(format!("the atlas reads TEXCOORD_{set}, which the mesh does not have"))?,
+        ),
+        None => None,
+    };
     let indices = reader.read_indices().ok_or("the mesh has no index buffer")?;
 
     let base = level.pos.len() as u32;
@@ -254,13 +353,24 @@ fn read_primitive(
     let normal_xf = Mat3::from_mat4(xf).inverse().transpose();
     level.pos.extend(pos.map(|p| xf.transform_point3(Vec3::from_array(p))));
     level.nrm.extend(nrm.map(|n| (normal_xf * Vec3::from_array(n)).normalize_or_zero()));
-    level.col.extend(colors.into_rgba_f32());
     for uv in uv.into_f32() {
         level.part.push(uv[0]);
         level.pivot.push(uv[1]);
     }
     let n = level.pos.len();
-    if level.nrm.len() != n || level.col.len() != n || level.part.len() != n {
+    match colors {
+        Some(colors) => level.col.extend(colors.into_rgba_f32()),
+        None => level.col.resize(n, [1.0; 4]),
+    }
+    match tex {
+        Some(tex) => level.tex.extend(tex.into_f32()),
+        None => level.tex.resize(n, [0.0; 2]),
+    }
+    if level.nrm.len() != n
+        || level.col.len() != n
+        || level.part.len() != n
+        || level.tex.len() != n
+    {
         return Err("the attributes have different vertex counts".into());
     }
     // A malformed file fails here with a message, not with a panic in
@@ -372,8 +482,194 @@ fn level_mesh(level: &Level) -> Mesh {
                 .map(|(p, v)| [*p, *v])
                 .collect::<Vec<_>>(),
         )
+        .with_inserted_attribute(Mesh::ATTRIBUTE_UV_1, level.tex.clone())
         .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, level.col.clone())
         .with_inserted_indices(Indices::U32(level.idx.clone()))
+}
+
+/// The model's atlas: the base colour texture of its first textured
+/// material, decoded, with a mip chain. The glTF image index comes with
+/// it so every primitive can be checked against it.
+fn read_atlas(
+    gltf: &gltf::Gltf,
+    blob: Option<&[u8]>,
+    path: &Path,
+) -> Fallible<Option<(usize, Image)>> {
+    let Some(info) = gltf
+        .document
+        .materials()
+        .find_map(|m| m.pbr_metallic_roughness().base_color_texture())
+    else {
+        return Ok(None);
+    };
+    let source = info.texture().source();
+    let (bytes, mime) = match source.source() {
+        gltf::image::Source::View { view, mime_type } => {
+            let blob = blob
+                .filter(|_| view.buffer().index() == 0)
+                .ok_or("the atlas is not in the GLB's binary chunk")?;
+            let bytes = blob
+                .get(view.offset()..view.offset() + view.length())
+                .ok_or("the atlas runs past the end of the file")?;
+            (bytes.to_vec(), Some(mime_type))
+        }
+        gltf::image::Source::Uri { uri, mime_type } => {
+            let file = path.parent().unwrap_or(Path::new(".")).join(uri);
+            let bytes = std::fs::read(&file)
+                .map_err(|e| format!("cannot read the atlas {}: {e}", file.display()))?;
+            (bytes, mime_type)
+        }
+    };
+    let sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+        mipmap_filter: ImageFilterMode::Linear,
+        anisotropy_clamp: 8,
+        ..ImageSamplerDescriptor::linear()
+    });
+    // sRGB colour. The mask in alpha stays linear, which is what an sRGB
+    // format does with alpha.
+    let mut image = Image::from_buffer(
+        &bytes,
+        ImageType::MimeType(mime.unwrap_or("image/png")),
+        CompressedImageFormats::NONE,
+        true,
+        sampler,
+        RenderAssetUsages::RENDER_WORLD,
+    )
+    .map_err(|e| format!("cannot decode the atlas: {e}"))?;
+    if image.texture_descriptor.format != TextureFormat::Rgba8UnormSrgb {
+        return Err(format!(
+            "the atlas decodes to {:?}, it must be 8-bit RGBA",
+            image.texture_descriptor.format
+        ));
+    }
+    add_mips(&mut image)?;
+    Ok(Some((source.index(), image)))
+}
+
+fn srgb_to_linear_lut() -> [f32; 256] {
+    std::array::from_fn(|i| {
+        let c = i as f32 / 255.0;
+        if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+    })
+}
+
+fn linear_to_srgb(v: f32) -> u8 {
+    let v = v.clamp(0.0, 1.0);
+    let c = if v <= 0.003_130_8 { v * 12.92 } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 };
+    (c * 255.0 + 0.5) as u8
+}
+
+/// A box-filtered mip chain down to one pixel, colour averaged in linear
+/// light and the mask as it is. A soldier a few pixels tall samples the
+/// small levels, and without them the atlas shimmers.
+fn add_mips(image: &mut Image) -> Fallible<()> {
+    let size = image.texture_descriptor.size;
+    let (mut w, mut h) = (size.width as usize, size.height as usize);
+    let Some(base) = image.data.take() else {
+        return Err("the atlas has no pixel data".into());
+    };
+    if base.len() != w * h * 4 {
+        return Err("the atlas pixel data does not match its size".into());
+    }
+    let lut = srgb_to_linear_lut();
+    let mut data = base.clone();
+    let mut prev = base;
+    let mut levels = 1;
+    while w > 1 || h > 1 {
+        let (nw, nh) = ((w / 2).max(1), (h / 2).max(1));
+        let mut next = vec![0u8; nw * nh * 4];
+        for y in 0..nh {
+            for x in 0..nw {
+                let mut sum = [0.0f32; 4];
+                for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                    let sx = (2 * x + dx).min(w - 1);
+                    let sy = (2 * y + dy).min(h - 1);
+                    let p = &prev[(sy * w + sx) * 4..][..4];
+                    for c in 0..3 {
+                        sum[c] += lut[p[c] as usize];
+                    }
+                    sum[3] += p[3] as f32;
+                }
+                let out = &mut next[(y * nw + x) * 4..][..4];
+                for c in 0..3 {
+                    out[c] = linear_to_srgb(sum[c] * 0.25);
+                }
+                out[3] = (sum[3] * 0.25 + 0.5) as u8;
+            }
+        }
+        data.extend_from_slice(&next);
+        prev = next;
+        (w, h) = (nw, nh);
+        levels += 1;
+    }
+    image.data = Some(data);
+    image.texture_descriptor.mip_level_count = levels;
+    Ok(())
+}
+
+/// Vertex colours from the atlas, for the derived far levels, which are
+/// boxes with nothing to sample. Each triangle is sampled at ten points
+/// across it and each vertex averages the triangles around it. The result
+/// is in the form the vertex path blends: the colour outside the team
+/// mask, with the mask as alpha.
+fn atlas_vertex_colors(level: &Level, image: &Image) -> Vec<[f32; 4]> {
+    let size = image.texture_descriptor.size;
+    let (w, h) = (size.width as usize, size.height as usize);
+    let px = image.data.as_deref().unwrap_or(&[]);
+    let n = level.pos.len();
+    if px.len() < w * h * 4 {
+        return vec![[1.0, 1.0, 1.0, 0.0]; n];
+    }
+    let lut = srgb_to_linear_lut();
+    // Per vertex: linear colour outside the mask, inside it, triangles.
+    let mut acc = vec![([0.0f32; 3], [0.0f32; 3], 0.0f32); n];
+    for tri in level.idx.chunks_exact(3) {
+        let uv = [0, 1, 2].map(|k| Vec2::from(level.tex[tri[k] as usize]));
+        let mut plain = [0.0f32; 3];
+        let mut team = [0.0f32; 3];
+        for a in 0..=3 {
+            for b in 0..=3 - a {
+                let c = 3 - a - b;
+                let p = (uv[0] * a as f32 + uv[1] * b as f32 + uv[2] * c as f32) / 3.0;
+                let x = ((p.x.clamp(0.0, 1.0) * w as f32) as usize).min(w - 1);
+                let y = ((p.y.clamp(0.0, 1.0) * h as f32) as usize).min(h - 1);
+                let t = &px[(y * w + x) * 4..][..4];
+                let mask = t[3] as f32 / 255.0;
+                for ch in 0..3 {
+                    let v = lut[t[ch] as usize];
+                    plain[ch] += v * (1.0 - mask) / 10.0;
+                    team[ch] += v * mask / 10.0;
+                }
+            }
+        }
+        for &i in tri {
+            let e = &mut acc[i as usize];
+            for ch in 0..3 {
+                e.0[ch] += plain[ch];
+                e.1[ch] += team[ch];
+            }
+            e.2 += 1.0;
+        }
+    }
+    acc.iter()
+        .map(|(plain, team, count)| {
+            if *count == 0.0 {
+                return [1.0, 1.0, 1.0, 0.0];
+            }
+            // The atlas shows `plain + tint * team` and the vertex path
+            // shows `mix(rgb, tint, a)`. They agree exactly where the
+            // masked surface is grey, which the spec asks team surfaces
+            // to be.
+            let a = ((team[0] + team[1] + team[2]) / (3.0 * count)).clamp(0.0, 1.0);
+            let keep = (1.0 - a).max(1e-3) * count;
+            [
+                (plain[0] / keep).min(1.0),
+                (plain[1] / keep).min(1.0),
+                (plain[2] / keep).min(1.0),
+                a,
+            ]
+        })
+        .collect()
 }
 
 /// Facings the visibility pass renders. A soldier stands at any yaw, so

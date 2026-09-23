@@ -310,10 +310,14 @@ impl MeshBuf {
 }
 
 pub(crate) fn build(m: MeshBuf) -> Mesh {
+    // No texture here. The atlas UV channel is still present, so every
+    // unit mesh has the same vertex layout (unit_glb.rs fills it).
+    let atlas_uv = vec![[0.0f32; 2]; m.pos.len()];
     Mesh::new(
         PrimitiveTopology::TriangleList,
         RenderAssetUsages::RENDER_WORLD,
     )
+    .with_inserted_attribute(Mesh::ATTRIBUTE_UV_1, atlas_uv)
     .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, m.pos)
     .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, m.nrm)
     .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, m.uv)

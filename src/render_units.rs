@@ -30,6 +30,7 @@ use bevy::{
         renderer::{RenderDevice, RenderQueue},
         sync_component::{SyncComponent, SyncComponentPlugin},
         sync_world::{MainEntity, RenderEntity},
+        texture::GpuImage,
         view::ExtractedView,
     },
 };
@@ -326,18 +327,22 @@ fn render_frame_end(clock: Res<RenderFrameClock>) {
 }
 
 fn extract_instance_data(
-    main_entities: Extract<Query<(&RenderEntity, &InstanceMaterialData)>>,
+    main_entities: Extract<Query<(&RenderEntity, &InstanceMaterialData, Option<&UnitAtlas>)>>,
     mut extracted: Query<&mut ExtractedInstances>,
     mut commands: Commands,
 ) {
     let t0 = std::time::Instant::now();
-    for (render_entity, data) in &main_entities {
+    for (render_entity, data, atlas) in &main_entities {
         let e = render_entity.id();
         if let Ok(mut ex) = extracted.get_mut(e) {
             ex.0.clear();
             ex.0.extend_from_slice(&data.0);
         } else {
-            commands.entity(e).insert(ExtractedInstances(data.0.clone()));
+            let mut entity = commands.entity(e);
+            entity.insert(ExtractedInstances(data.0.clone()));
+            if let Some(atlas) = atlas {
+                entity.insert(ExtractedAtlas(atlas.0.id()));
+            }
         }
     }
     EXTRACT_US.store(
@@ -391,6 +396,7 @@ impl Plugin for UnitRenderPlugin {
                 (
                     queue_custom.in_set(RenderSystems::QueueMeshes),
                     prepare_instance_buffers.in_set(RenderSystems::PrepareResources),
+                    prepare_atlas_bind_groups.in_set(RenderSystems::PrepareBindGroups),
                 ),
             );
     }
@@ -399,6 +405,7 @@ impl Plugin for UnitRenderPlugin {
 fn setup_unit_mesh(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
+    mut images: ResMut<Assets<Image>>,
     gpu: Res<GpuSyncConfig>,
     mut legs: ResMut<crate::gait::Legs>,
 ) {
@@ -414,7 +421,9 @@ fn setup_unit_mesh(
     // its draw function never runs and that bucket's units silently vanish
     // (the "LOD far bucket invisible" bug, devlog 0013).
     for kind in 0..crate::unit_types::NUM_KINDS {
-        let lods = crate::unit_glb::kind_lods(kind);
+        let model = crate::unit_glb::kind_lods(kind);
+        let lods = model.lods;
+        let atlas = model.atlas.map(|image| images.add(image));
         let tris: Vec<usize> =
             lods.iter().map(|m| m.indices().map_or(0, |i| i.len() / 3)).collect();
         // The gait pose is built on the leg this mesh has.
@@ -441,9 +450,21 @@ fn setup_unit_mesh(
             if let Some(pulled) = pulled {
                 entity.insert(pulled);
             }
+            if let Some(atlas) = atlas.as_ref().filter(|_| model.textured[lod]) {
+                entity.insert(UnitAtlas(atlas.clone()));
+            }
         }
     }
 }
+
+/// The texture atlas a bucket's mesh samples (unit_glb.rs). A bucket
+/// without one draws its vertex colours.
+#[derive(Component, Clone)]
+pub(crate) struct UnitAtlas(pub Handle<Image>);
+
+/// Render world: the atlas of a bucket.
+#[derive(Component, Clone, Copy)]
+pub(crate) struct ExtractedAtlas(pub AssetId<Image>);
 
 /// Copy the SoA sim state into the instance buffer (main world side):
 /// interpolate between fixed ticks, frustum-cull per instance, tint the
@@ -838,7 +859,7 @@ fn sync_instance_data(
     counts.sync_ms = t0.elapsed().as_secs_f32() * 1000.0;
 }
 
-#[allow(clippy::too_many_arguments)] // bevy system params
+#[allow(clippy::too_many_arguments, clippy::type_complexity)] // bevy system params
 fn queue_custom(
     transparent_3d_draw_functions: Res<DrawFunctions<Transparent3d>>,
     custom_pipeline: Res<CustomPipeline>,
@@ -850,7 +871,10 @@ fn queue_custom(
     maybe_batched_instance_buffers: Option<
         Res<BatchedInstanceBuffers<MeshUniform, MeshInputUniform>>,
     >,
-    material_meshes: Query<(Entity, &MainEntity, Option<&PullMeshGpu>), With<ExtractedInstances>>,
+    material_meshes: Query<
+        (Entity, &MainEntity, Option<&PullMeshGpu>, Has<ExtractedAtlas>),
+        With<ExtractedInstances>,
+    >,
     gpu_input: Option<Res<GpuUnitInput>>,
     mut transparent_render_phases: ResMut<ViewSortedRenderPhases<Transparent3d>>,
     views: Query<&ExtractedView>,
@@ -869,7 +893,7 @@ fn queue_custom(
             continue;
         };
 
-        for (entity, main_entity, pull_mesh) in &material_meshes {
+        for (entity, main_entity, pull_mesh, atlas) in &material_meshes {
             let Some(mesh_instance) = render_mesh_instances.render_mesh_queue_data(*main_entity)
             else {
                 continue;
@@ -893,10 +917,16 @@ fn queue_custom(
                         verts: pull_mesh.count,
                         bucket: pull_mesh.bucket as u32,
                         lod_debug,
+                        atlas,
                     },
                 ),
                 None => pipelines
-                    .specialize(&pipeline_cache, &custom_pipeline, key, &mesh.layout)
+                    .specialize(
+                        &pipeline_cache,
+                        &custom_pipeline,
+                        UnitMeshKey { mesh: key, atlas },
+                        &mesh.layout,
+                    )
                     .unwrap(),
             };
             transparent_phase.add_retained(Transparent3d {
@@ -982,31 +1012,131 @@ pub(crate) struct CustomPipeline {
     shader: Handle<Shader>,
     mesh_pipeline: MeshPipeline,
     /// Group 3 of a pulled bucket: the instance records, the index list,
-    /// the bucket's mesh corners, the bucket table.
+    /// the bucket's mesh corners, the bucket table, then the atlas and its
+    /// sampler.
     pub(crate) pull_layout: BindGroupLayoutDescriptor,
+    /// Group 3 of an instanced bucket: the atlas and its sampler, at the
+    /// same bindings as in `pull_layout`.
+    atlas_layout: BindGroupLayoutDescriptor,
+    /// One white texel with no team mask. An untextured bucket binds it to
+    /// fill the atlas slot, and a textured one until its atlas uploads.
+    pub(crate) blank_atlas: (TextureView, Sampler),
+}
+
+impl CustomPipeline {
+    /// The atlas a bucket binds: its own once uploaded, else the blank
+    /// texel. The flag says whether it is the bucket's own.
+    pub(crate) fn atlas_for<'a>(
+        &'a self,
+        atlas: Option<&ExtractedAtlas>,
+        images: &'a RenderAssets<GpuImage>,
+    ) -> (&'a TextureView, &'a Sampler, bool) {
+        match atlas.and_then(|a| images.get(a.0)) {
+            Some(image) => (&image.texture_view, &image.sampler, true),
+            None => (&self.blank_atlas.0, &self.blank_atlas.1, atlas.is_none()),
+        }
+    }
 }
 
 fn init_custom_pipeline(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
     mesh_pipeline: Res<MeshPipeline>,
+    device: Res<RenderDevice>,
+    queue: Res<RenderQueue>,
 ) {
+    let atlas_entries = || {
+        (
+            (4, binding_types::texture_2d(TextureSampleType::Float { filterable: true })),
+            (5, binding_types::sampler(SamplerBindingType::Filtering)),
+        )
+    };
+    let blank = device.create_texture_with_data(
+        &queue,
+        &TextureDescriptor {
+            label: Some("unit blank atlas"),
+            size: Extent3d::default(),
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Rgba8UnormSrgb,
+            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+            view_formats: &[],
+        },
+        TextureDataOrder::default(),
+        &[255, 255, 255, 0],
+    );
+    let blank_view = blank.create_view(&TextureViewDescriptor::default());
+    let blank_sampler = device.create_sampler(&SamplerDescriptor::default());
     commands.insert_resource(CustomPipeline {
         shader: load_embedded_asset!(asset_server.as_ref(), "shaders/unit_instancing.wgsl"),
         mesh_pipeline: mesh_pipeline.clone(),
         pull_layout: BindGroupLayoutDescriptor::new(
             "unit pull layout",
-            &BindGroupLayoutEntries::sequential(
+            &BindGroupLayoutEntries::with_indices(
                 ShaderStages::VERTEX,
                 (
-                    binding_types::storage_buffer_read_only_sized(false, None),
-                    binding_types::storage_buffer_read_only_sized(false, None),
-                    binding_types::storage_buffer_read_only_sized(false, None),
-                    binding_types::storage_buffer_read_only_sized(false, None),
+                    (0, binding_types::storage_buffer_read_only_sized(false, None)),
+                    (1, binding_types::storage_buffer_read_only_sized(false, None)),
+                    (2, binding_types::storage_buffer_read_only_sized(false, None)),
+                    (3, binding_types::storage_buffer_read_only_sized(false, None)),
+                    (
+                        4,
+                        binding_types::texture_2d(TextureSampleType::Float { filterable: true })
+                            .visibility(ShaderStages::FRAGMENT),
+                    ),
+                    (
+                        5,
+                        binding_types::sampler(SamplerBindingType::Filtering)
+                            .visibility(ShaderStages::FRAGMENT),
+                    ),
                 ),
             ),
         ),
+        atlas_layout: BindGroupLayoutDescriptor::new(
+            "unit atlas layout",
+            &BindGroupLayoutEntries::with_indices(ShaderStages::FRAGMENT, atlas_entries()),
+        ),
+        blank_atlas: (blank_view, blank_sampler),
     });
+}
+
+/// Group 3 of an instanced bucket: its atlas. Made once the atlas has
+/// uploaded, with the blank texel standing in until then.
+#[derive(Component)]
+pub(crate) struct AtlasBindGroup {
+    bind_group: BindGroup,
+    /// Bound to its own atlas, or has none. Otherwise it waits on the upload.
+    settled: bool,
+}
+
+#[allow(clippy::type_complexity)] // bevy system params
+fn prepare_atlas_bind_groups(
+    mut commands: Commands,
+    custom_pipeline: Res<CustomPipeline>,
+    pipeline_cache: Res<PipelineCache>,
+    device: Res<RenderDevice>,
+    images: Res<RenderAssets<GpuImage>>,
+    buckets: Query<
+        (Entity, Option<&ExtractedAtlas>, Option<&AtlasBindGroup>),
+        (With<ExtractedInstances>, Without<PullMeshGpu>),
+    >,
+) {
+    for (entity, atlas, existing) in &buckets {
+        if existing.is_some_and(|b| b.settled) {
+            continue;
+        }
+        let (view, sampler, settled) = custom_pipeline.atlas_for(atlas, &images);
+        let bind_group = device.create_bind_group(
+            "unit atlas bind group",
+            &pipeline_cache.get_bind_group_layout(&custom_pipeline.atlas_layout),
+            &BindGroupEntries::with_indices(((4, view), (5, sampler))),
+        );
+        commands.entity(entity).insert(AtlasBindGroup {
+            bind_group,
+            settled,
+        });
+    }
 }
 
 /// Pipeline variant of a pulled bucket. It has NO vertex buffers, and
@@ -1024,6 +1154,28 @@ pub(crate) struct PullPipelineKey {
     bucket: u32,
     /// FL_LOD_DEBUG: tint by level in the vertex shader.
     lod_debug: bool,
+    /// The bucket samples an atlas.
+    atlas: bool,
+}
+
+/// Pipeline variant of an instanced bucket.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct UnitMeshKey {
+    mesh: MeshPipelineKey,
+    /// The bucket samples an atlas.
+    atlas: bool,
+}
+
+/// Only a bucket with an atlas compiles the texture path. It carries
+/// more from vertex to fragment, and everything else keeps the plain
+/// vertex colour path.
+fn atlas_defs(descriptor: &mut RenderPipelineDescriptor, atlas: bool) {
+    if atlas {
+        descriptor.vertex.shader_defs.push("UNIT_ATLAS".into());
+        if let Some(fragment) = descriptor.fragment.as_mut() {
+            fragment.shader_defs.push("UNIT_ATLAS".into());
+        }
+    }
 }
 
 impl SpecializedRenderPipeline for CustomPipeline {
@@ -1048,20 +1200,21 @@ impl SpecializedRenderPipeline for CustomPipeline {
         if key.lod_debug {
             defs.push("LOD_DEBUG".into());
         }
+        atlas_defs(&mut descriptor, key.atlas);
         descriptor.set_layout(3, self.pull_layout.clone());
         descriptor
     }
 }
 
 impl SpecializedMeshPipeline for CustomPipeline {
-    type Key = MeshPipelineKey;
+    type Key = UnitMeshKey;
 
     fn specialize(
         &self,
         key: Self::Key,
         layout: &MeshVertexBufferLayoutRef,
     ) -> Result<RenderPipelineDescriptor, SpecializedMeshPipelineError> {
-        let mut descriptor = self.mesh_pipeline.specialize(key, layout)?;
+        let mut descriptor = self.mesh_pipeline.specialize(key.mesh, layout)?;
 
         descriptor.vertex.shader = self.shader.clone();
         descriptor.vertex.buffers.push(VertexBufferLayout {
@@ -1093,6 +1246,8 @@ impl SpecializedMeshPipeline for CustomPipeline {
             ],
         });
         descriptor.fragment.as_mut().unwrap().shader = self.shader.clone();
+        atlas_defs(&mut descriptor, key.atlas);
+        descriptor.set_layout(3, self.atlas_layout.clone());
         Ok(descriptor)
     }
 }
@@ -1115,20 +1270,28 @@ impl<P: PhaseItem> RenderCommand<P> for DrawMeshInstanced {
         SRes<GpuUnitBuffers>,
     );
     type ViewQuery = ();
-    type ItemQuery = (Option<Read<InstanceBuffer>>, Option<Read<PulledBucketGpu>>);
+    type ItemQuery = (
+        Option<Read<InstanceBuffer>>,
+        Option<Read<PulledBucketGpu>>,
+        Option<Read<AtlasBindGroup>>,
+    );
 
     #[inline]
     fn render<'w>(
         item: &P,
         _view: (),
-        bucket: Option<(Option<&'w InstanceBuffer>, Option<&'w PulledBucketGpu>)>,
+        bucket: Option<(
+            Option<&'w InstanceBuffer>,
+            Option<&'w PulledBucketGpu>,
+            Option<&'w AtlasBindGroup>,
+        )>,
         (meshes, render_mesh_instances, mesh_allocator, gpu): SystemParamItem<'w, '_, Self::Param>,
         pass: &mut TrackedRenderPass<'w>,
     ) -> RenderCommandResult {
         // A borrow check workaround.
         let mesh_allocator = mesh_allocator.into_inner();
 
-        let Some((instance_buffer, pulled)) = bucket else {
+        let Some((instance_buffer, pulled, atlas)) = bucket else {
             return RenderCommandResult::Skip;
         };
         // GPU mode: ONE plain draw over every corner of every soldier in
@@ -1150,7 +1313,7 @@ impl<P: PhaseItem> RenderCommand<P> for DrawMeshInstanced {
         let Some(gpu_mesh) = meshes.into_inner().get(mesh_instance.mesh_asset_id()) else {
             return RenderCommandResult::Skip;
         };
-        let Some(instance_buffer) = instance_buffer else {
+        let (Some(instance_buffer), Some(atlas)) = (instance_buffer, atlas) else {
             return RenderCommandResult::Skip;
         };
         // Most kind-by-level buckets are empty in any one view.
@@ -1163,6 +1326,7 @@ impl<P: PhaseItem> RenderCommand<P> for DrawMeshInstanced {
             return RenderCommandResult::Skip;
         };
 
+        pass.set_bind_group(3, &atlas.bind_group, &[]);
         pass.set_vertex_buffer(0, vertex_buffer_slice.buffer.slice(..));
         pass.set_vertex_buffer(1, instance_buffer.buffer.slice(..));
 
