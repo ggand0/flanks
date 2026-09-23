@@ -31,7 +31,7 @@ use bytemuck::{Pod, Zeroable};
 
 use crate::render_units::{
     CELEBRATE_BASE, CORPSE_CAP, Corpses, CustomPipeline, ExtractedAtlas, InstanceBucket,
-    InstanceData, LodBands,
+    InstanceData, LodBands, RigBuffer,
     LodConfig, NUM_BUCKETS, NUM_LODS, RenderCounts, SYNC_CHUNK, celebrate_progress, stance_tier,
     wall_signal,
 };
@@ -842,6 +842,7 @@ fn prepare_gpu_units(
 }
 
 /// Group 3 of every pulled bucket, rebuilt when the shared buffers moved.
+#[allow(clippy::type_complexity)] // bevy system params
 fn prepare_pull_bind_groups(
     mut commands: Commands,
     buffers: Res<GpuUnitBuffers>,
@@ -849,12 +850,18 @@ fn prepare_pull_bind_groups(
     pipeline_cache: Res<PipelineCache>,
     device: Res<RenderDevice>,
     images: Res<RenderAssets<GpuImage>>,
-    meshes: Query<(Entity, &PullMeshGpu, Option<&ExtractedAtlas>, Option<&PulledBucketGpu>)>,
+    meshes: Query<(
+        Entity,
+        &PullMeshGpu,
+        Option<&ExtractedAtlas>,
+        &RigBuffer,
+        Option<&PulledBucketGpu>,
+    )>,
 ) {
     let Some(alloc) = &buffers.alloc else {
         return;
     };
-    for (entity, mesh, atlas, existing) in &meshes {
+    for (entity, mesh, atlas, rig, existing) in &meshes {
         if existing.is_some_and(|b| b.generation == buffers.generation && b.atlas_settled) {
             continue;
         }
@@ -869,6 +876,7 @@ fn prepare_pull_bind_groups(
                 (3, alloc.bucket_info.as_entire_binding()),
                 (4, view),
                 (5, sampler),
+                (6, rig.0.as_entire_binding()),
             )),
         );
         commands.entity(entity).insert(PulledBucketGpu {

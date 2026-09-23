@@ -326,13 +326,16 @@ fn render_frame_end(clock: Res<RenderFrameClock>) {
     }
 }
 
+#[allow(clippy::type_complexity)] // bevy system params
 fn extract_instance_data(
-    main_entities: Extract<Query<(&RenderEntity, &InstanceMaterialData, Option<&UnitAtlas>)>>,
+    main_entities: Extract<
+        Query<(&RenderEntity, &InstanceMaterialData, Option<&UnitAtlas>, Option<&UnitRig>)>,
+    >,
     mut extracted: Query<&mut ExtractedInstances>,
     mut commands: Commands,
 ) {
     let t0 = std::time::Instant::now();
-    for (render_entity, data, atlas) in &main_entities {
+    for (render_entity, data, atlas, rig) in &main_entities {
         let e = render_entity.id();
         if let Ok(mut ex) = extracted.get_mut(e) {
             ex.0.clear();
@@ -342,6 +345,9 @@ fn extract_instance_data(
             entity.insert(ExtractedInstances(data.0.clone()));
             if let Some(atlas) = atlas {
                 entity.insert(ExtractedAtlas(atlas.0.id()));
+            }
+            if let Some(rig) = rig {
+                entity.insert(*rig);
             }
         }
     }
@@ -396,7 +402,8 @@ impl Plugin for UnitRenderPlugin {
                 (
                     queue_custom.in_set(RenderSystems::QueueMeshes),
                     prepare_instance_buffers.in_set(RenderSystems::PrepareResources),
-                    prepare_atlas_bind_groups.in_set(RenderSystems::PrepareBindGroups),
+                    prepare_rig_buffers.in_set(RenderSystems::PrepareResources),
+                    prepare_bucket_bind_groups.in_set(RenderSystems::PrepareBindGroups),
                 ),
             );
     }
@@ -423,6 +430,7 @@ fn setup_unit_mesh(
     for kind in 0..crate::unit_types::NUM_KINDS {
         let model = crate::unit_glb::kind_lods(kind);
         let lods = model.lods;
+        let rig = UnitRig(model.rig);
         let atlas = model.atlas.map(|image| images.add(image));
         let tris: Vec<usize> =
             lods.iter().map(|m| m.indices().map_or(0, |i| i.len() / 3)).collect();
@@ -444,6 +452,7 @@ fn setup_unit_mesh(
                 Mesh3d(meshes.add(mesh)),
                 InstanceMaterialData::default(),
                 bucket,
+                rig,
                 NoFrustumCulling,
                 NoAutomaticBatching,
             ));
@@ -465,6 +474,15 @@ pub(crate) struct UnitAtlas(pub Handle<Image>);
 /// Render world: the atlas of a bucket.
 #[derive(Component, Clone, Copy)]
 pub(crate) struct ExtractedAtlas(pub AssetId<Image>);
+
+/// The weapon arm rig of a bucket's kind (unit_meshes.rs `Rig`). The
+/// arrow buckets have none.
+#[derive(Component, Clone, Copy)]
+pub(crate) struct UnitRig(pub crate::unit_meshes::Rig);
+
+/// Render world: a bucket's rig as the uniform its draws bind.
+#[derive(Component)]
+pub(crate) struct RigBuffer(pub Buffer);
 
 /// Copy the SoA sim state into the instance buffer (main world side):
 /// interpolate between fixed ticks, frustum-cull per instance, tint the
@@ -1012,12 +1030,12 @@ pub(crate) struct CustomPipeline {
     shader: Handle<Shader>,
     mesh_pipeline: MeshPipeline,
     /// Group 3 of a pulled bucket: the instance records, the index list,
-    /// the bucket's mesh corners, the bucket table, then the atlas and its
-    /// sampler.
+    /// the bucket's mesh corners, the bucket table, then the atlas, its
+    /// sampler and the rig.
     pub(crate) pull_layout: BindGroupLayoutDescriptor,
-    /// Group 3 of an instanced bucket: the atlas and its sampler, at the
-    /// same bindings as in `pull_layout`.
-    atlas_layout: BindGroupLayoutDescriptor,
+    /// Group 3 of an instanced bucket: the atlas, its sampler and the rig,
+    /// at the same bindings as in `pull_layout`.
+    bucket_layout: BindGroupLayoutDescriptor,
     /// One white texel with no team mask. An untextured bucket binds it to
     /// fill the atlas slot, and a textured one until its atlas uploads.
     pub(crate) blank_atlas: (TextureView, Sampler),
@@ -1045,11 +1063,8 @@ fn init_custom_pipeline(
     device: Res<RenderDevice>,
     queue: Res<RenderQueue>,
 ) {
-    let atlas_entries = || {
-        (
-            (4, binding_types::texture_2d(TextureSampleType::Float { filterable: true })),
-            (5, binding_types::sampler(SamplerBindingType::Filtering)),
-        )
+    let rig = || {
+        binding_types::uniform_buffer_sized(false, None).visibility(ShaderStages::VERTEX)
     };
     let blank = device.create_texture_with_data(
         &queue,
@@ -1090,49 +1105,80 @@ fn init_custom_pipeline(
                         binding_types::sampler(SamplerBindingType::Filtering)
                             .visibility(ShaderStages::FRAGMENT),
                     ),
+                    (6, rig()),
                 ),
             ),
         ),
-        atlas_layout: BindGroupLayoutDescriptor::new(
-            "unit atlas layout",
-            &BindGroupLayoutEntries::with_indices(ShaderStages::FRAGMENT, atlas_entries()),
+        bucket_layout: BindGroupLayoutDescriptor::new(
+            "unit bucket layout",
+            &BindGroupLayoutEntries::with_indices(
+                ShaderStages::FRAGMENT,
+                (
+                    (4, binding_types::texture_2d(TextureSampleType::Float { filterable: true })),
+                    (5, binding_types::sampler(SamplerBindingType::Filtering)),
+                    (6, rig()),
+                ),
+            ),
         ),
         blank_atlas: (blank_view, blank_sampler),
     });
 }
 
-/// Group 3 of an instanced bucket: its atlas. Made once the atlas has
-/// uploaded, with the blank texel standing in until then.
+/// Each bucket's rig as a uniform, made once: rigs do not change.
+#[allow(clippy::type_complexity)] // bevy system params
+fn prepare_rig_buffers(
+    mut commands: Commands,
+    device: Res<RenderDevice>,
+    buckets: Query<(Entity, Option<&UnitRig>), (With<ExtractedInstances>, Without<RigBuffer>)>,
+) {
+    for (entity, rig) in &buckets {
+        let rig = rig.map(|r| r.0).unwrap_or_default();
+        commands.entity(entity).insert(RigBuffer(device.create_buffer_with_data(
+            &BufferInitDescriptor {
+                label: Some("unit rig"),
+                contents: bytemuck::bytes_of(&rig),
+                usage: BufferUsages::UNIFORM,
+            },
+        )));
+    }
+}
+
+/// Group 3 of an instanced bucket: its atlas and rig. Made once the atlas
+/// has uploaded, with the blank texel standing in until then.
 #[derive(Component)]
-pub(crate) struct AtlasBindGroup {
+pub(crate) struct BucketBindGroup {
     bind_group: BindGroup,
     /// Bound to its own atlas, or has none. Otherwise it waits on the upload.
     settled: bool,
 }
 
 #[allow(clippy::type_complexity)] // bevy system params
-fn prepare_atlas_bind_groups(
+fn prepare_bucket_bind_groups(
     mut commands: Commands,
     custom_pipeline: Res<CustomPipeline>,
     pipeline_cache: Res<PipelineCache>,
     device: Res<RenderDevice>,
     images: Res<RenderAssets<GpuImage>>,
     buckets: Query<
-        (Entity, Option<&ExtractedAtlas>, Option<&AtlasBindGroup>),
+        (Entity, Option<&ExtractedAtlas>, &RigBuffer, Option<&BucketBindGroup>),
         (With<ExtractedInstances>, Without<PullMeshGpu>),
     >,
 ) {
-    for (entity, atlas, existing) in &buckets {
+    for (entity, atlas, rig, existing) in &buckets {
         if existing.is_some_and(|b| b.settled) {
             continue;
         }
         let (view, sampler, settled) = custom_pipeline.atlas_for(atlas, &images);
         let bind_group = device.create_bind_group(
-            "unit atlas bind group",
-            &pipeline_cache.get_bind_group_layout(&custom_pipeline.atlas_layout),
-            &BindGroupEntries::with_indices(((4, view), (5, sampler))),
+            "unit bucket bind group",
+            &pipeline_cache.get_bind_group_layout(&custom_pipeline.bucket_layout),
+            &BindGroupEntries::with_indices((
+                (4, view),
+                (5, sampler),
+                (6, rig.0.as_entire_binding()),
+            )),
         );
-        commands.entity(entity).insert(AtlasBindGroup {
+        commands.entity(entity).insert(BucketBindGroup {
             bind_group,
             settled,
         });
@@ -1247,7 +1293,7 @@ impl SpecializedMeshPipeline for CustomPipeline {
         });
         descriptor.fragment.as_mut().unwrap().shader = self.shader.clone();
         atlas_defs(&mut descriptor, key.atlas);
-        descriptor.set_layout(3, self.atlas_layout.clone());
+        descriptor.set_layout(3, self.bucket_layout.clone());
         Ok(descriptor)
     }
 }
@@ -1273,7 +1319,7 @@ impl<P: PhaseItem> RenderCommand<P> for DrawMeshInstanced {
     type ItemQuery = (
         Option<Read<InstanceBuffer>>,
         Option<Read<PulledBucketGpu>>,
-        Option<Read<AtlasBindGroup>>,
+        Option<Read<BucketBindGroup>>,
     );
 
     #[inline]
@@ -1283,7 +1329,7 @@ impl<P: PhaseItem> RenderCommand<P> for DrawMeshInstanced {
         bucket: Option<(
             Option<&'w InstanceBuffer>,
             Option<&'w PulledBucketGpu>,
-            Option<&'w AtlasBindGroup>,
+            Option<&'w BucketBindGroup>,
         )>,
         (meshes, render_mesh_instances, mesh_allocator, gpu): SystemParamItem<'w, '_, Self::Param>,
         pass: &mut TrackedRenderPass<'w>,
@@ -1313,7 +1359,7 @@ impl<P: PhaseItem> RenderCommand<P> for DrawMeshInstanced {
         let Some(gpu_mesh) = meshes.into_inner().get(mesh_instance.mesh_asset_id()) else {
             return RenderCommandResult::Skip;
         };
-        let (Some(instance_buffer), Some(atlas)) = (instance_buffer, atlas) else {
+        let (Some(instance_buffer), Some(group)) = (instance_buffer, atlas) else {
             return RenderCommandResult::Skip;
         };
         // Most kind-by-level buckets are empty in any one view.
@@ -1326,7 +1372,7 @@ impl<P: PhaseItem> RenderCommand<P> for DrawMeshInstanced {
             return RenderCommandResult::Skip;
         };
 
-        pass.set_bind_group(3, &atlas.bind_group, &[]);
+        pass.set_bind_group(3, &group.bind_group, &[]);
         pass.set_vertex_buffer(0, vertex_buffer_slice.buffer.slice(..));
         pass.set_vertex_buffer(1, instance_buffer.buffer.slice(..));
 

@@ -38,7 +38,7 @@ use bevy::prelude::*;
 use bevy::render::render_resource::TextureFormat;
 
 use crate::render_units::NUM_LODS;
-use crate::unit_meshes::{MeshBuf, blend};
+use crate::unit_meshes::{MeshBuf, Rig, blend};
 use crate::unit_types::NUM_KINDS;
 
 type Fallible<T> = Result<T, String>;
@@ -47,8 +47,9 @@ type Fallible<T> = Result<T, String>;
 const KIND_FILE: [&str; NUM_KINDS] = ["knight", "man_at_arms", "spearman", "archer"];
 
 /// Part id to the name its pivot empty carries (`pivot_<part>`), in the
-/// order unit_meshes.rs and the vertex shader use.
-const PART_NAMES: [&str; 7] = [
+/// order unit_meshes.rs and the vertex shader use. Id 7 is the arrow,
+/// which no model carries.
+const PART_NAMES: [&str; 9] = [
     "body",
     "arm_weapon",
     "leg_l",
@@ -56,7 +57,12 @@ const PART_NAMES: [&str; 7] = [
     "arm_spear",
     "arm_shield",
     "arm_bow",
+    "",
+    "weapon",
 ];
+
+/// The held weapon's part id (unit_meshes.rs PART_WEAPON).
+const WEAPON: usize = 8;
 
 /// Triangle budget per level (docs/plans/unit-asset-spec.md). Only used
 /// to flag a level that will cost more than the plan assumed.
@@ -72,7 +78,8 @@ const SLABS: [(usize, usize); NUM_LODS] = [(0, 0), (8, 4), (3, 2), (3, 0)];
 /// the silhouette at some angles.
 const MIN_HALF: f32 = 0.005;
 
-/// A kind's meshes and the texture atlas its imported levels sample.
+/// A kind's meshes, the texture atlas its imported levels sample, and its
+/// weapon arm's rig.
 pub struct KindMeshes {
     pub lods: [Mesh; NUM_LODS],
     /// The model's base colour atlas: sRGB colour, alpha the team tint
@@ -81,6 +88,7 @@ pub struct KindMeshes {
     /// Levels that sample the atlas. Derived and code-built levels carry
     /// their colour per vertex.
     pub textured: [bool; NUM_LODS],
+    pub rig: Rig,
 }
 
 impl KindMeshes {
@@ -89,6 +97,7 @@ impl KindMeshes {
             lods: crate::unit_meshes::build_kind_lods(kind),
             atlas: None,
             textured: [false; NUM_LODS],
+            rig: crate::unit_meshes::code_rig(kind),
         }
     }
 }
@@ -185,6 +194,8 @@ fn import(kind: usize, path: &Path) -> Fallible<KindMeshes> {
     // nested under an empty has to arrive in the same place.
     let mut levels: [Option<Level>; NUM_LODS] = Default::default();
     let mut pivot_nodes: Vec<(usize, f32)> = Vec::new();
+    // Pivot and joint empties by name, in model space, for the arm rig.
+    let mut empties: Vec<(String, Vec3)> = Vec::new();
     let scene = gltf
         .document
         .default_scene()
@@ -199,9 +210,12 @@ fn import(kind: usize, path: &Path) -> Fallible<KindMeshes> {
         let Some(name) = node.name() else { continue };
         if let Some(part) = name
             .strip_prefix("pivot_")
-            .and_then(|p| PART_NAMES.iter().position(|q| *q == p))
+            .and_then(|p| PART_NAMES.iter().position(|q| !q.is_empty() && *q == p))
         {
             pivot_nodes.push((part, xf.w_axis.y));
+        }
+        if name.starts_with("pivot_") || name.starts_with("joint_") {
+            empties.push((name.to_string(), xf.w_axis.truncate()));
         }
         let Some(lod) = level_index(name) else { continue };
         let Some(mesh) = node.mesh() else { continue };
@@ -235,6 +249,8 @@ fn import(kind: usize, path: &Path) -> Fallible<KindMeshes> {
     for level in levels.iter_mut().flatten() {
         to_local(level, scale, half_height);
     }
+    let local = |p: Vec3| [scale * p.y - half_height, scale * p.z];
+    let rig = arm_rig(finest_local(&levels), &empties, local, name);
 
     let imported: Vec<usize> = (0..NUM_LODS).filter(|l| levels[*l].is_some()).collect();
     let tris: Vec<usize> = levels.iter().map(|l| l.as_ref().map_or(0, Level::tris)).collect();
@@ -284,7 +300,67 @@ fn import(kind: usize, path: &Path) -> Fallible<KindMeshes> {
         lods,
         atlas,
         textured,
+        rig,
     })
+}
+
+fn finest_local(levels: &[Option<Level>; NUM_LODS]) -> &Level {
+    levels.iter().flatten().next().expect("checked by the caller")
+}
+
+/// The weapon arm's rig, from the `weapon` part and the `pivot_weapon`
+/// and `joint_elbow` empties. A model without them keeps a rigid arm and
+/// logs why. `local` takes a model-space point to the pitch plane of
+/// engine local space.
+fn arm_rig(
+    level: &Level,
+    empties: &[(String, Vec3)],
+    local: impl Fn(Vec3) -> [f32; 2],
+    name: &str,
+) -> Rig {
+    let weapon: Vec<usize> =
+        (0..level.part.len()).filter(|&i| level.part[i].round() as usize == WEAPON).collect();
+    let has = |part: usize| level.part.iter().any(|p| p.round() as usize == part);
+    let (arm, arm_name, hold) = if has(4) {
+        (4, "arm_spear", crate::unit_meshes::HOLD_SPEAR)
+    } else if has(1) {
+        (1, "arm_weapon", crate::unit_meshes::HOLD_SWORD)
+    } else {
+        return Rig::default();
+    };
+    let find = |key: &str| empties.iter().find(|(n, _)| n == key).map(|(_, p)| *p);
+    let (Some(shoulder), Some(elbow), Some(grip)) =
+        (find(&format!("pivot_{arm_name}")), find("joint_elbow"), find("pivot_weapon"))
+    else {
+        if !weapon.is_empty() {
+            warn!("{name}: a weapon part without pivot_weapon and joint_elbow, the arm stays rigid");
+        }
+        return Rig::default();
+    };
+    if weapon.is_empty() {
+        warn!("{name}: no weapon part, the arm stays rigid");
+        return Rig::default();
+    }
+    // The level is already in engine space. Put the empties there too.
+    let [gy, gz] = local(grip);
+    let yz = |i: usize| Vec2::new(level.pos[i].y - gy, level.pos[i].z - gz);
+    let tip = weapon
+        .iter()
+        .map(|&i| yz(i))
+        .max_by(|a, b| a.length_squared().total_cmp(&b.length_squared()))
+        .unwrap_or(Vec2::Y)
+        .normalize_or(Vec2::Y);
+    let rear = weapon.iter().map(|&i| -yz(i).dot(tip)).fold(0.0f32, f32::max);
+    Rig {
+        shoulder: local(shoulder),
+        elbow: local(elbow),
+        grip: [gy, gz],
+        tip: tip.to_array(),
+        rear,
+        arm: arm as f32,
+        hold,
+        pad: 0.0,
+    }
 }
 
 /// The atlas a primitive samples, as its `TEXCOORD` set: None when the

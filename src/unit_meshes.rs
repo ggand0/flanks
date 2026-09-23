@@ -32,7 +32,7 @@ use crate::render_units::NUM_LODS;
 
 /// Body part ids (uv.x). Keep in sync with unit_instancing.wgsl.
 const PART_BODY: f32 = 0.0;
-const PART_ARM: f32 = 1.0; // sword arm + sword: attack swing
+const PART_ARM: f32 = 1.0; // sword arm, or the archer's draw arm
 const PART_LEG_L: f32 = 2.0;
 const PART_LEG_R: f32 = 3.0;
 /// Spear arm: shaft modeled VERTICAL; the shader levels it at the enemy
@@ -48,6 +48,75 @@ const PART_BOW_ARM: f32 = 6.0;
 /// Arrow projectile (arrows.rs buckets, not a body part): rigid, with
 /// flight pitch riding the anim2.z instance channel.
 const PART_ARROW: f32 = 7.0;
+/// The weapon in the weapon hand, sword or spear. Its pivot is the grip,
+/// and the shader turns it there (`Rig`).
+const PART_WEAPON: f32 = 8.0;
+
+/// How a weapon hand holds (`Rig::hold`).
+pub const HOLD_SWORD: f32 = 1.0;
+pub const HOLD_SPEAR: f32 = 2.0;
+/// The archer's draw hand: no weapon, it pulls the string.
+pub const HOLD_DRAW: f32 = 3.0;
+
+/// The weapon arm for the vertex shader (`Rig` in unit_instancing.wgsl):
+/// joints in the soldier's pitch plane, as (y, z) of local space in the
+/// rest pose. The shader bends the arm at the elbow and turns the held
+/// weapon at the grip, so the hand stays on the arm and the arm on the
+/// shoulder.
+#[derive(Clone, Copy, Default, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
+pub struct Rig {
+    pub shoulder: [f32; 2],
+    pub elbow: [f32; 2],
+    pub grip: [f32; 2],
+    /// Unit direction from the grip toward the weapon's point.
+    pub tip: [f32; 2],
+    /// How far the weapon reaches behind the grip, to butt or pommel.
+    pub rear: f32,
+    /// The weapon arm's part id, 0 when the arm has no rig.
+    pub arm: f32,
+    /// `HOLD_SWORD`, `HOLD_SPEAR` or `HOLD_DRAW`.
+    pub hold: f32,
+    pub pad: f32,
+}
+
+impl Rig {
+    /// The same rig on a mesh scaled by `s` about the local origin.
+    pub fn scaled(mut self, s: f32) -> Self {
+        for v in [&mut self.shoulder, &mut self.elbow, &mut self.grip] {
+            v[0] *= s;
+            v[1] *= s;
+        }
+        self.rear *= s;
+        self
+    }
+}
+
+/// The code-built kinds' weapon arms, read off their builders below. Each
+/// arm points forward from the shoulder with the hand at its end. The
+/// elbow sits a little below the straight line, so the rest pose is a
+/// bent arm the shader's arm solver reproduces exactly.
+pub fn code_rig(kind: usize) -> Rig {
+    let rig = |shoulder: f32, hand: [f32; 2], tip: [f32; 2], rear, arm, hold| Rig {
+        shoulder: [shoulder, 0.0],
+        elbow: [0.5 * (shoulder + hand[0]) - 0.03, 0.45 * hand[1]],
+        grip: hand,
+        tip,
+        rear,
+        arm,
+        hold,
+        pad: 0.0,
+    };
+    let forward = [0.0, 1.0];
+    let up = [1.0, 0.0];
+    let r = match kind as u8 {
+        crate::unit_types::KIND_HEAVY => rig(0.16, [0.14, 0.28], forward, 0.12, PART_ARM, HOLD_SWORD),
+        crate::unit_types::KIND_LIGHT => rig(0.14, [0.12, 0.235], forward, 0.10, PART_ARM, HOLD_SWORD),
+        crate::unit_types::KIND_SPEAR => rig(0.14, [0.12, 0.10], up, 0.478, PART_SPEAR_ARM, HOLD_SPEAR),
+        _ => rig(0.14, [0.12, 0.15], forward, 0.0, PART_ARM, HOLD_DRAW),
+    };
+    r.scaled(crate::unit_types::unit_scale())
+}
 
 /// Part palette: rgb = material color, a = team-color blend amount.
 /// Team color must stay DOMINANT (Thronefall rule): steel is darker than
@@ -261,34 +330,36 @@ impl MeshBuf {
     }
 
     /// A sword pointing forward (+Z) from the hand at `hand`: wood grip,
-    /// dark crossguard, bright blade with a tip block. All PART_ARM.
-    fn sword(&mut self, hand: Vec3, blade_len: f32, scale: f32, pivot_y: f32) {
+    /// dark crossguard, bright blade with a tip block. PART_WEAPON, with
+    /// the grip at the hand.
+    fn sword(&mut self, hand: Vec3, blade_len: f32, scale: f32) {
+        let pivot_y = hand.y;
         let s = scale;
         self.cuboid(
             hand + Vec3::new(0.0, 0.0, -0.05 * s),
             Vec3::new(0.024, 0.024, 0.05) * s,
-            PART_ARM,
+            PART_WEAPON,
             pivot_y,
             WOOD,
         );
         self.cuboid(
             hand + Vec3::new(0.0, 0.0, 0.02 * s),
             Vec3::new(0.10, 0.02, 0.018) * s,
-            PART_ARM,
+            PART_WEAPON,
             pivot_y,
             DARK_STEEL,
         );
         self.cuboid(
             hand + Vec3::new(0.0, 0.0, 0.04 * s + blade_len / 2.0),
             Vec3::new(0.042 * s, 0.014 * s, blade_len / 2.0),
-            PART_ARM,
+            PART_WEAPON,
             pivot_y,
             BLADE,
         );
         self.cuboid(
             hand + Vec3::new(0.0, 0.0, 0.04 * s + blade_len + 0.035 * s),
             Vec3::new(0.02, 0.014, 0.035) * s,
-            PART_ARM,
+            PART_WEAPON,
             pivot_y,
             BLADE,
         );
@@ -299,13 +370,14 @@ impl MeshBuf {
     /// Far-level sword: blade and tip as ONE block on the sword arm, no
     /// grip or crossguard. Same reach as `sword`, so the swing reads the
     /// same. `fat` thickens the two thin sides (`weapon_fat`).
-    fn blade(&mut self, hand: Vec3, blade_len: f32, scale: f32, pivot_y: f32, fat: f32) {
+    fn blade(&mut self, hand: Vec3, blade_len: f32, scale: f32, fat: f32) {
+        let pivot_y = hand.y;
         let s = scale;
         let len = blade_len + 0.07 * s;
         self.cuboid(
             hand + Vec3::new(0.0, 0.0, 0.04 * s + len / 2.0),
             Vec3::new(0.042 * s * fat, 0.014 * s * fat, len / 2.0),
-            PART_ARM,
+            PART_WEAPON,
             pivot_y,
             BLADE,
         );
@@ -378,7 +450,7 @@ pub fn build_knight(lod: usize) -> Mesh {
         );
         m.cuboid(helm.0, helm.1, PART_BODY, 0.0, STEEL);
         m.cuboid(shield.0, shield.1, PART_SHIELD, shoulder, TEAM);
-        m.blade(hand, 0.42, 1.2, shoulder, weapon_fat());
+        m.blade(hand, 0.42, 1.2, weapon_fat());
         return build(m);
     }
     // hips (team tabard) -> broad chest (team tabard over armor)
@@ -423,7 +495,7 @@ pub fn build_knight(lod: usize) -> Mesh {
             shoulder,
             blend(&[(TEAM, 0.6), (DARK_STEEL, 0.4)]),
         );
-        m.blade(hand, 0.42, 1.2, shoulder, 1.0);
+        m.blade(hand, 0.42, 1.2, 1.0);
         return build(m);
     }
     // full steel helm: head block + flared crown + nose guard
@@ -478,7 +550,7 @@ pub fn build_knight(lod: usize) -> Mesh {
         shoulder,
         DARK_STEEL,
     );
-    m.sword(Vec3::new(0.285, shoulder - 0.02, 0.28), 0.42, 1.2, shoulder);
+    m.sword(Vec3::new(0.285, shoulder - 0.02, 0.28), 0.42, 1.2);
     build(m)
 }
 
@@ -530,7 +602,7 @@ pub fn build_man_at_arms(lod: usize) -> Mesh {
         );
         m.cuboid(head.0, head.1, PART_BODY, 0.0, head_col);
         m.cuboid(buckler.0, buckler.1, PART_SHIELD, shoulder, WOOD);
-        m.blade(hand, 0.30, 1.0, shoulder, weapon_fat());
+        m.blade(hand, 0.30, 1.0, weapon_fat());
         return build(m);
     }
     // hips -> tunic chest (team cloth, slimmer than the knight)
@@ -581,7 +653,7 @@ pub fn build_man_at_arms(lod: usize) -> Mesh {
             shoulder,
             blend(&[(TEAM, 0.65), (SKIN, 0.35)]),
         );
-        m.blade(hand, 0.30, 1.0, shoulder, 1.0);
+        m.blade(hand, 0.30, 1.0, 1.0);
         return build(m);
     }
     // buckler arm stub (cloth sleeve) + small wooden buckler
@@ -614,7 +686,7 @@ pub fn build_man_at_arms(lod: usize) -> Mesh {
         shoulder,
         SKIN,
     );
-    m.sword(Vec3::new(0.22, shoulder - 0.02, 0.235), 0.30, 1.0, shoulder);
+    m.sword(Vec3::new(0.22, shoulder - 0.02, 0.235), 0.30, 1.0);
     build(m)
 }
 
@@ -673,8 +745,8 @@ pub fn build_spearman(lod: usize) -> Mesh {
         m.cuboid(
             Vec3::new(0.24, 0.506, 0.10),
             Vec3::new(0.024 * fat, 0.864, 0.024 * fat),
-            PART_SPEAR_ARM,
-            shoulder,
+            PART_WEAPON,
+            shoulder - 0.02,
             blend(&[(WOOD, 0.87), (BLADE, 0.13)]),
         );
         return build(m);
@@ -740,15 +812,15 @@ pub fn build_spearman(lod: usize) -> Mesh {
         m.cuboid(
             Vec3::new(0.24, 0.40, 0.10),
             Vec3::new(0.024, 0.75, 0.024),
-            PART_SPEAR_ARM,
-            shoulder,
+            PART_WEAPON,
+            shoulder - 0.02,
             WOOD,
         );
         m.cuboid(
             Vec3::new(0.24, 1.26, 0.10),
             Vec3::new(0.03, 0.11, 0.013),
-            PART_SPEAR_ARM,
-            shoulder,
+            PART_WEAPON,
+            shoulder - 0.02,
             BLADE,
         );
         return build(m);
@@ -794,29 +866,29 @@ pub fn build_spearman(lod: usize) -> Mesh {
     m.cuboid(
         Vec3::new(0.24, 0.40, 0.10),
         Vec3::new(0.024, 0.75, 0.024),
-        PART_SPEAR_ARM,
-        shoulder,
+        PART_WEAPON,
+        shoulder - 0.02,
         WOOD,
     );
     m.cuboid(
         Vec3::new(0.24, 1.24, 0.10),
         Vec3::new(0.034, 0.09, 0.014),
-        PART_SPEAR_ARM,
-        shoulder,
+        PART_WEAPON,
+        shoulder - 0.02,
         BLADE,
     );
     m.cuboid(
         Vec3::new(0.24, 1.335, 0.10),
         Vec3::new(0.016, 0.035, 0.010),
-        PART_SPEAR_ARM,
-        shoulder,
+        PART_WEAPON,
+        shoulder - 0.02,
         BLADE,
     );
     m.cuboid(
         Vec3::new(0.24, -0.33, 0.10),
         Vec3::new(0.028, 0.028, 0.028),
-        PART_SPEAR_ARM,
-        shoulder,
+        PART_WEAPON,
+        shoulder - 0.02,
         DARK_STEEL,
     );
     build(m)
