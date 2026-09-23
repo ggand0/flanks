@@ -51,7 +51,7 @@ def main():
     canvas=Image.new("RGBA",(1200,590),"#202b30")
     draw=ImageDraw.Draw(canvas)
     text(draw,(30,20),"L0 SCREEN-SIZE CHECKS",28,"#f0e8d6",True)
-    text(draw,(30,61),"50° above the horizon. All four use L0 geometry. Lower-detail meshes are pending review.",18)
+    text(draw,(30,61),"50° above the horizon. All four use L0 geometry.",18)
     coverage={}
     for index,(px,factor) in enumerate([(60,3),(20,8),(8,20),(3,45)]):
         x=index*300

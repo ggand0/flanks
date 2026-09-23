@@ -1,4 +1,4 @@
-"""Revised helm, mail skirt and boots for the knight L0. No rig or animation changes."""
+"""Revised helm, mail skirt and boots for the knight L0."""
 import math
 import numpy as np
 from mathutils import Vector

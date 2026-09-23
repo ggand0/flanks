@@ -1,18 +1,14 @@
-# Spearman textured v3: L0 arm articulation prototype
+# Spearman textured v3: jointed spear arm and stab
 
-L0 motion reviewed positively by the owner on 2026-09-23. Engine integration
-and final LOD acceptance remain pending. This directory contains reproducible
-sources; generated files go to `assets_dev/spearman/rebuild_v3/` by default.
-The original reviewed outputs remain in `assets_dev/spearman/textured_v3/`.
+This directory contains reproducible sources; generated files go to
+`assets_dev/spearman/rebuild_v3/` by default.
 
 `review_motion.py` renders side and oblique frame sequences and saves a playable
 96-frame `spear_stab_review.blend` at 30 fps. Encode the video with the command
 below, then open the generated `review.html` for speed controls and scrubbing.
 
-The asset is **not compatible with the current engine without the integration
-described below**. No `src/`, renderer, accepted GLB or earlier generator was
-edited for this prototype. The source files and motion tables are tracked; generated scenes and GLBs remain in ignored working directories.
-L1–L3 and full acceptance remain pending.
+The source files and motion tables are tracked; generated scenes and GLBs
+remain in ignored working directories.
 
 ## Changes and evidence
 
@@ -59,10 +55,11 @@ actual joint-cover convex polyhedra, and tests every triangle edge over the
 full sampled cycle. See `motion_validation.json` for exported vertex coverage
 and all pivots. The static render alone is not the evidence.
 
-## Proposed contract extension
+## Contract
 
-Existing IDs retain their meanings. `arm_spear` (4) now contains the upper
-weapon arm only; `weapon` (8) remains only the spear. Add:
+Existing IDs retain their meanings. `arm_spear` (4) contains the upper weapon
+arm only; `weapon` (8) contains only the spear. The forearm and hand are their
+own parts:
 
 | ID | Part | Pivot, glTF XYZ in metres |
 |---|---|---|
@@ -71,35 +68,12 @@ weapon arm only; `weapon` (8) remains only the spear. Add:
 | 10 | hand_spear | (-0.360, 1.205, 0.160) |
 | 8 | weapon | (-0.373, 1.185, 0.219) |
 
-IDs 9 and 10 are proposed additions for this isolated prototype, not changes
-to the approved spec. The byte format is unchanged: `TEXCOORD_1` stores the
-integer part ID and that part's pivot height, with the Blender V flip handled
-before export. `joint_elbow` and `joint_wrist` are also exported for inspection.
+`TEXCOORD_1` stores the integer part ID and that part's pivot height, with the
+Blender V flip handled before export. `joint_elbow` and `joint_wrist` are also
+exported for inspection. The engine reads the stab from `spear_stab.json`,
+installed next to the model as `spearman.stab.json`.
 
-## Engine integration, pending permission
-
-1. `src/unit_glb.rs`: recognize the two additional part names, load the wrist
-   and new joint positions, validate the complete rig, and preserve membership
-   in derived LODs. Select the new animation only for assets carrying that rig.
-2. `src/unit_meshes.rs` and both renderer bucket layouts: extend the rig uniform
-   with the wrist information and an explicit articulation flag. Preserve the
-   current fallback path for legacy assets/code-built meshes.
-3. `src/shaders/unit_instancing.wgsl`: use exact part membership and the shared
-   shoulder → elbow → wrist chain. Replace the broad `part > 7.5` weapon test
-   for this path, since it would incorrectly treat IDs 9/10 as weapons. Apply
-   upper-body transforms consistently to all these parts. Sample the authored
-   wind-up/recovery tables from `spear_stab.json`.
-4. Attack signals in `src/render_units.rs` / `src/shaders/unit_build.wgsl`:
-   preserve combat readiness at wind-up start. Currently negative standby
-   values carry readiness, but positive wind-up does not: at zero progress the
-   spear's `level` becomes zero. Do not hide that discontinuity with mesh
-   overlap. Preserve the existing uncommitted follow-through work; provide
-   normalized phase consistently for CPU and GPU paths, including charges.
-5. Review in game using a development path override, including low frame rates,
-   interrupted attacks, readiness transitions, moving attacks and derived LODs.
-   Accept the L0 motion before authoring final LODs or promoting the GLB.
-
-This prototype covers the stationary weapon-arm stab. Shieldwall shoulder
+The motion covers the stationary weapon-arm stab. Shieldwall shoulder
 motion, sword attacks, locomotion and full-body stepping are separate tasks.
 
 ## Rebuild
