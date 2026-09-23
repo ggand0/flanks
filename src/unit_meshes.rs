@@ -1266,6 +1266,26 @@ pub fn build_archer(lod: usize) -> Mesh {
     build(m)
 }
 
+/// These meshes are written at the kind's own half height, so the
+/// display scale (unit_types::unit_scale) has to be applied to them.
+/// An imported mesh is built to the scaled half height already.
+fn apply_scale(mesh: &mut Mesh, scale: f32) {
+    use bevy::mesh::VertexAttributeValues as V;
+    if let Some(V::Float32x3(pos)) = mesh.attribute_mut(Mesh::ATTRIBUTE_POSITION) {
+        for p in pos.iter_mut() {
+            for c in p.iter_mut() {
+                *c *= scale;
+            }
+        }
+    }
+    // uv.y is the part's pivot height, which lives in the same space.
+    if let Some(V::Float32x2(uv)) = mesh.attribute_mut(Mesh::ATTRIBUTE_UV_0) {
+        for uv in uv.iter_mut() {
+            uv[1] *= scale;
+        }
+    }
+}
+
 /// All detail levels of one unit kind, L0 first.
 pub fn build_kind_lods(kind: usize) -> [Mesh; NUM_LODS] {
     let builder: fn(usize) -> Mesh = match kind as u8 {
@@ -1274,7 +1294,14 @@ pub fn build_kind_lods(kind: usize) -> [Mesh; NUM_LODS] {
         crate::unit_types::KIND_SPEAR => build_spearman,
         _ => build_archer,
     };
-    std::array::from_fn(builder)
+    let scale = crate::unit_types::unit_scale();
+    std::array::from_fn(|lod| {
+        let mut mesh = builder(lod);
+        if (scale - 1.0).abs() > 1e-4 {
+            apply_scale(&mut mesh, scale);
+        }
+        mesh
+    })
 }
 
 /// Arrow projectile: shaft + head + fletching along +Z (flight

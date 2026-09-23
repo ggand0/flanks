@@ -205,7 +205,7 @@ impl LodBands {
             coarse: [[f32::INFINITY; NUM_LODS - 1]; crate::unit_types::NUM_KINDS],
         };
         for (kind, px) in cfg.px.iter().enumerate() {
-            let height = 2.0 * crate::unit_types::TYPES[kind].half_height;
+            let height = 2.0 * crate::unit_types::half_height(kind);
             for (j, px) in px.iter().enumerate() {
                 if px_per_unit > 0.0 && *px > 0.0 {
                     // A soldier is `px` tall at this distance.

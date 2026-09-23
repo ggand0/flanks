@@ -31,7 +31,7 @@ use bevy::prelude::*;
 
 use crate::render_units::NUM_LODS;
 use crate::unit_meshes::{MeshBuf, blend};
-use crate::unit_types::{NUM_KINDS, TYPES};
+use crate::unit_types::NUM_KINDS;
 
 type Fallible<T> = Result<T, String>;
 
@@ -175,7 +175,7 @@ fn import(kind: usize, path: &Path) -> Fallible<[Mesh; NUM_LODS]> {
 
     // True human metres to engine units: the soldier is 2 * half_height
     // tall and stands on the terrain at half_height.
-    let half_height = TYPES[kind].half_height;
+    let half_height = crate::unit_types::half_height(kind);
     let scale = 2.0 * half_height / top;
     let mirror = !std::env::var("FL_GLB_MIRROR").is_ok_and(|v| v == "0");
     for level in levels.iter_mut().flatten() {

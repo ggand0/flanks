@@ -115,6 +115,21 @@ pub struct UnitTypeParams {
     pub half_height: f32,
 }
 
+/// FL_UNIT_SCALE=f scales every soldier's height. At 1.0 they are 1.0 to
+/// 1.1 m tall, at 1.64 a knight is 1.8 m. Soldiers stand on the terrain
+/// at their half height, so this moves the sim and breaks the behaviour
+/// baselines when set.
+pub fn unit_scale() -> f32 {
+    static S: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *S.get_or_init(|| crate::util::env_or("FL_UNIT_SCALE", 1.0_f32).clamp(0.5, 2.5))
+}
+
+/// Half height of a kind at the display scale. Soldiers stand on the
+/// terrain at this and their meshes are built to it.
+pub fn half_height(kind: usize) -> f32 {
+    TYPES[kind].half_height * unit_scale()
+}
+
 /// Indexed by kind. Baseline feel: the median frontal matchup (light vs
 /// light) keeps its ~5-9 s 1v1 kill so battle lines grind instead of
 /// evaporating. Stats are scaled from the vanilla M2TW EDU (devlog 0031):

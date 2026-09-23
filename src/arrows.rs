@@ -389,7 +389,7 @@ fn update_arrows(
                 return;
             }
             let arrow_y = prev.y + (p.y - prev.y) * t;
-            let hh = TYPES[units.kind[u] as usize].half_height;
+            let hh = crate::unit_types::half_height(units.kind[u] as usize);
             let uy = units.pos[u].y;
             // Top margin stays BELOW the launch height (movement.rs
             // looses at +0.75 over mid-body) or shooters hit themselves.
