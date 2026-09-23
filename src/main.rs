@@ -6,6 +6,7 @@ mod camera;
 mod combat;
 mod fatigue;
 mod formation;
+mod gait;
 mod frontline;
 mod game_state;
 mod morale;

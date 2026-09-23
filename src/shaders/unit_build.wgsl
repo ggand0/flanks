@@ -38,13 +38,16 @@ struct Record {
     anim2: vec4<f32>,
 };
 
-// Per-soldier smoothing state, indexed by soldier index. Indices shuffle
-// on death-sweep swap-removes: a one-frame inherited value is invisible.
+// Per-soldier smoothing state, indexed by soldier index. The death sweep
+// swap-removes soldiers, and the one it moves into a freed slot takes
+// over that slot's state.
 struct Smooth {
+    // Smoothed ground speed, m/s.
     walk: f32,
     band: f32,
-    march: f32,
     wall: f32,
+    // Gait phase in cycles (gait.rs).
+    gait: f32,
     lod: u32,
 };
 
@@ -54,9 +57,7 @@ struct Regiment {
     stance: f32,
     // Victory cheer progress 0..1, negative when not celebrating.
     celebrate: f32,
-    marching: f32,
     walled: f32,
-    phase: f32,
     flags: u32,
 };
 
@@ -66,7 +67,7 @@ struct Params {
     alpha: f32,
     k_walk: f32,
     k_band: f32,
-    k_march: f32,
+    k_wall: f32,
     inv_dt: f32,
     n: u32,
     n_regs: u32,
@@ -75,7 +76,7 @@ struct Params {
     corpse_len: vec4<u32>,
     corpse_cap: u32,
     frame: u32,
-    pad0: u32,
+    dt: f32,
     pad1: u32,
     // [kind * 3 + set]: set 0 fine, 1 coarse, 2 plain. xyz = squared
     // switch distances for L0/L1, L1/L2, L2/L3 (inf = switch disabled).
@@ -83,6 +84,8 @@ struct Params {
     windup: vec4<f32>,
     // draw_ticks, death_ticks, hit_stagger_ticks, celebrate_base
     consts: vec4<f32>,
+    // Leg length per kind, hip to sole (gait.rs Legs).
+    legs: vec4<f32>,
     // x = first index slot of the bucket, y = mesh corners per soldier.
     buckets: array<vec4<u32>, 16>,
 };
@@ -160,6 +163,11 @@ fn culled(p: vec3<f32>) -> bool {
     return false;
 }
 
+// Gait cycles per second at this ground speed (gait.rs `rate`).
+fn gait_rate(speed: f32) -> f32 {
+    return 1.0 + 0.16 * speed;
+}
+
 fn lod_jitter(seed: f32) -> f32 {
     return 1.0 - 0.5 * LOD_JITTER + LOD_JITTER * seed;
 }
@@ -180,7 +188,7 @@ fn build_soldier(i: u32) {
     let group = s.b & 0xffffffu;
     let death_t = f32((s.b >> 24u) & 0xffu);
 
-    var reg = Regiment(0.0, -1.0, 0.0, 0.0, 0.0, 0u);
+    var reg = Regiment(0.0, -1.0, 0.0, 0u);
     if group < params.n_regs {
         reg = regiments[group];
     }
@@ -192,8 +200,10 @@ fn build_soldier(i: u32) {
     let disp = length(step.xz) * params.inv_dt;
     sm.walk += (disp - sm.walk) * params.k_walk;
     sm.band += (reg.stance - sm.band) * params.k_band;
-    sm.march += (reg.marching - sm.march) * params.k_march;
-    sm.wall += (reg.walled - sm.wall) * params.k_march;
+    sm.wall += (reg.walled - sm.wall) * params.k_wall;
+    // The step is capped as in gait.rs `advance`.
+    let g = sm.gait + min(gait_rate(sm.walk) * params.dt, 0.25);
+    sm.gait = g - floor(g);
 
     let position = mix(prev, pos, params.alpha);
     if culled(position) {
@@ -220,10 +230,6 @@ fn build_soldier(i: u32) {
     } else if (reg.flags & REG_HOVERED) != 0u {
         rgb = rgb * 0.45 + HOSTILE * 0.55;
     }
-
-    // Walk amount: deadband + smoothstep on the smoothed displacement.
-    let t = clamp((sm.walk - 0.06) / (1.2 - 0.06), 0.0, 1.0);
-    let move_amount = t * t * (3.0 - 2.0 * t);
 
     // Facing interpolates like position, wrap-aware.
     let dyr = s.yaw - s.yaw_prev + PI;
@@ -266,8 +272,8 @@ fn build_soldier(i: u32) {
     records[i] = Record(
         vec4<f32>(position, 1.0),
         vec4<f32>(rgb, s.seed),
-        vec4<f32>(yaw, move_amount, lunge, fx),
-        vec4<f32>(sm.march, sm.wall, reg.phase, stagger),
+        vec4<f32>(yaw, sm.walk, lunge, fx),
+        vec4<f32>(params.legs[kind], sm.wall, sm.gait, stagger),
     );
     smoothing[i] = sm;
     append(kind * NUM_LODS + lod, i, lod);

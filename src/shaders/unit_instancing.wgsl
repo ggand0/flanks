@@ -15,14 +15,14 @@ struct Vertex {
     @location(8) i_pos_scale: vec4<f32>,
     // rgb = team color, a = stable per-unit anim seed (not opacity).
     @location(9) i_color: vec4<f32>,
-    // x = yaw, y = move amount 0..1. z positive = attack: style*2 +
+    // x = yaw, y = ground speed in m/s. z positive = attack: style*2 +
     // wind-up progress (style 0 stab, 1 slash); z negative = stance
     // band (-0.25 enemy near, -0.5 blade leveled, -1 charging).
     // w = fx: [0,1) hit-flash intensity, [1,2] = 1 + death progress.
     @location(10) i_anim: vec4<f32>,
-    // Regiment pose signals (smoothed per unit CPU-side): x = march-in-
-    // step 0..1, y = wall 0..1 (shieldwall/spearwall by bucket),
-    // z = regiment walk-phase offset, w = spare.
+    // x = leg length, hip to sole (0 on corpses), y = wall 0..1
+    // (shieldwall/spearwall by bucket), z = gait phase in cycles,
+    // w = stagger.
     @location(11) i_anim2: vec4<f32>,
 };
 
@@ -39,6 +39,29 @@ const BRACE_ON: f32 = 0.0;
 // pending a rework — set to 1.0 to re-enable.
 const TAUNT_ON: f32 = 0.0;
 
+const TAU: f32 = 6.2831853;
+const PI: f32 = 3.14159265;
+
+// How much a soldier is moving, 0..1, from his smoothed ground speed.
+// The deadband sits over crowd jitter (about 0.03 m/s, devlog 0021) and
+// it saturates by 1.2 m/s, so a slow shove still reads.
+fn walk_gate(speed: f32) -> f32 {
+    return smoothstep(0.06, 1.2, speed);
+}
+
+// Gait cycles per second at this ground speed (gait.rs `rate`).
+fn gait_rate(speed: f32) -> f32 {
+    return 1.0 + 0.16 * speed;
+}
+
+// Hip swing half angle at full stride.
+const GAIT_SWING: f32 = 0.60;
+// Where a foot lands ahead of the hip, as a share of how far behind the
+// hip it leaves the ground.
+const GAIT_FRONT: f32 = 0.5;
+// The longest share of the cycle a foot stays down, a walk's.
+const GAIT_DUTY_MAX: f32 = 0.62;
+
 fn rot_y(p: vec3<f32>, c: f32, s: f32) -> vec3<f32> {
     return vec3<f32>(p.x * c + p.z * s, p.y, -p.x * s + p.z * c);
 }
@@ -49,6 +72,16 @@ fn pitch_about(p: vec3<f32>, py: f32, ang: f32) -> vec3<f32> {
     let s = sin(ang);
     let y = p.y - py;
     return vec3<f32>(p.x, py + y * c + p.z * s, -y * s + p.z * c);
+}
+
+// The same rotation about a joint that has moved off the body axis, for
+// the knee once the thigh has swung.
+fn pitch_about_at(p: vec3<f32>, cy: f32, cz: f32, ang: f32) -> vec3<f32> {
+    let c = cos(ang);
+    let s = sin(ang);
+    let y = p.y - cy;
+    let z = p.z - cz;
+    return vec3<f32>(p.x, cy + y * c + z * s, cz - y * s + z * c);
 }
 
 fn pitch_normal(n: vec3<f32>, ang: f32) -> vec3<f32> {
@@ -126,7 +159,8 @@ fn vertex_pull(@builtin(vertex_index) index: u32) -> VertexOutput {
 
 fn unit_vertex(vertex: Vertex) -> VertexOutput {
     let yaw = vertex.i_anim.x;
-    let moving = vertex.i_anim.y;
+    let speed = vertex.i_anim.y;
+    let moving = walk_gate(speed);
     // Positive z: attack progress. The 2s digit is the swing STYLE
     // (0 = stab, 1 = classic swing, 2 = slash), remainder = lunge
     // 0..~1.35. z >= 6 = victory cheer (no one left to swing at).
@@ -166,15 +200,40 @@ fn unit_vertex(vertex: Vertex) -> VertexOutput {
     var local = vertex.position;
     var normal = vertex.normal;
 
-    let march = vertex.i_anim2.x;
     let wall = vertex.i_anim2.y;
-    let phase = globals.time * 9.0 + seed * 6.2831853;
-    // March-in-step: the whole regiment walks on ONE phase (offset per
-    // regiment so neighboring blocks aren't synced with each other). The
-    // walk oscillators mix toward it; everything else stays per-unit.
-    let phase_reg = globals.time * 9.0 + vertex.i_anim2.z;
-    let walk_s = mix(sin(phase), sin(phase_reg), march);
-    let walk_s2 = mix(sin(phase * 2.0), sin(phase_reg * 2.0), march);
+    // Gait. The phase counts cycles of two steps, offset per soldier so
+    // a block does not move in lockstep. A planted foot travels back
+    // under the hip for `duty` of the cycle and has to cover the ground
+    // the soldier covers meanwhile, `speed * duty / rate`. At speed that
+    // is the full stride and the foot is down briefly, which is a run.
+    // Slower, the foot stays down longer, up to a walk's share, and
+    // below that the stride shortens. Either way the foot holds the
+    // ground.
+    let leg = vertex.i_anim2.x;
+    let gait = fract(vertex.i_anim2.z + seed);
+    let rate = gait_rate(speed);
+    let full = (1.0 + GAIT_FRONT) * leg * sin(GAIT_SWING);
+    let duty = min(full * rate / max(speed, 1e-3), GAIT_DUTY_MAX);
+    let sweep = speed * duty / rate;
+    // 0 standing, 1 at full stride.
+    let stride = sweep / max(full, 1e-4);
+    // How far behind the hip the planted foot leaves the ground.
+    let reach = sweep / (1.0 + GAIT_FRONT);
+    // 1 when both feet leave the ground between steps, 0 for a walk.
+    let run = 1.0 - smoothstep(0.25, 0.55, duty);
+    // The step wave the arms counter, and the idle wobble, which is the
+    // one oscillator that is not locomotion.
+    let limb = cos(TAU * gait);
+    let wobble = globals.time * 9.0 + seed * TAU;
+    // Hip drop. A walk vaults over the planted leg, lowest when the feet
+    // are furthest apart. A run is lowest at mid-stance, where the knee
+    // takes the landing, and highest in the air between steps. q is the
+    // step phase, 0 at touchdown.
+    let q = fract(2.0 * gait);
+    let walk_dip =
+        (leg - sqrt(max(leg * leg - reach * reach, 0.0))) * (0.5 + 0.5 * cos(TAU * q));
+    let run_dip = stride * leg * (0.03 + 0.07 * (0.5 + 0.5 * cos(TAU * (q - duty))));
+    let dip = mix(walk_dip, run_dip, run);
 
     // --- Part animation (rotations around the part pivot) ---
     if part > 6.5 {
@@ -194,8 +253,8 @@ fn unit_vertex(vertex: Vertex) -> VertexOutput {
         let raise = smoothstep(0.0, 0.8, lunge);
         let chop = smoothstep(0.85, 1.0, lunge);
         var ang = 0.75 * raise - 0.20 * chop
-            + 0.06 * moving * sin(phase + 3.1415) * (1.0 - raise)
-            + celebrate * (1.5 + 0.3 * sin(globals.time * 9.0 + seed * 6.2831853));
+            - 0.06 * moving * limb * (1.0 - raise)
+            + celebrate * (1.5 + 0.3 * sin(wobble));
         local = pitch_about(local, pivot, ang);
         normal = pitch_normal(normal, ang);
     } else if part > 4.5 {
@@ -203,7 +262,11 @@ fn unit_vertex(vertex: Vertex) -> VertexOutput {
         // around the body to FACE THE FRONT and lifts it into a guard —
         // a shieldwall is a wall of team color from the enemy's side.
         // (Spear bucket: same fronting reads as the spearwall's off-hand
-        // cover behind the leveled spears.)
+        // cover behind the leveled spears.) On the move it swings against
+        // the weapon arm, except in a wall.
+        let sway = -(0.12 + 0.20 * run) * moving * limb * (1.0 - wall);
+        local = pitch_about(local, pivot, sway);
+        normal = pitch_normal(normal, sway);
         if wall > 0.001 {
             let ang = 1.05 * wall;
             let c2 = cos(ang);
@@ -224,22 +287,55 @@ fn unit_vertex(vertex: Vertex) -> VertexOutput {
         // Slight walk sway while the spear is upright; vertical pump on
         // a victory cheer.
         var ang = -1.42 * level * (1.0 - celebrate)
-            + 0.05 * moving * sin(phase + 3.1415) * (1.0 - level)
-            + 0.10 * celebrate * sin(globals.time * 9.0 + seed * 6.2831853);
+            + 0.05 * moving * limb * (1.0 - level)
+            + 0.10 * celebrate * sin(wobble);
         local = pitch_about(local, pivot, ang);
         normal = pitch_normal(normal, ang);
         // Draw back, then punch the point home (the damage tick lands at
         // lunge 1.0, same timing as every other weapon).
         local.z += -0.30 * raise + 1.15 * chop;
     } else if part > 1.5 {
-        // Legs: opposite-phase walk swing, harder stride on the charge;
-        // bracing or a wall stance splits the legs (one foot planted).
-        let side = select(1.0, -1.0, part > 2.5);
-        let ang = 0.55 * (1.0 + 0.35 * sprint) * moving * walk_s * side
-            + 0.32 * brace * side
-            + 0.22 * wall * (1.0 - moving) * side;
-        local = pitch_about(local, pivot, ang);
-        normal = pitch_normal(normal, ang);
+        // Corpses carry no leg length and keep the legs they fell with.
+        if leg > 0.0 {
+            // Legs, two bones each, posed from where the foot has to be.
+            // Planted, it sweeps from `GAIT_FRONT * reach` ahead of the
+            // hip to `reach` behind. Swinging, it lifts and comes forward
+            // again. The knee bends by however far the foot sits inside
+            // the leg's length.
+            let side = select(1.0, -1.0, part > 2.5);
+            let p = fract(gait + select(0.0, 0.5, part > 2.5));
+            var fz = 0.0;
+            var fy = dip - leg;
+            if p < duty {
+                fz = reach * (GAIT_FRONT - (1.0 + GAIT_FRONT) * p / duty);
+            } else {
+                let t = (p - duty) / (1.0 - duty);
+                fz = reach * mix(-1.0, GAIT_FRONT, smoothstep(0.0, 1.0, t));
+                // A runner tucks the heel up under him, a walker barely lifts.
+                fy += stride * leg * (0.08 + 0.24 * run) * sin(PI * t);
+            }
+            // A braced or walled stance splits the feet, one forward one back.
+            fz += (0.32 * brace + 0.22 * wall * (1.0 - moving)) * side * leg;
+            let far = clamp(length(vec2<f32>(fz, fy)), 0.25 * leg, leg);
+            let flex = 2.0 * acos(min(far / leg, 1.0));
+            let thigh = atan2(fz, -fy) + 0.5 * flex;
+            local = pitch_about(local, pivot, thigh);
+            normal = pitch_normal(normal, thigh);
+            // Below the knee the leg folds back by the flex, blended over a
+            // band around the joint so the mesh bends instead of tearing.
+            let down = clamp((pivot - vertex.position.y) / leg, 0.0, 1.0);
+            let shin = smoothstep(0.38, 0.62, down);
+            if shin > 0.001 {
+                let knee = 0.5 * leg;
+                local = pitch_about_at(
+                    local,
+                    pivot - knee * cos(thigh),
+                    knee * sin(thigh),
+                    -flex * shin,
+                );
+                normal = pitch_normal(normal, -flex * shin);
+            }
+        }
     } else if part > 0.5 {
         // Sword arm. Three per-unit attack styles (stable seed pick), all
         // timed so the blow lands exactly when the damage event fires
@@ -247,8 +343,8 @@ fn unit_vertex(vertex: Vertex) -> VertexOutput {
         // stab, horizontal slash.
         let raise = smoothstep(0.0, 0.8, lunge);
         let chop = smoothstep(0.85, 1.0, lunge);
-        // Idle/walk sway when not attacking.
-        let sway = 0.18 * moving * sin(phase + 3.1415) * (1.0 - raise);
+        // The arm counters the legs, and pumps harder at a run.
+        let sway = (0.18 + 0.30 * run) * moving * limb * (1.0 - raise);
         // Ordinary moves carry the blade lowered at the side; battle
         // stance levels it at the enemy (slightly above horizontal),
         // and even a watch-range advance (`ready`) brings it most of
@@ -269,7 +365,7 @@ fn unit_vertex(vertex: Vertex) -> VertexOutput {
         var ang = 0.0;
         if celebrate > 0.001 {
             // Victory cheer: blade pumped skyward, bouncing with the hop.
-            ang = celebrate * (1.75 + 0.35 * sin(globals.time * 9.0 + seed * 6.2831853));
+            ang = celebrate * (1.75 + 0.35 * sin(wobble));
         } else if style < 0.5 {
             // Stab: draw the arm back, then thrust the blade forward
             // near-level. Translation happens in local space (pre-yaw).
@@ -295,12 +391,12 @@ fn unit_vertex(vertex: Vertex) -> VertexOutput {
         normal = pitch_normal(normal, ang);
     }
 
-    // Walk bob + slight forward lean; lunge adds body punch, charging
-    // adds a sprint lean and a heavier bob. Sprint lean is walk-gated
-    // (the stance band is no longer walk-scaled) so jammed stragglers
-    // don't posture.
-    let bob = 0.05 * (1.0 + 0.4 * sprint) * moving * walk_s2;
-    let lean = (0.10 * moving + 0.30 * lunge + 0.24 * sprint * (0.25 + 0.75 * moving))
+    // The body rides the hip drop from the gait. A runner leans as far
+    // forward as a charger.
+    let bob = -dip;
+    let lean = (0.10 * moving
+        + 0.24 * max(run * moving, sprint * (0.25 + 0.75 * moving))
+        + 0.30 * lunge)
         * clamp(local.y + 0.5, 0.0, 1.5);
     local.z += lean * 0.3;
 
@@ -311,7 +407,7 @@ fn unit_vertex(vertex: Vertex) -> VertexOutput {
     // sink rides the position offset below.
     let stagger = vertex.i_anim2.w;
     if stagger > 0.001 {
-        let reel = 1.0 + 0.18 * sin(globals.time * 22.0 + seed * 6.2831853);
+        let reel = 1.0 + 0.18 * sin(globals.time * 22.0 + seed * TAU);
         let sang = -0.42 * stagger * stagger * reel;
         let sca = cos(sang);
         let ssa = sin(sang);
@@ -357,7 +453,7 @@ fn unit_vertex(vertex: Vertex) -> VertexOutput {
 
     // Cheer hop: celebrating units bounce; braced-walk adds a slight
     // crouch on the advance too.
-    let hop = 0.06 * celebrate * max(sin(globals.time * 9.0 + seed * 6.2831853), 0.0);
+    let hop = 0.06 * celebrate * max(sin(wobble), 0.0);
     // Wall stance carries a slight crouch (the planted, braced line).
     let position = local * vertex.i_pos_scale.w
         + vertex.i_pos_scale.xyz

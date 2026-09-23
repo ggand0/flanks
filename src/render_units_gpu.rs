@@ -30,8 +30,8 @@ use bytemuck::{Pod, Zeroable};
 
 use crate::render_units::{
     CELEBRATE_BASE, CORPSE_CAP, Corpses, CustomPipeline, InstanceBucket, InstanceData, LodBands,
-    LodConfig, NUM_BUCKETS, NUM_LODS, RenderCounts, SYNC_CHUNK, celebrate_progress, march_signal,
-    regiment_phase, stance_tier, wall_signal,
+    LodConfig, NUM_BUCKETS, NUM_LODS, RenderCounts, SYNC_CHUNK, celebrate_progress, stance_tier,
+    wall_signal,
 };
 use crate::units::Units;
 use crate::unit_types::NUM_KINDS;
@@ -85,9 +85,7 @@ pub struct GpuSoldier {
 pub struct RegimentRecord {
     stance: f32,
     celebrate: f32,
-    marching: f32,
     walled: f32,
-    phase: f32,
     flags: u32,
 }
 
@@ -103,7 +101,7 @@ pub struct BuildParams {
     alpha: f32,
     k_walk: f32,
     k_band: f32,
-    k_march: f32,
+    k_wall: f32,
     inv_dt: f32,
     n: u32,
     n_regs: u32,
@@ -113,13 +111,16 @@ pub struct BuildParams {
     corpse_cap: u32,
     /// The frame this pass belongs to, stamped into the readback.
     frame: u32,
-    pad0: u32,
+    /// Seconds since the last frame, for the gait phase.
+    dt: f32,
     pad1: u32,
     /// [kind * 3 + set]: set 0 fine, 1 coarse, 2 plain.
     bands: [Vec4; 12],
     windup: Vec4,
     /// draw_ticks, death_ticks, hit_stagger_ticks, celebrate_base
     consts: Vec4,
+    /// Leg length per kind, hip to sole (gait.rs `Legs`).
+    legs: Vec4,
     /// x = first index slot of the bucket, y = mesh corners per soldier.
     buckets: [UVec4; NUM_BUCKETS],
 }
@@ -217,6 +218,7 @@ fn build_frame_params(
     lod_cfg: Res<LodConfig>,
     camera: Query<(&Camera, &Projection, &Transform), With<Camera3d>>,
     snap: Res<SoldierSnapshot>,
+    legs: Res<crate::gait::Legs>,
     mut frame: ResMut<GpuFrameInput>,
     mut counts: ResMut<RenderCounts>,
     mut no_cull: Local<Option<bool>>,
@@ -256,9 +258,7 @@ fn build_frame_params(
             RegimentRecord {
                 stance: stance_tier(gd),
                 celebrate: celebrate_progress(gd),
-                marching: march_signal(gd),
                 walled: wall_signal(gd),
-                phase: regiment_phase(g),
                 flags,
             }
         }));
@@ -272,7 +272,7 @@ fn build_frame_params(
     p.alpha = fixed_time.overstep_fraction();
     p.k_walk = (dt / 0.25).min(1.0);
     p.k_band = (dt / 0.35).min(1.0);
-    p.k_march = (dt / 0.5).min(1.0);
+    p.k_wall = (dt / 0.5).min(1.0);
     p.inv_dt = 1.0 / fixed_time.timestep().as_secs_f32().max(1e-6);
     p.n = snap.n;
     p.n_regs = groups.list.len() as u32;
@@ -292,6 +292,8 @@ fn build_frame_params(
         crate::movement::HIT_STAGGER_TICKS as f32,
         CELEBRATE_BASE,
     );
+    p.dt = dt;
+    p.legs = Vec4::from_array(legs.0);
     p.frame = frame_count.0;
     frame.params = p;
     frame.lod_debug = lod_cfg.debug;

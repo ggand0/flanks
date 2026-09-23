@@ -97,13 +97,12 @@ pub struct InstanceData {
     pub scale: f32,
     /// rgb = team color; a = stable per-unit anim seed (NOT opacity).
     pub color: [f32; 4],
-    /// x = yaw, y = move amount 0..1 (walk bob/lean),
-    /// z = lunge 0..1 (attack), w = fx: [0,1) hit flash, [1,2] death.
+    /// x = yaw, y = ground speed m/s, z = lunge 0..1 (attack),
+    /// w = fx: [0,1) hit flash, [1,2] death.
     pub anim: [f32; 4],
-    /// Regiment-level pose signals, smoothed per unit CPU-side:
-    /// x = march-in-step 0..1 (walk phase blends to the regiment phase),
-    /// y = wall 0..1 (shieldwall shield-front / spearwall leveled spears),
-    /// z = the regiment's shared walk phase offset, w = spare.
+    /// x = leg length, hip to sole, y = wall 0..1 (shieldwall
+    /// shield-front / spearwall leveled spears), z = gait phase in
+    /// cycles (gait.rs), w = stagger progress.
     pub anim2: [f32; 4],
 }
 
@@ -358,6 +357,7 @@ impl Plugin for UnitRenderPlugin {
             .init_resource::<RenderCounts>()
             .init_resource::<LodConfig>()
             .init_resource::<Corpses>()
+            .init_resource::<crate::gait::Legs>()
             .add_plugins(crate::render_units_gpu::GpuUnitRenderPlugin)
             .add_systems(Startup, setup_unit_mesh)
             // Must run after the camera moves: culling builds a FRESH
@@ -400,6 +400,7 @@ fn setup_unit_mesh(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     gpu: Res<GpuSyncConfig>,
+    mut legs: ResMut<crate::gait::Legs>,
 ) {
     // One instance entity per unit kind AND detail level, each with its
     // own code-built mesh. Instance positions are not the entity's transform;
@@ -416,7 +417,14 @@ fn setup_unit_mesh(
         let lods = crate::unit_glb::kind_lods(kind);
         let tris: Vec<usize> =
             lods.iter().map(|m| m.indices().map_or(0, |i| i.len() / 3)).collect();
-        info!("unit meshes: kind {kind} tris per level {tris:?}");
+        // The gait pose is built on the leg this mesh has.
+        if let Some(leg) = crate::gait::measure(&lods[0]) {
+            legs.0[kind] = leg;
+        }
+        info!(
+            "unit meshes: kind {kind} tris per level {tris:?}, leg {:.2} m",
+            legs.0[kind]
+        );
         // One bucket per detail level, shared by the living and the fallen.
         for (lod, mesh) in lods.into_iter().enumerate() {
             let bucket = InstanceBucket(bucket_of(kind, lod));
@@ -482,17 +490,6 @@ pub(crate) fn celebrate_progress(g: &crate::orders::GroupData) -> f32 {
     }
 }
 
-/// March-in-step: a formed Rect regiment moving under orders walks on a
-/// SHARED phase. Contact, the charge sprint and routs break step.
-pub(crate) fn march_signal(g: &crate::orders::GroupData) -> f32 {
-    let formed = g.shape == crate::formation::FormShape::Rect
-        && g.order.is_some()
-        && !g.engaged
-        && !g.charging
-        && !g.state.is_broken();
-    if formed { 1.0 } else { 0.0 }
-}
-
 /// Wall stance (shieldwall or spearwall by kind, the bucket knows which).
 pub(crate) fn wall_signal(g: &crate::orders::GroupData) -> f32 {
     if g.spacing == crate::formation::FormSpacing::Wall && !g.state.is_broken() {
@@ -502,23 +499,20 @@ pub(crate) fn wall_signal(g: &crate::orders::GroupData) -> f32 {
     }
 }
 
-/// Per-regiment walk-phase offset so two marching regiments are not in
-/// step with EACH OTHER.
-pub(crate) fn regiment_phase(g: usize) -> f32 {
-    crate::units::hash01(g as u32 ^ 0x51ED_BEEF) * std::f32::consts::TAU
-}
-
 /// Per-soldier render state carried between frames, index-aligned with
-/// `Units`. Indices shuffle on death-sweep swap-removes: a one-frame
-/// inherited value is invisible.
-#[derive(Default)]
-struct SmoothState {
-    walk: Vec<f32>,
-    band: Vec<f32>,
-    march: Vec<f32>,
-    wall: Vec<f32>,
+/// `Units`. The death sweep swap-removes soldiers, and the one it moves
+/// into a freed slot takes over that slot's state. Same fields in the
+/// same order as `Smooth` in unit_build.wgsl, the GPU path's copy.
+#[derive(Clone, Copy, Default)]
+struct Smooth {
+    /// Smoothed ground speed, m/s.
+    walk: f32,
+    band: f32,
+    wall: f32,
+    /// Gait phase in cycles (gait.rs).
+    gait: f32,
     /// Detail level last frame (hysteresis).
-    lod: Vec<u8>,
+    lod: u8,
 }
 
 #[allow(clippy::too_many_arguments)] // bevy system params
@@ -537,8 +531,12 @@ fn sync_instance_data(
     mut no_cull: Local<Option<bool>>,
     mut scratch: Local<Vec<[Vec<InstanceData>; NUM_BUCKETS]>>,
     mut corpse_scratch: Local<Vec<[Vec<InstanceData>; NUM_LODS]>>,
-    mut smooth: Local<SmoothState>,
-    (gpu, frame): (Res<GpuSyncConfig>, Res<bevy::diagnostic::FrameCount>),
+    mut smooth: Local<Vec<Smooth>>,
+    (gpu, frame, legs): (
+        Res<GpuSyncConfig>,
+        Res<bevy::diagnostic::FrameCount>,
+        Res<crate::gait::Legs>,
+    ),
 ) {
     let _span = info_span!("sync_instances").entered();
     let t0 = std::time::Instant::now();
@@ -584,18 +582,16 @@ fn sync_instance_data(
     // Broken regiments render desaturated (no extra instance data needed).
     let broken: Vec<bool> = groups.list.iter().map(|g| g.state.is_broken()).collect();
     let broken = &broken[..];
-    // One value per regiment: stance tier, cheer progress, march and
-    // wall signals, walk phase offset. Shared with the GPU path.
+    // One value per regiment: stance tier, cheer progress, wall signal.
+    // Shared with the GPU path.
     let stance: Vec<f32> = groups.list.iter().map(stance_tier).collect();
     let stance = &stance[..];
     let celebrating: Vec<f32> = groups.list.iter().map(celebrate_progress).collect();
     let celebrating = &celebrating[..];
-    let marching: Vec<f32> = groups.list.iter().map(march_signal).collect();
-    let marching = &marching[..];
     let walled: Vec<f32> = groups.list.iter().map(wall_signal).collect();
     let walled = &walled[..];
-    let reg_phase: Vec<f32> = (0..groups.list.len()).map(regiment_phase).collect();
-    let reg_phase = &reg_phase[..];
+    // Copied out of the resource so the parallel chunks can read it.
+    let legs = legs.0;
 
     // Parallel cull + bucket build into per-chunk scratch, then one memcpy
     // concat per bucket. The scratch vecs keep their allocations across
@@ -614,11 +610,7 @@ fn sync_instance_data(
     // shuffle on death-sweep swap-removes — a one-frame inherited value
     // is invisible.
     let smooth = &mut *smooth;
-    smooth.walk.resize(units.len(), 0.0);
-    smooth.band.resize(units.len(), 0.0);
-    smooth.march.resize(units.len(), 0.0);
-    smooth.wall.resize(units.len(), 0.0);
-    smooth.lod.resize(units.len(), 0);
+    smooth.resize(units.len(), Smooth::default());
     // The fallen: one job per SYNC_CHUNK of each kind's list, run next to
     // the unit chunks. Their instance data is frozen, so a job is only a
     // cull, a level pick and a copy. No hysteresis: bodies do not move.
@@ -631,23 +623,17 @@ fn sync_instance_data(
     if corpse_scratch.len() < corpse_jobs.len() {
         corpse_scratch.resize_with(corpse_jobs.len(), Default::default);
     }
-    let ema_k = (time.delta_secs() / 0.25).min(1.0);
+    let dt = time.delta_secs();
+    let ema_k = (dt / 0.25).min(1.0);
     // Stance tiers are per-regiment and snap; the POSE blends (~0.35 s).
-    let band_k = (time.delta_secs() / 0.35).min(1.0);
-    // Step/wall signals blend a touch slower (falling into step is a
-    // deliberate act, not a snap).
-    let march_k = (time.delta_secs() / 0.5).min(1.0);
+    let band_k = (dt / 0.35).min(1.0);
+    // The wall signal blends a touch slower: forming a wall is a
+    // deliberate act, not a snap.
+    let wall_k = (dt / 0.5).min(1.0);
     bevy::tasks::ComputeTaskPool::get().scope(|scope| {
-        for (
-            ci,
-            (((((chunk_scratch, ema_chunk), band_chunk), march_chunk), wall_chunk), lod_chunk),
-        ) in scratch
+        for (ci, (chunk_scratch, smooth_chunk)) in scratch
             .iter_mut()
-            .zip(smooth.walk.chunks_mut(SYNC_CHUNK))
-            .zip(smooth.band.chunks_mut(SYNC_CHUNK))
-            .zip(smooth.march.chunks_mut(SYNC_CHUNK))
-            .zip(smooth.wall.chunks_mut(SYNC_CHUNK))
-            .zip(smooth.lod.chunks_mut(SYNC_CHUNK))
+            .zip(smooth.chunks_mut(SYNC_CHUNK))
             .enumerate()
             .take(n_chunks)
         {
@@ -665,16 +651,14 @@ fn sync_instance_data(
                     // re-entering the frustum have a live value.
                     let step = units.pos[i] - units.pos_prev[i];
                     let disp = Vec2::new(step.x, step.z).length() * inv_dt;
-                    let ema = &mut ema_chunk[i - start];
-                    *ema += (disp - *ema) * ema_k;
-                    let tier = stance.get(units.group[i] as usize).copied().unwrap_or(0.0);
-                    let band = &mut band_chunk[i - start];
-                    *band += (tier - *band) * band_k;
                     let gi = units.group[i] as usize;
-                    let march = &mut march_chunk[i - start];
-                    *march += (marching.get(gi).copied().unwrap_or(0.0) - *march) * march_k;
-                    let wall = &mut wall_chunk[i - start];
-                    *wall += (walled.get(gi).copied().unwrap_or(0.0) - *wall) * march_k;
+                    let kind = units.kind[i] as usize;
+                    let sm = &mut smooth_chunk[i - start];
+                    sm.walk += (disp - sm.walk) * ema_k;
+                    let tier = stance.get(gi).copied().unwrap_or(0.0);
+                    sm.band += (tier - sm.band) * band_k;
+                    sm.wall += (walled.get(gi).copied().unwrap_or(0.0) - sm.wall) * wall_k;
+                    sm.gait = crate::gait::advance(sm.gait, crate::gait::rate(sm.walk), dt);
 
                     let position = units.pos_prev[i].lerp(units.pos[i], alpha);
                     let sphere = Sphere {
@@ -691,33 +675,27 @@ fn sync_instance_data(
                     // bounds. Indices shuffle on death-sweep swap-removes
                     // and culled soldiers skip this. A stale previous
                     // level is pulled back inside the bounds at once.
-                    let kind = units.kind[i] as usize;
                     let jitter = lod_jitter(units.color[i][3]);
                     let d2 = position.distance_squared(cam_pos) * jitter * jitter;
-                    let lod = &mut lod_chunk[i - start];
-                    *lod = (*lod).clamp(
+                    sm.lod = sm.lod.clamp(
                         LodBands::level(&bands.fine[kind], d2),
                         LodBands::level(&bands.coarse[kind], d2),
                     );
-                    let lod = *lod as usize;
+                    let lod = sm.lod as usize;
                     let mut color = units.color[i];
-                    if broken.get(units.group[i] as usize).copied().unwrap_or(false) {
+                    if broken.get(gi).copied().unwrap_or(false) {
                         let gray =
                             0.299 * color[0] + 0.587 * color[1] + 0.114 * color[2];
                         for c in color.iter_mut().take(3) {
                             *c = *c * 0.55 + gray * 0.45;
                         }
                     } else if has_sel
-                        && selection
-                            .regiments
-                            .get(units.group[i] as usize)
-                            .copied()
-                            .unwrap_or(false)
+                        && selection.regiments.get(gi).copied().unwrap_or(false)
                     {
                         for c in 0..3 {
                             color[c] = color[c] * 0.35 + HIGHLIGHT[c] * 0.65;
                         }
-                    } else if hover_enemy == Some(units.group[i]) {
+                    } else if hover_enemy == Some(gi as u32) {
                         for c in 0..3 {
                             color[c] = color[c] * 0.45 + HOSTILE[c] * 0.55;
                         }
@@ -725,19 +703,6 @@ fn sync_instance_data(
                     if lod_debug {
                         lod_debug_tint(&mut color, lod);
                     }
-                    // Walk amount from ACTUAL per-tick displacement, not
-                    // velocity: press shoves move bodies through positional
-                    // corrections that never enter `vel` (and kill it), so
-                    // vel-driven legs froze while the body slid. Deadband +
-                    // smoothstep: crowd jitter (~0.001 m/tick) must not
-                    // flicker the walk cycle on and off every frame.
-                    // ABSOLUTE band (m/s), not per-kind speed ratio — press
-                    // shoves are 0.2-0.7 m/s regardless of kind. Floor
-                    // 0.06 = 2x crowd jitter (0.03, the 0021 metric);
-                    // saturates by 1.2 m/s so slow shoves get VISIBLE leg
-                    // articulation instead of a 10% wiggle.
-                    let t = ((*ema - 0.06) / (1.2 - 0.06)).clamp(0.0, 1.0);
-                    let move_amount = t * t * (3.0 - 2.0 * t);
                     // Facing interpolates like position (wrap-aware), so
                     // per-tick yaw updates don't snap at render rates.
                     let dy = (units.yaw[i] - units.yaw_prev[i] + std::f32::consts::PI)
@@ -777,18 +742,14 @@ fn sync_instance_data(
                             as f32;
                         style * 2.0 + lunge
                     } else if units.death_t[i] == 0
-                        && celebrating
-                            .get(units.group[i] as usize)
-                            .copied()
-                            .unwrap_or(-1.0)
-                            >= 0.0
+                        && celebrating.get(gi).copied().unwrap_or(-1.0) >= 0.0
                     {
-                        CELEBRATE_BASE + celebrating[units.group[i] as usize]
+                        CELEBRATE_BASE + celebrating[gi]
                     } else if units.death_t[i] == 0 {
                         // Negative lunge = SMOOTHED battle stance (the
                         // regiment tier snaps; a pose must not —
                         // one-frame stance changes aren't immersive).
-                        -band_chunk[i - start]
+                        -sm.band
                     } else {
                         0.0
                     };
@@ -816,13 +777,8 @@ fn sync_instance_data(
                         position,
                         scale: 1.0,
                         color,
-                        anim: [yaw, move_amount, lunge, fx],
-                        anim2: [
-                            march_chunk[i - start],
-                            wall_chunk[i - start],
-                            reg_phase.get(gi).copied().unwrap_or(0.0),
-                            stagger,
-                        ],
+                        anim: [yaw, sm.walk, lunge, fx],
+                        anim2: [legs[kind], sm.wall, sm.gait, stagger],
                     });
                 }
             });
