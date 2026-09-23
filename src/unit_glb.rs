@@ -23,6 +23,11 @@
 //! area average lets the hidden mail under a surcoat turn a blue
 //! regiment grey. On a textured model they come from the atlas.
 //!
+//! A weapon arm split into upper arm, forearm and hand is posed by
+//! attack tables that ship next to the model, `<kind>.stab.json`, which
+//! the build scripts in tools/blender write. Without them the arm bends
+//! at the elbow as one piece.
+//!
 //! `FL_UNIT_MESH=code` keeps the code-built meshes and `FL_GLB_FAR=code`
 //! fills only the missing levels from them. `FL_GLB_<KIND>=path` loads
 //! another file for one kind, for example `FL_GLB_KNIGHT=path/to/knight.glb`.
@@ -49,7 +54,7 @@ const KIND_FILE: [&str; NUM_KINDS] = ["knight", "man_at_arms", "spearman", "arch
 /// Part id to the name its pivot empty carries (`pivot_<part>`), in the
 /// order unit_meshes.rs and the vertex shader use. Id 7 is the arrow,
 /// which no model carries.
-const PART_NAMES: [&str; 9] = [
+const PART_NAMES: [&str; 11] = [
     "body",
     "arm_weapon",
     "leg_l",
@@ -59,10 +64,16 @@ const PART_NAMES: [&str; 9] = [
     "arm_bow",
     "",
     "weapon",
+    "forearm_spear",
+    "hand_spear",
 ];
 
 /// The held weapon's part id (unit_meshes.rs PART_WEAPON).
 const WEAPON: usize = 8;
+/// A jointed weapon arm's forearm and hand. Its upper arm keeps the arm's
+/// id.
+const FOREARM: usize = 9;
+const HAND: usize = 10;
 
 /// Triangle budget per level (docs/plans/unit-asset-spec.md). Only used
 /// to flag a level that will cost more than the plan assumed.
@@ -250,7 +261,7 @@ fn import(kind: usize, path: &Path) -> Fallible<KindMeshes> {
         to_local(level, scale, half_height);
     }
     let local = |p: Vec3| [scale * p.y - half_height, scale * p.z];
-    let rig = arm_rig(finest_local(&levels), &empties, local, name);
+    let rig = arm_rig(&mut levels, &empties, local, scale, path, name);
 
     let imported: Vec<usize> = (0..NUM_LODS).filter(|l| levels[*l].is_some()).collect();
     let tris: Vec<usize> = levels.iter().map(|l| l.as_ref().map_or(0, Level::tris)).collect();
@@ -308,18 +319,21 @@ fn finest_local(levels: &[Option<Level>; NUM_LODS]) -> &Level {
     levels.iter().flatten().next().expect("checked by the caller")
 }
 
-/// The weapon arm's rig, from the `weapon` part and the `pivot_weapon`
-/// and `joint_elbow` empties. A model without them keeps a rigid arm and
-/// logs why. `local` takes a model-space point to the pitch plane of
-/// engine local space.
+/// The weapon arm's rig. A jointed arm needs its upper arm, forearm, hand
+/// and weapon parts, their pivot empties and its attack tables. A bent arm
+/// needs the `weapon` part, `pivot_weapon` and `joint_elbow`. Parts the
+/// arm cannot move on their own join the arm, which then bends or turns
+/// as one piece, and the log says why. `local` takes a model-space point
+/// to the pitch plane of engine local space.
 fn arm_rig(
-    level: &Level,
+    levels: &mut [Option<Level>; NUM_LODS],
     empties: &[(String, Vec3)],
     local: impl Fn(Vec3) -> [f32; 2],
+    scale: f32,
+    path: &Path,
     name: &str,
 ) -> Rig {
-    let weapon: Vec<usize> =
-        (0..level.part.len()).filter(|&i| level.part[i].round() as usize == WEAPON).collect();
+    let level = finest_local(levels);
     let has = |part: usize| level.part.iter().any(|p| p.round() as usize == part);
     let (arm, arm_name, hold) = if has(4) {
         (4, "arm_spear", crate::unit_meshes::HOLD_SPEAR)
@@ -329,21 +343,83 @@ fn arm_rig(
         return Rig::default();
     };
     let find = |key: &str| empties.iter().find(|(n, _)| n == key).map(|(_, p)| *p);
+    let jointed = has(FOREARM) || has(HAND);
+    let chain = jointed.then(|| {
+        let pivot = |part: usize| {
+            find(&format!("pivot_{}", PART_NAMES[part]))
+                .ok_or_else(|| format!("no pivot_{} empty", PART_NAMES[part]))
+        };
+        if !(has(FOREARM) && has(HAND) && has(WEAPON)) {
+            return Err("the jointed arm lacks its forearm, hand or weapon part".to_string());
+        }
+        let joints = [pivot(arm)?, pivot(FOREARM)?, pivot(HAND)?, pivot(WEAPON)?];
+        let attack = read_attack(&attack_path(path), &joints, [arm, FOREARM, HAND, WEAPON])?;
+        let [shoulder, elbow, wrist, grip] = joints.map(&local);
+        let (tip, rear) = weapon_axis(level, grip);
+        Ok(Rig {
+            shoulder,
+            elbow,
+            wrist,
+            grip,
+            tip,
+            rear,
+            arm: arm as f32,
+            hold,
+            slide: scale * attack.weapon_slide_levelled_m,
+            chain: 1.0,
+            windup: attack.windup,
+            recover: attack.recover,
+            ..Rig::default()
+        })
+    });
+    match chain {
+        Some(Ok(rig)) => {
+            info!("{name}: jointed weapon arm, attack from {}", attack_path(path).display());
+            return rig;
+        }
+        Some(Err(e)) => {
+            warn!("{name}: {e}, so the forearm and hand join the arm and it bends at the elbow");
+            fold(levels, &[FOREARM, HAND], arm);
+        }
+        None => {}
+    }
+
+    let level = finest_local(levels);
+    let has_weapon = level.part.iter().any(|p| p.round() as usize == WEAPON);
     let (Some(shoulder), Some(elbow), Some(grip)) =
         (find(&format!("pivot_{arm_name}")), find("joint_elbow"), find("pivot_weapon"))
     else {
-        if !weapon.is_empty() {
-            warn!("{name}: a weapon part without pivot_weapon and joint_elbow, the arm stays rigid");
+        if has_weapon {
+            warn!("{name}: a weapon part without pivot_weapon and joint_elbow, the arm and weapon turn as one");
+            fold(levels, &[WEAPON], arm);
         }
         return Rig::default();
     };
-    if weapon.is_empty() {
+    if !has_weapon {
         warn!("{name}: no weapon part, the arm stays rigid");
         return Rig::default();
     }
-    // The level is already in engine space. Put the empties there too.
-    let [gy, gz] = local(grip);
-    let yz = |i: usize| Vec2::new(level.pos[i].y - gy, level.pos[i].z - gz);
+    let grip = local(grip);
+    let (tip, rear) = weapon_axis(level, grip);
+    Rig {
+        shoulder: local(shoulder),
+        elbow: local(elbow),
+        wrist: grip,
+        grip,
+        tip,
+        rear,
+        arm: arm as f32,
+        hold,
+        ..Rig::default()
+    }
+}
+
+/// The weapon's direction from the grip to its point, and how far it
+/// reaches behind the grip, in the pitch plane of the rest pose.
+fn weapon_axis(level: &Level, grip: [f32; 2]) -> ([f32; 2], f32) {
+    let weapon: Vec<usize> =
+        (0..level.part.len()).filter(|&i| level.part[i].round() as usize == WEAPON).collect();
+    let yz = |i: usize| Vec2::new(level.pos[i].y - grip[0], level.pos[i].z - grip[1]);
     let tip = weapon
         .iter()
         .map(|&i| yz(i))
@@ -351,16 +427,108 @@ fn arm_rig(
         .unwrap_or(Vec2::Y)
         .normalize_or(Vec2::Y);
     let rear = weapon.iter().map(|&i| -yz(i).dot(tip)).fold(0.0f32, f32::max);
-    Rig {
-        shoulder: local(shoulder),
-        elbow: local(elbow),
-        grip: [gy, gz],
-        tip: tip.to_array(),
-        rear,
-        arm: arm as f32,
-        hold,
-        pad: 0.0,
+    (tip.to_array(), rear)
+}
+
+/// Merge parts into the arm: they take its id and pivot, so they move
+/// with it.
+fn fold(levels: &mut [Option<Level>; NUM_LODS], parts: &[usize], arm: usize) {
+    for level in levels.iter_mut().flatten() {
+        let Some(pivot) =
+            level.part.iter().position(|p| p.round() as usize == arm).map(|i| level.pivot[i])
+        else {
+            continue;
+        };
+        for i in 0..level.part.len() {
+            if parts.contains(&(level.part[i].round() as usize)) {
+                level.part[i] = arm as f32;
+                level.pivot[i] = pivot;
+            }
+        }
     }
+}
+
+/// The attack tables of a model with a jointed arm, next to it.
+fn attack_path(model: &Path) -> PathBuf {
+    model.with_extension("stab.json")
+}
+
+/// A jointed arm's attack as the build scripts write it
+/// (tools/blender/spearman/motion.py `export_clip`). Poses are shoulder,
+/// elbow and wrist turns from the rest pose plus how far the weapon is
+/// levelled, and the turns are pitches with + taking +Z toward +Y, the
+/// shader's convention.
+#[derive(serde::Deserialize)]
+struct AttackFile {
+    version: u32,
+    /// Joint positions by part id, model space.
+    joints_gltf_xyz: std::collections::HashMap<String, [f32; 3]>,
+    windup_samples: Vec<[f32; 4]>,
+    recovery_samples: Vec<[f32; 4]>,
+    recovery_seconds: f32,
+    weapon_slide_levelled_m: f32,
+}
+
+struct Attack {
+    windup: [[f32; 4]; crate::unit_meshes::ATTACK_SAMPLES],
+    recover: [[f32; 4]; crate::unit_meshes::ATTACK_SAMPLES],
+    weapon_slide_levelled_m: f32,
+}
+
+/// Read and check an attack file against the model's joints.
+fn read_attack(path: &Path, joints: &[Vec3; 4], parts: [usize; 4]) -> Fallible<Attack> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read its attack tables {}: {e}", path.display()))?;
+    let file: AttackFile = serde_json::from_str(&text)
+        .map_err(|e| format!("{} is not an attack file: {e}", path.display()))?;
+    if file.version != 1 {
+        return Err(format!("{} is version {}, the engine reads 1", path.display(), file.version));
+    }
+    let table = |samples: &[[f32; 4]]| -> Fallible<[[f32; 4]; crate::unit_meshes::ATTACK_SAMPLES]> {
+        if samples.iter().flatten().any(|v| !v.is_finite()) {
+            return Err(format!("{} has a pose that is not a number", path.display()));
+        }
+        samples.try_into().map_err(|_| {
+            format!(
+                "{} has {} poses in a table, the engine samples {}",
+                path.display(),
+                samples.len(),
+                crate::unit_meshes::ATTACK_SAMPLES
+            )
+        })
+    };
+    let windup = table(&file.windup_samples)?;
+    let recover = table(&file.recovery_samples)?;
+    // The soldier stands in the guard before and after a blow, and the
+    // follow-through starts where the wind-up struck.
+    let apart = |a: [f32; 4], b: [f32; 4]| a.iter().zip(b).any(|(a, b)| (a - b).abs() > 1e-3);
+    if apart(windup[0], recover[crate::unit_meshes::ATTACK_SAMPLES - 1]) {
+        return Err(format!("{}: the follow-through does not end in the guard", path.display()));
+    }
+    if apart(windup[crate::unit_meshes::ATTACK_SAMPLES - 1], recover[0]) {
+        return Err(format!("{}: the follow-through does not start at the strike", path.display()));
+    }
+    for (joint, part) in joints.iter().zip(parts) {
+        let Some(at) = file.joints_gltf_xyz.get(&part.to_string()) else {
+            return Err(format!("{} has no joint for part {}", path.display(), PART_NAMES[part]));
+        };
+        if joint.distance(Vec3::from_array(*at)) > 1e-3 {
+            return Err(format!(
+                "{} puts the {} joint at {at:?}, the model at {joint}",
+                path.display(),
+                PART_NAMES[part]
+            ));
+        }
+    }
+    if (file.recovery_seconds - crate::render_units::FOLLOW_S).abs() > 1e-3 {
+        warn!(
+            "{}: the follow-through is authored over {} s and plays over {} s",
+            path.display(),
+            file.recovery_seconds,
+            crate::render_units::FOLLOW_S
+        );
+    }
+    Ok(Attack { windup, recover, weapon_slide_levelled_m: file.weapon_slide_levelled_m })
 }
 
 /// The atlas a primitive samples, as its `TEXCOORD` set: None when the

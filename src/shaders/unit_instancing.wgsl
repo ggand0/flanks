@@ -5,8 +5,9 @@ struct Vertex {
     @location(0) position: vec3<f32>,
     @location(1) normal: vec3<f32>,
     // NOT texture coords: x = body part id (0 body, 1 sword arm,
-    // 2 left leg, 3 right leg, 4 spear arm, 5 shield arm, 6 bow arm),
-    // y = the part's pivot height.
+    // 2 left leg, 3 right leg, 4 spear arm, 5 shield arm, 6 bow arm,
+    // 7 arrow, 8 weapon, 9 and 10 a jointed weapon arm's forearm and
+    // hand), y = the part's pivot height.
     @location(2) part_pivot: vec2<f32>,
     // Where the vertex samples the kind's atlas (zero without one).
     @location(3) atlas_uv: vec2<f32>,
@@ -17,14 +18,13 @@ struct Vertex {
     @location(8) i_pos_scale: vec4<f32>,
     // rgb = team color, a = stable per-unit anim seed (not opacity).
     @location(9) i_color: vec4<f32>,
-    // x = yaw, y = ground speed in m/s. z positive = attack: style*2 +
-    // wind-up progress (style 0 stab, 1 slash); z negative = stance
-    // band (-0.25 enemy near, -0.5 blade leveled, -1 charging).
-    // w = fx: [0,1) hit-flash intensity, [1,2] = 1 + death progress.
+    // x = yaw, y = ground speed in m/s. z = attack or cheer
+    // (render_units.rs CELEBRATE_BASE), 0 for neither. w = fx: [0,1)
+    // hit-flash intensity, [1,2] = 1 + death progress, 2 on a corpse.
     @location(10) i_anim: vec4<f32>,
-    // x = leg length, hip to sole (0 on corpses), y = wall 0..1
-    // (shieldwall/spearwall by bucket), z = gait phase in cycles,
-    // w = stagger.
+    // x = stance band (0.25 enemy near, 0.5 fighting, 1 charging),
+    // y = wall 0..1 (shieldwall/spearwall by bucket), z = gait phase in
+    // cycles, w = stagger.
     @location(11) i_anim2: vec4<f32>,
 };
 
@@ -48,11 +48,13 @@ struct VertexOutput {
 @group(3) @binding(5) var unit_atlas_sampler: sampler;
 #endif
 
-// The weapon arm of this bucket's kind (unit_meshes.rs `Rig`): joints in
-// the soldier's pitch plane, as (y, z) of local space in the rest pose.
+// This bucket's kind (unit_meshes.rs `Rig`): its leg, and its weapon
+// arm's joints in the soldier's pitch plane, as (y, z) of local space in
+// the rest pose.
 struct Rig {
     shoulder: vec2<f32>,
     elbow: vec2<f32>,
+    wrist: vec2<f32>,
     grip: vec2<f32>,
     // Unit direction from the grip toward the weapon's point.
     tip: vec2<f32>,
@@ -62,7 +64,17 @@ struct Rig {
     arm: f32,
     // 1 sword, 2 spear, 3 the archer's draw hand.
     hold: f32,
-    pad: f32,
+    // How far the weapon slides through the hand once levelled.
+    slide: f32,
+    // Hip to sole.
+    leg: f32,
+    // 1 for a jointed arm: upper arm, forearm (9) and hand (10).
+    chain: f32,
+    // A jointed arm's attack, even samples over the wind-up and over the
+    // follow-through: shoulder, elbow and wrist turns from the rest pose,
+    // and how far the weapon is levelled. windup[0] is the guard.
+    windup: array<vec4<f32>, 33>,
+    recover: array<vec4<f32>, 33>,
 };
 @group(3) @binding(6) var<uniform> rig: Rig;
 
@@ -294,6 +306,20 @@ fn arm_pose(goal: vec2<f32>, aim: f32) -> vec3<f32> {
     );
 }
 
+// A jointed arm's attack pose at progress x of the wind-up, or of the
+// follow-through, straight between the two nearest samples.
+fn attack_pose(follow: bool, x: f32) -> vec4<f32> {
+    let t = clamp(x, 0.0, 1.0) * 32.0;
+    let i = min(u32(t), 31u);
+    var a = rig.windup[i];
+    var b = rig.windup[i + 1u];
+    if follow {
+        a = rig.recover[i];
+        b = rig.recover[i + 1u];
+    }
+    return mix(a, b, t - f32(i));
+}
+
 fn rot_y(p: vec3<f32>, c: f32, s: f32) -> vec3<f32> {
     return vec3<f32>(p.x * c + p.z * s, p.y, -p.x * s + p.z * c);
 }
@@ -397,22 +423,45 @@ fn unit_vertex(vertex: Vertex) -> VertexOutput {
     let yaw = vertex.i_anim.x;
     let speed = vertex.i_anim.y;
     let moving = walk_gate(speed);
-    // Positive z: attack progress. The 2s digit is the swing STYLE
-    // (0 = stab, 1 = classic swing, 2 = slash), remainder = lunge
-    // 0..~1.35. z >= 6 = victory cheer (no one left to swing at).
+    // Attack: the 2s digit is the swing style (0 stab, 1 classic swing,
+    // 2 slash), plus 3 on a charging blow. The remainder is the wind-up,
+    // 0..1 linear in time, or from 1.4 the follow-through after the blow
+    // landed (render_units.rs FOLLOW_BASE). From 12 the victory cheer.
     let zpos = max(vertex.i_anim.z, 0.0);
-    let style = floor(zpos * 0.5 + 0.001);
-    let lunge = zpos - style * 2.0;
-    // Cheer: z = 6 + progress. Ease in over the first ~8% and back out
+    let cheering = zpos > 11.5;
+    let digit = floor(zpos * 0.5 + 0.001);
+    let charge = digit > 2.5 && !cheering;
+    let style = digit - select(0.0, 3.0, charge);
+    let within = zpos - digit * 2.0;
+    let following = within > 1.395 && !cheering;
+    let windup = select(select(within, 0.0, following), 0.0, cheering);
+    let follow = clamp((within - 1.4) / 0.59, 0.0, 1.0);
+    // The lunge the code-posed arms and the body lean follow: quadratic
+    // over the wind-up and harder on a charge, where it raises from the
+    // levelled run-in point instead of dipping the blade first. After the
+    // blow it holds a moment and eases back to 0.
+    let amp = select(1.0, 1.35, charge);
+    var wound = windup * windup * amp;
+    if charge {
+        wound = max(wound, 0.18);
+    }
+    let settle = 1.0 - smoothstep(0.25, 1.0, follow);
+    let lunge = select(wound, settle * amp, following);
+    // Attack progress for every arm: `raise` draws back over the wind-up,
+    // `chop` drives the blow home over its last stretch so it lands on the
+    // strike tick, and both ease back together after it.
+    let raise = select(smoothstep(0.0, 0.55, wound), settle, following);
+    let chop = select(smoothstep(0.55, 1.0, wound), settle, following);
+    // Cheer: z = 12 + progress. Ease in over the first ~8% and back out
     // over the last ~10% — poses must never snap in one frame.
-    let cele_t = clamp(zpos - 6.0, 0.0, 1.0);
-    let celebrate = step(5.0, zpos)
+    let cele_t = clamp(zpos - 12.0, 0.0, 1.0);
+    let celebrate = select(0.0, 1.0, cheering)
         * smoothstep(0.0, 0.08, cele_t)
         * (1.0 - smoothstep(0.90, 1.0, cele_t));
-    // Negative z band: 0.25 = enemy in watch range (brace when
-    // standing), 0.5 = fighting but wavering (brace, no taunt),
-    // 0.65 = fighting confident (taunts), 1 = charging (sprint).
-    let band = max(-vertex.i_anim.z, 0.0);
+    // Stance band: 0.25 = enemy in watch range (brace when standing),
+    // 0.5 = fighting but wavering (brace, no taunt), 0.65 = fighting
+    // confident (taunts), 1 = charging (sprint).
+    let band = max(vertex.i_anim2.x, 0.0);
     let ready = smoothstep(0.05, 0.25, band);
     let stance = smoothstep(0.25, 0.5, band);
     let confident = smoothstep(0.55, 0.65, band);
@@ -438,8 +487,9 @@ fn unit_vertex(vertex: Vertex) -> VertexOutput {
 
     let wall = vertex.i_anim2.y;
     // Gait. The phase counts cycles of two steps, offset per soldier so
-    // a block does not move in lockstep.
-    let leg = vertex.i_anim2.x;
+    // a block does not move in lockstep. The fallen keep the legs they
+    // fell with.
+    let leg = select(0.0, rig.leg, fx < 1.99);
     let gait = fract(vertex.i_anim2.z + seed);
     let g = gait_at(speed, leg);
     let run = g.run;
@@ -450,11 +500,57 @@ fn unit_vertex(vertex: Vertex) -> VertexOutput {
     let dip = gait_dip(fract(2.0 * gait), g);
 
     // --- Part animation (rotations around the part pivot) ---
-    // Attack progress, shared by every arm: raise over the wind-up, chop
-    // at the strike.
-    let raise = smoothstep(0.0, 0.8, lunge);
-    let chop = smoothstep(0.85, 1.0, lunge);
-    if rig.arm > 0.5 && (part > 7.5 || abs(part - rig.arm) < 0.5) {
+    if rig.chain > 0.5 && (abs(part - rig.arm) < 0.5 || (part > 7.5 && part < 10.5)) {
+        // A jointed weapon arm: upper arm, forearm and hand turn at the
+        // shoulder, elbow and wrist, each carrying the next, and the
+        // weapon turns and slides through the hand. The rest pose is the
+        // carry. Readiness levels the weapon into the guard, and an attack
+        // plays the kind's tables from the guard and back to it.
+        let ready_level = max(max(stance, ready * 0.75), max(sprint, wall)) * (1.0 - celebrate);
+        // Carry to the guard is a straight blend of the joint turns, and
+        // so is carry to any attack pose. A wind-up that starts short of
+        // the guard reaches it in its first third, and the follow-through
+        // ends in the guard and settles to readiness as it runs out.
+        var pose = rig.windup[0] * ready_level;
+        if following {
+            pose = attack_pose(true, follow) * max(ready_level, 1.0 - smoothstep(0.92, 1.0, follow));
+        } else if windup > 0.0 {
+            pose = attack_pose(false, windup) * max(ready_level, smoothstep(0.0, 0.35, windup));
+        }
+        let upper = pose.x;
+        let fore = upper + pose.y;
+        let hand = fore + pose.z;
+        let elbow = rig.shoulder + yz_turn(rig.elbow - rig.shoulder, upper);
+        let wrist = elbow + yz_turn(rig.wrist - rig.elbow, fore);
+        let grip = wrist + yz_turn(rig.grip - rig.wrist, hand);
+        var ang = upper;
+        var joint = rig.shoulder;
+        var moved = rig.shoulder;
+        var shift = vec2<f32>(0.0);
+        if abs(part - 9.0) < 0.5 {
+            ang = fore;
+            joint = rig.elbow;
+            moved = elbow;
+        } else if abs(part - 10.0) < 0.5 {
+            ang = hand;
+            joint = rig.wrist;
+            moved = wrist;
+        } else if abs(part - 8.0) < 0.5 {
+            // The weapon keeps its own pitch, not the hand's. Levelling
+            // turns it from upright to straight ahead and slides it up
+            // through the fist toward the butt.
+            ang = -0.5 * PI * pose.w;
+            joint = rig.grip;
+            moved = grip;
+            shift = vec2<f32>(rig.slide * pose.w, 0.0);
+        }
+        let yz = moved + yz_turn(local.yz - joint + shift, ang);
+        local = vec3<f32>(local.x, yz.x, yz.y);
+        // The whole arm swings a little on the march and in the cheer.
+        let turn = 0.05 * moving * limb * (1.0 - pose.w) + 0.10 * celebrate * sin(wobble);
+        local = pitch_about_at(local, rig.shoulder.x, rig.shoulder.y, turn);
+        normal = pitch_normal(normal, ang + turn);
+    } else if rig.arm > 0.5 && (abs(part - 8.0) < 0.5 || abs(part - rig.arm) < 0.5) {
         // The weapon arm and its weapon: shoulder, elbow and wrist. The
         // hand stays on the arm and the arm on the shoulder, and the
         // weapon turns and slides in the hand.
@@ -476,10 +572,10 @@ fn unit_vertex(vertex: Vertex) -> VertexOutput {
             let l1 = length(rig.elbow - rig.shoulder);
             let l2 = length(rig.grip - rig.elbow);
             let levelled = rig.shoulder + vec2<f32>(-l1, 0.95 * l2);
-            // Draw back, then drive the point home along the shaft. The
-            // damage tick lands at lunge 1.0, as for every weapon.
+            // Draw back to the hip, then drive the point home along the
+            // shaft.
             goal = mix(rig.grip, levelled, level)
-                + yz_dir(aim) * reach * (-0.25 * raise + 0.9 * chop);
+                + yz_dir(aim) * reach * (-0.45 * raise * (1.0 - chop) + 0.9 * chop);
             slide = 0.58 * rig.rear * level;
             turn = 0.05 * moving * limb * (1.0 - level) + 0.10 * celebrate * sin(wobble);
         } else if rig.hold > 2.5 {
@@ -505,7 +601,7 @@ fn unit_vertex(vertex: Vertex) -> VertexOutput {
             } else if style < 0.5 {
                 // Stab: the hand pulls back, then thrusts along the blade,
                 // the wrist keeping the point near level.
-                goal = rig.grip + yz_dir(rest) * reach * (-0.3 * raise + 0.7 * chop);
+                goal = rig.grip + yz_dir(rest) * reach * (-0.4 * raise * (1.0 - chop) + 0.7 * chop);
                 aim = rest + 0.15 * raise - 0.1 * chop;
             } else if style < 1.5 {
                 // The classic swing: raise up and back, fast chop.
@@ -525,7 +621,7 @@ fn unit_vertex(vertex: Vertex) -> VertexOutput {
         // sleeve bends. The weapon turns with the hand.
         let upper = rig.elbow - rig.shoulder;
         let past = dot(vertex.position.yz - rig.elbow, upper) / dot(upper, upper);
-        let weapon = part > 7.5;
+        let weapon = abs(part - 8.0) < 0.5;
         let fore = select(smoothstep(-0.15, 0.15, past), 1.0, weapon);
         local = pitch_about_at(local, rig.shoulder.x, rig.shoulder.y, shoulder);
         let elbow = rig.shoulder + yz_turn(upper, shoulder);
@@ -671,7 +767,7 @@ fn unit_vertex(vertex: Vertex) -> VertexOutput {
 
     // The shoulders turn against the legs and the upper body shifts over
     // the planted foot, easing in up the torso so the hips stay square.
-    if part < 1.5 || (part > 3.5 && part < 6.5) || part > 7.5 {
+    if part < 1.5 || (part > 3.5 && part < 6.5) || (part > 7.5 && part < 10.5) {
         let w = select(1.0, smoothstep(0.0, 0.25, vertex.position.y), part < 0.5);
         let turn = 0.10 * g.run * g.stride * limb * w;
         local = rot_y(local, cos(turn), sin(turn));
@@ -684,7 +780,8 @@ fn unit_vertex(vertex: Vertex) -> VertexOutput {
     let bob = -dip;
     let lean = (0.10 * moving
         + 0.24 * max(run * moving, sprint * (0.25 + 0.75 * moving))
-        + 0.30 * lunge)
+        + 0.30 * lunge
+        + 0.25 * chop)
         * clamp(local.y + 0.5, 0.0, 1.5);
     local.z += lean * 0.3;
 

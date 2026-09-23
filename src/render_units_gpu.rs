@@ -30,10 +30,10 @@ use bevy::render::{
 use bytemuck::{Pod, Zeroable};
 
 use crate::render_units::{
-    CELEBRATE_BASE, CORPSE_CAP, Corpses, CustomPipeline, ExtractedAtlas, InstanceBucket,
-    InstanceData, LodBands, RigBuffer,
-    LodConfig, NUM_BUCKETS, NUM_LODS, RenderCounts, SYNC_CHUNK, celebrate_progress, stance_tier,
-    wall_signal,
+    BAND_FIGHTING, CELEBRATE_BASE, CORPSE_CAP, Corpses, CustomPipeline, ExtractedAtlas,
+    FOLLOW_BASE, FOLLOW_S, FOLLOW_SPAN, InstanceBucket, InstanceData, LodBands, RigBuffer,
+    LodConfig, NUM_BUCKETS, NUM_LODS, REWIND_S, RenderCounts, SYNC_CHUNK, celebrate_progress,
+    stance_tier, wall_signal,
 };
 use crate::units::Units;
 use crate::unit_types::NUM_KINDS;
@@ -113,16 +113,17 @@ pub struct BuildParams {
     corpse_cap: u32,
     /// The frame this pass belongs to, stamped into the readback.
     frame: u32,
-    /// Seconds since the last frame, for the gait phase.
+    /// Seconds since the last frame, for the gait phase and the attack.
     dt: f32,
-    pad1: u32,
+    /// render_units.rs BAND_FIGHTING.
+    fighting: f32,
     /// [kind * 3 + set]: set 0 fine, 1 coarse, 2 plain.
     bands: [Vec4; 12],
     windup: Vec4,
     /// draw_ticks, death_ticks, hit_stagger_ticks, celebrate_base
     consts: Vec4,
-    /// Leg length per kind, hip to sole (gait.rs `Legs`).
-    legs: Vec4,
+    /// FOLLOW_S, FOLLOW_BASE, FOLLOW_SPAN, REWIND_S (render_units.rs).
+    attack: Vec4,
     /// x = first index slot of the bucket, y = mesh corners per soldier.
     buckets: [UVec4; NUM_BUCKETS],
 }
@@ -220,7 +221,6 @@ fn build_frame_params(
     lod_cfg: Res<LodConfig>,
     camera: Query<(&Camera, &Projection, &Transform), With<Camera3d>>,
     snap: Res<SoldierSnapshot>,
-    legs: Res<crate::gait::Legs>,
     mut frame: ResMut<GpuFrameInput>,
     mut counts: ResMut<RenderCounts>,
     mut no_cull: Local<Option<bool>>,
@@ -295,7 +295,8 @@ fn build_frame_params(
         CELEBRATE_BASE,
     );
     p.dt = dt;
-    p.legs = Vec4::from_array(legs.0);
+    p.fighting = BAND_FIGHTING;
+    p.attack = Vec4::new(FOLLOW_S, FOLLOW_BASE, FOLLOW_SPAN, REWIND_S);
     p.frame = frame_count.0;
     frame.params = p;
     frame.lod_debug = lod_cfg.debug;
@@ -664,7 +665,7 @@ impl UnitAlloc {
                 (live_cap + NUM_KINDS * CORPSE_CAP) * size_of::<crate::render_units::InstanceData>(),
                 BufferUsages::COPY_DST,
             ),
-            smooth: storage_buffer(device, "unit smoothing", live_cap * 20, BufferUsages::empty()),
+            smooth: storage_buffer(device, "unit smoothing", live_cap * 32, BufferUsages::empty()),
             index_list: storage_buffer(device, "unit index list", total * 4, BufferUsages::empty()),
             kind_cap,
             bases,

@@ -49,6 +49,14 @@ struct Smooth {
     // Gait phase in cycles (gait.rs).
     gait: f32,
     lod: u32,
+    // Seconds of follow-through left after a blow.
+    follow: f32,
+    // Wind-up progress shown last frame, running back to 0 once the
+    // wind-up is cut short.
+    atk: f32,
+    // The swing byte of the current or last attack, and 1 << 8 when he
+    // was winding up last frame.
+    swing: u32,
 };
 
 // Per-regiment pose signals for this frame (render_units_gpu.rs
@@ -77,15 +85,16 @@ struct Params {
     corpse_cap: u32,
     frame: u32,
     dt: f32,
-    pad1: u32,
+    // render_units.rs BAND_FIGHTING.
+    fighting: f32,
     // [kind * 3 + set]: set 0 fine, 1 coarse, 2 plain. xyz = squared
     // switch distances for L0/L1, L1/L2, L2/L3 (inf = switch disabled).
     bands: array<vec4<f32>, 12>,
     windup: vec4<f32>,
     // draw_ticks, death_ticks, hit_stagger_ticks, celebrate_base
     consts: vec4<f32>,
-    // Leg length per kind, hip to sole (gait.rs Legs).
-    legs: vec4<f32>,
+    // FOLLOW_S, FOLLOW_BASE, FOLLOW_SPAN, REWIND_S (render_units.rs).
+    attack: vec4<f32>,
     // x = first index slot of the bucket, y = mesh corners per soldier.
     buckets: array<vec4<u32>, 16>,
 };
@@ -119,6 +128,7 @@ const TAU: f32 = 6.2831853;
 // units.rs swing bits.
 const SWING_STATE_MASK: u32 = 3u;
 const SWING_WINDUP: u32 = 1u;
+const SWING_RECOVER: u32 = 2u;
 const SWING_CHARGE: u32 = 4u;
 const SWING_STYLE_SHIFT: u32 = 3u;
 const SWING_STYLE_MASK: u32 = 24u;
@@ -199,7 +209,44 @@ fn build_soldier(i: u32) {
     let step = pos - prev;
     let disp = length(step.xz) * params.inv_dt;
     sm.walk += (disp - sm.walk) * params.k_walk;
-    sm.band += (reg.stance - sm.band) * params.k_band;
+
+    // The attack on anim z, 0 when he is not attacking, as in
+    // render_units.rs `attack_signal`.
+    let follow_s = params.attack.x;
+    let winding = (swing & SWING_STATE_MASK) == SWING_WINDUP && death_t == 0.0;
+    if winding {
+        var w = params.windup[kind];
+        if (swing & SWING_RANGED) != 0u {
+            w = params.consts.x;
+        }
+        sm.atk = clamp((w - swing_t + params.alpha) / (w + 1.0), 0.0, 1.0);
+        sm.swing = swing;
+    } else if (sm.swing & 256u) != 0u
+        && (swing & SWING_STATE_MASK) == SWING_RECOVER
+        && (swing & SWING_STAGGERED) == 0u {
+        sm.follow = follow_s;
+        sm.atk = 0.0;
+    } else {
+        sm.follow = max(sm.follow - params.dt, 0.0);
+        sm.atk = max(sm.atk - params.dt / params.attack.w, 0.0);
+    }
+    sm.swing = (sm.swing & 0xffu) | select(0u, 256u, winding);
+    var digit = f32((sm.swing & SWING_STYLE_MASK) >> SWING_STYLE_SHIFT);
+    if (sm.swing & SWING_CHARGE) != 0u {
+        digit += 3.0;
+    }
+    var attack = 0.0;
+    if sm.follow > 0.0 {
+        attack = digit * 2.0 + params.attack.y + params.attack.z * (1.0 - sm.follow / follow_s);
+    } else if sm.atk > 0.0 {
+        attack = digit * 2.0 + sm.atk;
+    }
+
+    var tier = reg.stance;
+    if attack > 0.0 && (sm.swing & SWING_RANGED) == 0u {
+        tier = max(tier, params.fighting);
+    }
+    sm.band += (tier - sm.band) * params.k_band;
     sm.wall += (reg.walled - sm.wall) * params.k_wall;
     // The step is capped as in gait.rs `advance`.
     let g = sm.gait + min(gait_rate(sm.walk) * params.dt, 0.25);
@@ -236,26 +283,10 @@ fn build_soldier(i: u32) {
     let dy = dyr - floor(dyr / TAU) * TAU - PI;
     let yaw = s.yaw_prev + dy * params.alpha;
 
-    // Attack lunge: quadratic wind-up, style in the 2s digit. Else the
-    // victory cheer, else the smoothed stance band, else nothing.
-    var lunge = 0.0;
-    if (swing & SWING_STATE_MASK) == SWING_WINDUP {
-        var w = params.windup[kind];
-        if (swing & SWING_RANGED) != 0u {
-            w = params.consts.x;
-        }
-        let tw = max((w - swing_t) / max(w, 1.0), 0.0);
-        let charge = (swing & SWING_CHARGE) != 0u;
-        var l = tw * tw;
-        if charge {
-            l = max(l * 1.35, 0.18);
-        }
-        let style = f32((swing & SWING_STYLE_MASK) >> SWING_STYLE_SHIFT);
-        lunge = style * 2.0 + l;
-    } else if death_t == 0.0 && reg.celebrate >= 0.0 {
+    // The attack, else the victory cheer, else nothing.
+    var lunge = attack;
+    if attack <= 0.0 && death_t == 0.0 && reg.celebrate >= 0.0 {
         lunge = params.consts.w + reg.celebrate;
-    } else if death_t == 0.0 {
-        lunge = -sm.band;
     }
 
     // fx: [0,1) hit flash, [1,2] death progress.
@@ -273,7 +304,7 @@ fn build_soldier(i: u32) {
         vec4<f32>(position, 1.0),
         vec4<f32>(rgb, s.seed),
         vec4<f32>(yaw, sm.walk, lunge, fx),
-        vec4<f32>(params.legs[kind], sm.wall, sm.gait, stagger),
+        vec4<f32>(sm.band, sm.wall, sm.gait, stagger),
     );
     smoothing[i] = sm;
     append(kind * NUM_LODS + lod, i, lod);

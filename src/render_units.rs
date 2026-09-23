@@ -98,12 +98,12 @@ pub struct InstanceData {
     pub scale: f32,
     /// rgb = team color; a = stable per-unit anim seed (NOT opacity).
     pub color: [f32; 4],
-    /// x = yaw, y = ground speed m/s, z = lunge 0..1 (attack),
-    /// w = fx: [0,1) hit flash, [1,2] death.
+    /// x = yaw, y = ground speed m/s, z = attack or cheer
+    /// (CELEBRATE_BASE), w = fx: [0,1) hit flash, [1,2] death.
     pub anim: [f32; 4],
-    /// x = leg length, hip to sole, y = wall 0..1 (shieldwall
-    /// shield-front / spearwall leveled spears), z = gait phase in
-    /// cycles (gait.rs), w = stagger progress.
+    /// x = stance band (`stance_tier`, smoothed), y = wall 0..1
+    /// (shieldwall shield-front / spearwall leveled spears), z = gait
+    /// phase in cycles (gait.rs), w = stagger progress.
     pub anim2: [f32; 4],
 }
 
@@ -368,7 +368,6 @@ impl Plugin for UnitRenderPlugin {
             .init_resource::<RenderCounts>()
             .init_resource::<LodConfig>()
             .init_resource::<Corpses>()
-            .init_resource::<crate::gait::Legs>()
             .add_plugins(crate::render_units_gpu::GpuUnitRenderPlugin)
             .add_systems(Startup, setup_unit_mesh)
             // Must run after the camera moves: culling builds a FRESH
@@ -414,7 +413,6 @@ fn setup_unit_mesh(
     mut meshes: ResMut<Assets<Mesh>>,
     mut images: ResMut<Assets<Image>>,
     gpu: Res<GpuSyncConfig>,
-    mut legs: ResMut<crate::gait::Legs>,
 ) {
     // One instance entity per unit kind AND detail level, each with its
     // own code-built mesh. Instance positions are not the entity's transform;
@@ -430,18 +428,16 @@ fn setup_unit_mesh(
     for kind in 0..crate::unit_types::NUM_KINDS {
         let model = crate::unit_glb::kind_lods(kind);
         let lods = model.lods;
-        let rig = UnitRig(model.rig);
+        let mut rig = model.rig;
+        // The gait pose is built on the leg this mesh has, or about half
+        // the figure's height when it has no legs.
+        rig.leg = crate::gait::measure(&lods[0])
+            .unwrap_or(crate::unit_types::half_height(kind));
+        let rig = UnitRig(rig);
         let atlas = model.atlas.map(|image| images.add(image));
         let tris: Vec<usize> =
             lods.iter().map(|m| m.indices().map_or(0, |i| i.len() / 3)).collect();
-        // The gait pose is built on the leg this mesh has.
-        if let Some(leg) = crate::gait::measure(&lods[0]) {
-            legs.0[kind] = leg;
-        }
-        info!(
-            "unit meshes: kind {kind} tris per level {tris:?}, leg {:.2} m",
-            legs.0[kind]
-        );
+        info!("unit meshes: kind {kind} tris per level {tris:?}, leg {:.2} m", rig.0.leg);
         // One bucket per detail level, shared by the living and the fallen.
         for (lod, mesh) in lods.into_iter().enumerate() {
             let bucket = InstanceBucket(bucket_of(kind, lod));
@@ -491,17 +487,35 @@ pub(crate) struct RigBuffer(pub Buffer);
 /// Units per parallel sync chunk.
 pub(crate) const SYNC_CHUNK: usize = 16_384;
 
-/// Anim z-channel encoding — the ONE authoritative map (keep in sync
-/// with unit_instancing.wgsl, which decodes it):
-///   z > 0, < CELEBRATE_BASE: attack = style * 2 + wind-up progress
-///     (style 0 stab, 1 classic swing, 2 slash/benched);
-///   z >= CELEBRATE_BASE: victory cheer, fraction = progress 0..1;
-///   z < 0: stance-band magnitude — tiers 0.25 enemy-near, 0.5 fighting
-///     wavering, 0.65 fighting confident, 1.0 charging — smoothed per
-///     unit (~0.35 s) before emission so poses never snap.
-pub(crate) const CELEBRATE_BASE: f32 = 6.0;
+/// Anim z-channel encoding, decoded by unit_instancing.wgsl and written
+/// the same way by unit_build.wgsl:
+///   z <= 0: no attack, no cheer;
+///   z > 0, < CELEBRATE_BASE: attack = digit * 2 + progress, where the
+///     digit is the swing style (0 stab, 1 classic swing, 2 slash,
+///     benched), plus 3 on a charging blow. Progress is the wind-up,
+///     0..1 linear in time, or from FOLLOW_BASE the follow-through;
+///   z >= CELEBRATE_BASE: victory cheer, fraction = progress 0..1.
+/// The stance band rides anim2.x.
+pub(crate) const CELEBRATE_BASE: f32 = 12.0;
 
-/// Battle stance tier of a regiment, the negative anim z band: 0.25 =
+/// A blow lands, then the arm comes back over this many seconds.
+pub(crate) const FOLLOW_S: f32 = 0.6;
+
+/// The follow-through on anim z: digit * 2 + FOLLOW_BASE + FOLLOW_SPAN *
+/// progress, above any wind-up.
+pub(crate) const FOLLOW_BASE: f32 = 1.4;
+pub(crate) const FOLLOW_SPAN: f32 = 0.59;
+
+/// Seconds a wind-up cut short takes to go back the way it came, from a
+/// full wind-up.
+pub(crate) const REWIND_S: f32 = 0.25;
+
+/// The stance band of a regiment fighting with confidence. A soldier who
+/// swings is fighting whatever his regiment does, so his band rises at
+/// least this far while he attacks.
+pub(crate) const BAND_FIGHTING: f32 = 0.65;
+
+/// Battle stance tier of a regiment, the anim2.x band: 0.25 =
 /// enemy in watch range (standing units brace), 0.5 = fighting but
 /// wavering (morale low, braces, no taunts), 0.65 = fighting confident,
 /// 1.0 = charging (sprint lean and stride). Plain moves carry lowered.
@@ -510,7 +524,7 @@ pub(crate) fn stance_tier(g: &crate::orders::GroupData) -> f32 {
     if g.charging {
         1.0
     } else if g.engaged || matches!(g.order, Some(crate::orders::Order::Attack(_))) {
-        if crate::morale::band(g) == crate::morale::Band::Steady { 0.65 } else { 0.5 }
+        if crate::morale::band(g) == crate::morale::Band::Steady { BAND_FIGHTING } else { 0.5 }
     } else if g.enemy_near {
         0.25
     } else {
@@ -519,7 +533,7 @@ pub(crate) fn stance_tier(g: &crate::orders::GroupData) -> f32 {
 }
 
 /// Victory cheer progress 0..1, negative when the regiment is not
-/// celebrating. Rides the positive band as CELEBRATE_BASE + progress so
+/// celebrating. Rides anim z as CELEBRATE_BASE + progress so
 /// the shader can ease in and out.
 pub(crate) fn celebrate_progress(g: &crate::orders::GroupData) -> f32 {
     if g.celebrate > 0 {
@@ -552,6 +566,60 @@ struct Smooth {
     gait: f32,
     /// Detail level last frame (hysteresis).
     lod: u8,
+    /// Seconds of follow-through left after a blow.
+    follow: f32,
+    /// Wind-up progress shown last frame, running back to 0 once the
+    /// wind-up is cut short.
+    atk: f32,
+    /// The swing byte of the current or last attack.
+    swing: u8,
+    /// Whether he was winding up last frame.
+    winding: bool,
+}
+
+/// One soldier's attack on anim z (CELEBRATE_BASE), 0 when he is not
+/// attacking, and his attack state carried on. The sim goes from wind-up
+/// to recovery on the tick the blow lands, so the follow-through is the
+/// renderer's: it plays for FOLLOW_S after that turn. A wind-up that ends
+/// any other way, by a stagger or death, goes back the way it came.
+/// Same steps as `build_soldier` in unit_build.wgsl.
+fn attack_signal(sm: &mut Smooth, sw: u8, swing_t: u8, kind: usize, dying: bool, alpha: f32, dt: f32) -> f32 {
+    use crate::units::{SWING_RANGED, SWING_RECOVER, SWING_STAGGERED, SWING_STATE_MASK, SWING_WINDUP};
+    let winding = sw & SWING_STATE_MASK == SWING_WINDUP && !dying;
+    if winding {
+        // A bow draw runs on the missile draw time, not the melee wind-up.
+        let w = if sw & SWING_RANGED != 0 {
+            crate::unit_types::missile::DRAW_TICKS as f32
+        } else {
+            crate::unit_types::TYPES[kind].windup_ticks as f32
+        };
+        // Between ticks the wind-up runs on with the fixed clock, and it
+        // reaches 1 on the tick the blow lands. Clamped: the draw-start
+        // jitter can put swing_t above the draw time.
+        sm.atk = ((w - swing_t as f32 + alpha) / (w + 1.0)).clamp(0.0, 1.0);
+        sm.swing = sw;
+    } else if sm.winding && sw & SWING_STATE_MASK == SWING_RECOVER && sw & SWING_STAGGERED == 0 {
+        sm.follow = FOLLOW_S;
+        sm.atk = 0.0;
+    } else {
+        sm.follow = (sm.follow - dt).max(0.0);
+        sm.atk = (sm.atk - dt / REWIND_S).max(0.0);
+    }
+    sm.winding = winding;
+    let digit = attack_digit(sm.swing);
+    if sm.follow > 0.0 {
+        digit * 2.0 + FOLLOW_BASE + FOLLOW_SPAN * (1.0 - sm.follow / FOLLOW_S)
+    } else if sm.atk > 0.0 {
+        digit * 2.0 + sm.atk
+    } else {
+        0.0
+    }
+}
+
+/// The attack digit of a swing byte: its style, plus 3 on a charge.
+fn attack_digit(sw: u8) -> f32 {
+    let style = ((sw & crate::units::SWING_STYLE_MASK) >> crate::units::SWING_STYLE_SHIFT) as f32;
+    if sw & crate::units::SWING_CHARGE != 0 { style + 3.0 } else { style }
 }
 
 #[allow(clippy::too_many_arguments)] // bevy system params
@@ -571,11 +639,7 @@ fn sync_instance_data(
     mut scratch: Local<Vec<[Vec<InstanceData>; NUM_BUCKETS]>>,
     mut corpse_scratch: Local<Vec<[Vec<InstanceData>; NUM_LODS]>>,
     mut smooth: Local<Vec<Smooth>>,
-    (gpu, frame, legs): (
-        Res<GpuSyncConfig>,
-        Res<bevy::diagnostic::FrameCount>,
-        Res<crate::gait::Legs>,
-    ),
+    (gpu, frame): (Res<GpuSyncConfig>, Res<bevy::diagnostic::FrameCount>),
 ) {
     let _span = info_span!("sync_instances").entered();
     let t0 = std::time::Instant::now();
@@ -629,8 +693,6 @@ fn sync_instance_data(
     let celebrating = &celebrating[..];
     let walled: Vec<f32> = groups.list.iter().map(wall_signal).collect();
     let walled = &walled[..];
-    // Copied out of the resource so the parallel chunks can read it.
-    let legs = legs.0;
 
     // Parallel cull + bucket build into per-chunk scratch, then one memcpy
     // concat per bucket. The scratch vecs keep their allocations across
@@ -694,7 +756,14 @@ fn sync_instance_data(
                     let kind = units.kind[i] as usize;
                     let sm = &mut smooth_chunk[i - start];
                     sm.walk += (disp - sm.walk) * ema_k;
-                    let tier = stance.get(gi).copied().unwrap_or(0.0);
+                    let sw = units.swing[i];
+                    let dying = units.death_t[i] > 0;
+                    let attack =
+                        attack_signal(sm, sw, units.swing_t[i], kind, dying, alpha, dt);
+                    let mut tier = stance.get(gi).copied().unwrap_or(0.0);
+                    if attack > 0.0 && sm.swing & crate::units::SWING_RANGED == 0 {
+                        tier = tier.max(BAND_FIGHTING);
+                    }
                     sm.band += (tier - sm.band) * band_k;
                     sm.wall += (walled.get(gi).copied().unwrap_or(0.0) - sm.wall) * wall_k;
                     sm.gait = crate::gait::advance(sm.gait, crate::gait::rate(sm.walk), dt);
@@ -748,47 +817,11 @@ fn sync_instance_data(
                         .rem_euclid(std::f32::consts::TAU)
                         - std::f32::consts::PI;
                     let yaw = units.yaw_prev[i] + dy * alpha;
-                    // Attack lunge ramps up quadratically over the wind-up
-                    // and snaps back on the strike (chunky, readable).
-                    // Charging blows lunge harder (arm angles saturate in
-                    // the shader; the extra goes into body lean).
-                    let sw = units.swing[i];
-                    let lunge = if sw & crate::units::SWING_STATE_MASK
-                        == crate::units::SWING_WINDUP
-                    {
-                        // A bow draw runs on the missile draw time, not
-                        // the melee wind-up (the same 0..1 progress then
-                        // drives the bow-arm raise + string pull).
-                        let w = if sw & crate::units::SWING_RANGED != 0 {
-                            crate::unit_types::missile::DRAW_TICKS as f32
-                        } else {
-                            crate::unit_types::TYPES[units.kind[i] as usize].windup_ticks as f32
-                        };
-                        // Clamped: the draw-start jitter can put swing_t
-                        // above the nominal draw time.
-                        let t = ((w - units.swing_t[i] as f32) / w.max(1.0)).max(0.0);
-                        let charge = sw & crate::units::SWING_CHARGE != 0;
-                        let amp = if charge { 1.35 } else { 1.0 };
-                        // A charging swing raises from the leveled run-in
-                        // point instead of dipping the blade first (0.18
-                        // puts the raise curve at the charge point angle).
-                        let lunge =
-                            if charge { (t * t * amp).max(0.18) } else { t * t * amp };
-                        // Style (stab/slash, picked at wind-up start)
-                        // rides the 2s digit of the positive band.
-                        let style = ((sw & crate::units::SWING_STYLE_MASK)
-                            >> crate::units::SWING_STYLE_SHIFT)
-                            as f32;
-                        style * 2.0 + lunge
-                    } else if units.death_t[i] == 0
-                        && celebrating.get(gi).copied().unwrap_or(-1.0) >= 0.0
-                    {
+                    // The attack, else the victory cheer, else nothing.
+                    let lunge = if attack > 0.0 {
+                        attack
+                    } else if !dying && celebrating.get(gi).copied().unwrap_or(-1.0) >= 0.0 {
                         CELEBRATE_BASE + celebrating[gi]
-                    } else if units.death_t[i] == 0 {
-                        // Negative lunge = SMOOTHED battle stance (the
-                        // regiment tier snaps; a pose must not —
-                        // one-frame stance changes aren't immersive).
-                        -sm.band
                     } else {
                         0.0
                     };
@@ -817,7 +850,7 @@ fn sync_instance_data(
                         scale: 1.0,
                         color,
                         anim: [yaw, sm.walk, lunge, fx],
-                        anim2: [legs[kind], sm.wall, sm.gait, stagger],
+                        anim2: [sm.band, sm.wall, sm.gait, stagger],
                     });
                 }
             });

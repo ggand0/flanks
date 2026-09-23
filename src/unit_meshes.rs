@@ -58,16 +58,23 @@ pub const HOLD_SPEAR: f32 = 2.0;
 /// The archer's draw hand: no weapon, it pulls the string.
 pub const HOLD_DRAW: f32 = 3.0;
 
-/// The weapon arm for the vertex shader (`Rig` in unit_instancing.wgsl):
-/// joints in the soldier's pitch plane, as (y, z) of local space in the
-/// rest pose. The shader bends the arm at the elbow and turns the held
-/// weapon at the grip, so the hand stays on the arm and the arm on the
-/// shoulder.
-#[derive(Clone, Copy, Default, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+/// Samples in each attack table of a jointed arm (`Rig::windup`).
+pub const ATTACK_SAMPLES: usize = 33;
+
+/// The kind's skeleton for the vertex shader (`Rig` in
+/// unit_instancing.wgsl): the leg length the gait is built on, and the
+/// weapon arm's joints in the soldier's pitch plane, as (y, z) of local
+/// space in the rest pose.
+///
+/// A bent arm (`chain` 0) is one mesh the shader bends at the elbow, and
+/// it turns the held weapon at the grip. A jointed arm (`chain` 1) is
+/// upper arm, forearm and hand as rigid parts, posed by the attack tables.
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 pub struct Rig {
     pub shoulder: [f32; 2],
     pub elbow: [f32; 2],
+    pub wrist: [f32; 2],
     pub grip: [f32; 2],
     /// Unit direction from the grip toward the weapon's point.
     pub tip: [f32; 2],
@@ -77,17 +84,36 @@ pub struct Rig {
     pub arm: f32,
     /// `HOLD_SWORD`, `HOLD_SPEAR` or `HOLD_DRAW`.
     pub hold: f32,
-    pub pad: f32,
+    /// How far the weapon slides through the hand once levelled.
+    pub slide: f32,
+    /// Hip to sole (gait.rs `measure`).
+    pub leg: f32,
+    /// 1 for a jointed arm.
+    pub chain: f32,
+    /// A jointed arm's attack, sampled evenly over the wind-up and over
+    /// the follow-through: shoulder, elbow and wrist turns from the rest
+    /// pose, and how far the weapon is levelled. Entry 0 of the wind-up
+    /// is the guard. The rest pose is the carry, all zero.
+    pub windup: [[f32; 4]; ATTACK_SAMPLES],
+    pub recover: [[f32; 4]; ATTACK_SAMPLES],
+}
+
+impl Default for Rig {
+    fn default() -> Self {
+        bytemuck::Zeroable::zeroed()
+    }
 }
 
 impl Rig {
     /// The same rig on a mesh scaled by `s` about the local origin.
     pub fn scaled(mut self, s: f32) -> Self {
-        for v in [&mut self.shoulder, &mut self.elbow, &mut self.grip] {
+        for v in [&mut self.shoulder, &mut self.elbow, &mut self.wrist, &mut self.grip] {
             v[0] *= s;
             v[1] *= s;
         }
         self.rear *= s;
+        self.slide *= s;
+        self.leg *= s;
         self
     }
 }
@@ -100,12 +126,13 @@ pub fn code_rig(kind: usize) -> Rig {
     let rig = |shoulder: f32, hand: [f32; 2], tip: [f32; 2], rear, arm, hold| Rig {
         shoulder: [shoulder, 0.0],
         elbow: [0.5 * (shoulder + hand[0]) - 0.03, 0.45 * hand[1]],
+        wrist: hand,
         grip: hand,
         tip,
         rear,
         arm,
         hold,
-        pad: 0.0,
+        ..Rig::default()
     };
     let forward = [0.0, 1.0];
     let up = [1.0, 0.0];

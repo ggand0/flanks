@@ -13,9 +13,6 @@
 //! (`gait_rate`). Keep the three in sync.
 
 use bevy::mesh::Mesh;
-use bevy::prelude::*;
-
-use crate::unit_types::{NUM_KINDS, TYPES};
 
 /// Cycles per second at rest, and what each m/s adds. A knight at his
 /// 6 m/s march turns over about 3.9 steps a second.
@@ -32,18 +29,6 @@ pub(crate) fn rate(speed: f32) -> f32 {
 pub(crate) fn advance(phase: f32, rate: f32, dt: f32) -> f32 {
     let p = phase + (rate * dt).min(0.25);
     p - p.floor()
-}
-
-/// Leg length per kind, hip pivot to sole, measured from the mesh that
-/// is drawn. The pose is built on it.
-#[derive(Resource)]
-pub struct Legs(pub [f32; NUM_KINDS]);
-
-impl Default for Legs {
-    /// Before the meshes are built: about the figure's half height.
-    fn default() -> Self {
-        Self(std::array::from_fn(|k| TYPES[k].half_height))
-    }
 }
 
 /// Hip pivot to sole in a mesh: the pivot the leg parts carry, less the
