@@ -11,7 +11,10 @@
 //! wind-up and chops on the strike.
 //!
 //! Local convention: origin at mid-body, +Z is forward (yaw 0), feet at
-//! y = -half_height (matching `TYPES[kind]`).
+//! y = -half_height (matching `TYPES[kind]`). The soldier's left hand is
+//! on +X and holds the shield. The builders below are written as seen
+//! from the front, shield on -X, and `build_kind_lods` mirrors every
+//! level into place.
 //!
 //! Every kind builds at `NUM_LODS` detail levels. L0 is the full mesh.
 //! L1 merges and drops what is under about a pixel in its band. L2 is
@@ -1270,6 +1273,25 @@ pub fn build_archer(lod: usize) -> Mesh {
     build(m)
 }
 
+/// The builders draw the soldier as seen from the front, with his shield
+/// on -X. Mirroring puts it in his left hand, where the sim counts it.
+fn mirror_x(mesh: &mut Mesh) {
+    use bevy::mesh::VertexAttributeValues as V;
+    for attribute in [Mesh::ATTRIBUTE_POSITION, Mesh::ATTRIBUTE_NORMAL] {
+        if let Some(V::Float32x3(values)) = mesh.attribute_mut(attribute) {
+            for v in values.iter_mut() {
+                v[0] = -v[0];
+            }
+        }
+    }
+    // A mirror turns every triangle inside out, and back faces are culled.
+    if let Some(Indices::U32(idx)) = mesh.indices_mut() {
+        for t in idx.chunks_mut(3) {
+            t.swap(1, 2);
+        }
+    }
+}
+
 /// These meshes are written at the kind's own half height, so the
 /// display scale (unit_types::unit_scale) has to be applied to them.
 /// An imported mesh is built to the scaled half height already.
@@ -1301,6 +1323,7 @@ pub fn build_kind_lods(kind: usize) -> [Mesh; NUM_LODS] {
     let scale = crate::unit_types::unit_scale();
     std::array::from_fn(|lod| {
         let mut mesh = builder(lod);
+        mirror_x(&mut mesh);
         if (scale - 1.0).abs() > 1e-4 {
             apply_scale(&mut mesh, scale);
         }

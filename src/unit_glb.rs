@@ -8,10 +8,9 @@
 //! are the channels the vertex shader already reads.
 //!
 //! On import the model is scaled to `2 * half_height` and dropped so the
-//! feet sit at `-half_height`. It is also mirrored on X, because every
-//! code-built mesh carries the shield on -X and the shieldwall pose
-//! swings it from there. The sim credits shield cover on +X, a mismatch
-//! older than this file.
+//! feet sit at `-half_height`. It is authored anatomically, weapon in the
+//! right hand on -X and shield in the left on +X, which is the engine's
+//! convention too.
 //!
 //! A model may carry one base colour texture, an atlas read through
 //! `TEXCOORD_0`. Its rgb is the colour and its alpha the team tint mask,
@@ -24,10 +23,9 @@
 //! area average lets the hidden mail under a surcoat turn a blue
 //! regiment grey. On a textured model they come from the atlas.
 //!
-//! `FL_UNIT_MESH=code` keeps the code-built meshes, `FL_GLB_FAR=code`
-//! fills only the missing levels from them, and `FL_GLB_MIRROR=0`
-//! imports the model as authored. `FL_GLB_<KIND>=path` loads another
-//! file for one kind, for example `FL_GLB_KNIGHT=path/to/knight.glb`.
+//! `FL_UNIT_MESH=code` keeps the code-built meshes and `FL_GLB_FAR=code`
+//! fills only the missing levels from them. `FL_GLB_<KIND>=path` loads
+//! another file for one kind, for example `FL_GLB_KNIGHT=path/to/knight.glb`.
 
 use std::path::{Path, PathBuf};
 
@@ -234,9 +232,8 @@ fn import(kind: usize, path: &Path) -> Fallible<KindMeshes> {
     // tall and stands on the terrain at half_height.
     let half_height = crate::unit_types::half_height(kind);
     let scale = 2.0 * half_height / top;
-    let mirror = !std::env::var("FL_GLB_MIRROR").is_ok_and(|v| v == "0");
     for level in levels.iter_mut().flatten() {
-        to_local(level, scale, half_height, mirror);
+        to_local(level, scale, half_height);
     }
 
     let imported: Vec<usize> = (0..NUM_LODS).filter(|l| levels[*l].is_some()).collect();
@@ -452,22 +449,11 @@ fn check_parts(level: &Level, pivot_nodes: &[(usize, f32)], name: &str) {
     }
 }
 
-/// Model space (metres, feet at 0, shield on +X) to engine local space
-/// (feet at -half_height, shield on -X).
-fn to_local(level: &mut Level, scale: f32, half_height: f32, mirror: bool) {
-    let sx = if mirror { -scale } else { scale };
+/// Model space (metres, feet at 0) to engine local space (feet at
+/// -half_height).
+fn to_local(level: &mut Level, scale: f32, half_height: f32) {
     for p in &mut level.pos {
-        *p = Vec3::new(sx * p.x, scale * p.y - half_height, scale * p.z);
-    }
-    if mirror {
-        for n in &mut level.nrm {
-            n.x = -n.x;
-        }
-        // Mirroring turns every triangle inside out, and back faces are
-        // culled.
-        for t in level.idx.chunks_mut(3) {
-            t.swap(1, 2);
-        }
+        *p = Vec3::new(scale * p.x, scale * p.y - half_height, scale * p.z);
     }
     for v in &mut level.pivot {
         *v = scale * *v - half_height;

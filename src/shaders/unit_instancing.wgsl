@@ -424,7 +424,9 @@ fn unit_vertex(vertex: Vertex) -> VertexOutput {
         local = pitch_about(local, pivot, sway);
         normal = pitch_normal(normal, sway);
         if wall > 0.001 {
-            let ang = 1.05 * wall;
+            // The shield is on +X, the left hand: turning it forward is a
+            // negative turn about Y.
+            let ang = -1.05 * wall;
             let c2 = cos(ang);
             let s2 = sin(ang);
             local = rot_y(local, c2, s2);
@@ -536,10 +538,10 @@ fn unit_vertex(vertex: Vertex) -> VertexOutput {
     // the planted foot, easing in up the torso so the hips stay square.
     if part < 1.5 || (part > 3.5 && part < 6.5) {
         let w = select(1.0, smoothstep(0.0, 0.25, vertex.position.y), part < 0.5);
-        let turn = -0.10 * g.run * g.stride * limb * w;
+        let turn = 0.10 * g.run * g.stride * limb * w;
         local = rot_y(local, cos(turn), sin(turn));
         normal = rot_y(normal, cos(turn), sin(turn));
-        local.x -= 0.02 * leg * g.run * g.stride * cos(TAU * (gait - 0.5 * g.duty)) * w;
+        local.x += 0.02 * leg * g.run * g.stride * cos(TAU * (gait - 0.5 * g.duty)) * w;
     }
 
     // The body rides the hip drop from the gait. A runner leans as far
