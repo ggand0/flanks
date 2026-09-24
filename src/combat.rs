@@ -128,56 +128,56 @@ pub fn process_deaths(
 }
 
 /// Losses are replaced from behind (M2TW: "losses replaced by the back
-/// ranks", and its RESHUFFLE unit task; devlog 0121). Each slot a dead
-/// man leaves goes to the nearest living man behind it in the same file
-/// who is not fighting, so he steps up one place and the front stays
-/// manned while the holes collect at the back. Files are read from the
-/// slot grid itself, so this works for any width, depth and spacing; a
-/// man with nobody behind him leaves his hole. Front slots are filled
-/// first, and a man takes at most one slot per tick.
+/// ranks", and its RESHUFFLE unit task; devlog 0121). Behind each slot a
+/// dead man leaves, his file closes up: every living man behind the hole
+/// who is not fighting moves up one place, nearest first, so the file
+/// stays closed behind its front and the holes collect at the back.
+/// Files are read from the slot grid itself, so this works for any
+/// width, depth and spacing; a hole with nobody behind it stays. Front
+/// holes are closed first, each against the slots the earlier ones left.
 fn fill_vacated_slots(units: &mut Units, groups: &crate::orders::Groups, vacated: &[(u32, Vec2)]) {
     if vacated.is_empty() {
         return;
     }
-    let mut order: Vec<usize> = (0..vacated.len()).collect();
+    let mut members: Vec<Vec<usize>> = vec![Vec::new(); groups.list.len()];
+    let mut need = vec![false; groups.list.len()];
+    for &(g, _) in vacated {
+        need[g as usize] = true;
+    }
+    for i in 0..units.len() {
+        let g = units.group[i] as usize;
+        if need[g] && units.death_t[i] == 0 {
+            members[g].push(i);
+        }
+    }
     let depth_of = |k: usize| {
         let gd = &groups.list[vacated[k].0 as usize];
         vacated[k].1.dot(crate::formation::facing_dir(gd.facing))
     };
+    let mut order: Vec<usize> = (0..vacated.len()).collect();
     order.sort_by(|&a, &b| depth_of(b).total_cmp(&depth_of(a)));
-    let mut vac_of_group: Vec<Vec<usize>> = vec![Vec::new(); groups.list.len()];
-    for &k in &order {
-        vac_of_group[vacated[k].0 as usize].push(k);
-    }
-    // Nearest idle man behind each vacated slot: (unit, distance behind).
-    let mut best: Vec<Option<(usize, f32)>> = vec![None; vacated.len()];
-    for i in 0..units.len() {
-        let g = units.group[i] as usize;
-        if vac_of_group[g].is_empty()
-            || units.death_t[i] != 0
-            || units.swing[i] & crate::units::SWING_STATE_MASK != crate::units::SWING_READY
-        {
-            continue;
-        }
-        let gd = &groups.list[g];
+    let mut file: Vec<(f32, usize)> = Vec::new();
+    for k in order {
+        let (g, hole) = vacated[k];
+        let gd = &groups.list[g as usize];
         let f = crate::formation::facing_dir(gd.facing);
         let r = Vec2::new(f.y, -f.x);
         let half_file = 0.5 * gd.spacing.pitch().x;
-        for &k in &vac_of_group[g] {
-            let d = vacated[k].1 - units.home[i];
+        file.clear();
+        for &i in &members[g as usize] {
+            if units.swing[i] & crate::units::SWING_STATE_MASK != crate::units::SWING_READY {
+                continue;
+            }
+            let d = hole - units.home[i];
             let behind = d.dot(f);
-            if behind > 0.1 && d.dot(r).abs() < half_file && best[k].is_none_or(|(_, b)| behind < b) {
-                best[k] = Some((i, behind));
+            if behind > 0.1 && d.dot(r).abs() < half_file {
+                file.push((behind, i));
             }
         }
-    }
-    let mut taken = vec![false; units.len()];
-    for &k in &order {
-        if let Some((i, _)) = best[k]
-            && !taken[i]
-        {
-            taken[i] = true;
-            units.home[i] = vacated[k].1;
+        file.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut hole = hole;
+        for &(_, i) in &file {
+            hole = std::mem::replace(&mut units.home[i], hole);
         }
     }
 }

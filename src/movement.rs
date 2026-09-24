@@ -217,7 +217,7 @@ pub fn diag_rear() -> bool {
 pub struct RearDiag {
     pub rows: Vec<Vec<RearDiagRow>>,
     prev_disp: Vec<Vec2>,
-    acc: std::collections::BTreeMap<(u8, usize), [f64; 18]>,
+    acc: std::collections::BTreeMap<(u8, usize), [f64; 19]>,
     next_log: u32,
 }
 
@@ -348,6 +348,7 @@ pub struct TickJob {
     reg_mover: Vec<bool>,
     press: Vec<bool>,
     engaged: Vec<bool>,
+    contact: Vec<bool>,
     hold: Vec<bool>,
     threat: Vec<Vec2>,
     form_face: Vec<Vec2>,
@@ -785,6 +786,9 @@ fn prepare_tick(
     // Regiments in melee: their shoved men wait for room instead of
     // threading back to their marks (a dressing block still threads).
     let engaged: Vec<bool> = groups.list.iter().map(|g| g.engaged).collect();
+    // Regiments holding a contact frame (frontline.rs): their fight is
+    // ahead of them, and their men never step back to dress.
+    let contact: Vec<bool> = groups.list.iter().map(|g| g.contact).collect();
     // Hold-position leash: units of a held regiment close only the last
     // step to a swing (no chasing across open ground).
     let hold: Vec<bool> = groups.list.iter().map(|g| g.hold).collect();
@@ -873,6 +877,7 @@ fn prepare_tick(
     job.reg_mover = group_mover;
     job.press = press;
     job.engaged = engaged;
+    job.contact = contact;
     job.hold = hold;
     job.threat = threat;
     job.form_face = form_face;
@@ -922,6 +927,7 @@ fn run_tick_job(job: &mut TickJob) {
         reg_mover,
         press,
         engaged,
+        contact,
         hold,
         threat,
         form_face,
@@ -967,6 +973,7 @@ fn run_tick_job(job: &mut TickJob) {
     let group_mover = &reg_mover[..];
     let press = &press[..];
     let engaged = &engaged[..];
+    let contact = &contact[..];
     let hold = &hold[..];
     let threat = &threat[..];
     let form_face = &form_face[..];
@@ -1294,6 +1301,21 @@ fn run_tick_job(job: &mut TickJob) {
                         });
                     }
 
+                    // A regiment fighting on its contact frame never
+                    // steps backward, away from its fight, to dress its
+                    // ranks: a man ahead of his mark (bunched up behind a
+                    // stopped front, or shoved forward) stays; he only
+                    // steps forward or sideways to it. Without this a
+                    // charging block walked backward to reopen its ranks
+                    // the moment it made contact. A regiment struck from
+                    // behind has its fight at its back, so it keeps
+                    // stepping back to hold its ground.
+                    if contact[gi] && !routed && form_face[gi] != Vec2::ZERO {
+                        let back = desired.dot(form_face[gi]);
+                        if back < 0.0 {
+                            desired -= form_face[gi] * back;
+                        }
+                    }
                     // In melee, holding men step back to their marks only
                     // through open ground: shoved off his mark with a comrade
                     // between him and it, a man stands where he is until
@@ -2375,7 +2397,12 @@ fn rear_diag_aggregate(
                 Some(crate::orders::Order::Move(_)) => 2,
             };
             let sp = disp.length() / dt;
-            let a = rear.acc.entry((class, rank)).or_insert([0.0; 18]);
+            let a = rear.acc.entry((class, rank)).or_insert([0.0; 19]);
+            // Walking backward: faster than 0.3 m/s, within 45 degrees of
+            // straight back from the regiment's facing.
+            if disp.length() / dt > 0.3 && disp.dot(fwd) < -0.707 * disp.length() {
+                a[18] += 1.0;
+            }
             let blocked = r.flags & 16 != 0;
             if blocked {
                 a[14] += 1.0;
@@ -2424,13 +2451,53 @@ fn rear_diag_aggregate(
     rear.next_log += 1;
     if rear.next_log >= 60 {
         rear.next_log = 0;
-        let mut s = String::new();
+        // Depth profile of engaged formed regiments: how full each
+        // rank-deep band behind the front is, in men per file. A closed
+        // block reads about 1.0 band after band; a hollow behind the
+        // front shows as low early bands.
+        const BANDS: usize = 8;
+        let mut occ = [0.0f32; BANDS];
+        let mut regs = 0usize;
+        let mut depths: Vec<Vec<f32>> = vec![Vec::new(); ng];
+        for i in 0..n {
+            let g = units.group[i] as usize;
+            let gd = &groups.list[g];
+            if gd.engaged
+                && !gd.state.is_broken()
+                && gd.shape == crate::formation::FormShape::Rect
+                && units.death_t[i] == 0
+            {
+                let f = crate::formation::facing_dir(gd.facing);
+                depths[g].push(units.pos[i].xz().dot(f));
+            }
+        }
+        for (g, d) in depths.iter_mut().enumerate() {
+            if d.len() < 20 {
+                continue;
+            }
+            d.sort_by(|a, b| b.total_cmp(a));
+            let front = d[d.len() / 20];
+            let pitch = groups.list[g].spacing.pitch().y;
+            let files = groups.list[g].files.max(1) as f32;
+            for &x in d.iter() {
+                let b = ((front - x) / pitch).max(0.0) as usize;
+                if b < BANDS {
+                    occ[b] += 1.0 / files;
+                }
+            }
+            regs += 1;
+        }
+        let occ_s: String = occ
+            .iter()
+            .map(|o| format!(" {:.2}", o / regs.max(1) as f32))
+            .collect();
+        let mut s = format!("\n  depth bands (men per file, front first):{occ_s}");
         for ((class, rank), a) in &rear.acc {
             let c = ["atk", "none", "move"][*class as usize];
             let k = a[0].max(1.0);
             let mv = a[2].max(1.0);
             s.push_str(&format!(
-                "\n  {c} r{rank}: n{:.0} spd {:.2} mov {:.0}% walk {:.0}% | slot {:.2} surge {:.2} push {:.2} corr {:.2} | dom slot/surge/body {:.0}/{:.0}/{:.0}% rev {:.0}% memo {:.0}% goal_d {:.1} | blocked {:.0}% of idle, {:.0}% of movers; creepers(<1.2) {:.0}% of movers, blocked {:.0}% of creepers",
+                "\n  {c} r{rank}: n{:.0} spd {:.2} mov {:.0}% walk {:.0}% | slot {:.2} surge {:.2} push {:.2} corr {:.2} | dom slot/surge/body {:.0}/{:.0}/{:.0}% rev {:.0}% memo {:.0}% goal_d {:.1} | blocked {:.0}% of idle, {:.0}% of movers; creepers(<1.2) {:.0}% of movers, blocked {:.0}% of creepers, backward {:.1}%",
                 a[0] / 60.0,
                 a[1] / k,
                 100.0 * a[2] / k,
@@ -2449,6 +2516,7 @@ fn rear_diag_aggregate(
                 100.0 * a[15] / mv,
                 100.0 * a[17] / mv,
                 100.0 * a[16] / a[17].max(1.0),
+                100.0 * a[18] / k,
             ));
         }
         info!(

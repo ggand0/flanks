@@ -483,7 +483,8 @@ fn update_groups(units: Res<Units>, mut groups: ResMut<Groups>) {
         // laterally where the block stood at contact, and in depth with
         // its front slot on the fight line, the mean position of the
         // men striking at an enemy ahead. The line moves the frame only
-        // in whole ranks, when the enemy front gives way or pushes back.
+        // forward and only in whole ranks, when the enemy front gives
+        // way.
         // Built from the regiment's own slot geometry, so any width,
         // depth and spacing works.
         if !rf {
@@ -503,9 +504,13 @@ fn update_groups(units: Res<Units>, mut groups: ResMut<Groups>) {
                 } else {
                     depth = group.anchor.dot(f);
                 }
+                // The frame only ever moves forward: when the enemy
+                // front gives way by a full rank, the block steps up. A
+                // fight line pushed back moves nobody back; men in
+                // melee do not dress backward (movement.rs).
                 if line_n[g] > 0 {
                     let line = line_sum[g] / line_n[g] as f32 - front_off[g];
-                    if (line - depth).abs() >= group.spacing.pitch().y {
+                    if line - depth >= group.spacing.pitch().y {
                         depth = line;
                     }
                 }
