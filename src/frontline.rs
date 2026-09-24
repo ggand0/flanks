@@ -281,9 +281,22 @@ fn update_groups(units: Res<Units>, mut groups: ResMut<Groups>) {
     let mut slot_err = vec![0.0f32; n];
     let mut sum_home = vec![Vec2::ZERO; n];
     let mut sum_r2 = vec![0.0f32; n];
+    // Contact frame inputs (see the frame below): each regiment's
+    // forward vector, its front-most slot, and the depth of the men
+    // fighting an enemy ahead of the frame.
+    let fwd: Vec<Vec2> = groups
+        .list
+        .iter()
+        .map(|g| crate::formation::facing_dir(g.facing))
+        .collect();
+    let mut front_off = vec![f32::MIN; n];
+    let mut line_sum = vec![0.0f32; n];
+    let mut line_n = vec![0u32; n];
+    let mut fight_n = vec![0u32; n];
     for i in 0..units.len() {
         let g = units.group[i] as usize;
         let p = Vec2::new(units.pos[i].x, units.pos[i].z);
+        front_off[g] = front_off[g].max(units.home[i].dot(fwd[g]));
         sums[g] += p;
         counts[g] += 1;
         sum_home[g] += units.home[i];
@@ -301,6 +314,15 @@ fn update_groups(units: Res<Units>, mut groups: ResMut<Groups>) {
             && units.swing[i] & crate::units::SWING_RANGED == 0
         {
             fighting[g] = true;
+            fight_n[g] += 1;
+            let ti = units.target[i] as usize;
+            if ti < units.len() {
+                let d = Vec2::new(units.pos[ti].x - p.x, units.pos[ti].z - p.y);
+                if d.dot(fwd[g]) > 0.5 * d.length() {
+                    line_sum[g] += p.dot(fwd[g]);
+                    line_n[g] += 1;
+                }
+            }
         }
         // Per-ordered-target engagement count (FL_RECTFIGHT): men in a
         // swing cycle whose combat memo points at a living soldier of
@@ -447,6 +469,50 @@ fn update_groups(units: Res<Units>, mut groups: ResMut<Groups>) {
                     group.anchor = group.centroid;
                     group.reform = true;
                 }
+            }
+        }
+        // Contact frame (the default melee; FL_RECTFIGHT has its own
+        // freeze above). An attacking regiment's slots are laid on its
+        // target's live center, which is right for the approach but
+        // wrong in melee: every slot sits inside the enemy and moves
+        // with it, so rear men lean on the backs ahead and whole blocks
+        // slide after a moving center (devlog 0119). M2TW stops
+        // updating a formation near the end of its path
+        // (formation_hold_distance). So once a real share of the
+        // regiment is fighting, whoever the enemy is, the frame holds:
+        // laterally where the block stood at contact, and in depth with
+        // its front slot on the fight line, the mean position of the
+        // men striking at an enemy ahead. The line moves the frame only
+        // in whole ranks, when the enemy front gives way or pushes back.
+        // Built from the regiment's own slot geometry, so any width,
+        // depth and spacing works.
+        if !rf {
+            let attacking = matches!(group.order, Some(crate::orders::Order::Attack(t))
+                if counts[t as usize] > 0 && !broken[t as usize]);
+            let formed = group.shape == crate::formation::FormShape::Rect
+                && !group.state.is_broken();
+            let starts = fight_n[g] >= lock_threshold;
+            if formed && attacking && engaged && (group.contact || starts) {
+                let f = fwd[g];
+                let r = Vec2::new(f.y, -f.x);
+                let mut depth = (group.centroid - group.home_bias).dot(f);
+                if !group.contact {
+                    group.contact = true;
+                    group.contact_lateral = (group.centroid - group.home_bias).dot(r);
+                    info!("regiment {g} holds a contact frame");
+                } else {
+                    depth = group.anchor.dot(f);
+                }
+                if line_n[g] > 0 {
+                    let line = line_sum[g] / line_n[g] as f32 - front_off[g];
+                    if (line - depth).abs() >= group.spacing.pitch().y {
+                        depth = line;
+                    }
+                }
+                group.anchor = r * group.contact_lateral + f * depth;
+            } else if group.contact {
+                group.contact = false;
+                info!("regiment {g} releases its contact frame");
             }
         }
         group.engaged = engaged;

@@ -124,6 +124,15 @@ pub struct GroupData {
     pub engaged_with_target: bool,
     /// Ticks of `engaged_with_target` left (same swing-gap bridge).
     pub engage_target_hold: u8,
+    /// Holding a contact frame (frontline.rs): an attacking regiment in
+    /// melee stops chasing its target's center and holds its slots with
+    /// the front rank on the fight line, the way M2TW stops updating a
+    /// formation near the end of its path (devlog 0121).
+    pub contact: bool,
+    /// The contact frame's lateral position along the regiment's right
+    /// vector, fixed when contact begins so the block cannot slide
+    /// sideways while it fights.
+    pub contact_lateral: f32,
     /// In the charge phase: attack order, inside charge range of the
     /// target, not yet in contact. Drives the war cry + sprint pose.
     pub charging: bool,
@@ -211,6 +220,8 @@ impl GroupData {
             engaged: false,
             engage_hold: 0,
             engaged_with_target: false,
+            contact: false,
+            contact_lateral: 0.0,
             engage_target_hold: 0,
             charging: false,
             enemy_near: false,
