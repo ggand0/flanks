@@ -530,6 +530,14 @@ fn menu_buttons(
         next.set(GameState::Battle);
         return;
     }
+    // FL_AUTOSTART=1: start a normal battle without a key press (with
+    // FL_DEPLOY=0 it skips the picker and deployment too), for measured
+    // runs of the real game with the AI on.
+    if !*auto && std::env::var("FL_AUTOSTART").is_ok() {
+        *auto = true;
+        start_normal_battle(&mut config, &mut next);
+        return;
+    }
     if keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::Space) {
         start_normal_battle(&mut config, &mut next);
         return;

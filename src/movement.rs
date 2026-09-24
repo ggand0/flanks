@@ -179,6 +179,38 @@ pub struct DamageEvent {
     pub impale: bool,
 }
 
+/// FL_DIAG_REAR: what moved each soldier this tick, as velocity-
+/// equivalent terms (devlog 0119).
+#[derive(Clone, Copy, Default)]
+pub struct RearDiagRow {
+    pub i: u32,
+    /// bit0 idle (Ready, no enemy in reach), bit1 memo surge, bit2 near
+    /// surge, bit3 holding (no order), bit4 a friend's body is in the
+    /// way he is driving.
+    pub flags: u8,
+    pub slot: Vec2,
+    pub surge: Vec2,
+    pub push: Vec2,
+    pub corr: Vec2,
+    pub goal_d: f32,
+}
+
+pub fn diag_rear() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FL_DIAG_REAR").is_ok())
+}
+
+/// FL_DIAG_REAR state: the rows the last tick emitted, each soldier's
+/// previous displacement (for direction reversals) and the per-bucket
+/// sums of the current log window.
+#[derive(Resource, Default)]
+pub struct RearDiag {
+    pub rows: Vec<Vec<RearDiagRow>>,
+    prev_disp: Vec<Vec2>,
+    acc: std::collections::BTreeMap<(u8, usize), [f64; 18]>,
+    next_log: u32,
+}
+
 /// One event buffer per integrate chunk; allocations persist across ticks.
 #[derive(Resource, Default)]
 pub struct DamageBuffers(pub Vec<Vec<DamageEvent>>);
@@ -243,6 +275,7 @@ impl Plugin for MovementPlugin {
             .init_resource::<CombatScale>()
             .init_resource::<DamageBuffers>()
             .init_resource::<DirTestStats>()
+            .init_resource::<RearDiag>()
             .insert_resource(DebugViz(true))
             .init_resource::<SpatialGrid>()
             .init_resource::<TickPipeline>()
@@ -326,6 +359,7 @@ pub struct TickJob {
     grid: SpatialGrid,
     events: Vec<Vec<DamageEvent>>,
     arrow_spawns: Vec<Vec<crate::arrows::ArrowSpawn>>,
+    diag: Vec<Vec<RearDiagRow>>,
     terrain: Option<std::sync::Arc<Terrain>>,
     dt: f32,
     combat_scale: f32,
@@ -801,6 +835,9 @@ fn prepare_tick(
     if job.arrow_spawns.len() < n_chunks {
         job.arrow_spawns.resize_with(n_chunks, Vec::new);
     }
+    if job.diag.len() < n_chunks {
+        job.diag.resize_with(n_chunks, Vec::new);
+    }
     // Spawn buffers come back drained from arrows.rs. A job dropped as
     // stale never got that far.
     for buf in &mut job.arrow_spawns {
@@ -881,6 +918,7 @@ fn run_tick_job(job: &mut TickJob) {
         grid,
         events,
         arrow_spawns,
+        diag,
         grid_ms,
         step_ms,
         ..
@@ -933,13 +971,17 @@ fn run_tick_job(job: &mut TickJob) {
             .zip(events.iter_mut())
             .zip(ammo.chunks_mut(CHUNK))
             .zip(arrow_spawns.iter_mut())
+            .zip(diag.iter_mut())
             .enumerate()
         {
-            let (((((((((((p_chunk, v_chunk), yaw_chunk), yawp_chunk), tgt_chunk), sw_chunk),
-                swt_chunk), fl_chunk), dt_chunk), events), ammo_chunk), arrow_out) = chunk;
+            let ((((((((((((p_chunk, v_chunk), yaw_chunk), yawp_chunk), tgt_chunk), sw_chunk),
+                swt_chunk), fl_chunk), dt_chunk), events), ammo_chunk), arrow_out), diag_out) =
+                chunk;
             let start = ci * CHUNK;
             scope.spawn(async move {
                 events.clear();
+                diag_out.clear();
+                let diag_on = diag_rear();
                 for j in 0..p_chunk.len() {
                     let i = start + j;
                     let p = pos_prev[i].xz();
@@ -966,6 +1008,7 @@ fn run_tick_job(job: &mut TickJob) {
                     let gi = group[i] as usize;
                     let routed = broken[gi];
                     let mut desired = Vec2::ZERO;
+                    let mut d_goal = 0.0f32;
                     if !dying && routed {
                         // Broken: flee toward the own map edge with a
                         // per-unit lateral scatter — slightly SLOWER than
@@ -987,6 +1030,7 @@ fn run_tick_job(job: &mut TickJob) {
                         let goal = orders[gi].unwrap_or(anchors[gi]) + home[i];
                         let to_goal = goal - p;
                         let dist = to_goal.length();
+                        d_goal = dist;
                         // Hold deadzone: parked units don't jitter around
                         // their slot point. 0.7 m (was 1.5 when homes were
                         // jittered spawn offsets): rigid slots sit exactly
@@ -1488,6 +1532,8 @@ fn run_tick_job(job: &mut TickJob) {
                     // free, 1 = packed) also damps the response below.
                     let jam = ((crowd - CROWD_SLOW) / (CROWD_STOP - CROWD_SLOW)).clamp(0.0, 1.0);
                     desired *= 1.0 - jam;
+                    let d_slot = desired;
+                    let mut d_surge = Vec2::ZERO;
                     // Fighters close the last meter to swing range. Only
                     // active when an enemy is ALREADY in reach — this is
                     // combat execution (like the wind-up foot plant), not
@@ -1539,6 +1585,7 @@ fn run_tick_job(job: &mut TickJob) {
                                 urge *= 1.0 - jam;
                             }
                             desired += to_enemy * (speed[i] * 0.35 * urge / dist);
+                            d_surge = to_enemy * (speed[i] * 0.35 * urge / dist);
                         }
                     }
                     // Formation pace: walls advance deliberately (running
@@ -1683,6 +1730,50 @@ fn run_tick_job(job: &mut TickJob) {
                         yaw_chunk[j] += step.clamp(-TURN_SPEED_MAX * dt, TURN_SPEED_MAX * dt);
                     }
 
+                    if diag_on && !dying && !routed {
+                        let mult = if wall[gi] != 0 {
+                            WALL_SPEED_FRAC
+                        } else if charging[gi] && !fat_nocharge[gi] {
+                            CHARGE_SPEED_BOOST
+                        } else {
+                            1.0
+                        } * fat_speed[gi];
+                        let idle = best_idx == u32::MAX
+                            && sw_chunk[j] & crate::units::SWING_STATE_MASK
+                                == crate::units::SWING_READY;
+                        // Is a friend's body in the way he is trying to go?
+                        let want = d_slot + d_surge;
+                        let mut blocked = false;
+                        if want.length_squared() > 1e-6 {
+                            let wd = want.normalize();
+                            grid.for_each_candidate(p, SEP_RADIUS, |o| {
+                                if o.idx as usize == i
+                                    || (o.meta & crate::spatial::META_TEAM) != my_team_bit
+                                {
+                                    return;
+                                }
+                                let d = o.xz() - p;
+                                let l = d.length();
+                                if l < SEP_RADIUS && l > 1e-4 && d.dot(wd) > 0.707 * l {
+                                    blocked = true;
+                                }
+                            });
+                        }
+                        let flags = idle as u8
+                            | (((d_surge != Vec2::ZERO && memo_close) as u8) << 1)
+                            | (((d_surge != Vec2::ZERO && !memo_close) as u8) << 2)
+                            | ((orders[gi].is_none() as u8) << 3)
+                            | ((blocked as u8) << 4);
+                        diag_out.push(RearDiagRow {
+                            i: i as u32,
+                            flags,
+                            slot: d_slot * mult,
+                            surge: d_surge * mult,
+                            push: push * (SEP_STRENGTH * (1.0 - jam) / STEER_GAIN),
+                            corr: corr / dt,
+                            goal_d: d_goal,
+                        });
+                    }
                     v_chunk[j] = Vec3::new(new_v.x, 0.0, new_v.y);
                     let mut nx = (pos_prev[i].x + new_v.x * dt + corr.x)
                         .clamp(bounds_min.x, bounds_max.x);
@@ -1733,6 +1824,7 @@ pub fn step_sim(
     mut stats: ResMut<SimStats>,
     mut pipeline: ResMut<TickPipeline>,
     mut dir_stats: ResMut<DirTestStats>,
+    mut rear: ResMut<RearDiag>,
 ) {
     // Take the finished background job. A job computed from an older
     // world (a new battle started while it ran) carries indices that
@@ -1795,6 +1887,10 @@ pub fn step_sim(
     std::mem::swap(&mut arrow_spawns.0, &mut job.arrow_spawns);
     stats.grid_ms = job.grid_ms;
     stats.step_ms = job.step_ms;
+    if diag_rear() {
+        std::mem::swap(&mut rear.rows, &mut job.diag);
+        rear_diag_aggregate(&mut rear, &units, &groups, job.dt);
+    }
 
     let Units {
         pos,
@@ -2146,6 +2242,132 @@ pub fn kick_tick(
     let worker = pipeline.worker.get_or_insert_with(TickWorker::default);
     worker.to_worker.lock().unwrap().send(job).expect("sim tick worker alive");
     pipeline.in_flight = true;
+}
+
+/// FL_DIAG_REAR: idle soldiers (Ready, no enemy in reach) of engaged
+/// formed regiments, bucketed by order class and rank: how many move,
+/// how fast, which term drives them, and how many push into a friend's
+/// back. Logs every 60 ticks.
+fn rear_diag_aggregate(rear: &mut RearDiag, units: &Units, groups: &Groups, dt: f32) {
+    let n = units.pos.len();
+    rear.prev_disp.resize(n, Vec2::ZERO);
+    let ng = groups.list.len();
+    let mut max_fwd = vec![f32::MIN; ng];
+    for i in 0..n {
+        let g = units.group[i] as usize;
+        let fwd = crate::formation::facing_dir(groups.list[g].facing);
+        max_fwd[g] = max_fwd[g].max(units.home[i].dot(fwd));
+    }
+    let rows = std::mem::take(&mut rear.rows);
+    for buf in &rows {
+        for r in buf {
+            let i = r.i as usize;
+            if i >= n {
+                continue;
+            }
+            let disp = (units.pos[i] - units.pos_prev[i]).xz();
+            let prev = rear.prev_disp[i];
+            rear.prev_disp[i] = disp;
+            let g = units.group[i] as usize;
+            let gd = &groups.list[g];
+            if !gd.engaged
+                || gd.state.is_broken()
+                || gd.shape != crate::formation::FormShape::Rect
+                || r.flags & 1 == 0
+            {
+                continue;
+            }
+            let fwd = crate::formation::facing_dir(gd.facing);
+            let pitch = gd.spacing.pitch().y;
+            let rank = (((max_fwd[g] - units.home[i].dot(fwd)) / pitch).round().max(0.0) as usize)
+                .min(5);
+            let class = match gd.order {
+                Some(crate::orders::Order::Attack(_)) => 0u8,
+                None => 1,
+                Some(crate::orders::Order::Move(_)) => 2,
+            };
+            let sp = disp.length() / dt;
+            let a = rear.acc.entry((class, rank)).or_insert([0.0; 18]);
+            let blocked = r.flags & 16 != 0;
+            if blocked {
+                a[14] += 1.0;
+            }
+            a[0] += 1.0;
+            a[1] += sp as f64;
+            let (ls, lu, lp, lc) =
+                (r.slot.length(), r.surge.length(), r.push.length(), r.corr.length());
+            a[4] += ls as f64;
+            a[5] += lu as f64;
+            a[6] += lp as f64;
+            a[7] += lc as f64;
+            a[13] += r.goal_d as f64;
+            if r.flags & 2 != 0 {
+                a[12] += 1.0;
+            }
+            if sp > 0.06 {
+                a[2] += 1.0;
+                if blocked {
+                    a[15] += 1.0;
+                    if sp < 1.2 {
+                        a[16] += 1.0;
+                    }
+                }
+                if sp < 1.2 {
+                    a[17] += 1.0;
+                }
+                if sp > 0.3 {
+                    a[3] += 1.0;
+                }
+                let pc = lp + lc;
+                if ls >= lu && ls >= pc {
+                    a[8] += 1.0;
+                } else if lu >= pc {
+                    a[9] += 1.0;
+                } else {
+                    a[10] += 1.0;
+                }
+                if prev.length() / dt > 0.06 && prev.dot(disp) < 0.0 {
+                    a[11] += 1.0;
+                }
+            }
+        }
+    }
+    rear.rows = rows;
+    rear.next_log += 1;
+    if rear.next_log >= 60 {
+        rear.next_log = 0;
+        let mut s = String::new();
+        for ((class, rank), a) in &rear.acc {
+            let c = ["atk", "none", "move"][*class as usize];
+            let k = a[0].max(1.0);
+            let mv = a[2].max(1.0);
+            s.push_str(&format!(
+                "\n  {c} r{rank}: n{:.0} spd {:.2} mov {:.0}% walk {:.0}% | slot {:.2} surge {:.2} push {:.2} corr {:.2} | dom slot/surge/body {:.0}/{:.0}/{:.0}% rev {:.0}% memo {:.0}% goal_d {:.1} | blocked {:.0}% of idle, {:.0}% of movers; creepers(<1.2) {:.0}% of movers, blocked {:.0}% of creepers",
+                a[0] / 60.0,
+                a[1] / k,
+                100.0 * a[2] / k,
+                100.0 * a[3] / k,
+                a[4] / k,
+                a[5] / k,
+                a[6] / k,
+                a[7] / k,
+                100.0 * a[8] / mv,
+                100.0 * a[9] / mv,
+                100.0 * a[10] / mv,
+                100.0 * a[11] / mv,
+                100.0 * a[12] / k,
+                a[13] / k,
+                100.0 * a[14] / k,
+                100.0 * a[15] / mv,
+                100.0 * a[17] / mv,
+                100.0 * a[16] / a[17].max(1.0),
+            ));
+        }
+        if !s.is_empty() {
+            info!("[rear-diag] idle men of engaged regiments:{s}");
+        }
+        rear.acc.clear();
+    }
 }
 
 fn toggle_debug_viz(keys: Res<ButtonInput<KeyCode>>, mut viz: ResMut<DebugViz>) {
