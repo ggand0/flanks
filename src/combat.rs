@@ -75,7 +75,7 @@ pub fn process_deaths(
                 units.kind[i] as usize,
                 crate::render_units::InstanceData {
                     position: units.pos[i],
-                    scale: 1.0,
+                    w: 0.0,
                     color: units.color[i],
                     anim: [units.yaw[i], 0.0, 0.0, 2.0],
                     anim2: [0.0; 4],

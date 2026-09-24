@@ -25,13 +25,15 @@ use bevy::render::{
     renderer::{RenderAdapter, RenderContext, RenderDevice, RenderQueue},
     storage::{GpuShaderBuffer, ShaderBuffer},
     sync_world::RenderEntity,
+    texture::GpuImage,
 };
 use bytemuck::{Pod, Zeroable};
 
 use crate::render_units::{
-    CELEBRATE_BASE, CORPSE_CAP, Corpses, CustomPipeline, InstanceBucket, InstanceData, LodBands,
-    LodConfig, NUM_BUCKETS, NUM_LODS, RenderCounts, SYNC_CHUNK, celebrate_progress, march_signal,
-    regiment_phase, stance_tier, wall_signal,
+    BAND_FIGHTING, BOW_FALL_S, BOW_RISE_S, BOW_WALK_MS, CELEBRATE_BASE, CORPSE_CAP, Corpses,
+    CustomPipeline, ExtractedAtlas, FOLLOW_BASE, FOLLOW_S, FOLLOW_SPAN, HOLD_S, InstanceBucket,
+    InstanceData, LodBands, LodConfig, NUM_BUCKETS, NUM_LODS, RANGED_BASE, RELEASE_S, RELOAD_S,
+    REWIND_S, RenderCounts, RigBuffer, SYNC_CHUNK, celebrate_progress, stance_tier, wall_signal,
 };
 use crate::units::Units;
 use crate::unit_types::NUM_KINDS;
@@ -85,9 +87,7 @@ pub struct GpuSoldier {
 pub struct RegimentRecord {
     stance: f32,
     celebrate: f32,
-    marching: f32,
     walled: f32,
-    phase: f32,
     flags: u32,
 }
 
@@ -103,7 +103,7 @@ pub struct BuildParams {
     alpha: f32,
     k_walk: f32,
     k_band: f32,
-    k_march: f32,
+    k_wall: f32,
     inv_dt: f32,
     n: u32,
     n_regs: u32,
@@ -113,13 +113,21 @@ pub struct BuildParams {
     corpse_cap: u32,
     /// The frame this pass belongs to, stamped into the readback.
     frame: u32,
-    pad0: u32,
-    pad1: u32,
+    /// Seconds since the last frame, for the gait phase and the attack.
+    dt: f32,
+    /// render_units.rs BAND_FIGHTING.
+    fighting: f32,
     /// [kind * 3 + set]: set 0 fine, 1 coarse, 2 plain.
     bands: [Vec4; 12],
     windup: Vec4,
     /// draw_ticks, death_ticks, hit_stagger_ticks, celebrate_base
     consts: Vec4,
+    /// FOLLOW_S, FOLLOW_BASE, FOLLOW_SPAN, REWIND_S (render_units.rs).
+    attack: Vec4,
+    /// RELEASE_S, RELOAD_S, HOLD_S, BOW_WALK_MS (render_units.rs).
+    shot: Vec4,
+    /// BOW_RISE_S, BOW_FALL_S, CANCEL_TICKS, RANGED_BASE.
+    bow: Vec4,
     /// x = first index slot of the bucket, y = mesh corners per soldier.
     buckets: [UVec4; NUM_BUCKETS],
 }
@@ -256,9 +264,7 @@ fn build_frame_params(
             RegimentRecord {
                 stance: stance_tier(gd),
                 celebrate: celebrate_progress(gd),
-                marching: march_signal(gd),
                 walled: wall_signal(gd),
-                phase: regiment_phase(g),
                 flags,
             }
         }));
@@ -272,7 +278,7 @@ fn build_frame_params(
     p.alpha = fixed_time.overstep_fraction();
     p.k_walk = (dt / 0.25).min(1.0);
     p.k_band = (dt / 0.35).min(1.0);
-    p.k_march = (dt / 0.5).min(1.0);
+    p.k_wall = (dt / 0.5).min(1.0);
     p.inv_dt = 1.0 / fixed_time.timestep().as_secs_f32().max(1e-6);
     p.n = snap.n;
     p.n_regs = groups.list.len() as u32;
@@ -291,6 +297,16 @@ fn build_frame_params(
         crate::movement::DEATH_TICKS as f32,
         crate::movement::HIT_STAGGER_TICKS as f32,
         CELEBRATE_BASE,
+    );
+    p.dt = dt;
+    p.fighting = BAND_FIGHTING;
+    p.attack = Vec4::new(FOLLOW_S, FOLLOW_BASE, FOLLOW_SPAN, REWIND_S);
+    p.shot = Vec4::new(RELEASE_S, RELOAD_S, HOLD_S, BOW_WALK_MS);
+    p.bow = Vec4::new(
+        BOW_RISE_S,
+        BOW_FALL_S,
+        crate::unit_types::missile::CANCEL_TICKS as f32,
+        RANGED_BASE,
     );
     p.frame = frame_count.0;
     frame.params = p;
@@ -389,7 +405,12 @@ struct PullVertex {
     part: f32,
     normal: [f32; 3],
     pivot: f32,
-    color: [f32; 4],
+    /// Vertex colour, unorm8 rgba.
+    color: u32,
+    /// Atlas coordinates, unorm16 each, then padding to the WGSL struct's
+    /// 48 bytes.
+    atlas_uv: u32,
+    pad: [u32; 2],
 }
 
 /// A bucket's level mesh with its index list expanded: the vertex shader
@@ -400,6 +421,18 @@ struct PullVertex {
 pub struct PullMesh {
     corners: Vec<PullVertex>,
     bucket: usize,
+}
+
+fn pack_unorm8(v: [f32; 4]) -> u32 {
+    v.iter()
+        .enumerate()
+        .map(|(k, c)| ((c.clamp(0.0, 1.0) * 255.0).round() as u32) << (8 * k))
+        .sum()
+}
+
+fn pack_unorm16(v: [f32; 2]) -> u32 {
+    let q = |c: f32| (c.clamp(0.0, 1.0) * 65535.0).round() as u32;
+    q(v[0]) | q(v[1]) << 16
 }
 
 impl PullMesh {
@@ -417,12 +450,17 @@ impl PullMesh {
         let Some(V::Float32x4(col)) = mesh.attribute(Mesh::ATTRIBUTE_COLOR) else {
             return None;
         };
+        let Some(V::Float32x2(atlas_uv)) = mesh.attribute(Mesh::ATTRIBUTE_UV_1) else {
+            return None;
+        };
         let corners = mesh.indices()?.iter().map(|i| PullVertex {
             position: pos[i],
             part: uv[i][0],
             normal: nrm[i],
             pivot: uv[i][1],
-            color: col[i],
+            color: pack_unorm8(col[i]),
+            atlas_uv: pack_unorm16(atlas_uv[i]),
+            pad: [0; 2],
         });
         Some(Self {
             corners: corners.collect(),
@@ -471,6 +509,8 @@ fn extract_pull_meshes(
 pub struct PulledBucketGpu {
     pub bind_group: BindGroup,
     generation: u32,
+    /// Bound to its own atlas, or has none. Otherwise it waits on the upload.
+    atlas_settled: bool,
     pub bucket: u32,
 }
 
@@ -636,7 +676,7 @@ impl UnitAlloc {
                 (live_cap + NUM_KINDS * CORPSE_CAP) * size_of::<crate::render_units::InstanceData>(),
                 BufferUsages::COPY_DST,
             ),
-            smooth: storage_buffer(device, "unit smoothing", live_cap * 20, BufferUsages::empty()),
+            smooth: storage_buffer(device, "unit smoothing", live_cap * 40, BufferUsages::empty()),
             index_list: storage_buffer(device, "unit index list", total * 4, BufferUsages::empty()),
             kind_cap,
             bases,
@@ -814,34 +854,48 @@ fn prepare_gpu_units(
 }
 
 /// Group 3 of every pulled bucket, rebuilt when the shared buffers moved.
+#[allow(clippy::type_complexity)] // bevy system params
 fn prepare_pull_bind_groups(
     mut commands: Commands,
     buffers: Res<GpuUnitBuffers>,
     custom_pipeline: Res<CustomPipeline>,
     pipeline_cache: Res<PipelineCache>,
     device: Res<RenderDevice>,
-    meshes: Query<(Entity, &PullMeshGpu, Option<&PulledBucketGpu>)>,
+    images: Res<RenderAssets<GpuImage>>,
+    meshes: Query<(
+        Entity,
+        &PullMeshGpu,
+        Option<&ExtractedAtlas>,
+        &RigBuffer,
+        Option<&PulledBucketGpu>,
+    )>,
 ) {
     let Some(alloc) = &buffers.alloc else {
         return;
     };
-    for (entity, mesh, existing) in &meshes {
-        if existing.is_some_and(|b| b.generation == buffers.generation) {
+    for (entity, mesh, atlas, rig, existing) in &meshes {
+        if existing.is_some_and(|b| b.generation == buffers.generation && b.atlas_settled) {
             continue;
         }
+        let (view, sampler, atlas_settled) = custom_pipeline.atlas_for(atlas, &images);
         let bind_group = device.create_bind_group(
             "unit pull bind group",
             &pipeline_cache.get_bind_group_layout(&custom_pipeline.pull_layout),
-            &BindGroupEntries::sequential((
-                alloc.records.as_entire_binding(),
-                alloc.index_list.as_entire_binding(),
-                mesh.vertices.as_entire_binding(),
-                alloc.bucket_info.as_entire_binding(),
+            &BindGroupEntries::with_indices((
+                (0, alloc.records.as_entire_binding()),
+                (1, alloc.index_list.as_entire_binding()),
+                (2, mesh.vertices.as_entire_binding()),
+                (3, alloc.bucket_info.as_entire_binding()),
+                (4, view),
+                (5, sampler),
+                (6, rig.rig.as_entire_binding()),
+                (7, rig.clips.as_entire_binding()),
             )),
         );
         commands.entity(entity).insert(PulledBucketGpu {
             bind_group,
             generation: buffers.generation,
+            atlas_settled,
             bucket: mesh.bucket as u32,
         });
     }

@@ -219,7 +219,7 @@ pub fn snap_to_slots(
     for i in assign_slots(units, g, gd) {
         let i = i as usize;
         let p = gd.anchor + units.home[i];
-        let hh = crate::unit_types::TYPES[units.kind[i] as usize].half_height;
+        let hh = crate::unit_types::half_height(units.kind[i] as usize);
         let pos = Vec3::new(p.x, terrain.height_at(p.x, p.y) + hh, p.y);
         units.pos[i] = pos;
         units.pos_prev[i] = pos;

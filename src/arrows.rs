@@ -183,7 +183,7 @@ impl Plugin for ArrowsPlugin {
 /// one for the ground litter. Same NoAutomaticBatching requirement as
 /// the unit buckets (devlog 0013).
 fn setup_arrow_buckets(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
-    let mesh = meshes.add(crate::unit_meshes::build_arrow());
+    let mesh = meshes.add(crate::unit_glb::arrow_mesh());
     commands.spawn((
         Mesh3d(mesh.clone()),
         InstanceMaterialData::default(),
@@ -389,7 +389,7 @@ fn update_arrows(
                 return;
             }
             let arrow_y = prev.y + (p.y - prev.y) * t;
-            let hh = TYPES[units.kind[u] as usize].half_height;
+            let hh = crate::unit_types::half_height(units.kind[u] as usize);
             let uy = units.pos[u].y;
             // Top margin stays BELOW the launch height (movement.rs
             // looses at +0.75 over mid-body) or shooters hit themselves.
@@ -429,7 +429,7 @@ fn update_arrows(
             let center = Vec3::new(p.x, ground, p.z) - dir * 0.16;
             stuck.push(InstanceData {
                 position: center,
-                scale: 1.0,
+                w: 1.0,
                 color: [1.0, 1.0, 1.0, 0.0],
                 anim: [yaw, 0.0, 0.0, 0.0],
                 anim2: [0.0, 0.0, pitch, 0.0],
@@ -636,7 +636,7 @@ fn sync_arrow_instances(
             position: p,
             // Flying arrows draw a third oversized: a volley must READ
             // at battle zoom (the ground litter stays true-scale).
-            scale: 1.35,
+            w: 1.35,
             color: [1.0, 1.0, 1.0, 0.0],
             anim: [yaw, 0.0, 0.0, 0.0],
             anim2: [0.0, 0.0, pitch, 0.0],

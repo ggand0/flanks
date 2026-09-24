@@ -175,7 +175,8 @@ pub fn push_unit(
         Vec3::new(0.58, 0.35, 0.16), // orange army: autumn russet
     ];
     let params = &crate::unit_types::TYPES[kind as usize];
-    let p = Vec3::new(x, terrain.height_at(x, z) + params.half_height, z);
+    let hh = crate::unit_types::half_height(kind as usize);
+    let p = Vec3::new(x, terrain.height_at(x, z) + hh, z);
     units.pos.push(p);
     units.pos_prev.push(p);
     units.vel.push(Vec3::ZERO);

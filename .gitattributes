@@ -1,0 +1,3 @@
+# Unit models carry an embedded texture atlas, several MB each, and are
+# revised often.
+assets/units/*.glb filter=lfs diff=lfs merge=lfs -text

@@ -1314,7 +1314,7 @@ fn run_tick_job(job: &mut TickJob) {
                                     // Target gone mid-draw: ease off and
                                     // reassess shortly.
                                     sw_chunk[j] = crate::units::SWING_RECOVER;
-                                    swt_chunk[j] = 20;
+                                    swt_chunk[j] = crate::unit_types::missile::CANCEL_TICKS;
                                 }
                             }
                             crate::units::SWING_WINDUP => {
@@ -1705,7 +1705,7 @@ fn run_tick_job(job: &mut TickJob) {
                     }
                     p_chunk[j] = Vec3::new(
                         nx,
-                        terrain.height_at(nx, nz) + TYPES[kind[i] as usize].half_height,
+                        terrain.height_at(nx, nz) + crate::unit_types::half_height(kind[i] as usize),
                         nz,
                     );
                 }
@@ -1965,7 +1965,12 @@ pub fn step_sim(
                             nx = pos[v].x;
                             nz = pos[v].z;
                         }
-                        pos[v] = Vec3::new(nx, terrain.height_at(nx, nz) + pv.half_height, nz);
+                        pos[v] = Vec3::new(
+                            nx,
+                            terrain.height_at(nx, nz)
+                                + crate::unit_types::half_height(kind[v] as usize),
+                            nz,
+                        );
                     }
                     // An impaled runner is STOPPED, not thrown — his
                     // momentum went into the point; the stagger is the

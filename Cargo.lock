@@ -2500,7 +2500,9 @@ dependencies = [
  "bevy",
  "bytemuck",
  "dirs",
+ "gltf",
  "serde",
+ "serde_json",
  "serde_yaml_ng",
 ]
 

@@ -43,6 +43,10 @@ pub mod missile {
     /// Reload between volleys: 8 s -> a ~9.5 s cycle, matching the
     /// animation-bound ~10 s / "6 volleys a minute" M2TW longbow cycle.
     pub const RELOAD_TICKS: u8 = 240;
+    /// Pause after a draw whose target went away before the loose. Far
+    /// shorter than any reload, which is how the renderer tells the two
+    /// apart.
+    pub const CANCEL_TICKS: u8 = 20;
     /// Launch speed band the arc solver may use (verbatim `velocity 20 48`).
     pub const SPEED_MIN: f32 = 20.0;
     pub const SPEED_MAX: f32 = 48.0;
@@ -113,6 +117,21 @@ pub struct UnitTypeParams {
     pub fatigue_rate: f32,
     /// Mesh half height; units sit on the terrain at this Y.
     pub half_height: f32,
+}
+
+/// FL_UNIT_SCALE=f scales every soldier's height. At 1.0 they are 1.0 to
+/// 1.1 m tall, at 1.64 a knight is 1.8 m. Soldiers stand on the terrain
+/// at their half height, so this moves the sim and breaks the behaviour
+/// baselines when set.
+pub fn unit_scale() -> f32 {
+    static S: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *S.get_or_init(|| crate::util::env_or("FL_UNIT_SCALE", 1.0_f32).clamp(0.5, 2.5))
+}
+
+/// Half height of a kind at the display scale. Soldiers stand on the
+/// terrain at this and their meshes are built to it.
+pub fn half_height(kind: usize) -> f32 {
+    TYPES[kind].half_height * unit_scale()
 }
 
 /// Indexed by kind. Baseline feel: the median frontal matchup (light vs
