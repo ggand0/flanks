@@ -46,6 +46,8 @@ pub fn process_deaths(
     let _span = info_span!("process_deaths").entered();
     let (edge_min, edge_max) = (terrain.min().y + 8.0, terrain.max().y - 8.0);
     let mut craters: Vec<(Vec2, f32)> = Vec::new();
+    // Slots the dead leave in formed regiments, filled after the sweep.
+    let mut vacated: Vec<(u32, Vec2)> = Vec::new();
     let mut i = 0;
     while i < units.len() {
         // Kills are counted at the hp<=0 transition (damage apply pass);
@@ -68,6 +70,10 @@ pub fn process_deaths(
             stats.fled[team] += 1;
         }
         if dead {
+            let gd = &groups.list[units.group[i] as usize];
+            if gd.shape == crate::formation::FormShape::Rect && !gd.state.is_broken() {
+                vacated.push((units.group[i], units.home[i]));
+            }
             // Leave the body where it fell, frozen in its final topple
             // pose (fx = 2.0 is the shader's fully-dead state). Escaped
             // units leave nothing.
@@ -111,11 +117,67 @@ pub fn process_deaths(
     for (c, r) in craters {
         terrain.carve_crater(c, r, r * 0.4);
     }
+    fill_vacated_slots(&mut units, &groups, &vacated);
 
     stats.alive = [0, 0];
     for (&t, &d) in units.team.iter().zip(&units.death_t) {
         if d == 0 {
             stats.alive[t as usize] += 1;
+        }
+    }
+}
+
+/// Losses are replaced from behind (M2TW: "losses replaced by the back
+/// ranks", and its RESHUFFLE unit task; devlog 0121). Each slot a dead
+/// man leaves goes to the nearest living man behind it in the same file
+/// who is not fighting, so he steps up one place and the front stays
+/// manned while the holes collect at the back. Files are read from the
+/// slot grid itself, so this works for any width, depth and spacing; a
+/// man with nobody behind him leaves his hole. Front slots are filled
+/// first, and a man takes at most one slot per tick.
+fn fill_vacated_slots(units: &mut Units, groups: &crate::orders::Groups, vacated: &[(u32, Vec2)]) {
+    if vacated.is_empty() {
+        return;
+    }
+    let mut order: Vec<usize> = (0..vacated.len()).collect();
+    let depth_of = |k: usize| {
+        let gd = &groups.list[vacated[k].0 as usize];
+        vacated[k].1.dot(crate::formation::facing_dir(gd.facing))
+    };
+    order.sort_by(|&a, &b| depth_of(b).total_cmp(&depth_of(a)));
+    let mut vac_of_group: Vec<Vec<usize>> = vec![Vec::new(); groups.list.len()];
+    for &k in &order {
+        vac_of_group[vacated[k].0 as usize].push(k);
+    }
+    // Nearest idle man behind each vacated slot: (unit, distance behind).
+    let mut best: Vec<Option<(usize, f32)>> = vec![None; vacated.len()];
+    for i in 0..units.len() {
+        let g = units.group[i] as usize;
+        if vac_of_group[g].is_empty()
+            || units.death_t[i] != 0
+            || units.swing[i] & crate::units::SWING_STATE_MASK != crate::units::SWING_READY
+        {
+            continue;
+        }
+        let gd = &groups.list[g];
+        let f = crate::formation::facing_dir(gd.facing);
+        let r = Vec2::new(f.y, -f.x);
+        let half_file = 0.5 * gd.spacing.pitch().x;
+        for &k in &vac_of_group[g] {
+            let d = vacated[k].1 - units.home[i];
+            let behind = d.dot(f);
+            if behind > 0.1 && d.dot(r).abs() < half_file && best[k].is_none_or(|(_, b)| behind < b) {
+                best[k] = Some((i, behind));
+            }
+        }
+    }
+    let mut taken = vec![false; units.len()];
+    for &k in &order {
+        if let Some((i, _)) = best[k]
+            && !taken[i]
+        {
+            taken[i] = true;
+            units.home[i] = vacated[k].1;
         }
     }
 }
