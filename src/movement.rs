@@ -429,10 +429,6 @@ pub struct TickJob {
     broken_flags: Vec<bool>,
     mover_flags: Vec<bool>,
     yaw_snapshot: Vec<f32>,
-    /// Some regiment is in melee: only then does a man read how the
-    /// comrades around him move (a comrade walking away the same way is
-    /// no obstacle). The velocities ride in the grid.
-    vel_known: bool,
     // Outputs beyond the columns: the grid the tick built, landed swings
     // and loosed arrows per chunk. All swapped into their resources at
     // install.
@@ -920,7 +916,6 @@ fn prepare_tick(
     // into &mut chunks there. The spear-line hazard reads the SPEARMAN's
     // facing from the charger's side of the scan; no spearwalls anywhere,
     // no copy.
-    job.vel_known = groups.list.iter().any(|g| g.fight_point.is_some());
     job.yaw_snapshot.clear();
     if faces_spearwall[0] || faces_spearwall[1] {
         job.yaw_snapshot.extend_from_slice(&units.yaw);
@@ -983,7 +978,6 @@ fn run_tick_job(job: &mut TickJob) {
     let bounds_min = job.bounds_min;
     let bounds_max = job.bounds_max;
     let faces_spearwall = job.faces_spearwall;
-    let vel_known = job.vel_known;
     let TickJob {
         pos_in,
         pos_out,
@@ -1403,7 +1397,7 @@ fn run_tick_job(job: &mut TickJob) {
                     // only while he has no enemy in reach, and watches his
                     // comrades go only while he sees no enemy of his own.
                     let look_lanes = memo_dir != Vec2::ZERO && best_idx == u32::MAX && !dying && !routed;
-                    let watch_go = in_melee && !committed && !memo_valid && vel_known;
+                    let watch_go = in_melee && !committed && !memo_valid;
                     let slot_on = slot_dir != Vec2::ZERO;
                     if look_lanes || watch_go || slot_on {
                         // Branch-free: neighbors of both teams interleave in a
@@ -1415,7 +1409,7 @@ fn run_tick_job(job: &mut TickJob) {
                             let d2 = d.length_squared();
                             let reach = 0.707 * d2.sqrt();
                             let near = d2 < SEP_RADIUS * SEP_RADIUS;
-                            let going = if vel_known { ov.dot(memo_dir) } else { 0.0 };
+                            let going = ov.dot(memo_dir);
                             // A comrade ahead: he walks up to him instead
                             // of jogging, and at arm's length the man
                             // blocks his way. One already walking away the
@@ -1522,7 +1516,8 @@ fn run_tick_job(job: &mut TickJob) {
                         // a comrade of his own regiment running to the fight.
                         if watch_go && !saw_comrade_go {
                             saw_comrade_go = grid.any_candidate_vel(p, look.min(JOIN_SEE_R), |o, ov| {
-                                crate::spatial::meta_group(o.meta) == gi
+                                o.idx as usize != i
+                                    && crate::spatial::meta_group(o.meta) == gi
                                     && (p - o.xz()).length_squared() < JOIN_SEE_R * JOIN_SEE_R
                                     && ov.dot(memo_dir) > GOING_SPEED
                             });
