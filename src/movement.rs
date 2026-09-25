@@ -74,6 +74,11 @@ const STEP_STOP: f32 = 0.35;
 /// facing while he moves: he steps sideways or back, he does not turn
 /// to walk (M2TW's shuffle keeps facing).
 const STEP_FACE_SPEED: f32 = 1.05;
+/// Closing up behind the man ahead in melee: M2TW's ready-stance
+/// `advance` (1.06 m/s) for a small gap, its `combat_jog` (2.87 m/s)
+/// once the gap is more than a rank (devlog 0123).
+const ADVANCE_PACE: f32 = 1.06;
+const COMBAT_JOG_PACE: f32 = 2.87;
 const CHUNK: usize = 2048;
 
 /// Routing units flee at this fraction of their speed: fleeing at
@@ -349,6 +354,8 @@ pub struct TickJob {
     press: Vec<bool>,
     engaged: Vec<bool>,
     contact: Vec<bool>,
+    front_off: Vec<f32>,
+    pitch: Vec<Vec2>,
     hold: Vec<bool>,
     threat: Vec<Vec2>,
     form_face: Vec<Vec2>,
@@ -789,6 +796,17 @@ fn prepare_tick(
     // Regiments holding a contact frame (frontline.rs): their fight is
     // ahead of them, and their men never step back to dress.
     let contact: Vec<bool> = groups.list.iter().map(|g| g.contact).collect();
+    // Each regiment's front-most slot along its facing, and its slot
+    // pitch: a man behind the front rank has a file-mate ahead of him.
+    let mut front_off = vec![f32::MIN; groups.list.len()];
+    for i in 0..units.pos.len() {
+        let g = group[i] as usize;
+        if contact[g] && death_t[i] == 0 {
+            let f = crate::formation::facing_dir(groups.list[g].facing);
+            front_off[g] = front_off[g].max(units.home[i].dot(f));
+        }
+    }
+    let pitch: Vec<Vec2> = groups.list.iter().map(|g| g.spacing.pitch()).collect();
     // Hold-position leash: units of a held regiment close only the last
     // step to a swing (no chasing across open ground).
     let hold: Vec<bool> = groups.list.iter().map(|g| g.hold).collect();
@@ -878,6 +896,8 @@ fn prepare_tick(
     job.press = press;
     job.engaged = engaged;
     job.contact = contact;
+    job.front_off = front_off;
+    job.pitch = pitch;
     job.hold = hold;
     job.threat = threat;
     job.form_face = form_face;
@@ -928,6 +948,8 @@ fn run_tick_job(job: &mut TickJob) {
         press,
         engaged,
         contact,
+        front_off,
+        pitch,
         hold,
         threat,
         form_face,
@@ -974,6 +996,8 @@ fn run_tick_job(job: &mut TickJob) {
     let press = &press[..];
     let engaged = &engaged[..];
     let contact = &contact[..];
+    let front_off = &front_off[..];
+    let pitch = &pitch[..];
     let hold = &hold[..];
     let threat = &threat[..];
     let form_face = &form_face[..];
@@ -1146,6 +1170,13 @@ fn run_tick_job(job: &mut TickJob) {
                         Vec2::ZERO
                     };
                     let mut slot_blocked = false;
+                    // Closing up in melee: the nearest file-mate ahead of
+                    // him, and whether a comrade blocks the way forward.
+                    let follow = contact[gi] && !routed && form_face[gi] != Vec2::ZERO;
+                    let ff = form_face[gi];
+                    let half_file = 0.5 * pitch[gi].x;
+                    let mut mate_ahead = f32::MAX;
+                    let mut ahead_blocked = false;
                     let scan_r = if at_charge_speed {
                         QUERY_RADIUS.max(params.reach).max(spear_reach)
                     } else {
@@ -1204,6 +1235,20 @@ fn run_tick_job(job: &mut TickJob) {
                             && (-d).dot(memo_dir) > 0.707 * d2.sqrt()
                         {
                             way_blocked = true;
+                        }
+                        if follow && !cross && group[o.idx as usize] as usize == gi {
+                            let rel = -d;
+                            let ahead = rel.dot(ff);
+                            if ahead > 0.3 && (rel.x * ff.y - rel.y * ff.x).abs() < half_file {
+                                mate_ahead = mate_ahead.min(ahead);
+                            }
+                        }
+                        if follow
+                            && !cross
+                            && d2 < SEP_RADIUS * SEP_RADIUS
+                            && (-d).dot(ff) > 0.707 * d2.sqrt()
+                        {
+                            ahead_blocked = true;
                         }
                         if !cross
                             && slot_dir != Vec2::ZERO
@@ -1324,6 +1369,36 @@ fn run_tick_job(job: &mut TickJob) {
                     // the man's back.
                     if slot_blocked {
                         desired = Vec2::ZERO;
+                    }
+                    // Closing up (devlog 0123). In melee a man behind the
+                    // front rank keeps close behind the man ahead of him in
+                    // his file: when that man steps forward to fight, or
+                    // falls, the file follows at once instead of holding
+                    // its slots until the whole frame catches up. A mate
+                    // beyond the scan is a gap of more than a rank. Forward
+                    // only, through open ground, and only while no enemy
+                    // is in reach.
+                    if follow
+                        && best_idx == u32::MAX
+                        && !ahead_blocked
+                        && home[i].dot(ff) < front_off[gi] - 0.5 * pitch[gi].y
+                    {
+                        let gap = if mate_ahead < f32::MAX {
+                            mate_ahead - pitch[gi].y
+                        } else {
+                            f32::MAX
+                        };
+                        // A standing man starts only once the gap reaches
+                        // half a rank, so the fighter's small moves do not
+                        // ripple down the file; once moving he closes up.
+                        let moving = v_chunk[j].xz().length_squared()
+                            > (0.5 * STEP_PACE) * (0.5 * STEP_PACE);
+                        let start = if moving { STEP_STOP } else { 0.5 * pitch[gi].y };
+                        if gap > start {
+                            let pace = if gap > pitch[gi].y { COMBAT_JOG_PACE } else { ADVANCE_PACE };
+                            let ground = terrain.wade_mult(p.x, p.y);
+                            desired = desired - ff * desired.dot(ff) + ff * (pace * ground);
+                        }
                     }
 
                     // Sparse-fight acquisition (see WIDE_ACQUIRE_R): a
