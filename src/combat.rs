@@ -113,6 +113,7 @@ pub fn process_deaths(
         units.death_t.swap_remove(i);
         units.home.swap_remove(i);
         units.ammo.swap_remove(i);
+        units.out_form.swap_remove(i);
     }
     for (c, r) in craters {
         terrain.carve_crater(c, r, r * 0.4);

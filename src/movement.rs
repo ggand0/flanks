@@ -109,21 +109,21 @@ const STAND_GRIP: f32 = 6.0;
 const JOIN_WINDOW: u32 = 15;
 fn join_react_chance() -> f32 {
     static P: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-    *P.get_or_init(|| crate::util::env_or("FL_JOIN_REACT", 0.35_f32).clamp(0.0, 1.0))
+    *P.get_or_init(|| crate::util::env_or("FL_JOIN_REACT", 0.2_f32).clamp(0.0, 1.0))
 }
 /// Ground speed toward the fight that reads as "going to it".
 const GOING_SPEED: f32 = 1.0;
 /// How far a man notices a comrade of his own regiment running to the
 /// fight (checked on the acquisition scan, every 8th tick).
-const JOIN_SEE_R: f32 = 8.0;
+const JOIN_SEE_R: f32 = 6.0;
 /// Even with nobody going in sight, a man joins once his regiment has
 /// been in melee longer than his own patience, spread between these
 /// (seconds; FL_JOIN_PATIENCE sets the upper end): the fight's noise and
 /// the officers carry further than sight. Far men join late, never not.
-const JOIN_PATIENCE_MIN: f32 = 8.0;
+const JOIN_PATIENCE_MIN: f32 = 25.0;
 fn join_patience_max() -> f32 {
     static D: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-    *D.get_or_init(|| crate::util::env_or("FL_JOIN_PATIENCE", 25.0_f32).max(JOIN_PATIENCE_MIN))
+    *D.get_or_init(|| crate::util::env_or("FL_JOIN_PATIENCE", 50.0_f32).max(JOIN_PATIENCE_MIN))
 }
 
 /// Sight radius for a man of a fighting regiment looking for an enemy
@@ -402,6 +402,7 @@ pub struct TickJob {
     flash: Vec<u8>,
     death_t: Vec<u8>,
     ammo: Vec<u8>,
+    out_form: Vec<bool>,
     // Per-regiment command snapshot, taken at prep.
     orders: Vec<Option<Vec2>>,
     anchors: Vec<Vec2>,
@@ -573,7 +574,8 @@ fn prepare_tick(
     copy_col!(
         pos_in <- pos, speed <- speed, team <- team, kind <- kind, group <- group,
         home <- home, vel <- vel, yaw <- yaw, yaw_prev <- yaw_prev, target <- target,
-        swing <- swing, swing_t <- swing_t, flash <- flash, death_t <- death_t, ammo <- ammo
+        swing <- swing, swing_t <- swing_t, flash <- flash, death_t <- death_t, ammo <- ammo,
+        out_form <- out_form
     );
     job.pos_out.clear();
     job.pos_out.resize(units.pos.len(), Vec3::ZERO);
@@ -995,6 +997,7 @@ fn run_tick_job(job: &mut TickJob) {
         flash,
         death_t,
         ammo,
+        out_form,
         speed,
         team,
         kind,
@@ -1086,11 +1089,12 @@ fn run_tick_job(job: &mut TickJob) {
             .zip(ammo.chunks_mut(CHUNK))
             .zip(arrow_spawns.iter_mut())
             .zip(diag.iter_mut())
+            .zip(out_form.chunks_mut(CHUNK))
             .enumerate()
         {
-            let ((((((((((((p_chunk, v_chunk), yaw_chunk), yawp_chunk), tgt_chunk), sw_chunk),
-                swt_chunk), fl_chunk), dt_chunk), events), ammo_chunk), arrow_out), diag_out) =
-                chunk;
+            let (((((((((((((p_chunk, v_chunk), yaw_chunk), yawp_chunk), tgt_chunk), sw_chunk),
+                swt_chunk), fl_chunk), dt_chunk), events), ammo_chunk), arrow_out), diag_out),
+                of_chunk) = chunk;
             let start = ci * CHUNK;
             scope.spawn(async move {
                 events.clear();
@@ -1222,22 +1226,22 @@ fn run_tick_job(job: &mut TickJob) {
                         && team[memo] != team[i]
                         && pos_prev[memo].xz().distance_squared(p)
                             < (seek_radius() + 1.0) * (seek_radius() + 1.0);
-                    // Joining the fight: his regiment has been in melee
-                    // longer than his own delay, and he sees no enemy.
-                    // Joining the fight: his regiment is in melee and he
-                    // sees no enemy. He goes if he is already on his way,
-                    // or (after the scan) when he sees a comrade beside him
-                    // running to the fight.
-                    let join_fp = match fight_point[gi] {
-                        Some(fp) if !memo_valid && !routed && !dying && melee_ticks[gi] > 0 => {
-                            Some(fp)
-                        }
-                        _ => None,
-                    };
-                    let already_going = join_fp.is_some_and(|fp| {
-                        v_chunk[j].xz().dot((fp - p).normalize_or_zero()) > GOING_SPEED
-                    });
-                    let mut join_to = if already_going { join_fp } else { None };
+                    // In melee: his regiment has a fight. He is either
+                    // still in formation or out of it (out_form: he left
+                    // his slot to fight, a state that sticks until the
+                    // melee ends; M2TW's isInFormation). Fighting takes
+                    // him out of formation.
+                    let in_melee = fight_point[gi].is_some() && !routed && !dying;
+                    if !in_melee {
+                        of_chunk[j] = false;
+                    } else if sw_chunk[j] & crate::units::SWING_STATE_MASK
+                        != crate::units::SWING_READY
+                        && sw_chunk[j] & crate::units::SWING_RANGED == 0
+                    {
+                        of_chunk[j] = true;
+                    }
+                    let committed = in_melee && of_chunk[j];
+                    let join_fp = if in_melee { fight_point[gi] } else { None };
                     let memo_dir = if memo_valid {
                         (pos_prev[memo].xz() - p).normalize_or_zero()
                     } else if let Some(fp) = join_fp {
@@ -1325,8 +1329,8 @@ fn run_tick_job(job: &mut TickJob) {
                         {
                             way_blocked = true;
                         }
-                        if join_fp.is_some()
-                            && !already_going
+                        if in_melee
+                            && !committed
                             && !cross
                             && group[o.idx as usize] as usize == gi
                             && (o.idx as usize) < vel_snap.len()
@@ -1510,8 +1514,8 @@ fn run_tick_job(job: &mut TickJob) {
                                     far_d2 = d2;
                                     tgt_chunk[j] = o.idx;
                                 }
-                            } else if join_fp.is_some()
-                                && !already_going
+                            } else if in_melee
+                                && !committed
                                 && group[o.idx as usize] as usize == gi
                                 && (o.idx as usize) < vel_snap.len()
                                 && (p - o.xz()).length_squared() < JOIN_SEE_R * JOIN_SEE_R
@@ -1523,37 +1527,37 @@ fn run_tick_job(job: &mut TickJob) {
                     }
 
 
-                    // Joining: a comrade seen running to the fight (he
-                    // reacts in his own time), or his patience with the
-                    // fight's noise runs out.
-                    if join_to.is_none() && join_fp.is_some() {
+                    // Leaving formation to fight, in his own time: he
+                    // reacts to an enemy in sight or a comrade seen running
+                    // to the fight (a chance per half-second window), or
+                    // his patience with the fight's noise runs out. Near
+                    // men go first and the line rolls up outward.
+                    let mut committed = committed;
+                    if in_melee && !committed {
                         let patience = (JOIN_PATIENCE_MIN
                             + (join_patience_max() - JOIN_PATIENCE_MIN)
                                 * crate::units::hash01((i as u32).wrapping_mul(0x3C6E) ^ 0xF372))
                             * 30.0;
-                        if melee_ticks[gi] as f32 > patience {
-                            join_to = join_fp;
-                        } else if saw_comrade_go {
+                        let react = (memo_valid || saw_comrade_go) && {
                             let window = (tick.wrapping_add((i as u32).wrapping_mul(11)) / JOIN_WINDOW)
                                 .wrapping_mul(0x9E37_79B1);
-                            if crate::units::hash01(window ^ (i as u32).wrapping_mul(0x6A09))
+                            crate::units::hash01(window ^ (i as u32).wrapping_mul(0x6A09))
                                 < join_react_chance()
-                            {
-                                join_to = join_fp;
-                            }
+                        };
+                        if react || melee_ticks[gi] as f32 > patience {
+                            committed = true;
+                            of_chunk[j] = true;
                         }
                     }
-                    // A man committed to the fight (an enemy he is going
-                    // for, or joining) no longer dresses on his slot until
-                    // the fight ends and the regiment re-forms (M2TW keeps
-                    // the slot but the man fights out of formation).
-                    // Blocked, he stands; he never walks back to his old
-                    // place. Keeping the slot pull under the seek made him
-                    // loop between the fight and his slot.
-                    if fight_point[gi].is_some() && (memo_valid || join_to.is_some()) {
+                    // Out of formation he never dresses on his slot until
+                    // the melee ends and the regiment re-forms: he fights,
+                    // goes for an enemy he sees, heads for the fight, or
+                    // stands where he is when blocked. Inferring this from
+                    // his speed made a man who slowed down run back to his
+                    // slot and come out again, over and over.
+                    if committed {
                         desired = Vec2::ZERO;
                     }
-
 
                     // Swing state machine. All writes are to this unit's own
                     // row; damage goes through the chunk event buffer.
@@ -1848,7 +1852,7 @@ fn run_tick_job(job: &mut TickJob) {
                         (tgt_chunk[j], false)
                     } else if best_idx != u32::MAX {
                         (best_idx, false)
-                    } else if crowd < acquire_crowd_lim {
+                    } else if crowd < acquire_crowd_lim && (!in_melee || committed) {
                         (tgt_chunk[j], true)
                     } else {
                         (u32::MAX, false)
@@ -1925,7 +1929,9 @@ fn run_tick_job(job: &mut TickJob) {
                     // ground, walking with a comrade close ahead, waiting
                     // or sidestepping when blocked. He picks a soldier to
                     // fight once one is in sight (the acquisition above).
-                    if let Some(fp) = join_to
+                    if committed
+                        && !memo_valid
+                        && let Some(fp) = join_fp
                         && best_idx == u32::MAX
                         && d_surge == Vec2::ZERO
                         && sw_chunk[j] & crate::units::SWING_STATE_MASK == crate::units::SWING_READY
@@ -2257,6 +2263,7 @@ pub fn step_sim(
         std::mem::swap(&mut u.flash, &mut job.flash);
         std::mem::swap(&mut u.death_t, &mut job.death_t);
         std::mem::swap(&mut u.ammo, &mut job.ammo);
+        std::mem::swap(&mut u.out_form, &mut job.out_form);
     }
     std::mem::swap(&mut *grid, &mut job.grid);
     std::mem::swap(&mut damage.0, &mut job.events);
@@ -2785,7 +2792,38 @@ fn rear_diag_aggregate(
             .iter()
             .map(|o| format!(" {:.2}", o / regs.max(1) as f32))
             .collect();
-        let mut s = format!("\n  depth bands (men per file, front first):{occ_s}");
+        // Men of regiments in melee running away from their own fight
+        // (not staggered, faster than 1.5 m/s): the run-back defect.
+        // Split: out of formation and moving toward his own target
+        // (an enemy behind him: legitimate), out of formation otherwise,
+        // and still in formation (walking back to a slot).
+        let (mut rb_target, mut rb_out, mut rb_in) = (0usize, 0usize, 0usize);
+        for i in 0..n {
+            let gd = &groups.list[units.group[i] as usize];
+            let v = units.vel[i].xz();
+            if units.death_t[i] == 0
+                && units.swing[i] & crate::units::SWING_STAGGERED == 0
+                && gd.fight_point.is_some_and(|fp| {
+                    v.dot((fp - units.pos[i].xz()).normalize_or_zero()) < -1.5
+                })
+            {
+                let t = units.target[i] as usize;
+                let to_target = t < n
+                    && units.team[t] != units.team[i]
+                    && v.dot(units.pos[t].xz() - units.pos[i].xz()) > 0.0;
+                if !units.out_form[i] {
+                    rb_in += 1;
+                } else if to_target {
+                    rb_target += 1;
+                } else {
+                    rb_out += 1;
+                }
+            }
+        }
+        let run_back = format!("{} (in formation {rb_in}, out toward his target {rb_target}, out other {rb_out})", rb_in + rb_target + rb_out);
+        let mut s = format!(
+            "\n  depth bands (men per file, front first):{occ_s}\n  running back from their fight: {run_back}"
+        );
         for ((class, rank), a) in &rear.acc {
             let c = ["atk", "none", "move"][*class as usize];
             let k = a[0].max(1.0);

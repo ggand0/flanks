@@ -48,6 +48,11 @@ pub struct Units {
     /// Arrows left (archers; 0 for melee kinds). Decremented on loose;
     /// an empty quiver means melee only.
     pub ammo: Vec<u8>,
+    /// Out of formation: he has left his slot to fight (M2TW keeps this
+    /// per soldier, isInFormation). While his regiment is in melee he
+    /// does not walk back to his slot; the flag clears when the melee
+    /// ends and the regiment re-forms (movement.rs, devlog 0123).
+    pub out_form: Vec<bool>,
     /// Bumped every time a battle rebuilds this world. A sim tick job
     /// computed from an older world carries indices that mean nothing
     /// here: movement.rs drops it instead of installing it.
@@ -216,6 +221,7 @@ pub fn push_unit(
     } else {
         0
     });
+    units.out_form.push(false);
 }
 
 /// FL_TEST_SURROUND: two equal blue detachments of light infantry, one

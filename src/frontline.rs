@@ -502,6 +502,18 @@ fn update_groups(units: Res<Units>, mut groups: ResMut<Groups>) {
         if engaged && !group.state.is_broken() && (group.melee_ticks > 0 || fight_n[g] >= lock_threshold) {
             group.melee_ticks = group.melee_ticks.saturating_add(1);
         } else {
+            // The melee is over: its men come back into formation
+            // (movement.rs clears out_form). A regiment with no attack
+            // order re-forms where it stands, M2TW's discrete reforming
+            // state; an attacker's order lays its slots again.
+            if group.melee_ticks > 0
+                && group.shape == crate::formation::FormShape::Rect
+                && !group.state.is_broken()
+                && !matches!(group.order, Some(crate::orders::Order::Attack(_)))
+            {
+                group.anchor = group.centroid;
+                group.reform = true;
+            }
             group.melee_ticks = 0;
         }
         group.fight_point = if group.melee_ticks > 0 && !group.hold {

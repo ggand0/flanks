@@ -798,10 +798,22 @@ fn pile_test_log(groups: Res<Groups>, units: Res<Units>, time: Res<Time>, mut ne
     // Victim men still out in the line, more than 25 m from the first
     // attacker's center: the roll-up of a wide line shows here.
     let ac = groups.list[1].centroid;
-    let (mut jog, mut walk, mut ready) = (0, 0, 0);
+    let (mut jog, mut walk, mut ready, mut run_back, mut out_form) = (0, 0, 0, 0, 0);
     for i in 0..units.len() {
         if units.group[i] == 0 && units.death_t[i] == 0 {
-            let sp = Vec2::new(units.vel[i].x, units.vel[i].z).length();
+            if units.out_form[i] {
+                out_form += 1;
+            }
+            let vxz = Vec2::new(units.vel[i].x, units.vel[i].z);
+            let sp = vxz.length();
+            // Running away from his own regiment's fight while it is in
+            // melee: the run-back defect.
+            if let Some(fp) = v.fight_point
+                && units.swing[i] & crate::units::SWING_STAGGERED == 0
+                && vxz.dot((fp - Vec2::new(units.pos[i].x, units.pos[i].z)).normalize_or_zero()) < -1.5
+            {
+                run_back += 1;
+            }
             if sp > 1.5 {
                 jog += 1;
             } else if sp > 0.3 {
@@ -812,7 +824,7 @@ fn pile_test_log(groups: Res<Groups>, units: Res<Units>, time: Res<Time>, mut ne
             }
         }
     }
-    info!("[pile-test] orange moving: jog {jog} walk {walk}, ready {ready}");
+    info!("[pile-test] orange moving: jog {jog} walk {walk}, ready {ready}, out of formation {out_form}, running back from the fight {run_back}");
     // Victim men not at the fight: nearest living attacker more than
     // 8 m away (test-only brute force).
     let attackers: Vec<Vec2> = (0..units.len())
