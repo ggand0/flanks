@@ -101,15 +101,18 @@ fn sidestep_chance() -> f32 {
 /// unaffected; true overlap is still corrected.
 const STAND_GRIP: f32 = 6.0;
 
-/// A man of a regiment in melee who sees no enemy heads for the enemy
-/// unit his regiment fights after his own delay, spread between these
-/// (seconds, FL_JOIN_DELAY sets the upper end): the line rolls up from
-/// the contact outward, as in Gota's M2TW test (devlog 0123).
-const JOIN_DELAY_MIN: f32 = 1.0;
-fn join_delay_max() -> f32 {
-    static D: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-    *D.get_or_init(|| crate::util::env_or("FL_JOIN_DELAY", 6.0_f32).max(JOIN_DELAY_MIN))
+/// A man of a regiment in melee who sees no enemy joins the fight when
+/// he sees the comrade beside him run toward it: in each half-second
+/// window he reacts with this chance (FL_JOIN_REACT overrides), so the
+/// line rolls up from the contact outward, a man at a time, as in
+/// Gota's M2TW test (devlog 0123). Once going he keeps going.
+const JOIN_WINDOW: u32 = 15;
+fn join_react_chance() -> f32 {
+    static P: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *P.get_or_init(|| crate::util::env_or("FL_JOIN_REACT", 0.35_f32).clamp(0.0, 1.0))
 }
+/// Ground speed toward the fight that reads as "going to it".
+const GOING_SPEED: f32 = 1.0;
 
 /// Sight radius for a man of a fighting regiment looking for an enemy
 /// to go to (FL_SEEK_R, meters). A play-testing knob.
@@ -1209,19 +1212,23 @@ fn run_tick_job(job: &mut TickJob) {
                             < (seek_radius() + 1.0) * (seek_radius() + 1.0);
                     // Joining the fight: his regiment has been in melee
                     // longer than his own delay, and he sees no enemy.
-                    let join_to = match fight_point[gi] {
-                        Some(fp) if !memo_valid && !routed && !dying => {
-                            let delay = (JOIN_DELAY_MIN
-                                + (join_delay_max() - JOIN_DELAY_MIN)
-                                    * crate::units::hash01((i as u32).wrapping_mul(0x6A09) ^ 0xE667))
-                                * 30.0;
-                            (melee_ticks[gi] as f32 > delay).then_some(fp)
+                    // Joining the fight: his regiment is in melee and he
+                    // sees no enemy. He goes if he is already on his way,
+                    // or (after the scan) when he sees a comrade beside him
+                    // running to the fight.
+                    let join_fp = match fight_point[gi] {
+                        Some(fp) if !memo_valid && !routed && !dying && melee_ticks[gi] > 0 => {
+                            Some(fp)
                         }
                         _ => None,
                     };
+                    let already_going = join_fp.is_some_and(|fp| {
+                        v_chunk[j].xz().dot((fp - p).normalize_or_zero()) > GOING_SPEED
+                    });
+                    let mut join_to = if already_going { join_fp } else { None };
                     let memo_dir = if memo_valid {
                         (pos_prev[memo].xz() - p).normalize_or_zero()
-                    } else if let Some(fp) = join_to {
+                    } else if let Some(fp) = join_fp {
                         (fp - p).normalize_or_zero()
                     } else {
                         Vec2::ZERO
@@ -1242,6 +1249,9 @@ fn run_tick_job(job: &mut TickJob) {
                     // A comrade anywhere ahead within the scan: he walks
                     // up to him instead of jogging.
                     let mut comrade_ahead = false;
+                    // A comrade of his own regiment close by, running to
+                    // the fight: the sight that makes him follow.
+                    let mut saw_comrade_go = false;
                     let scan_r = if at_charge_speed {
                         QUERY_RADIUS.max(params.reach).max(spear_reach)
                     } else {
@@ -1302,6 +1312,15 @@ fn run_tick_job(job: &mut TickJob) {
                                 && vel_snap[o.idx as usize].dot(memo_dir) > 0.5)
                         {
                             way_blocked = true;
+                        }
+                        if join_fp.is_some()
+                            && !already_going
+                            && !cross
+                            && group[o.idx as usize] as usize == gi
+                            && (o.idx as usize) < vel_snap.len()
+                            && vel_snap[o.idx as usize].dot(memo_dir) > GOING_SPEED
+                        {
+                            saw_comrade_go = true;
                         }
                         // A comrade already walking away the same way is
                         // no obstacle: men heading for the same fight move
@@ -1444,6 +1463,13 @@ fn run_tick_job(job: &mut TickJob) {
                     // the man's back.
                     if slot_blocked {
                         desired = Vec2::ZERO;
+                    }
+                    if join_to.is_none() && saw_comrade_go {
+                        let window = (tick.wrapping_add((i as u32).wrapping_mul(11)) / JOIN_WINDOW)
+                            .wrapping_mul(0x9E37_79B1);
+                        if crate::units::hash01(window ^ (i as u32).wrapping_mul(0x6A09)) < join_react_chance() {
+                            join_to = join_fp;
+                        }
                     }
                     // A man committed to the fight (an enemy he is going
                     // for, or joining) no longer dresses on his slot until
