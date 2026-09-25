@@ -133,6 +133,15 @@ pub struct GroupData {
     /// vector, fixed when contact begins so the block cannot slide
     /// sideways while it fights.
     pub contact_lateral: f32,
+    /// Ticks this regiment has been in a real melee (engaged, with at
+    /// least the count gate's share of its men fighting once); 0 when
+    /// not. Men out of sight of an enemy join the fight after their own
+    /// delay counted from here (movement.rs, devlog 0123).
+    pub melee_ticks: u32,
+    /// Where the enemy unit this regiment fights stands: its ordered
+    /// target if alive and unbroken, else the nearest unbroken enemy
+    /// regiment. None when not in melee or in hold (guard) mode.
+    pub fight_point: Option<Vec2>,
     /// In the charge phase: attack order, inside charge range of the
     /// target, not yet in contact. Drives the war cry + sprint pose.
     pub charging: bool,
@@ -222,6 +231,8 @@ impl GroupData {
             engaged_with_target: false,
             contact: false,
             contact_lateral: 0.0,
+            melee_ticks: 0,
+            fight_point: None,
             engage_target_hold: 0,
             charging: false,
             enemy_near: false,

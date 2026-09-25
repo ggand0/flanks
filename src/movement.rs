@@ -101,6 +101,16 @@ fn sidestep_chance() -> f32 {
 /// unaffected; true overlap is still corrected.
 const STAND_GRIP: f32 = 6.0;
 
+/// A man of a regiment in melee who sees no enemy heads for the enemy
+/// unit his regiment fights after his own delay, spread between these
+/// (seconds, FL_JOIN_DELAY sets the upper end): the line rolls up from
+/// the contact outward, as in Gota's M2TW test (devlog 0123).
+const JOIN_DELAY_MIN: f32 = 1.0;
+fn join_delay_max() -> f32 {
+    static D: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *D.get_or_init(|| crate::util::env_or("FL_JOIN_DELAY", 6.0_f32).max(JOIN_DELAY_MIN))
+}
+
 /// Sight radius for a man of a fighting regiment looking for an enemy
 /// to go to (FL_SEEK_R, meters). A play-testing knob.
 fn seek_radius() -> f32 {
@@ -385,6 +395,8 @@ pub struct TickJob {
     press: Vec<bool>,
     engaged: Vec<bool>,
     contact: Vec<bool>,
+    fight_point: Vec<Option<Vec2>>,
+    melee_ticks: Vec<u32>,
     hold: Vec<bool>,
     threat: Vec<Vec2>,
     form_face: Vec<Vec2>,
@@ -401,6 +413,9 @@ pub struct TickJob {
     broken_flags: Vec<bool>,
     mover_flags: Vec<bool>,
     yaw_snapshot: Vec<f32>,
+    /// Tick-start ground velocities, copied only while some regiment is
+    /// in melee: a comrade walking away the same way is no obstacle.
+    vel_snapshot: Vec<Vec2>,
     // Outputs beyond the columns: the grid the tick built, landed swings
     // and loosed arrows per chunk. All swapped into their resources at
     // install.
@@ -826,6 +841,9 @@ fn prepare_tick(
     // Regiments holding a contact frame (frontline.rs): their fight is
     // ahead of them, and their men never step back to dress.
     let contact: Vec<bool> = groups.list.iter().map(|g| g.contact).collect();
+    // Where each regiment in melee has its fight, and for how long.
+    let fight_point: Vec<Option<Vec2>> = groups.list.iter().map(|g| g.fight_point).collect();
+    let melee_ticks: Vec<u32> = groups.list.iter().map(|g| g.melee_ticks).collect();
 
     // Hold-position leash: units of a held regiment close only the last
     // step to a swing (no chasing across open ground).
@@ -884,6 +902,10 @@ fn prepare_tick(
     // into &mut chunks there. The spear-line hazard reads the SPEARMAN's
     // facing from the charger's side of the scan; no spearwalls anywhere,
     // no copy.
+    job.vel_snapshot.clear();
+    if groups.list.iter().any(|g| g.fight_point.is_some()) {
+        job.vel_snapshot.extend(units.vel.iter().map(|v| v.xz()));
+    }
     job.yaw_snapshot.clear();
     if faces_spearwall[0] || faces_spearwall[1] {
         job.yaw_snapshot.extend_from_slice(&units.yaw);
@@ -917,6 +939,8 @@ fn prepare_tick(
     job.press = press;
     job.engaged = engaged;
     job.contact = contact;
+    job.fight_point = fight_point;
+    job.melee_ticks = melee_ticks;
     job.hold = hold;
     job.threat = threat;
     job.form_face = form_face;
@@ -968,6 +992,8 @@ fn run_tick_job(job: &mut TickJob) {
         press,
         engaged,
         contact,
+        fight_point,
+        melee_ticks,
         hold,
         threat,
         form_face,
@@ -982,6 +1008,7 @@ fn run_tick_job(job: &mut TickJob) {
         broken_flags,
         mover_flags,
         yaw_snapshot,
+        vel_snapshot,
         grid,
         events,
         arrow_spawns,
@@ -1007,6 +1034,7 @@ fn run_tick_job(job: &mut TickJob) {
     let group = &group[..];
     let home = &home[..];
     let yaw_snap = &yaw_snapshot[..];
+    let vel_snap = &vel_snapshot[..];
     let orders = &orders[..];
     let anchors = &anchors[..];
     let broken = &reg_broken[..];
@@ -1014,6 +1042,8 @@ fn run_tick_job(job: &mut TickJob) {
     let press = &press[..];
     let engaged = &engaged[..];
     let contact = &contact[..];
+    let fight_point = &fight_point[..];
+    let melee_ticks = &melee_ticks[..];
     let hold = &hold[..];
     let threat = &threat[..];
     let form_face = &form_face[..];
@@ -1173,8 +1203,26 @@ fn run_tick_job(job: &mut TickJob) {
                     // comrade's body standing in that direction blocks the
                     // surge toward him (below).
                     let memo = prev_target as usize;
-                    let memo_dir = if memo < pos_prev.len() && team[memo] != team[i] {
+                    let memo_valid = memo < pos_prev.len()
+                        && team[memo] != team[i]
+                        && pos_prev[memo].xz().distance_squared(p)
+                            < (seek_radius() + 1.0) * (seek_radius() + 1.0);
+                    // Joining the fight: his regiment has been in melee
+                    // longer than his own delay, and he sees no enemy.
+                    let join_to = match fight_point[gi] {
+                        Some(fp) if !memo_valid && !routed && !dying => {
+                            let delay = (JOIN_DELAY_MIN
+                                + (join_delay_max() - JOIN_DELAY_MIN)
+                                    * crate::units::hash01((i as u32).wrapping_mul(0x6A09) ^ 0xE667))
+                                * 30.0;
+                            (melee_ticks[gi] as f32 > delay).then_some(fp)
+                        }
+                        _ => None,
+                    };
+                    let memo_dir = if memo_valid {
                         (pos_prev[memo].xz() - p).normalize_or_zero()
+                    } else if let Some(fp) = join_to {
+                        (fp - p).normalize_or_zero()
                     } else {
                         Vec2::ZERO
                     };
@@ -1250,10 +1298,23 @@ fn run_tick_job(job: &mut TickJob) {
                             && memo_dir != Vec2::ZERO
                             && d2 < SEP_RADIUS * SEP_RADIUS
                             && (-d).dot(memo_dir) > 0.707 * d2.sqrt()
+                            && !((o.idx as usize) < vel_snap.len()
+                                && vel_snap[o.idx as usize].dot(memo_dir) > 0.5)
                         {
                             way_blocked = true;
                         }
-                        if !cross && memo_dir != Vec2::ZERO && (-d).dot(memo_dir) > 0.707 * d2.sqrt() {
+                        // A comrade already walking away the same way is
+                        // no obstacle: men heading for the same fight move
+                        // together instead of each waiting for the next.
+                        let walking_away = !cross
+                            && memo_dir != Vec2::ZERO
+                            && (o.idx as usize) < vel_snap.len()
+                            && vel_snap[o.idx as usize].dot(memo_dir) > 0.5;
+                        if !cross
+                            && !walking_away
+                            && memo_dir != Vec2::ZERO
+                            && (-d).dot(memo_dir) > 0.707 * d2.sqrt()
+                        {
                             comrade_ahead = true;
                         }
                         if !cross && memo_dir != Vec2::ZERO && d2 < SEP_RADIUS * SEP_RADIUS {
@@ -1382,6 +1443,16 @@ fn run_tick_job(job: &mut TickJob) {
                     // back to his own mark) instead of pressing into
                     // the man's back.
                     if slot_blocked {
+                        desired = Vec2::ZERO;
+                    }
+                    // A man committed to the fight (an enemy he is going
+                    // for, or joining) no longer dresses on his slot until
+                    // the fight ends and the regiment re-forms (M2TW keeps
+                    // the slot but the man fights out of formation).
+                    // Blocked, he stands; he never walks back to his old
+                    // place. Keeping the slot pull under the seek made him
+                    // loop between the fight and his slot.
+                    if fight_point[gi].is_some() && (memo_valid || join_to.is_some()) {
                         desired = Vec2::ZERO;
                     }
 
@@ -1786,6 +1857,42 @@ fn run_tick_job(job: &mut TickJob) {
                             };
                             desired += to_enemy * (pace * urge / dist);
                             d_surge = to_enemy * (pace * urge / dist);
+                        }
+                    }
+                    // Joining: no enemy to close on, so he heads for the
+                    // enemy unit his regiment fights, jogging over open
+                    // ground, walking with a comrade close ahead, waiting
+                    // or sidestepping when blocked. He picks a soldier to
+                    // fight once one is in sight (the acquisition above).
+                    if let Some(fp) = join_to
+                        && best_idx == u32::MAX
+                        && d_surge == Vec2::ZERO
+                        && sw_chunk[j] & crate::units::SWING_STATE_MASK == crate::units::SWING_READY
+                    {
+                        let to_fp = fp - p;
+                        let dist = to_fp.length();
+                        if dist > 1.0 {
+                            let dir = to_fp / dist;
+                            desired = if !way_blocked {
+                                let pace = if comrade_ahead { ADVANCE_PACE } else { COMBAT_JOG_PACE };
+                                dir * pace * (1.0 - jam)
+                            } else {
+                                let window = (tick.wrapping_add((i as u32).wrapping_mul(7))
+                                    / SIDESTEP_WINDOW)
+                                    .wrapping_mul(0x2545_F491);
+                                let roll = crate::units::hash01(window ^ (i as u32).wrapping_mul(0x9E37));
+                                let chance = sidestep_chance();
+                                let side = match (left_blocked, right_blocked) {
+                                    _ if roll >= chance => Vec2::ZERO,
+                                    (false, true) => side_dir,
+                                    (true, false) => -side_dir,
+                                    (false, false) if roll < 0.5 * chance => side_dir,
+                                    (false, false) => -side_dir,
+                                    (true, true) => Vec2::ZERO,
+                                };
+                                side * STEP_PACE
+                            };
+                            d_surge = desired;
                         }
                     }
                     // Formation pace: walls advance deliberately (running

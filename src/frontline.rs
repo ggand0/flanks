@@ -383,12 +383,18 @@ fn update_groups(units: Res<Units>, mut groups: ResMut<Groups>) {
         let mut nearest_d2 = ENEMY_NEAR_R * ENEMY_NEAR_R;
         let mut threat = Vec2::ZERO;
         let mut hostile = false;
+        let mut nearest_formed_d2 = ENEMY_NEAR_R * ENEMY_NEAR_R;
+        let mut nearest_formed: Option<Vec2> = None;
         for t in 0..n {
             if t != g && counts[t] > 0 && teams[t] != group.team {
                 let d2 = cents[t].distance_squared(group.centroid);
                 if d2 < nearest_d2 {
                     nearest_d2 = d2;
                     threat = cents[t] - group.centroid;
+                }
+                if !broken[t] && d2 < nearest_formed_d2 {
+                    nearest_formed_d2 = d2;
+                    nearest_formed = Some(cents[t]);
                 }
                 if d2 < ENEMY_NEAR_R * ENEMY_NEAR_R && !broken[t] {
                     hostile = true;
@@ -488,6 +494,26 @@ fn update_groups(units: Res<Units>, mut groups: ResMut<Groups>) {
         // men who see an enemy go to him themselves (movement.rs).
         // Built from the regiment's own slot geometry, so any width,
         // depth and spacing works.
+        // Melee clock and fight point (movement.rs joins the men out of
+        // sight of an enemy to the fight after their own delay). The
+        // clock starts at the count gate, so a stray poke does not pull
+        // a whole regiment in; M2TW engages a unit when enough enemy
+        // soldiers are in its proximity zone (devlog 0036).
+        if engaged && !group.state.is_broken() && (group.melee_ticks > 0 || fight_n[g] >= lock_threshold) {
+            group.melee_ticks = group.melee_ticks.saturating_add(1);
+        } else {
+            group.melee_ticks = 0;
+        }
+        group.fight_point = if group.melee_ticks > 0 && !group.hold {
+            match group.order {
+                Some(crate::orders::Order::Attack(t)) if counts[t as usize] > 0 && !broken[t as usize] => {
+                    Some(cents[t as usize])
+                }
+                _ => nearest_formed,
+            }
+        } else {
+            None
+        };
         if !rf {
             let attacking = matches!(group.order, Some(crate::orders::Order::Attack(t))
                 if counts[t as usize] > 0 && !broken[t as usize]);
@@ -499,7 +525,14 @@ fn update_groups(units: Res<Units>, mut groups: ResMut<Groups>) {
                 let r = Vec2::new(f.y, -f.x);
                 if !group.contact {
                     group.contact = true;
-                    group.contact_lateral = (group.centroid - group.home_bias).dot(r);
+                    // Sideways the frame stays where the slots already
+                    // were: an attack lays them around the target's center.
+                    // Snapping to the men's average instead sent a wide
+                    // line's flanks, still converging, walking back out.
+                    group.contact_lateral = match group.order {
+                        Some(crate::orders::Order::Attack(t)) => cents[t as usize].dot(r),
+                        _ => (group.centroid - group.home_bias).dot(r),
+                    };
                     let mut depth = (group.centroid - group.home_bias).dot(f);
                     if line_n[g] > 0 {
                         depth = line_sum[g] / line_n[g] as f32 - front_off[g];

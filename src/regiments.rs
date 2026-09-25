@@ -623,6 +623,14 @@ fn spawn_pile_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
     // FL_PILE_ATEASE=1: the victim stands at ease instead of in hold, so
     // it answers with its own attack order like a player's regiment.
     list[0].hold = std::env::var("FL_PILE_ATEASE").is_err();
+    // FL_PILE_VICTIM_FILES: stretch the victim into a wide line (Gota's
+    // M2TW test: a deep unit hits a wide one, which wraps it).
+    if let Ok(files) = std::env::var("FL_PILE_VICTIM_FILES").map(|v| v.parse::<u32>().unwrap_or(0))
+        && files > 0
+    {
+        list[0].files = files;
+        crate::formation::assign_slots(units, 0, &mut list[0]);
+    }
     // FL_PILE_N: how many attackers (default six; two is "two regiments
     // engage mine at once").
     let n_attackers = crate::util::env_or("FL_PILE_N", 6_usize).clamp(1, 6);
@@ -787,9 +795,42 @@ fn pile_test_log(groups: Res<Groups>, units: Res<Units>, time: Res<Time>, mut ne
     let past = (0..units.len())
         .filter(|&i| units.group[i] != 0 && units.death_t[i] == 0 && units.pos[i].z > 72.0)
         .count();
+    // Victim men still out in the line, more than 25 m from the first
+    // attacker's center: the roll-up of a wide line shows here.
+    let ac = groups.list[1].centroid;
+    let (mut jog, mut walk, mut ready) = (0, 0, 0);
+    for i in 0..units.len() {
+        if units.group[i] == 0 && units.death_t[i] == 0 {
+            let sp = Vec2::new(units.vel[i].x, units.vel[i].z).length();
+            if sp > 1.5 {
+                jog += 1;
+            } else if sp > 0.3 {
+                walk += 1;
+            }
+            if units.swing[i] & crate::units::SWING_STATE_MASK == crate::units::SWING_READY {
+                ready += 1;
+            }
+        }
+    }
+    info!("[pile-test] orange moving: jog {jog} walk {walk}, ready {ready}");
+    // Victim men not at the fight: nearest living attacker more than
+    // 8 m away (test-only brute force).
+    let attackers: Vec<Vec2> = (0..units.len())
+        .filter(|&i| units.group[i] != 0 && units.death_t[i] == 0)
+        .map(|i| Vec2::new(units.pos[i].x, units.pos[i].z))
+        .collect();
+    let _ = ac;
+    let out = (0..units.len())
+        .filter(|&i| {
+            units.group[i] == 0 && units.death_t[i] == 0 && {
+                let p = Vec2::new(units.pos[i].x, units.pos[i].z);
+                attackers.iter().all(|a| a.distance_squared(p) > 64.0)
+            }
+        })
+        .count();
     info!(
-        "[pile-test] t={t:.0}s orange {} alive, center {moved:+.2} front {front:+.2} rear {back:+.2} m along its facing, contact {}, engaged {} | blues engaged {engaged}/{n}, charging {charging}, past its far side {past}",
-        v.count, v.contact, v.engaged
+        "[pile-test] t={t:.0}s orange {} alive, center {moved:+.2} front {front:+.2} rear {back:+.2} m along its facing, contact {}, engaged {} | blues engaged {engaged}/{n}, charging {charging}, past its far side {past}, orange away from the fight (>8 m) {out}, melee {} fp {:?}",
+        v.count, v.contact, v.engaged, v.melee_ticks, v.fight_point
     );
 }
 
