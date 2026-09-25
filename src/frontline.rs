@@ -482,9 +482,10 @@ fn update_groups(units: Res<Units>, mut groups: ResMut<Groups>) {
         // regiment is fighting, whoever the enemy is, the frame holds:
         // laterally where the block stood at contact, and in depth with
         // its front slot on the fight line, the mean position of the
-        // men striking at an enemy ahead. The line moves the frame only
-        // forward and only in whole ranks, when the enemy front gives
-        // way.
+        // men striking at an enemy ahead, as it stands at contact. Then
+        // the frame stays put for the whole fight, as an M2TW formation
+        // does: a file with no enemy in front of it holds its slots, and
+        // men who see an enemy go to him themselves (movement.rs).
         // Built from the regiment's own slot geometry, so any width,
         // depth and spacing works.
         if !rf {
@@ -496,25 +497,16 @@ fn update_groups(units: Res<Units>, mut groups: ResMut<Groups>) {
             if formed && attacking && engaged && (group.contact || starts) {
                 let f = fwd[g];
                 let r = Vec2::new(f.y, -f.x);
-                let mut depth = (group.centroid - group.home_bias).dot(f);
                 if !group.contact {
                     group.contact = true;
                     group.contact_lateral = (group.centroid - group.home_bias).dot(r);
-                    info!("regiment {g} holds a contact frame");
-                } else {
-                    depth = group.anchor.dot(f);
-                }
-                // The frame only ever moves forward: when the enemy
-                // front gives way by a full rank, the block steps up. A
-                // fight line pushed back moves nobody back; men in
-                // melee do not dress backward (movement.rs).
-                if line_n[g] > 0 {
-                    let line = line_sum[g] / line_n[g] as f32 - front_off[g];
-                    if line - depth >= group.spacing.pitch().y {
-                        depth = line;
+                    let mut depth = (group.centroid - group.home_bias).dot(f);
+                    if line_n[g] > 0 {
+                        depth = line_sum[g] / line_n[g] as f32 - front_off[g];
                     }
+                    group.anchor = r * group.contact_lateral + f * depth;
+                    info!("regiment {g} holds a contact frame");
                 }
-                group.anchor = r * group.contact_lateral + f * depth;
             } else if group.contact {
                 group.contact = false;
                 info!("regiment {g} releases its contact frame");

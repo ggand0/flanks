@@ -635,6 +635,14 @@ fn spawn_pile_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
                 Vec2::new((col as f32 - 1.0) * 55.0, -40.0 - row as f32 * 35.0);
             spawn_regiment(units, terrain, &mut list, 0, KIND_LIGHT, anchor, 500, -1.0);
             let g = list.len() - 1;
+            // FL_PILE_FILES: stretch the attackers into a wide line (the
+            // runaway-flank repro: files with no enemy in front of them).
+            if let Ok(files) = std::env::var("FL_PILE_FILES").map(|v| v.parse::<u32>().unwrap_or(0))
+                && files > 0
+            {
+                list[g].files = files;
+                crate::formation::assign_slots(units, g as u32, &mut list[g]);
+            }
             list[g].order = Some(crate::orders::Order::Attack(0));
             list[g].auto_order = true;
         }
@@ -774,8 +782,13 @@ fn pile_test_log(groups: Res<Groups>, units: Res<Units>, time: Res<Time>, mut ne
     } else {
         (d[d.len() / 20], d[d.len() * 19 / 20])
     };
+    // Attackers standing beyond the victim's far side (z > 72): a line
+    // whose flank files walk on past the fight shows up here.
+    let past = (0..units.len())
+        .filter(|&i| units.group[i] != 0 && units.death_t[i] == 0 && units.pos[i].z > 72.0)
+        .count();
     info!(
-        "[pile-test] t={t:.0}s orange {} alive, center {moved:+.2} front {front:+.2} rear {back:+.2} m along its facing, contact {}, engaged {} | blues engaged {engaged}/{n}, charging {charging}",
+        "[pile-test] t={t:.0}s orange {} alive, center {moved:+.2} front {front:+.2} rear {back:+.2} m along its facing, contact {}, engaged {} | blues engaged {engaged}/{n}, charging {charging}, past its far side {past}",
         v.count, v.contact, v.engaged
     );
 }

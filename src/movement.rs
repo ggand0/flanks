@@ -74,11 +74,39 @@ const STEP_STOP: f32 = 0.35;
 /// facing while he moves: he steps sideways or back, he does not turn
 /// to walk (M2TW's shuffle keeps facing).
 const STEP_FACE_SPEED: f32 = 1.05;
-/// Closing up behind the man ahead in melee: M2TW's ready-stance
-/// `advance` (1.06 m/s) for a small gap, its `combat_jog` (2.87 m/s)
-/// once the gap is more than a rank (devlog 0123).
+/// Going to an enemy he can see: M2TW's ready-stance `advance`
+/// (1.06 m/s) for the last few meters or with a comrade close ahead,
+/// its `combat_jog` (2.87 m/s) from further out over open ground
+/// (devlog 0123).
 const ADVANCE_PACE: f32 = 1.06;
 const COMBAT_JOG_PACE: f32 = 2.87;
+const JOG_BEYOND: f32 = 3.0;
+/// Each man stops short of the enemy he goes to at his own distance,
+/// 1.2 m plus up to this much: ranks are men, not a machine.
+const SEEK_STOP_SPREAD: f32 = 0.4;
+/// A man blocked by a comrade on the way to his enemy sidesteps toward
+/// an open lane in some one-second windows (M2TW's isSideStepping),
+/// and waits in the others.
+const SIDESTEP_WINDOW: u32 = 30;
+
+/// Share of those windows in which a blocked man sidesteps
+/// (FL_SIDESTEP, 0 to 1). A play-testing knob.
+fn sidestep_chance() -> f32 {
+    static P: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *P.get_or_init(|| crate::util::env_or("FL_SIDESTEP", 0.2))
+}
+/// A standing man plants his feet: a push must exceed this (m/s^2 of
+/// separation push) before it moves him. About a 10 cm squeeze from one
+/// neighbor. Stepping and running men, and charge knockback, are
+/// unaffected; true overlap is still corrected.
+const STAND_GRIP: f32 = 6.0;
+
+/// Sight radius for a man of a fighting regiment looking for an enemy
+/// to go to (FL_SEEK_R, meters). A play-testing knob.
+fn seek_radius() -> f32 {
+    static R: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *R.get_or_init(|| crate::util::env_or("FL_SEEK_R", 15.0))
+}
 const CHUNK: usize = 2048;
 
 /// Routing units flee at this fraction of their speed: fleeing at
@@ -224,6 +252,9 @@ pub struct RearDiag {
     prev_disp: Vec<Vec2>,
     acc: std::collections::BTreeMap<(u8, usize), [f64; 19]>,
     next_log: u32,
+    step_sum: f64,
+    grid_sum: f64,
+    step_n: u32,
 }
 
 /// One event buffer per integrate chunk; allocations persist across ticks.
@@ -354,8 +385,6 @@ pub struct TickJob {
     press: Vec<bool>,
     engaged: Vec<bool>,
     contact: Vec<bool>,
-    front_off: Vec<f32>,
-    pitch: Vec<Vec2>,
     hold: Vec<bool>,
     threat: Vec<Vec2>,
     form_face: Vec<Vec2>,
@@ -383,6 +412,7 @@ pub struct TickJob {
     dt: f32,
     combat_scale: f32,
     tick_seed: u32,
+    tick: u32,
     rf: bool,
     bounds_min: Vec2,
     bounds_max: Vec2,
@@ -796,17 +826,7 @@ fn prepare_tick(
     // Regiments holding a contact frame (frontline.rs): their fight is
     // ahead of them, and their men never step back to dress.
     let contact: Vec<bool> = groups.list.iter().map(|g| g.contact).collect();
-    // Each regiment's front-most slot along its facing, and its slot
-    // pitch: a man behind the front rank has a file-mate ahead of him.
-    let mut front_off = vec![f32::MIN; groups.list.len()];
-    for i in 0..units.pos.len() {
-        let g = group[i] as usize;
-        if contact[g] && death_t[i] == 0 {
-            let f = crate::formation::facing_dir(groups.list[g].facing);
-            front_off[g] = front_off[g].max(units.home[i].dot(f));
-        }
-    }
-    let pitch: Vec<Vec2> = groups.list.iter().map(|g| g.spacing.pitch()).collect();
+
     // Hold-position leash: units of a held regiment close only the last
     // step to a swing (no chasing across open ground).
     let hold: Vec<bool> = groups.list.iter().map(|g| g.hold).collect();
@@ -885,6 +905,7 @@ fn prepare_tick(
         buf.clear();
     }
     job.tick_seed = tick.wrapping_mul(0x9E37_79B1);
+    job.tick = tick;
     job.rf = rf;
     job.bounds_min = bounds_min;
     job.bounds_max = bounds_max;
@@ -896,8 +917,6 @@ fn prepare_tick(
     job.press = press;
     job.engaged = engaged;
     job.contact = contact;
-    job.front_off = front_off;
-    job.pitch = pitch;
     job.hold = hold;
     job.threat = threat;
     job.form_face = form_face;
@@ -920,6 +939,7 @@ fn run_tick_job(job: &mut TickJob) {
     let terrain: &Terrain = &terrain_arc;
     let dt = job.dt;
     let tick_seed = job.tick_seed;
+    let tick = job.tick;
     let rf = job.rf;
     let bounds_min = job.bounds_min;
     let bounds_max = job.bounds_max;
@@ -948,8 +968,6 @@ fn run_tick_job(job: &mut TickJob) {
         press,
         engaged,
         contact,
-        front_off,
-        pitch,
         hold,
         threat,
         form_face,
@@ -996,8 +1014,6 @@ fn run_tick_job(job: &mut TickJob) {
     let press = &press[..];
     let engaged = &engaged[..];
     let contact = &contact[..];
-    let front_off = &front_off[..];
-    let pitch = &pitch[..];
     let hold = &hold[..];
     let threat = &threat[..];
     let form_face = &form_face[..];
@@ -1170,13 +1186,14 @@ fn run_tick_job(job: &mut TickJob) {
                         Vec2::ZERO
                     };
                     let mut slot_blocked = false;
-                    // Closing up in melee: the nearest file-mate ahead of
-                    // him, and whether a comrade blocks the way forward.
-                    let follow = contact[gi] && !routed && form_face[gi] != Vec2::ZERO;
-                    let ff = form_face[gi];
-                    let half_file = 0.5 * pitch[gi].x;
-                    let mut mate_ahead = f32::MAX;
-                    let mut ahead_blocked = false;
+                    // Open lanes to either side of the way to that enemy,
+                    // for a sidestep when the way itself is blocked.
+                    let side_dir = Vec2::new(-memo_dir.y, memo_dir.x);
+                    let mut left_blocked = false;
+                    let mut right_blocked = false;
+                    // A comrade anywhere ahead within the scan: he walks
+                    // up to him instead of jogging.
+                    let mut comrade_ahead = false;
                     let scan_r = if at_charge_speed {
                         QUERY_RADIUS.max(params.reach).max(spear_reach)
                     } else {
@@ -1236,19 +1253,16 @@ fn run_tick_job(job: &mut TickJob) {
                         {
                             way_blocked = true;
                         }
-                        if follow && !cross && group[o.idx as usize] as usize == gi {
-                            let rel = -d;
-                            let ahead = rel.dot(ff);
-                            if ahead > 0.3 && (rel.x * ff.y - rel.y * ff.x).abs() < half_file {
-                                mate_ahead = mate_ahead.min(ahead);
-                            }
+                        if !cross && memo_dir != Vec2::ZERO && (-d).dot(memo_dir) > 0.707 * d2.sqrt() {
+                            comrade_ahead = true;
                         }
-                        if follow
-                            && !cross
-                            && d2 < SEP_RADIUS * SEP_RADIUS
-                            && (-d).dot(ff) > 0.707 * d2.sqrt()
-                        {
-                            ahead_blocked = true;
+                        if !cross && memo_dir != Vec2::ZERO && d2 < SEP_RADIUS * SEP_RADIUS {
+                            let lateral = (-d).dot(side_dir);
+                            if lateral > 0.707 * d2.sqrt() {
+                                left_blocked = true;
+                            } else if lateral < -0.707 * d2.sqrt() {
+                                right_blocked = true;
+                            }
                         }
                         if !cross
                             && slot_dir != Vec2::ZERO
@@ -1370,36 +1384,6 @@ fn run_tick_job(job: &mut TickJob) {
                     if slot_blocked {
                         desired = Vec2::ZERO;
                     }
-                    // Closing up (devlog 0123). In melee a man behind the
-                    // front rank keeps close behind the man ahead of him in
-                    // his file: when that man steps forward to fight, or
-                    // falls, the file follows at once instead of holding
-                    // its slots until the whole frame catches up. A mate
-                    // beyond the scan is a gap of more than a rank. Forward
-                    // only, through open ground, and only while no enemy
-                    // is in reach.
-                    if follow
-                        && best_idx == u32::MAX
-                        && !ahead_blocked
-                        && home[i].dot(ff) < front_off[gi] - 0.5 * pitch[gi].y
-                    {
-                        let gap = if mate_ahead < f32::MAX {
-                            mate_ahead - pitch[gi].y
-                        } else {
-                            f32::MAX
-                        };
-                        // A standing man starts only once the gap reaches
-                        // half a rank, so the fighter's small moves do not
-                        // ripple down the file; once moving he closes up.
-                        let moving = v_chunk[j].xz().length_squared()
-                            > (0.5 * STEP_PACE) * (0.5 * STEP_PACE);
-                        let start = if moving { STEP_STOP } else { 0.5 * pitch[gi].y };
-                        if gap > start {
-                            let pace = if gap > pitch[gi].y { COMBAT_JOG_PACE } else { ADVANCE_PACE };
-                            let ground = terrain.wade_mult(p.x, p.y);
-                            desired = desired - ff * desired.dot(ff) + ff * (pace * ground);
-                        }
-                    }
 
                     // Sparse-fight acquisition (see WIDE_ACQUIRE_R): a
                     // pressing unit with an empty scan and open space
@@ -1421,8 +1405,12 @@ fn run_tick_job(job: &mut TickJob) {
                         && crowd < acquire_crowd_lim
                         && (i as u32).wrapping_add(tick_seed).is_multiple_of(8)
                     {
-                        let mut far_d2 = WIDE_ACQUIRE_R * WIDE_ACQUIRE_R;
-                        grid.for_each_candidate(p, WIDE_ACQUIRE_R, |o| {
+                        // A man of a fighting regiment looks as far as he
+                        // can see (seek_radius); on the approach the old
+                        // short scan stands.
+                        let look = if engaged[gi] { seek_radius() } else { WIDE_ACQUIRE_R };
+                        let mut far_d2 = look * look;
+                        grid.for_each_candidate(p, look, |o| {
                             let enemy = (o.meta & crate::spatial::META_TEAM) != my_team_bit
                                 && (o.meta & crate::spatial::META_DYING) == 0;
                             if enemy {
@@ -1741,9 +1729,19 @@ fn run_tick_job(job: &mut TickJob) {
                         let to_enemy = pos_prev[close_to as usize].xz() - p;
                         let dist = to_enemy.length();
                         // Held regiments fight at arm's length only.
-                        let max_close = if hold[gi] { 2.2 } else { WIDE_ACQUIRE_R + 1.0 };
-                        if dist > 1.2 && dist < max_close {
-                            let mut urge = ((dist - 1.2) / 0.8).clamp(0.0, 1.0);
+                        let look = if engaged[gi] { seek_radius() } else { WIDE_ACQUIRE_R };
+                        let max_close = if hold[gi] { 2.2 } else { look + 1.0 };
+                        // Going to a seen enemy, each man stops at his own
+                        // distance; closing the last meter to a man already
+                        // in reach stays as it was.
+                        let stop = if memo_close {
+                            1.2 + SEEK_STOP_SPREAD
+                                * crate::units::hash01((i as u32).wrapping_mul(0x3C1B) ^ 0x51F7)
+                        } else {
+                            1.2
+                        };
+                        if dist > stop && dist < max_close {
+                            let mut urge = ((dist - stop) / 0.8).clamp(0.0, 1.0);
                             // The surge toward a REMEMBERED enemy (no
                             // one in reach yet) is steering, not combat
                             // execution: it yields to the jam like all
@@ -1760,10 +1758,34 @@ fn run_tick_job(job: &mut TickJob) {
                                 // (M2TW's crowded soldier, devlog 0121).
                                 if way_blocked {
                                     urge = 0.0;
+                                    // Waiting; in some windows he sidesteps
+                                    // toward whichever side is open.
+                                    let window = (tick.wrapping_add((i as u32).wrapping_mul(7))
+                                        / SIDESTEP_WINDOW)
+                                        .wrapping_mul(0x2545_F491);
+                                    let roll = crate::units::hash01(window ^ (i as u32).wrapping_mul(0x9E37));
+                                    let chance = sidestep_chance();
+                                    if roll < chance {
+                                        let side = match (left_blocked, right_blocked) {
+                                            (false, true) => side_dir,
+                                            (true, false) => -side_dir,
+                                            (false, false) if roll < 0.5 * chance => side_dir,
+                                            (false, false) => -side_dir,
+                                            (true, true) => Vec2::ZERO,
+                                        };
+                                        desired += side * STEP_PACE;
+                                    }
                                 }
                             }
-                            desired += to_enemy * (speed[i] * 0.35 * urge / dist);
-                            d_surge = to_enemy * (speed[i] * 0.35 * urge / dist);
+                            let pace = if !memo_close {
+                                speed[i] * 0.35
+                            } else if dist > JOG_BEYOND && !comrade_ahead {
+                                COMBAT_JOG_PACE
+                            } else {
+                                ADVANCE_PACE
+                            };
+                            desired += to_enemy * (pace * urge / dist);
+                            d_surge = to_enemy * (pace * urge / dist);
                         }
                     }
                     // Formation pace: walls advance deliberately (running
@@ -1789,8 +1811,16 @@ fn run_tick_job(job: &mut TickJob) {
                     // crowd is quasi-static and overlap resolution is
                     // purely positional — force-based separation in a
                     // wedged mass only produces bang-bang oscillation.
-                    let mut accel =
-                        (desired - v) * STEER_GAIN + push * (SEP_STRENGTH * (1.0 - jam));
+                    let mut push_a = push * (SEP_STRENGTH * (1.0 - jam));
+                    // A standing man plants his feet: small pushes do not
+                    // move him, real shoves do (less the grip). Without it
+                    // any squeeze turned straight into sliding, and a
+                    // fight's jostle rippled back through packed ranks.
+                    if desired.length_squared() < 1e-6 {
+                        let pl = push_a.length();
+                        push_a *= if pl > STAND_GRIP { (pl - STAND_GRIP) / pl } else { 0.0 };
+                    }
+                    let mut accel = (desired - v) * STEER_GAIN + push_a;
                     let a2 = accel.length_squared();
                     if a2 > MAX_ACCEL * MAX_ACCEL {
                         accel *= MAX_ACCEL / a2.sqrt();
@@ -2065,6 +2095,27 @@ pub fn step_sim(
     std::mem::swap(&mut arrow_spawns.0, &mut job.arrow_spawns);
     stats.grid_ms = job.grid_ms;
     stats.step_ms = job.step_ms;
+    // FL_LOG_STEP=1: mean kinematic step and grid time over each 150
+    // ticks (5 s), for cost comparisons between builds and knobs.
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *ON.get_or_init(|| std::env::var("FL_LOG_STEP").is_ok()) {
+            rear.step_sum += job.step_ms as f64;
+            rear.grid_sum += job.grid_ms as f64;
+            rear.step_n += 1;
+            if rear.step_n == 150 {
+                info!(
+                    "[step] mean step {:.2} ms, grid {:.2} ms, {} units",
+                    rear.step_sum / 150.0,
+                    rear.grid_sum / 150.0,
+                    units.pos.len()
+                );
+                rear.step_sum = 0.0;
+                rear.grid_sum = 0.0;
+                rear.step_n = 0;
+            }
+        }
+    }
     if diag_rear() {
         std::mem::swap(&mut rear.rows, &mut job.diag);
         rear_diag_aggregate(&mut rear, &units, &groups, job.dt, cstats.kills, pipeline.tick);
