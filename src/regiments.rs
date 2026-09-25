@@ -620,9 +620,17 @@ fn charge_test_log(
 fn spawn_pile_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
     let mut list = Vec::new();
     spawn_regiment(units, terrain, &mut list, 1, KIND_LIGHT, Vec2::new(0.0, 60.0), 500, 1.0);
-    list[0].hold = true;
+    // FL_PILE_ATEASE=1: the victim stands at ease instead of in hold, so
+    // it answers with its own attack order like a player's regiment.
+    list[0].hold = std::env::var("FL_PILE_ATEASE").is_err();
+    // FL_PILE_N: how many attackers (default six; two is "two regiments
+    // engage mine at once").
+    let n_attackers = crate::util::env_or("FL_PILE_N", 6_usize).clamp(1, 6);
     for row in 0..2 {
         for col in 0..3 {
+            if row * 3 + col >= n_attackers {
+                continue;
+            }
             let anchor =
                 Vec2::new((col as f32 - 1.0) * 55.0, -40.0 - row as f32 * 35.0);
             spawn_regiment(units, terrain, &mut list, 0, KIND_LIGHT, anchor, 500, -1.0);
@@ -632,7 +640,7 @@ fn spawn_pile_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
         }
     }
     groups.list = list;
-    info!("[pile-test] six blue regiments attack ONE holding orange regiment");
+    info!("[pile-test] {n_attackers} blue regiments attack ONE orange regiment");
 }
 
 /// FL_TEST_JOIN=1: the join-the-fight order (regression repro). Orange
@@ -736,19 +744,39 @@ fn routpass_test_log(
 
 /// FL_TEST_PILE bookkeeping every 4 s: victim strength + how many of
 /// the six attackers are actually fighting.
-fn pile_test_log(groups: Res<Groups>, time: Res<Time>, mut next: Local<f32>) {
-    if std::env::var("FL_TEST_PILE").is_err() || groups.list.len() < 7 {
+fn pile_test_log(groups: Res<Groups>, units: Res<Units>, time: Res<Time>, mut next: Local<f32>) {
+    if std::env::var("FL_TEST_PILE").is_err() || groups.list.len() < 2 {
         return;
     }
     let t = time.elapsed_secs();
     if t < *next {
         return;
     }
-    *next = t + 4.0;
+    *next = t + 1.0;
+    let n = groups.list.len() - 1;
     let engaged = groups.list[1..].iter().filter(|g| g.engaged).count();
+    let charging = groups.list[1..].iter().filter(|g| g.charging).count();
+    let v = &groups.list[0];
+    // How far the victim block has moved along its own facing since
+    // spawn (z = 60, facing -z): negative = pushed back.
+    let fwd = crate::formation::facing_dir(v.facing);
+    let moved = (v.centroid - Vec2::new(0.0, 60.0)).dot(fwd);
+    // Its front and rear edges (95th and 5th percentile of depth along
+    // its facing, relative to the spawn center): the center alone moves
+    // back as front-rank men die even if nobody steps.
+    let mut d: Vec<f32> = (0..units.len())
+        .filter(|&i| units.group[i] == 0 && units.death_t[i] == 0)
+        .map(|i| (Vec2::new(units.pos[i].x, units.pos[i].z) - Vec2::new(0.0, 60.0)).dot(fwd))
+        .collect();
+    d.sort_by(|a, b| a.total_cmp(b));
+    let (back, front) = if d.is_empty() {
+        (0.0, 0.0)
+    } else {
+        (d[d.len() / 20], d[d.len() * 19 / 20])
+    };
     info!(
-        "[pile-test] t={t:.0}s orange {} alive, blues engaged {engaged}/6",
-        groups.list[0].count
+        "[pile-test] t={t:.0}s orange {} alive, center {moved:+.2} front {front:+.2} rear {back:+.2} m along its facing, contact {}, engaged {} | blues engaged {engaged}/{n}, charging {charging}",
+        v.count, v.contact, v.engaged
     );
 }
 
