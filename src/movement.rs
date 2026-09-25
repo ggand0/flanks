@@ -114,8 +114,25 @@ fn join_react_chance() -> f32 {
 /// Ground speed toward the fight that reads as "going to it".
 const GOING_SPEED: f32 = 1.0;
 /// How far a man notices a comrade of his own regiment running to the
-/// fight (checked on the acquisition scan, every 8th tick).
+/// fight (on his far look, below).
 const JOIN_SEE_R: f32 = 6.0;
+/// A man does not re-read the comrades around him 30 times a second.
+/// He looks at the comrades beside him and in his way every LOOK_TICKS
+/// (about a quarter second, a human reaction time), in his own rhythm,
+/// and acts on what he last saw (the `sight` column) in between. His
+/// far look (enemies in sight, comrades running to the fight) keeps the
+/// acquisition's own 1-in-8 rhythm.
+const LOOK_TICKS: u32 = 8;
+/// `sight` bits: a comrade blocks his way, his left, his right; a
+/// comrade ahead; a comrade between him and his mark; a comrade close
+/// by running to the fight; one further out (far look).
+const SIGHT_WAY: u8 = 1;
+const SIGHT_LEFT: u8 = 1 << 1;
+const SIGHT_RIGHT: u8 = 1 << 2;
+const SIGHT_AHEAD: u8 = 1 << 3;
+const SIGHT_MARK: u8 = 1 << 4;
+const SIGHT_GO: u8 = 1 << 5;
+const SIGHT_GO_FAR: u8 = 1 << 6;
 /// Even with nobody going in sight, a man joins once his regiment has
 /// been in melee longer than his own patience, spread between these
 /// (seconds; FL_JOIN_PATIENCE sets the upper end): the fight's noise and
@@ -403,6 +420,7 @@ pub struct TickJob {
     death_t: Vec<u8>,
     ammo: Vec<u8>,
     out_form: Vec<bool>,
+    sight: Vec<u8>,
     // Per-regiment command snapshot, taken at prep.
     orders: Vec<Option<Vec2>>,
     anchors: Vec<Vec2>,
@@ -572,7 +590,7 @@ fn prepare_tick(
         pos_in <- pos, speed <- speed, team <- team, kind <- kind, group <- group,
         home <- home, vel <- vel, yaw <- yaw, yaw_prev <- yaw_prev, target <- target,
         swing <- swing, swing_t <- swing_t, flash <- flash, death_t <- death_t, ammo <- ammo,
-        out_form <- out_form
+        out_form <- out_form, sight <- sight
     );
     job.pos_out.clear();
     job.pos_out.resize(units.pos.len(), Vec3::ZERO);
@@ -991,6 +1009,7 @@ fn run_tick_job(job: &mut TickJob) {
         death_t,
         ammo,
         out_form,
+        sight,
         speed,
         team,
         kind,
@@ -1083,11 +1102,12 @@ fn run_tick_job(job: &mut TickJob) {
             .zip(arrow_spawns.iter_mut())
             .zip(diag.iter_mut())
             .zip(out_form.chunks_mut(CHUNK))
+            .zip(sight.chunks_mut(CHUNK))
             .enumerate()
         {
-            let (((((((((((((p_chunk, v_chunk), yaw_chunk), yawp_chunk), tgt_chunk), sw_chunk),
+            let ((((((((((((((p_chunk, v_chunk), yaw_chunk), yawp_chunk), tgt_chunk), sw_chunk),
                 swt_chunk), fl_chunk), dt_chunk), events), ammo_chunk), arrow_out), diag_out),
-                of_chunk) = chunk;
+                of_chunk), si_chunk) = chunk;
             let start = ci * CHUNK;
             scope.spawn(async move {
                 events.clear();
@@ -1219,6 +1239,7 @@ fn run_tick_job(job: &mut TickJob) {
                     let in_melee = fight_point[gi].is_some() && !routed && !dying;
                     if !in_melee {
                         of_chunk[j] = false;
+                        si_chunk[j] &= !(SIGHT_GO | SIGHT_GO_FAR);
                     } else if sw_chunk[j] & crate::units::SWING_STATE_MASK
                         != crate::units::SWING_READY
                         && sw_chunk[j] & crate::units::SWING_RANGED == 0
@@ -1369,69 +1390,77 @@ fn run_tick_job(job: &mut TickJob) {
                     } else {
                         Vec2::ZERO
                     };
-                    // A comrade in his way blocks him; he sidesteps
-                    // toward whichever side is open.
-                    let mut way_blocked = false;
-                    let side_dir = Vec2::new(-memo_dir.y, memo_dir.x);
-                    let mut left_blocked = false;
-                    let mut right_blocked = false;
-                    // A comrade ahead: he walks up to him instead of
-                    // jogging.
-                    let mut comrade_ahead = false;
-                    // A comrade of his own regiment close by, running to
-                    // the fight: the sight that makes him follow.
-                    let mut saw_comrade_go = false;
-                    // The same blocking test toward a holding man's own
-                    // mark.
+                    // The blocking test toward a holding man's own mark.
                     let slot_dir = if orders[gi].is_none() && engaged[gi] && !routed {
                         desired.normalize_or_zero()
                     } else {
                         Vec2::ZERO
                     };
-                    let mut slot_blocked = false;
-                    // What he sees of the comrades around him on his way
-                    // (to his enemy, to the fight, or back to his mark): a
-                    // separate pass over the same neighbors, run only by
-                    // men who are going somewhere, so the separation scan
-                    // everyone pays for stays lean. He looks for a lane
-                    // only while he has no enemy in reach, and watches his
-                    // comrades go only while he sees no enemy of his own.
+                    // Open lanes to either side of his way.
+                    let side_dir = Vec2::new(-memo_dir.y, memo_dir.x);
+                    // His look at the comrades around him on his way (to
+                    // his enemy, to the fight, or back to his mark), in
+                    // his own rhythm: a separate pass over the neighbors
+                    // of the separation scan, run only by men who are
+                    // going somewhere. He looks for a lane only while he
+                    // has no enemy in reach, and watches his comrades go
+                    // only while he sees no enemy of his own.
                     let look_lanes = memo_dir != Vec2::ZERO && best_idx == u32::MAX && !dying && !routed;
                     let watch_go = in_melee && !committed && !memo_valid;
                     let slot_on = slot_dir != Vec2::ZERO;
-                    if look_lanes || watch_go || slot_on {
-                        // Branch-free: neighbors of both teams interleave in a
-                        // melee, and branching on each one mispredicts.
-                        grid.for_each_candidate_vel(p, scan_r, |o, ov| {
-                            let comrade = (o.idx as usize != i)
-                                & ((o.meta & crate::spatial::META_TEAM) == my_team_bit);
-                            let d = p - o.xz();
-                            let d2 = d.length_squared();
-                            let reach = 0.707 * d2.sqrt();
-                            let near = d2 < SEP_RADIUS * SEP_RADIUS;
-                            let going = ov.dot(memo_dir);
-                            // A comrade ahead: he walks up to him instead
-                            // of jogging, and at arm's length the man
-                            // blocks his way. One already walking away the
-                            // same way is neither: men heading for the
-                            // same fight move together instead of each
-                            // waiting for the next.
-                            let away = going > 0.5;
-                            let ahead = comrade & look_lanes & ((-d).dot(memo_dir) > reach) & !away;
-                            comrade_ahead |= ahead;
-                            way_blocked |= ahead & near;
-                            saw_comrade_go |= comrade
-                                & watch_go
-                                & (crate::spatial::meta_group(o.meta) == gi)
-                                & (going > GOING_SPEED);
-                            let lateral = (-d).dot(side_dir);
-                            let beside = comrade & look_lanes & near;
-                            left_blocked |= beside & (lateral > reach);
-                            right_blocked |= beside & (lateral < -reach);
-                            slot_blocked |=
-                                comrade & slot_on & near & ((-d).dot(slot_dir) > reach);
-                        });
+                    if (i as u32).wrapping_add(tick).is_multiple_of(LOOK_TICKS) {
+                        let mut seen = 0u8;
+                        if look_lanes || watch_go || slot_on {
+                            let (mut way, mut left, mut right, mut ahead_any, mut mark, mut go) =
+                                (false, false, false, false, false, false);
+                            // Branch-free: neighbors of both teams interleave
+                            // in a melee, and branching on each one
+                            // mispredicts.
+                            grid.for_each_candidate_vel(p, scan_r, |o, ov| {
+                                let comrade = (o.idx as usize != i)
+                                    & ((o.meta & crate::spatial::META_TEAM) == my_team_bit);
+                                let d = p - o.xz();
+                                let d2 = d.length_squared();
+                                let reach = 0.707 * d2.sqrt();
+                                let near = d2 < SEP_RADIUS * SEP_RADIUS;
+                                let going = ov.dot(memo_dir);
+                                // A comrade ahead: he walks up to him
+                                // instead of jogging, and at arm's length
+                                // the man blocks his way. One already
+                                // walking away the same way is neither: men
+                                // heading for the same fight move together
+                                // instead of each waiting for the next.
+                                let away = going > 0.5;
+                                let ahead = comrade & look_lanes & ((-d).dot(memo_dir) > reach) & !away;
+                                ahead_any |= ahead;
+                                way |= ahead & near;
+                                // A comrade of his own regiment close by,
+                                // running to the fight: the sight that
+                                // makes him follow.
+                                go |= comrade
+                                    & watch_go
+                                    & (crate::spatial::meta_group(o.meta) == gi)
+                                    & (going > GOING_SPEED);
+                                let lateral = (-d).dot(side_dir);
+                                let beside = comrade & look_lanes & near;
+                                left |= beside & (lateral > reach);
+                                right |= beside & (lateral < -reach);
+                                mark |= comrade & slot_on & near & ((-d).dot(slot_dir) > reach);
+                            });
+                            seen = (way as u8 * SIGHT_WAY)
+                                | (left as u8 * SIGHT_LEFT)
+                                | (right as u8 * SIGHT_RIGHT)
+                                | (ahead_any as u8 * SIGHT_AHEAD)
+                                | (mark as u8 * SIGHT_MARK)
+                                | (go as u8 * SIGHT_GO);
+                        }
+                        si_chunk[j] = (si_chunk[j] & SIGHT_GO_FAR) | seen;
                     }
+                    let way_blocked = si_chunk[j] & SIGHT_WAY != 0;
+                    let left_blocked = si_chunk[j] & SIGHT_LEFT != 0;
+                    let right_blocked = si_chunk[j] & SIGHT_RIGHT != 0;
+                    let comrade_ahead = si_chunk[j] & SIGHT_AHEAD != 0;
+                    let slot_blocked = si_chunk[j] & SIGHT_MARK != 0;
                     // Ran onto a braced spear: the collision is a damage
                     // event from the SPEARMAN, resolved with everything
                     // else in the serial apply (which also stops the
@@ -1489,16 +1518,20 @@ fn run_tick_job(job: &mut TickJob) {
                     // (1 - jam) brake on the surge below is what stops
                     // him, continuously, when the pack is real.
                     let acquire_crowd_lim = if rf { CROWD_STOP } else { CROWD_SLOW };
+                    // A man of a fighting regiment looks as far as he can
+                    // see (seek_radius) on his far look; on the approach
+                    // the old short scan stands.
+                    let far_look = (i as u32).wrapping_add(tick_seed).is_multiple_of(8);
+                    if far_look {
+                        si_chunk[j] &= !SIGHT_GO_FAR;
+                    }
                     if best_idx == u32::MAX
                         && !dying
                         && !routed
                         && press[gi]
                         && crowd < acquire_crowd_lim
-                        && (i as u32).wrapping_add(tick_seed).is_multiple_of(8)
+                        && far_look
                     {
-                        // A man of a fighting regiment looks as far as he
-                        // can see (seek_radius); on the approach the old
-                        // short scan stands.
                         let look = if engaged[gi] { seek_radius() } else { WIDE_ACQUIRE_R };
                         let mut far_d2 = look * look;
                         grid.for_each_candidate(p, look, |o| {
@@ -1514,13 +1547,15 @@ fn run_tick_job(job: &mut TickJob) {
                         });
                         // Further than the neighbor scan, within JOIN_SEE_R:
                         // a comrade of his own regiment running to the fight.
-                        if watch_go && !saw_comrade_go {
-                            saw_comrade_go = grid.any_candidate_vel(p, look.min(JOIN_SEE_R), |o, ov| {
+                        if watch_go
+                            && grid.any_candidate_vel(p, look.min(JOIN_SEE_R), |o, ov| {
                                 o.idx as usize != i
                                     && crate::spatial::meta_group(o.meta) == gi
                                     && (p - o.xz()).length_squared() < JOIN_SEE_R * JOIN_SEE_R
                                     && ov.dot(memo_dir) > GOING_SPEED
-                            });
+                            })
+                        {
+                            si_chunk[j] |= SIGHT_GO_FAR;
                         }
                     }
 
@@ -1536,6 +1571,7 @@ fn run_tick_job(job: &mut TickJob) {
                             + (join_patience_max() - JOIN_PATIENCE_MIN)
                                 * crate::units::hash01((i as u32).wrapping_mul(0x3C6E) ^ 0xF372))
                             * 30.0;
+                        let saw_comrade_go = si_chunk[j] & (SIGHT_GO | SIGHT_GO_FAR) != 0;
                         let react = (memo_valid || saw_comrade_go) && {
                             let window = (tick.wrapping_add((i as u32).wrapping_mul(11)) / JOIN_WINDOW)
                                 .wrapping_mul(0x9E37_79B1);
@@ -2262,6 +2298,7 @@ pub fn step_sim(
         std::mem::swap(&mut u.death_t, &mut job.death_t);
         std::mem::swap(&mut u.ammo, &mut job.ammo);
         std::mem::swap(&mut u.out_form, &mut job.out_form);
+        std::mem::swap(&mut u.sight, &mut job.sight);
     }
     std::mem::swap(&mut *grid, &mut job.grid);
     std::mem::swap(&mut damage.0, &mut job.events);

@@ -53,6 +53,10 @@ pub struct Units {
     /// does not walk back to his slot; the flag clears when the melee
     /// ends and the regiment re-forms (movement.rs, devlog 0123).
     pub out_form: Vec<bool>,
+    /// What he last saw of the comrades around him and of comrades
+    /// running to the fight (movement.rs SIGHT_* bits). A man looks
+    /// around every few ticks, not every tick, and acts on what he saw.
+    pub sight: Vec<u8>,
     /// Bumped every time a battle rebuilds this world. A sim tick job
     /// computed from an older world carries indices that mean nothing
     /// here: movement.rs drops it instead of installing it.
@@ -222,6 +226,7 @@ pub fn push_unit(
         0
     });
     units.out_form.push(false);
+    units.sight.push(0);
 }
 
 /// FL_TEST_SURROUND: two equal blue detachments of light infantry, one
