@@ -113,6 +113,18 @@ fn join_react_chance() -> f32 {
 }
 /// Ground speed toward the fight that reads as "going to it".
 const GOING_SPEED: f32 = 1.0;
+/// How far a man notices a comrade of his own regiment running to the
+/// fight (checked on the acquisition scan, every 8th tick).
+const JOIN_SEE_R: f32 = 8.0;
+/// Even with nobody going in sight, a man joins once his regiment has
+/// been in melee longer than his own patience, spread between these
+/// (seconds; FL_JOIN_PATIENCE sets the upper end): the fight's noise and
+/// the officers carry further than sight. Far men join late, never not.
+const JOIN_PATIENCE_MIN: f32 = 8.0;
+fn join_patience_max() -> f32 {
+    static D: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *D.get_or_init(|| crate::util::env_or("FL_JOIN_PATIENCE", 25.0_f32).max(JOIN_PATIENCE_MIN))
+}
 
 /// Sight radius for a man of a fighting regiment looking for an enemy
 /// to go to (FL_SEEK_R, meters). A play-testing knob.
@@ -1464,24 +1476,6 @@ fn run_tick_job(job: &mut TickJob) {
                     if slot_blocked {
                         desired = Vec2::ZERO;
                     }
-                    if join_to.is_none() && saw_comrade_go {
-                        let window = (tick.wrapping_add((i as u32).wrapping_mul(11)) / JOIN_WINDOW)
-                            .wrapping_mul(0x9E37_79B1);
-                        if crate::units::hash01(window ^ (i as u32).wrapping_mul(0x6A09)) < join_react_chance() {
-                            join_to = join_fp;
-                        }
-                    }
-                    // A man committed to the fight (an enemy he is going
-                    // for, or joining) no longer dresses on his slot until
-                    // the fight ends and the regiment re-forms (M2TW keeps
-                    // the slot but the man fights out of formation).
-                    // Blocked, he stands; he never walks back to his old
-                    // place. Keeping the slot pull under the seek made him
-                    // loop between the fight and his slot.
-                    if fight_point[gi].is_some() && (memo_valid || join_to.is_some()) {
-                        desired = Vec2::ZERO;
-                    }
-
                     // Sparse-fight acquisition (see WIDE_ACQUIRE_R): a
                     // pressing unit with an empty scan and open space
                     // around it memoizes a farther enemy in `target` so
@@ -1516,9 +1510,50 @@ fn run_tick_job(job: &mut TickJob) {
                                     far_d2 = d2;
                                     tgt_chunk[j] = o.idx;
                                 }
+                            } else if join_fp.is_some()
+                                && !already_going
+                                && group[o.idx as usize] as usize == gi
+                                && (o.idx as usize) < vel_snap.len()
+                                && (p - o.xz()).length_squared() < JOIN_SEE_R * JOIN_SEE_R
+                                && vel_snap[o.idx as usize].dot(memo_dir) > GOING_SPEED
+                            {
+                                saw_comrade_go = true;
                             }
                         });
                     }
+
+
+                    // Joining: a comrade seen running to the fight (he
+                    // reacts in his own time), or his patience with the
+                    // fight's noise runs out.
+                    if join_to.is_none() && join_fp.is_some() {
+                        let patience = (JOIN_PATIENCE_MIN
+                            + (join_patience_max() - JOIN_PATIENCE_MIN)
+                                * crate::units::hash01((i as u32).wrapping_mul(0x3C6E) ^ 0xF372))
+                            * 30.0;
+                        if melee_ticks[gi] as f32 > patience {
+                            join_to = join_fp;
+                        } else if saw_comrade_go {
+                            let window = (tick.wrapping_add((i as u32).wrapping_mul(11)) / JOIN_WINDOW)
+                                .wrapping_mul(0x9E37_79B1);
+                            if crate::units::hash01(window ^ (i as u32).wrapping_mul(0x6A09))
+                                < join_react_chance()
+                            {
+                                join_to = join_fp;
+                            }
+                        }
+                    }
+                    // A man committed to the fight (an enemy he is going
+                    // for, or joining) no longer dresses on his slot until
+                    // the fight ends and the regiment re-forms (M2TW keeps
+                    // the slot but the man fights out of formation).
+                    // Blocked, he stands; he never walks back to his old
+                    // place. Keeping the slot pull under the seek made him
+                    // loop between the fight and his slot.
+                    if fight_point[gi].is_some() && (memo_valid || join_to.is_some()) {
+                        desired = Vec2::ZERO;
+                    }
+
 
                     // Swing state machine. All writes are to this unit's own
                     // row; damage goes through the chunk event buffer.
