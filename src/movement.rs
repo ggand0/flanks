@@ -1217,14 +1217,6 @@ fn run_tick_job(job: &mut TickJob) {
                         && v_chunk[j].xz().length_squared() > cs * cs;
                     let mut impale_idx = u32::MAX;
                     let mut impale_d = f32::MAX;
-                    // Direction to the enemy remembered last tick: a
-                    // comrade's body standing in that direction blocks the
-                    // surge toward him (below).
-                    let memo = prev_target as usize;
-                    let memo_valid = memo < pos_prev.len()
-                        && team[memo] != team[i]
-                        && pos_prev[memo].xz().distance_squared(p)
-                            < (seek_radius() + 1.0) * (seek_radius() + 1.0);
                     // In melee: his regiment has a fight. He is either
                     // still in formation or out of it (out_form: he left
                     // his slot to fight, a state that sticks until the
@@ -1241,32 +1233,6 @@ fn run_tick_job(job: &mut TickJob) {
                     }
                     let committed = in_melee && of_chunk[j];
                     let join_fp = if in_melee { fight_point[gi] } else { None };
-                    let memo_dir = if memo_valid {
-                        (pos_prev[memo].xz() - p).normalize_or_zero()
-                    } else if let Some(fp) = join_fp {
-                        (fp - p).normalize_or_zero()
-                    } else {
-                        Vec2::ZERO
-                    };
-                    let mut way_blocked = false;
-                    // The same test toward a holding man's own mark.
-                    let slot_dir = if orders[gi].is_none() && engaged[gi] && !routed {
-                        desired.normalize_or_zero()
-                    } else {
-                        Vec2::ZERO
-                    };
-                    let mut slot_blocked = false;
-                    // Open lanes to either side of the way to that enemy,
-                    // for a sidestep when the way itself is blocked.
-                    let side_dir = Vec2::new(-memo_dir.y, memo_dir.x);
-                    let mut left_blocked = false;
-                    let mut right_blocked = false;
-                    // A comrade anywhere ahead within the scan: he walks
-                    // up to him instead of jogging.
-                    let mut comrade_ahead = false;
-                    // A comrade of his own regiment close by, running to
-                    // the fight: the sight that makes him follow.
-                    let mut saw_comrade_go = false;
                     let scan_r = if at_charge_speed {
                         QUERY_RADIUS.max(params.reach).max(spear_reach)
                     } else {
@@ -1388,6 +1354,47 @@ fn run_tick_job(job: &mut TickJob) {
                         }
                     });
 
+                    // The enemy he remembers, if still in sight: he tracks
+                    // him while he has no enemy in reach, and seeing him
+                    // is what makes a man still in formation react. A man
+                    // fighting someone in reach out of formation needs
+                    // neither, and skips the lookup.
+                    let memo = prev_target as usize;
+                    let memo_valid = ((best_idx == u32::MAX && !dying && !routed)
+                        || (in_melee && !committed))
+                        && memo < pos_prev.len()
+                        && team[memo] != team[i]
+                        && pos_prev[memo].xz().distance_squared(p)
+                            < (seek_radius() + 1.0) * (seek_radius() + 1.0);
+                    // Which way he is going: to that enemy, else to his
+                    // regiment's fight.
+                    let memo_dir = if memo_valid {
+                        (pos_prev[memo].xz() - p).normalize_or_zero()
+                    } else if let Some(fp) = join_fp {
+                        (fp - p).normalize_or_zero()
+                    } else {
+                        Vec2::ZERO
+                    };
+                    // A comrade in his way blocks him; he sidesteps
+                    // toward whichever side is open.
+                    let mut way_blocked = false;
+                    let side_dir = Vec2::new(-memo_dir.y, memo_dir.x);
+                    let mut left_blocked = false;
+                    let mut right_blocked = false;
+                    // A comrade ahead: he walks up to him instead of
+                    // jogging.
+                    let mut comrade_ahead = false;
+                    // A comrade of his own regiment close by, running to
+                    // the fight: the sight that makes him follow.
+                    let mut saw_comrade_go = false;
+                    // The same blocking test toward a holding man's own
+                    // mark.
+                    let slot_dir = if orders[gi].is_none() && engaged[gi] && !routed {
+                        desired.normalize_or_zero()
+                    } else {
+                        Vec2::ZERO
+                    };
+                    let mut slot_blocked = false;
                     // What he sees of the comrades around him on his way
                     // (to his enemy, to the fight, or back to his mark): a
                     // separate pass over the same neighbors, run only by
