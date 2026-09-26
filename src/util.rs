@@ -13,7 +13,7 @@ thread_local! {
     static SIM_WORKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Mark the calling thread as the sim tick worker (movement.rs). Called
+/// Mark the calling thread as the sim tick worker (sim/mod.rs). Called
 /// once, when that thread starts.
 pub fn mark_sim_worker() {
     SIM_WORKER.with(|w| w.set(true));

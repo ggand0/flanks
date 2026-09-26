@@ -111,7 +111,7 @@ struct AudioBank {
     damage: Vec<Handle<AudioSource>>,
     death: Vec<Handle<AudioSource>>,
     vox_rout: Vec<Handle<AudioSource>>,
-    /// Rout soundscape (sfx_rout/, owner's movie-research direction +
+    /// Rout soundscape (sfx_rout/, the film retreats' direction +
     /// M2TW Individual_Retreat): commanders shouting Retreat/Withdraw
     /// over a mostly silent fleeing mass, panic screams only in the
     /// first moments of a break, massed running feet underneath.
@@ -206,7 +206,7 @@ fn setup_audio(mut commands: Commands, assets: Res<AssetServer>) {
             "sfx_death_04",
             "sfx_death_05",
         ]),
-        // vox_rally_01/02 are benched (owner: unusable, use nowhere).
+        // vox_rally_01/02 are benched: unusable, use nowhere.
         vox_rout: load_set(&[
             "vox_rout_01",
             "vox_rout_02",
@@ -239,7 +239,7 @@ fn setup_audio(mut commands: Commands, assets: Res<AssetServer>) {
             "sfx_rout/feet_run_wash_mass_02",
         ]),
         // The sfx_new/vox_rally_03/04_celebrate one-shots are benched
-        // (owner: superseded); the celebrate state cheers from these.
+        // (superseded); the celebrate state cheers from these.
         celebrate_small: load_set(&[
             "sfx_celebrate/group_cheer_small_01_mocking",
             "sfx_celebrate/group_cheer_small_02_mocking",
@@ -333,7 +333,7 @@ fn setup_audio(mut commands: Commands, assets: Res<AssetServer>) {
             "sfx_melee/battle_screams/battle_scream9",
         ]),
         // The old vox_warcry crowd clips are benched: the charge is
-        // layered from these pools now (devlog 0069).
+        // layered from these pools now.
         yell_charge: load_set(&[
             "sfx_charge/vox_yell_01",
             "sfx_charge/vox_yell_01b",
@@ -875,7 +875,7 @@ fn archer_one_shots(
     }
 
     // String snaps: a volley is the EVENT, not garnish over a din (the
-    // melee-clang tuning read as "a dozen archers", owner-tested) — a
+    // melee-clang tuning read as "a dozen archers" in play) — a
     // large share of looses each spawn a jittered snap and the clips
     // LAYER into the ripple of a massed release. Distance thins the
     // count only mildly; it mostly quiets the clips.
@@ -1091,7 +1091,7 @@ fn event_cues(
             }
             // The victors' roar moved to celebrate_vox: the M2TW cheer
             // is a STATE (the last nearby foe gone), not a break edge.
-            // Rally has no vox for now (owner benched the old clips);
+            // Rally has no vox for now (the old clips are benched);
             // a rally cue needs a fresh asset first.
             st.vox_gate = 1.5;
         }
@@ -1117,8 +1117,8 @@ struct ChargeVoxState {
     frame: u32,
 }
 
-/// The M2TW charge soundscape, two layers (mined configs, devlog
-/// 0069). Foreground: single-man charge yells — M2TW plays
+/// The M2TW charge soundscape, two layers (mined from its configs).
+/// Foreground: single-man charge yells — M2TW plays
 /// `Individual_Charge` on one in five charging soldiers, each his own
 /// positional clip — budgeted here from the men charging near the
 /// camera, the same fractional-accumulator pattern as the clangs and
@@ -1196,7 +1196,7 @@ fn charge_vox(
     }
 
     // Yell budget: 0.2 yells per man (M2TW probability) spread over the
-    // measured 2.8..7 s charge window (~4.5 s mid, devlog 0056). Our
+    // measured 2.8..7 s charge window (~4.5 s mid). Our
     // regiments run far bigger than M2TW's 60-150 men, so the caps and
     // the one-shot allowance keep a 1000-man charge a chorus instead
     // of a decoder flood.
@@ -1236,7 +1236,7 @@ struct RoutVoxState {
     frame: u32,
 }
 
-/// The rout soundscape. Owner's direction from film retreats
+/// The rout soundscape, after film retreats
 /// (Napoleon 2023, The Patriot), matching the M2TW config: after the
 /// first panicked moments men flee mostly SILENT — what carries is
 /// officers shouting Retreat / Withdraw / Fall back (M2TW
@@ -1371,7 +1371,7 @@ struct CelebrateVoxState {
     frame: u32,
 }
 
-/// Victory celebration (M2TW unit_celebrate state bank, devlog 0070):
+/// Victory celebration (M2TW unit_celebrate state bank):
 /// while a regiment's `celebrate` window runs (the last nearby foe
 /// routed or died, ~5 s, frontline.rs), it cheers as a STATE — a
 /// rolling size-banded group cheer per regiment, first sheet on the
@@ -1476,7 +1476,7 @@ struct MeleeVoxState {
     frame: u32,
 }
 
-/// The melee human layer (M2TW soldier_voice vocals, devlog 0070):
+/// The melee human layer (M2TW soldier_voice vocals):
 /// men, not steel, carry the sound of a fight. Two feeds. Per-HIT
 /// vocals ride the same sim hit counter as the clangs — each spawn
 /// picks the attacker's grunt, the victim's grunt, or the attacker's

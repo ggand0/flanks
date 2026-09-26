@@ -126,7 +126,7 @@ const TAU: f32 = 6.2831853;
 const PI: f32 = 3.14159265;
 
 // How much a soldier is moving, 0..1, from his smoothed ground speed.
-// The deadband sits over crowd jitter (about 0.03 m/s, devlog 0021) and
+// The deadband sits over crowd jitter (about 0.03 m/s) and
 // it saturates by 1.2 m/s, so a slow shove still reads.
 fn walk_gate(speed: f32) -> f32 {
     return smoothstep(0.06, 1.2, speed);

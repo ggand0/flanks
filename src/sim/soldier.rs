@@ -56,7 +56,7 @@ const ARRIVE_RADIUS: f32 = 35.0;
 /// A holding soldier who leaves his mark by more than the hold deadzone
 /// walks back at this pace at least, and keeps going until he is within
 /// STEP_STOP of it: a real step, never a creep. M2TW's slowest
-/// locomotion is its shuffle, 0.75 to 0.9 m/s (devlog 0120).
+/// locomotion is its shuffle, 0.75 to 0.9 m/s.
 const STEP_PACE: f32 = 0.8;
 const STEP_STOP: f32 = 0.35;
 /// Below this ground speed a standing formation's soldier keeps his
@@ -65,8 +65,7 @@ const STEP_STOP: f32 = 0.35;
 const STEP_FACE_SPEED: f32 = 1.05;
 /// Going to an enemy he can see: M2TW's ready-stance `advance`
 /// (1.06 m/s) for the last few meters or with a comrade close ahead,
-/// its `combat_jog` (2.87 m/s) from further out over open ground
-/// (devlog 0123).
+/// its `combat_jog` (2.87 m/s) from further out over open ground.
 const ADVANCE_PACE: f32 = 1.06;
 const COMBAT_JOG_PACE: f32 = 2.87;
 const JOG_BEYOND: f32 = 3.0;
@@ -94,7 +93,7 @@ const STAND_GRIP: f32 = 6.0;
 /// he sees the comrade beside him run toward it: in each half-second
 /// window he reacts with this chance (FL_JOIN_REACT overrides), so the
 /// line rolls up from the contact outward, a man at a time, as in
-/// Gota's M2TW test (devlog 0123). Once going he keeps going.
+/// M2TW when a deep unit hits a wide line. Once going he keeps going.
 const JOIN_WINDOW: u32 = 15;
 fn join_react_chance() -> f32 {
     static P: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
@@ -320,11 +319,11 @@ pub(crate) fn tick_chunk(f: &Field, rows: Rows, out: &mut ChunkOut) {
         drive(f, &mut s, &mut st);
         scan(f, &mut s, &mut st, out);
         look_around(f, &mut s, &mut st);
-        hold_the_frame(f, &mut s, &mut st);
+        hold_the_frame(f, &mut st);
         acquire(f, &mut s, &mut st);
         decide_to_join(f, &mut s, &mut st);
         swing(f, &mut s, &mut st, out);
-        yield_to_crowd(f, &mut s, &mut st);
+        yield_to_crowd(&mut st);
         close_in(f, &mut s, &mut st);
         steer(f, &mut s, &mut st);
         face(f, &mut s, &mut st);
@@ -344,18 +343,17 @@ fn begin(f: &Field, s: &mut Soldier) -> Step {
     let dying = *s.death_t > 0;
     // Hit flash decays here (set by the serial apply pass).
     *s.flash = s.flash.saturating_sub(1);
-    // Corpses play out their death anim: no orders, no combat; they stay
-    // as an obstacle until swept.
+    // Corpses play out their death anim: no orders, no combat; they stay as
+    // an obstacle until swept.
     if dying && *s.death_t > 1 {
         *s.death_t -= 1;
     }
     let gi = group[i] as usize;
     let routed = broken[gi];
-    // In melee: his regiment has a fight. He is either
-    // still in formation or out of it (out_form: he left
-    // his slot to fight, a state that sticks until the
-    // melee ends; M2TW's isInFormation). Fighting takes
-    // him out of formation.
+    // In melee: his regiment has a fight. He is either still in formation or
+    // out of it (out_form: he left his slot to fight, a state that sticks
+    // until the melee ends; M2TW's isInFormation). Fighting takes him out of
+    // formation.
     let in_melee = fight_point[gi].is_some() && !routed && !dying;
     if !in_melee {
         *s.out_form = false;
@@ -416,21 +414,19 @@ fn drive(f: &Field, s: &mut Soldier, st: &mut Step) {
     let gi = st.gi;
     let dying = st.dying;
     let routed = st.routed;
-    // Units move ONLY under orders. A regiment order is one
-    // point rigidly translated by each unit's `home` offset
-    // (the block moves; it never converges). No order =
-    // hold at the anchor — a standing order: units drift
-    // back to their slot at reduced gain inside the block.
-    // Enemy contact is pure physics: cross-team separation
-    // blocks, crowd yield stops the shove, combat thins the
-    // block. The "front line" is where that collision is.
+    // Units move ONLY under orders. A regiment order is one point rigidly
+    // translated by each unit's `home` offset (the block moves; it never
+    // converges). No order = hold at the anchor — a standing order: units
+    // drift back to their slot at reduced gain inside the block. Enemy
+    // contact is pure physics: cross-team separation blocks, crowd yield
+    // stops the shove, combat thins the block. The "front line" is where that
+    // collision is.
     let mut desired = Vec2::ZERO;
     if !dying && routed {
-        // Broken: flee toward the own map edge with a
-        // per-unit lateral scatter — slightly SLOWER than
-        // formed pursuers (0.9x): fleeing at exactly max
-        // speed made pursuit a zero-kill treadmill (gap
-        // frozen forever, counts flat for 30-45 s).
+        // Broken: flee toward the own map edge with a per-unit lateral
+        // scatter — slightly SLOWER than formed pursuers (0.9x): fleeing at
+        // exactly max speed made pursuit a zero-kill treadmill (gap frozen
+        // forever, counts flat for 30-45 s).
         let flee_z: f32 = if team[i] == 0 { -1.0 } else { 1.0 };
         let lat = (crate::units::hash01((i as u32).wrapping_mul(17) + 3) - 0.5)
             * 0.7;
@@ -446,22 +442,18 @@ fn drive(f: &Field, s: &mut Soldier, st: &mut Step) {
         let goal = orders[gi].unwrap_or(anchors[gi]) + home[i];
         let to_goal = goal - p;
         let dist = to_goal.length();
-        // Hold deadzone: parked units don't jitter around
-        // their slot point. 0.7 m (was 1.5 when homes were
-        // jittered spawn offsets): rigid slots sit exactly
-        // at the separation rest distance, so a dressed
-        // rank is force-free and can afford tight tolerance
-        // — with 1.5 the ranks never finished dressing.
-        // A soldier already stepping finishes the step
-        // (STEP_STOP) instead of stalling at the
-        // deadzone's edge.
+        // Hold deadzone: parked units don't jitter around their slot point.
+        // 0.7 m (was 1.5 when homes were jittered spawn offsets): rigid slots
+        // sit exactly at the separation rest distance, so a dressed rank is
+        // force-free and can afford tight tolerance — with 1.5 the ranks
+        // never finished dressing. A soldier already stepping finishes the
+        // step (STEP_STOP) instead of stalling at the deadzone's edge.
         let stepping = s.vel.xz().length_squared()
             > (0.5 * STEP_PACE) * (0.5 * STEP_PACE);
         let deadzone = if stepping { STEP_STOP } else { 0.7 };
         if !(holding && dist < deadzone) {
-            // Slope penalty: steep ground is slow ground.
-            // Wading the river is slow too (the bridge
-            // deck is dry: full speed).
+            // Slope penalty: steep ground is slow ground. Wading the river is
+            // slow too (the bridge deck is dry: full speed).
             let slope = terrain.slope_at(p.x, p.y);
             let slope_mult = 1.0 / (1.0 + 3.0 * slope * slope);
             let (gain, arrive) = if holding {
@@ -499,11 +491,10 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
     let p = st.p;
     let gi = st.gi;
     let dying = st.dying;
-    // Fused neighbor scan: separation physics + nearest
-    // living enemy in reach (swing targeting). Scalar over
-    // cache-ordered SortedUnits — an 8-wide SIMD variant
-    // measured slower here (devlog 0020): candidate runs
-    // are too short for lane occupancy.
+    // Fused neighbor scan: separation physics + nearest living enemy in reach
+    // (swing targeting). Scalar over cache-ordered SortedUnits — an 8-wide
+    // SIMD variant measured slower here: candidate runs are too short for
+    // lane occupancy.
     let mut push = Vec2::ZERO;
     let mut corr = Vec2::ZERO;
     let mut crowd = 0.0f32;
@@ -515,12 +506,10 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
     let mut best_d2 = f32::MAX;
     let mut best_idx = u32::MAX;
     let mut sticky = false;
-    // Moving at charge speed with unspent momentum: braced
-    // enemy spears in the path are a collision hazard, and
-    // the scan must see out to SPEAR reach, not just mine.
-    // A man already run through (flash) or reeling is not
-    // re-impaled every tick — a spear is a point, not an
-    // aura.
+    // Moving at charge speed with unspent momentum: braced enemy spears in
+    // the path are a collision hazard, and the scan must see out to SPEAR
+    // reach, not just mine. A man already run through (flash) or reeling is
+    // not re-impaled every tick — a spear is a point, not an aura.
     let spear_reach = TYPES[crate::unit_types::KIND_SPEAR as usize].reach;
     let cs = speed[i] * CHARGE_SPEED_FRAC;
     let at_charge_speed = faces_spearwall[team[i] as usize]
@@ -550,9 +539,8 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
                 best_idx = o.idx;
             }
         }
-        // Spear-line collision: he is a braced enemy
-        // spearman, and my body is crossing his leveled
-        // point while I close at speed.
+        // Spear-line collision: he is a braced enemy spearman, and my body is
+        // crossing his leveled point while I close at speed.
         if at_charge_speed
             && enemy
             && (o.meta & crate::spatial::META_WALL) != 0
@@ -575,23 +563,18 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
                 impale_idx = o.idx;
             }
         }
-        // Two same-team units both in a wall STANCE rest
-        // shoulder to shoulder (symmetric predicate: both
-        // sides compute the same radius). Ordinary ranks
-        // keep parade spacing even while fighting — the
-        // seams between files are what enemy bodies flow
-        // into.
+        // Two same-team units both in a wall STANCE rest shoulder to shoulder
+        // (symmetric predicate: both sides compute the same radius). Ordinary
+        // ranks keep parade spacing even while fighting — the seams between
+        // files are what enemy bodies flow into.
         let cross = (o.meta & crate::spatial::META_TEAM) != my_team_bit;
-        // No packing rule for fighting regiments: M2TW
-        // keeps its formation grid during melee, and
-        // observably loosens it. The fighting crowd's
-        // spacing is slots plus body collision, nothing
-        // else. A shoulder-to-shoulder press rest for
-        // fighting pairs sealed the very seams the
-        // intermix needs: a pressed front's gaps shrank
-        // to about 1.05 m against 0.95 m bodies and
-        // symmetric fights collapsed to a two-rank duel
-        // line. It must not come back.
+        // No packing rule for fighting regiments: M2TW keeps its formation
+        // grid during melee, and observably loosens it. The fighting crowd's
+        // spacing is slots plus body collision, nothing else. A
+        // shoulder-to-shoulder press rest for fighting pairs sealed the very
+        // seams the intermix needs: a pressed front's gaps shrank to about
+        // 1.05 m against 0.95 m bodies and symmetric fights collapsed to a
+        // two-rank duel line. It must not come back.
         let sep_r = if !cross && my_wall && (o.meta & crate::spatial::META_WALL) != 0 {
             WALL_SEP_RADIUS
         } else {
@@ -604,29 +587,25 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
             let len = d2.sqrt();
             let w = 1.0 - len / sep_r;
             if len < HARD_RADIUS {
-                // Overlap is resolved POSITIONALLY only.
-                // (There used to be a hard force boost here
-                // too — two solvers fighting over the same
-                // overlap made packed crowds oscillate at
-                // the accel cap: the every-frame twitch.)
+                // Overlap is resolved POSITIONALLY only. A hard force boost
+                // here as well made packed crowds oscillate at the
+                // acceleration cap, two solvers fighting over the same
+                // overlap, every frame.
                 corr += d * ((HARD_RADIUS - len) * CORR_GAIN * mw / len);
             }
             push += d * (w * mw / len);
-            // Jam density: COMPRESSED pairs only — a
-            // neighbor resting AT his pair's rest
-            // distance contests nothing, so a formed
-            // man's slot-keeping is never faded by the
-            // settled enemies one stride away (the
-            // yield-and-stay-ragged defect).
+            // Jam density: COMPRESSED pairs only — a neighbor resting AT his
+            // pair's rest distance contests nothing, so a formed man's
+            // slot-keeping is never faded by the settled enemies one stride
+            // away, which made a line yield and stay ragged.
             crowd += w;
         }
     });
 
-    // Ran onto a braced spear: the collision is a damage
-    // event from the SPEARMAN, resolved with everything
-    // else in the serial apply (which also stops the
-    // runner). One point, one wound — the nearest line
-    // crossed this tick.
+    // Ran onto a braced spear: the collision is a damage event from the
+    // SPEARMAN, resolved with everything else in the serial apply (which also
+    // stops the runner). One point, one wound — the nearest line crossed this
+    // tick.
     if impale_idx != u32::MAX {
         let jit = 0.85
             + 0.3
@@ -674,10 +653,9 @@ fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
     let best_idx = st.best_idx;
     let scan_r = st.scan_r;
     let my_team_bit = st.my_team_bit;
-    // The enemy he remembers, if still in sight: he tracks
-    // him while he has no enemy in reach, and seeing him
-    // is what makes a man still in formation react. A man
-    // fighting someone in reach out of formation needs
+    // The enemy he remembers, if still in sight: he tracks him while he has
+    // no enemy in reach, and seeing him is what makes a man still in
+    // formation react. A man fighting someone in reach out of formation needs
     // neither, and skips the lookup.
     let memo = prev_target as usize;
     let memo_valid = ((best_idx == u32::MAX && !dying && !routed)
@@ -686,8 +664,7 @@ fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
         && team[memo] != team[i]
         && pos_prev[memo].xz().distance_squared(p)
             < (seek_radius() + 1.0) * (seek_radius() + 1.0);
-    // Which way he is going: to that enemy, else to his
-    // regiment's fight.
+    // Which way he is going: to that enemy, else to his regiment's fight.
     let memo_dir = if memo_valid {
         (pos_prev[memo].xz() - p).normalize_or_zero()
     } else if let Some(fp) = join_fp {
@@ -703,13 +680,11 @@ fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
     };
     // Open lanes to either side of his way.
     let side_dir = Vec2::new(-memo_dir.y, memo_dir.x);
-    // His look at the comrades around him on his way (to
-    // his enemy, to the fight, or back to his mark), in
-    // his own rhythm: a separate pass over the neighbors
-    // of the separation scan, run only by men who are
-    // going somewhere. He looks for a lane only while he
-    // has no enemy in reach, and watches his comrades go
-    // only while he sees no enemy of his own.
+    // His look at the comrades around him on his way (to his enemy, to the
+    // fight, or back to his mark), in his own rhythm: a separate pass over
+    // the neighbors of the separation scan, run only by men who are going
+    // somewhere. He looks for a lane only while he has no enemy in reach, and
+    // watches his comrades go only while he sees no enemy of his own.
     let look_lanes = memo_dir != Vec2::ZERO && best_idx == u32::MAX && !dying && !routed;
     let watch_go = in_melee && !committed && !memo_valid;
     let slot_on = slot_dir != Vec2::ZERO;
@@ -718,9 +693,8 @@ fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
         if look_lanes || watch_go || slot_on {
             let (mut way, mut left, mut right, mut ahead_any, mut mark, mut go) =
                 (false, false, false, false, false, false);
-            // Branch-free: neighbors of both teams interleave
-            // in a melee, and branching on each one
-            // mispredicts.
+            // Branch-free: neighbors of both teams interleave in a melee, and
+            // branching on each one mispredicts.
             grid.for_each_candidate_vel(p, scan_r, |o, ov| {
                 let comrade = (o.idx as usize != i)
                     & ((o.meta & crate::spatial::META_TEAM) == my_team_bit);
@@ -729,19 +703,16 @@ fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
                 let reach = 0.707 * d2.sqrt();
                 let near = d2 < SEP_RADIUS * SEP_RADIUS;
                 let going = ov.dot(memo_dir);
-                // A comrade ahead: he walks up to him
-                // instead of jogging, and at arm's length
-                // the man blocks his way. One already
-                // walking away the same way is neither: men
-                // heading for the same fight move together
-                // instead of each waiting for the next.
+                // A comrade ahead: he walks up to him instead of jogging, and
+                // at arm's length the man blocks his way. One already walking
+                // away the same way is neither: men heading for the same
+                // fight move together instead of each waiting for the next.
                 let away = going > 0.5;
                 let ahead = comrade & look_lanes & ((-d).dot(memo_dir) > reach) & !away;
                 ahead_any |= ahead;
                 way |= ahead & near;
-                // A comrade of his own regiment close by,
-                // running to the fight: the sight that
-                // makes him follow.
+                // A comrade of his own regiment close by, running to the
+                // fight: the sight that makes him follow.
                 go |= comrade
                     & watch_go
                     & (crate::spatial::meta_group(o.meta) == gi)
@@ -781,33 +752,29 @@ fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
 /// from his regiment's fight to dress, or press into the comrade between
 /// him and his mark.
 #[inline]
-fn hold_the_frame(f: &Field, _s: &mut Soldier, st: &mut Step) {
+fn hold_the_frame(f: &Field, st: &mut Step) {
     let Field { contact, form_face, .. } = *f;
     let gi = st.gi;
     let routed = st.routed;
     let slot_blocked = st.slot_blocked;
     let mut desired = st.desired;
-    // A regiment fighting on its contact frame never
-    // steps backward, away from its fight, to dress its
-    // ranks: a man ahead of his mark (bunched up behind a
-    // stopped front, or shoved forward) stays; he only
-    // steps forward or sideways to it. Without this a
-    // charging block walked backward to reopen its ranks
-    // the moment it made contact. A regiment struck from
-    // behind has its fight at its back, so it keeps
-    // stepping back to hold its ground.
+    // A regiment fighting on its contact frame never steps backward, away
+    // from its fight, to dress its ranks: a man ahead of his mark (bunched up
+    // behind a stopped front, or shoved forward) stays; he only steps forward
+    // or sideways to it. Without this a charging block walked backward to
+    // reopen its ranks the moment it made contact. A regiment struck from
+    // behind has its fight at its back, so it keeps stepping back to hold its
+    // ground.
     if contact[gi] && !routed && form_face[gi] != Vec2::ZERO {
         let back = desired.dot(form_face[gi]);
         if back < 0.0 {
             desired -= form_face[gi] * back;
         }
     }
-    // In melee, holding men step back to their marks only
-    // through open ground: shoved off his mark with a comrade
-    // between him and it, a man stands where he is until
-    // the way clears (the comrade dies, steps up or moves
-    // back to his own mark) instead of pressing into
-    // the man's back.
+    // In melee, holding men step back to their marks only through open
+    // ground: shoved off his mark with a comrade between him and it, a man
+    // stands where he is until the way clears (the comrade dies, steps up or
+    // moves back to his own mark) instead of pressing into the man's back.
     if slot_blocked {
         desired = Vec2::ZERO;
     }
@@ -832,16 +799,14 @@ fn acquire(f: &Field, s: &mut Soldier, st: &mut Step) {
     let watch_go = st.watch_go;
     let memo_dir = st.memo_dir;
     let my_team_bit = st.my_team_bit;
-    // Sparse-fight acquisition (see WIDE_ACQUIRE_R): a
-    // pressing unit with an empty scan and open space
-    // around it memoizes a farther enemy in `target` so
-    // the closing drive below can restore contact. Gated
-    // hard (press + no near enemy + low crowd + 1/8
-    // cadence) to stay off the 200k hot path.
+    // Sparse-fight acquisition (see WIDE_ACQUIRE_R): a pressing unit with an
+    // empty scan and open space around it memoizes a farther enemy in
+    // `target` so the closing drive below can restore contact. Gated hard
+    // (press + no near enemy + low crowd + 1/8 cadence) to stay off the 200k
+    // hot path.
     let acquire_crowd_lim = CROWD_SLOW;
-    // A man of a fighting regiment looks as far as he can
-    // see (seek_radius) on his far look; on the approach
-    // the old short scan stands.
+    // A man of a fighting regiment looks as far as he can see (seek_radius)
+    // on his far look; on the approach the old short scan stands.
     let far_look = (i as u32).wrapping_add(tick_seed).is_multiple_of(8);
     if far_look {
         *s.sight &= !SIGHT_GO_FAR;
@@ -866,8 +831,8 @@ fn acquire(f: &Field, s: &mut Soldier, st: &mut Step) {
                 }
             }
         });
-        // Further than the neighbor scan, within JOIN_SEE_R:
-        // a comrade of his own regiment running to the fight.
+        // Further than the neighbor scan, within JOIN_SEE_R: a comrade of his
+        // own regiment running to the fight.
         if watch_go
             && grid.any_candidate_vel(p, look.min(JOIN_SEE_R), |o, ov| {
                 o.idx as usize != i
@@ -893,11 +858,10 @@ fn decide_to_join(f: &Field, s: &mut Soldier, st: &mut Step) {
     let memo_valid = st.memo_valid;
     let mut desired = st.desired;
     let committed = st.committed;
-    // Leaving formation to fight, in his own time: he
-    // reacts to an enemy in sight or a comrade seen running
-    // to the fight (a chance per half-second window), or
-    // his patience with the fight's noise runs out. Near
-    // men go first and the line rolls up outward.
+    // Leaving formation to fight, in his own time: he reacts to an enemy in
+    // sight or a comrade seen running to the fight (a chance per half-second
+    // window), or his patience with the fight's noise runs out. Near men go
+    // first and the line rolls up outward.
     let mut committed = committed;
     if in_melee && !committed {
         let patience = (JOIN_PATIENCE_MIN
@@ -916,12 +880,11 @@ fn decide_to_join(f: &Field, s: &mut Soldier, st: &mut Step) {
             *s.out_form = true;
         }
     }
-    // Out of formation he never dresses on his slot until
-    // the melee ends and the regiment re-forms: he fights,
-    // goes for an enemy he sees, heads for the fight, or
-    // stands where he is when blocked. Inferring this from
-    // his speed made a man who slowed down run back to his
-    // slot and come out again, over and over.
+    // Out of formation he never dresses on his slot until the melee ends and
+    // the regiment re-forms: he fights, goes for an enemy he sees, heads for
+    // the fight, or stands where he is when blocked. Inferring this from his
+    // speed made a man who slowed down run back to his slot and come out
+    // again, over and over.
     if committed {
         desired = Vec2::ZERO;
     }
@@ -946,16 +909,15 @@ fn swing(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
     let best_idx = st.best_idx;
     let my_kind = st.my_kind;
     let mut desired = st.desired;
-    // Swing state machine. All writes are to this unit's own
-    // row; damage goes through the chunk event buffer.
+    // Swing state machine. All writes are to this unit's own row; damage goes
+    // through the chunk event buffer.
     let mut face_target = None;
     if !dying {
         match *s.swing & crate::units::SWING_STATE_MASK {
             crate::units::SWING_WINDUP
                 if *s.swing & crate::units::SWING_RANGED != 0 =>
             {
-                // Drawing the bow: feet planted, eyes on
-                // the target block.
+                // Drawing the bow: feet planted, eyes on the target block.
                 desired = Vec2::ZERO;
                 if let Some(shot) = &shoot_at[gi] {
                     face_target = Some(shot.c);
@@ -966,16 +928,11 @@ fn swing(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
                                     ^ (i as u32).wrapping_mul(k).wrapping_add(k),
                             )
                         };
-                        // Aim: an actual soldier of the
-                        // target regiment (M2TW keeps a
-                        // per-soldier aim target, devlog
-                        // 0060), the M2TW range-
-                        // INDEPENDENT landing scatter,
-                        // and a lead for the block's
-                        // drift over the flight. The
-                        // footprint-disc spot stands in
-                        // only if every member died
-                        // this tick.
+                        // Aim: an actual soldier of the target regiment (M2TW
+                        // keeps a per-soldier aim target), the M2TW range-
+                        // INDEPENDENT landing scatter, and a lead for the
+                        // block's drift over the flight. The footprint-disc
+                        // spot stands in only if every member died this tick.
                         let members = &target_members[shot.t];
                         let base = if members.is_empty() {
                             let ang =
@@ -998,11 +955,9 @@ fn swing(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
                                 (h(0x5DC1) + h(0x6B8D) - 1.0) * sigma,
                             );
                         aim += shot.vel * (aim.distance(p) / 30.0);
-                        // Launch ABOVE the body-hit band
-                        // (arrows.rs tops out at ground
-                        // + 1.15): a shaft leaving at
-                        // head height is inside its own
-                        // shooter's hit cylinder at
+                        // Launch ABOVE the body-hit band (arrows.rs tops out
+                        // at ground + 1.15): a shaft leaving at head height
+                        // is inside its own shooter's hit cylinder at
                         // flight-time zero and kills him.
                         let from =
                             Vec3::new(p.x, pos_prev[i].y + 0.75, p.y);
@@ -1024,9 +979,8 @@ fn swing(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
                         });
                         *s.ammo = s.ammo.saturating_sub(1);
                         *s.swing = crate::units::SWING_RECOVER;
-                        // Reload: the M2TW volley cycle is
-                        // animation-bound at ~10 s; the
-                        // jitter keeps later volleys ragged.
+                        // Reload: the M2TW volley cycle is animation-bound at
+                        // ~10 s; the jitter keeps later volleys ragged.
                         *s.swing_t =
                             (crate::unit_types::missile::RELOAD_TICKS as f32
                                 * (0.8 + 0.25 * h(0x77F1)))
@@ -1036,18 +990,16 @@ fn swing(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
                         *s.swing_t -= 1;
                     }
                 } else {
-                    // Target gone mid-draw: ease off and
-                    // reassess shortly.
+                    // Target gone mid-draw: ease off and reassess shortly.
                     *s.swing = crate::units::SWING_RECOVER;
                     *s.swing_t = crate::unit_types::missile::CANCEL_TICKS;
                 }
             }
             crate::units::SWING_WINDUP => {
-                // Feet planted while winding up — EXCEPT
-                // against a routing target: the cut-down
-                // happens at a run, or the runner is 3 m
-                // gone by the strike tick and every blow
-                // whiffs (the pursuit treadmill).
+                // Feet planted while winding up — EXCEPT against a routing
+                // target: the cut-down happens at a run, or the runner is 3 m
+                // gone by the strike tick and every blow whiffs (the pursuit
+                // treadmill).
                 let t = *s.target as usize;
                 let target_routed =
                     t < pos_prev.len() && broken[group[t] as usize];
@@ -1058,9 +1010,8 @@ fn swing(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
                     face_target = Some(pos_prev[t].xz());
                 }
                 if *s.swing_t == 0 {
-                    // Strike lands; validity (still alive,
-                    // still in reach, still an enemy) is
-                    // checked in the apply pass — a dodged
+                    // Strike lands; validity (still alive, still in reach,
+                    // still an enemy) is checked in the apply pass — a dodged
                     // or dead target is a whiff.
                     let jit =
                         0.85 + 0.3 * crate::units::hash01(tick_seed ^ (i as u32));
@@ -1084,9 +1035,8 @@ fn swing(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
             }
             crate::units::SWING_RECOVER => {
                 if *s.swing_t == 0 {
-                    // A stagger that just wore off leaves
-                    // one free pass against the next one
-                    // (anti-stunlock); a plain recovery
+                    // A stagger that just wore off leaves one free pass
+                    // against the next one (anti-stunlock); a plain recovery
                     // carries an unspent pass forward.
                     let immune = if *s.swing
                         & crate::units::SWING_STAGGERED
@@ -1102,23 +1052,19 @@ fn swing(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
                 }
             }
             _ => {
-                // Ready: pick a target from the scan. Stick
-                // with the previous one when still in reach
-                // (duels), else nearest. Routing units never
-                // start attacks (they still defend nothing —
+                // Ready: pick a target from the scan. Stick with the previous
+                // one when still in reach (duels), else nearest. Routing
+                // units never start attacks (they still defend nothing —
                 // pursuit is free hits).
                 let chosen = if sticky { prev_target } else { best_idx };
-                // No eyes in the back of his head: a man
-                // only opens on a target in his forward
-                // half-plane. Being struck tells him where
-                // to turn (the flash facing below), but it
-                // does NOT let him swing backward over his
-                // shoulder — he attacks once he has turned
-                // far enough, at the human turn-speed cap.
-                // Without this gate every rear-approached
-                // victim counter-wound-up on proximity and
-                // was face-on before the first blow landed;
-                // the rear sector never fired in practice.
+                // No eyes in the back of his head: a man only opens on a
+                // target in his forward half-plane. Being struck tells him
+                // where to turn (the flash facing below), but it does NOT let
+                // him swing backward over his shoulder — he attacks once he
+                // has turned far enough, at the human turn-speed cap. Without
+                // this gate every rear-approached victim counter-wound-up on
+                // proximity and was face-on before the first blow landed; the
+                // rear sector never fired in practice.
                 let aware = chosen != u32::MAX && {
                     let t = chosen as usize;
                     t < pos_prev.len() && {
@@ -1132,16 +1078,13 @@ fn swing(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
                 };
                 if chosen != u32::MAX && !routed && aware {
                     *s.target = chosen;
-                    // Arriving at speed = a charging blow:
-                    // momentum converts to damage + a bigger
-                    // lunge (render reads the flag).
+                    // Arriving at speed = a charging blow: momentum converts
+                    // to damage + a bigger lunge (render reads the flag).
                     let v2 = s.vel.xz().length_squared();
                     let cs = speed[i] * CHARGE_SPEED_FRAC;
-                    // Attack style for this swing (render
-                    // variety only): 0 = stab, 1 = the
-                    // classic swing. (2 = slash exists in
-                    // the shader but benched.)
-                    // Spears only ever thrust.
+                    // Attack style for this swing (render variety only): 0 =
+                    // stab, 1 = the classic swing. (2 = slash exists in the
+                    // shader but benched.) Spears only ever thrust.
                     let style = if my_kind
                         == crate::unit_types::KIND_SPEAR as usize
                     {
@@ -1169,11 +1112,10 @@ fn swing(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
                         < crate::unit_types::missile::RANGE
                             * crate::unit_types::missile::RANGE
                 {
-                    // Nock and draw (foot archers shoot
-                    // standing only; the walk gate keeps a
-                    // marching or skirmishing man's bow on
-                    // his back). Style bits stay 0: the
-                    // stab pull-back IS the string draw.
+                    // Nock and draw (foot archers shoot standing only; the
+                    // walk gate keeps a marching or skirmishing man's bow on
+                    // his back). Style bits stay 0: the stab pull-back IS the
+                    // string draw.
                     *s.swing = crate::units::SWING_WINDUP
                         | crate::units::SWING_RANGED;
                     *s.swing_t = crate::unit_types::missile::DRAW_TICKS
@@ -1183,9 +1125,8 @@ fn swing(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
                 }
             }
         }
-        // A reloading archer contacted in melee drops the
-        // reload: he defends at knife tempo instead of
-        // standing through the 8 s bow cycle.
+        // A reloading archer contacted in melee drops the reload: he defends
+        // at knife tempo instead of standing through the 8 s bow cycle.
         if my_kind == crate::unit_types::KIND_ARCHER as usize
             && best_idx != u32::MAX
             && *s.swing & crate::units::SWING_STATE_MASK
@@ -1199,19 +1140,19 @@ fn swing(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
     st.face_target = face_target;
 }
 
-/// The crowd's say on his drive: overlap corrections and pushes are
+/// What the crowd does to his drive: overlap corrections and pushes are
 /// clamped, and in a packed crowd the drive fades out so the mass cannot
 /// keep compressing itself.
 #[inline]
-fn yield_to_crowd(_f: &Field, _s: &mut Soldier, st: &mut Step) {
+fn yield_to_crowd(st: &mut Step) {
     let crowd = st.crowd;
     let mut corr = st.corr;
     let mut push = st.push;
     let mut desired = st.desired;
     let mut corr_len2 = corr.length_squared();
     if corr_len2 < 1e-4 {
-        // Sub-centimeter corrections are settle noise, not
-        // overlap: applying them is pure micro-twitch.
+        // Sub-centimeter corrections are settle noise, not overlap: applying
+        // them is pure micro-twitch.
         corr = Vec2::ZERO;
         corr_len2 = 0.0;
     } else if corr_len2 > CORR_MAX * CORR_MAX {
@@ -1221,9 +1162,9 @@ fn yield_to_crowd(_f: &Field, _s: &mut Soldier, st: &mut Step) {
     if push_len > SEP_PUSH_MAX {
         push *= SEP_PUSH_MAX / push_len;
     }
-    // Yield in dense crowds: goal drive fades out entirely
-    // so the mass can't keep compressing itself; `jam` (0 =
-    // free, 1 = packed) also damps the response below.
+    // Yield in dense crowds: goal drive fades out entirely so the mass can't
+    // keep compressing itself; `jam` (0 = free, 1 = packed) also damps the
+    // response below.
     let jam = ((crowd - CROWD_SLOW) / (CROWD_STOP - CROWD_SLOW)).clamp(0.0, 1.0);
     desired *= 1.0 - jam;
     st.corr = corr;
@@ -1259,23 +1200,18 @@ fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
     let side_dir = st.side_dir;
     let mut desired = st.desired;
     let mut d_surge = Vec2::ZERO;
-    // Fighters close the last meter to swing range. Only
-    // active when an enemy is ALREADY in reach — this is
-    // combat execution (like the wind-up foot plant), not
-    // steering; it bypasses the jam yield on purpose so
-    // front lines stay joined instead of settling at the
-    // separation standoff just outside sword range.
-    // Close toward the LOCKED swing target when there is
-    // one — the per-tick nearest enemy flips in a clog and
-    // flip-flopping the close direction reads as twitch.
-    // Falls back to the far-acquisition memo in `target`
-    // when the near scan is empty AND the unit is in open
-    // space — in a dense press the memo would let second
-    // ranks drive through the jam and compress the crowd
-    // (nn regression). The memo may be stale after death
-    // sweeps reindex, so it is validated as "some enemy
-    // within closing range" — a legitimate closing target
-    // regardless of identity.
+    // Fighters close the last meter to swing range. Only active when an enemy
+    // is ALREADY in reach — this is combat execution (like the wind-up foot
+    // plant), not steering; it bypasses the jam yield on purpose so front
+    // lines stay joined instead of settling at the separation standoff just
+    // outside sword range. Close toward the LOCKED swing target when there is
+    // one — the per-tick nearest enemy flips in a clog and flip-flopping the
+    // close direction reads as twitch. Falls back to the far-acquisition memo
+    // in `target` when the near scan is empty AND the unit is in open space —
+    // in a dense press the memo would let second ranks drive through the jam
+    // and compress the crowd into overlap. The memo may be stale after
+    // death sweeps reindex, so it is validated as "some enemy within closing
+    // range" — a legitimate closing target regardless of identity.
     let (close_to, memo_close) = if *s.swing & crate::units::SWING_STATE_MASK
         != crate::units::SWING_READY
         && (*s.target as usize) < pos_prev.len()
@@ -1298,9 +1234,8 @@ fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
         // Held regiments fight at arm's length only.
         let look = if engaged[gi] { seek_radius() } else { WIDE_ACQUIRE_R };
         let max_close = if hold[gi] { 2.2 } else { look + 1.0 };
-        // Going to a seen enemy, each man stops at his own
-        // distance; closing the last meter to a man already
-        // in reach stays as it was.
+        // Going to a seen enemy, each man stops at his own distance; closing
+        // the last meter to a man already in reach stays as it was.
         let stop = if memo_close {
             1.2 + SEEK_STOP_SPREAD
                 * crate::units::hash01((i as u32).wrapping_mul(0x3C1B) ^ 0x51F7)
@@ -1309,24 +1244,21 @@ fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
         };
         if dist > stop && dist < max_close {
             let mut urge = ((dist - stop) / 0.8).clamp(0.0, 1.0);
-            // The surge toward a REMEMBERED enemy (no
-            // one in reach yet) is steering, not combat
-            // execution: it yields to the jam like all
-            // steering, so the press brakes on genuine
-            // body-pack. Ungated this factor is always
-            // 1 (the memo gate above already required
+            // The surge toward a REMEMBERED enemy (no one in reach yet) is
+            // steering, not combat execution: it yields to the jam like all
+            // steering, so the press brakes on genuine body-pack. Ungated
+            // this factor is always 1 (the memo gate above already required
             // crowd < CROWD_SLOW, i.e. jam == 0).
             if memo_close {
                 urge *= 1.0 - jam;
-                // He steps toward a remembered enemy only
-                // through open ground. With a comrade in
-                // the way he stands and waits for room
-                // instead of leaning on the man's back
-                // (M2TW's crowded soldier, devlog 0121).
+                // He steps toward a remembered enemy only through open
+                // ground. With a comrade in the way he stands and waits for
+                // room instead of leaning on the man's back (M2TW's crowded
+                // soldier).
                 if way_blocked {
                     urge = 0.0;
-                    // Waiting; in some windows he sidesteps
-                    // toward whichever side is open.
+                    // Waiting; in some windows he sidesteps toward whichever
+                    // side is open.
                     let window = (tick.wrapping_add((i as u32).wrapping_mul(7))
                         / SIDESTEP_WINDOW)
                         .wrapping_mul(0x2545_F491);
@@ -1355,10 +1287,9 @@ fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
             d_surge = to_enemy * (pace * urge / dist);
         }
     }
-    // Joining: no enemy to close on, so he heads for the
-    // enemy unit his regiment fights, jogging over open
-    // ground, walking with a comrade close ahead, waiting
-    // or sidestepping when blocked. He picks a soldier to
+    // Joining: no enemy to close on, so he heads for the enemy unit his
+    // regiment fights, jogging over open ground, walking with a comrade close
+    // ahead, waiting or sidestepping when blocked. He picks a soldier to
     // fight once one is in sight (the acquisition above).
     if committed
         && !memo_valid
@@ -1411,34 +1342,30 @@ fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
     let corr = st.corr;
     let corr_len2 = st.corr_len2;
     let mut desired = st.desired;
-    // Formation pace: walls advance deliberately (running
-    // breaks a wall), the charge phase runs the last
-    // stretch home. Broken/dying already excluded from
-    // both states by construction.
+    // Formation pace: walls advance deliberately (running breaks a wall), the
+    // charge phase runs the last stretch home. Broken/dying already excluded
+    // from both states by construction.
     if wall[gi] != 0 {
         desired *= WALL_SPEED_FRAC;
     } else if charging[gi] && !dying && !routed && !fat_nocharge[gi] {
         desired *= CHARGE_SPEED_BOOST;
     }
     desired *= fat_speed[gi];
-    // A staggered man reels where the blow left him: no
-    // steering, no closing, until the stun runs out. The
-    // shove that staggered him still resolves through
-    // separation — he is a body, not an actor.
+    // A staggered man reels where the blow left him: no steering, no closing,
+    // until the stun runs out. The shove that staggered him still resolves
+    // through separation — he is a body, not an actor.
     if *s.swing & crate::units::SWING_STAGGERED != 0 {
         desired = Vec2::ZERO;
     }
 
     let v = s.vel.xz();
-    // Jammed units stop shoving entirely: at full jam the
-    // crowd is quasi-static and overlap resolution is
-    // purely positional — force-based separation in a
-    // wedged mass only produces bang-bang oscillation.
+    // Jammed units stop shoving entirely: at full jam the crowd is
+    // quasi-static and overlap resolution is purely positional — force-based
+    // separation in a wedged mass only produces bang-bang oscillation.
     let mut push_a = push * (SEP_STRENGTH * (1.0 - jam));
-    // A standing man plants his feet: small pushes do not
-    // move him, real shoves do (less the grip). Without it
-    // any squeeze turned straight into sliding, and a
-    // fight's jostle rippled back through packed ranks.
+    // A standing man plants his feet: small pushes do not move him, real
+    // shoves do (less the grip). Without it any squeeze turned straight into
+    // sliding, and a fight's jostle rippled back through packed ranks.
     if desired.length_squared() < 1e-6 {
         let pl = push_a.length();
         push_a *= if pl > STAND_GRIP { (pl - STAND_GRIP) / pl } else { 0.0 };
@@ -1450,17 +1377,16 @@ fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
     }
 
     let mut new_v = v + accel * dt;
-    // Viscous damping in the press: bleeds the spring energy
-    // that otherwise ping-pongs between neighbors every tick.
+    // Viscous damping in the press: bleeds the spring energy that otherwise
+    // ping-pongs between neighbors every tick.
     new_v *= 1.0 - 0.4 * jam;
     let vmax = speed[i] * 1.15; // slight overspeed under crowd pressure
     let v2 = new_v.length_squared();
     if v2 > vmax * vmax {
         new_v *= vmax / v2.sqrt();
     }
-    // After a positional correction, kill the velocity
-    // component still driving into the overlap or it
-    // re-penetrates next tick.
+    // After a positional correction, kill the velocity component still
+    // driving into the overlap or it re-penetrates next tick.
     if corr_len2 > 1e-12 {
         let cn = corr.normalize_or_zero();
         let into = new_v.dot(-cn);
@@ -1488,26 +1414,22 @@ fn face(f: &Field, s: &mut Soldier, st: &mut Step) {
     let best_idx = st.best_idx;
     let face_target = st.face_target;
     let new_v = st.new_v;
-    // Facing priority: locked wind-up target > nearest
-    // enemy in reach > movement direction. Fighters keep
-    // eyes on the enemy even while the crowd shoves them;
-    // only routing/unengaged units face their velocity.
-    // yaw_prev snapshots the pre-update angle so the
-    // renderer can interpolate (yaw stepped once per tick
-    // otherwise — visible facing snaps at high fps).
+    // Facing priority: locked wind-up target > nearest enemy in reach >
+    // movement direction. Fighters keep eyes on the enemy even while the
+    // crowd shoves them; only routing/unengaged units face their velocity.
+    // yaw_prev snapshots the pre-update angle so the renderer can interpolate
+    // (yaw stepped once per tick otherwise — visible facing snaps at high
+    // fps).
     *s.yaw_prev = *s.yaw;
     let face_dir = match face_target {
         Some(t) => t - p,
-        // A man IN his swing cycle faces the fight (a
-        // formed one too — he is the fighting rim), and a
-        // man JUST STRUCK turns toward the blow (flash).
-        // A man merely NEAR an enemy does not: turning on
-        // proximity raced the attacker's wind-up and had
-        // every rear-approached victim frontal by first
-        // blood — the whole point of facing, gone. So the
-        // first hit lands in the back, spins its victim,
-        // and THEN he answers. Unformed units (Blob, no
-        // facing claim) still turn on proximity.
+        // A man IN his swing cycle faces the fight (a formed one too — he is
+        // the fighting rim), and a man JUST STRUCK turns toward the blow
+        // (flash). A man merely NEAR an enemy does not: turning on proximity
+        // raced the attacker's wind-up and had every rear-approached victim
+        // frontal by first blood — the whole point of facing, gone. So the
+        // first hit lands in the back, spins its victim, and THEN he answers.
+        // Unformed units (Blob, no facing claim) still turn on proximity.
         None if !routed
             && best_idx != u32::MAX
             && ((*s.swing & crate::units::SWING_STATE_MASK)
@@ -1517,21 +1439,18 @@ fn face(f: &Field, s: &mut Soldier, st: &mut Step) {
         {
             pos_prev[best_idx as usize].xz() - p
         }
-        // Out of formation with no enemy in reach: he faces
-        // where he is going, the enemy he remembers or the
-        // fight he heads for, standing or walking. Without
-        // this a blocked joiner fell through to the formed
-        // man's rule below and stood facing the line's front
-        // with the fight beside him.
+        // Out of formation with no enemy in reach: he faces where he is
+        // going, the enemy he remembers or the fight he heads for, standing
+        // or walking. Without this a blocked joiner fell through to the
+        // formed man's rule below and stood facing the line's front with the
+        // fight beside him.
         None if !routed && committed && memo_dir != Vec2::ZERO => memo_dir,
-        // Blooded and the enemy still close: a man who has
-        // traded blows keeps facing the fight while his
-        // last foe (combat memo, validated by team and
-        // distance like the closing drive) stands within
-        // KEEP_FACING_R — no parade dressing with a sword
-        // a few strides away. A player reform takes hold
-        // once the ground near him clears. Fresh men fall
-        // through and hold the ordered line.
+        // Blooded and the enemy still close: a man who has traded blows keeps
+        // facing the fight while his last foe (combat memo, validated by team
+        // and distance like the closing drive) stands within KEEP_FACING_R —
+        // no parade dressing with a sword a few strides away. A player reform
+        // takes hold once the ground near him clears. Fresh men fall through
+        // and hold the ordered line.
         None if !routed
             && new_v.length_squared() < STEP_FACE_SPEED * STEP_FACE_SPEED
             && form_face[gi] != Vec2::ZERO
@@ -1544,21 +1463,19 @@ fn face(f: &Field, s: &mut Soldier, st: &mut Step) {
         {
             pos_prev[*s.target as usize].xz() - p
         }
-        // Standing in formation: HOLD the ordered facing.
-        // M2TW rule — a formed unit never rotates itself
-        // toward a threat (it goes "ready" in place; the
-        // render brace pose keys off enemy_near, not yaw);
-        // facing is the player's job, and leaving a flank
-        // open is supposed to cost.
+        // Standing in formation: HOLD the ordered facing. M2TW rule — a
+        // formed unit never rotates itself toward a threat (it goes "ready"
+        // in place; the render brace pose keys off enemy_near, not yaw);
+        // facing is the player's job, and leaving a flank open is supposed to
+        // cost.
         None if !routed
             && new_v.length_squared() < STEP_FACE_SPEED * STEP_FACE_SPEED
             && form_face[gi] != Vec2::ZERO =>
         {
             form_face[gi]
         }
-        // Standing watch WITHOUT a formation claim (Blob
-        // mobs, rallied remnants): face the enemy mass
-        // instead of keeping a stale yaw.
+        // Standing watch WITHOUT a formation claim (Blob mobs, rallied
+        // remnants): face the enemy mass instead of keeping a stale yaw.
         None if !routed
             && new_v.length_squared() < STEP_FACE_SPEED * STEP_FACE_SPEED
             && threat[gi] != Vec2::ZERO =>
@@ -1572,9 +1489,8 @@ fn face(f: &Field, s: &mut Soldier, st: &mut Step) {
     } else {
         0.25 // velocity facing ignores micro-drift
     };
-    // A staggered man cannot even turn — the stun freezes
-    // his facing, so a charge's second blow finds the same
-    // back the first one hit.
+    // A staggered man cannot even turn — the stun freezes his facing, so a
+    // charge's second blow finds the same back the first one hit.
     if !dying
         && *s.swing & crate::units::SWING_STAGGERED == 0
         && face_dir.length_squared() > min_len2
@@ -1601,10 +1517,9 @@ fn integrate(f: &Field, s: &mut Soldier, st: &mut Step) {
         .clamp(bounds_min.x, bounds_max.x);
     let mut nz = (pos_prev[i].z + new_v.y * dt + corr.y)
         .clamp(bounds_min.y, bounds_max.y);
-    // Impassable ground (terrace risers, gorge walls,
-    // crater lips): wall-slide — keep the axis that
-    // stays on walkable ground, drop the one that
-    // doesn't, so crowds flow along the obstacle.
+    // Impassable ground (terrace risers, gorge walls, crater lips):
+    // wall-slide — keep the axis that stays on walkable ground, drop the one
+    // that doesn't, so crowds flow along the obstacle.
     if terrain.blocked_at(nx, nz) {
         let (px, pz) = (pos_prev[i].x, pos_prev[i].z);
         if !terrain.blocked_at(nx, pz) {

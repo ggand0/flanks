@@ -130,7 +130,7 @@ pub fn process_deaths(
 }
 
 /// Losses are replaced from behind (M2TW: "losses replaced by the back
-/// ranks", and its RESHUFFLE unit task; devlog 0121). Behind each slot a
+/// ranks", and its RESHUFFLE unit task). Behind each slot a
 /// dead man leaves, his file closes up: every living man behind the hole
 /// who is not fighting moves up one place, nearest first, so the file
 /// stays closed behind its front and the holes collect at the back.

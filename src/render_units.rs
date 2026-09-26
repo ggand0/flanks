@@ -427,7 +427,7 @@ fn setup_unit_mesh(
     // slot), so bevy's sorted-phase batcher merges their phase items and
     // `SortedRenderPhase::render_range` skips every item after the first —
     // its draw function never runs and that bucket's units silently vanish
-    // (the "LOD far bucket invisible" bug, devlog 0013).
+    // (the "LOD far bucket invisible" bug).
     for kind in 0..crate::unit_types::NUM_KINDS {
         let model = crate::unit_glb::kind_lods(kind);
         let lods = model.lods;

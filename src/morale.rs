@@ -1,6 +1,6 @@
 //! Regiment morale: the most-tuned system in the game.
 //!
-//! Model (devlog 0055): morale is a LEVEL, not a
+//! Model: morale is a LEVEL, not a
 //! draining tank — the M2TW engine keeps a per-unit `moraleLevel` plus a
 //! list of concurrent situational effects summed onto the unit's base
 //! stat, recomputed continuously (M2TWEOP disassembly). Every tick:
@@ -10,12 +10,12 @@
 //!             + no-enemy calm + wall stance
 //!
 //! Steady above the shaken band; WAVERING below -7; at -11 or less the
-//! regiment breaks (bands measured from the live engine, devlog 0057). A routing
+//! regiment breaks (bands measured from the live engine). A routing
 //! regiment keeps recomputing the same level as it flees: when the
 //! situation genuinely improves (clear of enemies, contagion gone) the
 //! level climbs back over -5 and it rallies — no dice roll. Factor
 //! values follow the MTW1 table where M2TW's are unknown; the flank
-//! ring, disorder term, and all radii are ours (flagged in the devlog).
+//! ring, disorder term, and all radii are ours (flagged below).
 //! Per-regiment factor values are published to `MoraleReadout` for the
 //! inspect panel.
 
@@ -80,7 +80,7 @@ pub struct MoraleReadout(pub Vec<MoraleFactors>);
 // --- Morale tuning ---
 // MTW1 official-guide values (the numeric template CA carried forward;
 // M2TW's own are hardcoded and unpublished) unless flagged otherwise.
-/// State bands, MEASURED from the live engine (devlog 0057: base morale
+/// State bands, MEASURED from the live engine (base morale
 /// plus the summed effect amounts, per state, across 13950 samples).
 /// Medians: high +12, firm +3, shaken -3, wavering -7, routing -11.
 /// The bands overlap in the engine (documented anti-thrash hysteresis);
@@ -106,7 +106,7 @@ const ROUT_LOCK_DECAY_S: f32 = 25.0;
 /// engine's waveringTimer analog; overlapping state bands are the
 /// documented anti-thrash device.
 const BREAK_HOLD_S: f32 = 1.0;
-/// Casualty ladder, MEASURED from the live engine (devlog 0057, proven
+/// Casualty ladder, MEASURED from the live engine (proven
 /// by bucketing every sample's effect amount against that unit's actual
 /// soldiers/soldiersMax): discrete STEPS, and nothing at all below 10%.
 /// The 25% step was previously unknown to the community.
@@ -140,7 +140,7 @@ const FLANK_T: f32 = 0.6;
 /// front-line mixing zone must not count (a frontal press ≠ a flank).
 const FLANK_DOMINANCE: f32 = 1.2;
 /// Routing friendly regiments within NEIGHBOR_R — the documented MTW
-/// curve (primary source, devlog 0055 round 2): -6 per WEIGHTED routing
+/// curve (primary source): -6 per WEIGHTED routing
 /// unit, saturating at two units (-12). Routers are weighted by class
 /// against observer discipline (rout_weight): drilled troops half-count
 /// lesser men streaming past — the built-in anti-cascade anchor.
@@ -173,7 +173,7 @@ const NEIGHBOR_R2: f32 = NEIGHBOR_R * NEIGHBOR_R;
 /// Broken regiments below this fraction of initial strength shatter
 /// (never rally, flee until despawn). OURS, not M2TW: the engine keeps
 /// routing units routing — the capture caught a Pikemen unit fleeing
-/// with 1 man of 120 left (devlog 0057). With the measured rout line at
+/// with 1 man of 120 left. With the measured rout line at
 /// -11, regiments break so late that a 15% floor made every break
 /// shatter instantly and the rout phase disappeared; 3% restores it.
 const SHATTER_FRAC: f32 = 0.03;
@@ -186,8 +186,8 @@ const RALLY_DELAY: f32 = 8.0;
 /// command is ~6 m (6 + 7xcommand + 4xinfluence) — effectively nothing,
 /// so the aura waits for real generals with stars.
 const LEADER_ALIVE: f32 = 2.0;
-/// The commander's OWN regiment carries far more: MEASURED +8 (devlog
-/// 0057, effect id 3 — it appeared on the general's bodyguard and on no
+/// The commander's OWN regiment carries far more: MEASURED +8 (effect
+/// id 3 — it appeared on the general's bodyguard and on no
 /// other unit, matching Feral's RTW documentation exactly).
 const LEADER_SELF: f32 = 8.0;
 /// Leader falls: -8 for a few seconds, then -2 for the rest of the

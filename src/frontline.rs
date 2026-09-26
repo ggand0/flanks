@@ -1,6 +1,6 @@
 //! Frontline VISUALIZATION. The "front line" is not a mechanic: it is a
 //! readout of where the two masses physically collide. Units never steer by
-//! it — movement is orders + collision (movement.rs).
+//! it — movement is orders + collision (sim/soldier.rs).
 //!
 //! Per fixed tick, on a coarse 8 m grid: splat + blur per-team density,
 //! then marching-squares the phi = 0 contour of phi = blue − orange,
@@ -414,7 +414,7 @@ fn update_groups(units: Res<Units>, mut groups: ResMut<Groups>) {
         // target's live center, which is right for the approach but
         // wrong in melee: every slot sits inside the enemy and moves
         // with it, so rear men lean on the backs ahead and whole blocks
-        // slide after a moving center (devlog 0119). M2TW stops
+        // slide after a moving center. M2TW stops
         // updating a formation near the end of its path
         // (formation_hold_distance). So once a real share of the
         // regiment is fighting, whoever the enemy is, the frame holds:
@@ -423,14 +423,14 @@ fn update_groups(units: Res<Units>, mut groups: ResMut<Groups>) {
         // men striking at an enemy ahead, as it stands at contact. Then
         // the frame stays put for the whole fight, as an M2TW formation
         // does: a file with no enemy in front of it holds its slots, and
-        // men who see an enemy go to him themselves (movement.rs).
+        // men who see an enemy go to him themselves (sim/soldier.rs).
         // Built from the regiment's own slot geometry, so any width,
         // depth and spacing works.
-        // Melee clock and fight point (movement.rs joins the men out of
+        // Melee clock and fight point (sim/soldier.rs joins the men out of
         // sight of an enemy to the fight after their own delay). The
         // clock starts at the count gate, so a stray poke does not pull
         // a whole regiment in; M2TW engages a unit when enough enemy
-        // soldiers are in its proximity zone (devlog 0036).
+        // soldiers are in its proximity zone.
         // The crash of a charge: the block keeps coming until the enemy
         // has stopped it; only then does the melee begin.
         if engaged
@@ -441,7 +441,7 @@ fn update_groups(units: Res<Units>, mut groups: ResMut<Groups>) {
             group.melee_ticks = group.melee_ticks.saturating_add(1);
         } else {
             // The melee is over: its men come back into formation
-            // (movement.rs clears out_form). A regiment with no attack
+            // (sim/soldier.rs clears out_form). A regiment with no attack
             // order re-forms where it stands, M2TW's discrete reforming
             // state; an attacker's order lays its slots again.
             if group.melee_ticks > 0

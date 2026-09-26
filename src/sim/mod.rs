@@ -86,7 +86,7 @@ impl Plugin for SimPlugin {
 /// Dedicated OS thread that runs tick jobs. NOT a bevy task: a system
 /// that parks waiting for a pooled job can deadlock, because every worker
 /// allowed to start that job may itself be parked inside a system task
-/// (executor priority inversion, caught live with gdb, devlog 0050). A
+/// (executor priority inversion, caught live with gdb). A
 /// dedicated thread is always runnable, a panic in the job surfaces as a
 /// crash instead of a silent hang, and its scopes never tick the shared
 /// executor (`util::sim_scope`), so it cannot steal a parked system and

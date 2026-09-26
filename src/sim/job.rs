@@ -110,10 +110,10 @@ struct FireSolutions {
 }
 
 /// Fill `job` from the live world: column copies, the per-regiment
-/// command snapshot, the archers' fire solutions and scalars. This is
-/// the serial prep that used to open `step_sim`. It also makes the two
-/// regiment writes that prep always made: the stand-off anchor snap and
-/// the `firing` flag.
+/// command snapshot, the archers' fire solutions and scalars. The
+/// serial prep of a tick, on the main thread. It also makes the two
+/// regiment writes prep makes: the stand-off anchor snap and the
+/// `firing` flag.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_tick(
     job: &mut TickJob,
@@ -290,8 +290,8 @@ fn archer_fire_solutions(
         groups.list[g].firing = s.is_some() && groups.list[g].ammo_left > 0;
     }
     // Living members of every regiment under fire this tick: each shot
-    // aims at an actual soldier (M2TW's per-soldier aim targets,
-    // devlog 0060), not at a spot on the block's footprint. Into a
+    // aims at an actual soldier (M2TW's per-soldier aim targets),
+    // not at a spot on the block's footprint. Into a
     // locked melee the shafts head for enemy bodies; friends die only
     // to genuine misses and interceptions.
     let mut targeted = vec![false; n_groups];

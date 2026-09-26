@@ -1,5 +1,5 @@
 //! Rigid regiment formations: a slot generator writing into the existing
-//! `units.home` column (the seam prepared in devlogs 0003/0018). A regiment
+//! `units.home` column. A regiment
 //! order stays ONE point; formations only change the per-unit offset from
 //! it — the movement hot path is untouched.
 //!
@@ -54,7 +54,7 @@ pub enum FormSpacing {
 
 impl FormSpacing {
     /// (lateral, depth) slot pitch in meters. Wall matches the tightened
-    /// separation rest distance (movement.rs WALL_SEP_RADIUS) — slots the
+    /// separation rest distance (sim/soldier.rs WALL_SEP_RADIUS) — slots the
     /// physics refuses to hold are lies.
     pub fn pitch(self) -> Vec2 {
         match self {

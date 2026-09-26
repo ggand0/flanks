@@ -50,8 +50,8 @@ fn spear_frac() -> f32 {
 
 /// Archer regiments per army: a fixed COUNT by default — archers are
 /// force multipliers, and scaling them with army size turned big
-/// battles into arrow weather (owner: "two is probably enough
-/// considering how OP they are"). FL_ARCHER_FRAC switches back to a
+/// battles into arrow weather; two are enough for how strong they
+/// are. FL_ARCHER_FRAC switches back to a
 /// fraction of the army for sandbox play (=1 for all-archer fields).
 fn archer_regs(n_regs: usize) -> usize {
     match std::env::var("FL_ARCHER_FRAC")
@@ -450,7 +450,7 @@ fn spawn_rout_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
 /// ~2.5 s later — from the LEFT side in the control pair (the shield arm:
 /// factor-identical to frontal) and from the REAR in the test pair (skill
 /// and shield gone). The damage pass buckets every hit on a blue victim by
-/// its actual sector at hit time (movement.rs DirTestStats). Acceptance:
+/// its actual sector at hit time (sim/damage.rs DirTestStats). Acceptance:
 /// rear-sector kills (one feeding regiment) >= front-sector kills (TWO
 /// feeding regiments), i.e. per-attacker rear kill rate >= 2x frontal.
 fn spawn_dir_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
@@ -623,7 +623,7 @@ fn spawn_pile_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
     // FL_PILE_ATEASE=1: the victim stands at ease instead of in hold, so
     // it answers with its own attack order like a player's regiment.
     list[0].hold = std::env::var("FL_PILE_ATEASE").is_err();
-    // FL_PILE_VICTIM_FILES: stretch the victim into a wide line (Gota's
+    // FL_PILE_VICTIM_FILES: stretch the victim into a wide line (the
     // M2TW test: a deep unit hits a wide one, which wraps it).
     if let Ok(files) = std::env::var("FL_PILE_VICTIM_FILES").map(|v| v.parse::<u32>().unwrap_or(0))
         && files > 0
@@ -794,9 +794,6 @@ fn pile_test_log(groups: Res<Groups>, units: Res<Units>, time: Res<Time>, mut ne
     let past = (0..units.len())
         .filter(|&i| units.group[i] != 0 && units.death_t[i] == 0 && units.pos[i].z > 72.0)
         .count();
-    // Victim men still out in the line, more than 25 m from the first
-    // attacker's center: the roll-up of a wide line shows here.
-    let ac = groups.list[1].centroid;
     let (mut jog, mut walk, mut ready, mut run_back, mut out_form) = (0, 0, 0, 0, 0);
     for i in 0..units.len() {
         if units.group[i] == 0 && units.death_t[i] == 0 {
@@ -830,7 +827,6 @@ fn pile_test_log(groups: Res<Groups>, units: Res<Units>, time: Res<Time>, mut ne
         .filter(|&i| units.group[i] != 0 && units.death_t[i] == 0)
         .map(|i| Vec2::new(units.pos[i].x, units.pos[i].z))
         .collect();
-    let _ = ac;
     let out = (0..units.len())
         .filter(|&i| {
             units.group[i] == 0 && units.death_t[i] == 0 && {

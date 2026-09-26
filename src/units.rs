@@ -26,7 +26,7 @@ pub struct Units {
     pub color: Vec<[f32; 4]>,
     /// Combat memo (unit index; `u32::MAX` = none): the melee target
     /// while a swing is in flight, and the sparse-fight closing memo
-    /// otherwise (movement.rs wide acquisition). NEVER cleared, and
+    /// otherwise (sim/soldier.rs wide acquisition). NEVER cleared, and
     /// death-sweep swap-removes reindex units, so it can point at an
     /// arbitrary unit later — every consumer MUST validate on use
     /// (swings re-check at hit time; the closing drive checks team and
@@ -51,15 +51,15 @@ pub struct Units {
     /// Out of formation: he has left his slot to fight (M2TW keeps this
     /// per soldier, isInFormation). While his regiment is in melee he
     /// does not walk back to his slot; the flag clears when the melee
-    /// ends and the regiment re-forms (movement.rs, devlog 0123).
+    /// ends and the regiment re-forms (sim/soldier.rs).
     pub out_form: Vec<bool>,
     /// What he last saw of the comrades around him and of comrades
-    /// running to the fight (movement.rs SIGHT_* bits). A man looks
+    /// running to the fight (sim/soldier.rs SIGHT_* bits). A man looks
     /// around every few ticks, not every tick, and acts on what he saw.
     pub sight: Vec<u8>,
     /// Bumped every time a battle rebuilds this world. A sim tick job
     /// computed from an older world carries indices that mean nothing
-    /// here: movement.rs drops it instead of installing it.
+    /// here: sim/mod.rs drops it instead of installing it.
     pub generation: u64,
 }
 

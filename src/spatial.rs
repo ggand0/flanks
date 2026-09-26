@@ -7,7 +7,7 @@
 //! integrate loop reads contiguous memory instead of gathering pos/team
 //! through random unit indices (the cache misses dominated the old cost).
 //!
-//! NOTE (devlog 0020): an 8-wide SIMD variant of this layout (split x/z/meta
+//! NOTE: an 8-wide SIMD variant of this layout (split x/z/meta
 //! lane arrays + f32x8 kernel) was built and measured SLOWER overall — the
 //! candidate runs are too short (~3-15 units) for lane occupancy, and the
 //! split arrays cost extra cache lines on the short-run majority. Don't

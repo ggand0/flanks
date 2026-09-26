@@ -21,7 +21,7 @@ const SPEARWALL_ATK_PTS: f32 = 2.0;
 /// within 60 deg of the victim's facing; rear = beyond 120 deg; else side.
 /// Shared with the arrow-impact resolution (arrows.rs).
 pub const SECTOR_COS_60: f32 = 0.5;
-/// Charge impact (phase B). A charge-flagged hit shoves its victim along
+/// Charge impact. A charge-flagged hit shoves its victim along
 /// the blow: displacement = KNOCKBACK * m_a/(m_a+m_v), applied straight
 /// to position (next tick's separation resolves the pile — same pipe as
 /// all overlap). Heavy into light ~0.55 m: the line visibly DENTS.
@@ -60,7 +60,6 @@ fn debug_stagger() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("FL_DEBUG_STAGGER").is_ok())
 }
-
 
 /// A landed swing, resolved after the parallel integrate: chunks emit into
 /// their own buffer (no write races), then a serial pass applies damage.
@@ -113,7 +112,6 @@ impl Default for DirTestStats {
 pub const DEATH_TICKS: u8 = 18;
 /// Ticks of hit flash after taking damage.
 const FLASH_TICKS: u8 = 4;
-
 
 /// What the apply reads beside the soldier columns: the tick's regiment
 /// snapshot and scalars, taken from the finished job.
@@ -266,7 +264,7 @@ pub fn apply_damage(
                     // The attacker's regiment is winning its exchange.
                     groups.list[group[a] as usize].recent_kills += 1;
                 }
-                // Charge impact (phase B): momentum becomes a shove and a
+                // Charge impact: momentum becomes a shove and a
                 // stun. Walls barely budge and never stagger; a braced
                 // SPEARWALL additionally reflects the charge bonus onto
                 // the charger (points punish momentum) — the M2TW rule.

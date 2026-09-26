@@ -117,7 +117,7 @@ pub struct GroupData {
     /// Holding a contact frame (frontline.rs): an attacking regiment in
     /// melee stops chasing its target's center and holds its slots with
     /// the front rank on the fight line, the way M2TW stops updating a
-    /// formation near the end of its path (devlog 0121).
+    /// formation near the end of its path.
     pub contact: bool,
     /// The contact frame's lateral position along the regiment's right
     /// vector, fixed when contact begins so the block cannot slide
@@ -126,7 +126,7 @@ pub struct GroupData {
     /// Ticks this regiment has been in a real melee (engaged, with at
     /// least the count gate's share of its men fighting once); 0 when
     /// not. Men out of sight of an enemy join the fight after their own
-    /// delay counted from here (movement.rs, devlog 0123).
+    /// delay counted from here (sim/soldier.rs).
     pub melee_ticks: u32,
     /// Where the enemy unit this regiment fights stands: its ordered
     /// target if alive and unbroken, else the nearest unbroken enemy
@@ -148,7 +148,7 @@ pub struct GroupData {
     pub crash_cap: u16,
     /// An enemy regiment's centroid is within combat-watch range: units
     /// of this regiment scan wider for adjacent enemies (sparse-fight
-    /// acquisition, movement.rs) and brace when standing.
+    /// acquisition, sim/soldier.rs) and brace when standing.
     pub enemy_near: bool,
     /// Normalized direction to the nearest enemy regiment (ZERO when
     /// none in watch range): standing units face it (brace facing).
