@@ -902,7 +902,8 @@ fn prepare_tick(
     let wall: Vec<u8> = groups.list.iter().map(crate::formation::wall_kind).collect();
     // Charge phase: the run home (speed boost feeds the per-unit
     // SWING_CHARGE predicate too — momentum the sim can see).
-    let charging: Vec<bool> = groups.list.iter().map(|g| g.charging).collect();
+    // The crash of a charge keeps the charge pace (frontline.rs).
+    let charging: Vec<bool> = groups.list.iter().map(|g| g.charging || g.crashing).collect();
     // Fatigue locomotion: tired legs are slow legs, and exhausted
     // regiments cannot sprint the charge home (MTW1 "cannot run or
     // charge"; fleeing men tire too — pursuit catches them).

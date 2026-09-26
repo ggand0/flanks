@@ -32,6 +32,14 @@ const ENEMY_NEAR_R: f32 = 60.0;
 /// Victory-cheer length (~5 s at 30 Hz) after the last nearby unbroken
 /// enemy regiment routs or dies. Pub: render encodes cheer progress.
 pub const CELEBRATE_TICKS: u16 = 150;
+/// The fixed tick.
+const TICK_DT: f32 = 1.0 / 30.0;
+/// A crashing block has been stopped when its smoothed forward speed
+/// falls under this (m/s). Its crash lasts at most the time its rear
+/// needs to arrive at the charge pace, and never longer than the cap.
+const CRASH_STALL: f32 = 0.3;
+const CRASH_PACE: f32 = 4.0;
+const CRASH_MAX_TICKS: u16 = 240;
 
 #[derive(Resource)]
 pub struct InfluenceField {
@@ -290,6 +298,7 @@ fn update_groups(units: Res<Units>, mut groups: ResMut<Groups>) {
         .map(|g| crate::formation::facing_dir(g.facing))
         .collect();
     let mut front_off = vec![f32::MIN; n];
+    let mut back_off = vec![f32::MAX; n];
     let mut line_sum = vec![0.0f32; n];
     let mut line_n = vec![0u32; n];
     let mut fight_n = vec![0u32; n];
@@ -297,6 +306,7 @@ fn update_groups(units: Res<Units>, mut groups: ResMut<Groups>) {
         let g = units.group[i] as usize;
         let p = Vec2::new(units.pos[i].x, units.pos[i].z);
         front_off[g] = front_off[g].max(units.home[i].dot(fwd[g]));
+        back_off[g] = back_off[g].min(units.home[i].dot(fwd[g]));
         sums[g] += p;
         counts[g] += 1;
         sum_home[g] += units.home[i];
@@ -499,7 +509,13 @@ fn update_groups(units: Res<Units>, mut groups: ResMut<Groups>) {
         // clock starts at the count gate, so a stray poke does not pull
         // a whole regiment in; M2TW engages a unit when enough enemy
         // soldiers are in its proximity zone (devlog 0036).
-        if engaged && !group.state.is_broken() && (group.melee_ticks > 0 || fight_n[g] >= lock_threshold) {
+        // The crash of a charge: the block keeps coming until the enemy
+        // has stopped it; only then does the melee begin.
+        if engaged
+            && !group.state.is_broken()
+            && !group.crashing
+            && (group.melee_ticks > 0 || fight_n[g] >= lock_threshold)
+        {
             group.melee_ticks = group.melee_ticks.saturating_add(1);
         } else {
             // The melee is over: its men come back into formation
@@ -532,7 +548,7 @@ fn update_groups(units: Res<Units>, mut groups: ResMut<Groups>) {
             let formed = group.shape == crate::formation::FormShape::Rect
                 && !group.state.is_broken();
             let starts = fight_n[g] >= lock_threshold;
-            if formed && attacking && engaged && (group.contact || starts) {
+            if formed && attacking && engaged && !group.crashing && (group.contact || starts) {
                 let f = fwd[g];
                 let r = Vec2::new(f.y, -f.x);
                 if !group.contact {
@@ -585,6 +601,27 @@ fn update_groups(units: Res<Units>, mut groups: ResMut<Groups>) {
                 "regiment {g} {}",
                 if charging { "CHARGES" } else { "CHARGE ENDS" }
             );
+        }
+        // The crash: a charging regiment that engages keeps its block
+        // moving (M2TW runs the charge task until most of the unit has
+        // charged) until the enemy has stopped it, read off its centroid's
+        // smoothed forward speed, or until its rear has had time to arrive.
+        let v_fwd = (group.centroid - prev_cents[g]).dot(fwd[g]) / TICK_DT;
+        group.adv_speed += (v_fwd - group.adv_speed) * 0.1;
+        if group.charging && !charging && engaged && group.melee_ticks == 0 && !group.crashing {
+            group.crashing = true;
+            group.crash_ticks = 0;
+            // The rear needs depth / pace to arrive; that long at most.
+            let depth = (front_off[g] - back_off[g]).max(0.0);
+            group.crash_cap = ((depth / CRASH_PACE / TICK_DT) as u16).clamp(30, CRASH_MAX_TICKS);
+            info!("regiment {g} CRASHES");
+        } else if group.crashing {
+            group.crash_ticks = group.crash_ticks.saturating_add(1);
+            let stalled = group.crash_ticks > 15 && group.adv_speed < CRASH_STALL;
+            if stalled || group.crash_ticks > group.crash_cap || !engaged {
+                group.crashing = false;
+                info!("regiment {g} CRASH ENDS ({} ticks)", group.crash_ticks);
+            }
         }
         group.charging = charging;
     }
