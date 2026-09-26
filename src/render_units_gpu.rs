@@ -573,7 +573,7 @@ fn extract_gpu_units(mut main_world: ResMut<MainWorld>, mut input: ResMut<GpuUni
 
 /// The compute pipelines and their bind group layout.
 #[derive(Resource)]
-struct GpuUnitPipelines {
+pub(crate) struct GpuUnitPipelines {
     build: CachedComputePipelineId,
     finalize: CachedComputePipelineId,
     layout: BindGroupLayoutDescriptor,
@@ -906,7 +906,7 @@ fn prepare_pull_bind_groups(
 /// every soldier, turn the counts into draw arguments. The shadow cascades
 /// draw from the same lists (render_units_shadow.rs), so the pass must come
 /// first or they draw last frame's.
-fn run_unit_build_pass(
+pub(crate) fn run_unit_build_pass(
     buffers: Res<GpuUnitBuffers>,
     pipelines: Res<GpuUnitPipelines>,
     pipeline_cache: Res<PipelineCache>,

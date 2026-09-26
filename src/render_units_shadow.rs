@@ -14,12 +14,24 @@
 //! Known limitation: the lists are culled by the camera frustum, not the
 //! light's, so a soldier just off the screen edge toward the sun casts
 //! nothing. A light-frustum test in the build compute is the later fix.
+//!
+//! The whole shadow pass is timed on the GPU as
+//! `render/sun_shadows/elapsed_gpu` (`ShadowPassTimer`).
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+
+use wgpu::{QuerySet, QuerySetDescriptor, QueryType};
 
 use bevy::{
-    core_pipeline::core_3d::CORE_3D_DEPTH_FORMAT,
+    core_pipeline::{Core3d, Core3dSystems, core_3d::CORE_3D_DEPTH_FORMAT},
+    diagnostic::{Diagnostic, DiagnosticPath, Diagnostics, RegisterDiagnostic},
     ecs::system::{SystemParamItem, lifetimeless::*},
     mesh::MeshVertexBufferLayoutRef,
-    pbr::{LightEntity, Shadow, ShadowBatchSetKey, ShadowBinKey, queue_shadows},
+    pbr::{
+        EARLY_SHADOW_PASS, LightEntity, Shadow, ShadowBatchSetKey, ShadowBinKey,
+        per_view_shadow_pass, queue_shadows,
+    },
     prelude::*,
     render::{
         Render, RenderApp, RenderStartup, RenderSystems,
@@ -32,7 +44,7 @@ use bevy::{
             ViewBinnedRenderPhases,
         },
         render_resource::*,
-        renderer::RenderDevice,
+        renderer::{RenderContext, RenderDevice, RenderQueue},
         sync_world::MainEntity,
         view::{ExtractedView, ViewUniform, ViewUniformOffset, ViewUniforms},
     },
@@ -288,6 +300,8 @@ pub struct UnitShadowPlugin;
 
 impl Plugin for UnitShadowPlugin {
     fn build(&self, app: &mut App) {
+        app.register_diagnostic(Diagnostic::new(SHADOW_PASS_GPU).with_suffix(" ms"))
+            .add_systems(Update, publish_shadow_pass_time);
         app.sub_app_mut(RenderApp)
             .init_resource::<UnitShadowBindGroups>()
             .init_resource::<SpecializedRenderPipelines<UnitShadowPipeline>>()
@@ -295,7 +309,10 @@ impl Plugin for UnitShadowPlugin {
             .add_render_command::<Shadow, DrawUnitShadow>()
             .add_systems(
                 RenderStartup,
-                init_unit_shadow_pipeline.after(crate::render_units::init_custom_pipeline),
+                (
+                    init_unit_shadow_pipeline.after(crate::render_units::init_custom_pipeline),
+                    init_shadow_pass_timer,
+                ),
             )
             .add_systems(
                 Render,
@@ -304,7 +321,129 @@ impl Plugin for UnitShadowPlugin {
                         .in_set(RenderSystems::QueueMeshes)
                         .after(queue_shadows),
                     prepare_unit_shadow_bind_groups.in_set(RenderSystems::PrepareBindGroups),
+                    shadow_timer_map.in_set(RenderSystems::Cleanup),
+                ),
+            )
+            .add_systems(
+                Core3d,
+                (
+                    shadow_timer_begin
+                        .after(crate::render_units_gpu::run_unit_build_pass)
+                        .before(per_view_shadow_pass::<EARLY_SHADOW_PASS>),
+                    shadow_timer_end
+                        .after(per_view_shadow_pass::<EARLY_SHADOW_PASS>)
+                        .before(Core3dSystems::MainPass),
                 ),
             );
+    }
+}
+
+/// GPU time of the sun's shadow pass: every cascade, Bevy's meshes and the
+/// soldiers together. Bevy times its main passes but not this one, and its
+/// span recorder cannot open a span in one render system and close it in
+/// another, so two timestamps bracket the pass here. The value joins the
+/// `render/.../elapsed_gpu` lines of the periodic log.
+pub const SHADOW_PASS_GPU: DiagnosticPath =
+    DiagnosticPath::const_new("render/sun_shadows/elapsed_gpu");
+
+/// Last read shadow pass time, milliseconds as f32 bits; `u32::MAX` until
+/// the first readback.
+static SHADOW_PASS_MS: AtomicU32 = AtomicU32::new(u32::MAX);
+
+const TIMER_IDLE: u8 = 0;
+/// The resolve and copy are recorded in this frame's commands.
+const TIMER_COPIED: u8 = 1;
+/// Waiting for the map. The readback buffer must not be copied into.
+const TIMER_MAPPING: u8 = 2;
+
+#[derive(Resource)]
+struct ShadowPassTimer {
+    queries: QuerySet,
+    resolve: Buffer,
+    readback: Buffer,
+    /// Nanoseconds per timestamp tick.
+    period: f32,
+    state: Arc<AtomicU8>,
+}
+
+fn init_shadow_pass_timer(mut commands: Commands, device: Res<RenderDevice>, queue: Res<RenderQueue>) {
+    let needed = WgpuFeatures::TIMESTAMP_QUERY | WgpuFeatures::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+    if !device.features().contains(needed) {
+        return;
+    }
+    let buffer = |label, usage| {
+        device.create_buffer(&BufferDescriptor {
+            label: Some(label),
+            size: 16,
+            usage,
+            mapped_at_creation: false,
+        })
+    };
+    commands.insert_resource(ShadowPassTimer {
+        queries: device.wgpu_device().create_query_set(&QuerySetDescriptor {
+            label: Some("sun shadow pass timestamps"),
+            ty: QueryType::Timestamp,
+            count: 2,
+        }),
+        resolve: buffer(
+            "sun shadow pass timestamps resolve",
+            BufferUsages::QUERY_RESOLVE | BufferUsages::COPY_SRC,
+        ),
+        readback: buffer(
+            "sun shadow pass timestamps readback",
+            BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+        ),
+        period: queue.get_timestamp_period(),
+        state: Arc::new(AtomicU8::new(TIMER_IDLE)),
+    });
+}
+
+fn shadow_timer_begin(timer: Option<Res<ShadowPassTimer>>, mut ctx: RenderContext) {
+    if let Some(timer) = timer {
+        ctx.command_encoder().write_timestamp(&timer.queries, 0);
+    }
+}
+
+fn shadow_timer_end(timer: Option<Res<ShadowPassTimer>>, mut ctx: RenderContext) {
+    let Some(timer) = timer else {
+        return;
+    };
+    let encoder = ctx.command_encoder();
+    encoder.write_timestamp(&timer.queries, 1);
+    if timer.state.load(Ordering::Acquire) == TIMER_IDLE {
+        encoder.resolve_query_set(&timer.queries, 0..2, &timer.resolve, 0);
+        encoder.copy_buffer_to_buffer(&timer.resolve, 0, &timer.readback, 0, 16);
+        timer.state.store(TIMER_COPIED, Ordering::Release);
+    }
+}
+
+/// After the frame's submit, as Bevy's own readback does: map, read the two
+/// stamps, unmap.
+fn shadow_timer_map(timer: Option<Res<ShadowPassTimer>>) {
+    let Some(timer) = timer else {
+        return;
+    };
+    if timer.state.load(Ordering::Acquire) != TIMER_COPIED {
+        return;
+    }
+    timer.state.store(TIMER_MAPPING, Ordering::Release);
+    let buffer = timer.readback.clone();
+    let state = timer.state.clone();
+    let period = timer.period;
+    timer.readback.slice(..).map_async(MapMode::Read, move |res| {
+        if res.is_ok() {
+            let stamps: [u64; 2] = bytemuck::pod_read_unaligned(&buffer.slice(..).get_mapped_range());
+            buffer.unmap();
+            let ms = stamps[1].wrapping_sub(stamps[0]) as f64 * period as f64 * 1e-6;
+            SHADOW_PASS_MS.store((ms as f32).to_bits(), Ordering::Relaxed);
+        }
+        state.store(TIMER_IDLE, Ordering::Release);
+    });
+}
+
+fn publish_shadow_pass_time(mut diagnostics: Diagnostics) {
+    let bits = SHADOW_PASS_MS.load(Ordering::Relaxed);
+    if bits != u32::MAX {
+        diagnostics.add_measurement(&SHADOW_PASS_GPU, || f32::from_bits(bits) as f64);
     }
 }
