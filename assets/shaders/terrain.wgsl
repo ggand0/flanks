@@ -22,23 +22,27 @@ fn hash_ground(p: vec2<f32>) -> f32 {
     return fract((q.x + q.y) * q.z);
 }
 
-struct PastureSample {
+struct GroundSample {
     color: vec3<f32>,
     normal_roughness: vec4<f32>,
 };
 
-fn pasture_patch(uv: vec2<f32>, uv_dx: vec2<f32>, uv_dy: vec2<f32>, cell: vec2<f32>, detail: f32) -> PastureSample {
+fn ground_patch(
+    color_map: texture_2d<f32>, normal_map: texture_2d<f32>,
+    uv: vec2<f32>, uv_dx: vec2<f32>, uv_dy: vec2<f32>,
+    cell: vec2<f32>, detail: f32,
+) -> GroundSample {
     let angle = hash_ground(cell + 61.0) * 6.2831853;
     let c = cos(angle);
     let s = sin(angle);
     let rotation = mat2x2<f32>(vec2<f32>(c, s), vec2<f32>(-s, c));
     let offset = vec2<f32>(hash_ground(cell), hash_ground(cell + 37.0));
     let patch_uv = rotation * uv + offset;
-    var result: PastureSample;
-    result.color = textureSampleGrad(pasture, ground_sampler, patch_uv, rotation * uv_dx, rotation * uv_dy).rgb;
+    var result: GroundSample;
+    result.color = textureSampleGrad(color_map, ground_sampler, patch_uv, rotation * uv_dx, rotation * uv_dy).rgb;
     result.normal_roughness = vec4<f32>(0.5, 0.5, 1.0, 0.95);
     if detail > 0.001 {
-        result.normal_roughness = textureSampleGrad(pasture_normal, ground_sampler, patch_uv, rotation * uv_dx, rotation * uv_dy);
+        result.normal_roughness = textureSampleGrad(normal_map, ground_sampler, patch_uv, rotation * uv_dx, rotation * uv_dy);
         // OpenGL tangent Y points opposite texture V, so rotate XY with the UV basis.
         result.normal_roughness = vec4<f32>(
             rotation * (result.normal_roughness.xy * 2.0 - 1.0) * 0.5 + 0.5,
@@ -48,9 +52,12 @@ fn pasture_patch(uv: vec2<f32>, uv_dx: vec2<f32>, uv_dy: vec2<f32>, cell: vec2<f
     return result;
 }
 
-fn sample_pasture(p: vec2<f32>, dx: vec2<f32>, dy: vec2<f32>, tile_m: f32, detail: f32) -> PastureSample {
+fn sample_ground(
+    color_map: texture_2d<f32>, normal_map: texture_2d<f32>, mean: vec3<f32>,
+    p: vec2<f32>, dx: vec2<f32>, dy: vec2<f32>, tile_m: f32, detail: f32,
+) -> GroundSample {
     // Normalize the residual variance so blended regions do not become softer
-    // than patch centers. The prepared texture has a linear mean of 0.5.
+    // than patch centers. The linear mean keeps the distant color stable.
     let uv_dx = dx / tile_m;
     let uv_dy = dy / tile_m;
     let grid = mat2x2<f32>(vec2<f32>(1.0, 0.0), vec2<f32>(-0.57735027, 1.15470054)) * (p / (tile_m * 1.7));
@@ -66,12 +73,12 @@ fn sample_pasture(p: vec2<f32>, dx: vec2<f32>, dy: vec2<f32>, tile_m: f32, detai
         c = base + vec2<f32>(1.0, 0.0);
         weights = vec3<f32>(f.x + f.y - 1.0, 1.0 - f.x, 1.0 - f.y);
     }
-    let sa = pasture_patch(p / tile_m, uv_dx, uv_dy, a, detail);
-    let sb = pasture_patch(p / tile_m, uv_dx, uv_dy, b, detail);
-    let sc = pasture_patch(p / tile_m, uv_dx, uv_dy, c, detail);
-    var result: PastureSample;
-    let residual = (sa.color - 0.5) * weights.x + (sb.color - 0.5) * weights.y + (sc.color - 0.5) * weights.z;
-    result.color = 0.5 + residual * inverseSqrt(dot(weights, weights));
+    let sa = ground_patch(color_map, normal_map, p / tile_m, uv_dx, uv_dy, a, detail);
+    let sb = ground_patch(color_map, normal_map, p / tile_m, uv_dx, uv_dy, b, detail);
+    let sc = ground_patch(color_map, normal_map, p / tile_m, uv_dx, uv_dy, c, detail);
+    var result: GroundSample;
+    let residual = (sa.color - mean) * weights.x + (sb.color - mean) * weights.y + (sc.color - mean) * weights.z;
+    result.color = max(vec3<f32>(0.0), mean + residual * inverseSqrt(dot(weights, weights)));
     result.normal_roughness = sa.normal_roughness * weights.x + sb.normal_roughness * weights.y + sc.normal_roughness * weights.z;
     return result;
 }
@@ -86,25 +93,27 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     // World-space mapping remains continuous when a chunk is rebuilt.
     let dx = dpdx(p);
     let dy = dpdy(p);
-    // A projected footprint also fades detail on distant, grazing surfaces.
-    let footprint = max(length(dx.xz), length(dy.xz));
-    let color_detail = (1.0 - smoothstep(65.0, 300.0, distance_to_camera))
-        * (1.0 - smoothstep(0.15, 0.7, footprint));
-    var grass: PastureSample;
-    grass.color = vec3<f32>(0.5);
-    grass.normal_roughness = vec4<f32>(0.5, 0.5, 1.0, 0.95);
-    if color_detail > 0.001 || detail > 0.001 {
-        grass = sample_pasture(p.xz, dx.xz, dy.xz, 6.0, detail);
-    }
-    let soil_uv = p.xz / 3.5;
-    let stone_uv = p.xz / 4.0;
-    let soil_color = textureSample(earth, ground_sampler, soil_uv).rgb;
-    var rock_color = textureSample(stone, ground_sampler, stone_uv).rgb;
-    var soil_nr = vec4<f32>(0.5, 0.5, 1.0, 0.95);
-    var rock_nr = soil_nr;
-    if detail > 0.001 {
-        soil_nr = textureSampleGrad(earth_normal, ground_sampler, soil_uv, dx.xz / 3.5, dy.xz / 3.5);
-        rock_nr = textureSampleGrad(stone_normal, ground_sampler, stone_uv, dx.xz / 4.0, dy.xz / 4.0);
+    // Mip filtering removes subpixel detail continuously, without a separate
+    // distance band that turns textured ground into a flat color.
+    let grass = sample_ground(
+        pasture, pasture_normal, vec3<f32>(0.5),
+        p.xz, dx.xz, dy.xz, 10.0, detail,
+    );
+    let soil_sample = sample_ground(
+        earth, earth_normal, vec3<f32>(0.194145, 0.120636, 0.057649),
+        p.xz + 83.0, dx.xz, dy.xz, 3.5, detail,
+    );
+    let soil_color = soil_sample.color;
+    let soil_nr = soil_sample.normal_roughness;
+    var rock_color = vec3<f32>(0.284067, 0.232351, 0.136810);
+    var rock_nr = vec4<f32>(0.5, 0.5, 1.0, 0.95);
+    if in.color.b > 0.05 {
+        let rock_sample = sample_ground(
+            stone, stone_normal, rock_color,
+            p.xz - 157.0, dx.xz, dy.xz, 4.0, detail,
+        );
+        rock_color = rock_sample.color;
+        rock_nr = rock_sample.normal_roughness;
     }
 
     // Side projections avoid stretching the stony layer on steep banks.
@@ -120,21 +129,17 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
 
     let field = textureSample(coverage, coverage_sampler, (p.xz - coverage_bounds.xy) / coverage_bounds.zw);
     let dry = field.r;
-    let soil = max(field.g, in.color.g);
+    let edge_detail = (grass.color.r - 0.5) * field.g * (1.0 - field.g) * 2.0;
+    let soil = max(clamp(field.g + edge_detail, 0.0, 1.0), in.color.g);
     let rock = smoothstep(0.05, 0.95, in.color.b) * (1.0 - soil);
     let damp = in.color.a;
 
-    // Meter-scale turf variation bridges the coverage field and blade detail.
-    // Its footprint fade leaves only the broad field when it becomes subpixel.
-    let turf = sample_pasture(p.xz + vec2<f32>(173.0, -291.0), dx.xz, dy.xz, 34.0, 0.0);
-    let turf_amount = 1.0 - smoothstep(0.8, 3.0, footprint);
-    let turf_variation = clamp(1.0 + (turf.color.r - 0.5) * 1.9, 0.55, 1.5);
-    let grass_color = mix(vec3<f32>(0.085, 0.115, 0.042), vec3<f32>(0.175, 0.153, 0.078), dry);
-    let grass_detail = clamp(1.0 + (grass.color - 0.5) * 1.6, vec3<f32>(0.45), vec3<f32>(1.6));
-    var color = grass_color * mix(vec3<f32>(1.0), grass_detail, color_detail)
-        * mix(1.0, turf_variation, turf_amount);
-    let soil_surface = mix(vec3<f32>(0.125, 0.101, 0.070), soil_color * vec3<f32>(0.85, 0.89, 0.82), color_detail);
-    let stone_surface = mix(vec3<f32>(0.18, 0.174, 0.15), rock_color * vec3<f32>(0.92, 0.95, 0.96), color_detail);
+    // Broad color comes from coverage, with one scale of close grass detail.
+    let grass_color = mix(vec3<f32>(0.075, 0.105, 0.033), vec3<f32>(0.185, 0.154, 0.073), dry);
+    let grass_detail = clamp(1.0 + (grass.color - 0.5) * 2.2, vec3<f32>(0.45), vec3<f32>(1.6));
+    var color = grass_color * grass_detail;
+    let soil_surface = soil_color * vec3<f32>(0.85, 0.89, 0.82);
+    let stone_surface = rock_color * vec3<f32>(0.92, 0.95, 0.96);
     color = mix(color, soil_surface, soil);
     color = mix(color, stone_surface, rock);
     color *= (0.82 + 0.36 * field.b) * (1.0 - damp * 0.24);

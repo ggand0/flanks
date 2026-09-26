@@ -10,4 +10,4 @@ The source textures are released under [CC0 1.0](https://creativecommons.org/pub
 
 `sources.json` records exact download URLs, sizes and checksums. `prepare.py` converts the maps to KTX2 with a full mip chain and Zstandard compression. Color uses sRGB; normal XYZ and roughness A use linear channels. Source JPEGs are not required at runtime.
 
-The pasture color map contains neutral detail centered on 0.5 in linear space. The preparation script removes broad color and lighting patches with a periodic filter; the terrain coverage field supplies those scales. The shader preserves the detail's variance when blending rotated samples and uses separate turf and close grass scales.
+The pasture color map contains neutral detail centered on 0.5 in linear space. The preparation script removes broad color and lighting patches with a periodic filter; the terrain coverage field supplies those scales. The shader preserves the detail's variance when blending rotated samples at the close grass scale. Broad grass and earth regions come from the coverage field.

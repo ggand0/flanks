@@ -383,6 +383,47 @@ pub fn river_bed_depth(t: f32) -> f32 {
     RIVER_DEPTH * (1.0 - t * t).max(0.0).powf(0.75)
 }
 
+/// Broad asymmetric shoulders frame an open lowland. Analytic falloffs avoid
+/// ridge cusps and circular slope breaks through the deployment area.
+fn classic_height(p: Vec2) -> f32 {
+    fn shoulder(p: Vec2, center: Vec2, radii: Vec2, angle: f32, height: f32) -> f32 {
+        let q = Mat2::from_angle(angle) * (p - center) / radii;
+        height * (-q.length_squared()).exp()
+    }
+    let west = shoulder(
+        p,
+        Vec2::new(-390.0, -100.0),
+        Vec2::new(190.0, 430.0),
+        0.2,
+        17.0,
+    );
+    let east = shoulder(
+        p,
+        Vec2::new(380.0, 160.0),
+        Vec2::new(230.0, 410.0),
+        -0.45,
+        13.0,
+    );
+    let north = shoulder(
+        p,
+        Vec2::new(-60.0, -390.0),
+        Vec2::new(450.0, 170.0),
+        0.15,
+        8.0,
+    );
+    let south = shoulder(
+        p,
+        Vec2::new(80.0, 430.0),
+        Vec2::new(420.0, 240.0),
+        -0.2,
+        4.0,
+    );
+    let valley = (p.x - 0.18 * p.y - 30.0 * (p.y / 240.0).sin()) / 155.0;
+    let detail = fbm(Mat2::from_angle(0.61) * p / 190.0 + Vec2::new(11.8, 46.2)) * 0.65;
+    5.0 + p.x * 0.002 - p.y * 0.003 + west + east + north + south - 3.0 * (-valley * valley).exp()
+        + detail
+}
+
 fn generate_terrain(mut commands: Commands) {
     let classic = map_is_classic();
     let origin = Vec2::new(
@@ -393,7 +434,11 @@ fn generate_terrain(mut commands: Commands) {
     for z in 0..VERTS_Z {
         for x in 0..VERTS_X {
             let p = origin + Vec2::new(x as f32, z as f32) * CELL;
-            // Large rolling landforms + medium detail + ridged peaks.
+            if classic {
+                heights[z * VERTS_X + x] = classic_height(p);
+                continue;
+            }
+            // Experimental river base: rolling landforms and ridged peaks.
             let base = fbm(p / 320.0) * 22.0;
             let detail = fbm(p / 90.0 + Vec2::splat(37.7)) * 4.5;
             let r = 1.0 - fbm(p / 260.0 + Vec2::splat(91.3)).abs().min(1.0);
@@ -568,14 +613,14 @@ fn ground_coverage(terrain: &Terrain) -> Image {
             let broad = cover_noise(q / Vec2::new(145.0, 85.0) + Vec2::splat(7.3));
             let patches = cover_noise(q / 31.0 + Vec2::splat(37.8));
             let flecks = cover_noise(q / 7.0 + Vec2::splat(91.1));
-            let neighbors = terrain.h(x.saturating_sub(24), z)
-                + terrain.h((x + 24).min(VERTS_X - 1), z)
-                + terrain.h(x, z.saturating_sub(24))
-                + terrain.h(x, (z + 24).min(VERTS_Z - 1));
+            let neighbors = terrain.h(x.saturating_sub(48), z)
+                + terrain.h((x + 48).min(VERTS_X - 1), z)
+                + terrain.h(x, z.saturating_sub(48))
+                + terrain.h(x, (z + 48).min(VERTS_Z - 1));
             let relief = terrain.h(x, z) - neighbors * 0.25;
-            let dry = (0.55 + broad * 0.65 + patches * 0.18 + relief * 0.045).clamp(0.0, 1.0);
-            let soil = smoothstep(0.22, 0.75, patches + broad * 0.3) * 0.5;
-            let variation = (0.5 + flecks * 0.3 + patches * 0.15).clamp(0.0, 1.0);
+            let dry = (0.52 + broad * 0.28 + patches * 0.08 + relief * 0.07).clamp(0.0, 1.0);
+            let soil = smoothstep(0.52, 0.82, dry + patches * 0.16) * 0.5;
+            let variation = (0.5 + flecks * 0.08 + patches * 0.06).clamp(0.0, 1.0);
             for value in [dry, soil, variation, 1.0] {
                 pixels.push((value * 255.0).round() as u8);
             }
@@ -753,6 +798,42 @@ fn auto_test_craters(
 mod tests {
     use super::*;
     use bevy::mesh::VertexAttributeValues;
+
+    #[test]
+    fn classic_landforms_keep_gentle_slopes_without_sharp_cell_ridges() {
+        let mut min_height = f32::INFINITY;
+        let mut max_height = f32::NEG_INFINITY;
+        let mut max_slope = 0.0_f32;
+        let mut max_bend = 0.0_f32;
+        for z in 1..VERTS_Z - 1 {
+            for x in 1..VERTS_X - 1 {
+                let p = Vec2::new(
+                    x as f32 - (VERTS_X - 1) as f32 * 0.5,
+                    z as f32 - (VERTS_Z - 1) as f32 * 0.5,
+                ) * CELL;
+                let h = classic_height(p);
+                min_height = min_height.min(h);
+                max_height = max_height.max(h);
+                let dx = (classic_height(p + Vec2::X * CELL) - classic_height(p - Vec2::X * CELL))
+                    / (2.0 * CELL);
+                let dz = (classic_height(p + Vec2::Y * CELL) - classic_height(p - Vec2::Y * CELL))
+                    / (2.0 * CELL);
+                max_slope = max_slope.max(Vec2::new(dx, dz).length());
+                for axis in [Vec2::X, Vec2::Y] {
+                    let bend =
+                        classic_height(p + axis * CELL) - 2.0 * h + classic_height(p - axis * CELL);
+                    max_bend = max_bend.max(bend.abs());
+                }
+            }
+        }
+        println!(
+            "classic heights {min_height:.2}..{max_height:.2} m, max slope {max_slope:.4}, max cell bend {max_bend:.4} m"
+        );
+        assert!(min_height.is_finite() && max_height.is_finite());
+        assert!(max_height - min_height > 10.0);
+        assert!(max_slope < 0.2, "plain slopes exceed a 20% grade");
+        assert!(max_bend < 0.1, "adjacent cells form a sharp ridge");
+    }
 
     fn sloped_field() -> Terrain {
         let mut heights = vec![0.0; VERTS_X * VERTS_Z];
