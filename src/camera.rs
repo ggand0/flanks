@@ -169,6 +169,13 @@ pub fn apply_camera_transform(
         if sweep > 0.0 && (time.elapsed_secs() / sweep) as u32 % 2 == 1 {
             cam.distance = 900.0;
         }
+        // A negative period gives a continuous zoom and orbit for checking
+        // material transitions in motion, without injecting desktop input.
+        if sweep < 0.0 {
+            let phase = time.elapsed_secs() / -sweep * std::f32::consts::TAU;
+            cam.distance = 40.0 + 860.0 * (0.5 - 0.5 * phase.cos());
+            cam.yaw += phase.sin() * 0.35;
+        }
         cam.target_distance = cam.distance;
     }
     let min = terrain.min();
