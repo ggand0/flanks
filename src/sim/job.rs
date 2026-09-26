@@ -130,6 +130,33 @@ pub struct TickJob {
     pub(crate) field_ms: f32,
 }
 
+impl TickJob {
+    /// Release the job's handles on the shared columns. Called the moment
+    /// a finished job is taken (and again, harmlessly, at the install):
+    /// nothing reads them once the run is over, and a column nobody else
+    /// holds is written in place by the main thread's fixed tick and
+    /// recycled by the install without a copy.
+    pub(crate) fn release_inputs(&mut self) {
+        self.pos_in = Default::default();
+        self.speed = Default::default();
+        self.team = Default::default();
+        self.kind = Default::default();
+        self.group = Default::default();
+        self.home = Default::default();
+        self.vel_in = Default::default();
+        self.yaw_in = Default::default();
+        self.yaw_prev_in = Default::default();
+        self.target_in = Default::default();
+        self.swing_in = Default::default();
+        self.swing_t_in = Default::default();
+        self.flash_in = Default::default();
+        self.death_t_in = Default::default();
+        self.ammo_in = Default::default();
+        self.out_form_in = Default::default();
+        self.sight_in = Default::default();
+    }
+}
+
 /// The index ranges of every regiment's men, in index order. Regiments
 /// are contiguous at spawn; only the death sweep's swap-removes scatter
 /// men, so a regiment is a few runs. Walking a regiment's runs visits

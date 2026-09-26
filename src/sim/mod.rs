@@ -216,6 +216,10 @@ pub fn take_tick(
     pipeline.field_from_job = false;
     match taken {
         Some(mut job) => {
+            // The run is over: let go of the shared columns now, so the
+            // systems between here and the install (a regiment closing
+            // ranks writes `home`) write in place instead of copying.
+            job.release_inputs();
             std::mem::swap(&mut runs.runs, &mut job.reg_runs);
             if let Some(mut field) = field {
                 std::mem::swap(&mut *field, &mut job.field);
@@ -572,36 +576,29 @@ pub fn step_sim(
     };
 
     // INSTALL: the completed tick becomes the live state. The job's
-    // clones of the shared columns are released first, so the columns
-    // the install replaces are unique and come back as the next tick's
-    // output buffers: no copy, no allocation. pos_prev <- the state at
-    // tick start (the job's shared position column), pos <- the new
+    // handles on the shared columns are released first (already done at
+    // the take on the threaded path), so the columns the install
+    // replaces are unique and come back as the next tick's output
+    // buffers: no copy, no allocation. pos_prev <- the state at tick
+    // start (the job's shared position column), pos <- the new
     // kinematics.
+    job.release_inputs();
     {
         let u = &mut *units;
         macro_rules! install {
-            ($($col:ident <- $out:ident / $inp:ident),*) => {$(
-                drop(std::mem::take(&mut job.$inp));
+            ($($col:ident <- $out:ident),*) => {$(
                 let released = u.$col.install(std::mem::take(&mut job.$out));
                 job.$out = std::sync::Arc::try_unwrap(released).unwrap_or_default();
             )*};
         }
-        drop(std::mem::take(&mut job.pos_in));
         let tick_start = u.pos.install(std::mem::take(&mut job.pos_out));
         let released = u.pos_prev.install_shared(tick_start);
         job.pos_out = std::sync::Arc::try_unwrap(released).unwrap_or_default();
         install!(
-            vel <- vel / vel_in, yaw <- yaw / yaw_in, yaw_prev <- yaw_prev / yaw_prev_in,
-            target <- target / target_in, swing <- swing / swing_in,
-            swing_t <- swing_t / swing_t_in, flash <- flash / flash_in,
-            death_t <- death_t / death_t_in, ammo <- ammo / ammo_in,
-            out_form <- out_form / out_form_in, sight <- sight / sight_in
+            vel <- vel, yaw <- yaw, yaw_prev <- yaw_prev, target <- target, swing <- swing,
+            swing_t <- swing_t, flash <- flash, death_t <- death_t, ammo <- ammo,
+            out_form <- out_form, sight <- sight
         );
-        drop(std::mem::take(&mut job.speed));
-        drop(std::mem::take(&mut job.team));
-        drop(std::mem::take(&mut job.kind));
-        drop(std::mem::take(&mut job.group));
-        drop(std::mem::take(&mut job.home));
     }
     // The sweep's candidates (combat.rs), ascending.
     pipeline.sweep_candidates.clear();
