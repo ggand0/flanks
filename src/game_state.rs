@@ -7,7 +7,7 @@ use crate::combat::CombatStats;
 use crate::sim::damage::DirTestStats;
 use crate::orders::{Groups, Selection};
 use crate::render_units::Corpses;
-use crate::terrain::Terrain;
+use crate::terrain::{MapChanged, MapKind, Terrain};
 use crate::units::Units;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -83,6 +83,7 @@ pub struct BattleConfig {
     pub units_per_team: usize,
     pub reg_size: usize,
     pub ai_enabled: bool,
+    pub map: MapKind,
     pub scenario: Scenario,
     /// Player composition from the Select Units screen: regiments per
     /// kind (KIND_* indexed), summing to at most `n_slots()`.
@@ -108,6 +109,7 @@ impl Default for BattleConfig {
             units_per_team,
             reg_size,
             ai_enabled: !std::env::var("FL_AI").is_ok_and(|v| v == "0"),
+            map: MapKind::from_env(),
             scenario: Scenario::from_env(),
         }
     }
@@ -181,6 +183,7 @@ enum MenuButton {
 enum OptionButton {
     ArmySize,
     Ai,
+    Map,
 }
 
 #[derive(Component)]
@@ -382,6 +385,7 @@ fn spawn_menu(mut commands: Commands, config: Res<BattleConfig>) {
                     if config.ai_enabled { "On" } else { "Off" },
                     OptionButton::Ai,
                 );
+                spawn_option_row(opts, "Map", config.map.label(), OptionButton::Map);
             });
 
             spawn_text_button(p, "Start Battle", MenuButton::StartBattle);
@@ -560,6 +564,7 @@ fn menu_option_buttons(
     query: Query<(&Interaction, &OptionButton, &Children), Changed<Interaction>>,
     mut texts: Query<&mut Text>,
     mut config: ResMut<BattleConfig>,
+    mut maps: MessageWriter<MapChanged>,
 ) {
     for (interaction, opt, children) in &query {
         if *interaction != Interaction::Pressed {
@@ -583,6 +588,11 @@ fn menu_option_buttons(
             OptionButton::Ai => {
                 config.ai_enabled = !config.ai_enabled;
                 if config.ai_enabled { "On" } else { "Off" }
+            }
+            OptionButton::Map => {
+                config.map = config.map.next();
+                maps.write(MapChanged(config.map));
+                config.map.label()
             }
         };
         for child in children.iter() {
@@ -675,8 +685,9 @@ pub fn setup_battle(
         info!("deployment phase: place your regiments, then begin the battle");
     }
     info!(
-        "battle started: {} per team, scenario {}, AI {}",
+        "battle started: {} per team, map {}, scenario {}, AI {}",
         config.units_per_team,
+        config.map.label(),
         config.scenario.label(),
         if config.ai_enabled { "on" } else { "off" },
     );

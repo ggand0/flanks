@@ -22,13 +22,53 @@ pub const CHUNKS_Z: usize = 12;
 const VERTS_X: usize = CHUNKS_X * CHUNK_CELLS + 1;
 const VERTS_Z: usize = CHUNKS_Z * CHUNK_CELLS + 1;
 
-/// FL_MAP=river: the map-art generation (river, terraces, ground
-/// variety, vegetation, water, bridge, steep-ground blocking).
-/// Anything else (default): the classic pre-map-art map.
-pub fn map_is_classic() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| !std::env::var("FL_MAP").is_ok_and(|v| v == "river"))
+/// The battlefields the menu's Map row cycles through. `FL_MAP=classic`
+/// or `FL_MAP=river` picks one at launch; anything else is the grassland.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum MapKind {
+    /// Broad pasture shoulders around an open lowland: the default.
+    #[default]
+    Grassland,
+    /// The 0.1.0 heightfield: rolling noise with ridged peaks, no river.
+    Classic,
+    /// Experimental: the same noise with terraces, a river and a bridge.
+    River,
 }
+
+impl MapKind {
+    pub fn from_env() -> Self {
+        match std::env::var("FL_MAP").as_deref() {
+            Ok("river") => Self::River,
+            Ok("classic") => Self::Classic,
+            _ => Self::Grassland,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Grassland => "Grassland",
+            Self::Classic => "Classic",
+            Self::River => "River",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::Grassland => Self::Classic,
+            Self::Classic => Self::River,
+            Self::River => Self::Grassland,
+        }
+    }
+}
+
+/// Sent by the menu when the Map row changes. The terrain regenerates
+/// and the river scenery respawns in the same frame.
+#[derive(Message, Clone, Copy)]
+pub struct MapChanged(pub MapKind);
+
+/// The map rebuild runs in this set; the river scenery respawns after it.
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MapRebuild;
 
 #[derive(Resource, Clone)]
 pub struct Terrain {
@@ -37,8 +77,10 @@ pub struct Terrain {
     /// Impassable vertices (terrace risers, gorge walls, crater lips),
     /// same grid as `heights`. All-false on the classic map.
     blocked: Vec<bool>,
-    /// True on the classic map: skips the river carve, terraces, ground
-    /// variety, and every river-dependent system (water, bridge, wade).
+    pub kind: MapKind,
+    /// True on the two maps without a river (grassland and classic):
+    /// skips the river carve, terraces, ground variety, and every
+    /// river-dependent system (water, bridge, wade).
     pub classic: bool,
     /// World-space min corner.
     pub origin: Vec2,
@@ -233,9 +275,28 @@ fn vertex_blocked(heights: &[f32], x: usize, z: usize) -> bool {
 struct TerrainChunks {
     meshes: Vec<Handle<Mesh>>,
     original_heights: Vec<f32>,
+    material: Option<Handle<GroundMaterial>>,
+    band_material: Option<Handle<StandardMaterial>>,
+    /// Every map's textures, held so a map switch finds them loaded.
+    warm: Vec<Handle<Image>>,
 }
 
+const GROUND_TEXTURES: [&str; 8] = [
+    "terrain/pasture_natural_color.ktx2",
+    "terrain/pasture_color.ktx2",
+    "terrain/pasture_normal_roughness.ktx2",
+    "terrain/earth_color.ktx2",
+    "terrain/earth_normal_roughness.ktx2",
+    "terrain/stony_soil_color.ktx2",
+    "terrain/stony_soil_normal_roughness.ktx2",
+    "terrain/grassland_layout_color.ktx2",
+];
+
 type GroundMaterial = ExtendedMaterial<StandardMaterial, GroundLayers>;
+
+/// One terrain chunk entity.
+#[derive(Component)]
+struct GroundChunk;
 
 #[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
 struct GroundLayers {
@@ -272,12 +333,13 @@ pub struct TerrainPlugin;
 impl Plugin for TerrainPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<TerrainChunks>()
+            .add_message::<MapChanged>()
             .add_plugins(MaterialPlugin::<GroundMaterial>::default())
             .add_systems(PreStartup, generate_terrain)
             .add_systems(Startup, spawn_chunks)
             .add_systems(
                 Update,
-                (crater_tool, auto_test_craters, remesh_dirty).chain(),
+                (rebuild_map.in_set(MapRebuild), crater_tool, auto_test_craters, remesh_dirty).chain(),
             );
     }
 }
@@ -427,7 +489,14 @@ fn classic_height(p: Vec2) -> f32 {
 }
 
 fn generate_terrain(mut commands: Commands) {
-    let classic = map_is_classic();
+    commands.insert_resource(build_terrain(MapKind::from_env()));
+}
+
+/// The heightfield and the blocked mask of one map. Grassland has its
+/// own analytic landforms; classic and river share the noise formula,
+/// and river alone carves the channel, terraces and impassable walls.
+fn build_terrain(kind: MapKind) -> Terrain {
+    let classic = kind != MapKind::River;
     let origin = Vec2::new(
         -(VERTS_X as f32 - 1.0) * CELL * 0.5,
         -(VERTS_Z as f32 - 1.0) * CELL * 0.5,
@@ -436,7 +505,7 @@ fn generate_terrain(mut commands: Commands) {
     for z in 0..VERTS_Z {
         for x in 0..VERTS_X {
             let p = origin + Vec2::new(x as f32, z as f32) * CELL;
-            if classic {
+            if kind == MapKind::Grassland {
                 heights[z * VERTS_X + x] = classic_height(p);
                 continue;
             }
@@ -493,15 +562,14 @@ fn generate_terrain(mut commands: Commands) {
             }
         }
     }
-    commands.insert_resource(Terrain {
+    info!("terrain: {} map", kind.label());
+    Terrain {
         heights,
         blocked,
+        kind,
         classic,
         origin,
         dirty: vec![false; CHUNKS_X * CHUNKS_Z],
-    });
-    if !classic {
-        info!("FL_MAP=river: map-art terrain (river, terraces, vegetation)");
     }
 }
 
@@ -525,73 +593,154 @@ fn ground_texture(assets: &AssetServer, path: &'static str) -> Handle<Image> {
         .load(path)
 }
 
+fn ground_base() -> StandardMaterial {
+    StandardMaterial {
+        base_color: Color::WHITE,
+        perceptual_roughness: 0.95,
+        reflectance: 0.05,
+        ..default()
+    }
+}
+
+/// The ground material's layers for one map: the grassland gets the
+/// authored layout and the natural pasture, the classic field and the
+/// river map get procedural coverage from their relief and stony slopes.
+fn ground_layers(assets: &AssetServer, images: &mut Assets<Image>, terrain: &Terrain) -> GroundLayers {
+    // Only the grassland has a painted layout; the other maps derive
+    // their coverage from their own relief and put stone on steep faces.
+    let authored = terrain.kind == MapKind::Grassland;
+    GroundLayers {
+        pasture: ground_texture(
+            assets,
+            if authored {
+                "terrain/pasture_natural_color.ktx2"
+            } else {
+                "terrain/pasture_color.ktx2"
+            },
+        ),
+        pasture_normal: ground_texture(assets, "terrain/pasture_normal_roughness.ktx2"),
+        stone: ground_texture(
+            assets,
+            if authored {
+                "terrain/earth_color.ktx2"
+            } else {
+                "terrain/stony_soil_color.ktx2"
+            },
+        ),
+        stone_normal: ground_texture(
+            assets,
+            if authored {
+                "terrain/earth_normal_roughness.ktx2"
+            } else {
+                "terrain/stony_soil_normal_roughness.ktx2"
+            },
+        ),
+        earth: ground_texture(assets, "terrain/earth_color.ktx2"),
+        earth_normal: ground_texture(assets, "terrain/earth_normal_roughness.ktx2"),
+        coverage: if authored {
+            ground_texture(assets, "terrain/grassland_layout_color.ktx2")
+        } else {
+            images.add(ground_coverage(terrain))
+        },
+        coverage_bounds: if authored {
+            Vec4::new(
+                terrain.origin.x,
+                terrain.origin.y,
+                (VERTS_X - 1) as f32 * CELL,
+                (VERTS_Z - 1) as f32 * CELL,
+            )
+        } else {
+            Vec4::new(
+                terrain.origin.x - CELL * 0.5,
+                terrain.origin.y - CELL * 0.5,
+                VERTS_X as f32 * CELL,
+                VERTS_Z as f32 * CELL,
+            )
+        },
+        natural_ground: u32::from(authored),
+    }
+}
+
+/// The menu changed the map: regenerate the heightfield in place, give
+/// every chunk a material with the new map's layers and mark every
+/// chunk, so `remesh_dirty` rebuilds the whole field later in this frame.
+#[allow(clippy::too_many_arguments)]
+fn rebuild_map(
+    mut changes: MessageReader<MapChanged>,
+    mut terrain: ResMut<Terrain>,
+    mut chunks: ResMut<TerrainChunks>,
+    mut materials: ResMut<Assets<GroundMaterial>>,
+    assets: Res<AssetServer>,
+    mut images: ResMut<Assets<Image>>,
+    mut commands: Commands,
+    chunk_entities: Query<Entity, With<GroundChunk>>,
+) {
+    let Some(MapChanged(kind)) = changes.read().last().copied() else {
+        return;
+    };
+    if kind == terrain.kind {
+        return;
+    }
+    let t0 = Instant::now();
+    *terrain = build_terrain(kind);
+    terrain.dirty.fill(true);
+    chunks.original_heights.clone_from(&terrain.heights);
+    // A fresh material on every chunk: a component change, which the
+    // renderer tracks, where editing the asset in place did not reach them.
+    let material = materials.add(GroundMaterial {
+        base: ground_base(),
+        extension: ground_layers(&assets, &mut images, &terrain),
+    });
+    for e in &chunk_entities {
+        let mut entity = commands.entity(e);
+        if kind == MapKind::Classic {
+            entity.remove::<MeshMaterial3d<GroundMaterial>>();
+            if let Some(band) = &chunks.band_material {
+                entity.insert(MeshMaterial3d(band.clone()));
+            }
+        } else {
+            entity.remove::<MeshMaterial3d<StandardMaterial>>();
+            entity.insert(MeshMaterial3d(material.clone()));
+        }
+    }
+    chunks.material = Some(material);
+    debug!(
+        "map rebuilt as {} in {:.2} ms",
+        kind.label(),
+        t0.elapsed().as_secs_f32() * 1000.0
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
 fn spawn_chunks(
     mut commands: Commands,
     terrain: Res<Terrain>,
     assets: Res<AssetServer>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<GroundMaterial>>,
+    mut standard: ResMut<Assets<StandardMaterial>>,
     mut chunks: ResMut<TerrainChunks>,
     mut images: ResMut<Assets<Image>>,
 ) {
     let material = materials.add(GroundMaterial {
-        base: StandardMaterial {
-            base_color: Color::WHITE,
-            perceptual_roughness: 0.95,
-            reflectance: 0.05,
-            ..default()
-        },
-        extension: GroundLayers {
-            pasture: ground_texture(
-                &assets,
-                if terrain.classic {
-                    "terrain/pasture_natural_color.ktx2"
-                } else {
-                    "terrain/pasture_color.ktx2"
-                },
-            ),
-            pasture_normal: ground_texture(&assets, "terrain/pasture_normal_roughness.ktx2"),
-            stone: ground_texture(
-                &assets,
-                if terrain.classic {
-                    "terrain/earth_color.ktx2"
-                } else {
-                    "terrain/stony_soil_color.ktx2"
-                },
-            ),
-            stone_normal: ground_texture(
-                &assets,
-                if terrain.classic {
-                    "terrain/earth_normal_roughness.ktx2"
-                } else {
-                    "terrain/stony_soil_normal_roughness.ktx2"
-                },
-            ),
-            earth: ground_texture(&assets, "terrain/earth_color.ktx2"),
-            earth_normal: ground_texture(&assets, "terrain/earth_normal_roughness.ktx2"),
-            coverage: if terrain.classic {
-                ground_texture(&assets, "terrain/grassland_layout_color.ktx2")
-            } else {
-                images.add(ground_coverage(&terrain))
-            },
-            coverage_bounds: if terrain.classic {
-                Vec4::new(
-                    terrain.origin.x,
-                    terrain.origin.y,
-                    (VERTS_X - 1) as f32 * CELL,
-                    (VERTS_Z - 1) as f32 * CELL,
-                )
-            } else {
-                Vec4::new(
-                    terrain.origin.x - CELL * 0.5,
-                    terrain.origin.y - CELL * 0.5,
-                    VERTS_X as f32 * CELL,
-                    VERTS_Z as f32 * CELL,
-                )
-            },
-            natural_ground: u32::from(terrain.classic),
-        },
+        base: ground_base(),
+        extension: ground_layers(&assets, &mut images, &terrain),
     });
+    chunks.material = Some(material.clone());
+    let band_material = standard.add(StandardMaterial {
+        base_color: Color::WHITE,
+        perceptual_roughness: 1.0,
+        reflectance: 0.05,
+        ..default()
+    });
+    chunks.band_material = Some(band_material.clone());
+    // Otherwise a switch in the menu drops the ground for the frames the
+    // new map's textures take to load.
+    chunks.warm = GROUND_TEXTURES
+        .iter()
+        .copied()
+        .map(|path| ground_texture(&assets, path))
+        .collect();
     chunks.original_heights.clone_from(&terrain.heights);
     for cz in 0..CHUNKS_Z {
         for cx in 0..CHUNKS_X {
@@ -599,7 +748,12 @@ fn spawn_chunks(
             let aabb = mesh.compute_aabb();
             let handle = meshes.add(mesh);
             chunks.meshes.push(handle.clone());
-            let mut e = commands.spawn((Mesh3d(handle), MeshMaterial3d(material.clone())));
+            let mut e = commands.spawn((Mesh3d(handle), GroundChunk));
+            if terrain.kind == MapKind::Classic {
+                e.insert(MeshMaterial3d(band_material.clone()));
+            } else {
+                e.insert(MeshMaterial3d(material.clone()));
+            }
             if let Some(aabb) = aabb {
                 e.insert(aabb);
             }
@@ -700,7 +854,98 @@ fn ground_weights(terrain: &Terrain, original: &[f32], x: usize, z: usize, n: Ve
     [0.0, soil, stone, damp]
 }
 
+fn band_color(h: f32, slope: f32, p: Vec2, classic: bool) -> [f32; 4] {
+    let mut c = if slope > 0.75 {
+        Color::srgb(0.46, 0.42, 0.36) // scree on steep faces
+    } else if h < -2.5 {
+        Color::srgb(0.33, 0.25, 0.17) // crater floor / deep dirt
+    } else if h < 0.0 {
+        Color::srgb(0.43, 0.34, 0.22) // dirt
+    } else if h < 5.0 {
+        Color::srgb(0.34, 0.43, 0.22) // low grass
+    } else if h < 11.0 {
+        Color::srgb(0.42, 0.50, 0.26) // grass
+    } else if h < 17.0 {
+        Color::srgb(0.52, 0.52, 0.33) // dry highland
+    } else if h < 24.0 {
+        Color::srgb(0.52, 0.48, 0.42) // rock
+    } else {
+        Color::srgb(0.78, 0.79, 0.82) // snowcap
+    };
+    // Grass-band variety: golden wheat patches and a subtle per-triangle
+    // tone wobble so the open field doesn't read as flat plastic.
+    // (New map only — the classic map keeps the flat bands.)
+    if !classic && slope <= 0.75 && (0.0..11.0).contains(&h) {
+        let patch = fbm(p / 70.0 + Vec2::splat(47.1));
+        if patch > 0.62 {
+            c = Color::srgb(0.62, 0.53, 0.24); // wheat field
+        } else {
+            let k = 0.94 + 0.12 * fbm(p / 45.0 + Vec2::splat(13.7));
+            let l = c.to_linear();
+            c = Color::linear_rgb(l.red * k, l.green * k, l.blue * k);
+        }
+    }
+    c.to_linear().to_f32_array()
+}
+/// Flat-shaded triangle soup for one chunk: 2 triangles per cell, per-face
+/// normal and one hard-banded color per triangle. World coords baked in.
+fn build_band_mesh(terrain: &Terrain, cx: usize, cz: usize) -> Mesh {
+    let n_tris = CHUNK_CELLS * CHUNK_CELLS * 2;
+    let mut positions = Vec::with_capacity(n_tris * 3);
+    let mut normals = Vec::with_capacity(n_tris * 3);
+    let mut colors = Vec::with_capacity(n_tris * 3);
+
+    let vx0 = cx * CHUNK_CELLS;
+    let vz0 = cz * CHUNK_CELLS;
+    for dz in 0..CHUNK_CELLS {
+        for dx in 0..CHUNK_CELLS {
+            let (x, z) = (vx0 + dx, vz0 + dz);
+            let wp = |xx: usize, zz: usize| -> Vec3 {
+                let w = terrain.origin + Vec2::new(xx as f32, zz as f32) * CELL;
+                Vec3::new(w.x, terrain.h(xx, zz), w.y)
+            };
+            let p00 = wp(x, z);
+            let p10 = wp(x + 1, z);
+            let p01 = wp(x, z + 1);
+            let p11 = wp(x + 1, z + 1);
+            // Alternate the quad split diagonal for a less regular look.
+            let tris = if (x + z) % 2 == 0 {
+                [[p00, p01, p11], [p00, p11, p10]]
+            } else {
+                [[p00, p01, p10], [p10, p01, p11]]
+            };
+            for tri in tris {
+                let n = (tri[1] - tri[0]).cross(tri[2] - tri[0]).normalize_or_zero();
+                let hc = (tri[0].y + tri[1].y + tri[2].y) / 3.0;
+                let slope = (1.0 - n.y * n.y).sqrt() / n.y.max(0.1);
+                let pc = Vec2::new(
+                    (tri[0].x + tri[1].x + tri[2].x) / 3.0,
+                    (tri[0].z + tri[1].z + tri[2].z) / 3.0,
+                );
+                let col = band_color(hc, slope, pc, true);
+                for v in tri {
+                    positions.push(v);
+                    normals.push(n);
+                    colors.push(col);
+                }
+            }
+        }
+    }
+
+    Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    )
+    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
+}
+
+/// The classic map keeps its 0.1.0 look: flat-shaded soup with height bands.
 fn build_chunk_mesh(terrain: &Terrain, original: &[f32], cx: usize, cz: usize) -> Mesh {
+    if terrain.kind == MapKind::Classic {
+        return build_band_mesh(terrain, cx, cz);
+    }
     let side = CHUNK_CELLS + 1;
     let mut positions = Vec::with_capacity(side * side);
     let mut normals = Vec::with_capacity(side * side);
@@ -887,6 +1132,7 @@ mod tests {
         Terrain {
             heights,
             blocked: vec![false; VERTS_X * VERTS_Z],
+            kind: MapKind::Grassland,
             classic: true,
             origin: Vec2::ZERO,
             dirty: vec![false; CHUNKS_X * CHUNKS_Z],

@@ -9,7 +9,7 @@ use bevy::mesh::PrimitiveTopology;
 use bevy::prelude::*;
 
 use crate::terrain::{
-    CELL, CHUNK_CELLS, CHUNKS_X, CHUNKS_Z, Terrain, fbm, river_center_x, river_half_width,
+    CELL, CHUNK_CELLS, CHUNKS_X, CHUNKS_Z, MapKind, Terrain, fbm, river_center_x, river_half_width,
 };
 use crate::units::hash01;
 
@@ -17,7 +17,7 @@ pub struct VegetationPlugin;
 
 impl Plugin for VegetationPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, spawn_vegetation);
+        app.add_systems(Update, respawn_vegetation.after(crate::terrain::MapRebuild));
     }
 }
 
@@ -196,11 +196,35 @@ fn push_transformed(dst: &mut Soup, src: &Soup, c: Vec3, yaw: f32, scale: f32, a
     }
 }
 
-fn spawn_vegetation(
+/// The plants of the current map, one merged mesh per terrain chunk.
+#[derive(Component)]
+struct Plants;
+
+/// Plants follow the terrain's map: the first frame grows them, and a
+/// map change clears the old ones and grows the new map's.
+fn respawn_vegetation(
+    mut seen: Local<Option<MapKind>>,
+    old: Query<Entity, With<Plants>>,
     mut commands: Commands,
     terrain: Res<Terrain>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    if *seen == Some(terrain.kind) {
+        return;
+    }
+    *seen = Some(terrain.kind);
+    for e in &old {
+        commands.entity(e).despawn();
+    }
+    plant(&mut commands, &terrain, &mut meshes, &mut materials);
+}
+
+fn plant(
+    commands: &mut Commands,
+    terrain: &Terrain,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
 ) {
     if terrain.classic {
         return;
@@ -279,7 +303,7 @@ fn spawn_vegetation(
         let mesh = soup.into_mesh();
         let aabb = mesh.compute_aabb();
         let handle = meshes.add(mesh);
-        let mut e = commands.spawn((Mesh3d(handle), MeshMaterial3d(material.clone())));
+        let mut e = commands.spawn((Mesh3d(handle), MeshMaterial3d(material.clone()), Plants));
         if let Some(aabb) = aabb {
             e.insert(aabb);
         }
