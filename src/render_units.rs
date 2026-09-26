@@ -47,7 +47,7 @@ use crate::units::Units;
 
 /// Bounding-sphere radius for per-instance frustum culling: cube diagonal
 /// plus a generous margin so nothing pops inside the screen edge.
-const CULL_RADIUS: f32 = 2.5;
+pub(crate) const CULL_RADIUS: f32 = 2.5;
 
 /// Instances drawn this frame after culling (overlay diagnostics).
 #[derive(Resource, Default)]
@@ -238,6 +238,31 @@ impl LodBands {
         }
         lod
     }
+}
+
+/// Shadow texels Bevy's default shadow filter (its 5x5 texel Gaussian
+/// PCF) blurs together: detail narrower than this does not show.
+const SHADOW_FILTER_TEXELS: f32 = 2.0;
+
+/// The level a soldier of `kind` casts his shadow with into a sun cascade
+/// of `texel` metres per shadow texel: the level the camera picks for a
+/// soldier as many pixels tall as his shadow can show detail, his height
+/// in shadow texels over what the filter blurs together. As in
+/// `LodBands::level`, the farthest threshold passed wins.
+/// `FL_SHADOW_FILTER_TEXELS=1` casts at full texel detail, for A/B passes.
+pub(crate) fn shadow_level(cfg: &LodConfig, kind: usize, texel: f32) -> usize {
+    static FILTER: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    let filter = *FILTER.get_or_init(|| {
+        crate::util::env_or("FL_SHADOW_FILTER_TEXELS", SHADOW_FILTER_TEXELS).max(0.25)
+    });
+    let px = 2.0 * crate::unit_types::half_height(kind) / (texel * filter).max(1e-6);
+    cfg.px[kind]
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| **t > 0.0 && px < **t)
+        .map(|(j, _)| j + 1)
+        .max()
+        .unwrap_or(0)
 }
 
 /// Per-kind corpse cap (ring-buffered: oldest bodies fade from the field).

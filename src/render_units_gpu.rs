@@ -30,11 +30,13 @@ use bevy::render::{
 use bytemuck::{Pod, Zeroable};
 
 use crate::render_units::{
-    BAND_FIGHTING, BOW_FALL_S, BOW_RISE_S, BOW_WALK_MS, CELEBRATE_BASE, CORPSE_CAP, Corpses,
-    CustomPipeline, ExtractedAtlas, FOLLOW_BASE, FOLLOW_S, FOLLOW_SPAN, HOLD_S, InstanceBucket,
-    InstanceData, LodBands, LodConfig, NUM_BUCKETS, NUM_LODS, RANGED_BASE, RELEASE_S, RELOAD_S,
-    REWIND_S, RenderCounts, RigBuffer, SYNC_CHUNK, celebrate_progress, stance_tier, wall_signal,
+    BAND_FIGHTING, BOW_FALL_S, BOW_RISE_S, BOW_WALK_MS, CELEBRATE_BASE, CORPSE_CAP, CULL_RADIUS,
+    Corpses, CustomPipeline, ExtractedAtlas, FOLLOW_BASE, FOLLOW_S, FOLLOW_SPAN, HOLD_S,
+    InstanceBucket, InstanceData, LodBands, LodConfig, NUM_BUCKETS, NUM_LODS, RANGED_BASE,
+    RELEASE_S, RELOAD_S, REWIND_S, RenderCounts, RigBuffer, SYNC_CHUNK, celebrate_progress,
+    shadow_level, stance_tier, wall_signal,
 };
+use crate::render_units_shadow::{CAST_LODS, unit_shadows};
 use crate::units::Units;
 use crate::unit_types::NUM_KINDS;
 
@@ -58,8 +60,23 @@ pub fn cpu_sweep(cfg: Res<GpuSyncConfig>) -> bool {
 }
 
 /// Words of the counts readback: 16 bucket totals, 16 fallen per bucket,
-/// the frame stamp, the soldier count.
-const READBACK_WORDS: usize = 36;
+/// the frame stamp, the soldier count, two spare, then the 16 caster list
+/// counts (cascade * 4 + kind).
+const READBACK_WORDS: usize = 52;
+
+/// Sun shadow cascades the build fills caster lists for, Bevy's maximum.
+pub const MAX_CASCADES: usize = bevy::pbr::MAX_CASCADES_PER_LIGHT;
+
+/// Caster lists: one per cascade and kind.
+const CASTER_LISTS: usize = MAX_CASCADES * NUM_KINDS;
+
+/// Indirect draw arguments: the camera's buckets, then the caster lists.
+pub const DRAW_ARGS: usize = NUM_BUCKETS + CASTER_LISTS;
+
+/// Bytes of one set of per-bucket list entries in the bucket table: the
+/// camera's set, then one per cascade. A pulled draw binds one set, at a
+/// multiple of the storage offset alignment every device allows.
+const BUCKET_SET_BYTES: u64 = 256;
 
 /// Per-tick snapshot of one soldier, 56 bytes, every field exact. All
 /// scalars, so the WGSL struct (`Soldier` in unit_build.wgsl) has the same
@@ -130,10 +147,31 @@ pub struct BuildParams {
     bow: Vec4,
     /// x = first index slot of the bucket, y = mesh corners per soldier.
     buckets: [UVec4; NUM_BUCKETS],
+    /// The camera's forward axis, for view depth.
+    cam_fwd: Vec4,
+    /// Where a soldier's shadow can fall: xz = the centre of the ground his
+    /// cull sphere shades, from his position, w = its radius.
+    shadow_reach: Vec4,
+    /// The view depths each cascade is sampled at, blend band included.
+    cascade_near: Vec4,
+    cascade_far: Vec4,
+    /// Per cascade, one entry per kind: the first slot of the caster list.
+    shadow_lists: [UVec4; MAX_CASCADES],
+    /// Per cascade and kind: corners per soldier of the level he casts with.
+    shadow_corners: [UVec4; MAX_CASCADES],
+    /// Cascades the build fills, 0 with shadows off.
+    n_cascades: u32,
+    /// render_units_shadow.rs CAST_LODS.
+    cast_lods: u32,
 }
 
 const _: () = assert!(NUM_KINDS == 4, "BuildParams packs per-kind values in vec4s");
 const _: () = assert!(NUM_BUCKETS == 16, "unit_build.wgsl sizes its counters for 16 buckets");
+const _: () = assert!(MAX_CASCADES == 4, "unit_build.wgsl sizes its cascades for 4");
+const _: () = assert!(
+    NUM_BUCKETS * 16 == BUCKET_SET_BYTES as usize,
+    "one bucket table set is 16 entries of 16 bytes"
+);
 
 /// The soldier snapshot on the main world side. `records` is double
 /// buffered against the render world: extract swaps the two, so the
@@ -154,6 +192,8 @@ pub struct GpuFrameInput {
     pub params: BuildParams,
     pub regiments: Vec<RegimentRecord>,
     pub lod_debug: bool,
+    /// Per cascade and kind: the detail level soldiers cast with.
+    pub shadow_levels: [[u32; NUM_KINDS]; MAX_CASCADES],
 }
 
 /// Pack the live soldier columns into the snapshot. Runs after every
@@ -223,15 +263,22 @@ fn build_frame_params(
     time: Res<Time>,
     fixed_time: Res<Time<Fixed>>,
     lod_cfg: Res<LodConfig>,
-    camera: Query<(&Camera, &Projection, &Transform), With<Camera3d>>,
+    camera: Query<(Entity, &Camera, &Projection, &Transform), With<Camera3d>>,
+    lights: Query<(
+        &DirectionalLight,
+        &GlobalTransform,
+        &bevy::light::CascadeShadowConfig,
+        &bevy::light::Cascades,
+    )>,
     snap: Res<SoldierSnapshot>,
     mut frame: ResMut<GpuFrameInput>,
     mut counts: ResMut<RenderCounts>,
     mut no_cull: Local<Option<bool>>,
     frame_count: Res<FrameCount>,
+    mut logged: Local<[Option<[u32; NUM_KINDS]>; MAX_CASCADES]>,
 ) {
     let t0 = std::time::Instant::now();
-    let Ok((cam, projection, cam_tf)) = camera.single() else {
+    let Ok((cam_entity, cam, projection, cam_tf)) = camera.single() else {
         return;
     };
     // Fresh frustum from THIS frame's camera state, as the CPU pass does.
@@ -309,6 +356,52 @@ fn build_frame_params(
         RANGED_BASE,
     );
     p.frame = frame_count.0;
+    // The sun's cascades for this camera, as the shadow pass draws them
+    // this frame. A soldier casts into a cascade when the ground his shadow
+    // can fall on is in view at depths the cascade serves, with the level
+    // that shows all the detail the cascade's filtered texels can
+    // (render_units.rs `shadow_level`).
+    p.cast_lods = CAST_LODS as u32;
+    p.cam_fwd = cam_tf.forward().as_vec3().extend(0.0);
+    let sun = lights
+        .iter()
+        .find(|(light, ..)| light.shadow_maps_enabled && unit_shadows())
+        .and_then(|(_, sun, config, c)| Some((sun, config, c.cascades.get(&cam_entity)?)));
+    if let Some((sun, config, cascades)) = sun {
+        // A point at height h above the ground shades the ground h * run
+        // away from the sun. A soldier stands half his height above his
+        // feet, so the top of his cull sphere is at most CULL_RADIUS plus
+        // the tallest kind's half height above the ground, and the sphere's
+        // shadow lies in a sphere around the midpoint of that run. A sun
+        // under 5 degrees is taken at 5.
+        let to_sun = sun.back().as_vec3();
+        let run = -Vec2::new(to_sun.x, to_sun.z) / to_sun.y.max(5f32.to_radians().sin());
+        let top = CULL_RADIUS
+            + (0..NUM_KINDS).map(crate::unit_types::half_height).fold(0.0, f32::max);
+        let half = run * (0.5 * top);
+        p.shadow_reach = Vec4::new(half.x, 0.0, half.y, CULL_RADIUS + half.length());
+        // Bevy samples cascade c up to its far bound, and blends in from
+        // the previous one's far bound less the overlap.
+        let mut near = 0.0;
+        for (c, cascade) in cascades.iter().take(MAX_CASCADES).enumerate() {
+            let far = config.bounds[c];
+            p.cascade_near[c] = near;
+            p.cascade_far[c] = far;
+            let levels = std::array::from_fn(|kind| {
+                shadow_level(&lod_cfg, kind, cascade.texel_size) as u32
+            });
+            if logged[c] != Some(levels) {
+                logged[c] = Some(levels);
+                info!(
+                    "sun shadow cascade {c}: {near:.0} to {far:.0} m, texel {:.1} cm, soldiers cast with levels {levels:?}",
+                    cascade.texel_size * 100.0
+                );
+            }
+            frame.shadow_levels[c] = levels;
+            p.n_cascades = c as u32 + 1;
+            near = (1.0 - config.overlap_proportion) * far;
+        }
+    }
     frame.params = p;
     frame.lod_debug = lod_cfg.debug;
 
@@ -343,6 +436,8 @@ struct CheckStats {
     mismatched: u32,
     worst: u32,
     detailed: u32,
+    /// Readbacks since the caster counts were last logged.
+    since_casters: u32,
 }
 
 /// A readback landed: fill the overlay counts, and in check mode compare
@@ -365,6 +460,14 @@ fn on_counts_readback(
     let living: [u32; NUM_BUCKETS] = std::array::from_fn(|b| words[b].saturating_sub(fallen[b]));
     let frame = words[2 * NUM_BUCKETS];
     counts.set_from_buckets(&living, &fallen);
+    // The sun shadow casters per cascade, one count per kind, about every
+    // two seconds next to the periodic log.
+    stats.since_casters += 1;
+    if stats.since_casters >= 120 && words[36..].iter().any(|&n| n > 0) {
+        stats.since_casters = 0;
+        let casters: Vec<&[u32]> = words[36..].chunks(NUM_KINDS).collect();
+        info!("  unit shadow casters per cascade, per kind: {casters:?}");
+    }
     if !cfg.check {
         return;
     }
@@ -508,6 +611,10 @@ fn extract_pull_meshes(
 #[derive(Component)]
 pub struct PulledBucketGpu {
     pub bind_group: BindGroup,
+    /// The same group for drawing into each sun shadow cascade: it binds
+    /// that cascade's set of the bucket table, so the bucket's draw reads
+    /// the cascade's caster list for its kind.
+    pub shadow: Vec<BindGroup>,
     generation: u32,
     /// Bound to its own atlas, or has none. Otherwise it waits on the upload.
     atlas_settled: bool,
@@ -525,6 +632,8 @@ pub struct GpuUnitInput {
     params: BuildParams,
     regiments: Vec<RegimentRecord>,
     pub lod_debug: bool,
+    /// Per cascade and kind: the detail level soldiers cast with.
+    pub shadow_levels: [[u32; NUM_KINDS]; MAX_CASCADES],
     /// Bodies that fell since the last frame: slot in the corpse region
     /// and the frozen record. Sorted by slot in prepare.
     corpse_pending: Vec<(u32, InstanceData)>,
@@ -564,6 +673,7 @@ fn extract_gpu_units(mut main_world: ResMut<MainWorld>, mut input: ResMut<GpuUni
     input.regiments.clear();
     input.regiments.extend_from_slice(&frame.regiments);
     input.lod_debug = frame.lod_debug;
+    input.shadow_levels = frame.shadow_levels;
     if input.readback.is_none() {
         input.readback = main_world
             .get_resource::<CountsReadback>()
@@ -631,10 +741,12 @@ pub struct UnitAlloc {
     pub records: Buffer,
     smooth: Buffer,
     /// Per bucket, `kind_cap[kind] + CORPSE_CAP` slots: a soldier of a
-    /// kind can only land in one of that kind's levels.
+    /// kind can only land in one of that kind's levels. Then as many per
+    /// cascade and kind for the casters.
     pub index_list: Buffer,
     kind_cap: [usize; NUM_KINDS],
     bases: [u32; NUM_BUCKETS],
+    shadow_bases: [[u32; NUM_KINDS]; MAX_CASCADES],
     counts: Buffer,
     pub args: Buffer,
     regiments: Buffer,
@@ -661,6 +773,13 @@ impl UnitAlloc {
                 total += kind_cap[kind] + CORPSE_CAP;
             }
         }
+        let mut shadow_bases = [[0u32; NUM_KINDS]; MAX_CASCADES];
+        for cascade in &mut shadow_bases {
+            for (kind, base) in cascade.iter_mut().enumerate() {
+                *base = total as u32;
+                total += kind_cap[kind] + CORPSE_CAP;
+            }
+        }
         let regiments_cap = 256;
         Self {
             soldiers: storage_buffer(
@@ -680,11 +799,17 @@ impl UnitAlloc {
             index_list: storage_buffer(device, "unit index list", total * 4, BufferUsages::empty()),
             kind_cap,
             bases,
-            counts: storage_buffer(device, "unit bucket counts", 32 * 4, BufferUsages::COPY_DST),
+            shadow_bases,
+            counts: storage_buffer(
+                device,
+                "unit bucket counts",
+                (2 * NUM_BUCKETS + CASTER_LISTS) * 4,
+                BufferUsages::COPY_DST,
+            ),
             args: storage_buffer(
                 device,
                 "unit draw args",
-                NUM_BUCKETS * 16,
+                DRAW_ARGS * 16,
                 BufferUsages::INDIRECT | BufferUsages::COPY_DST,
             ),
             regiments: storage_buffer(
@@ -697,7 +822,7 @@ impl UnitAlloc {
             bucket_info: storage_buffer(
                 device,
                 "unit bucket info",
-                NUM_BUCKETS * 16,
+                (1 + MAX_CASCADES) * BUCKET_SET_BYTES as usize,
                 BufferUsages::COPY_DST,
             ),
         }
@@ -806,16 +931,28 @@ fn prepare_gpu_units(
         corpse_pending.clear();
     }
 
-    let mut info = [[0u32; 4]; NUM_BUCKETS];
+    // The bucket table: the camera's set, then one set per cascade whose
+    // every level of a kind points at the cascade's caster list for it.
+    let mut info = [[[0u32; 4]; NUM_BUCKETS]; 1 + MAX_CASCADES];
     for mesh in &meshes {
-        info[mesh.bucket] = [alloc.bases[mesh.bucket], mesh.count, 0, 0];
+        let b = mesh.bucket;
+        info[0][b] = [alloc.bases[b], mesh.count, 0, 0];
+        for c in 0..MAX_CASCADES {
+            info[1 + c][b] = [alloc.shadow_bases[c][b / NUM_LODS], mesh.count, 0, 0];
+        }
     }
     queue.write_buffer(&alloc.bucket_info, 0, bytemuck::cast_slice(&info));
     let mut params = input.params;
     params.corpse_base = alloc.live_cap as u32;
     params.corpse_cap = CORPSE_CAP as u32;
     params.corpse_len = UVec4::from_array(input.corpse_len);
-    params.buckets = info.map(UVec4::from_array);
+    params.buckets = info[0].map(UVec4::from_array);
+    params.shadow_lists = alloc.shadow_bases.map(UVec4::from_array);
+    params.shadow_corners = input.shadow_levels.map(|levels| {
+        UVec4::from_array(std::array::from_fn(|kind| {
+            info[0][kind * NUM_LODS + levels[kind] as usize][1]
+        }))
+    });
     buffers.params.set(params);
     buffers.params.write_buffer(&device, &queue);
     buffers.threads = n as u32 + input.corpse_len.iter().sum::<u32>();
@@ -878,22 +1015,34 @@ fn prepare_pull_bind_groups(
             continue;
         }
         let (view, sampler, atlas_settled) = custom_pipeline.atlas_for(atlas, &images);
-        let bind_group = device.create_bind_group(
-            "unit pull bind group",
-            &pipeline_cache.get_bind_group_layout(&custom_pipeline.pull_layout),
-            &BindGroupEntries::with_indices((
-                (0, alloc.records.as_entire_binding()),
-                (1, alloc.index_list.as_entire_binding()),
-                (2, mesh.vertices.as_entire_binding()),
-                (3, alloc.bucket_info.as_entire_binding()),
-                (4, view),
-                (5, sampler),
-                (6, rig.rig.as_entire_binding()),
-                (7, rig.clips.as_entire_binding()),
-            )),
-        );
+        let layout = pipeline_cache.get_bind_group_layout(&custom_pipeline.pull_layout);
+        // Set 0 of the bucket table is the camera's, set 1 + c cascade c's.
+        let group = |set: u64| {
+            device.create_bind_group(
+                "unit pull bind group",
+                &layout,
+                &BindGroupEntries::with_indices((
+                    (0, alloc.records.as_entire_binding()),
+                    (1, alloc.index_list.as_entire_binding()),
+                    (2, mesh.vertices.as_entire_binding()),
+                    (
+                        3,
+                        BufferBinding {
+                            buffer: &alloc.bucket_info,
+                            offset: set * BUCKET_SET_BYTES,
+                            size: BufferSize::new(BUCKET_SET_BYTES),
+                        },
+                    ),
+                    (4, view),
+                    (5, sampler),
+                    (6, rig.rig.as_entire_binding()),
+                    (7, rig.clips.as_entire_binding()),
+                )),
+            )
+        };
         commands.entity(entity).insert(PulledBucketGpu {
-            bind_group,
+            bind_group: group(0),
+            shadow: (1..=MAX_CASCADES as u64).map(group).collect(),
             generation: buffers.generation,
             atlas_settled,
             bucket: mesh.bucket as u32,
@@ -953,6 +1102,7 @@ impl Plugin for GpuUnitRenderPlugin {
                 PostUpdate,
                 (pack_soldier_snapshot, build_frame_params)
                     .chain()
+                    .after(bevy::light::SimulationLightSystems::UpdateDirectionalLightCascades)
                     .run_if(gpu_sync),
             );
         app.sub_app_mut(RenderApp)

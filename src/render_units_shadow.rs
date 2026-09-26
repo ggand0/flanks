@@ -2,18 +2,22 @@
 //!
 //! The unit buckets draw into the sun's cascaded shadow maps through
 //! Bevy's own `Shadow` phase, as non-mesh items beside the meshes Bevy
-//! queues there. Each item is a depth-only variant of the unit pipeline:
-//! the same vertex shader and pose code, the same bucket bind group and
-//! the same draw (`DrawMeshInstanced`), so on the GPU path a cascade
-//! redraws the index lists and indirect arguments the build pass wrote
-//! for the camera, with no per-soldier CPU work.
+//! queues there. Each item is a depth-only variant of the unit pipeline
+//! with the same vertex shader and pose code.
+//!
+//! GPU path: the build pass (unit_build.wgsl) puts every near soldier
+//! whose sphere overlaps a cascade's box on that cascade's caster list for
+//! his kind, off screen or not, so a cascade draws only what can shade it.
+//! A cascade draws a kind with one level for all its casters: the level
+//! the camera picks for a soldier as many pixels tall as his filtered
+//! shadow shows detail (`render_units::shadow_level`). No per-soldier CPU
+//! work.
+//!
+//! CPU path (`FL_GPU_SYNC=0`): every cascade draws the camera's near
+//! buckets from their instance buffers, the fallback's simple form.
 //!
 //! Only the near levels cast (`CAST_LODS`). Farther soldiers are a few
-//! pixels tall and their shadows would be smaller than a shadow texel.
-//!
-//! Known limitation: the lists are culled by the camera frustum, not the
-//! light's, so a soldier just off the screen edge toward the sun casts
-//! nothing. A light-frustum test in the build compute is the later fix.
+//! pixels tall and their shadows would be a few pixels.
 //!
 //! The whole shadow pass is timed on the GPU as
 //! `render/sun_shadows/elapsed_gpu` (`ShadowPassTimer`).
@@ -51,12 +55,23 @@ use bevy::{
 };
 
 use crate::render_units::{
-    CustomPipeline, DrawMeshInstanced, ExtractedBucket, NUM_LODS, PullPipelineKey, UnitMeshKey,
+    CustomPipeline, DrawMeshInstanced, ExtractedBucket, NUM_BUCKETS, NUM_LODS, PullPipelineKey,
+    UnitMeshKey,
 };
-use crate::render_units_gpu::PullMeshGpu;
+use crate::render_units_gpu::{
+    GpuUnitBuffers, GpuUnitInput, MAX_CASCADES, PullMeshGpu, PulledBucketGpu,
+};
+use crate::unit_types::NUM_KINDS;
 
-/// Detail levels that cast: L0 and L1.
-const CAST_LODS: usize = 2;
+/// Detail levels that cast: soldiers the camera would draw at L0 or L1.
+pub(crate) const CAST_LODS: usize = 2;
+
+/// `FL_UNIT_SHADOWS=0`: soldiers cast nothing while the rest of the scene
+/// keeps its shadows, the A/B for their share of the shadow pass.
+pub(crate) fn unit_shadows() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::util::env_or("FL_UNIT_SHADOWS", 1_u32) != 0)
+}
 
 /// The depth-only unit pipeline, specialized per bucket like the main one.
 #[derive(Resource)]
@@ -183,10 +198,10 @@ fn prepare_unit_shadow_bind_groups(
     }
 }
 
-/// Put the near-level buckets into every sun cascade's shadow phase.
-/// The phase is retained and Bevy's own queue removes what it did not
-/// add, so each item is taken out and put back every frame: a handful
-/// of hash map operations, no per-soldier work.
+/// Put the unit casters into every sun cascade's shadow phase. The phase
+/// is retained and Bevy's own queue removes what it did not add, so each
+/// item is taken out and put back every frame: a handful of hash map
+/// operations, no per-soldier work.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)] // bevy system params
 fn queue_unit_shadows(
     draw_functions: Res<DrawFunctions<Shadow>>,
@@ -197,21 +212,33 @@ fn queue_unit_shadows(
     meshes: Res<RenderAssets<RenderMesh>>,
     mesh_allocator: Res<MeshAllocator>,
     render_mesh_instances: Res<bevy::pbr::RenderMeshInstances>,
+    gpu_input: Res<GpuUnitInput>,
     buckets: Query<(Entity, &MainEntity, &ExtractedBucket, Option<&PullMeshGpu>)>,
     light_views: Query<(&LightEntity, &ExtractedView)>,
     mut phases: ResMut<ViewBinnedRenderPhases<Shadow>>,
 ) {
-    let draw = draw_functions.read().id::<DrawUnitShadow>();
+    let draw_pulled = draw_functions.read().id::<DrawUnitShadowPulled>();
+    let draw_instanced = draw_functions.read().id::<DrawUnitShadowInstanced>();
     for (light, view) in &light_views {
-        if !matches!(light, LightEntity::Directional { .. }) {
+        let &LightEntity::Directional { cascade_index, .. } = light else {
             continue;
-        }
+        };
         let Some(phase) = phases.get_mut(&view.retained_view_entity) else {
             continue;
         };
         for (entity, main_entity, bucket, pull_mesh) in &buckets {
             phase.remove(*main_entity);
-            if bucket.0 % NUM_LODS >= CAST_LODS {
+            if !unit_shadows() || cascade_index >= MAX_CASCADES {
+                continue;
+            }
+            let (kind, lod) = (bucket.0 / NUM_LODS, bucket.0 % NUM_LODS);
+            // GPU path: the one level this cascade draws the kind with.
+            // CPU path: the near levels, as the camera drew them.
+            let casts = match pull_mesh {
+                Some(_) => lod == gpu_input.shadow_levels[cascade_index][kind] as usize,
+                None => lod < CAST_LODS,
+            };
+            if !casts {
                 continue;
             }
             let Some(mesh_instance) = render_mesh_instances.render_mesh_queue_data(*main_entity)
@@ -229,11 +256,14 @@ fn queue_unit_shadows(
                     mesh.primitive_topology(),
                     mesh.index_format(),
                 );
-            let pipeline_id = match pull_mesh {
-                Some(pull_mesh) => pull_pipelines.specialize(
-                    &pipeline_cache,
-                    &pipeline,
-                    PullPipelineKey::shadow(mesh_key, mesh.layout.clone(), pull_mesh),
+            let (pipeline_id, draw_function) = match pull_mesh {
+                Some(pull_mesh) => (
+                    pull_pipelines.specialize(
+                        &pipeline_cache,
+                        &pipeline,
+                        PullPipelineKey::shadow(mesh_key, mesh.layout.clone(), pull_mesh),
+                    ),
+                    draw_pulled,
                 ),
                 None => match mesh_pipelines.specialize(
                     &pipeline_cache,
@@ -241,7 +271,7 @@ fn queue_unit_shadows(
                     UnitMeshKey::shadow(mesh_key),
                     &mesh.layout,
                 ) {
-                    Ok(id) => id,
+                    Ok(id) => (id, draw_instanced),
                     Err(err) => {
                         error!("unit shadow pipeline: {err}");
                         continue;
@@ -251,7 +281,7 @@ fn queue_unit_shadows(
             phase.add(
                 ShadowBatchSetKey {
                     pipeline: pipeline_id,
-                    draw_function: draw,
+                    draw_function,
                     material_bind_group_index: None,
                     slabs,
                 },
@@ -266,7 +296,43 @@ fn queue_unit_shadows(
     }
 }
 
-type DrawUnitShadow = (SetItemPipeline, SetUnitShadowViewGroups, DrawMeshInstanced);
+type DrawUnitShadowPulled = (SetItemPipeline, SetUnitShadowViewGroups, DrawCasterList);
+type DrawUnitShadowInstanced = (SetItemPipeline, SetUnitShadowViewGroups, DrawMeshInstanced);
+
+/// A pulled bucket drawn into one cascade: its group 3 with the cascade's
+/// set of the bucket table, and the indirect arguments of the cascade's
+/// caster list for the bucket's kind (unit_build.wgsl `finalize`).
+struct DrawCasterList;
+
+impl<P: PhaseItem> RenderCommand<P> for DrawCasterList {
+    type Param = SRes<GpuUnitBuffers>;
+    type ViewQuery = Read<LightEntity>;
+    type ItemQuery = Read<PulledBucketGpu>;
+
+    #[inline]
+    fn render<'w>(
+        _item: &P,
+        light: &'w LightEntity,
+        pulled: Option<&'w PulledBucketGpu>,
+        gpu: SystemParamItem<'w, '_, Self::Param>,
+        pass: &mut TrackedRenderPass<'w>,
+    ) -> RenderCommandResult {
+        let &LightEntity::Directional { cascade_index, .. } = light else {
+            return RenderCommandResult::Skip;
+        };
+        let (Some(pulled), Some(alloc)) = (pulled, &gpu.into_inner().alloc) else {
+            return RenderCommandResult::Skip;
+        };
+        let Some(group) = pulled.shadow.get(cascade_index) else {
+            return RenderCommandResult::Skip;
+        };
+        let kind = pulled.bucket as usize / NUM_LODS;
+        let list = NUM_BUCKETS + cascade_index * NUM_KINDS + kind;
+        pass.set_bind_group(3, group, &[]);
+        pass.draw_indirect(&alloc.args, list as u64 * 16);
+        RenderCommandResult::Success
+    }
+}
 
 /// Groups 0 to 2 of the shadow pipeline: the light view at its uniform
 /// offset, then the two empty groups.
@@ -306,7 +372,8 @@ impl Plugin for UnitShadowPlugin {
             .init_resource::<UnitShadowBindGroups>()
             .init_resource::<SpecializedRenderPipelines<UnitShadowPipeline>>()
             .init_resource::<SpecializedMeshPipelines<UnitShadowPipeline>>()
-            .add_render_command::<Shadow, DrawUnitShadow>()
+            .add_render_command::<Shadow, DrawUnitShadowPulled>()
+            .add_render_command::<Shadow, DrawUnitShadowInstanced>()
             .add_systems(
                 RenderStartup,
                 (
