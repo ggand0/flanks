@@ -8,7 +8,7 @@ use bevy::image::{ImageAddressMode, ImageLoaderSettings, ImageSampler, ImageSamp
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::pbr::{ExtendedMaterial, MaterialExtension};
 use bevy::prelude::*;
-use bevy::render::render_resource::AsBindGroup;
+use bevy::render::render_resource::{AsBindGroup, Extent3d, TextureDimension, TextureFormat};
 use bevy::shader::ShaderRef;
 use bevy::window::PrimaryWindow;
 use std::time::Instant;
@@ -252,6 +252,11 @@ struct GroundLayers {
     earth: Handle<Image>,
     #[texture(106)]
     earth_normal: Handle<Image>,
+    #[texture(107)]
+    #[sampler(108)]
+    coverage: Handle<Image>,
+    #[uniform(109)]
+    coverage_bounds: Vec4,
 }
 
 impl MaterialExtension for GroundLayers {
@@ -475,6 +480,7 @@ fn spawn_chunks(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<GroundMaterial>>,
     mut chunks: ResMut<TerrainChunks>,
+    mut images: ResMut<Assets<Image>>,
 ) {
     let material = materials.add(GroundMaterial {
         base: StandardMaterial {
@@ -490,6 +496,13 @@ fn spawn_chunks(
             stone_normal: ground_texture(&assets, "terrain/stony_soil_normal_roughness.ktx2"),
             earth: ground_texture(&assets, "terrain/earth_color.ktx2"),
             earth_normal: ground_texture(&assets, "terrain/earth_normal_roughness.ktx2"),
+            coverage: images.add(ground_coverage(&terrain)),
+            coverage_bounds: Vec4::new(
+                terrain.origin.x - CELL * 0.5,
+                terrain.origin.y - CELL * 0.5,
+                VERTS_X as f32 * CELL,
+                VERTS_Z as f32 * CELL,
+            ),
         },
     });
     chunks.original_heights.clone_from(&terrain.heights);
@@ -518,15 +531,78 @@ fn ground_normal(terrain: &Terrain, x: usize, z: usize) -> Vec3 {
     Vec3::new(-dx, 1.0, -dz).normalize()
 }
 
-/// RGBA carries dryness, exposed earth, stone and dampness, not display color.
+/// Smooth gradient noise for rendering only; does not draw from simulation RNGs.
+fn cover_noise(p: Vec2) -> f32 {
+    fn gradient(x: i32, y: i32) -> Vec2 {
+        let mut h = (x as u32).wrapping_mul(0x8da6_b343) ^ (y as u32).wrapping_mul(0xd816_3841);
+        h ^= h >> 16;
+        h = h.wrapping_mul(0x7feb_352d);
+        h ^= h >> 15;
+        let a = h as f32 * (std::f32::consts::TAU / u32::MAX as f32);
+        Vec2::new(a.cos(), a.sin())
+    }
+    let base = p.floor();
+    let f = p - base;
+    let u = f * f * f * (f * (f * 6.0 - Vec2::splat(15.0)) + Vec2::splat(10.0));
+    let x = base.x as i32;
+    let y = base.y as i32;
+    let a = gradient(x, y).dot(f);
+    let b = gradient(x + 1, y).dot(f - Vec2::X);
+    let c = gradient(x, y + 1).dot(f - Vec2::Y);
+    let d = gradient(x + 1, y + 1).dot(f - Vec2::ONE);
+    ((a + (b - a) * u.x) * (1.0 - u.y) + (c + (d - c) * u.x) * u.y) * 1.5
+}
+
+/// One clamped field spans the battlefield. Warped coordinates break lattice
+/// alignment; relative relief keeps hollows greener than nearby shoulders.
+fn ground_coverage(terrain: &Terrain) -> Image {
+    let mut pixels = Vec::with_capacity(VERTS_X * VERTS_Z * 4);
+    for z in 0..VERTS_Z {
+        for x in 0..VERTS_X {
+            let p = terrain.origin + Vec2::new(x as f32, z as f32) * CELL;
+            let warp = Vec2::new(
+                cover_noise(p / 170.0 + Vec2::new(17.2, 81.7)),
+                cover_noise(p / 170.0 + Vec2::new(53.6, 11.3)),
+            ) * 65.0;
+            let q = Mat2::from_angle(0.57) * (p + warp);
+            let broad = cover_noise(q / Vec2::new(145.0, 85.0) + Vec2::splat(7.3));
+            let patches = cover_noise(q / 31.0 + Vec2::splat(37.8));
+            let flecks = cover_noise(q / 7.0 + Vec2::splat(91.1));
+            let neighbors = terrain.h(x.saturating_sub(24), z)
+                + terrain.h((x + 24).min(VERTS_X - 1), z)
+                + terrain.h(x, z.saturating_sub(24))
+                + terrain.h(x, (z + 24).min(VERTS_Z - 1));
+            let relief = terrain.h(x, z) - neighbors * 0.25;
+            let dry = (0.55 + broad * 0.65 + patches * 0.18 + relief * 0.045).clamp(0.0, 1.0);
+            let soil = smoothstep(0.22, 0.75, patches + broad * 0.3) * 0.5;
+            let variation = (0.5 + flecks * 0.3 + patches * 0.15).clamp(0.0, 1.0);
+            for value in [dry, soil, variation, 1.0] {
+                pixels.push((value * 255.0).round() as u8);
+            }
+        }
+    }
+    let mut image = Image::new(
+        Extent3d {
+            width: VERTS_X as u32,
+            height: VERTS_Z as u32,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        pixels,
+        TextureFormat::Rgba8Unorm,
+        RenderAssetUsages::RENDER_WORLD,
+    );
+    image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor::linear());
+    image
+}
+
+/// RGBA carries an unused channel, crater exposure, stone and bank dampness.
 fn ground_weights(terrain: &Terrain, original: &[f32], x: usize, z: usize, n: Vec3) -> [f32; 4] {
     let p = terrain.origin + Vec2::new(x as f32, z as f32) * CELL;
     let h = terrain.h(x, z);
     let slope = n.xz().length() / n.y.max(0.001);
-    let dry = smoothstep(-0.5, 0.6, fbm(p / 95.0 + Vec2::splat(47.1)) + slope * 0.4);
-    let wear = smoothstep(0.35, 0.95, fbm(p / 32.0 + Vec2::splat(113.8))) * 0.55;
     let disturbed = smoothstep(0.03, 0.65, (h - original[z * VERTS_X + x]).abs());
-    let mut soil = wear.max(disturbed);
+    let mut soil = disturbed;
     let stone = smoothstep(0.45, 0.95, slope) * (1.0 - disturbed * 0.8);
     let mut damp = 0.0;
     if !terrain.classic {
@@ -534,7 +610,7 @@ fn ground_weights(terrain: &Terrain, original: &[f32], x: usize, z: usize, n: Ve
         damp = 1.0 - smoothstep(0.0, 10.0, bank_distance);
         soil = soil.max(damp * 0.8);
     }
-    [dry, soil, stone, damp]
+    [0.0, soil, stone, damp]
 }
 
 fn build_chunk_mesh(terrain: &Terrain, original: &[f32], cx: usize, cz: usize) -> Mesh {
