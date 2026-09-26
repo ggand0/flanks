@@ -1,9 +1,9 @@
 //! Arrow projectiles: a SoA pool + instanced draws, never entities
-//! (devlog 0011). Arrows are real objects — a solved ballistic launch,
+//! Arrows are real objects — a solved ballistic launch,
 //! 30 Hz flight under gravity, and damage applied to whatever body the
 //! shaft actually crosses. No hit rolls at fire time, no accuracy auras:
 //! friendly fire, the high-ground range bonus, and shield facing all
-//! emerge from the flight itself (M2TW-evidenced, devlog 0060).
+//! emerge from the flight itself, as they do in M2TW.
 //!
 //! Ordering contract: `update_arrows` runs after `step_sim` (fresh grid,
 //! index-stable columns, spawn buffers filled) and before
@@ -167,9 +167,9 @@ impl Plugin for ArrowsPlugin {
             .add_systems(
                 FixedUpdate,
                 (
-                    skirmish_and_ammo.before(crate::movement::step_sim),
+                    skirmish_and_ammo.before(crate::sim::step_sim),
                     update_arrows
-                        .after(crate::movement::step_sim)
+                        .after(crate::sim::step_sim)
                         .before(crate::combat::process_deaths),
                 )
                     .in_set(crate::game_state::SimSet),
@@ -181,7 +181,7 @@ impl Plugin for ArrowsPlugin {
 /// The arrow mesh rides the SAME instanced pipeline as units (any entity
 /// with InstanceMaterialData is queued): one bucket for flying arrows,
 /// one for the ground litter. Same NoAutomaticBatching requirement as
-/// the unit buckets (devlog 0013).
+/// the unit buckets.
 fn setup_arrow_buckets(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
     let mesh = meshes.add(crate::unit_glb::arrow_mesh());
     commands.spawn((
@@ -294,7 +294,7 @@ fn update_arrows(
     mut groups: ResMut<crate::orders::Groups>,
     grid: Res<crate::spatial::SpatialGrid>,
     terrain: Res<crate::terrain::Terrain>,
-    scale: Res<crate::movement::CombatScale>,
+    scale: Res<crate::sim::CombatScale>,
     mut cstats: ResMut<crate::combat::CombatStats>,
     mut stats: ResMut<ArrowStats>,
     mut stuck: ResMut<StuckArrows>,
@@ -391,7 +391,7 @@ fn update_arrows(
             let arrow_y = prev.y + (p.y - prev.y) * t;
             let hh = crate::unit_types::half_height(units.kind[u] as usize);
             let uy = units.pos[u].y;
-            // Top margin stays BELOW the launch height (movement.rs
+            // Top margin stays BELOW the launch height (sim/soldier.rs
             // looses at +0.75 over mid-body) or shooters hit themselves.
             if arrow_y < uy - hh || arrow_y > uy + hh + 0.05 {
                 return;
@@ -441,7 +441,7 @@ fn update_arrows(
         i += 1;
     }
 
-    // Serial damage apply, mirroring the melee pass (movement.rs): the
+    // Serial damage apply, mirroring the melee pass (sim/damage.rs): the
     // M2TW missile resolution is armour everywhere (no AP on plain
     // arrows), shield front + LEFT only, and NO defence skill — a
     // falling shaft cannot be parried. Friendly fire is real: no team
@@ -456,19 +456,19 @@ fn update_arrows(
         let pv = &TYPES[units.kind[v] as usize];
         let fwd = Vec2::new(units.yaw[v].sin(), units.yaw[v].cos());
         let along = fwd.dot(h.from_dir);
-        let front = along >= crate::movement::SECTOR_COS_60;
-        let rear = along < -crate::movement::SECTOR_COS_60;
+        let front = along >= crate::sim::damage::SECTOR_COS_60;
+        let rear = along < -crate::sim::damage::SECTOR_COS_60;
         let left_side = !front && !rear && h.from_dir.dot(Vec2::new(fwd.y, -fwd.x)) > 0.0;
         let shield = if front || left_side { pv.shield } else { 0.0 };
         let factor =
             (missile::ATTACK - (pv.armour + shield)).clamp(-FACTOR_CLAMP, FACTOR_CLAMP);
         // The missile curve is steeper than melee's (missile::FACTOR_MULT):
-        // armour classes must separate hard under arrows (devlog 0064).
+        // armour classes must separate hard under arrows.
         let dmg = missile::BASE_DMG * missile::FACTOR_MULT.powf(factor) * h.jit * combat_scale;
         units.hp[v] -= dmg;
         units.flash[v] = 4;
         if units.hp[v] <= 0.0 {
-            units.death_t[v] = crate::movement::DEATH_TICKS;
+            units.death_t[v] = crate::sim::damage::DEATH_TICKS;
             cstats.kills[units.team[v] as usize] += 1;
             groups.list[units.group[v] as usize].recent_deaths += 1;
             if units.team[v] != h.team {
@@ -477,17 +477,17 @@ fn update_arrows(
         } else {
             // A nonfatal shaft rocks its man: the SAME stumble roll as a
             // melee blow, on the same factor — no separate mechanism.
-            // M2TW has no missile-stagger parameter anywhere (verified
-            // absence, devlog 0060); what it does have is the generic
+            // M2TW has no missile-stagger parameter anywhere; what it does
+            // have is the generic
             // hit reaction played on every nonfatal impact, arrows
             // included — which is exactly what the melee stumble models.
             // Braced walls hit frontally stay planted and the
             // anti-stunlock immunity pass applies, like melee.
             let braced = front
                 && crate::formation::wall_kind(&groups.list[units.group[v] as usize]) != 0;
-            let p = (crate::movement::STAGGER_P0
-                + crate::movement::STAGGER_P_PER_FACTOR * factor)
-                .clamp(crate::movement::STAGGER_P_MIN, 1.0);
+            let p = (crate::sim::damage::STAGGER_P0
+                + crate::sim::damage::STAGGER_P_PER_FACTOR * factor)
+                .clamp(crate::sim::damage::STAGGER_P_MIN, 1.0);
             let roll = hash01(
                 (*tick)
                     .wrapping_mul(0x85EB_CA6B)
@@ -503,7 +503,7 @@ fn update_arrows(
                     // archer's 8 s bow cycle as stagger time would
                     // freeze him into a statue.
                     units.swing_t[v] = units.swing_t[v]
-                        .clamp(crate::movement::HIT_STAGGER_TICKS, 45);
+                        .clamp(crate::sim::damage::HIT_STAGGER_TICKS, 45);
                 }
             }
         }

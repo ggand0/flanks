@@ -427,7 +427,7 @@ fn setup_unit_mesh(
     // slot), so bevy's sorted-phase batcher merges their phase items and
     // `SortedRenderPhase::render_range` skips every item after the first —
     // its draw function never runs and that bucket's units silently vanish
-    // (the "LOD far bucket invisible" bug, devlog 0013).
+    // (the "LOD far bucket invisible" bug).
     for kind in 0..crate::unit_types::NUM_KINDS {
         let model = crate::unit_glb::kind_lods(kind);
         let lods = model.lods;
@@ -895,7 +895,7 @@ fn sync_instance_data(
                     };
                     // fx: [0,1) hit flash, [1,2] death progress.
                     let fx = if units.death_t[i] > 0 {
-                        2.0 - units.death_t[i] as f32 / crate::movement::DEATH_TICKS as f32
+                        2.0 - units.death_t[i] as f32 / crate::sim::damage::DEATH_TICKS as f32
                     } else {
                         units.flash[i] as f32 * 0.25
                     };
@@ -908,7 +908,7 @@ fn sync_instance_data(
                         // stumble plays the full rock for its 0.5 s; a
                         // charge impact or impalement holds it ~1 s.
                         (units.swing_t[i] as f32
-                            / crate::movement::HIT_STAGGER_TICKS as f32)
+                            / crate::sim::damage::HIT_STAGGER_TICKS as f32)
                             .min(1.0)
                     } else {
                         0.0

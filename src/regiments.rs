@@ -50,8 +50,8 @@ fn spear_frac() -> f32 {
 
 /// Archer regiments per army: a fixed COUNT by default — archers are
 /// force multipliers, and scaling them with army size turned big
-/// battles into arrow weather (owner: "two is probably enough
-/// considering how OP they are"). FL_ARCHER_FRAC switches back to a
+/// battles into arrow weather; two are enough for how strong they
+/// are. FL_ARCHER_FRAC switches back to a
 /// fraction of the army for sandbox play (=1 for all-archer fields).
 fn archer_regs(n_regs: usize) -> usize {
     match std::env::var("FL_ARCHER_FRAC")
@@ -450,7 +450,7 @@ fn spawn_rout_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
 /// ~2.5 s later — from the LEFT side in the control pair (the shield arm:
 /// factor-identical to frontal) and from the REAR in the test pair (skill
 /// and shield gone). The damage pass buckets every hit on a blue victim by
-/// its actual sector at hit time (movement.rs DirTestStats). Acceptance:
+/// its actual sector at hit time (sim/damage.rs DirTestStats). Acceptance:
 /// rear-sector kills (one feeding regiment) >= front-sector kills (TWO
 /// feeding regiments), i.e. per-attacker rear kill rate >= 2x frontal.
 fn spawn_dir_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
@@ -488,7 +488,7 @@ fn spawn_dir_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
 /// survival, every 2 s.
 #[allow(clippy::too_many_arguments)] // bevy system params
 fn dir_test_log(
-    dir_stats: Res<crate::movement::DirTestStats>,
+    dir_stats: Res<crate::sim::damage::DirTestStats>,
     units: Res<Units>,
     time: Res<Time>,
     mut next: Local<f32>,
@@ -613,26 +613,50 @@ fn charge_test_log(
 
 /// FL_TEST_PILE=1: the pile-on order — six blue regiments in a 3x2
 /// block, ALL attack-ordered at one holding orange regiment (the blob
-/// repro from the FL_RECTFIGHT saga). Acceptance: the fight crowds the
+/// repro). Acceptance: the fight crowds the
 /// victim's perimeter and the second wave stands PRESSED against the
 /// fighting mass (not parked at parade pitch, not smeared into one
 /// ball); the victim collapses; blues re-dress rectangles afterward.
 fn spawn_pile_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
     let mut list = Vec::new();
     spawn_regiment(units, terrain, &mut list, 1, KIND_LIGHT, Vec2::new(0.0, 60.0), 500, 1.0);
-    list[0].hold = true;
+    // FL_PILE_ATEASE=1: the victim stands at ease instead of in hold, so
+    // it answers with its own attack order like a player's regiment.
+    list[0].hold = std::env::var("FL_PILE_ATEASE").is_err();
+    // FL_PILE_VICTIM_FILES: stretch the victim into a wide line (the
+    // M2TW test: a deep unit hits a wide one, which wraps it).
+    if let Ok(files) = std::env::var("FL_PILE_VICTIM_FILES").map(|v| v.parse::<u32>().unwrap_or(0))
+        && files > 0
+    {
+        list[0].files = files;
+        crate::formation::assign_slots(units, 0, &mut list[0]);
+    }
+    // FL_PILE_N: how many attackers (default six; two is "two regiments
+    // engage mine at once").
+    let n_attackers = crate::util::env_or("FL_PILE_N", 6_usize).clamp(1, 6);
     for row in 0..2 {
         for col in 0..3 {
+            if row * 3 + col >= n_attackers {
+                continue;
+            }
             let anchor =
                 Vec2::new((col as f32 - 1.0) * 55.0, -40.0 - row as f32 * 35.0);
             spawn_regiment(units, terrain, &mut list, 0, KIND_LIGHT, anchor, 500, -1.0);
             let g = list.len() - 1;
+            // FL_PILE_FILES: stretch the attackers into a wide line (the
+            // runaway-flank repro: files with no enemy in front of them).
+            if let Ok(files) = std::env::var("FL_PILE_FILES").map(|v| v.parse::<u32>().unwrap_or(0))
+                && files > 0
+            {
+                list[g].files = files;
+                crate::formation::assign_slots(units, g as u32, &mut list[g]);
+            }
             list[g].order = Some(crate::orders::Order::Attack(0));
             list[g].auto_order = true;
         }
     }
     groups.list = list;
-    info!("[pile-test] six blue regiments attack ONE holding orange regiment");
+    info!("[pile-test] {n_attackers} blue regiments attack ONE orange regiment");
 }
 
 /// FL_TEST_JOIN=1: the join-the-fight order (regression repro). Orange
@@ -684,12 +708,11 @@ fn join_test_log(
         }
     }
     info!(
-        "[join-test] t={t:.0}s orange {} / A {} / B {} alive; B->orange {:.1} m, B windups {b_windups}, B locked {}",
+        "[join-test] t={t:.0}s orange {} / A {} / B {} alive; B->orange {:.1} m, B windups {b_windups}",
         groups.list[0].count,
         groups.list[1].count,
         groups.list[2].count,
         groups.list[2].centroid.distance(groups.list[0].centroid),
-        groups.list[2].engaged_with_target,
     );
 }
 
@@ -714,7 +737,7 @@ fn spawn_routpass_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups
 /// walks through it, and the overlap floor.
 fn routpass_test_log(
     groups: Res<crate::orders::Groups>,
-    stats: Res<crate::movement::SimStats>,
+    stats: Res<crate::sim::SimStats>,
     time: Res<Time>,
     mut next: Local<f32>,
 ) {
@@ -736,19 +759,85 @@ fn routpass_test_log(
 
 /// FL_TEST_PILE bookkeeping every 4 s: victim strength + how many of
 /// the six attackers are actually fighting.
-fn pile_test_log(groups: Res<Groups>, time: Res<Time>, mut next: Local<f32>) {
-    if std::env::var("FL_TEST_PILE").is_err() || groups.list.len() < 7 {
+fn pile_test_log(groups: Res<Groups>, units: Res<Units>, time: Res<Time>, mut next: Local<f32>) {
+    if std::env::var("FL_TEST_PILE").is_err() || groups.list.len() < 2 {
         return;
     }
     let t = time.elapsed_secs();
     if t < *next {
         return;
     }
-    *next = t + 4.0;
+    *next = t + 1.0;
+    let n = groups.list.len() - 1;
     let engaged = groups.list[1..].iter().filter(|g| g.engaged).count();
+    let charging = groups.list[1..].iter().filter(|g| g.charging).count();
+    let v = &groups.list[0];
+    // How far the victim block has moved along its own facing since
+    // spawn (z = 60, facing -z): negative = pushed back.
+    let fwd = crate::formation::facing_dir(v.facing);
+    let moved = (v.centroid - Vec2::new(0.0, 60.0)).dot(fwd);
+    // Its front and rear edges (95th and 5th percentile of depth along
+    // its facing, relative to the spawn center): the center alone moves
+    // back as front-rank men die even if nobody steps.
+    let mut d: Vec<f32> = (0..units.len())
+        .filter(|&i| units.group[i] == 0 && units.death_t[i] == 0)
+        .map(|i| (Vec2::new(units.pos[i].x, units.pos[i].z) - Vec2::new(0.0, 60.0)).dot(fwd))
+        .collect();
+    d.sort_by(|a, b| a.total_cmp(b));
+    let (back, front) = if d.is_empty() {
+        (0.0, 0.0)
+    } else {
+        (d[d.len() / 20], d[d.len() * 19 / 20])
+    };
+    // Attackers standing beyond the victim's far side (z > 72): a line
+    // whose flank files walk on past the fight shows up here.
+    let past = (0..units.len())
+        .filter(|&i| units.group[i] != 0 && units.death_t[i] == 0 && units.pos[i].z > 72.0)
+        .count();
+    let (mut jog, mut walk, mut ready, mut run_back, mut out_form) = (0, 0, 0, 0, 0);
+    for i in 0..units.len() {
+        if units.group[i] == 0 && units.death_t[i] == 0 {
+            if units.out_form[i] {
+                out_form += 1;
+            }
+            let vxz = Vec2::new(units.vel[i].x, units.vel[i].z);
+            let sp = vxz.length();
+            // Running away from his own regiment's fight while it is in
+            // melee: the run-back defect.
+            if let Some(fp) = v.fight_point
+                && units.swing[i] & crate::units::SWING_STAGGERED == 0
+                && vxz.dot((fp - Vec2::new(units.pos[i].x, units.pos[i].z)).normalize_or_zero()) < -1.5
+            {
+                run_back += 1;
+            }
+            if sp > 1.5 {
+                jog += 1;
+            } else if sp > 0.3 {
+                walk += 1;
+            }
+            if units.swing[i] & crate::units::SWING_STATE_MASK == crate::units::SWING_READY {
+                ready += 1;
+            }
+        }
+    }
+    info!("[pile-test] orange moving: jog {jog} walk {walk}, ready {ready}, out of formation {out_form}, running back from the fight {run_back}");
+    // Victim men not at the fight: nearest living attacker more than
+    // 8 m away (test-only brute force).
+    let attackers: Vec<Vec2> = (0..units.len())
+        .filter(|&i| units.group[i] != 0 && units.death_t[i] == 0)
+        .map(|i| Vec2::new(units.pos[i].x, units.pos[i].z))
+        .collect();
+    let out = (0..units.len())
+        .filter(|&i| {
+            units.group[i] == 0 && units.death_t[i] == 0 && {
+                let p = Vec2::new(units.pos[i].x, units.pos[i].z);
+                attackers.iter().all(|a| a.distance_squared(p) > 64.0)
+            }
+        })
+        .count();
     info!(
-        "[pile-test] t={t:.0}s orange {} alive, blues engaged {engaged}/6",
-        groups.list[0].count
+        "[pile-test] t={t:.0}s orange {} alive, center {moved:+.2} front {front:+.2} rear {back:+.2} m along its facing, contact {}, engaged {} | blues engaged {engaged}/{n}, charging {charging}, past its far side {past}, orange away from the fight (>8 m) {out}, melee {} fp {:?}",
+        v.count, v.contact, v.engaged, v.melee_ticks, v.fight_point
     );
 }
 
@@ -890,7 +979,7 @@ fn spawn_arena(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
 /// FL_ARENA bookkeeping: per-lane strengths + the player's kills and
 /// damage per hit by sector, every 4 s once fighting starts.
 fn arena_log(
-    dir_stats: Res<crate::movement::DirTestStats>,
+    dir_stats: Res<crate::sim::damage::DirTestStats>,
     units: Res<Units>,
     groups: Res<Groups>,
     time: Res<Time>,

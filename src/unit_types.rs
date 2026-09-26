@@ -29,10 +29,10 @@ pub const BASE_DMG: [f32; 2] = [
 
 /// Ranged stats, archer-only for now (a second ranged kind needs the
 /// spatial META widen first, so these stay consts instead of a TYPES
-/// column). All values M2TW-evidenced (devlog 0060) unless noted.
+/// column). All values M2TW-evidenced unless noted.
 pub mod missile {
     /// EDU missile attack: Peasant Archers 5, Longbowmen 6, Yeoman 8.
-    /// Plain-archer tier with a bit of punch (owner call: plain first).
+    /// Plain-archer tier with a bit of punch: plain archers first.
     pub const ATTACK: f32 = 6.0;
     /// Meters, the vanilla `arrow` range (bodkin/composite reach 160).
     pub const RANGE: f32 = 120.0;
@@ -55,8 +55,8 @@ pub mod missile {
     /// Landing scatter sigma in meters, RANGE-INDEPENDENT (the measured
     /// M2TW quirk: accuracy does not improve up close).
     pub const SCATTER_SIGMA: f32 = 3.0;
-    /// Missile damage curve, CALIBRATED against archery-range logs
-    /// (devlog 0064). Arrows use a steeper factor multiplier than melee:
+    /// Missile damage curve, CALIBRATED against archery-range logs.
+    /// Arrows use a steeper factor multiplier than melee:
     /// armour and shields blunt a falling shaft far harder than they
     /// blunt a sword, and with the melee curve the measured spread was
     /// only 2.5x between shielded lights (9.4% kills/arrow — hotter
@@ -79,7 +79,7 @@ pub struct UnitTypeParams {
     pub hp: f32,
     /// M2TW-style combat stats. Damage per hit is
     /// `BASE_DMG[weapon] * FACTOR_MULT^(attack + situational - defence)`,
-    /// resolved directionally at damage apply (movement.rs): defence_skill
+    /// resolved directionally at damage apply (sim/damage.rs): defence_skill
     /// counts vs front/side attacks but NOT rear; shield covers the front
     /// and LEFT side only (shield arm); armour counts everywhere, halved
     /// by `ap` attackers.
@@ -106,7 +106,7 @@ pub struct UnitTypeParams {
     /// Base morale level (M2TW `stat_mental` first field). The situational
     /// modifier sum in morale.rs rides on top of this; vanilla M2TW scale:
     /// measured vanilla range is 1..11 (peasants 1, militia 3, sergeants
-    /// and pikemen 5, knights 9-11) — see devlog 0057.
+    /// and pikemen 5, knights 9-11).
     pub base_morale: f32,
     /// Multiplier on morale SHOCK modifiers (flanked, rout contagion) —
     /// M2TW discipline: "determines the amount of morale lost when morale
@@ -136,7 +136,7 @@ pub fn half_height(kind: usize) -> f32 {
 
 /// Indexed by kind. Baseline feel: the median frontal matchup (light vs
 /// light) keeps its ~5-9 s 1v1 kill so battle lines grind instead of
-/// evaporating. Stats are scaled from the vanilla M2TW EDU (devlog 0031):
+/// evaporating. Stats are scaled from the vanilla M2TW EDU:
 /// heavies ~ Dismounted Feudal Knights, lights ~ Armored Sergeants'
 /// sword-and-board cousins, spears ~ upper Spear Militia. Elite frontal
 /// fights run LONGER than the old flat model (grindy shield-on-shield,
@@ -145,9 +145,9 @@ pub fn half_height(kind: usize) -> f32 {
 pub const TYPES: [UnitTypeParams; NUM_KINDS] = [
     // KIND_HEAVY — knights: slow, armored, hard-hitting, shove-heavy.
     UnitTypeParams {
-        // The 1.5x "pacing placeholder" HP bump (c0ecffb, pre-morale-
-        // rework) is REVERTED across all kinds (owner call, archer
-        // round 2): 240/135/150 back to the M2TW stat model's original
+        // The 1.5x "pacing placeholder" HP bump from before the morale
+        // rework is reverted across all kinds: 240/135/150 back to the
+        // M2TW stat model's original
         // 160/90/100 anchors.
         hp: 160.0,
         attack: 13.0,
@@ -166,10 +166,10 @@ pub const TYPES: [UnitTypeParams; NUM_KINDS] = [
         // (~3.5) slot in above; mass drives separation shove and charge
         // knockback ratios.
         mass: 1.5,
-        // MEASURED vanilla EDU scale (devlog 0057): base morale runs
+        // MEASURED vanilla EDU scale: base morale runs
         // 1..11 across all 413 units — 11 is the CEILING (Dismounted
         // English Knights, Demi Lancers, Norman Knights), not a midpoint.
-        // Our heavies map to the dismounted-knight rows of devlog 0031.
+        // Our heavies map to the dismounted-knight rows.
         base_morale: 11.0,
         discipline: 0.6,
         fatigue_rate: 1.3,
@@ -224,7 +224,7 @@ pub const TYPES: [UnitTypeParams; NUM_KINDS] = [
     // KIND_ARCHER — levy bowmen: the ranged kind (missile stats live in
     // `missile`); this row is their WEAK melee fallback. Flesh-tier
     // protection, knife-and-buckler-less scrap, fast on their feet.
-    // Scaled from the Peasant Archers / Longbowmen EDU band (devlog 0060):
+    // Scaled from the Peasant Archers / Longbowmen EDU band:
     // melee attack 2..7, armour 0..1, no shield, morale 3 untrained,
     // mass 0.8.
     UnitTypeParams {

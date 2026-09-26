@@ -1,4 +1,4 @@
-//! Regiment fatigue, the M2TW model (devlog 0055 evidence record):
+//! Regiment fatigue, the M2TW model:
 //! an accumulator fed by activity — fighting fastest, then charging and
 //! running — that recovers while standing, banded into the six M2TW
 //! display states. Effects follow the MTW1 official-guide table (the
@@ -23,7 +23,7 @@ impl Plugin for FatiguePlugin {
         app.add_systems(
             FixedUpdate,
             update_fatigue
-                .after(crate::movement::step_sim)
+                .after(crate::sim::step_sim)
                 .before(crate::morale::update_morale)
                 .in_set(crate::game_state::SimSet),
         );
@@ -101,7 +101,7 @@ pub fn cannot_charge(fatigue: f32) -> bool {
 // --- Accumulation rates (per second, before the kind fatigue_rate
 // mult). M2TW's exact rates are hardcoded and were never published for
 // ANY title in the lineage, so these are knobs — but they now have a
-// MEASURED anchor (devlog 0057): reading the engine's own per-unit
+// MEASURED anchor: reading the engine's own per-unit
 // fatigue counter through two live battles, 855 s of hard fighting
 // moved units only to 2-5 on the engine's 0..15 scale, i.e. roughly
 // warmed up to winded. M2TW tires men SLOWLY; nothing came close to

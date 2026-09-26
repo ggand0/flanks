@@ -114,22 +114,41 @@ pub struct GroupData {
     pub engaged: bool,
     /// Ticks of `engaged` left since the last soldier fought.
     pub engage_hold: u8,
-    /// FL_RECTFIGHT: enough of this regiment's soldiers are in a swing
-    /// cycle against its ORDERED attack target's men (the engine keeps
-    /// per-enemy-unit engagedSoldiers counts and gates engagement on
-    /// "enough soldiers in the proximity zone"). THIS is what freezes
-    /// the attack path — a trickle of overflow duels never halts the
-    /// march; the poked men defend individually while the block keeps
-    /// walking to its ordered fight.
-    pub engaged_with_target: bool,
-    /// Ticks of `engaged_with_target` left (same swing-gap bridge).
-    pub engage_target_hold: u8,
+    /// Holding a contact frame (frontline.rs): an attacking regiment in
+    /// melee stops chasing its target's center and holds its slots with
+    /// the front rank on the fight line, the way M2TW stops updating a
+    /// formation near the end of its path.
+    pub contact: bool,
+    /// The contact frame's lateral position along the regiment's right
+    /// vector, fixed when contact begins so the block cannot slide
+    /// sideways while it fights.
+    pub contact_lateral: f32,
+    /// Ticks this regiment has been in a real melee (engaged, with at
+    /// least the count gate's share of its men fighting once); 0 when
+    /// not. Men out of sight of an enemy join the fight after their own
+    /// delay counted from here (sim/soldier.rs).
+    pub melee_ticks: u32,
+    /// Where the enemy unit this regiment fights stands: its ordered
+    /// target if alive and unbroken, else the nearest unbroken enemy
+    /// regiment. None when not in melee or in hold (guard) mode.
+    pub fight_point: Option<Vec2>,
     /// In the charge phase: attack order, inside charge range of the
     /// target, not yet in contact. Drives the war cry + sprint pose.
     pub charging: bool,
+    /// The crash of a charge (frontline.rs): from the moment a charging
+    /// regiment engages until the enemy has stopped its block. The frame
+    /// keeps moving, the charge pace stays, the melee clock waits.
+    pub crashing: bool,
+    pub crash_ticks: u16,
+    /// The centroid's forward speed, smoothed (m/s): the crash ends when
+    /// it dies (the enemy has stopped the block).
+    pub adv_speed: f32,
+    /// Ticks the crash may last at most: the block's depth over the
+    /// charge pace, the time its rear needs to arrive.
+    pub crash_cap: u16,
     /// An enemy regiment's centroid is within combat-watch range: units
     /// of this regiment scan wider for adjacent enemies (sparse-fight
-    /// acquisition, movement.rs) and brace when standing.
+    /// acquisition, sim/soldier.rs) and brace when standing.
     pub enemy_near: bool,
     /// Normalized direction to the nearest enemy regiment (ZERO when
     /// none in watch range): standing units face it (brace facing).
@@ -139,11 +158,6 @@ pub struct GroupData {
     pub hostile_near: bool,
     /// Victory-cheer ticks remaining (render-only celebration).
     pub celebrate: u16,
-    /// FL_RECTFIGHT: where the fight happened — set on engagement, read
-    /// by the pursuit-range check. M2TW's melee manager limits pursuit
-    /// to attack-dist-multiplier × max-engage-dist from the engagement
-    /// point (3.0 × 40 = 120 m in vanilla config_ai_battle.xml).
-    pub fight_origin: Vec2,
     /// The army's command regiment (the captain/general rides here).
     /// M2TW: every army has a leader; his presence is an army-wide
     /// morale term and his fall a shock. Assigned once by morale.rs.
@@ -210,14 +224,19 @@ impl GroupData {
             centroid: anchor,
             engaged: false,
             engage_hold: 0,
-            engaged_with_target: false,
-            engage_target_hold: 0,
+            contact: false,
+            contact_lateral: 0.0,
+            melee_ticks: 0,
+            fight_point: None,
             charging: false,
+            crashing: false,
+            crash_ticks: 0,
+            adv_speed: 0.0,
+            crash_cap: 0,
             enemy_near: false,
             threat_dir: Vec2::ZERO,
             hostile_near: false,
             celebrate: 0,
-            fight_origin: Vec2::ZERO,
             leader: false,
             // Overwritten by the first morale tick (base + calm bonuses).
             morale: crate::unit_types::TYPES[kind as usize].base_morale,
@@ -305,7 +324,7 @@ impl Plugin for OrdersPlugin {
             .add_systems(
                 FixedUpdate,
                 clear_arrived_orders
-                    .after(crate::movement::step_sim)
+                    .after(crate::sim::step_sim)
                     .in_set(crate::game_state::SimSet),
             );
     }
@@ -807,7 +826,6 @@ pub fn halt_selected(selection: &Selection, groups: &mut Groups) {
 /// centroid refreshed by the frontline pass each tick.
 pub fn clear_arrived_orders(mut groups: ResMut<Groups>) {
     let counts: Vec<usize> = groups.list.iter().map(|g| g.count).collect();
-    let broken_flags: Vec<bool> = groups.list.iter().map(|g| g.state.is_broken()).collect();
     for (g, group) in groups.list.iter_mut().enumerate() {
         match group.order {
             Some(Order::Move(t)) => {
@@ -825,30 +843,13 @@ pub fn clear_arrived_orders(mut groups: ResMut<Groups>) {
                 group.order = None;
                 info!("regiment {g} attack target {t} destroyed, holding");
             }
-            // FL_RECTFIGHT pursuit range: M2TW's melee manager limits
-            // pursuit to attack-dist-multiplier × max-engage-dist from
-            // the engagement point (vanilla: 3.0 × 40 = 120 m). Once
-            // the regiment has moved that far from where the fight
-            // happened, it disengages and reforms — "pursuing" is a
-            // bounded engine state, not infinite chase.
-            Some(Order::Attack(t))
-                if crate::formation::rectfight()
-                    && broken_flags[t as usize]
-                    && group.fight_origin != Vec2::ZERO
-                    && group.centroid.distance_squared(group.fight_origin) > 120.0 * 120.0 =>
-            {
-                group.anchor = group.centroid;
-                group.reform = true;
-                group.order = None;
-                info!("regiment {g} pursuit range exceeded, reforming");
-            }
             _ => {}
         }
     }
 }
 
 fn draw_order_gizmos(
-    viz: Res<crate::movement::DebugViz>,
+    viz: Res<crate::sim::DebugViz>,
     groups: Res<Groups>,
     terrain: Res<Terrain>,
     mut gizmos: Gizmos,

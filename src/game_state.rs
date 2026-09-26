@@ -4,7 +4,7 @@ use bevy::time::common_conditions::paused as time_paused;
 
 use crate::ai::BattleOutcome;
 use crate::combat::CombatStats;
-use crate::movement::DirTestStats;
+use crate::sim::damage::DirTestStats;
 use crate::orders::{Groups, Selection};
 use crate::render_units::Corpses;
 use crate::terrain::Terrain;
@@ -528,6 +528,14 @@ fn menu_buttons(
     if !*auto && scripts_active() {
         *auto = true;
         next.set(GameState::Battle);
+        return;
+    }
+    // FL_AUTOSTART=1: start a normal battle without a key press (with
+    // FL_DEPLOY=0 it skips the picker and deployment too), for measured
+    // runs of the real game with the AI on.
+    if !*auto && std::env::var("FL_AUTOSTART").is_ok() {
+        *auto = true;
+        start_normal_battle(&mut config, &mut next);
         return;
     }
     if keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::Space) {

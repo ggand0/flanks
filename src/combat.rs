@@ -28,7 +28,7 @@ impl Plugin for CombatPlugin {
         app.init_resource::<CombatStats>().add_systems(
             FixedUpdate,
             process_deaths
-                .after(crate::movement::step_sim)
+                .after(crate::sim::step_sim)
                 .before(crate::orders::clear_arrived_orders)
                 .in_set(crate::game_state::SimSet),
         );
@@ -46,6 +46,8 @@ pub fn process_deaths(
     let _span = info_span!("process_deaths").entered();
     let (edge_min, edge_max) = (terrain.min().y + 8.0, terrain.max().y - 8.0);
     let mut craters: Vec<(Vec2, f32)> = Vec::new();
+    // Slots the dead leave in formed regiments, filled after the sweep.
+    let mut vacated: Vec<(u32, Vec2)> = Vec::new();
     let mut i = 0;
     while i < units.len() {
         // Kills are counted at the hp<=0 transition (damage apply pass);
@@ -68,6 +70,10 @@ pub fn process_deaths(
             stats.fled[team] += 1;
         }
         if dead {
+            let gd = &groups.list[units.group[i] as usize];
+            if gd.shape == crate::formation::FormShape::Rect && !gd.state.is_broken() {
+                vacated.push((units.group[i], units.home[i]));
+            }
             // Leave the body where it fell, frozen in its final topple
             // pose (fx = 2.0 is the shader's fully-dead state). Escaped
             // units leave nothing.
@@ -107,15 +113,73 @@ pub fn process_deaths(
         units.death_t.swap_remove(i);
         units.home.swap_remove(i);
         units.ammo.swap_remove(i);
+        units.out_form.swap_remove(i);
+        units.sight.swap_remove(i);
     }
     for (c, r) in craters {
         terrain.carve_crater(c, r, r * 0.4);
     }
+    fill_vacated_slots(&mut units, &groups, &vacated);
 
     stats.alive = [0, 0];
     for (&t, &d) in units.team.iter().zip(&units.death_t) {
         if d == 0 {
             stats.alive[t as usize] += 1;
+        }
+    }
+}
+
+/// Losses are replaced from behind (M2TW: "losses replaced by the back
+/// ranks", and its RESHUFFLE unit task). Behind each slot a
+/// dead man leaves, his file closes up: every living man behind the hole
+/// who is not fighting moves up one place, nearest first, so the file
+/// stays closed behind its front and the holes collect at the back.
+/// Files are read from the slot grid itself, so this works for any
+/// width, depth and spacing; a hole with nobody behind it stays. Front
+/// holes are closed first, each against the slots the earlier ones left.
+fn fill_vacated_slots(units: &mut Units, groups: &crate::orders::Groups, vacated: &[(u32, Vec2)]) {
+    if vacated.is_empty() {
+        return;
+    }
+    let mut members: Vec<Vec<usize>> = vec![Vec::new(); groups.list.len()];
+    let mut need = vec![false; groups.list.len()];
+    for &(g, _) in vacated {
+        need[g as usize] = true;
+    }
+    for i in 0..units.len() {
+        let g = units.group[i] as usize;
+        if need[g] && units.death_t[i] == 0 {
+            members[g].push(i);
+        }
+    }
+    let depth_of = |k: usize| {
+        let gd = &groups.list[vacated[k].0 as usize];
+        vacated[k].1.dot(crate::formation::facing_dir(gd.facing))
+    };
+    let mut order: Vec<usize> = (0..vacated.len()).collect();
+    order.sort_by(|&a, &b| depth_of(b).total_cmp(&depth_of(a)));
+    let mut file: Vec<(f32, usize)> = Vec::new();
+    for k in order {
+        let (g, hole) = vacated[k];
+        let gd = &groups.list[g as usize];
+        let f = crate::formation::facing_dir(gd.facing);
+        let r = Vec2::new(f.y, -f.x);
+        let half_file = 0.5 * gd.spacing.pitch().x;
+        file.clear();
+        for &i in &members[g as usize] {
+            if units.swing[i] & crate::units::SWING_STATE_MASK != crate::units::SWING_READY {
+                continue;
+            }
+            let d = hole - units.home[i];
+            let behind = d.dot(f);
+            if behind > 0.1 && d.dot(r).abs() < half_file {
+                file.push((behind, i));
+            }
+        }
+        file.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut hole = hole;
+        for &(_, i) in &file {
+            hole = std::mem::replace(&mut units.home[i], hole);
         }
     }
 }
