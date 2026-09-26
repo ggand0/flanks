@@ -613,7 +613,7 @@ fn charge_test_log(
 
 /// FL_TEST_PILE=1: the pile-on order — six blue regiments in a 3x2
 /// block, ALL attack-ordered at one holding orange regiment (the blob
-/// repro from the FL_RECTFIGHT saga). Acceptance: the fight crowds the
+/// repro). Acceptance: the fight crowds the
 /// victim's perimeter and the second wave stands PRESSED against the
 /// fighting mass (not parked at parade pitch, not smeared into one
 /// ball); the victim collapses; blues re-dress rectangles afterward.
@@ -708,12 +708,11 @@ fn join_test_log(
         }
     }
     info!(
-        "[join-test] t={t:.0}s orange {} / A {} / B {} alive; B->orange {:.1} m, B windups {b_windups}, B locked {}",
+        "[join-test] t={t:.0}s orange {} / A {} / B {} alive; B->orange {:.1} m, B windups {b_windups}",
         groups.list[0].count,
         groups.list[1].count,
         groups.list[2].count,
         groups.list[2].centroid.distance(groups.list[0].centroid),
-        groups.list[2].engaged_with_target,
     );
 }
 

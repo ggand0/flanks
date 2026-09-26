@@ -32,13 +32,6 @@ pub const META_DYING: u32 = 1 << 3;
 /// tighter separation rest distance (a shieldwall the physics would
 /// otherwise push back out to normal spacing).
 pub const META_WALL: u32 = 1 << 4;
-/// Unit's regiment is BROKEN (routing/shattered): a fleeing body
-/// collides at body scale — it commands no rank-dressing courtesy.
-pub const META_BROKEN: u32 = 1 << 5;
-/// Unit's regiment is executing a Move order: a body deliberately
-/// passing through (the engine's formationMovingThrough) — body-scale
-/// collision against formed same-team lines.
-pub const META_MOVER: u32 = 1 << 6;
 /// The unit's regiment (index into `Groups::list`) fills the bits above
 /// the flags: read it with `meta_group`.
 pub const META_GROUP_SHIFT: u32 = 7;
@@ -112,8 +105,6 @@ impl SpatialGrid {
         groups: &[u32],
         death_t: &[u8],
         walled: &[bool],
-        broken: &[bool],
-        mover: &[bool],
     ) {
         let n = positions.len();
         if n == 0 {
@@ -201,8 +192,6 @@ impl SpatialGrid {
                             | ((kinds[i] as u32) << META_KIND_SHIFT)
                             | (((death_t[i] > 0) as u32) * META_DYING)
                             | ((walled[i] as u32) * META_WALL)
-                            | ((broken[i] as u32) * META_BROKEN)
-                            | ((mover[i] as u32) * META_MOVER)
                             | (groups[i] << META_GROUP_SHIFT);
                         unsafe {
                             *out.0.add(k) = SortedUnit {
