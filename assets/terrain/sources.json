@@ -22,7 +22,11 @@
         "bytes": 328190,
         "sha256": "111341f948b7e073edf7ac6add8777e1bf10df8959400df3863243e89bbc8c08"
       }
-    }
+    },
+    "physical_size_m": [
+      2.51,
+      2.51
+    ]
   },
   "stony_soil": {
     "asset": "grass_path_2",

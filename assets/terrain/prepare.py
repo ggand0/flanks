@@ -1,4 +1,4 @@
-"""Pack the Poly Haven ground maps into mipmapped KTX2 textures.
+"""Pack the ground maps into mipmapped KTX2 textures.
 
 Requires NumPy, Pillow and Khronos toktx 4.4.2. Run from any directory:
 python3 assets/terrain/prepare.py --downloads /tmp/terrain-downloads --toktx toktx
@@ -25,8 +25,8 @@ def pasture_detail(source):
     height, width = luminance.shape
     fy = np.fft.fftfreq(height)[:, None]
     fx = np.fft.fftfreq(width)[None, :]
-    # Periodic filtering preserves the tile seam and removes clumps larger
-    # than about 0.4 m when the texture covers 6 m of ground.
+    # Periodic filtering preserves the tile seam. The 32-pixel radius removes
+    # broad lighting and color variation from the 1K source tile.
     gaussian = np.exp(-2.0 * np.pi ** 2 * 32.0 ** 2 * (fx * fx + fy * fy))
     low = np.fft.ifft2(np.fft.fft2(log_light) * gaussian).real
     neutral = np.clip(0.5 + (log_light - low) * 0.3, 0.02, 0.98)
@@ -40,9 +40,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--downloads", type=Path, required=True)
     parser.add_argument("--toktx", default="toktx")
+    parser.add_argument("--layers", nargs="+", help="Pack only the named layers")
     args = parser.parse_args()
     root = Path(__file__).resolve().parent
     sources = json.loads((root / "sources.json").read_text())
+    if args.layers:
+        sources = {layer: sources[layer] for layer in args.layers}
     with tempfile.TemporaryDirectory(prefix="flanks-ground-") as temporary:
         for layer, source in sources.items():
             maps = {}

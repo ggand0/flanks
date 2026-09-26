@@ -97,7 +97,7 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     // distance band that turns textured ground into a flat color.
     let grass = sample_ground(
         pasture, pasture_normal, vec3<f32>(0.5),
-        p.xz, dx.xz, dy.xz, 10.0, detail,
+        p.xz, dx.xz, dy.xz, 2.51, detail,
     );
     let soil_sample = sample_ground(
         earth, earth_normal, vec3<f32>(0.194145, 0.120636, 0.057649),
@@ -151,8 +151,11 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     // Texture V increases along +Z; the OpenGL normal's +Y points toward -Z.
     let tangent = normalize(vec3<f32>(n.y, -n.x, 0.0));
     let bitangent = cross(n, tangent);
-    let detail_normal = nr.xyz * 2.0 - 1.0;
-    pbr.N = normalize(n + (tangent * detail_normal.x + bitangent * detail_normal.y) * detail * 0.32);
+    let grass_normal = (grass.normal_roughness.xyz * 2.0 - 1.0) * vec3<f32>(0.18, 0.18, 1.0);
+    let soil_normal = (soil_nr.xyz * 2.0 - 1.0) * vec3<f32>(0.32, 0.32, 1.0);
+    let rock_normal = (rock_nr.xyz * 2.0 - 1.0) * vec3<f32>(0.32, 0.32, 1.0);
+    let detail_normal = mix(mix(grass_normal, soil_normal, soil), rock_normal, rock);
+    pbr.N = normalize(n + (tangent * detail_normal.x + bitangent * detail_normal.y) * detail);
 
     var out: FragmentOutput;
     out.color = apply_pbr_lighting(pbr);
