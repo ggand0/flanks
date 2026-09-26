@@ -1140,6 +1140,12 @@ fn unit_vertex(vertex: Vertex) -> VertexOutput {
     // The pose is built in world space: the bucket entity has no
     // transform of its own.
     out.clip_position = position_world_to_clip(position);
+#ifdef UNIT_SHADOW_DEPTH_CLAMP
+    // Shadow pass on a device without depth clip control: a soldier
+    // between the sun and the cascade's near plane lands on that plane
+    // instead of being clipped (render_units_shadow.rs).
+    out.clip_position.z = min(out.clip_position.z, out.clip_position.w);
+#endif
     out.world_position = position;
     // Rotated with the instance above.
     out.world_normal = normal;

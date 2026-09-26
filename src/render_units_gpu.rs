@@ -901,9 +901,11 @@ fn prepare_pull_bind_groups(
     }
 }
 
-/// The compute pass, recorded into the frame's encoder before the main
-/// passes of the view: clear the counters, build every soldier, turn the
-/// counts into draw arguments.
+/// The compute pass, recorded into the frame's encoder before the sun's
+/// shadow pass and the main passes of the view: clear the counters, build
+/// every soldier, turn the counts into draw arguments. The shadow cascades
+/// draw from the same lists (render_units_shadow.rs), so the pass must come
+/// first or they draw last frame's.
 fn run_unit_build_pass(
     buffers: Res<GpuUnitBuffers>,
     pipelines: Res<GpuUnitPipelines>,
@@ -970,7 +972,7 @@ impl Plugin for GpuUnitRenderPlugin {
             .add_systems(
                 Core3d,
                 run_unit_build_pass
-                    .after(Core3dSystems::Prepass)
+                    .before(bevy::pbr::per_view_shadow_pass::<{ bevy::pbr::EARLY_SHADOW_PASS }>)
                     .before(Core3dSystems::MainPass),
             );
     }

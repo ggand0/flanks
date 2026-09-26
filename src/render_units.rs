@@ -119,6 +119,10 @@ pub struct InstanceMaterialData(pub Vec<InstanceData>);
 #[derive(Component)]
 pub struct InstanceBucket(pub usize);
 
+/// Render world: the bucket a unit draw entity holds. Arrows have none.
+#[derive(Component, Clone, Copy)]
+pub(crate) struct ExtractedBucket(pub usize);
+
 /// Detail levels per unit kind: L0 is the full mesh, the last level a
 /// couple of blocks for soldiers a few pixels tall.
 pub const NUM_LODS: usize = 4;
@@ -332,13 +336,19 @@ fn render_frame_end(clock: Res<RenderFrameClock>) {
 #[allow(clippy::type_complexity)] // bevy system params
 fn extract_instance_data(
     main_entities: Extract<
-        Query<(&RenderEntity, &InstanceMaterialData, Option<&UnitAtlas>, Option<&UnitRig>)>,
+        Query<(
+            &RenderEntity,
+            &InstanceMaterialData,
+            Option<&UnitAtlas>,
+            Option<&UnitRig>,
+            Option<&InstanceBucket>,
+        )>,
     >,
     mut extracted: Query<&mut ExtractedInstances>,
     mut commands: Commands,
 ) {
     let t0 = std::time::Instant::now();
-    for (render_entity, data, atlas, rig) in &main_entities {
+    for (render_entity, data, atlas, rig, bucket) in &main_entities {
         let e = render_entity.id();
         if let Ok(mut ex) = extracted.get_mut(e) {
             ex.0.clear();
@@ -351,6 +361,9 @@ fn extract_instance_data(
             }
             if let Some(rig) = rig {
                 entity.insert(rig.clone());
+            }
+            if let Some(bucket) = bucket {
+                entity.insert(ExtractedBucket(bucket.0));
             }
         }
     }
@@ -372,6 +385,7 @@ impl Plugin for UnitRenderPlugin {
             .init_resource::<LodConfig>()
             .init_resource::<Corpses>()
             .add_plugins(crate::render_units_gpu::GpuUnitRenderPlugin)
+            .add_plugins(crate::render_units_shadow::UnitShadowPlugin)
             .add_systems(Startup, setup_unit_mesh)
             // Must run after the camera moves: culling builds a FRESH
             // frustum from this frame's camera transform (the Frustum
@@ -428,6 +442,9 @@ fn setup_unit_mesh(
     // `SortedRenderPhase::render_range` skips every item after the first —
     // its draw function never runs and that bucket's units silently vanish
     // (the "LOD far bucket invisible" bug).
+    //
+    // NotShadowCaster: Bevy's own shadow queue would find no material on
+    // these entities. They cast through render_units_shadow.rs instead.
     for kind in 0..crate::unit_types::NUM_KINDS {
         let model = crate::unit_glb::kind_lods(kind);
         let lods = model.lods;
@@ -454,6 +471,7 @@ fn setup_unit_mesh(
                 rig.clone(),
                 NoFrustumCulling,
                 NoAutomaticBatching,
+                bevy::light::NotShadowCaster,
             ));
             if let Some(pulled) = pulled {
                 entity.insert(pulled);
@@ -1126,7 +1144,7 @@ pub(crate) fn prepare_instance_buffers(
     );
 }
 
-#[derive(Resource)]
+#[derive(Resource, Clone)]
 pub(crate) struct CustomPipeline {
     shader: Handle<Shader>,
     mesh_pipeline: MeshPipeline,
@@ -1157,7 +1175,7 @@ impl CustomPipeline {
     }
 }
 
-fn init_custom_pipeline(
+pub(crate) fn init_custom_pipeline(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
     mesh_pipeline: Res<MeshPipeline>,
@@ -1322,12 +1340,38 @@ pub(crate) struct PullPipelineKey {
     atlas: bool,
 }
 
+impl PullPipelineKey {
+    /// The depth-only variant a bucket casts its shadow with
+    /// (render_units_shadow.rs): no atlas, no level tint.
+    pub(crate) fn shadow(
+        mesh: MeshPipelineKey,
+        layout: MeshVertexBufferLayoutRef,
+        pull_mesh: &PullMeshGpu,
+    ) -> Self {
+        Self {
+            mesh,
+            layout,
+            verts: pull_mesh.count,
+            bucket: pull_mesh.bucket as u32,
+            lod_debug: false,
+            atlas: false,
+        }
+    }
+}
+
 /// Pipeline variant of an instanced bucket.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct UnitMeshKey {
     mesh: MeshPipelineKey,
     /// The bucket samples an atlas.
     atlas: bool,
+}
+
+impl UnitMeshKey {
+    /// The depth-only variant, as `PullPipelineKey::shadow`.
+    pub(crate) fn shadow(mesh: MeshPipelineKey) -> Self {
+        Self { mesh, atlas: false }
+    }
 }
 
 /// Only a bucket with an atlas compiles the texture path. It carries
@@ -1424,7 +1468,7 @@ type DrawCustom = (
     DrawMeshInstanced,
 );
 
-struct DrawMeshInstanced;
+pub(crate) struct DrawMeshInstanced;
 
 impl<P: PhaseItem> RenderCommand<P> for DrawMeshInstanced {
     type Param = (
