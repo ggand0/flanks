@@ -1,11 +1,15 @@
 //! Chunked deformable heightmap terrain. Heights live in one big vertex grid;
 //! chunks are 32x32-cell mesh entities rebuilt when a crater dirties them.
-//! Look: flat-shaded triangle soup with hard height-banded colors.
+//! Smooth indexed chunks share heightfield normals and blend pasture materials.
 
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::primitives::{Aabb, MeshAabb};
-use bevy::mesh::PrimitiveTopology;
+use bevy::image::{ImageAddressMode, ImageLoaderSettings, ImageSampler, ImageSamplerDescriptor};
+use bevy::mesh::{Indices, PrimitiveTopology};
+use bevy::pbr::{ExtendedMaterial, MaterialExtension};
 use bevy::prelude::*;
+use bevy::render::render_resource::AsBindGroup;
+use bevy::shader::ShaderRef;
 use bevy::window::PrimaryWindow;
 use std::time::Instant;
 
@@ -47,11 +51,7 @@ impl Terrain {
     }
 
     pub fn max(&self) -> Vec2 {
-        self.origin
-            + Vec2::new(
-                (VERTS_X - 1) as f32 * CELL,
-                (VERTS_Z - 1) as f32 * CELL,
-            )
+        self.origin + Vec2::new((VERTS_X - 1) as f32 * CELL, (VERTS_Z - 1) as f32 * CELL)
     }
 
     #[inline]
@@ -159,16 +159,16 @@ impl Terrain {
             let bz1 = (z1 + 1).min(VERTS_Z - 1);
             for z in bz0..=bz1 {
                 for x in bx0..=bx1 {
-                    self.blocked[z * VERTS_X + x] =
-                        vertex_blocked(&self.heights, x, z);
+                    self.blocked[z * VERTS_X + x] = vertex_blocked(&self.heights, x, z);
                 }
             }
         }
-        // Chunk c spans verts [c*32, c*32+32]; a vertex touches up to 2 chunks.
-        let cx0 = x0.saturating_sub(1) / CHUNK_CELLS;
-        let cz0 = z0.saturating_sub(1) / CHUNK_CELLS;
-        let cx1 = (x1 / CHUNK_CELLS).min(CHUNKS_X - 1);
-        let cz1 = (z1 / CHUNK_CELLS).min(CHUNKS_Z - 1);
+        // Normals read one neighbor beyond each vertex. Include both copies
+        // of boundary vertices whose stencil touches the deformed region.
+        let cx0 = x0.saturating_sub(2) / CHUNK_CELLS;
+        let cz0 = z0.saturating_sub(2) / CHUNK_CELLS;
+        let cx1 = ((x1 + 1) / CHUNK_CELLS).min(CHUNKS_X - 1);
+        let cz1 = ((z1 + 1) / CHUNK_CELLS).min(CHUNKS_Z - 1);
         for cz in cz0..=cz1 {
             for cx in cx0..=cx1 {
                 self.dirty[cz * CHUNKS_X + cx] = true;
@@ -228,18 +228,50 @@ fn vertex_blocked(heights: &[f32], x: usize, z: usize) -> bool {
     max_d / CELL >= SLOPE_BLOCK
 }
 
-/// Mesh handle + entity per chunk, indexed [cz * CHUNKS_X + cx].
+/// Original heights identify exposed crater soil without changing the sim surface.
 #[derive(Resource, Default)]
-struct TerrainChunks(Vec<Handle<Mesh>>);
+struct TerrainChunks {
+    meshes: Vec<Handle<Mesh>>,
+    original_heights: Vec<f32>,
+}
+
+type GroundMaterial = ExtendedMaterial<StandardMaterial, GroundLayers>;
+
+#[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
+struct GroundLayers {
+    #[texture(100)]
+    #[sampler(101)]
+    pasture: Handle<Image>,
+    #[texture(102)]
+    pasture_normal: Handle<Image>,
+    #[texture(103)]
+    stone: Handle<Image>,
+    #[texture(104)]
+    stone_normal: Handle<Image>,
+    #[texture(105)]
+    earth: Handle<Image>,
+    #[texture(106)]
+    earth_normal: Handle<Image>,
+}
+
+impl MaterialExtension for GroundLayers {
+    fn fragment_shader() -> ShaderRef {
+        "shaders/terrain.wgsl".into()
+    }
+}
 
 pub struct TerrainPlugin;
 
 impl Plugin for TerrainPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<TerrainChunks>()
+            .add_plugins(MaterialPlugin::<GroundMaterial>::default())
             .add_systems(PreStartup, generate_terrain)
             .add_systems(Startup, spawn_chunks)
-            .add_systems(Update, (crater_tool, auto_test_craters, remesh_dirty).chain());
+            .add_systems(
+                Update,
+                (crater_tool, auto_test_craters, remesh_dirty).chain(),
+            );
     }
 }
 
@@ -421,25 +453,52 @@ fn generate_terrain(mut commands: Commands) {
     }
 }
 
+fn ground_texture(assets: &AssetServer, path: &'static str) -> Handle<Image> {
+    assets
+        .load_builder()
+        .with_settings(move |settings: &mut ImageLoaderSettings| {
+            settings.is_srgb = path.ends_with("_color.ktx2");
+            settings.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+                address_mode_u: ImageAddressMode::Repeat,
+                address_mode_v: ImageAddressMode::Repeat,
+                anisotropy_clamp: 8,
+                ..ImageSamplerDescriptor::linear()
+            });
+        })
+        .load(path)
+}
+
 fn spawn_chunks(
     mut commands: Commands,
     terrain: Res<Terrain>,
+    assets: Res<AssetServer>,
     mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut materials: ResMut<Assets<GroundMaterial>>,
     mut chunks: ResMut<TerrainChunks>,
 ) {
-    let material = materials.add(StandardMaterial {
-        base_color: Color::WHITE,
-        perceptual_roughness: 1.0,
-        reflectance: 0.05,
-        ..default()
+    let material = materials.add(GroundMaterial {
+        base: StandardMaterial {
+            base_color: Color::WHITE,
+            perceptual_roughness: 0.95,
+            reflectance: 0.05,
+            ..default()
+        },
+        extension: GroundLayers {
+            pasture: ground_texture(&assets, "terrain/pasture_color.ktx2"),
+            pasture_normal: ground_texture(&assets, "terrain/pasture_normal_roughness.ktx2"),
+            stone: ground_texture(&assets, "terrain/stony_soil_color.ktx2"),
+            stone_normal: ground_texture(&assets, "terrain/stony_soil_normal_roughness.ktx2"),
+            earth: ground_texture(&assets, "terrain/earth_color.ktx2"),
+            earth_normal: ground_texture(&assets, "terrain/earth_normal_roughness.ktx2"),
+        },
     });
+    chunks.original_heights.clone_from(&terrain.heights);
     for cz in 0..CHUNKS_Z {
         for cx in 0..CHUNKS_X {
-            let mesh = build_chunk_mesh(&terrain, cx, cz);
+            let mesh = build_chunk_mesh(&terrain, &chunks.original_heights, cx, cz);
             let aabb = mesh.compute_aabb();
             let handle = meshes.add(mesh);
-            chunks.0.push(handle.clone());
+            chunks.meshes.push(handle.clone());
             let mut e = commands.spawn((Mesh3d(handle), MeshMaterial3d(material.clone())));
             if let Some(aabb) = aabb {
                 e.insert(aabb);
@@ -448,92 +507,76 @@ fn spawn_chunks(
     }
 }
 
-fn band_color(h: f32, slope: f32, p: Vec2, classic: bool) -> [f32; 4] {
-    let mut c = if slope > 0.75 {
-        Color::srgb(0.46, 0.42, 0.36) // scree on steep faces
-    } else if h < -2.5 {
-        Color::srgb(0.33, 0.25, 0.17) // crater floor / deep dirt
-    } else if h < 0.0 {
-        Color::srgb(0.43, 0.34, 0.22) // dirt
-    } else if h < 5.0 {
-        Color::srgb(0.34, 0.43, 0.22) // low grass
-    } else if h < 11.0 {
-        Color::srgb(0.42, 0.50, 0.26) // grass
-    } else if h < 17.0 {
-        Color::srgb(0.52, 0.52, 0.33) // dry highland
-    } else if h < 24.0 {
-        Color::srgb(0.52, 0.48, 0.42) // rock
-    } else {
-        Color::srgb(0.78, 0.79, 0.82) // snowcap
-    };
-    // Grass-band variety: golden wheat patches and a subtle per-triangle
-    // tone wobble so the open field doesn't read as flat plastic.
-    // (New map only — the classic map keeps the flat bands.)
-    if !classic && slope <= 0.75 && (0.0..11.0).contains(&h) {
-        let patch = fbm(p / 70.0 + Vec2::splat(47.1));
-        if patch > 0.62 {
-            c = Color::srgb(0.62, 0.53, 0.24); // wheat field
-        } else {
-            let k = 0.94 + 0.12 * fbm(p / 45.0 + Vec2::splat(13.7));
-            let l = c.to_linear();
-            c = Color::linear_rgb(l.red * k, l.green * k, l.blue * k);
-        }
-    }
-    c.to_linear().to_f32_array()
+/// Central differences use the global grid, including across chunk boundaries.
+fn ground_normal(terrain: &Terrain, x: usize, z: usize) -> Vec3 {
+    let xm = x.saturating_sub(1);
+    let xp = (x + 1).min(VERTS_X - 1);
+    let zm = z.saturating_sub(1);
+    let zp = (z + 1).min(VERTS_Z - 1);
+    let dx = (terrain.h(xp, z) - terrain.h(xm, z)) / ((xp - xm) as f32 * CELL);
+    let dz = (terrain.h(x, zp) - terrain.h(x, zm)) / ((zp - zm) as f32 * CELL);
+    Vec3::new(-dx, 1.0, -dz).normalize()
 }
 
-/// Flat-shaded triangle soup for one chunk: 2 triangles per cell, per-face
-/// normal and one hard-banded color per triangle. World coords baked in.
-fn build_chunk_mesh(terrain: &Terrain, cx: usize, cz: usize) -> Mesh {
-    let n_tris = CHUNK_CELLS * CHUNK_CELLS * 2;
-    let mut positions = Vec::with_capacity(n_tris * 3);
-    let mut normals = Vec::with_capacity(n_tris * 3);
-    let mut colors = Vec::with_capacity(n_tris * 3);
+/// RGBA carries dryness, exposed earth, stone and dampness, not display color.
+fn ground_weights(terrain: &Terrain, original: &[f32], x: usize, z: usize, n: Vec3) -> [f32; 4] {
+    let p = terrain.origin + Vec2::new(x as f32, z as f32) * CELL;
+    let h = terrain.h(x, z);
+    let slope = n.xz().length() / n.y.max(0.001);
+    let dry = smoothstep(-0.5, 0.6, fbm(p / 95.0 + Vec2::splat(47.1)) + slope * 0.4);
+    let wear = smoothstep(0.35, 0.95, fbm(p / 32.0 + Vec2::splat(113.8))) * 0.55;
+    let disturbed = smoothstep(0.03, 0.65, (h - original[z * VERTS_X + x]).abs());
+    let mut soil = wear.max(disturbed);
+    let stone = smoothstep(0.45, 0.95, slope) * (1.0 - disturbed * 0.8);
+    let mut damp = 0.0;
+    if !terrain.classic {
+        let bank_distance = (p.x - river_center_x(p.y)).abs() - river_half_width(p.y);
+        damp = 1.0 - smoothstep(0.0, 10.0, bank_distance);
+        soil = soil.max(damp * 0.8);
+    }
+    [dry, soil, stone, damp]
+}
 
+fn build_chunk_mesh(terrain: &Terrain, original: &[f32], cx: usize, cz: usize) -> Mesh {
+    let side = CHUNK_CELLS + 1;
+    let mut positions = Vec::with_capacity(side * side);
+    let mut normals = Vec::with_capacity(side * side);
+    let mut weights = Vec::with_capacity(side * side);
+    let mut indices = Vec::with_capacity(CHUNK_CELLS * CHUNK_CELLS * 6);
     let vx0 = cx * CHUNK_CELLS;
     let vz0 = cz * CHUNK_CELLS;
+    for dz in 0..side {
+        for dx in 0..side {
+            let (x, z) = (vx0 + dx, vz0 + dz);
+            let p = terrain.origin + Vec2::new(x as f32, z as f32) * CELL;
+            let n = ground_normal(terrain, x, z);
+            positions.push([p.x, terrain.h(x, z), p.y]);
+            normals.push(n.to_array());
+            weights.push(ground_weights(terrain, original, x, z, n));
+        }
+    }
     for dz in 0..CHUNK_CELLS {
         for dx in 0..CHUNK_CELLS {
-            let (x, z) = (vx0 + dx, vz0 + dz);
-            let wp = |xx: usize, zz: usize| -> Vec3 {
-                let w = terrain.origin + Vec2::new(xx as f32, zz as f32) * CELL;
-                Vec3::new(w.x, terrain.h(xx, zz), w.y)
-            };
-            let p00 = wp(x, z);
-            let p10 = wp(x + 1, z);
-            let p01 = wp(x, z + 1);
-            let p11 = wp(x + 1, z + 1);
-            // Alternate the quad split diagonal for a less regular look.
-            let tris = if (x + z) % 2 == 0 {
-                [[p00, p01, p11], [p00, p11, p10]]
+            let a = (dz * side + dx) as u32;
+            let b = a + 1;
+            let c = a + side as u32;
+            let d = c + 1;
+            // Preserve the heightfield's alternating triangle split.
+            if (vx0 + dx + vz0 + dz).is_multiple_of(2) {
+                indices.extend_from_slice(&[a, c, d, a, d, b]);
             } else {
-                [[p00, p01, p10], [p10, p01, p11]]
-            };
-            for tri in tris {
-                let n = (tri[1] - tri[0]).cross(tri[2] - tri[0]).normalize_or_zero();
-                let hc = (tri[0].y + tri[1].y + tri[2].y) / 3.0;
-                let slope = (1.0 - n.y * n.y).sqrt() / n.y.max(0.1);
-                let pc = Vec2::new(
-                    (tri[0].x + tri[1].x + tri[2].x) / 3.0,
-                    (tri[0].z + tri[1].z + tri[2].z) / 3.0,
-                );
-                let col = band_color(hc, slope, pc, terrain.classic);
-                for v in tri {
-                    positions.push(v);
-                    normals.push(n);
-                    colors.push(col);
-                }
+                indices.extend_from_slice(&[a, c, b, b, c, d]);
             }
         }
     }
-
     Mesh::new(
         PrimitiveTopology::TriangleList,
         RenderAssetUsages::default(),
     )
     .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
     .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
-    .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, weights)
+    .with_inserted_indices(Indices::U32(indices))
 }
 
 fn remesh_dirty(
@@ -553,12 +596,12 @@ fn remesh_dirty(
             if !terrain.dirty[ci] {
                 continue;
             }
-            let mesh = build_chunk_mesh(&terrain, cx, cz);
+            let mesh = build_chunk_mesh(&terrain, &chunks.original_heights, cx, cz);
             let aabb = mesh.compute_aabb();
-            let _ = meshes.insert(&chunks.0[ci], mesh);
+            let _ = meshes.insert(&chunks.meshes[ci], mesh);
             if let Some(new_aabb) = aabb {
                 for (m, mut old) in &mut chunk_entities {
-                    if m.0 == chunks.0[ci] {
+                    if m.0 == chunks.meshes[ci] {
                         *old = new_aabb;
                     }
                 }
@@ -624,5 +667,99 @@ fn auto_test_craters(
     let center = Vec2::new(a.cos(), a.sin()) * r;
     let radius = 8.0 + hash01(*n * 7 + 3) * 6.0;
     terrain.carve_crater(center, radius, radius * 0.45);
-    info!("test crater #{} at ({:.0}, {:.0}) r={radius:.1}", *n, center.x, center.y);
+    info!(
+        "test crater #{} at ({:.0}, {:.0}) r={radius:.1}",
+        *n, center.x, center.y
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy::mesh::VertexAttributeValues;
+
+    fn sloped_field() -> Terrain {
+        let mut heights = vec![0.0; VERTS_X * VERTS_Z];
+        for z in 0..VERTS_Z {
+            for x in 0..VERTS_X {
+                heights[z * VERTS_X + x] = (x as f32 * 0.125 + z as f32 * 0.25) * CELL;
+            }
+        }
+        Terrain {
+            heights,
+            blocked: vec![false; VERTS_X * VERTS_Z],
+            classic: true,
+            origin: Vec2::ZERO,
+            dirty: vec![false; CHUNKS_X * CHUNKS_Z],
+        }
+    }
+
+    fn vec3_attribute(mesh: &Mesh, attribute: bevy::mesh::MeshVertexAttribute) -> &Vec<[f32; 3]> {
+        let Some(VertexAttributeValues::Float32x3(values)) = mesh.attribute(attribute) else {
+            panic!("expected a three-component vertex attribute");
+        };
+        values
+    }
+
+    #[test]
+    fn indexed_ground_preserves_heights_winding_and_chunk_seams() {
+        let terrain = sloped_field();
+        let left = build_chunk_mesh(&terrain, &terrain.heights, 0, 0);
+        let right = build_chunk_mesh(&terrain, &terrain.heights, 1, 0);
+        let positions = vec3_attribute(&left, Mesh::ATTRIBUTE_POSITION);
+        let normals = vec3_attribute(&left, Mesh::ATTRIBUTE_NORMAL);
+        let right_positions = vec3_attribute(&right, Mesh::ATTRIBUTE_POSITION);
+        let right_normals = vec3_attribute(&right, Mesh::ATTRIBUTE_NORMAL);
+        assert_eq!(positions.len(), 1089);
+        assert_eq!(left.indices().unwrap().len(), 6144);
+        let expected_normal = Vec3::new(-0.125, 1.0, -0.25).normalize();
+        for (i, position) in positions.iter().enumerate() {
+            let x = i % 33;
+            let z = i / 33;
+            assert_eq!(position[1], terrain.h(x, z));
+            assert!(Vec3::from_array(normals[i]).distance(expected_normal) < 1e-6);
+        }
+        let indices: Vec<_> = left.indices().unwrap().iter().collect();
+        for tri in indices.chunks_exact(3) {
+            let a = Vec3::from_array(positions[tri[0]]);
+            let b = Vec3::from_array(positions[tri[1]]);
+            let c = Vec3::from_array(positions[tri[2]]);
+            assert!((b - a).cross(c - a).y > 0.0);
+        }
+        for z in 0..33 {
+            assert_eq!(positions[z * 33 + 32], right_positions[z * 33]);
+            assert_eq!(normals[z * 33 + 32], right_normals[z * 33]);
+        }
+    }
+
+    #[test]
+    fn crater_exposes_soil_and_invalidates_every_changed_normal() {
+        let mut terrain = sloped_field();
+        let before = terrain.clone();
+        terrain.carve_crater(Vec2::new(66.0, 66.0), 5.0, 2.0);
+        for cz in 0..2 {
+            for cx in 0..2 {
+                for z in cz * CHUNK_CELLS..=(cz + 1) * CHUNK_CELLS {
+                    for x in cx * CHUNK_CELLS..=(cx + 1) * CHUNK_CELLS {
+                        if ground_normal(&terrain, x, z) != ground_normal(&before, x, z) {
+                            assert!(terrain.dirty[cz * CHUNKS_X + cx]);
+                        }
+                    }
+                }
+            }
+        }
+        let weights = ground_weights(
+            &terrain,
+            &before.heights,
+            33,
+            33,
+            ground_normal(&terrain, 33, 33),
+        );
+        assert_eq!(weights[1], 1.0);
+        assert_eq!(
+            terrain.height_at(66.0, 66.0),
+            before.height_at(66.0, 66.0) - 2.0
+        );
+        assert!(terrain.blocked.iter().all(|blocked| !blocked));
+    }
 }
