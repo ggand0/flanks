@@ -3,3 +3,4 @@
 //! way; what has moved out lives here.
 
 pub mod damage;
+pub mod job;
