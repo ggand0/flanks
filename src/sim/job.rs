@@ -1,8 +1,9 @@
-//! One kinematic tick's job: the copies of the world it computes from,
-//! the per-regiment snapshot, and the buffers it fills. `prepare_tick`
+//! One kinematic tick's job: the shared columns it reads, the
+//! per-regiment snapshot, and the buffers it fills. `prepare_tick`
 //! builds it on the main thread; the kernel runs it on the worker.
 
 use bevy::prelude::*;
+use std::sync::Arc;
 
 use crate::orders::Groups;
 use crate::sim::damage::DamageEvent;
@@ -24,25 +25,42 @@ pub(crate) struct ShootAt {
     pub(crate) t: usize,
 }
 
-/// Everything one kinematic tick owns: copies of the input state, the
-/// per-regiment command snapshot, and the output buffers. Fully
+/// Everything one kinematic tick owns: the shared columns it reads, the
+/// per-regiment command snapshot, and the buffers it fills. Fully
 /// self-contained, so the tick can run on a worker thread while the main
-/// world keeps rendering the last completed tick — nothing borrows ECS
-/// data across frames. Per-soldier buffers are recycled tick to tick
-/// (swapped at install, clear + extend at prep).
+/// world keeps rendering the last completed tick.
+///
+/// The soldier columns are not copied. The job holds `Arc` clones of
+/// the live columns (`Units::Column`), taken at the kick. The main world
+/// writes its columns only between the install and the kick, when the
+/// job holds nothing, so the clones are never stale and the writes never
+/// copy. The read-modify-write columns are read from the clones and
+/// written to the job's own output buffers, which the install swaps in;
+/// the buffers the install releases become the next tick's outputs.
 #[derive(Default)]
 pub struct TickJob {
-    // Tick-start positions (the kernel's `pos_prev`) and the new ones.
-    pub(crate) pos_in: Vec<Vec3>,
+    // Shared inputs: the live columns at the kick. `pos_in` is the
+    // kernel's `pos_prev`.
+    pub(crate) pos_in: Arc<Vec<Vec3>>,
+    pub(crate) speed: Arc<Vec<f32>>,
+    pub(crate) team: Arc<Vec<u8>>,
+    pub(crate) kind: Arc<Vec<u8>>,
+    pub(crate) group: Arc<Vec<u32>>,
+    pub(crate) home: Arc<Vec<Vec2>>,
+    pub(crate) vel_in: Arc<Vec<Vec3>>,
+    pub(crate) yaw_in: Arc<Vec<f32>>,
+    pub(crate) yaw_prev_in: Arc<Vec<f32>>,
+    pub(crate) target_in: Arc<Vec<u32>>,
+    pub(crate) swing_in: Arc<Vec<u8>>,
+    pub(crate) swing_t_in: Arc<Vec<u8>>,
+    pub(crate) flash_in: Arc<Vec<u8>>,
+    pub(crate) death_t_in: Arc<Vec<u8>>,
+    pub(crate) ammo_in: Arc<Vec<u8>>,
+    pub(crate) out_form_in: Arc<Vec<bool>>,
+    pub(crate) sight_in: Arc<Vec<u8>>,
+    // Outputs: the columns after the tick. Each kernel task copies its
+    // chunk in from the shared column, then runs the stages on it.
     pub(crate) pos_out: Vec<Vec3>,
-    // Read-only column copies (the death sweep swap-removes the live
-    // columns between ticks, so the job cannot share them).
-    pub(crate) speed: Vec<f32>,
-    pub(crate) team: Vec<u8>,
-    pub(crate) kind: Vec<u8>,
-    pub(crate) group: Vec<u32>,
-    pub(crate) home: Vec<Vec2>,
-    // Read-modify-write columns: copied in at prep, swapped out at install.
     pub(crate) vel: Vec<Vec3>,
     pub(crate) yaw: Vec<f32>,
     pub(crate) yaw_prev: Vec<f32>,
@@ -67,19 +85,34 @@ pub struct TickJob {
     pub(crate) threat: Vec<Vec2>,
     pub(crate) form_face: Vec<Vec2>,
     pub(crate) wall: Vec<u8>,
+    /// Per regiment: in a wall stance (the grid's META_WALL bit).
+    pub(crate) group_wall: Vec<bool>,
     pub(crate) charging: Vec<bool>,
     pub(crate) fat_speed: Vec<f32>,
     pub(crate) fat_nocharge: Vec<bool>,
     pub(crate) shoot_at: Vec<Option<ShootAt>>,
-    pub(crate) target_members: Vec<Vec<u32>>,
+    /// Per regiment: under fire this tick (some regiment's bows aim at it).
+    pub(crate) targeted: Vec<bool>,
     pub(crate) blocks: [Vec<(Vec2, f32, f32)>; 2],
     pub(crate) faces_spearwall: [bool; 2],
-    // Per-soldier prep products.
-    pub(crate) wall_flags: Vec<bool>,
-    pub(crate) yaw_snapshot: Vec<f32>,
-    // Outputs beyond the columns: the grid the tick built, landed swings
-    // and loosed arrows per chunk. All swapped into their resources at
-    // install.
+    // Products of the run beyond the columns, all swapped into their
+    // resources when the job is taken or installed.
+    /// Each regiment's men as index ranges, in index order (see
+    /// `regiment_runs`).
+    pub(crate) reg_runs: Vec<Vec<(u32, u32)>>,
+    /// Living members of every regiment under fire, per regiment, in
+    /// index order.
+    pub(crate) target_members: Vec<Vec<u32>>,
+    /// The density field of the tick's start positions (frontline.rs),
+    /// built when a taker wants it (not on the inline path, where
+    /// `update_field` already rebuilt the resource this tick).
+    pub(crate) field: crate::frontline::InfluenceField,
+    pub(crate) field_wanted: bool,
+    /// Men whose death countdown reached its last tick, ascending.
+    pub(crate) dead: Vec<u32>,
+    /// Living men standing near or beyond their own map edge, ascending:
+    /// the sweep's candidates for a router who has left the field.
+    pub(crate) at_edge: Vec<u32>,
     pub(crate) grid: SpatialGrid,
     pub(crate) events: Vec<Vec<DamageEvent>>,
     pub(crate) arrow_spawns: Vec<Vec<crate::arrows::ArrowSpawn>>,
@@ -94,6 +127,32 @@ pub struct TickJob {
     pub(crate) generation: u64,
     pub(crate) grid_ms: f32,
     pub(crate) step_ms: f32,
+    pub(crate) field_ms: f32,
+}
+
+/// The index ranges of every regiment's men, in index order. Regiments
+/// are contiguous at spawn; only the death sweep's swap-removes scatter
+/// men, so a regiment is a few runs. Walking a regiment's runs visits
+/// its men in ascending index, the order every serial loop over the
+/// army used, so sums taken this way are the same bits.
+pub(crate) fn regiment_runs(group: &[u32], n_groups: usize, out: &mut Vec<Vec<(u32, u32)>>) {
+    out.resize_with(n_groups, Vec::new);
+    for runs in out.iter_mut() {
+        runs.clear();
+    }
+    let mut i = 0usize;
+    let n = group.len();
+    while i < n {
+        let g = group[i];
+        let start = i;
+        i += 1;
+        while i < n && group[i] == g {
+            i += 1;
+        }
+        if (g as usize) < n_groups {
+            out[g as usize].push((start as u32, i as u32));
+        }
+    }
 }
 
 /// The archers' fire solutions of a tick.
@@ -102,18 +161,18 @@ struct FireSolutions {
     /// halted, volleying.
     standoff: Vec<bool>,
     shoot_at: Vec<Option<ShootAt>>,
-    /// Living members of every regiment under fire, per regiment.
-    target_members: Vec<Vec<u32>>,
+    /// Per regiment: under fire this tick.
+    targeted: Vec<bool>,
     /// Friendly formed blocks per team as discs with a clearance ceiling,
     /// for the loft-over-friendlies check.
     blocks: [Vec<(Vec2, f32, f32)>; 2],
 }
 
-/// Fill `job` from the live world: column copies, the per-regiment
+/// Fill `job` from the live world: the shared columns, the per-regiment
 /// command snapshot, the archers' fire solutions and scalars. The
-/// serial prep of a tick, on the main thread. It also makes the two
-/// regiment writes prep makes: the stand-off anchor snap and the
-/// `firing` flag.
+/// serial prep of a tick, on the main thread, per regiment only: nothing
+/// here loops over the army. It also makes the two regiment writes prep
+/// makes: the stand-off anchor snap and the `firing` flag.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_tick(
     job: &mut TickJob,
@@ -131,10 +190,10 @@ pub(crate) fn prepare_tick(
     job.terrain = Some(terrain_arc.clone());
     let terrain: &Terrain = terrain_arc;
 
-    copy_columns(job, units);
-    let fire = archer_fire_solutions(groups, units, tracks, terrain);
+    share_columns(job, units);
+    let fire = archer_fire_solutions(groups, tracks, terrain);
     job.orders = resolve_orders(groups, &fire.standoff);
-    snapshot_regiments(job, groups, units, terrain);
+    snapshot_regiments(job, groups, terrain);
 
     let n_chunks = units.pos.len().div_ceil(CHUNK);
     if job.events.len() < n_chunks {
@@ -151,29 +210,52 @@ pub(crate) fn prepare_tick(
     job.tick_seed = tick.wrapping_mul(0x9E37_79B1);
     job.tick = tick;
     job.shoot_at = fire.shoot_at;
-    job.target_members = fire.target_members;
+    job.targeted = fire.targeted;
     job.blocks = fire.blocks;
+    job.field.size_to(terrain.min(), terrain.max());
 }
 
-/// The soldier columns, copied into the job: the death sweep swap-removes
-/// the live columns between ticks, so the job cannot share them.
-fn copy_columns(job: &mut TickJob, units: &Units) {
-    macro_rules! copy_col {
-        ($($dst:ident <- $src:ident),*) => {$(
-            job.$dst.clear();
-            job.$dst.extend_from_slice(&units.$src);
-        )*};
+/// The soldier columns, shared into the job: `Arc` clones of the live
+/// columns, no copy. The output buffers are sized to the army; their
+/// contents are overwritten by the kernel (each task copies its chunk in
+/// from the shared column first, and the position output is written for
+/// every man), so they are never cleared.
+fn share_columns(job: &mut TickJob, units: &Units) {
+    job.pos_in = units.pos.share();
+    job.speed = units.speed.share();
+    job.team = units.team.share();
+    job.kind = units.kind.share();
+    job.group = units.group.share();
+    job.home = units.home.share();
+    job.vel_in = units.vel.share();
+    job.yaw_in = units.yaw.share();
+    job.yaw_prev_in = units.yaw_prev.share();
+    job.target_in = units.target.share();
+    job.swing_in = units.swing.share();
+    job.swing_t_in = units.swing_t.share();
+    job.flash_in = units.flash.share();
+    job.death_t_in = units.death_t.share();
+    job.ammo_in = units.ammo.share();
+    job.out_form_in = units.out_form.share();
+    job.sight_in = units.sight.share();
+    let n = units.pos.len();
+    fn fit<T: Clone + Default>(v: &mut Vec<T>, n: usize) {
+        if v.len() != n {
+            v.resize(n, T::default());
+        }
     }
-    // pos_in is the state at tick start; pos_out is fully rewritten by
-    // the integrate.
-    copy_col!(
-        pos_in <- pos, speed <- speed, team <- team, kind <- kind, group <- group,
-        home <- home, vel <- vel, yaw <- yaw, yaw_prev <- yaw_prev, target <- target,
-        swing <- swing, swing_t <- swing_t, flash <- flash, death_t <- death_t, ammo <- ammo,
-        out_form <- out_form, sight <- sight
-    );
-    job.pos_out.clear();
-    job.pos_out.resize(units.pos.len(), Vec3::ZERO);
+    fit(&mut job.pos_out, n);
+    fit(&mut job.vel, n);
+    fit(&mut job.yaw, n);
+    fit(&mut job.yaw_prev, n);
+    fit(&mut job.target, n);
+    fit(&mut job.swing, n);
+    fit(&mut job.swing_t, n);
+    fit(&mut job.flash, n);
+    fit(&mut job.death_t, n);
+    fit(&mut job.ammo, n);
+    fit(&mut job.out_form, n);
+    fit(&mut job.sight, n);
 }
 
 /// An attack order for a ranged regiment is a fire order, not a melee
@@ -183,13 +265,9 @@ fn copy_columns(job: &mut TickJob, units: &Units) {
 /// the stand-off anchor snap and the `firing` flag.
 fn archer_fire_solutions(
     groups: &mut Groups,
-    units: &Units,
     tracks: &crate::arrows::RegTracks,
     terrain: &Terrain,
 ) -> FireSolutions {
-    let pos_prev = &units.pos[..];
-    let group = &units.group[..];
-    let death_t = &units.death_t[..];
     // An attack order for a
     // ranged regiment is a FIRE order, not a melee charge: the regiment
     // halts once the target is inside range (the stand-off below feeds
@@ -289,22 +367,15 @@ fn archer_fire_solutions(
     for (g, s) in shoot_at.iter().enumerate() {
         groups.list[g].firing = s.is_some() && groups.list[g].ammo_left > 0;
     }
-    // Living members of every regiment under fire this tick: each shot
-    // aims at an actual soldier (M2TW's per-soldier aim targets),
-    // not at a spot on the block's footprint. Into a
-    // locked melee the shafts head for enemy bodies; friends die only
-    // to genuine misses and interceptions.
+    // Regiments under fire this tick. The job lists their living members
+    // (`target_members`, built on the worker from its shared columns):
+    // each shot aims at an actual soldier (M2TW's per-soldier aim
+    // targets), not at a spot on the block's footprint. Into a locked
+    // melee the shafts head for enemy bodies; friends die only to
+    // genuine misses and interceptions.
     let mut targeted = vec![false; n_groups];
     for s in shoot_at.iter().flatten() {
         targeted[s.t] = true;
-    }
-    let mut target_members: Vec<Vec<u32>> = vec![Vec::new(); n_groups];
-    if targeted.iter().any(|t| *t) {
-        for i in 0..pos_prev.len() {
-            if death_t[i] == 0 && targeted[group[i] as usize] {
-                target_members[group[i] as usize].push(i as u32);
-            }
-        }
     }
     // Friendly blocks per team for the loft-over-friendlies check: every
     // live formed regiment as a disc with a clearance ceiling. A
@@ -328,7 +399,7 @@ fn archer_fire_solutions(
     FireSolutions {
         standoff,
         shoot_at,
-        target_members,
+        targeted,
         blocks,
     }
 }
@@ -364,17 +435,15 @@ fn resolve_orders(groups: &Groups, standoff: &[bool]) -> Vec<Option<Vec2>> {
 
 /// The per-regiment state the kernel reads, snapshotted into the job,
 /// plus the per-soldier flags derived from it.
-fn snapshot_regiments(job: &mut TickJob, groups: &Groups, units: &Units, terrain: &Terrain) {
-    let group = &units.group[..];
-    // Per-unit wall flag for the grid meta (same-team wall pairs pack
-    // tighter in the separation below).
+fn snapshot_regiments(job: &mut TickJob, groups: &Groups, terrain: &Terrain) {
+    // Per-regiment wall flag for the grid meta (same-team wall pairs pack
+    // tighter in the separation); the rebuild reads it through the
+    // regiment index it already carries per man.
     let group_wall: Vec<bool> = groups
         .list
         .iter()
         .map(|g| crate::formation::wall_kind(g) != 0)
         .collect();
-    job.wall_flags.clear();
-    job.wall_flags.extend(group.iter().map(|&g| group_wall[g as usize]));
     let group_broken: Vec<bool> = groups.list.iter().map(|g| g.state.is_broken()).collect();
     let anchors: Vec<Vec2> = groups.list.iter().map(|g| g.anchor).collect();
     // Regiments in combat-watch range of an enemy (sparse-fight
@@ -448,15 +517,9 @@ fn snapshot_regiments(job: &mut TickJob, groups: &Groups, units: &Units, terrain
             .iter()
             .any(|g| g.team != t && g.count > 0 && crate::formation::wall_kind(g) == 2)
     });
-    // Read-only yaw snapshot (tick-start, like pos_prev) for cross-unit
-    // reads inside the parallel integrate — the live yaw column is split
-    // into &mut chunks there. The spear-line hazard reads the SPEARMAN's
-    // facing from the charger's side of the scan; no spearwalls anywhere,
-    // no copy.
-    job.yaw_snapshot.clear();
-    if faces_spearwall[0] || faces_spearwall[1] {
-        job.yaw_snapshot.extend_from_slice(&units.yaw);
-    }
+    // The spear-line hazard reads the SPEARMAN's facing from the
+    // charger's side of the scan: the shared yaw column at the tick's
+    // start serves as that read-only snapshot.
     job.bounds_min = bounds_min;
     job.bounds_max = bounds_max;
     job.faces_spearwall = faces_spearwall;
@@ -471,6 +534,7 @@ fn snapshot_regiments(job: &mut TickJob, groups: &Groups, units: &Units, terrain
     job.threat = threat;
     job.form_face = form_face;
     job.wall = wall;
+    job.group_wall = group_wall;
     job.charging = charging;
     job.fat_speed = fat_speed;
     job.fat_nocharge = fat_nocharge;

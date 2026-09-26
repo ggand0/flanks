@@ -104,7 +104,7 @@ impl SpatialGrid {
         kinds: &[u8],
         groups: &[u32],
         death_t: &[u8],
-        walled: &[bool],
+        group_wall: &[bool],
     ) {
         let n = positions.len();
         if n == 0 {
@@ -191,7 +191,7 @@ impl SpatialGrid {
                         let meta = ((teams[i] as u32) * META_TEAM)
                             | ((kinds[i] as u32) << META_KIND_SHIFT)
                             | (((death_t[i] > 0) as u32) * META_DYING)
-                            | ((walled[i] as u32) * META_WALL)
+                            | ((group_wall[groups[i] as usize] as u32) * META_WALL)
                             | (groups[i] << META_GROUP_SHIFT);
                         unsafe {
                             *out.0.add(k) = SortedUnit {

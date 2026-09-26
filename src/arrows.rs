@@ -167,7 +167,9 @@ impl Plugin for ArrowsPlugin {
             .add_systems(
                 FixedUpdate,
                 (
-                    skirmish_and_ammo.before(crate::sim::step_sim),
+                    skirmish_and_ammo
+                        .after(crate::sim::take_tick)
+                        .before(crate::sim::step_sim),
                     update_arrows
                         .after(crate::sim::step_sim)
                         .before(crate::combat::process_deaths),
@@ -529,17 +531,22 @@ const SKIRMISH_REOPEN: f32 = 40.0;
 fn skirmish_and_ammo(
     mut groups: ResMut<crate::orders::Groups>,
     units: Res<crate::units::Units>,
+    runs: Res<crate::sim::RegimentRuns>,
     terrain: Res<crate::terrain::Terrain>,
 ) {
-    // Regiment ammo pools (the unit-card ammo bar).
-    for gd in groups.list.iter_mut() {
-        if gd.kind == crate::unit_types::KIND_ARCHER {
-            gd.ammo_left = 0;
+    // Regiment ammo pools (the unit-card ammo bar), summed over the
+    // archer regiments' own men.
+    for (g, gd) in groups.list.iter_mut().enumerate() {
+        if gd.kind != crate::unit_types::KIND_ARCHER {
+            continue;
         }
-    }
-    for i in 0..units.len() {
-        if units.kind[i] == crate::unit_types::KIND_ARCHER && units.death_t[i] == 0 {
-            groups.list[units.group[i] as usize].ammo_left += units.ammo[i] as u32;
+        gd.ammo_left = 0;
+        for &(s, e) in runs.of(g) {
+            for i in s as usize..e as usize {
+                if units.kind[i] == crate::unit_types::KIND_ARCHER && units.death_t[i] == 0 {
+                    gd.ammo_left += units.ammo[i] as u32;
+                }
+            }
         }
     }
 
