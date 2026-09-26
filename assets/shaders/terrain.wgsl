@@ -23,6 +23,67 @@ fn hash_ground(p: vec2<f32>) -> f32 {
     return fract((q.x + q.y) * q.z);
 }
 
+fn cover_variation(p: vec2<f32>) -> f32 {
+    let cell = floor(p);
+    let f = fract(p);
+    let weight = f * f * (3.0 - 2.0 * f);
+    return mix(
+        mix(hash_ground(cell), hash_ground(cell + vec2<f32>(1.0, 0.0)), weight.x),
+        mix(hash_ground(cell + vec2<f32>(0.0, 1.0)), hash_ground(cell + 1.0), weight.x),
+        weight.y,
+    ) * 2.0 - 1.0;
+}
+
+fn meadow_transition(field: vec4<f32>, uv: vec2<f32>, p: vec2<f32>, footprint: f32) -> vec4<f32> {
+    // This corridor belongs to the authored eastern dry meadow. Keep the
+    // pasture and the outer dry ground outside it unchanged.
+    let corridor = smoothstep(0.57, 0.64, uv.x) * (1.0 - smoothstep(0.86, 0.94, uv.x));
+    if corridor < 0.001 {
+        return field;
+    }
+
+    // Estimate grass and dry-ground coverage over metres, rather than retaining
+    // the source image's small islands as enlarged, hard-edged color outlines.
+    let texel_m = coverage_bounds.z / f32(textureDimensions(coverage).x);
+    let mip = log2(max(8.0, footprint) / texel_m);
+    var grass_sum = vec4<f32>(0.0);
+    var dry_sum = vec4<f32>(0.0);
+    var alpha_sum = 0.0;
+    var local_mean = field.rgb;
+    for (var y = -1; y <= 1; y += 1) {
+        for (var x = -1; x <= 1; x += 1) {
+            let weight = select(1.0, 2.0, x == 0) * select(1.0, 2.0, y == 0);
+            let offset = vec2<f32>(f32(x), f32(y)) * 16.0 / coverage_bounds.zw;
+            let sample = textureSampleLevel(coverage, coverage_sampler, uv + offset, mip);
+            if x == 0 && y == 0 {
+                local_mean = sample.rgb;
+            }
+            let warmth = (sample.r - sample.g) / max(sample.r + sample.g, 0.001);
+            let dry = smoothstep(-0.035, 0.075, warmth);
+            grass_sum += vec4<f32>(sample.rgb, 1.0) * ((1.0 - dry) * weight);
+            dry_sum += vec4<f32>(sample.rgb, 1.0) * (dry * weight);
+            alpha_sum += sample.a * weight;
+        }
+    }
+    let coverage_weight = dry_sum.a / 16.0;
+    let edge = smoothstep(0.04, 0.22, coverage_weight) * (1.0 - smoothstep(0.78, 0.96, coverage_weight));
+    if edge < 0.001 {
+        return field;
+    }
+    let grass_color = grass_sum.rgb / max(grass_sum.a, 0.001);
+    let dry_color = dry_sum.rgb / max(dry_sum.a, 0.001);
+    // Small coverage interruptions have explicit world sizes. Filter them out
+    // when unresolved, and confine them to the mixed vegetation corridor.
+    let breakup = cover_variation(p / vec2<f32>(7.0, 4.0)) * 0.16 * (1.0 - smoothstep(3.0, 8.0, footprint))
+        + cover_variation(p / 2.5 + 37.0) * 0.08 * (1.0 - smoothstep(1.0, 3.0, footprint));
+    let dry = clamp(coverage_weight + breakup * 4.0 * coverage_weight * (1.0 - coverage_weight), 0.0, 1.0);
+    // Preserve resolved surface grain while changing the larger material mix.
+    let luminance = vec3<f32>(0.2126, 0.7152, 0.0722);
+    let grain = clamp(dot(field.rgb, luminance) / max(dot(local_mean, luminance), 0.001), 0.65, 1.45);
+    let transition = vec4<f32>(mix(grass_color, dry_color, dry) * grain, alpha_sum / 16.0);
+    return mix(field, transition, corridor * edge);
+}
+
 struct GroundSample {
     color: vec3<f32>,
     normal_roughness: vec4<f32>,
@@ -128,7 +189,11 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
         rock_nr = mix(rock_nr, vec4<f32>(0.5, 0.5, 1.0, 0.95), side_weight);
     }
 
-    let field = textureSample(coverage, coverage_sampler, (p.xz - coverage_bounds.xy) / coverage_bounds.zw);
+    let coverage_uv = (p.xz - coverage_bounds.xy) / coverage_bounds.zw;
+    var field = textureSample(coverage, coverage_sampler, coverage_uv);
+    if natural_ground != 0u {
+        field = meadow_transition(field, coverage_uv, p.xz, max(length(dx.xz), length(dy.xz)));
+    }
     var soil: f32;
     var rock = 0.0;
     var color: vec3<f32>;
