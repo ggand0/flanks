@@ -147,10 +147,24 @@ fn setup_world(mut commands: Commands) {
     commands.spawn((
         DirectionalLight {
             illuminance: 8_000.0,
-            shadow_maps_enabled: false,
+            // FL_SHADOWS=0 turns every sun shadow off, units included:
+            // without shadow maps the light has no cascade views for the
+            // unit draw to cast into, and the unit shader skips the
+            // lookup on the light's flag.
+            shadow_maps_enabled: crate::util::env_or("FL_SHADOWS", 1_u32) != 0,
             ..default()
         },
         // Lowish sun: flat-shaded relief needs directional contrast.
         Transform::from_rotation(Quat::from_euler(EulerRot::YXZ, 0.7, -0.75, 0.0)),
+        // Three cascades out to where soldiers stop being more than a few
+        // pixels tall. The first covers the close-up, where a soldier's
+        // shadow at his feet needs the finest texels.
+        bevy::light::CascadeShadowConfigBuilder {
+            num_cascades: 3,
+            first_cascade_far_bound: 40.0,
+            maximum_distance: 280.0,
+            ..default()
+        }
+        .build(),
     ));
 }
