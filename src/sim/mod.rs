@@ -4,3 +4,4 @@
 
 pub mod damage;
 pub mod job;
+pub mod soldier;
