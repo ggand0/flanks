@@ -10,7 +10,6 @@ mod gait;
 mod frontline;
 mod game_state;
 mod morale;
-mod movement;
 mod orders;
 mod overlay;
 mod picker;
@@ -109,7 +108,7 @@ fn main() {
             ai::AiPlugin,
             banners::BannersPlugin,
             audio::BattleAudioPlugin,
-            movement::MovementPlugin,
+            sim::SimPlugin,
             arrows::ArrowsPlugin,
         ))
         .add_plugins((

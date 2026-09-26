@@ -167,9 +167,9 @@ impl Plugin for ArrowsPlugin {
             .add_systems(
                 FixedUpdate,
                 (
-                    skirmish_and_ammo.before(crate::movement::step_sim),
+                    skirmish_and_ammo.before(crate::sim::step_sim),
                     update_arrows
-                        .after(crate::movement::step_sim)
+                        .after(crate::sim::step_sim)
                         .before(crate::combat::process_deaths),
                 )
                     .in_set(crate::game_state::SimSet),
@@ -294,7 +294,7 @@ fn update_arrows(
     mut groups: ResMut<crate::orders::Groups>,
     grid: Res<crate::spatial::SpatialGrid>,
     terrain: Res<crate::terrain::Terrain>,
-    scale: Res<crate::movement::CombatScale>,
+    scale: Res<crate::sim::CombatScale>,
     mut cstats: ResMut<crate::combat::CombatStats>,
     mut stats: ResMut<ArrowStats>,
     mut stuck: ResMut<StuckArrows>,
@@ -456,8 +456,8 @@ fn update_arrows(
         let pv = &TYPES[units.kind[v] as usize];
         let fwd = Vec2::new(units.yaw[v].sin(), units.yaw[v].cos());
         let along = fwd.dot(h.from_dir);
-        let front = along >= crate::movement::SECTOR_COS_60;
-        let rear = along < -crate::movement::SECTOR_COS_60;
+        let front = along >= crate::sim::damage::SECTOR_COS_60;
+        let rear = along < -crate::sim::damage::SECTOR_COS_60;
         let left_side = !front && !rear && h.from_dir.dot(Vec2::new(fwd.y, -fwd.x)) > 0.0;
         let shield = if front || left_side { pv.shield } else { 0.0 };
         let factor =
@@ -468,7 +468,7 @@ fn update_arrows(
         units.hp[v] -= dmg;
         units.flash[v] = 4;
         if units.hp[v] <= 0.0 {
-            units.death_t[v] = crate::movement::DEATH_TICKS;
+            units.death_t[v] = crate::sim::damage::DEATH_TICKS;
             cstats.kills[units.team[v] as usize] += 1;
             groups.list[units.group[v] as usize].recent_deaths += 1;
             if units.team[v] != h.team {
@@ -485,9 +485,9 @@ fn update_arrows(
             // anti-stunlock immunity pass applies, like melee.
             let braced = front
                 && crate::formation::wall_kind(&groups.list[units.group[v] as usize]) != 0;
-            let p = (crate::movement::STAGGER_P0
-                + crate::movement::STAGGER_P_PER_FACTOR * factor)
-                .clamp(crate::movement::STAGGER_P_MIN, 1.0);
+            let p = (crate::sim::damage::STAGGER_P0
+                + crate::sim::damage::STAGGER_P_PER_FACTOR * factor)
+                .clamp(crate::sim::damage::STAGGER_P_MIN, 1.0);
             let roll = hash01(
                 (*tick)
                     .wrapping_mul(0x85EB_CA6B)
@@ -503,7 +503,7 @@ fn update_arrows(
                     // archer's 8 s bow cycle as stagger time would
                     // freeze him into a statue.
                     units.swing_t[v] = units.swing_t[v]
-                        .clamp(crate::movement::HIT_STAGGER_TICKS, 45);
+                        .clamp(crate::sim::damage::HIT_STAGGER_TICKS, 45);
                 }
             }
         }

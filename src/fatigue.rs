@@ -23,7 +23,7 @@ impl Plugin for FatiguePlugin {
         app.add_systems(
             FixedUpdate,
             update_fatigue
-                .after(crate::movement::step_sim)
+                .after(crate::sim::step_sim)
                 .before(crate::morale::update_morale)
                 .in_set(crate::game_state::SimSet),
         );

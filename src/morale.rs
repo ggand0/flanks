@@ -32,7 +32,7 @@ impl Plugin for MoralePlugin {
         app.init_resource::<MoraleReadout>().add_systems(
             FixedUpdate,
             update_morale
-                .after(crate::movement::step_sim)
+                .after(crate::sim::step_sim)
                 .before(crate::orders::clear_arrived_orders)
                 .in_set(crate::game_state::SimSet),
         );

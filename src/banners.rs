@@ -163,7 +163,7 @@ fn update_banners(
     groups: Res<Groups>,
     selection: Res<Selection>,
     terrain: Res<Terrain>,
-    viz: Res<crate::movement::DebugViz>,
+    viz: Res<crate::sim::DebugViz>,
     camera: Query<&crate::camera::RtsCamera>,
     time: Res<Time>,
     assets: Option<Res<BannerAssets>>,

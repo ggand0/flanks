@@ -324,7 +324,7 @@ impl Plugin for OrdersPlugin {
             .add_systems(
                 FixedUpdate,
                 clear_arrived_orders
-                    .after(crate::movement::step_sim)
+                    .after(crate::sim::step_sim)
                     .in_set(crate::game_state::SimSet),
             );
     }
@@ -849,7 +849,7 @@ pub fn clear_arrived_orders(mut groups: ResMut<Groups>) {
 }
 
 fn draw_order_gizmos(
-    viz: Res<crate::movement::DebugViz>,
+    viz: Res<crate::sim::DebugViz>,
     groups: Res<Groups>,
     terrain: Res<Terrain>,
     mut gizmos: Gizmos,

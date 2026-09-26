@@ -28,7 +28,7 @@ impl Plugin for CombatPlugin {
         app.init_resource::<CombatStats>().add_systems(
             FixedUpdate,
             process_deaths
-                .after(crate::movement::step_sim)
+                .after(crate::sim::step_sim)
                 .before(crate::orders::clear_arrived_orders)
                 .in_set(crate::game_state::SimSet),
         );

@@ -4,7 +4,7 @@ use bevy::time::common_conditions::paused as time_paused;
 
 use crate::ai::BattleOutcome;
 use crate::combat::CombatStats;
-use crate::movement::DirTestStats;
+use crate::sim::damage::DirTestStats;
 use crate::orders::{Groups, Selection};
 use crate::render_units::Corpses;
 use crate::terrain::Terrain;

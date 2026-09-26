@@ -895,7 +895,7 @@ fn sync_instance_data(
                     };
                     // fx: [0,1) hit flash, [1,2] death progress.
                     let fx = if units.death_t[i] > 0 {
-                        2.0 - units.death_t[i] as f32 / crate::movement::DEATH_TICKS as f32
+                        2.0 - units.death_t[i] as f32 / crate::sim::damage::DEATH_TICKS as f32
                     } else {
                         units.flash[i] as f32 * 0.25
                     };
@@ -908,7 +908,7 @@ fn sync_instance_data(
                         // stumble plays the full rock for its 0.5 s; a
                         // charge impact or impalement holds it ~1 s.
                         (units.swing_t[i] as f32
-                            / crate::movement::HIT_STAGGER_TICKS as f32)
+                            / crate::sim::damage::HIT_STAGGER_TICKS as f32)
                             .min(1.0)
                     } else {
                         0.0

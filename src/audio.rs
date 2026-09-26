@@ -12,7 +12,7 @@ use bevy::prelude::*;
 use crate::camera::RtsCamera;
 use crate::combat::CombatStats;
 use crate::game_state::GameState;
-use crate::movement::SimStats;
+use crate::sim::SimStats;
 use crate::orders::{Groups, RegState};
 use crate::units::hash01;
 

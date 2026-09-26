@@ -488,7 +488,7 @@ fn spawn_dir_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
 /// survival, every 2 s.
 #[allow(clippy::too_many_arguments)] // bevy system params
 fn dir_test_log(
-    dir_stats: Res<crate::movement::DirTestStats>,
+    dir_stats: Res<crate::sim::damage::DirTestStats>,
     units: Res<Units>,
     time: Res<Time>,
     mut next: Local<f32>,
@@ -737,7 +737,7 @@ fn spawn_routpass_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups
 /// walks through it, and the overlap floor.
 fn routpass_test_log(
     groups: Res<crate::orders::Groups>,
-    stats: Res<crate::movement::SimStats>,
+    stats: Res<crate::sim::SimStats>,
     time: Res<Time>,
     mut next: Local<f32>,
 ) {
@@ -983,7 +983,7 @@ fn spawn_arena(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
 /// FL_ARENA bookkeeping: per-lane strengths + the player's kills and
 /// damage per hit by sector, every 4 s once fighting starts.
 fn arena_log(
-    dir_stats: Res<crate::movement::DirTestStats>,
+    dir_stats: Res<crate::sim::damage::DirTestStats>,
     units: Res<Units>,
     groups: Res<Groups>,
     time: Res<Time>,

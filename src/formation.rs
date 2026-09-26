@@ -263,7 +263,7 @@ impl Plugin for FormationPlugin {
         app.add_systems(
             FixedUpdate,
             apply_reforms
-                .before(crate::movement::step_sim)
+                .before(crate::sim::step_sim)
                 .in_set(crate::game_state::SimSet),
         )
         .add_systems(

@@ -294,8 +294,8 @@ fn build_frame_params(
     }));
     p.consts = Vec4::new(
         crate::unit_types::missile::DRAW_TICKS as f32,
-        crate::movement::DEATH_TICKS as f32,
-        crate::movement::HIT_STAGGER_TICKS as f32,
+        crate::sim::damage::DEATH_TICKS as f32,
+        crate::sim::damage::HIT_STAGGER_TICKS as f32,
         CELEBRATE_BASE,
     );
     p.dt = dt;

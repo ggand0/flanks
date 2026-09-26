@@ -6,7 +6,7 @@
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 
-use crate::movement::DebugViz;
+use crate::sim::DebugViz;
 use crate::orders::{Groups, PLAYER_TEAM};
 use crate::terrain::Terrain;
 use crate::units::Units;
