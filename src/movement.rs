@@ -2084,6 +2084,13 @@ fn run_tick_job(job: &mut TickJob) {
                         {
                             pos_prev[best_idx as usize].xz() - p
                         }
+                        // Out of formation with no enemy in reach: he faces
+                        // where he is going, the enemy he remembers or the
+                        // fight he heads for, standing or walking. Without
+                        // this a blocked joiner fell through to the formed
+                        // man's rule below and stood facing the line's front
+                        // with the fight beside him.
+                        None if !routed && committed && memo_dir != Vec2::ZERO => memo_dir,
                         // Blooded and the enemy still close: a man who has
                         // traded blows keeps facing the fight while his
                         // last foe (combat memo, validated by team and
