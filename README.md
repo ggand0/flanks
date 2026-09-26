@@ -51,7 +51,7 @@ A set of `FL_*` environment variables configure sandbox battles and scripted tes
 
 ## Assets
 
-There are no external art assets: unit meshes, terrain, and all animation are generated in code. Sound effects are AI-generated (ElevenLabs), plus one [marching loop from Pixabay](https://pixabay.com/sound-effects/people-marching-loop-32908/). Audio files are covered by their respective licenses, not the source license below.
+Unit models are made for this project. The ground uses three CC0 textures from [Poly Haven](https://polyhaven.com/) and a layout image made for the project; see `assets/terrain/LICENSE.md`. Everything else is generated in code. Sound effects are AI-generated (ElevenLabs), plus one [marching loop from Pixabay](https://pixabay.com/sound-effects/people-marching-loop-32908/). Audio files are covered by their respective licenses, not the source license below.
 
 ## License
 

@@ -941,7 +941,7 @@ fn build_band_mesh(terrain: &Terrain, cx: usize, cz: usize) -> Mesh {
     .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
 }
 
-/// The classic map keeps its 0.1.0 look: flat-shaded soup with height bands.
+/// The classic map keeps its 0.1.0 look: flat shading and height bands.
 fn build_chunk_mesh(terrain: &Terrain, original: &[f32], cx: usize, cz: usize) -> Mesh {
     if terrain.kind == MapKind::Classic {
         return build_band_mesh(terrain, cx, cz);
