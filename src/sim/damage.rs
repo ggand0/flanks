@@ -26,6 +26,11 @@ pub const SECTOR_COS_60: f32 = 0.5;
 /// to position (next tick's separation resolves the pile — same pipe as
 /// all overlap). Heavy into light ~0.55 m: the line visibly DENTS.
 const CHARGE_KNOCKBACK: f32 = 0.9;
+/// The farthest the apply pass moves a man after the job wrote his
+/// position (the charge shove above, at most): the job's list of men
+/// near the map edge (sim/mod.rs) reaches this much further in, so the
+/// death sweep's candidates hold every man the shove could carry out.
+pub const KNOCKBACK_MARGIN: f32 = CHARGE_KNOCKBACK;
 /// Braced walls barely budge (0.25x knockback) and never stagger.
 const WALL_KNOCKBACK_RESIST: f32 = 0.25;
 /// Stagger: a charge-flagged hit cancels the victim's swing and locks
