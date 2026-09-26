@@ -1,15 +1,21 @@
 //! The battle simulation's fixed tick. Soldiers are rows in the `Units`
 //! columns, never entities. Each tick is a self-contained job (job.rs):
-//! the main thread copies the world into it and kicks it, a dedicated
-//! worker thread rebuilds the collision grid and runs every soldier
-//! through his stages (soldier.rs) in parallel chunks, and the next
-//! fixed tick installs the result and applies the landed swings in
-//! order (damage.rs). Behavior lives in the soldier stages; this file
-//! is the plumbing between the frame and the job.
+//! the main thread shares the world's columns into it and kicks it, a
+//! dedicated worker thread rebuilds the collision grid and runs every
+//! soldier through his stages (soldier.rs) in parallel chunks, and the
+//! next fixed tick takes the result, installs its columns and applies
+//! the landed swings in order (damage.rs). Behavior lives in the soldier
+//! stages; this file is the plumbing between the frame and the job.
+//!
+//! The rule of the fixed tick on the main thread: it does per-regiment
+//! work and swaps, never a loop over the army. Whatever the frame needs
+//! per soldier (the density field, the regiment runs, this tick's dead)
+//! the job computes on the pool and hands over as a product.
 
 use bevy::prelude::*;
 use std::time::Instant;
 
+use crate::frontline::InfluenceField;
 use crate::orders::Groups;
 use crate::spatial::SpatialGrid;
 use crate::terrain::Terrain;
@@ -21,7 +27,24 @@ pub mod job;
 pub mod soldier;
 
 use damage::{DamageBuffers, DirTestStats};
-use job::{prepare_tick, TickJob, CHUNK};
+use job::{prepare_tick, regiment_runs, TickJob, CHUNK};
+
+/// Each regiment's men as index ranges in index order, valid for the
+/// column layout the fixed tick starts with (before this tick's death
+/// sweep). Built by the job from its shared regiment column, or on the
+/// main thread when no job was taken. Consumers walk a regiment's runs
+/// instead of scanning the army.
+#[derive(Resource, Default)]
+pub struct RegimentRuns {
+    pub runs: Vec<Vec<(u32, u32)>>,
+}
+
+impl RegimentRuns {
+    /// The index ranges of regiment `g` (empty for an unknown regiment).
+    pub fn of(&self, g: usize) -> &[(u32, u32)] {
+        self.runs.get(g).map_or(&[], |r| &r[..])
+    }
+}
 
 #[derive(Resource)]
 pub struct CombatScale(pub f32);
@@ -71,10 +94,11 @@ impl Plugin for SimPlugin {
             .init_resource::<SpatialGrid>()
             .init_resource::<TickPipeline>()
             .init_resource::<SharedTerrain>()
+            .init_resource::<RegimentRuns>()
             .add_systems(
                 FixedUpdate,
                 (
-                    (refresh_shared_terrain, step_sim).chain(),
+                    (refresh_shared_terrain, take_tick, step_sim).chain(),
                     kick_tick.after(crate::orders::clear_arrived_orders),
                 )
                     .in_set(crate::game_state::SimSet),
@@ -119,15 +143,28 @@ impl Default for TickWorker {
     }
 }
 
-/// The in-flight tick job, recycled job buffers and the tick counter. The
-/// counter lives here, not in a `Local`, because the kick (whose prep
-/// seeds the per-tick hashes) and the apply both need it.
+/// The in-flight tick job, the taken one, recycled job buffers and the
+/// tick counter. The counter lives here, not in a `Local`, because the
+/// kick (whose prep seeds the per-tick hashes) and the apply both need
+/// it.
 #[derive(Resource, Default)]
 pub struct TickPipeline {
     worker: Option<TickWorker>,
     in_flight: bool,
+    /// The finished job of this tick, taken at the head of the fixed
+    /// tick (`take_tick`) so the systems before the install can read
+    /// its products; `step_sim` installs it.
+    taken: Option<Box<TickJob>>,
     scratch: Option<Box<TickJob>>,
     pub tick: u32,
+    /// The density field resource holds the taken job's field for this
+    /// tick (else `update_field` rebuilds it inline).
+    pub field_from_job: bool,
+    /// The death sweep's candidates for this tick, ascending: the men
+    /// whose death countdown ran out in the installed tick and the
+    /// living men near their own map edge. Every other man is neither
+    /// dead nor fled, so the sweep visits only these.
+    pub sweep_candidates: Vec<u32>,
 }
 
 impl TickPipeline {
@@ -147,6 +184,53 @@ impl TickPipeline {
         self.in_flight = false;
         let worker = self.worker.as_ref().expect("worker exists while a job is in flight");
         Some(worker.from_worker.lock().unwrap().recv().expect("sim tick worker alive"))
+    }
+}
+
+/// The head of the fixed tick: take the finished job and hand its
+/// products to the systems that run before the install. The regiment
+/// runs and the density field are computed from the columns as they
+/// were at the kick, which is exactly what those systems read now,
+/// because nothing writes the columns while a job is in flight. With no
+/// job to take (the first tick of a battle, FL_PIPELINE=0, a stale job)
+/// the runs are built here and the field inline in `update_field`.
+pub fn take_tick(
+    mut pipeline: ResMut<TickPipeline>,
+    units: Res<Units>,
+    groups: Res<Groups>,
+    mut runs: ResMut<RegimentRuns>,
+    field: Option<ResMut<InfluenceField>>,
+    mut stats: ResMut<SimStats>,
+) {
+    // A job computed from an older world (a new battle started while it
+    // ran) carries indices that mean nothing here: recycle its buffers
+    // and drop the result.
+    let taken = match pipeline.take_in_flight() {
+        Some(job) if job.generation == units.generation && !units.pos.is_empty() => Some(job),
+        Some(stale) => {
+            pipeline.scratch = Some(stale);
+            None
+        }
+        None => None,
+    };
+    pipeline.field_from_job = false;
+    match taken {
+        Some(mut job) => {
+            // The run is over: let go of the shared columns now, so the
+            // systems between here and the install (a regiment closing
+            // ranks writes `home`) write in place instead of copying.
+            job.release_inputs();
+            std::mem::swap(&mut runs.runs, &mut job.reg_runs);
+            if let Some(mut field) = field {
+                std::mem::swap(&mut *field, &mut job.field);
+                pipeline.field_from_job = true;
+                stats.field_ms = job.field_ms;
+            }
+            pipeline.taken = Some(job);
+        }
+        None => {
+            regiment_runs(&units.group, groups.list.len(), &mut runs.runs);
+        }
     }
 }
 
@@ -171,11 +255,13 @@ pub fn refresh_shared_terrain(terrain: Res<Terrain>, mut shared: ResMut<SharedTe
     }
 }
 
-/// Run one kinematic tick on the job's owned data: grid rebuild, then the
-/// parallel integrate. No ECS access, so it can run on any thread. The
-/// kernel below is the long-standing integrate loop, verbatim: only the
-/// binding preamble changed when the tick became a job. Every scope in
-/// here, the grid rebuild's included, goes through `util::sim_scope`.
+/// Run one kinematic tick on the job's data: the regiment runs and the
+/// member lists of the regiments under fire, the grid rebuild, the
+/// density field, then the parallel integrate. No ECS access, so it can
+/// run on any thread. The kernel below is the long-standing integrate
+/// loop, verbatim: only the binding preamble changed when the tick
+/// became a job. Every scope in here, the grid rebuild's and the field's
+/// included, goes through `util::sim_scope`.
 fn run_tick_job(job: &mut TickJob) {
     let terrain_arc = job.terrain.clone().expect("terrain snapshot set at prep");
     let terrain: &Terrain = &terrain_arc;
@@ -187,6 +273,22 @@ fn run_tick_job(job: &mut TickJob) {
     let faces_spearwall = job.faces_spearwall;
     let TickJob {
         pos_in,
+        speed,
+        team,
+        kind,
+        group,
+        home,
+        vel_in,
+        yaw_in,
+        yaw_prev_in,
+        target_in,
+        swing_in,
+        swing_t_in,
+        flash_in,
+        death_t_in,
+        ammo_in,
+        out_form_in,
+        sight_in,
         pos_out,
         vel,
         yaw,
@@ -199,11 +301,6 @@ fn run_tick_job(job: &mut TickJob) {
         ammo,
         out_form,
         sight,
-        speed,
-        team,
-        kind,
-        group,
-        home,
         orders,
         anchors,
         reg_broken,
@@ -216,38 +313,66 @@ fn run_tick_job(job: &mut TickJob) {
         threat,
         form_face,
         wall,
+        group_wall,
         charging,
         fat_speed,
         fat_nocharge,
         shoot_at,
-        target_members,
+        targeted,
         blocks,
-        wall_flags,
-        yaw_snapshot,
+        reg_runs,
+        target_members,
+        field,
+        field_wanted,
+        dead,
+        at_edge,
         grid,
         events,
         arrow_spawns,
         grid_ms,
         step_ms,
+        field_ms,
         ..
     } = job;
 
-    let t0 = Instant::now();
-    {
-        let _span = info_span!("grid_rebuild").entered();
-        grid.rebuild(pos_in, vel, team, kind, group, death_t, wall_flags);
-    }
-    let t1 = Instant::now();
-    *grid_ms = (t1 - t0).as_secs_f32() * 1000.0;
-
-    let grid = &*grid;
     let pos_prev = &pos_in[..];
     let speed = &speed[..];
     let team = &team[..];
     let kind = &kind[..];
     let group = &group[..];
     let home = &home[..];
-    let yaw_snap = &yaw_snapshot[..];
+    let yaw_snap = &yaw_in[..];
+    let death_t_in = &death_t_in[..];
+    let n_groups = orders.len();
+
+    // The regiment runs, and from them the living members of every
+    // regiment under fire, in index order.
+    regiment_runs(group, n_groups, reg_runs);
+    target_members.resize_with(n_groups, Vec::new);
+    for (g, members) in target_members.iter_mut().enumerate() {
+        members.clear();
+        if targeted[g] {
+            for &(s, e) in &reg_runs[g] {
+                members.extend((s..e).filter(|&i| death_t_in[i as usize] == 0));
+            }
+        }
+    }
+
+    let t0 = Instant::now();
+    {
+        let _span = info_span!("grid_rebuild").entered();
+        grid.rebuild(pos_prev, &vel_in[..], team, kind, group, death_t_in, group_wall);
+    }
+    let t1 = Instant::now();
+    *grid_ms = (t1 - t0).as_secs_f32() * 1000.0;
+    if *field_wanted {
+        let _span = info_span!("density_field").entered();
+        field.rebuild(pos_prev, team);
+    }
+    let t2 = Instant::now();
+    *field_ms = (t2 - t1).as_secs_f32() * 1000.0;
+
+    let grid = &*grid;
     let orders = &orders[..];
     let anchors = &anchors[..];
     let broken = &reg_broken[..];
@@ -302,8 +427,24 @@ fn run_tick_job(job: &mut TickJob) {
         bounds_max,
     };
     let f = &field;
+    // The shared read-modify-write columns, for the copy-in per chunk.
+    let vel_in = &vel_in[..];
+    let yaw_in = &yaw_in[..];
+    let yaw_prev_in = &yaw_prev_in[..];
+    let target_in = &target_in[..];
+    let swing_in = &swing_in[..];
+    let swing_t_in = &swing_t_in[..];
+    let flash_in = &flash_in[..];
+    let ammo_in = &ammo_in[..];
+    let out_form_in = &out_form_in[..];
+    let sight_in = &sight_in[..];
+    // The map edges a router leaves the field at (combat.rs), widened by
+    // the charge knockback the apply pass can still add to a position:
+    // the sweep's candidate list must hold every man it might remove.
+    let edge_lo = terrain.min().y + 8.0 + damage::KNOCKBACK_MARGIN;
+    let edge_hi = terrain.max().y - 8.0 - damage::KNOCKBACK_MARGIN;
     let integrate_span = info_span!("integrate").entered();
-    crate::util::sim_scope(|scope| {
+    let lists: Vec<(Vec<u32>, Vec<u32>)> = crate::util::sim_scope(|scope| {
         for (ci, chunk) in pos_out
             .chunks_mut(CHUNK)
             .zip(vel.chunks_mut(CHUNK))
@@ -323,30 +464,67 @@ fn run_tick_job(job: &mut TickJob) {
         {
             let (((((((((((((pos, vel), yaw), yaw_prev), target), swing), swing_t), flash),
                 death_t), events), ammo), arrows), out_form), sight) = chunk;
-            let rows = soldier::Rows {
-                start: ci * CHUNK,
-                pos,
-                vel,
-                yaw,
-                yaw_prev,
-                target,
-                swing,
-                swing_t,
-                flash,
-                death_t,
-                ammo,
-                out_form,
-                sight,
-            };
+            let start = ci * CHUNK;
+            let end = start + pos.len();
             scope.spawn(async move {
+                // The chunk's rows, copied in from the shared columns.
+                vel.copy_from_slice(&vel_in[start..end]);
+                yaw.copy_from_slice(&yaw_in[start..end]);
+                yaw_prev.copy_from_slice(&yaw_prev_in[start..end]);
+                target.copy_from_slice(&target_in[start..end]);
+                swing.copy_from_slice(&swing_in[start..end]);
+                swing_t.copy_from_slice(&swing_t_in[start..end]);
+                flash.copy_from_slice(&flash_in[start..end]);
+                death_t.copy_from_slice(&death_t_in[start..end]);
+                ammo.copy_from_slice(&ammo_in[start..end]);
+                out_form.copy_from_slice(&out_form_in[start..end]);
+                sight.copy_from_slice(&sight_in[start..end]);
+                let rows = soldier::Rows {
+                    start,
+                    pos: &mut *pos,
+                    vel,
+                    yaw,
+                    yaw_prev,
+                    target,
+                    swing,
+                    swing_t,
+                    flash,
+                    death_t: &mut *death_t,
+                    ammo,
+                    out_form,
+                    sight,
+                };
                 events.clear();
                 let mut out = soldier::ChunkOut { events, arrows };
                 soldier::tick_chunk(f, rows, &mut out);
+                // The sweep's candidates from this chunk: countdowns that
+                // just ran out, and living men near their own map edge.
+                let mut dead = Vec::new();
+                let mut at_edge = Vec::new();
+                for j in 0..pos.len() {
+                    let i = start + j;
+                    if death_t[j] == 1 {
+                        dead.push(i as u32);
+                    } else if death_t[j] == 0 {
+                        let z = pos[j].z;
+                        let out = if team[i] == 0 { z < edge_lo } else { z > edge_hi };
+                        if out {
+                            at_edge.push(i as u32);
+                        }
+                    }
+                }
+                (dead, at_edge)
             });
         }
     });
     drop(integrate_span);
-    *step_ms = t1.elapsed().as_secs_f32() * 1000.0;
+    dead.clear();
+    at_edge.clear();
+    for (d, e) in lists {
+        dead.extend(d);
+        at_edge.extend(e);
+    }
+    *step_ms = t2.elapsed().as_secs_f32() * 1000.0;
 }
 
 #[allow(clippy::too_many_arguments)] // bevy system params
@@ -367,22 +545,12 @@ pub fn step_sim(
     mut pipeline: ResMut<TickPipeline>,
     mut dir_stats: ResMut<DirTestStats>,
 ) {
-    // Take the finished background job. A job computed from an older
-    // world (a new battle started while it ran) carries indices that
-    // mean nothing here: recycle its buffers and drop the result.
-    let finished = match pipeline.take_in_flight() {
-        Some(job) if job.generation == units.generation && !units.pos.is_empty() => Some(job),
-        Some(stale) => {
-            pipeline.scratch = Some(stale);
-            None
-        }
-        None => None,
-    };
+    let finished = pipeline.taken.take();
     if units.pos.is_empty() {
         return;
     }
     // No job waiting (the first tick of a battle, FL_PIPELINE=0, or a
-    // stale one dropped above): compute this tick inline.
+    // stale one dropped at the take): compute this tick inline.
     let mut job = match finished {
         Some(job) => job,
         None => {
@@ -400,31 +568,44 @@ pub fn step_sim(
                 scale.0,
                 pipeline.tick,
             );
+            // update_field rebuilt the resource inline this tick.
+            job.field_wanted = false;
             run_tick_job(&mut job);
             job
         }
     };
 
-    // INSTALL: the completed tick becomes the live state. pos_prev <-
-    // the state at tick start, pos <- the new kinematics, the
-    // read-modify-write columns swap in, and the job keeps last tick's
-    // buffers for recycling at the next prep.
+    // INSTALL: the completed tick becomes the live state. The job's
+    // handles on the shared columns are released first (already done at
+    // the take on the threaded path), so the columns the install
+    // replaces are unique and come back as the next tick's output
+    // buffers: no copy, no allocation. pos_prev <- the state at tick
+    // start (the job's shared position column), pos <- the new
+    // kinematics.
+    job.release_inputs();
     {
         let u = &mut *units;
-        std::mem::swap(&mut u.pos, &mut u.pos_prev);
-        std::mem::swap(&mut u.pos, &mut job.pos_out);
-        std::mem::swap(&mut u.vel, &mut job.vel);
-        std::mem::swap(&mut u.yaw, &mut job.yaw);
-        std::mem::swap(&mut u.yaw_prev, &mut job.yaw_prev);
-        std::mem::swap(&mut u.target, &mut job.target);
-        std::mem::swap(&mut u.swing, &mut job.swing);
-        std::mem::swap(&mut u.swing_t, &mut job.swing_t);
-        std::mem::swap(&mut u.flash, &mut job.flash);
-        std::mem::swap(&mut u.death_t, &mut job.death_t);
-        std::mem::swap(&mut u.ammo, &mut job.ammo);
-        std::mem::swap(&mut u.out_form, &mut job.out_form);
-        std::mem::swap(&mut u.sight, &mut job.sight);
+        macro_rules! install {
+            ($($col:ident <- $out:ident),*) => {$(
+                let released = u.$col.install(std::mem::take(&mut job.$out));
+                job.$out = std::sync::Arc::try_unwrap(released).unwrap_or_default();
+            )*};
+        }
+        let tick_start = u.pos.install(std::mem::take(&mut job.pos_out));
+        let released = u.pos_prev.install_shared(tick_start);
+        job.pos_out = std::sync::Arc::try_unwrap(released).unwrap_or_default();
+        install!(
+            vel <- vel, yaw <- yaw, yaw_prev <- yaw_prev, target <- target, swing <- swing,
+            swing_t <- swing_t, flash <- flash, death_t <- death_t, ammo <- ammo,
+            out_form <- out_form, sight <- sight
+        );
     }
+    // The sweep's candidates (combat.rs), ascending.
+    pipeline.sweep_candidates.clear();
+    pipeline.sweep_candidates.extend_from_slice(&job.dead);
+    pipeline.sweep_candidates.extend_from_slice(&job.at_edge);
+    pipeline.sweep_candidates.sort_unstable();
+    pipeline.sweep_candidates.dedup();
     std::mem::swap(&mut *grid, &mut job.grid);
     std::mem::swap(&mut damage.0, &mut job.events);
     std::mem::swap(&mut arrow_spawns.0, &mut job.arrow_spawns);
@@ -451,7 +632,7 @@ pub fn step_sim(
     pipeline.tick = pipeline.tick.wrapping_add(1);
     let tick = pipeline.tick;
     if tick.is_multiple_of(60) {
-        diag::neighbour_audit(&mut stats, &grid, &units.pos, &units.pos_prev);
+        diag::neighbour_audit(&mut stats, &grid, &units.pos[..], &units.pos_prev[..]);
     }
     diag::fingerprint(tick, &units);
     diag::spike_line(&stats, tick, units.pos.len());
@@ -494,6 +675,7 @@ pub fn kick_tick(
         scale.0,
         pipeline.tick,
     );
+    job.field_wanted = true;
     let worker = pipeline.worker.get_or_insert_with(TickWorker::default);
     worker.to_worker.lock().unwrap().send(job).expect("sim tick worker alive");
     pipeline.in_flight = true;

@@ -5,8 +5,10 @@
 //! Per fixed tick, on a coarse 8 m grid: splat + blur per-team density,
 //! then marching-squares the phi = 0 contour of phi = blue − orange,
 //! restricted to cells where both teams are present. Drawn as gizmos.
-//! The density field also answers "is this group in contact?" for
-//! order-arrival bookkeeping.
+//! Morale reads the density for its flank and surround terms. The tick
+//! job builds the field on the worker from its shared columns (the
+//! positions this tick starts with) and hands it over at the take;
+//! `update_field` rebuilds it inline only when no job was taken.
 
 use bevy::prelude::*;
 
@@ -41,7 +43,7 @@ const CRASH_STALL: f32 = 0.3;
 const CRASH_PACE: f32 = 4.0;
 const CRASH_MAX_TICKS: u16 = 240;
 
-#[derive(Resource)]
+#[derive(Resource, Default)]
 pub struct InfluenceField {
     origin: Vec2,
     w: usize,
@@ -93,16 +95,40 @@ impl InfluenceField {
         self.d[0][i] - self.d[1][i]
     }
 
-    fn rebuild_density(&mut self, units: &Units) {
-        // Parallel splat into per-chunk fields, then a linear merge; the
-        // blur passes stay serial (the field is only ~12k cells).
+    /// Size the field to the battlefield if it is not already: the job's
+    /// own field starts empty and follows the terrain of the battle.
+    pub(crate) fn size_to(&mut self, min: Vec2, max: Vec2) {
+        let w = ((max.x - min.x) / FIELD_CELL).ceil() as usize + 1;
+        let h = ((max.y - min.y) / FIELD_CELL).ceil() as usize + 1;
+        if self.origin != min || self.w != w || self.h != h {
+            *self = Self::new(min, max);
+        }
+    }
+
+    /// The field of these positions: the density splat and blur per
+    /// team, then the contour. Callable from the tick job (every scope
+    /// is `util::sim_scope`) and from the main thread alike; the counts
+    /// are integers, so the partition into chunks changes no bit.
+    pub(crate) fn rebuild(&mut self, pos: &[Vec3], team: &[u8]) {
+        if self.w == 0 || self.h == 0 {
+            return;
+        }
+        self.rebuild_density(pos, team);
+        self.extract_contour();
+    }
+
+    fn rebuild_density(&mut self, pos: &[Vec3], team: &[u8]) {
+        // Parallel splat into per-chunk fields, each task clearing its
+        // own, then a merge parallel over strips of cells; the blur
+        // passes stay serial (the field is only ~12k cells).
         const CHUNK: usize = 16_384;
-        let n_chunks = units.len().div_ceil(CHUNK);
+        let n = pos.len();
+        let n_chunks = n.div_ceil(CHUNK);
         let (w, h, origin) = (self.w, self.h, self.origin);
         let cells = w * h;
         self.splat_scratch
             .resize_with(n_chunks.max(self.splat_scratch.len()), Default::default);
-        bevy::tasks::ComputeTaskPool::get().scope(|scope| {
+        crate::util::sim_scope(|scope| {
             for (ci, chunk_fields) in self.splat_scratch.iter_mut().enumerate().take(n_chunks) {
                 scope.spawn(async move {
                     for f in chunk_fields.iter_mut() {
@@ -110,23 +136,40 @@ impl InfluenceField {
                         f.resize(cells, 0.0);
                     }
                     let start = ci * CHUNK;
-                    let end = (start + CHUNK).min(units.len());
+                    let end = (start + CHUNK).min(n);
                     for i in start..end {
-                        let g = (Vec2::new(units.pos[i].x, units.pos[i].z) - origin) / FIELD_CELL;
+                        let g = (Vec2::new(pos[i].x, pos[i].z) - origin) / FIELD_CELL;
                         let x = (g.x as usize).min(w - 1);
                         let z = (g.y as usize).min(h - 1);
-                        chunk_fields[units.team[i] as usize][z * w + x] += 1.0;
+                        chunk_fields[team[i] as usize][z * w + x] += 1.0;
+                    }
+                });
+            }
+        });
+        // Merge: every task sums the chunk fields over its own strip of
+        // cells, for both teams.
+        const STRIP: usize = 1024;
+        let scratch = &self.splat_scratch[..n_chunks];
+        let [d0, d1] = &mut self.d;
+        crate::util::sim_scope(|scope| {
+            for (si, (s0, s1)) in d0.chunks_mut(STRIP).zip(d1.chunks_mut(STRIP)).enumerate() {
+                let off = si * STRIP;
+                scope.spawn(async move {
+                    let len = s0.len();
+                    s0.fill(0.0);
+                    s1.fill(0.0);
+                    for chunk_fields in scratch {
+                        for (dst, src) in s0.iter_mut().zip(&chunk_fields[0][off..off + len]) {
+                            *dst += *src;
+                        }
+                        for (dst, src) in s1.iter_mut().zip(&chunk_fields[1][off..off + len]) {
+                            *dst += *src;
+                        }
                     }
                 });
             }
         });
         for team in 0..2 {
-            self.d[team].fill(0.0);
-            for chunk_fields in self.splat_scratch.iter().take(n_chunks) {
-                for (dst, src) in self.d[team].iter_mut().zip(&chunk_fields[team]) {
-                    *dst += *src;
-                }
-            }
             for _ in 0..3 {
                 self.blur_pass(team);
             }
@@ -231,6 +274,7 @@ impl Plugin for FrontlinePlugin {
                 FixedUpdate,
                 (update_field, update_groups)
                     .chain()
+                    .after(crate::sim::take_tick)
                     .before(crate::sim::step_sim)
                     .in_set(crate::game_state::SimSet),
             )
@@ -242,20 +286,23 @@ fn init_field(mut commands: Commands, terrain: Res<Terrain>) {
     commands.insert_resource(InfluenceField::new(terrain.min(), terrain.max()));
 }
 
+/// The density field of this tick's start positions. The taken job
+/// built it on the worker and `take_tick` swapped it in; with no job
+/// taken it is rebuilt here, inline, from the same positions.
 fn update_field(
     field: Option<ResMut<InfluenceField>>,
     units: Res<Units>,
+    pipeline: Res<crate::sim::TickPipeline>,
     mut stats: ResMut<crate::sim::SimStats>,
 ) {
+    if pipeline.field_from_job {
+        return;
+    }
     let Some(mut field) = field else { return };
     let t0 = std::time::Instant::now();
     {
         let _span = info_span!("density_field").entered();
-        field.rebuild_density(&units);
-    }
-    {
-        let _span = info_span!("contour").entered();
-        field.extract_contour();
+        field.rebuild(&units.pos[..], &units.team[..]);
     }
     stats.field_ms = t0.elapsed().as_secs_f32() * 1000.0;
 }
@@ -271,20 +318,33 @@ fn update_field(
 const ENGAGE_LOCK_FRAC: f32 = 0.03;
 const ENGAGE_LOCK_FLOOR: u32 = 4;
 
-fn update_groups(units: Res<Units>, mut groups: ResMut<Groups>) {
+/// One regiment's sums over its men, in index order.
+#[derive(Clone, Copy)]
+struct RegimentSums {
+    pos: Vec2,
+    count: usize,
+    home: Vec2,
+    r2: f32,
+    slot_err: f32,
+    front_off: f32,
+    back_off: f32,
+    line_sum: f32,
+    line_n: u32,
+    fight_n: u32,
+}
+
+fn update_groups(
+    units: Res<Units>,
+    runs: Res<crate::sim::RegimentRuns>,
+    mut groups: ResMut<Groups>,
+) {
     let n = groups.list.len();
-    let mut sums = vec![Vec2::ZERO; n];
-    let mut counts = vec![0usize; n];
-    let mut fighting = vec![false; n];
     // Disorder measures SHAPE coherence, not travel: deviation from the
     // slot relative to the regiment's own centroid (last tick's — 33 ms
     // stale is nothing at 2 s smoothing). A rigid march scores ~0; a
     // block churned up by melee scores meters.
     let prev_cents: Vec<Vec2> = groups.list.iter().map(|g| g.centroid).collect();
     let prev_bias: Vec<Vec2> = groups.list.iter().map(|g| g.home_bias).collect();
-    let mut slot_err = vec![0.0f32; n];
-    let mut sum_home = vec![Vec2::ZERO; n];
-    let mut sum_r2 = vec![0.0f32; n];
     // Contact frame inputs (see the frame below): each regiment's
     // forward vector, its front-most slot, and the depth of the men
     // fighting an enemy ahead of the frame.
@@ -293,48 +353,72 @@ fn update_groups(units: Res<Units>, mut groups: ResMut<Groups>) {
         .iter()
         .map(|g| crate::formation::facing_dir(g.facing))
         .collect();
-    let mut front_off = vec![f32::MIN; n];
-    let mut back_off = vec![f32::MAX; n];
-    let mut line_sum = vec![0.0f32; n];
-    let mut line_n = vec![0u32; n];
-    let mut fight_n = vec![0u32; n];
-    for i in 0..units.len() {
-        let g = units.group[i] as usize;
-        let p = Vec2::new(units.pos[i].x, units.pos[i].z);
-        front_off[g] = front_off[g].max(units.home[i].dot(fwd[g]));
-        back_off[g] = back_off[g].min(units.home[i].dot(fwd[g]));
-        sums[g] += p;
-        counts[g] += 1;
-        sum_home[g] += units.home[i];
-        sum_r2[g] += (p - prev_cents[g]).length_squared();
-        slot_err[g] += (p - prev_cents[g] - units.home[i] + prev_bias[g]).length();
-        // Ground-truth contact: a unit in WIND-UP has an enemy in reach
-        // and is striking. TW rule — one soldier fighting engages the
-        // regiment. (`target` is stale outside a swing cycle and `swing`
-        // spawns in Recover for strike staggering — neither is usable.)
-        // A bow DRAW is a wind-up too but not melee: counting it made
-        // an archer regiment "engaged" the moment it drew, which
-        // silenced its own fire solution before the first loose.
-        if units.death_t[i] == 0
-            && units.swing[i] & crate::units::SWING_STATE_MASK == crate::units::SWING_WINDUP
-            && units.swing[i] & crate::units::SWING_RANGED == 0
-        {
-            fighting[g] = true;
-            fight_n[g] += 1;
-            let ti = units.target[i] as usize;
-            if ti < units.len() {
-                let d = Vec2::new(units.pos[ti].x - p.x, units.pos[ti].z - p.y);
-                if d.dot(fwd[g]) > 0.5 * d.length() {
-                    line_sum[g] += p.dot(fwd[g]);
-                    line_n[g] += 1;
+    // The sums over the men, one task per regiment walking its runs in
+    // index order: the same additions in the same order as one scan of
+    // the army, regiment by regiment, so the same bits. Bevy's scope
+    // returns the tasks' results in spawn order.
+    let units = &*units;
+    let runs = &*runs;
+    let (prev_cents_r, prev_bias_r, fwd_r) = (&prev_cents, &prev_bias, &fwd);
+    let sums: Vec<RegimentSums> = bevy::tasks::ComputeTaskPool::get().scope(|scope| {
+        for g in 0..n {
+            scope.spawn(async move {
+                let (pc, pb, f) = (prev_cents_r[g], prev_bias_r[g], fwd_r[g]);
+                let mut a = RegimentSums {
+                    pos: Vec2::ZERO,
+                    count: 0,
+                    home: Vec2::ZERO,
+                    r2: 0.0,
+                    slot_err: 0.0,
+                    front_off: f32::MIN,
+                    back_off: f32::MAX,
+                    line_sum: 0.0,
+                    line_n: 0,
+                    fight_n: 0,
+                };
+                for &(s, e) in runs.of(g) {
+                    for i in s as usize..e as usize {
+                        let p = Vec2::new(units.pos[i].x, units.pos[i].z);
+                        a.front_off = a.front_off.max(units.home[i].dot(f));
+                        a.back_off = a.back_off.min(units.home[i].dot(f));
+                        a.pos += p;
+                        a.count += 1;
+                        a.home += units.home[i];
+                        a.r2 += (p - pc).length_squared();
+                        a.slot_err += (p - pc - units.home[i] + pb).length();
+                        // Ground-truth contact: a unit in WIND-UP has an enemy in reach
+                        // and is striking. TW rule: one soldier fighting engages the
+                        // regiment. (`target` is stale outside a swing cycle and `swing`
+                        // spawns in Recover for strike staggering, so neither is usable.)
+                        // A bow DRAW is a wind-up too but not melee: counting it made
+                        // an archer regiment "engaged" the moment it drew, which
+                        // silenced its own fire solution before the first loose.
+                        if units.death_t[i] == 0
+                            && units.swing[i] & crate::units::SWING_STATE_MASK
+                                == crate::units::SWING_WINDUP
+                            && units.swing[i] & crate::units::SWING_RANGED == 0
+                        {
+                            a.fight_n += 1;
+                            let ti = units.target[i] as usize;
+                            if ti < units.len() {
+                                let d = Vec2::new(units.pos[ti].x - p.x, units.pos[ti].z - p.y);
+                                if d.dot(f) > 0.5 * d.length() {
+                                    a.line_sum += p.dot(f);
+                                    a.line_n += 1;
+                                }
+                            }
+                        }
+                    }
                 }
-            }
+                a
+            });
         }
-    }
+    });
+    let counts: Vec<usize> = sums.iter().map(|a| a.count).collect();
+    let fighting: Vec<bool> = sums.iter().map(|a| a.fight_n > 0).collect();
     let cents: Vec<Vec2> = sums
         .iter()
-        .zip(&counts)
-        .map(|(s, c)| if *c > 0 { *s / *c as f32 } else { Vec2::ZERO })
+        .map(|a| if a.count > 0 { a.pos / a.count as f32 } else { Vec2::ZERO })
         .collect();
     let teams: Vec<u8> = groups.list.iter().map(|g| g.team).collect();
     let broken: Vec<bool> = groups.list.iter().map(|g| g.state.is_broken()).collect();
@@ -348,18 +432,18 @@ fn update_groups(units: Res<Units>, mut groups: ResMut<Groups>) {
             continue;
         }
         group.centroid = cents[g];
-        group.home_bias = sum_home[g] / counts[g] as f32;
+        group.home_bias = sums[g].home / counts[g] as f32;
         // Formation disorder: how far the regiment stands from its slots,
         // smoothed ~2 s. Only Rect makes the discipline claim.
         let err = if group.shape == crate::formation::FormShape::Rect {
-            slot_err[g] / counts[g] as f32
+            sums[g].slot_err / counts[g] as f32
         } else {
             0.0
         };
         group.disorder += (err - group.disorder) / 60.0;
         // Footprint radius: RMS distance x 1.5 reaches the block edge
         // (uniform disc: RMS = R/sqrt(2)); smoothed like disorder.
-        let r = (sum_r2[g] / counts[g] as f32).sqrt() * 1.5;
+        let r = (sums[g].r2 / counts[g] as f32).sqrt() * 1.5;
         group.radius += (r - group.radius) / 60.0;
         let mut nearest_d2 = ENEMY_NEAR_R * ENEMY_NEAR_R;
         let mut threat = Vec2::ZERO;
@@ -436,7 +520,7 @@ fn update_groups(units: Res<Units>, mut groups: ResMut<Groups>) {
         if engaged
             && !group.state.is_broken()
             && !group.crashing
-            && (group.melee_ticks > 0 || fight_n[g] >= lock_threshold)
+            && (group.melee_ticks > 0 || sums[g].fight_n >= lock_threshold)
         {
             group.melee_ticks = group.melee_ticks.saturating_add(1);
         } else {
@@ -468,7 +552,7 @@ fn update_groups(units: Res<Units>, mut groups: ResMut<Groups>) {
             if counts[t as usize] > 0 && !broken[t as usize]);
         let formed = group.shape == crate::formation::FormShape::Rect
             && !group.state.is_broken();
-        let starts = fight_n[g] >= lock_threshold;
+        let starts = sums[g].fight_n >= lock_threshold;
         if formed && attacking && engaged && !group.crashing && (group.contact || starts) {
             let f = fwd[g];
             let r = Vec2::new(f.y, -f.x);
@@ -483,8 +567,8 @@ fn update_groups(units: Res<Units>, mut groups: ResMut<Groups>) {
                     _ => (group.centroid - group.home_bias).dot(r),
                 };
                 let mut depth = (group.centroid - group.home_bias).dot(f);
-                if line_n[g] > 0 {
-                    depth = line_sum[g] / line_n[g] as f32 - front_off[g];
+                if sums[g].line_n > 0 {
+                    depth = sums[g].line_sum / sums[g].line_n as f32 - sums[g].front_off;
                 }
                 group.anchor = r * group.contact_lateral + f * depth;
                 info!("regiment {g} holds a contact frame");
@@ -531,7 +615,7 @@ fn update_groups(units: Res<Units>, mut groups: ResMut<Groups>) {
             group.crashing = true;
             group.crash_ticks = 0;
             // The rear needs depth / pace to arrive; that long at most.
-            let depth = (front_off[g] - back_off[g]).max(0.0);
+            let depth = (sums[g].front_off - sums[g].back_off).max(0.0);
             group.crash_cap = ((depth / CRASH_PACE / TICK_DT) as u16).clamp(30, CRASH_MAX_TICKS);
             info!("regiment {g} CRASHES");
         } else if group.crashing {

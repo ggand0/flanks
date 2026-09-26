@@ -1,25 +1,75 @@
 //! SoA storage for all units. Units are never individual Bevy entities.
 
 use bevy::prelude::*;
+use std::sync::Arc;
 
-/// All per-unit state, structure-of-arrays.
+/// A soldier column the tick job shares with the main world. The job
+/// takes a clone of the `Arc` at its kick and reads through it; nothing
+/// is copied. Writes go through `DerefMut`, which is `Arc::make_mut`: a
+/// write while nobody else holds the column (every write of the fixed
+/// tick, which happens between the install and the kick) is a plain
+/// write, and a write while the job holds a clone (a formation key
+/// pressed mid-tick) copies that one column once. Reads and writes at
+/// every call site look exactly like a `Vec`.
+#[derive(Clone)]
+pub struct Column<T>(Arc<Vec<T>>);
+
+impl<T> Default for Column<T> {
+    fn default() -> Self {
+        Self(Arc::new(Vec::new()))
+    }
+}
+
+impl<T> Column<T> {
+    /// The shared buffer, for a reader on another thread: a pointer copy.
+    pub fn share(&self) -> Arc<Vec<T>> {
+        self.0.clone()
+    }
+
+    /// Install `v` as the column; returns the buffer it replaces.
+    pub fn install(&mut self, v: Vec<T>) -> Arc<Vec<T>> {
+        std::mem::replace(&mut self.0, Arc::new(v))
+    }
+
+    /// Install a buffer another column just released.
+    pub fn install_shared(&mut self, a: Arc<Vec<T>>) -> Arc<Vec<T>> {
+        std::mem::replace(&mut self.0, a)
+    }
+}
+
+impl<T> std::ops::Deref for Column<T> {
+    type Target = Vec<T>;
+    fn deref(&self) -> &Vec<T> {
+        &self.0
+    }
+}
+
+impl<T: Clone> std::ops::DerefMut for Column<T> {
+    fn deref_mut(&mut self) -> &mut Vec<T> {
+        Arc::make_mut(&mut self.0)
+    }
+}
+
+/// All per-unit state, structure-of-arrays. The columns the tick job
+/// reads are `Column`s (shared with the job); `hp` and `color` are the
+/// main world's own.
 #[derive(Resource, Default)]
 pub struct Units {
-    pub pos: Vec<Vec3>,
+    pub pos: Column<Vec3>,
     /// Position at the previous fixed tick; rendering lerps prev -> pos.
-    pub pos_prev: Vec<Vec3>,
-    pub vel: Vec<Vec3>,
+    pub pos_prev: Column<Vec3>,
+    pub vel: Column<Vec3>,
     /// Per-unit max speed (small variation breaks lockstep patterns).
-    pub speed: Vec<f32>,
-    pub team: Vec<u8>,
+    pub speed: Column<f32>,
+    pub team: Column<u8>,
     /// Unit type: index into `unit_types::TYPES` (also the render bucket).
-    pub kind: Vec<u8>,
+    pub kind: Column<u8>,
     /// Smoothed facing angle around Y (0 = +Z); sim-owned, render-consumed.
-    pub yaw: Vec<f32>,
+    pub yaw: Column<f32>,
     /// Facing at the previous fixed tick; rendering lerps yaw_prev -> yaw.
-    pub yaw_prev: Vec<f32>,
+    pub yaw_prev: Column<f32>,
     /// Index into `Groups::list`.
-    pub group: Vec<u32>,
+    pub group: Column<u32>,
     pub hp: Vec<f32>,
     /// Base render color (team color with per-unit variation baked in).
     /// Alpha carries a stable per-unit anim seed, not opacity.
@@ -31,32 +81,32 @@ pub struct Units {
     /// arbitrary unit later — every consumer MUST validate on use
     /// (swings re-check at hit time; the closing drive checks team and
     /// distance). Do not read it as "current enemy" anywhere else.
-    pub target: Vec<u32>,
+    pub target: Column<u32>,
     /// Swing state: 0 = Ready, 1 = WindUp, 2 = Recover.
-    pub swing: Vec<u8>,
+    pub swing: Column<u8>,
     /// Ticks left in the current swing phase.
-    pub swing_t: Vec<u8>,
+    pub swing_t: Column<u8>,
     /// Hit-flash ticks remaining (render feedback).
-    pub flash: Vec<u8>,
+    pub flash: Column<u8>,
     /// 0 = alive. Set to DEATH_TICKS on death; corpse plays its anim and is
     /// swap-removed when it reaches 1.
-    pub death_t: Vec<u8>,
+    pub death_t: Column<u8>,
     /// Offset from the regiment anchor: a regiment order is the SAME point
     /// for the whole block, rigidly translated per unit by this offset.
     /// Captured at spawn (loose); rigid formations will write slot offsets.
-    pub home: Vec<Vec2>,
+    pub home: Column<Vec2>,
     /// Arrows left (archers; 0 for melee kinds). Decremented on loose;
     /// an empty quiver means melee only.
-    pub ammo: Vec<u8>,
+    pub ammo: Column<u8>,
     /// Out of formation: he has left his slot to fight (M2TW keeps this
     /// per soldier, isInFormation). While his regiment is in melee he
     /// does not walk back to his slot; the flag clears when the melee
     /// ends and the regiment re-forms (sim/soldier.rs).
-    pub out_form: Vec<bool>,
+    pub out_form: Column<bool>,
     /// What he last saw of the comrades around him and of comrades
     /// running to the fight (sim/soldier.rs SIGHT_* bits). A man looks
     /// around every few ticks, not every tick, and acts on what he saw.
-    pub sight: Vec<u8>,
+    pub sight: Column<u8>,
     /// Bumped every time a battle rebuilds this world. A sim tick job
     /// computed from an older world carries indices that mean nothing
     /// here: sim/mod.rs drops it instead of installing it.
