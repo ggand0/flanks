@@ -61,10 +61,13 @@ def main():
                 albedo = pasture_detail(maps["Diffuse"])
             normal = maps["nor_gl"].convert("RGBA")
             normal.putalpha(maps["Rough"].convert("L"))
-            for suffix, pixels, transfer in [
+            outputs = [
                 ("color", albedo, "srgb"),
                 ("normal_roughness", normal, "linear"),
-            ]:
+            ]
+            if layer == "pasture":
+                outputs.append(("natural_color", maps["Diffuse"].convert("RGBA"), "srgb"))
+            for suffix, pixels, transfer in outputs:
                 png = Path(temporary) / f"{layer}_{suffix}.png"
                 pixels.save(png)
                 destination = root / f"{layer}_{suffix}.ktx2"

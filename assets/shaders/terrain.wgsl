@@ -15,6 +15,7 @@
 @group(#{MATERIAL_BIND_GROUP}) @binding(107) var coverage: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(108) var coverage_sampler: sampler;
 @group(#{MATERIAL_BIND_GROUP}) @binding(109) var<uniform> coverage_bounds: vec4<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(110) var<uniform> natural_ground: u32;
 
 fn hash_ground(p: vec2<f32>) -> f32 {
     var q = fract(vec3<f32>(p.xyx) * 0.1031);
@@ -96,7 +97,7 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     // Mip filtering removes subpixel detail continuously, without a separate
     // distance band that turns textured ground into a flat color.
     let grass = sample_ground(
-        pasture, pasture_normal, vec3<f32>(0.5),
+        pasture, pasture_normal, select(vec3<f32>(0.5), vec3<f32>(0.158131, 0.119077, 0.049214), natural_ground != 0u),
         p.xz, dx.xz, dy.xz, 2.51, detail,
     );
     let soil_sample = sample_ground(
@@ -107,7 +108,7 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     let soil_nr = soil_sample.normal_roughness;
     var rock_color = vec3<f32>(0.284067, 0.232351, 0.136810);
     var rock_nr = vec4<f32>(0.5, 0.5, 1.0, 0.95);
-    if in.color.b > 0.05 {
+    if natural_ground == 0u && in.color.b > 0.05 {
         let rock_sample = sample_ground(
             stone, stone_normal, rock_color,
             p.xz - 157.0, dx.xz, dy.xz, 4.0, detail,
@@ -118,7 +119,7 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
 
     // Side projections avoid stretching the stony layer on steep banks.
     let side_weight = smoothstep(0.25, 0.75, 1.0 - n.y);
-    if side_weight > 0.001 {
+    if natural_ground == 0u && side_weight > 0.001 {
         let side_x = textureSampleGrad(stone, ground_sampler, p.zy / 4.0, dx.zy / 4.0, dy.zy / 4.0).rgb;
         let side_z = textureSampleGrad(stone, ground_sampler, p.xy / 4.0, dx.xy / 4.0, dy.xy / 4.0).rgb;
         let side_color = mix(side_z, side_x, abs(n.x) / max(abs(n.x) + abs(n.z), 0.001));
@@ -128,21 +129,31 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     }
 
     let field = textureSample(coverage, coverage_sampler, (p.xz - coverage_bounds.xy) / coverage_bounds.zw);
-    let dry = field.r;
-    let edge_detail = (grass.color.r - 0.5) * field.g * (1.0 - field.g) * 2.0;
-    let soil = max(clamp(field.g + edge_detail, 0.0, 1.0), in.color.g);
-    let rock = smoothstep(0.05, 0.95, in.color.b) * (1.0 - soil);
-    let damp = in.color.a;
-
-    // Broad color comes from coverage, with one scale of close grass detail.
-    let grass_color = mix(vec3<f32>(0.075, 0.105, 0.033), vec3<f32>(0.185, 0.154, 0.073), dry);
-    let grass_detail = clamp(1.0 + (grass.color - 0.5) * 2.2, vec3<f32>(0.45), vec3<f32>(1.6));
-    var color = grass_color * grass_detail;
+    var soil: f32;
+    var rock = 0.0;
+    var color: vec3<f32>;
     let soil_surface = soil_color * vec3<f32>(0.85, 0.89, 0.82);
-    let stone_surface = rock_color * vec3<f32>(0.92, 0.95, 0.96);
-    color = mix(color, soil_surface, soil);
-    color = mix(color, stone_surface, rock);
-    color *= (0.82 + 0.36 * field.b) * (1.0 - damp * 0.24);
+    if natural_ground != 0u {
+        // The unique albedo carries metre-scale surface structure. Native-scale
+        // scan detail converges to one under mip filtering, preserving that layout.
+        let grass_residual = grass.color / vec3<f32>(0.158131, 0.119077, 0.049214);
+        let earth_residual = soil_color / vec3<f32>(0.194145, 0.120636, 0.057649);
+        let surface_detail = clamp(mix(grass_residual, earth_residual, field.a), vec3<f32>(0.35), vec3<f32>(2.2));
+        color = field.rgb * surface_detail;
+        color = mix(color, soil_surface, in.color.g);
+        soil = max(field.a, in.color.g);
+    } else {
+        // The river material retains its procedural coverage and bank layers.
+        let edge_detail = (grass.color.r - 0.5) * field.g * (1.0 - field.g) * 2.0;
+        soil = max(clamp(field.g + edge_detail, 0.0, 1.0), in.color.g);
+        rock = smoothstep(0.05, 0.95, in.color.b) * (1.0 - soil);
+        let grass_color = mix(vec3<f32>(0.075, 0.105, 0.033), vec3<f32>(0.185, 0.154, 0.073), field.r);
+        let grass_detail = clamp(1.0 + (grass.color - 0.5) * 2.2, vec3<f32>(0.45), vec3<f32>(1.6));
+        let stone_surface = rock_color * vec3<f32>(0.92, 0.95, 0.96);
+        color = mix(grass_color * grass_detail, soil_surface, soil);
+        color = mix(color, stone_surface, rock);
+        color *= (0.82 + 0.36 * field.b) * (1.0 - in.color.a * 0.24);
+    }
 
     var pbr = pbr_input_from_standard_material(in, is_front);
     pbr.material.base_color = vec4<f32>(color, 1.0);

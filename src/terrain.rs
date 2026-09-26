@@ -257,6 +257,8 @@ struct GroundLayers {
     coverage: Handle<Image>,
     #[uniform(109)]
     coverage_bounds: Vec4,
+    #[uniform(110)]
+    natural_ground: u32,
 }
 
 impl MaterialExtension for GroundLayers {
@@ -508,9 +510,14 @@ fn ground_texture(assets: &AssetServer, path: &'static str) -> Handle<Image> {
         .load_builder()
         .with_settings(move |settings: &mut ImageLoaderSettings| {
             settings.is_srgb = path.ends_with("_color.ktx2");
+            let address_mode = if path == "terrain/grassland_layout_color.ktx2" {
+                ImageAddressMode::ClampToEdge
+            } else {
+                ImageAddressMode::Repeat
+            };
             settings.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
-                address_mode_u: ImageAddressMode::Repeat,
-                address_mode_v: ImageAddressMode::Repeat,
+                address_mode_u: address_mode,
+                address_mode_v: address_mode,
                 anisotropy_clamp: 8,
                 ..ImageSamplerDescriptor::linear()
             });
@@ -535,19 +542,54 @@ fn spawn_chunks(
             ..default()
         },
         extension: GroundLayers {
-            pasture: ground_texture(&assets, "terrain/pasture_color.ktx2"),
+            pasture: ground_texture(
+                &assets,
+                if terrain.classic {
+                    "terrain/pasture_natural_color.ktx2"
+                } else {
+                    "terrain/pasture_color.ktx2"
+                },
+            ),
             pasture_normal: ground_texture(&assets, "terrain/pasture_normal_roughness.ktx2"),
-            stone: ground_texture(&assets, "terrain/stony_soil_color.ktx2"),
-            stone_normal: ground_texture(&assets, "terrain/stony_soil_normal_roughness.ktx2"),
+            stone: ground_texture(
+                &assets,
+                if terrain.classic {
+                    "terrain/earth_color.ktx2"
+                } else {
+                    "terrain/stony_soil_color.ktx2"
+                },
+            ),
+            stone_normal: ground_texture(
+                &assets,
+                if terrain.classic {
+                    "terrain/earth_normal_roughness.ktx2"
+                } else {
+                    "terrain/stony_soil_normal_roughness.ktx2"
+                },
+            ),
             earth: ground_texture(&assets, "terrain/earth_color.ktx2"),
             earth_normal: ground_texture(&assets, "terrain/earth_normal_roughness.ktx2"),
-            coverage: images.add(ground_coverage(&terrain)),
-            coverage_bounds: Vec4::new(
-                terrain.origin.x - CELL * 0.5,
-                terrain.origin.y - CELL * 0.5,
-                VERTS_X as f32 * CELL,
-                VERTS_Z as f32 * CELL,
-            ),
+            coverage: if terrain.classic {
+                ground_texture(&assets, "terrain/grassland_layout_color.ktx2")
+            } else {
+                images.add(ground_coverage(&terrain))
+            },
+            coverage_bounds: if terrain.classic {
+                Vec4::new(
+                    terrain.origin.x,
+                    terrain.origin.y,
+                    (VERTS_X - 1) as f32 * CELL,
+                    (VERTS_Z - 1) as f32 * CELL,
+                )
+            } else {
+                Vec4::new(
+                    terrain.origin.x - CELL * 0.5,
+                    terrain.origin.y - CELL * 0.5,
+                    VERTS_X as f32 * CELL,
+                    VERTS_Z as f32 * CELL,
+                )
+            },
+            natural_ground: u32::from(terrain.classic),
         },
     });
     chunks.original_heights.clone_from(&terrain.heights);

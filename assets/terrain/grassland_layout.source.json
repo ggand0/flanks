@@ -1,0 +1,20 @@
+{
+  "asset": "grassland_layout",
+  "source": "Original artwork created for this project",
+  "file": "grassland_layout.png",
+  "sha256": "8ae93dce81f77c35cc0fc5cd803a7223831ea5a673f2943e56cef55f083019c7",
+  "pixels": [
+    1448,
+    1086
+  ],
+  "world_size_m": [
+    1024,
+    768
+  ],
+  "prompt": "grassland_layout.prompt.txt",
+  "preparation": "prepare_layout.py",
+  "channels": {
+    "RGB": "sRGB ground albedo",
+    "A": "linear exposed-earth detail weight"
+  }
+}
