@@ -19,6 +19,7 @@ mod render_units;
 mod render_units_gpu;
 mod selection;
 mod settings;
+mod sim;
 mod spatial;
 mod terrain;
 mod unit_cards;
