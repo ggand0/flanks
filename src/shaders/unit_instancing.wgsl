@@ -1,5 +1,7 @@
-#import bevy_pbr::mesh_functions::{get_world_from_local, mesh_position_local_to_clip}
-#import bevy_pbr::mesh_view_bindings::globals
+#import bevy_pbr::mesh_view_bindings::{globals, lights, view}
+#import bevy_pbr::mesh_view_types::DIRECTIONAL_LIGHT_FLAGS_SHADOWS_ENABLED_BIT
+#import bevy_pbr::shadows::fetch_directional_shadow
+#import bevy_pbr::view_transformations::position_world_to_clip
 
 struct Vertex {
     @location(0) position: vec3<f32>,
@@ -34,14 +36,18 @@ struct Vertex {
 
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
+    // rgb = unlit vertex colour (part material blended with the team
+    // colour), a = hit flash.
+    @location(0) color: vec4<f32>,
+    // Lighting runs per pixel, where the sun's shadow map is sampled.
+    @location(1) world_position: vec3<f32>,
+    @location(2) world_normal: vec3<f32>,
+    // Death darkening, 0..1.
+    @location(3) death: f32,
 #ifdef UNIT_ATLAS
-    // rgb = lit vertex colour, a = hit flash.
-    @location(0) color: vec4<f32>,
-    // rgb = team colour for the atlas mask, a = death darkening.
-    @location(1) team: vec4<f32>,
-    @location(2) atlas_uv: vec2<f32>,
-#else
-    @location(0) color: vec4<f32>,
+    // Team colour for the atlas mask.
+    @location(4) team: vec3<f32>,
+    @location(5) atlas_uv: vec2<f32>,
 #endif
 };
 
@@ -1131,37 +1137,59 @@ fn unit_vertex(vertex: Vertex) -> VertexOutput {
         );
 
     var out: VertexOutput;
-    // Instance entity sits at the origin with identity transform, so passing
-    // index 0 is fine (same hack as the upstream instancing example).
-    out.clip_position = mesh_position_local_to_clip(
-        get_world_from_local(0u),
-        vec4<f32>(position, 1.0)
+    // The pose is built in world space: the bucket entity has no
+    // transform of its own.
+    out.clip_position = position_world_to_clip(position);
+    out.world_position = position;
+    // Rotated with the instance above.
+    out.world_normal = normal;
+
+    // Part material blended with the team color (a = team amount). The
+    // fragment lights it, then the hit flash lerps toward white and
+    // death darkens.
+    out.color = vec4<f32>(
+        mix(vertex.v_color.rgb, vertex.i_color.rgb, vertex.v_color.a),
+        clamp(fx, 0.0, 1.0) * step(fx, 1.0),
     );
-
-    // Flat-shaded lambert: normals are per-face, so per-vertex lighting is
-    // exact; normals are rotated with the instance above.
-    let n = normalize(normal);
-    let sun_dir = normalize(vec3<f32>(0.45, 0.85, 0.3));
-    let ndl = max(dot(n, sun_dir), 0.0);
-    let sky = 0.5 + 0.5 * n.y; // hemispheric ambient, brighter from above
-    let light = 0.30 + 0.20 * sky + 0.65 * ndl;
-
-    // Part material blended with the team color (a = team amount), then
-    // hit flash lerps toward white and death darkens. With an atlas the
-    // fragment does the last two after sampling it.
-    let base = mix(vertex.v_color.rgb, vertex.i_color.rgb, vertex.v_color.a);
-    let flash = clamp(fx, 0.0, 1.0) * step(fx, 1.0);
+    out.death = death;
 #ifdef UNIT_ATLAS
-    out.color = vec4<f32>(base * light, flash);
-    out.team = vec4<f32>(vertex.i_color.rgb, death);
+    out.team = vertex.i_color.rgb;
     out.atlas_uv = vertex.atlas_uv;
-#else
-    var rgb = base * light;
-    rgb = mix(rgb, vec3<f32>(1.0, 1.0, 1.0), flash * 0.8);
-    rgb = rgb * (1.0 - 0.45 * death);
-    out.color = vec4<f32>(rgb, 1.0);
 #endif
     return out;
+}
+
+// How much of the scene's sun reaches this pixel, 0..1: the first
+// directional light's shadow cascades, 1 past the last cascade or with
+// shadows off (FL_SHADOWS=0).
+fn sun_shadow(world_position: vec3<f32>, normal: vec3<f32>, frag_xy: vec2<f32>) -> f32 {
+    if (lights.directional_lights[0].flags & DIRECTIONAL_LIGHT_FLAGS_SHADOWS_ENABLED_BIT) == 0u {
+        return 1.0;
+    }
+    let p = vec4<f32>(world_position, 1.0);
+    let view_z = dot(vec4<f32>(
+        view.view_from_world[0].z,
+        view.view_from_world[1].z,
+        view.view_from_world[2].z,
+        view.view_from_world[3].z,
+    ), p);
+    return fetch_directional_shadow(0u, p, normal, view_z, frag_xy);
+}
+
+// Lambert from the scene's sun, so shading and shadow agree, over a
+// hemispheric ambient brighter from above. Faces turned away from the sun
+// skip the shadow lookup.
+fn unit_light(world_position: vec3<f32>, world_normal: vec3<f32>, frag_xy: vec2<f32>) -> f32 {
+    let n = normalize(world_normal);
+    let sky = 0.5 + 0.5 * n.y;
+    var sun = 0.0;
+    if lights.n_directional_lights > 0u {
+        sun = max(dot(n, lights.directional_lights[0].direction_to_light), 0.0);
+        if sun > 0.0 {
+            sun *= sun_shadow(world_position, n, frag_xy);
+        }
+    }
+    return 0.30 + 0.20 * sky + 0.65 * sun;
 }
 
 @fragment
@@ -1170,12 +1198,13 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // The atlas mask tints rather than replaces, so cloth keeps its weave
     // under the team colour.
     let texel = textureSample(unit_atlas, unit_atlas_sampler, in.atlas_uv);
-    let tint = mix(vec3<f32>(1.0), in.team.rgb, texel.a);
+    let tint = mix(vec3<f32>(1.0), in.team, texel.a);
     var rgb = in.color.rgb * texel.rgb * tint;
-    rgb = mix(rgb, vec3<f32>(1.0, 1.0, 1.0), in.color.a * 0.8);
-    rgb = rgb * (1.0 - 0.45 * in.team.a);
-    return vec4<f32>(rgb, 1.0);
 #else
-    return in.color;
+    var rgb = in.color.rgb;
 #endif
+    rgb *= unit_light(in.world_position, in.world_normal, in.clip_position.xy);
+    rgb = mix(rgb, vec3<f32>(1.0, 1.0, 1.0), in.color.a * 0.8);
+    rgb = rgb * (1.0 - 0.45 * in.death);
+    return vec4<f32>(rgb, 1.0);
 }
