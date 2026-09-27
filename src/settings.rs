@@ -11,9 +11,15 @@
 //! (any button tagged `OpenSettingsButton`). While it is open the
 //! shell input systems are gated off via `settings_closed`, so ESC
 //! closes the modal instead of toggling pause and clicks cannot fall
-//! through to the screen behind.
+//! through to the screen behind. It has three tabs: General (audio,
+//! camera, video), Interface (what the battle screen shows) and
+//! Controls (drag select and the list of keys).
+//!
+//! F1 to F3 flip the Interface settings in battle, so a key and its
+//! Settings row are the same saved state.
 
 use bevy::ecs::hierarchy::ChildSpawnerCommands;
+use bevy::ecs::system::EntityCommands;
 use bevy::prelude::*;
 use bevy::ui::FocusPolicy;
 use bevy::window::{MonitorSelection, PresentMode, PrimaryWindow, WindowMode};
@@ -30,6 +36,7 @@ pub struct Settings {
     pub camera: CameraSettings,
     pub controls: ControlsSettings,
     pub video: VideoSettings,
+    pub interface: InterfaceSettings,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
@@ -70,6 +77,25 @@ pub struct VideoSettings {
     pub shadows: bool,
 }
 
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
+#[serde(default)]
+pub struct InterfaceSettings {
+    /// F1: the battle HUD, meaning the unit card bar with its control
+    /// panel and the balance of power bar.
+    pub hud: bool,
+    /// F2: the unit panel (bottom right) for the hovered or selected
+    /// regiment.
+    pub unit_panel: bool,
+    /// F3: the debug overlay (fps and sim readout, top left). It also
+    /// unlocks the debug tools: the morale breakdown in the unit panel
+    /// and the X crater tool. The periodic log runs either way.
+    pub debug_overlay: bool,
+    /// Soldiers flash white when hit.
+    pub hit_flash: bool,
+    /// The front line drawn along the fighting (still under G).
+    pub front_line: bool,
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -77,6 +103,13 @@ impl Default for Settings {
             camera: CameraSettings { pan_speed: 1.0, edge_pan: true },
             controls: ControlsSettings { box_select: false },
             video: VideoSettings { vsync: false, fullscreen: false, shadows: true },
+            interface: InterfaceSettings {
+                hud: true,
+                unit_panel: true,
+                debug_overlay: false,
+                hit_flash: true,
+                front_line: true,
+            },
         }
     }
 }
@@ -92,6 +125,9 @@ impl Default for ControlsSettings {
 }
 impl Default for VideoSettings {
     fn default() -> Self { Settings::default().video }
+}
+impl Default for InterfaceSettings {
+    fn default() -> Self { Settings::default().interface }
 }
 
 fn settings_path() -> Option<std::path::PathBuf> {
@@ -181,7 +217,42 @@ enum Toggle {
     VSync,
     Fullscreen,
     Shadows,
+    Hud,
+    UnitPanel,
+    DebugOverlay,
+    HitFlash,
+    FrontLine,
 }
+
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum Tab {
+    #[default]
+    General,
+    Interface,
+    Controls,
+}
+
+impl Tab {
+    const ALL: [Tab; 3] = [Tab::General, Tab::Interface, Tab::Controls];
+
+    fn label(self) -> &'static str {
+        match self {
+            Tab::General => "General",
+            Tab::Interface => "Interface",
+            Tab::Controls => "Controls",
+        }
+    }
+}
+
+/// The tab the modal shows, kept across openings.
+#[derive(Resource, Default)]
+struct ActiveTab(Tab);
+
+#[derive(Component)]
+struct TabButton(Tab);
+
+#[derive(Component)]
+struct TabBody(Tab);
 
 /// On the slider track button; fill bar and value text are looked up
 /// by their own `Slider`-carrying marker components.
@@ -208,6 +279,7 @@ pub struct SettingsPlugin;
 impl Plugin for SettingsPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<SliderDrag>()
+            .init_resource::<ActiveTab>()
             .add_systems(Startup, load_click_sound)
             .add_systems(
                 Update,
@@ -216,11 +288,15 @@ impl Plugin for SettingsPlugin {
                     close_input,
                     slider_drag,
                     toggle_buttons,
+                    tab_buttons,
+                    sync_tabs,
+                    interface_keys.run_if(in_state(GameState::Battle)),
                     sync_widgets,
                     apply_video,
                     apply_shadows,
                     save_debounced,
-                ),
+                )
+                    .chain(),
             )
             .add_systems(OnExit(GameState::Menu), close_on_state_change)
             .add_systems(OnExit(GameState::Battle), close_on_state_change);
@@ -237,9 +313,14 @@ const PANEL_BG: Color = Color::srgba(0.07, 0.08, 0.10, 0.97);
 const BACKDROP: Color = Color::srgba(0.01, 0.02, 0.03, 0.6);
 const TRACK_BG: Color = Color::srgb(0.20, 0.21, 0.25);
 const FILL_BG: Color = Color::srgb(0.55, 0.58, 0.66);
+const TAB_ACTIVE: Color = Color::srgba(0.22, 0.38, 0.62, 0.95);
 const TRACK_WIDTH: f32 = 220.0;
-const LABEL_WIDTH: f32 = 110.0;
+const LABEL_WIDTH: f32 = 160.0;
 const VALUE_WIDTH: f32 = 52.0;
+/// The tab body's size: the largest tab, so switching never resizes the
+/// panel under the cursor.
+const BODY_WIDTH: f32 = 560.0;
+const BODY_HEIGHT: f32 = 400.0;
 
 impl Slider {
     /// Current position as a 0..1 fraction of the track.
@@ -286,6 +367,11 @@ impl Toggle {
             Self::VSync => s.video.vsync,
             Self::Fullscreen => s.video.fullscreen,
             Self::Shadows => s.video.shadows,
+            Self::Hud => s.interface.hud,
+            Self::UnitPanel => s.interface.unit_panel,
+            Self::DebugOverlay => s.interface.debug_overlay,
+            Self::HitFlash => s.interface.hit_flash,
+            Self::FrontLine => s.interface.front_line,
         }
     }
 
@@ -296,6 +382,11 @@ impl Toggle {
             Self::VSync => s.video.vsync = !s.video.vsync,
             Self::Fullscreen => s.video.fullscreen = !s.video.fullscreen,
             Self::Shadows => s.video.shadows = !s.video.shadows,
+            Self::Hud => s.interface.hud = !s.interface.hud,
+            Self::UnitPanel => s.interface.unit_panel = !s.interface.unit_panel,
+            Self::DebugOverlay => s.interface.debug_overlay = !s.interface.debug_overlay,
+            Self::HitFlash => s.interface.hit_flash = !s.interface.hit_flash,
+            Self::FrontLine => s.interface.front_line = !s.interface.front_line,
         }
     }
 
@@ -429,7 +520,111 @@ fn toggle_row(p: &mut ChildSpawnerCommands, label: &str, toggle: Toggle, s: &Set
     });
 }
 
-fn spawn_modal(commands: &mut Commands, s: &Settings) {
+/// The Controls tab: every binding by area. It mirrors the input code
+/// (camera.rs, selection.rs, unit_cards.rs, orders.rs, formation.rs,
+/// the F keys below), so a changed binding changes here too. Two
+/// columns, split between Selection and Orders.
+const CONTROLS: [(&str, &[(&str, &str)]); 4] = [
+    (
+        "Camera",
+        &[
+            ("W A S D", "Pan"),
+            ("Screen edge", "Pan"),
+            ("Mouse wheel", "Zoom"),
+            ("Middle drag", "Rotate"),
+        ],
+    ),
+    (
+        "Selection",
+        &[
+            ("Left click, drag", "Select"),
+            ("Card click", "Select a unit"),
+            ("Shift + card", "Select a range"),
+            ("Ctrl + card", "Add or remove"),
+            ("Ctrl + A / I / M", "All, infantry, missile"),
+            ("Ctrl + 1 to 9", "Assign a group"),
+            ("1 to 9", "Recall a group"),
+            ("Enter", "Clear the selection"),
+        ],
+    ),
+    (
+        "Orders",
+        &[
+            ("Right click", "Move, or attack"),
+            ("Right drag", "Form a line"),
+            ("Backspace", "Halt"),
+            ("F", "Shield or spear wall"),
+            ("L", "Loose formation"),
+            ("B", "Blob"),
+            ("H", "Hold position"),
+            ("T", "Fire at will"),
+            ("K", "Skirmish"),
+        ],
+    ),
+    (
+        "Interface",
+        &[
+            ("Esc", "Pause"),
+            ("F1", "Battle HUD"),
+            ("F2", "Unit panel"),
+            ("F3", "Debug overlay"),
+            ("G", "Banners and map lines"),
+            ("X, with F3 on", "Dig a crater"),
+        ],
+    ),
+];
+
+fn controls_column(p: &mut ChildSpawnerCommands, sections: &[(&str, &[(&str, &str)])]) {
+    p.spawn(Node {
+        flex_direction: FlexDirection::Column,
+        width: Val::Percent(50.0),
+        ..default()
+    })
+    .with_children(|col| {
+        for (header, rows) in sections {
+            section_header(col, header);
+            for (key, action) in *rows {
+                col.spawn(Node {
+                    flex_direction: FlexDirection::Row,
+                    margin: UiRect::vertical(Val::Px(2.0)),
+                    ..default()
+                })
+                .with_children(|row| {
+                    row.spawn((
+                        Text::new(*key),
+                        TextFont { font_size: FontSize::Px(14.0), ..default() },
+                        TextColor(TEXT_COLOR),
+                        Node { width: Val::Px(128.0), ..default() },
+                    ));
+                    row.spawn((
+                        Text::new(*action),
+                        TextFont { font_size: FontSize::Px(14.0), ..default() },
+                        TextColor(DIM_TEXT_COLOR),
+                    ));
+                });
+            }
+        }
+    });
+}
+
+fn tab_body<'a>(
+    p: &'a mut ChildSpawnerCommands<'_>,
+    tab: Tab,
+    active: Tab,
+) -> EntityCommands<'a> {
+    p.spawn((
+        Node {
+            display: if tab == active { Display::Flex } else { Display::None },
+            flex_direction: FlexDirection::Column,
+            width: Val::Px(BODY_WIDTH),
+            height: Val::Px(BODY_HEIGHT),
+            ..default()
+        },
+        TabBody(tab),
+    ))
+}
+
+fn spawn_modal(commands: &mut Commands, s: &Settings, active: Tab) {
     commands
         .spawn((
             Node {
@@ -462,35 +657,86 @@ fn spawn_modal(commands: &mut Commands, s: &Settings) {
                     TextFont { font_size: FontSize::Px(30.0), ..default() },
                     TextColor(TEXT_COLOR),
                     Node {
-                        margin: UiRect::bottom(Val::Px(4.0)),
+                        margin: UiRect::bottom(Val::Px(12.0)),
                         align_self: AlignSelf::Center,
                         ..default()
                     },
                 ));
 
-                section_header(panel, "Audio");
-                slider_row(panel, "Master", Slider::Master, s);
-                slider_row(panel, "Battle", Slider::Battle, s);
-                slider_row(panel, "Interface", Slider::Ui, s);
+                panel
+                    .spawn(Node {
+                        flex_direction: FlexDirection::Row,
+                        column_gap: Val::Px(4.0),
+                        margin: UiRect::bottom(Val::Px(4.0)),
+                        ..default()
+                    })
+                    .with_children(|tabs| {
+                        for tab in Tab::ALL {
+                            tabs.spawn((
+                                Button,
+                                Node {
+                                    padding: UiRect::axes(Val::Px(18.0), Val::Px(6.0)),
+                                    ..default()
+                                },
+                                BackgroundColor(if tab == active { TAB_ACTIVE } else { BTN_NORMAL }),
+                                crate::game_state::CustomStyled,
+                                TabButton(tab),
+                            ))
+                            .with_children(|b| {
+                                b.spawn((
+                                    Text::new(tab.label()),
+                                    TextFont { font_size: FontSize::Px(15.0), ..default() },
+                                    TextColor(TEXT_COLOR),
+                                ));
+                            });
+                        }
+                    });
 
-                section_header(panel, "Camera");
-                slider_row(panel, "Pan speed", Slider::PanSpeed, s);
-                toggle_row(panel, "Edge pan", Toggle::EdgePan, s);
+                tab_body(panel, Tab::General, active).with_children(|body| {
+                    section_header(body, "Audio");
+                    slider_row(body, "Master", Slider::Master, s);
+                    slider_row(body, "Battle", Slider::Battle, s);
+                    slider_row(body, "Interface", Slider::Ui, s);
 
-                section_header(panel, "Controls");
-                toggle_row(panel, "Drag select", Toggle::BoxSelect, s);
+                    section_header(body, "Camera");
+                    slider_row(body, "Pan speed", Slider::PanSpeed, s);
+                    toggle_row(body, "Edge pan", Toggle::EdgePan, s);
 
-                section_header(panel, "Video");
-                toggle_row(panel, "Window", Toggle::Fullscreen, s);
-                toggle_row(panel, "VSync", Toggle::VSync, s);
-                toggle_row(panel, "Shadows", Toggle::Shadows, s);
+                    section_header(body, "Video");
+                    toggle_row(body, "Window", Toggle::Fullscreen, s);
+                    toggle_row(body, "VSync", Toggle::VSync, s);
+                    toggle_row(body, "Shadows", Toggle::Shadows, s);
+                });
+
+                tab_body(panel, Tab::Interface, active).with_children(|body| {
+                    section_header(body, "Screen");
+                    toggle_row(body, "Battle HUD (F1)", Toggle::Hud, s);
+                    toggle_row(body, "Unit panel (F2)", Toggle::UnitPanel, s);
+                    toggle_row(body, "Debug overlay (F3)", Toggle::DebugOverlay, s);
+
+                    section_header(body, "Battlefield");
+                    toggle_row(body, "Hit flash", Toggle::HitFlash, s);
+                    toggle_row(body, "Front line", Toggle::FrontLine, s);
+                });
+
+                tab_body(panel, Tab::Controls, active).with_children(|body| {
+                    toggle_row(body, "Drag select", Toggle::BoxSelect, s);
+                    body.spawn(Node {
+                        flex_direction: FlexDirection::Row,
+                        ..default()
+                    })
+                    .with_children(|cols| {
+                        controls_column(cols, &CONTROLS[..2]);
+                        controls_column(cols, &CONTROLS[2..]);
+                    });
+                });
 
                 panel
                     .spawn((
                         Button,
                         Node {
                             padding: UiRect::axes(Val::Px(32.0), Val::Px(10.0)),
-                            margin: UiRect::top(Val::Px(22.0)),
+                            margin: UiRect::top(Val::Px(18.0)),
                             align_self: AlignSelf::Center,
                             ..default()
                         },
@@ -518,11 +764,69 @@ fn open_buttons(
     query: Query<&Interaction, (Changed<Interaction>, With<OpenSettingsButton>)>,
     open: Query<(), With<SettingsRoot>>,
     settings: Res<Settings>,
+    active: Res<ActiveTab>,
 ) {
     for interaction in &query {
         if *interaction == Interaction::Pressed && open.is_empty() {
-            spawn_modal(&mut commands, &settings);
+            spawn_modal(&mut commands, &settings, active.0);
         }
+    }
+}
+
+fn tab_buttons(
+    query: Query<(&Interaction, &TabButton), Changed<Interaction>>,
+    mut active: ResMut<ActiveTab>,
+) {
+    for (interaction, tab) in &query {
+        if *interaction == Interaction::Pressed && active.0 != tab.0 {
+            active.0 = tab.0;
+        }
+    }
+}
+
+/// Show the active tab's body and paint the tab buttons: the active one
+/// in the accent, the others with the usual hover shades.
+fn sync_tabs(
+    active: Res<ActiveTab>,
+    mut bodies: Query<(&mut Node, &TabBody)>,
+    mut buttons: Query<(&Interaction, &TabButton, &mut BackgroundColor)>,
+) {
+    for (interaction, tab, mut bg) in &mut buttons {
+        let want = if tab.0 == active.0 {
+            TAB_ACTIVE
+        } else {
+            match interaction {
+                Interaction::Pressed => crate::game_state::BTN_PRESSED,
+                Interaction::Hovered => crate::game_state::BTN_HOVER,
+                Interaction::None => BTN_NORMAL,
+            }
+        };
+        if bg.0 != want {
+            bg.0 = want;
+        }
+    }
+    if !active.is_changed() {
+        return;
+    }
+    for (mut node, body) in &mut bodies {
+        let display = if body.0 == active.0 { Display::Flex } else { Display::None };
+        if node.display != display {
+            node.display = display;
+        }
+    }
+}
+
+/// F1 to F3 flip the Interface settings in battle (paused too): the
+/// battle HUD, the unit panel and the debug overlay.
+fn interface_keys(keys: Res<ButtonInput<KeyCode>>, mut settings: ResMut<Settings>) {
+    if keys.just_pressed(KeyCode::F1) {
+        settings.interface.hud = !settings.interface.hud;
+    }
+    if keys.just_pressed(KeyCode::F2) {
+        settings.interface.unit_panel = !settings.interface.unit_panel;
+    }
+    if keys.just_pressed(KeyCode::F3) {
+        settings.interface.debug_overlay = !settings.interface.debug_overlay;
     }
 }
 

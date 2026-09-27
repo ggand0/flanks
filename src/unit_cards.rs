@@ -22,6 +22,12 @@ use crate::game_state::{
 use crate::orders::{Groups, Hover, PLAYER_TEAM, RegState, Selection, halt_selected};
 use crate::unit_types::{KIND_ARCHER, KIND_HEAVY, KIND_SPEAR, NUM_KINDS};
 
+/// The bar's root: the Battle HUD setting (F1) shows or hides it. A
+/// hidden node takes no pointer input, so the map is clickable where the
+/// bar was.
+#[derive(Component)]
+struct CardBar;
+
 /// Card button; the payload is the regiment's index into `Groups::list`.
 #[derive(Component)]
 struct UnitCard(usize);
@@ -131,10 +137,20 @@ impl Plugin for UnitCardsPlugin {
                 (card_clicks, card_hover, control_buttons).in_set(HudInputSet),
                 // Visual refresh keeps running while paused: the HUD stays
                 // readable, only input is gated.
-                (refresh_cards, refresh_control_buttons)
+                (refresh_cards, refresh_control_buttons, show_card_bar)
                     .run_if(in_state(GameState::Battle)),
             ),
         );
+    }
+}
+
+fn show_card_bar(
+    settings: Res<crate::settings::Settings>,
+    mut bar: Query<&mut Visibility, With<CardBar>>,
+) {
+    let want = if settings.interface.hud { Visibility::Inherited } else { Visibility::Hidden };
+    for mut vis in &mut bar {
+        vis.set_if_neq(want);
     }
 }
 
@@ -637,6 +653,7 @@ fn spawn_card_bar(
             // Blocks map input in the gaps between cards too.
             Interaction::default(),
             DespawnOnExit(GameState::Battle),
+            CardBar,
         ))
         .with_children(|bar| {
             bar.spawn(Node {

@@ -1,4 +1,5 @@
-//! FPS + unit count overlay (top-left), plus a periodic FPS log line.
+//! The debug overlay (top-left, F3) with the periodic FPS log line,
+//! and the unit panel (bottom-right, F2).
 
 use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy::prelude::*;
@@ -6,7 +7,7 @@ use bevy::render::diagnostic::RenderDiagnosticsPlugin;
 
 use crate::combat::CombatStats;
 use crate::sim::SimStats;
-use crate::orders::{Groups, RegState, Selection};
+use crate::orders::{Groups, Selection};
 use crate::morale::MoraleReadout;
 use crate::render_units::RenderCounts;
 use crate::units::Units;
@@ -14,10 +15,14 @@ use crate::units::Units;
 #[derive(Component)]
 struct OverlayText;
 
-/// TW-style regiment plaque (bottom-right): name, strength, morale, and
-/// the live morale factor breakdown from `MoraleReadout`.
+/// The unit panel (bottom-right), after M2TW's: army, name [class]
+/// (men), what the regiment is doing, its morale and fatigue words. The
+/// debug overlay adds the morale level, the formation and the live
+/// factor breakdown from `MoraleReadout`.
 #[derive(Component)]
 struct InspectPanel;
+#[derive(Component)]
+struct InspectTeam;
 #[derive(Component)]
 struct InspectText;
 
@@ -156,7 +161,7 @@ impl Plugin for OverlayPlugin {
             .add_systems(Startup, (spawn_overlay, spawn_inspect_panel))
             .add_systems(
                 OnEnter(crate::game_state::GameState::Battle),
-                (show_overlay, reset_frame_stats),
+                reset_frame_stats,
             )
             .init_resource::<TicksThisFrame>()
             .init_resource::<FramePacing>()
@@ -183,7 +188,7 @@ impl Plugin for OverlayPlugin {
             .add_systems(FixedLast, fixed_end)
             .add_systems(
                 Update,
-                (update_overlay, update_inspect_panel, report_catchup)
+                (show_overlay, update_overlay, update_inspect_panel, report_catchup)
                     .run_if(in_state(crate::game_state::GameState::Battle)),
             )
             .add_systems(
@@ -197,9 +202,21 @@ impl Plugin for OverlayPlugin {
     }
 }
 
-fn show_overlay(mut overlay: Query<&mut Visibility, With<OverlayText>>) {
+/// The overlay text follows the Debug overlay setting (F3). Only its
+/// visibility: `update_overlay` keeps writing the periodic log.
+fn show_overlay(
+    settings: Res<crate::settings::Settings>,
+    mut overlay: Query<&mut Visibility, With<OverlayText>>,
+) {
+    let want = if settings.interface.debug_overlay {
+        Visibility::Visible
+    } else {
+        Visibility::Hidden
+    };
     for mut vis in &mut overlay {
-        *vis = Visibility::Visible;
+        if *vis != want {
+            *vis = want;
+        }
     }
 }
 
@@ -234,99 +251,133 @@ fn spawn_overlay(mut commands: Commands) {
     ));
 }
 
+/// The panel's army line takes the team's colour, muted to sit on the
+/// dark panel.
+const TEAM_TEXT: [Color; 2] = [Color::srgb(0.55, 0.72, 0.95), Color::srgb(0.95, 0.66, 0.40)];
+
 fn spawn_inspect_panel(mut commands: Commands) {
+    let font = || TextFont {
+        font_size: FontSize::Px(15.0),
+        ..default()
+    };
     commands
         .spawn((
             Node {
                 position_type: PositionType::Absolute,
                 right: Val::Px(10.0),
-                // Sits above the unit card bar.
                 bottom: Val::Px(crate::unit_cards::BAR_HEIGHT + 10.0),
-                padding: UiRect::all(Val::Px(10.0)),
+                padding: UiRect::axes(Val::Px(12.0), Val::Px(8.0)),
+                flex_direction: FlexDirection::Column,
                 ..default()
             },
-            BackgroundColor(Color::srgba(0.07, 0.08, 0.10, 0.88)),
+            BackgroundColor(Color::srgba(0.07, 0.08, 0.10, 0.82)),
             Visibility::Hidden,
             InspectPanel,
         ))
         .with_children(|p| {
+            p.spawn((Text::new(""), font(), TextColor(TEAM_TEXT[0]), InspectTeam));
             p.spawn((
                 Text::new(""),
-                TextFont {
-                    font_size: FontSize::Px(15.0),
-                    ..default()
-                },
+                font(),
                 TextColor(Color::srgb(0.92, 0.92, 0.85)),
                 InspectText,
             ));
         });
 }
 
-/// Show the hovered regiment (enemy first — it doubles as the attack
-/// preview), else a lone selected regiment, else hide.
+/// What the regiment is doing, in M2TW's words (battle.txt).
+fn action_word(gd: &crate::orders::GroupData) -> &'static str {
+    if gd.state.is_broken() {
+        "Routing"
+    } else if gd.charging {
+        "Charging"
+    } else if gd.engaged {
+        "Fighting"
+    } else if gd.firing {
+        "Firing missiles"
+    } else if gd.order.is_some() {
+        "Marching"
+    } else if gd.celebrate > 0 {
+        "Taunting"
+    } else {
+        "Idle"
+    }
+}
+
+/// Show the hovered regiment (enemy first: it doubles as the attack
+/// preview), else a lone selected regiment, else hide. The Unit panel
+/// setting (F2) hides it; without the battle HUD (F1) it drops to the
+/// screen's edge.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)] // bevy system params
 fn update_inspect_panel(
     hover: Res<crate::orders::Hover>,
     selection: Res<Selection>,
     groups: Res<Groups>,
     readout: Res<MoraleReadout>,
-    mut panel: Query<&mut Visibility, With<InspectPanel>>,
-    mut text: Query<&mut Text, With<InspectText>>,
+    settings: Res<crate::settings::Settings>,
+    mut panel: Query<(&mut Visibility, &mut Node), With<InspectPanel>>,
+    mut team: Query<(&mut Text, &mut TextColor), (With<InspectTeam>, Without<InspectText>)>,
+    mut text: Query<&mut Text, (With<InspectText>, Without<InspectTeam>)>,
 ) {
-    let Ok(mut vis) = panel.single_mut() else { return };
+    let Ok((mut vis, mut node)) = panel.single_mut() else { return };
+    let Ok((mut team_text, mut team_color)) = team.single_mut() else { return };
     let Ok(mut text) = text.single_mut() else { return };
+    let ui = &settings.interface;
+    let bottom = Val::Px(if ui.hud { crate::unit_cards::BAR_HEIGHT + 10.0 } else { 10.0 });
+    if node.bottom != bottom {
+        node.bottom = bottom;
+    }
     let single_sel = (selection.regiments.iter().filter(|s| **s).count() == 1)
         .then(|| selection.regiments.iter().position(|s| *s).unwrap() as u32);
-    let Some(g) = hover.enemy.or(hover.own).or(single_sel) else {
-        *vis = Visibility::Hidden;
+    let shown = ui
+        .unit_panel
+        .then(|| hover.enemy.or(hover.own).or(single_sel))
+        .flatten()
+        .map(|g| g as usize)
+        .filter(|&g| groups.list.get(g).is_some_and(|gd| gd.count > 0));
+    let Some(g) = shown else {
+        vis.set_if_neq(Visibility::Hidden);
         return;
     };
-    let g = g as usize;
-    let Some(gd) = groups.list.get(g).filter(|gd| gd.count > 0) else {
-        *vis = Visibility::Hidden;
-        return;
-    };
-    *vis = Visibility::Visible;
+    vis.set_if_neq(Visibility::Visible);
+    let gd = &groups.list[g];
 
-    let kind = match gd.kind {
-        crate::unit_types::KIND_HEAVY => "Heavy Knights",
-        crate::unit_types::KIND_SPEAR => "Spearmen",
-        crate::unit_types::KIND_ARCHER => "Archers",
-        _ => "Men-at-Arms",
-    };
-    let team = if gd.team == 0 { "blue" } else { "orange" };
-    let state = match gd.state {
-        RegState::Steady if gd.charging => "STEADY - CHARGING",
-        RegState::Steady if crate::morale::band(gd) == crate::morale::Band::Wavering => {
-            "WAVERING"
-        }
-        RegState::Steady if crate::morale::band(gd) == crate::morale::Band::Shaken => "SHAKEN",
-        RegState::Steady if gd.engaged => "STEADY - engaged",
-        RegState::Steady => "STEADY",
-        RegState::Routing { .. } => "ROUTING",
-        RegState::Shattered => "SHATTERED",
-    };
-    // Formation line: shape/files, spacing mode, engagement stance.
-    let formation = match gd.shape {
-        crate::formation::FormShape::Blob => "mob".to_string(),
-        crate::formation::FormShape::Rect => format!("{} files", gd.files),
-    };
-    let mode = match crate::formation::wall_kind(gd) {
-        1 => "  SHIELDWALL",
-        2 => "  SPEARWALL",
-        _ if gd.spacing == crate::formation::FormSpacing::Loose => "  loose order",
-        _ => "",
-    };
-    let stance = if gd.hold { "  HOLD POSITION" } else { "" };
+    let t = (gd.team as usize).min(1);
+    let army = if t == 0 { "Blue" } else { "Orange" };
+    if team_text.0 != army {
+        team_text.0 = army.to_string();
+    }
+    team_color.set_if_neq(TextColor(TEAM_TEXT[t]));
     let fat = crate::fatigue::state_name(crate::fatigue::state(gd.fatigue));
     let mut s = format!(
-        "{kind} {g} ({team})\n{}/{} men    morale {:+.1}    {state}\n{formation}{mode}{stance}    {fat}\n",
-        gd.count, gd.initial_count, gd.morale,
+        "{} [{}] ({})\n{}\n{}\n{fat}",
+        crate::unit_types::kind_name(gd.kind),
+        crate::unit_types::kind_class(gd.kind),
+        gd.count,
+        action_word(gd),
+        crate::morale::state_word(gd),
     );
-    if gd.count > 0 {
-        // Morale is a level now: base + the signed modifier sum. Show
-        // every nonzero factor so the player can SEE the state of mind.
+    if ui.debug_overlay {
+        // Formation line: shape/files, spacing mode, engagement stance.
+        let formation = match gd.shape {
+            crate::formation::FormShape::Blob => "mob".to_string(),
+            crate::formation::FormShape::Rect => format!("{} files", gd.files),
+        };
+        let mode = match crate::formation::wall_kind(gd) {
+            1 => "  shieldwall",
+            2 => "  spearwall",
+            _ if gd.spacing == crate::formation::FormSpacing::Loose => "  loose order",
+            _ => "",
+        };
+        let stance = if gd.hold { "  hold position" } else { "" };
+        s += &format!(
+            "\n\nregiment {g}  {}/{} men  morale {:+.1}\n{formation}{mode}{stance}",
+            gd.count, gd.initial_count, gd.morale,
+        );
+        // Morale is a level: base + the signed modifier sum. Every
+        // nonzero factor, so the state of mind can be read.
         let f = readout.0.get(g).copied().unwrap_or_default();
-        s += &format!("base            {:+.1}", f.base);
+        s += &format!("\nbase            {:+.1}", f.base);
         for (label, v) in [
             ("casualties", f.casualties),
             ("melee exchange", f.exchange),
@@ -350,7 +401,9 @@ fn update_inspect_panel(
             s += &format!("\n(surrounded {:.0}%)", f.flanked01 * 100.0);
         }
     }
-    text.0 = s;
+    if text.0 != s {
+        text.0 = s;
+    }
 }
 
 #[allow(clippy::too_many_arguments)] // bevy system params

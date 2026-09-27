@@ -1024,8 +1024,10 @@ fn remesh_dirty(
     );
 }
 
-/// Debug tool: X carves a crater under the cursor.
+/// Debug tool: X carves a crater under the cursor, only with the debug
+/// overlay on (F3) so a stray key never digs up a normal battle.
 fn crater_tool(
+    settings: Res<crate::settings::Settings>,
     keys: Res<ButtonInput<KeyCode>>,
     mut terrain: ResMut<Terrain>,
     window: Query<&Window, With<PrimaryWindow>>,
@@ -1034,7 +1036,7 @@ fn crater_tool(
     mut cooldown: Local<f32>,
 ) {
     *cooldown -= time.delta_secs();
-    if !keys.pressed(KeyCode::KeyX) || *cooldown > 0.0 {
+    if !settings.interface.debug_overlay || !keys.pressed(KeyCode::KeyX) || *cooldown > 0.0 {
         return;
     }
     let Ok(window) = window.single() else { return };

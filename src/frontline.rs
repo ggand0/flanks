@@ -632,12 +632,14 @@ fn update_groups(
 
 fn draw_front_gizmos(
     viz: Res<DebugViz>,
+    settings: Res<crate::settings::Settings>,
     field: Option<Res<InfluenceField>>,
     terrain: Res<Terrain>,
     mut gizmos: Gizmos,
 ) {
     let Some(field) = field else { return };
-    if !viz.0 {
+    // The Front line setting, and G over it.
+    if !viz.0 || !settings.interface.front_line {
         return;
     }
     let lift = |p: Vec2| Vec3::new(p.x, terrain.height_at(p.x, p.y) + 1.5, p.y);

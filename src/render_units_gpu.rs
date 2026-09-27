@@ -201,10 +201,16 @@ pub struct GpuFrameInput {
 /// when `Units` changed, so frames without a tick pack nothing. Parallel
 /// on the compute pool. Not reachable from the tick job, so a plain scope
 /// is correct here.
-fn pack_soldier_snapshot(units: Res<Units>, mut snap: ResMut<SoldierSnapshot>) {
+fn pack_soldier_snapshot(
+    units: Res<Units>,
+    settings: Res<crate::settings::Settings>,
+    mut snap: ResMut<SoldierSnapshot>,
+) {
     if !units.is_changed() {
         return;
     }
+    // The Hit flash setting: off packs every flash as zero.
+    let flash = settings.interface.hit_flash;
     let t0 = std::time::Instant::now();
     let n = units.len();
     snap.records.resize(n, GpuSoldier::zeroed());
@@ -212,7 +218,7 @@ fn pack_soldier_snapshot(units: Res<Units>, mut snap: ResMut<SoldierSnapshot>) {
     let records = &mut snap.records;
     let chunk_counts: Vec<[u32; NUM_KINDS]> = bevy::tasks::ComputeTaskPool::get().scope(|scope| {
         for (ci, out) in records.chunks_mut(SYNC_CHUNK).enumerate() {
-            scope.spawn(async move { pack_chunk(units, ci * SYNC_CHUNK, out) });
+            scope.spawn(async move { pack_chunk(units, ci * SYNC_CHUNK, out, flash) });
         }
     });
     let mut kind_counts = [0u32; NUM_KINDS];
@@ -227,7 +233,7 @@ fn pack_soldier_snapshot(units: Res<Units>, mut snap: ResMut<SoldierSnapshot>) {
     snap.pack_ms = t0.elapsed().as_secs_f32() * 1000.0;
 }
 
-fn pack_chunk(units: &Units, start: usize, out: &mut [GpuSoldier]) -> [u32; NUM_KINDS] {
+fn pack_chunk(units: &Units, start: usize, out: &mut [GpuSoldier], flash: bool) -> [u32; NUM_KINDS] {
     let mut kind_counts = [0u32; NUM_KINDS];
     for (j, rec) in out.iter_mut().enumerate() {
         let i = start + j;
@@ -243,7 +249,7 @@ fn pack_chunk(units: &Units, start: usize, out: &mut [GpuSoldier]) -> [u32; NUM_
             a: kind
                 | (units.swing[i] as u32) << 8
                 | (units.swing_t[i] as u32) << 16
-                | (units.flash[i] as u32) << 24,
+                | if flash { (units.flash[i] as u32) << 24 } else { 0 },
             b: (group & 0x00ff_ffff) | (units.death_t[i] as u32) << 24,
             color: units.color[i],
         };

@@ -766,9 +766,14 @@ fn sync_instance_data(
     mut scratch: Local<Vec<[Vec<InstanceData>; NUM_BUCKETS]>>,
     mut corpse_scratch: Local<Vec<[Vec<InstanceData>; NUM_LODS]>>,
     mut smooth: Local<Vec<Smooth>>,
-    (gpu, frame): (Res<GpuSyncConfig>, Res<bevy::diagnostic::FrameCount>),
+    (gpu, frame, settings): (
+        Res<GpuSyncConfig>,
+        Res<bevy::diagnostic::FrameCount>,
+        Res<crate::settings::Settings>,
+    ),
 ) {
     let _span = info_span!("sync_instances").entered();
+    let hit_flash = settings.interface.hit_flash;
     let t0 = std::time::Instant::now();
     let Ok((cam, projection, cam_tf)) = camera.single() else {
         return;
@@ -958,8 +963,10 @@ fn sync_instance_data(
                     // fx: [0,1) hit flash, [1,2] death progress.
                     let fx = if units.death_t[i] > 0 {
                         2.0 - units.death_t[i] as f32 / crate::sim::damage::DEATH_TICKS as f32
-                    } else {
+                    } else if hit_flash {
                         units.flash[i] as f32 * 0.25
+                    } else {
+                        0.0
                     };
                     // Stagger progress (1 at the blow, 0 recovered): the
                     // rocked-back pose. Death pose owns dying men.

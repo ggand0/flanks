@@ -32,15 +32,6 @@ const GRID_W: f32 = 12.0 * (CELL_W + 3.0) + 12.0;
 /// Roster display order matches the battle line front to rear.
 const ROSTER_ORDER: [u8; NUM_KINDS] = [KIND_HEAVY, KIND_SPEAR, KIND_LIGHT, KIND_ARCHER];
 
-fn kind_name(kind: u8) -> &'static str {
-    match kind {
-        KIND_HEAVY => "Knights",
-        KIND_SPEAR => "Spearmen",
-        KIND_ARCHER => "Bowmen",
-        _ => "Men-at-Arms",
-    }
-}
-
 fn kind_desc(kind: u8) -> &'static str {
     match kind {
         KIND_HEAVY => "Knights: slow, armored line breakers. Strongest holding the front rank.",
@@ -412,7 +403,7 @@ fn spawn_roster_pane(row: &mut ChildSpawnerCommands, icons: &PickerIcons) {
                     },
                 ));
                 card.spawn((
-                    Text::new(kind_name(kind)),
+                    Text::new(crate::unit_types::kind_name(kind)),
                     TextFont { font_size: FontSize::Px(14.0), ..default() },
                     TextColor(TEXT_COLOR),
                     Node { flex_grow: 1.0, ..default() },
