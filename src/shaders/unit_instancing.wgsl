@@ -34,20 +34,23 @@ struct Vertex {
     @location(11) i_anim2: vec4<f32>,
 };
 
+// Kept narrow on purpose: a far view pushes 60M vertices through this
+// shader per frame, and every float here is paid that many times, while
+// the fragment runs about eight million times (devlog 0147).
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
-    // rgb = unlit vertex colour (part material blended with the team
-    // colour), a = hit flash.
+    // rgb = the lit vertex colour: part material blended with the team
+    // colour, times the sun and the sky. a = the sun's share of that
+    // light, the part the shadow takes away.
     @location(0) color: vec4<f32>,
-    // Lighting runs per pixel, where the sun's shadow map is sampled.
-    @location(1) world_position: vec3<f32>,
-    @location(2) world_normal: vec3<f32>,
-    // Death darkening, 0..1.
-    @location(3) death: f32,
+    // Per instance, so flat. x = team colour, unorm8 rgb, and the death
+    // darkening in the top byte; y = the hit flash, unorm8 in the low byte.
+    @location(1) @interpolate(flat) packed: vec2<u32>,
+    // World position pushed off the surface by the shadow map's normal
+    // bias: where the fragment samples the sun's shadow.
+    @location(2) shadow_position: vec3<f32>,
 #ifdef UNIT_ATLAS
-    // Team colour for the atlas mask.
-    @location(4) team: vec3<f32>,
-    @location(5) atlas_uv: vec2<f32>,
+    @location(3) atlas_uv: vec2<f32>,
 #endif
 };
 
@@ -112,6 +115,19 @@ struct Bow {
     clips: array<vec4<u32>, 2>,
 };
 @group(3) @binding(6) var<uniform> rig: Rig;
+// The scene's sun as the vertex stage sees it (render_units_shadow.rs
+// `SunUniform`): bevy binds its lights to the fragment stage only.
+struct Sun {
+    // xyz = direction toward the sun, zero without a light.
+    direction_to_light: vec4<f32>,
+    // x = 1 with shadow maps on, y = the light's shadow normal bias,
+    // z = the cascade overlap proportion, w = the cascade count.
+    params: vec4<f32>,
+    // Per cascade: its far bound in view depth, and its texel in metres.
+    far_bounds: vec4<f32>,
+    texel_sizes: vec4<f32>,
+};
+@group(3) @binding(8) var<uniform> sun: Sun;
 // The shot tables of this bucket's kind (unit_glb.rs `Shots::buffer`).
 // A pose is 8 vec4s: six joint turns as xyzw quaternions (the drawing
 // arm's shoulder, elbow and wrist, then the bow arm's), (bow yaw, limb
@@ -1146,71 +1162,101 @@ fn unit_vertex(vertex: Vertex) -> VertexOutput {
     // instead of being clipped (render_units_shadow.rs).
     out.clip_position.z = min(out.clip_position.z, out.clip_position.w);
 #endif
-    out.world_position = position;
-    // Rotated with the instance above.
-    out.world_normal = normal;
-
-    // Part material blended with the team color (a = team amount). The
-    // fragment lights it, then the hit flash lerps toward white and
-    // death darkens.
-    out.color = vec4<f32>(
-        mix(vertex.v_color.rgb, vertex.i_color.rgb, vertex.v_color.a),
-        clamp(fx, 0.0, 1.0) * step(fx, 1.0),
+    // Lambert from the scene's sun, so shading and shadow agree, over a
+    // hemispheric ambient brighter from above. Normals are per face
+    // (rotated with the instance above), so per-vertex light is exact.
+    let n = normalize(normal);
+    let sky = 0.30 + 0.20 * (0.5 + 0.5 * n.y);
+    let direct = 0.65 * max(dot(n, sun.direction_to_light.xyz), 0.0);
+    // Part material blended with the team color (a = team amount), lit.
+    // The fragment takes the shadow off the sun's share, then the hit
+    // flash lerps toward white and death darkens.
+    let base = mix(vertex.v_color.rgb, vertex.i_color.rgb, vertex.v_color.a);
+    out.color = vec4<f32>(base * (sky + direct), direct / (sky + direct));
+    out.packed = vec2<u32>(
+        pack4x8unorm(vec4<f32>(vertex.i_color.rgb, death)),
+        pack4x8unorm(vec4<f32>(clamp(fx, 0.0, 1.0) * step(fx, 1.0), 0.0, 0.0, 0.0)),
     );
-    out.death = death;
+    out.shadow_position = position + n * shadow_normal_bias(position);
 #ifdef UNIT_ATLAS
-    out.team = vertex.i_color.rgb;
     out.atlas_uv = vertex.atlas_uv;
 #endif
     return out;
 }
 
-// How much of the scene's sun reaches this pixel, 0..1: the first
-// directional light's shadow cascades, 1 past the last cascade or with
-// shadows off (FL_SHADOWS=0).
-fn sun_shadow(world_position: vec3<f32>, normal: vec3<f32>, frag_xy: vec2<f32>) -> f32 {
-    if (lights.directional_lights[0].flags & DIRECTIONAL_LIGHT_FLAGS_SHADOWS_ENABLED_BIT) == 0u {
-        return 1.0;
-    }
-    let p = vec4<f32>(world_position, 1.0);
-    let view_z = dot(vec4<f32>(
+// Depth along the camera's view axis, negative in front of it.
+fn view_depth(world_position: vec3<f32>) -> f32 {
+    return dot(vec4<f32>(
         view.view_from_world[0].z,
         view.view_from_world[1].z,
         view.view_from_world[2].z,
         view.view_from_world[3].z,
-    ), p);
-    return fetch_directional_shadow(0u, p, normal, view_z, frag_xy);
+    ), vec4<f32>(world_position, 1.0));
 }
 
-// Lambert from the scene's sun, so shading and shadow agree, over a
-// hemispheric ambient brighter from above. Faces turned away from the sun
-// skip the shadow lookup.
-fn unit_light(world_position: vec3<f32>, world_normal: vec3<f32>, frag_xy: vec2<f32>) -> f32 {
-    let n = normalize(world_normal);
-    let sky = 0.5 + 0.5 * n.y;
-    var sun = 0.0;
-    if lights.n_directional_lights > 0u {
-        sun = max(dot(n, lights.directional_lights[0].direction_to_light), 0.0);
-        if sun > 0.0 {
-            sun *= sun_shadow(world_position, n, frag_xy);
+// How far off the surface the sun's shadow is sampled, in metres: the
+// light's normal bias scaled to the texel of the cascade this depth
+// reads, as bevy_pbr::shadows::sample_directional_cascade does per pixel
+// from the normal. The fragment no longer carries the normal, so the
+// offset is applied here. In a blend band the next cascade is read too,
+// with a larger texel: its bias serves both, a little more than the
+// first needs. 0 with shadows off.
+fn shadow_normal_bias(world_position: vec3<f32>) -> f32 {
+    if sun.params.x == 0.0 {
+        return 0.0;
+    }
+    let depth = -view_depth(world_position);
+    let n_cascades = u32(sun.params.w);
+    // bevy_pbr::shadows::get_cascade_index: the first cascade whose far
+    // bound is past this depth.
+    var c = n_cascades;
+    for (var i = 0u; i < n_cascades; i++) {
+        if depth < sun.far_bounds[i] {
+            c = i;
+            break;
         }
     }
-    return 0.30 + 0.20 * sky + 0.65 * sun;
+    if c >= n_cascades {
+        return 0.0;
+    }
+    if c + 1u < n_cascades && depth >= (1.0 - sun.params.z) * sun.far_bounds[c] {
+        c += 1u;
+    }
+    return sun.params.y * sun.texel_sizes[c];
+}
+
+// How much of the scene's sun reaches this point, 0..1: the first
+// directional light's shadow cascades at a position already pushed off
+// the surface by the normal bias, so no normal goes in. 1 past the last
+// cascade or with shadows off (FL_SHADOWS=0).
+fn sun_shadow(shadow_position: vec3<f32>, frag_xy: vec2<f32>) -> f32 {
+    if (lights.directional_lights[0].flags & DIRECTIONAL_LIGHT_FLAGS_SHADOWS_ENABLED_BIT) == 0u {
+        return 1.0;
+    }
+    let p = vec4<f32>(shadow_position, 1.0);
+    return fetch_directional_shadow(0u, p, vec3<f32>(0.0), view_depth(shadow_position), frag_xy);
 }
 
 @fragment
 fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
+    // rgb = team colour, a = death darkening.
+    let team = unpack4x8unorm(in.packed.x);
+    let flash = unpack4x8unorm(in.packed.y).x;
 #ifdef UNIT_ATLAS
     // The atlas mask tints rather than replaces, so cloth keeps its weave
     // under the team colour.
     let texel = textureSample(unit_atlas, unit_atlas_sampler, in.atlas_uv);
-    let tint = mix(vec3<f32>(1.0), in.team, texel.a);
+    let tint = mix(vec3<f32>(1.0), team.rgb, texel.a);
     var rgb = in.color.rgb * texel.rgb * tint;
 #else
     var rgb = in.color.rgb;
 #endif
-    rgb *= unit_light(in.world_position, in.world_normal, in.clip_position.xy);
-    rgb = mix(rgb, vec3<f32>(1.0, 1.0, 1.0), in.color.a * 0.8);
-    rgb = rgb * (1.0 - 0.45 * in.death);
+    // The sun's share of the light, less what its shadow takes. A face
+    // turned from the sun has no share and skips the lookup.
+    if in.color.a > 0.0 {
+        rgb *= 1.0 - in.color.a * (1.0 - sun_shadow(in.shadow_position, in.clip_position.xy));
+    }
+    rgb = mix(rgb, vec3<f32>(1.0, 1.0, 1.0), flash * 0.8);
+    rgb = rgb * (1.0 - 0.45 * team.a);
     return vec4<f32>(rgb, 1.0);
 }

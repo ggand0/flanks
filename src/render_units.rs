@@ -1175,10 +1175,10 @@ pub(crate) struct CustomPipeline {
     mesh_pipeline: MeshPipeline,
     /// Group 3 of a pulled bucket: the instance records, the index list,
     /// the bucket's mesh corners, the bucket table, then the atlas, its
-    /// sampler and the rig.
+    /// sampler, the rig and the sun.
     pub(crate) pull_layout: BindGroupLayoutDescriptor,
-    /// Group 3 of an instanced bucket: the atlas, its sampler and the rig,
-    /// at the same bindings as in `pull_layout`.
+    /// Group 3 of an instanced bucket: the atlas, its sampler, the rig and
+    /// the sun, at the same bindings as in `pull_layout`.
     bucket_layout: BindGroupLayoutDescriptor,
     /// One white texel with no team mask. An untextured bucket binds it to
     /// fill the atlas slot, and a textured one until its atlas uploads.
@@ -1209,6 +1209,10 @@ pub(crate) fn init_custom_pipeline(
 ) {
     let rig = || {
         binding_types::uniform_buffer_sized(false, None).visibility(ShaderStages::VERTEX)
+    };
+    let sun = || {
+        binding_types::uniform_buffer::<crate::render_units_shadow::SunUniform>(false)
+            .visibility(ShaderStages::VERTEX)
     };
     let clips = || {
         binding_types::storage_buffer_read_only_sized(false, None)
@@ -1255,6 +1259,7 @@ pub(crate) fn init_custom_pipeline(
                     ),
                     (6, rig()),
                     (7, clips()),
+                    (8, sun()),
                 ),
             ),
         ),
@@ -1267,6 +1272,7 @@ pub(crate) fn init_custom_pipeline(
                     (5, binding_types::sampler(SamplerBindingType::Filtering)),
                     (6, rig()),
                     (7, clips()),
+                    (8, sun()),
                 ),
             ),
         ),
@@ -1319,11 +1325,15 @@ fn prepare_bucket_bind_groups(
     pipeline_cache: Res<PipelineCache>,
     device: Res<RenderDevice>,
     images: Res<RenderAssets<GpuImage>>,
+    sun: Res<crate::render_units_shadow::SunBuffer>,
     buckets: Query<
         (Entity, Option<&ExtractedAtlas>, &RigBuffer, Option<&BucketBindGroup>),
         (With<ExtractedInstances>, Without<PullMeshGpu>),
     >,
 ) {
+    let Some(sun) = sun.binding() else {
+        return;
+    };
     for (entity, atlas, rig, existing) in &buckets {
         if existing.is_some_and(|b| b.settled) {
             continue;
@@ -1337,6 +1347,7 @@ fn prepare_bucket_bind_groups(
                 (5, sampler),
                 (6, rig.rig.as_entire_binding()),
                 (7, rig.clips.as_entire_binding()),
+                (8, sun.clone()),
             )),
         );
         commands.entity(entity).insert(BucketBindGroup {

@@ -991,7 +991,7 @@ fn prepare_gpu_units(
 }
 
 /// Group 3 of every pulled bucket, rebuilt when the shared buffers moved.
-#[allow(clippy::type_complexity)] // bevy system params
+#[allow(clippy::too_many_arguments, clippy::type_complexity)] // bevy system params
 fn prepare_pull_bind_groups(
     mut commands: Commands,
     buffers: Res<GpuUnitBuffers>,
@@ -999,6 +999,7 @@ fn prepare_pull_bind_groups(
     pipeline_cache: Res<PipelineCache>,
     device: Res<RenderDevice>,
     images: Res<RenderAssets<GpuImage>>,
+    sun: Res<crate::render_units_shadow::SunBuffer>,
     meshes: Query<(
         Entity,
         &PullMeshGpu,
@@ -1007,7 +1008,7 @@ fn prepare_pull_bind_groups(
         Option<&PulledBucketGpu>,
     )>,
 ) {
-    let Some(alloc) = &buffers.alloc else {
+    let (Some(alloc), Some(sun)) = (&buffers.alloc, sun.binding()) else {
         return;
     };
     for (entity, mesh, atlas, rig, existing) in &meshes {
@@ -1037,6 +1038,7 @@ fn prepare_pull_bind_groups(
                     (5, sampler),
                     (6, rig.rig.as_entire_binding()),
                     (7, rig.clips.as_entire_binding()),
+                    (8, sun.clone()),
                 )),
             )
         };

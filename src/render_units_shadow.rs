@@ -54,6 +54,8 @@ use bevy::{
     },
 };
 
+use bevy::render::extract_resource::{ExtractResource, ExtractResourcePlugin};
+
 use crate::render_units::{
     CustomPipeline, DrawMeshInstanced, ExtractedBucket, NUM_BUCKETS, NUM_LODS, PullPipelineKey,
     UnitMeshKey,
@@ -62,6 +64,79 @@ use crate::render_units_gpu::{
     GpuUnitBuffers, GpuUnitInput, MAX_CASCADES, PullMeshGpu, PulledBucketGpu,
 };
 use crate::unit_types::NUM_KINDS;
+
+/// The scene's sun as the unit vertex shader needs it (`Sun` in
+/// unit_instancing.wgsl): Bevy binds its lights uniform to the fragment
+/// stage only, and the unit shader lights per vertex. Filled once per
+/// frame after Bevy updates the cascades, extracted as is.
+#[derive(Resource, Clone, Copy, Default, ExtractResource, ShaderType)]
+pub(crate) struct SunUniform {
+    /// xyz = direction toward the sun, zero without a light.
+    direction_to_light: Vec4,
+    /// x = 1 with shadow maps on, y = the light's shadow normal bias,
+    /// z = the cascade overlap proportion, w = the cascade count.
+    params: Vec4,
+    /// Per cascade: its far bound in view depth, and its texel in metres.
+    far_bounds: Vec4,
+    texel_sizes: Vec4,
+}
+
+#[allow(clippy::type_complexity)] // bevy system params
+fn update_sun_uniform(
+    camera: Query<Entity, With<Camera3d>>,
+    lights: Query<(
+        &DirectionalLight,
+        &GlobalTransform,
+        &bevy::light::CascadeShadowConfig,
+        &bevy::light::Cascades,
+    )>,
+    mut uniform: ResMut<SunUniform>,
+) {
+    let mut u = SunUniform::default();
+    if let Some((light, transform, config, cascades)) = lights.iter().next() {
+        u.direction_to_light = transform.back().as_vec3().extend(0.0);
+        let cascades = camera
+            .single()
+            .ok()
+            .filter(|_| light.shadow_maps_enabled)
+            .and_then(|cam| cascades.cascades.get(&cam));
+        if let Some(cascades) = cascades {
+            u.params = Vec4::new(
+                1.0,
+                light.shadow_normal_bias,
+                config.overlap_proportion,
+                cascades.len().min(MAX_CASCADES) as f32,
+            );
+            for (c, cascade) in cascades.iter().take(MAX_CASCADES).enumerate() {
+                u.far_bounds[c] = config.bounds[c];
+                u.texel_sizes[c] = cascade.texel_size;
+            }
+        }
+    }
+    *uniform = u;
+}
+
+/// Render world: the uniform's buffer, bound at group 3 binding 8 of
+/// every unit draw. Written every frame, allocated once.
+#[derive(Resource, Default)]
+pub(crate) struct SunBuffer(UniformBuffer<SunUniform>);
+
+impl SunBuffer {
+    /// The binding, once the first frame wrote the buffer.
+    pub(crate) fn binding(&self) -> Option<BindingResource<'_>> {
+        self.0.binding()
+    }
+}
+
+fn prepare_sun_buffer(
+    uniform: Res<SunUniform>,
+    mut buffer: ResMut<SunBuffer>,
+    device: Res<RenderDevice>,
+    queue: Res<RenderQueue>,
+) {
+    buffer.0.set(*uniform);
+    buffer.0.write_buffer(&device, &queue);
+}
 
 /// Detail levels that cast: soldiers the camera would draw at L0 or L1.
 pub(crate) const CAST_LODS: usize = 2;
@@ -367,8 +442,16 @@ pub struct UnitShadowPlugin;
 impl Plugin for UnitShadowPlugin {
     fn build(&self, app: &mut App) {
         app.register_diagnostic(Diagnostic::new(SHADOW_PASS_GPU).with_suffix(" ms"))
-            .add_systems(Update, publish_shadow_pass_time);
+            .init_resource::<SunUniform>()
+            .add_plugins(ExtractResourcePlugin::<SunUniform>::default())
+            .add_systems(Update, publish_shadow_pass_time)
+            .add_systems(
+                PostUpdate,
+                update_sun_uniform
+                    .after(bevy::light::SimulationLightSystems::UpdateDirectionalLightCascades),
+            );
         app.sub_app_mut(RenderApp)
+            .init_resource::<SunBuffer>()
             .init_resource::<UnitShadowBindGroups>()
             .init_resource::<SpecializedRenderPipelines<UnitShadowPipeline>>()
             .init_resource::<SpecializedMeshPipelines<UnitShadowPipeline>>()
@@ -387,6 +470,7 @@ impl Plugin for UnitShadowPlugin {
                     queue_unit_shadows
                         .in_set(RenderSystems::QueueMeshes)
                         .after(queue_shadows),
+                    prepare_sun_buffer.in_set(RenderSystems::PrepareResources),
                     prepare_unit_shadow_bind_groups.in_set(RenderSystems::PrepareBindGroups),
                     shadow_timer_map.in_set(RenderSystems::Cleanup),
                 ),
