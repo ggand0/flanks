@@ -92,7 +92,7 @@ pub struct InterfaceSettings {
     pub debug_overlay: bool,
     /// Soldiers flash white when hit.
     pub hit_flash: bool,
-    /// The front line drawn along the fighting (still under G).
+    /// The front line drawn along the fighting. G hides it too.
     pub front_line: bool,
 }
 

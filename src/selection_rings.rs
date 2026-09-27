@@ -52,11 +52,11 @@ use crate::render_units_gpu::{GpuSyncConfig, GpuUnitBuffers, RING_ARG};
 use crate::unit_types::NUM_KINDS;
 
 /// Ring radius in metres: the move preview's slot circles
-/// (orders.rs `draw_line_preview`), so a slot of the preview and the
+/// (orders.rs `draw_order_preview`), so a slot of the preview and the
 /// soldier who takes it read the same.
 const RADIUS: f32 = 0.42;
-/// The facing notch on the front of the ring.
-const NOTCH: bool = true;
+/// The teardrop point on the front of the ring, where the soldier faces.
+const FACING_POINT: bool = true;
 
 /// Ring styles, in the order unit_rings.wgsl indexes its colours.
 const STYLE_SELECTED: u32 = 0;
@@ -152,7 +152,7 @@ struct RingParams {
     half_heights: Vec4,
     /// xy = the height field's origin, z = its cell, w = the ring radius.
     terrain: Vec4,
-    /// xy = the height field's vertex counts, z = 1 with the facing notch,
+    /// xy = the height field's vertex counts, z = 1 with the facing point,
     /// w = the first ring entry in the entry buffer.
     grid: UVec4,
 }
@@ -188,8 +188,8 @@ fn extract_rings(mut main_world: ResMut<MainWorld>, mut input: ResMut<RingInput>
         let l = c.to_linear();
         Vec4::new(l.red, l.green, l.blue, a)
     };
-    // Toned down from the move preview's slot green and the old hostile
-    // tint: a dense formation fills the ground with them.
+    // Muted colours: a dense formation covers the ground with them, and a
+    // bright one glares.
     let green = Color::srgb(0.42, 0.74, 0.46);
     input.params = RingParams {
         colors: [
@@ -199,7 +199,7 @@ fn extract_rings(mut main_world: ResMut<MainWorld>, mut input: ResMut<RingInput>
         ],
         half_heights: Vec4::from_array(std::array::from_fn(crate::unit_types::half_height)),
         terrain: Vec4::new(terrain.origin.x, terrain.origin.y, crate::terrain::CELL, RADIUS),
-        grid: UVec4::new(terrain.verts.x, terrain.verts.y, NOTCH as u32, 0),
+        grid: UVec4::new(terrain.verts.x, terrain.verts.y, FACING_POINT as u32, 0),
     };
 }
 

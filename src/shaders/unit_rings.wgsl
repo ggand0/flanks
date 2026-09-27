@@ -22,7 +22,7 @@ struct RingParams {
     half_heights: vec4<f32>,
     // xy = the height field's origin, z = its cell, w = the ring radius.
     terrain: vec4<f32>,
-    // xy = the height field's vertex counts, z = 1 with the facing notch,
+    // xy = the height field's vertex counts, z = 1 with the facing point,
     // w = the first ring entry in `entries`.
     grid: vec4<u32>,
 };
@@ -37,7 +37,7 @@ struct RingParams {
 // The quad's half size in ring radii: room for the point.
 const EXTENT: f32 = 1.5;
 // Opacity of the whole shape, before the style's scale. One even fill: a
-// brighter rim stacked the colour up where formations are dense.
+// brighter rim would stack the colour up where formations are dense.
 const FILL: f32 = 0.45;
 // The point's tip, in ring radii from the centre. The two lines from the
 // tip that touch the circle close the teardrop.

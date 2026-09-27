@@ -651,9 +651,9 @@ impl PileSetup {
 }
 
 /// FL_TEST_PILE=1: the pile-on order: blue regiments in a 3x2 block,
-/// ALL attack-ordered at one orange regiment (the blob repro with six).
+/// all attack-ordered at one orange regiment (the blob repro with six).
 /// Acceptance: the fight crowds the victim's perimeter and the second
-/// wave stands PRESSED against the fighting mass (not parked at parade
+/// wave stands pressed against the fighting mass (not parked at parade
 /// pitch, not smeared into one ball); the victim collapses; blues
 /// re-dress rectangles afterward.
 fn spawn_pile_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups, setup: PileSetup) {
