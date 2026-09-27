@@ -3,3 +3,4 @@
 assets/units/*.glb filter=lfs diff=lfs merge=lfs -text
 assets/terrain/*.ktx2 filter=lfs diff=lfs merge=lfs -text
 assets/terrain/*.png filter=lfs diff=lfs merge=lfs -text
+assets/vegetation/*.glb filter=lfs diff=lfs merge=lfs -text
