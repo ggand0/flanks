@@ -240,16 +240,21 @@ impl LodBands {
     }
 }
 
-/// Shadow texels Bevy's default shadow filter (its 5x5 texel Gaussian
-/// PCF) blurs together: detail narrower than this does not show.
-const SHADOW_FILTER_TEXELS: f32 = 2.0;
+/// Width of Bevy's default shadow filter in shadow texels: its Gaussian
+/// PCF (`sample_shadow_map_castano_thirteen`) takes taps from two texels
+/// either side of the pixel's own, so an outline detail narrower than
+/// five texels is smeared before it reaches the screen.
+const SHADOW_FILTER_TEXELS: f32 = 5.0;
 
 /// The level a soldier of `kind` casts his shadow with into a sun cascade
 /// of `texel` metres per shadow texel: the level the camera picks for a
 /// soldier as many pixels tall as his shadow can show detail, his height
-/// in shadow texels over what the filter blurs together. As in
-/// `LodBands::level`, the farthest threshold passed wins.
-/// `FL_SHADOW_FILTER_TEXELS=1` casts at full texel detail, for A/B passes.
+/// in shadow texels over the filter's width. As in `LodBands::level`, the
+/// farthest threshold passed wins. In the 40 m view that is L2 into the
+/// first cascade and L3 into the second; crops of the foreground knights
+/// at L1 and L2 look the same, and the shadow pass costs a third
+/// (devlog 0147). `FL_SHADOW_FILTER_TEXELS=2` casts a level finer, for
+/// A/B passes.
 pub(crate) fn shadow_level(cfg: &LodConfig, kind: usize, texel: f32) -> usize {
     static FILTER: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
     let filter = *FILTER.get_or_init(|| {
