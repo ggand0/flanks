@@ -234,7 +234,11 @@ fn respawn_vegetation(
                 let (x, z) = (-495.0, tree.review_z);
                 commands
                     .spawn((
-                        Transform::from_xyz(x, terrain.height_at(x, z) - 0.08, z),
+                        Transform::from_xyz(
+                            x,
+                            terrain.height_at(x, z) - (levels[0].height * 0.01).clamp(0.01, 0.08),
+                            z,
+                        ),
                         Visibility::Inherited,
                         Plants,
                         TreeLevel { asset, level: 0 },
@@ -355,6 +359,7 @@ struct TreePart {
 struct TreeMesh {
     parts: Vec<TreePart>,
     height: f32,
+    detail_size: f32,
 }
 
 #[derive(Component)]
@@ -421,6 +426,12 @@ fn load_trees(
             [3000, 700, 4],
         ),
         (
+            "shrub_b_v4",
+            "shrub_b_v4_fuller/shrub_b/tree.glb",
+            0.0,
+            [1900, 120, 4],
+        ),
+        (
             "silver_birch_warm",
             "birch_warm_v1/birch_warm/silver_birch/tree.glb",
             12.0,
@@ -455,15 +466,24 @@ fn load_trees(
                         })
                     })
                     .collect();
-                let levels = levels.map(|(parts, height)| TreeMesh {
-                    parts: parts
-                        .into_iter()
-                        .map(|(mesh, material)| TreePart {
-                            mesh: meshes.add(mesh),
-                            material: material_handles[material].clone(),
-                        })
-                        .collect(),
-                    height,
+                let levels = levels.map(|(parts, height)| {
+                    // Broad, low shrubs need detail while their crown is still wide on screen.
+                    let detail_size = parts
+                        .iter()
+                        .filter_map(|(mesh, _)| mesh.compute_aabb())
+                        .map(|bounds| (bounds.half_extents * 2.0).max_element())
+                        .fold(height, f32::max);
+                    TreeMesh {
+                        parts: parts
+                            .into_iter()
+                            .map(|(mesh, material)| TreePart {
+                                mesh: meshes.add(mesh),
+                                material: material_handles[material].clone(),
+                            })
+                            .collect(),
+                        height,
+                        detail_size,
+                    }
                 });
                 info!(
                     "vegetation: loaded {name} L0/L1/card from {}",
@@ -808,7 +828,8 @@ fn select_tree_level(
         let levels = &tree.levels;
         let centre = transform.translation + Vec3::Y * levels[0].height * 0.5;
         let distance = camera_transform.translation.distance(centre).max(1.0);
-        let pixels = levels[0].height * viewport / (2.0 * (perspective.fov * 0.5).tan() * distance);
+        let pixels =
+            levels[0].detail_size * viewport / (2.0 * (perspective.fov * 0.5).tan() * distance);
         let mut next = match selected.level {
             0 if pixels < 16.0 => 2,
             0 if pixels < 108.0 => 1,
@@ -827,7 +848,7 @@ fn select_tree_level(
         }
         if next != selected.level {
             debug!(
-                "vegetation: {} level {next}, projected height {pixels:.1} px",
+                "vegetation: {} level {next}, projected size {pixels:.1} px",
                 tree.name
             );
             selected.level = next;
