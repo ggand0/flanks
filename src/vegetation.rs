@@ -227,7 +227,7 @@ fn respawn_vegetation(
         commands.entity(e).despawn();
     }
     match terrain.kind {
-        MapKind::Grassland => {
+        MapKind::Grassland | MapKind::Sandbox => {
             for (asset, tree) in trees.0.iter().enumerate() {
                 let levels = &tree.levels;
                 // Review specimens stay inside the western scenery margin.
