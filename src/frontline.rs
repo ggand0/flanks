@@ -332,8 +332,10 @@ struct RegimentSums {
     line_n: u32,
     fight_n: u32,
     /// Of `fight_n`, the men striking a man of the regiment's attack
-    /// target.
+    /// target, and of `line_sum`/`line_n` their share.
     target_fight_n: u32,
+    target_line_sum: f32,
+    target_line_n: u32,
 }
 
 fn update_groups(
@@ -388,6 +390,8 @@ fn update_groups(
                     line_n: 0,
                     fight_n: 0,
                     target_fight_n: 0,
+                    target_line_sum: 0.0,
+                    target_line_n: 0,
                 };
                 for &(s, e) in runs.of(g) {
                     for i in s as usize..e as usize {
@@ -413,7 +417,8 @@ fn update_groups(
                         {
                             a.fight_n += 1;
                             let ti = units.target[i] as usize;
-                            if ti < units.len() && Some(units.group[ti]) == tg {
+                            let at_target = ti < units.len() && Some(units.group[ti]) == tg;
+                            if at_target {
                                 a.target_fight_n += 1;
                             }
                             if ti < units.len() {
@@ -421,6 +426,10 @@ fn update_groups(
                                 if d.dot(f) > 0.5 * d.length() {
                                     a.line_sum += p.dot(f);
                                     a.line_n += 1;
+                                    if at_target {
+                                        a.target_line_sum += p.dot(f);
+                                        a.target_line_n += 1;
+                                    }
                                 }
                             }
                         }
@@ -504,12 +513,14 @@ fn update_groups(
         }
         let engaged = group.engage_hold > 0;
         let lock_threshold = ((group.count as f32 * ENGAGE_LOCK_FRAC) as u32).max(ENGAGE_LOCK_FLOOR);
-        // A new attack target while fighting: the regiment breaks off its
-        // fight and marches on the new one (orders.rs `retarget`), until
-        // enough of its men fight the new target or it disengages.
+        // A new attack target while fighting (orders.rs `retarget`): the
+        // regiment leaves its fight and marches on the new one, and its
+        // melee, when it comes, is with that target alone. It lasts while
+        // the order stands and the regiment stays engaged.
         let target = attack_target[g];
-        if engaged && target.is_some() && target != group.seen_target && !group.retarget {
+        if engaged && target.is_some() && target != group.seen_target {
             group.retarget = true;
+            group.melee_ticks = 0;
             if group.contact {
                 group.contact = false;
                 info!("regiment {g} releases its contact frame");
@@ -517,15 +528,22 @@ fn update_groups(
             info!("regiment {g} breaks off for its new target");
         }
         group.seen_target = target;
-        if group.retarget
-            && (!engaged || target.is_none() || sums[g].target_fight_n >= lock_threshold)
-        {
+        if group.retarget && (!engaged || target.is_none()) {
             group.retarget = false;
-            info!("regiment {g} fights its new target");
+            info!("regiment {g} ends its break-off");
         }
-        // Under a Move order, or breaking off for a new target, the
-        // regiment has no fight: its melee clock stops.
-        let moving = matches!(group.order, Some(crate::orders::Order::Move(_))) || group.retarget;
+        // The men who count toward starting a melee and laying a contact
+        // frame: all who strike, or after a retarget only those striking
+        // the target.
+        let (fight_n, line_sum, line_n) = if group.retarget {
+            (sums[g].target_fight_n, sums[g].target_line_sum, sums[g].target_line_n)
+        } else {
+            (sums[g].fight_n, sums[g].line_sum, sums[g].line_n)
+        };
+        // Under a Move order, or on the way to a new target, the regiment
+        // has no fight: its melee clock stops.
+        let breaking_off = group.retarget && group.melee_ticks == 0 && fight_n < lock_threshold;
+        let moving = matches!(group.order, Some(crate::orders::Order::Move(_))) || breaking_off;
         if engaged != group.engaged {
             info!(
                 "regiment {g} {}",
@@ -559,8 +577,11 @@ fn update_groups(
             && !group.state.is_broken()
             && !group.crashing
             && !moving
-            && (group.melee_ticks > 0 || sums[g].fight_n >= lock_threshold)
+            && (group.melee_ticks > 0 || fight_n >= lock_threshold)
         {
+            if group.retarget && group.melee_ticks == 0 {
+                info!("regiment {g} fights its new target");
+            }
             group.melee_ticks = group.melee_ticks.saturating_add(1);
         } else {
             // The melee is over: its men come back into formation
@@ -580,9 +601,12 @@ fn update_groups(
         // No fight point without a fight: a Move order takes the regiment
         // out (M2TW's WITHDRAW, devlog 0120), so its men leave the melee
         // and walk where they were sent.
+        // An ordered target stays the fight while it has men, routing
+        // too: the regiment pursues it, as its march does (orders.rs
+        // `goal`), instead of turning to whatever formed enemy is near.
         group.fight_point = if group.melee_ticks > 0 && !group.hold && !moving {
             match group.order {
-                Some(crate::orders::Order::Attack(t)) if counts[t as usize] > 0 && !broken[t as usize] => {
+                Some(crate::orders::Order::Attack(t)) if counts[t as usize] > 0 => {
                     Some(cents[t as usize])
                 }
                 _ => nearest_formed,
@@ -594,14 +618,8 @@ fn update_groups(
             if counts[t as usize] > 0 && !broken[t as usize]);
         let formed = group.shape == crate::formation::FormShape::Rect
             && !group.state.is_broken();
-        let starts = sums[g].fight_n >= lock_threshold;
-        if formed
-            && attacking
-            && engaged
-            && !group.crashing
-            && !group.retarget
-            && (group.contact || starts)
-        {
+        let starts = fight_n >= lock_threshold;
+        if formed && attacking && engaged && !group.crashing && (group.contact || starts) {
             let f = fwd[g];
             let r = Vec2::new(f.y, -f.x);
             if !group.contact {
@@ -615,8 +633,8 @@ fn update_groups(
                     _ => (group.centroid - group.home_bias).dot(r),
                 };
                 let mut depth = (group.centroid - group.home_bias).dot(f);
-                if sums[g].line_n > 0 {
-                    depth = sums[g].line_sum / sums[g].line_n as f32 - sums[g].front_off;
+                if line_n > 0 {
+                    depth = line_sum / line_n as f32 - sums[g].front_off;
                 }
                 group.anchor = r * group.contact_lateral + f * depth;
                 info!("regiment {g} holds a contact frame");

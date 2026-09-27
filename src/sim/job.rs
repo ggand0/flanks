@@ -78,6 +78,7 @@ pub struct TickJob {
     pub(crate) reg_broken: Vec<bool>,
     pub(crate) press: Vec<bool>,
     pub(crate) moving: Vec<bool>,
+    pub(crate) focus: Vec<Option<u32>>,
     pub(crate) engaged: Vec<bool>,
     pub(crate) contact: Vec<bool>,
     pub(crate) fight_point: Vec<Option<Vec2>>,
@@ -479,11 +480,25 @@ fn snapshot_regiments(job: &mut TickJob, groups: &Groups, terrain: &Terrain) {
     // pushing through what blocks them and striking only whoever stands in
     // front of them; they close on no enemy and go after none they see. A
     // regiment breaking off for a new attack target does the same on its
-    // way there (orders.rs `retarget`).
+    // way there (orders.rs `retarget`), until its melee with the target
+    // starts.
     let moving: Vec<bool> = groups
         .list
         .iter()
-        .map(|g| matches!(g.order, Some(crate::orders::Order::Move(_))) || g.retarget)
+        .map(|g| {
+            matches!(g.order, Some(crate::orders::Order::Move(_)))
+                || (g.retarget && g.melee_ticks == 0)
+        })
+        .collect();
+    // Once that melee starts, its men fight the target alone: they strike,
+    // close on and go after only its men, and leave the old enemy be.
+    let focus: Vec<Option<u32>> = groups
+        .list
+        .iter()
+        .map(|g| match g.order {
+            Some(crate::orders::Order::Attack(t)) if g.retarget && g.melee_ticks > 0 => Some(t),
+            _ => None,
+        })
         .collect();
     // Regiments in combat-watch range of an enemy (sparse-fight
     // acquisition). HOLD regiments never acquire wide: they stand their
@@ -566,6 +581,7 @@ fn snapshot_regiments(job: &mut TickJob, groups: &Groups, terrain: &Terrain) {
     job.reg_broken = group_broken;
     job.press = press;
     job.moving = moving;
+    job.focus = focus;
     job.engaged = engaged;
     job.contact = contact;
     job.fight_point = fight_point;
