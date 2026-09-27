@@ -834,7 +834,8 @@ fn spawn_deploy_ui(commands: &mut Commands) {
                 flex_direction: FlexDirection::Column,
                 align_items: AlignItems::Center,
                 justify_content: JustifyContent::SpaceBetween,
-                padding: UiRect::top(Val::Px(10.0)).with_bottom(Val::Px(150.0)),
+                // The banner starts under the balance of power bar.
+                padding: UiRect::top(Val::Px(36.0)).with_bottom(Val::Px(150.0)),
                 ..default()
             },
             GlobalZIndex(5),

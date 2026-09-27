@@ -1,6 +1,7 @@
 mod ai;
 mod arrows;
 mod audio;
+mod balance;
 mod banners;
 mod camera;
 mod combat;
@@ -122,6 +123,7 @@ fn main() {
             camera::RtsCameraPlugin,
             overlay::OverlayPlugin,
             unit_cards::UnitCardsPlugin,
+            balance::BalancePlugin,
             picker::PickerPlugin,
         ))
         .insert_resource(Time::<Fixed>::from_hz(30.0))
