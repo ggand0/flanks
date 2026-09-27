@@ -16,6 +16,7 @@ mod picker;
 mod regiments;
 mod render_units;
 mod render_units_gpu;
+mod render_units_shadow;
 mod selection;
 mod settings;
 mod sim;
@@ -138,19 +139,47 @@ fn main() {
             ),
         ))
         .insert_resource(ClearColor(Color::srgb(0.62, 0.70, 0.78)))
+        // Bevy's default drops an unfocused window to 60 updates a
+        // second. That silently caps every fps and frame-time reading
+        // the moment the desktop gets a click, so the loop runs
+        // continuously either way: a measurement reads frames generated,
+        // and a battle keeps going behind another window.
+        .insert_resource(bevy::winit::WinitSettings {
+            focused_mode: bevy::winit::UpdateMode::Continuous,
+            unfocused_mode: bevy::winit::UpdateMode::Continuous,
+        })
         .add_systems(Startup, setup_world)
         .run();
 }
 
 /// Sun; terrain chunks come from TerrainPlugin.
-fn setup_world(mut commands: Commands) {
+fn setup_world(mut commands: Commands, settings: Res<settings::Settings>) {
     commands.spawn((
         DirectionalLight {
             illuminance: 8_000.0,
-            shadow_maps_enabled: false,
+            // The Shadows setting, or FL_SHADOWS=0, turns every sun
+            // shadow off, units included: without shadow maps the light
+            // has no cascade views for the unit draw to cast into, and
+            // the unit shader skips the lookup on the light's flag.
+            shadow_maps_enabled: settings::shadows_on(&settings),
             ..default()
         },
         // Lowish sun: flat-shaded relief needs directional contrast.
         Transform::from_rotation(Quat::from_euler(EulerRot::YXZ, 0.7, -0.75, 0.0)),
+        // Two cascades out to where soldiers stop casting (about 100 m,
+        // where the camera draws them at L2). The first covers the
+        // close-up, where a soldier's shadow at his feet needs the finest
+        // texels. Every cascade is one more view Bevy walks every mesh
+        // for each frame, plus a pass, and a third one out to 280 m held
+        // banner poles only: the hills cast nothing at this sun. Trees at
+        // distance will want it back: FL_SHADOW_CASCADES=3
+        // FL_SHADOW_DIST=280.
+        bevy::light::CascadeShadowConfigBuilder {
+            num_cascades: crate::util::env_or("FL_SHADOW_CASCADES", 2_usize).clamp(1, 4),
+            first_cascade_far_bound: 40.0,
+            maximum_distance: crate::util::env_or("FL_SHADOW_DIST", 110.0_f32).max(41.0),
+            ..default()
+        }
+        .build(),
     ));
 }

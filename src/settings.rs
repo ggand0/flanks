@@ -65,6 +65,9 @@ pub struct VideoSettings {
     pub vsync: bool,
     /// Borderless fullscreen on the current monitor.
     pub fullscreen: bool,
+    /// The sun's shadow maps. Off buys frames on a slow machine: the
+    /// shadow pass and two extra views per frame (devlog 0147).
+    pub shadows: bool,
 }
 
 impl Default for Settings {
@@ -73,7 +76,7 @@ impl Default for Settings {
             audio: AudioSettings { master: 1.0, battle: 1.0, ui: 1.0 },
             camera: CameraSettings { pan_speed: 1.0, edge_pan: true },
             controls: ControlsSettings { box_select: false },
-            video: VideoSettings { vsync: false, fullscreen: false },
+            video: VideoSettings { vsync: false, fullscreen: false, shadows: true },
         }
     }
 }
@@ -177,6 +180,7 @@ enum Toggle {
     BoxSelect,
     VSync,
     Fullscreen,
+    Shadows,
 }
 
 /// On the slider track button; fill bar and value text are looked up
@@ -214,6 +218,7 @@ impl Plugin for SettingsPlugin {
                     toggle_buttons,
                     sync_widgets,
                     apply_video,
+                    apply_shadows,
                     save_debounced,
                 ),
             )
@@ -280,6 +285,7 @@ impl Toggle {
             Self::BoxSelect => s.controls.box_select,
             Self::VSync => s.video.vsync,
             Self::Fullscreen => s.video.fullscreen,
+            Self::Shadows => s.video.shadows,
         }
     }
 
@@ -289,6 +295,7 @@ impl Toggle {
             Self::BoxSelect => s.controls.box_select = !s.controls.box_select,
             Self::VSync => s.video.vsync = !s.video.vsync,
             Self::Fullscreen => s.video.fullscreen = !s.video.fullscreen,
+            Self::Shadows => s.video.shadows = !s.video.shadows,
         }
     }
 
@@ -476,6 +483,7 @@ fn spawn_modal(commands: &mut Commands, s: &Settings) {
                 section_header(panel, "Video");
                 toggle_row(panel, "Window", Toggle::Fullscreen, s);
                 toggle_row(panel, "VSync", Toggle::VSync, s);
+                toggle_row(panel, "Shadows", Toggle::Shadows, s);
 
                 panel
                     .spawn((
@@ -670,6 +678,26 @@ fn apply_video(
     }
     if win.present_mode != present {
         win.present_mode = present;
+    }
+}
+
+/// Whether the sun casts shadow maps: the setting, and `FL_SHADOWS=0`
+/// over it for A/B runs.
+pub fn shadows_on(s: &Settings) -> bool {
+    s.video.shadows && crate::util::env_or("FL_SHADOWS", 1_u32) != 0
+}
+
+/// The shadow toggle reaches the sun: Bevy builds or drops the cascade
+/// views from the light's flag, so nothing else needs to change.
+fn apply_shadows(settings: Res<Settings>, mut lights: Query<&mut DirectionalLight>) {
+    if !settings.is_changed() {
+        return;
+    }
+    let on = shadows_on(&settings);
+    for mut light in &mut lights {
+        if light.shadow_maps_enabled != on {
+            light.shadow_maps_enabled = on;
+        }
     }
 }
 

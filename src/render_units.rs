@@ -47,7 +47,7 @@ use crate::units::Units;
 
 /// Bounding-sphere radius for per-instance frustum culling: cube diagonal
 /// plus a generous margin so nothing pops inside the screen edge.
-const CULL_RADIUS: f32 = 2.5;
+pub(crate) const CULL_RADIUS: f32 = 2.5;
 
 /// Instances drawn this frame after culling (overlay diagnostics).
 #[derive(Resource, Default)]
@@ -118,6 +118,10 @@ pub struct InstanceMaterialData(pub Vec<InstanceData>);
 /// per-instance color.
 #[derive(Component)]
 pub struct InstanceBucket(pub usize);
+
+/// Render world: the bucket a unit draw entity holds. Arrows have none.
+#[derive(Component, Clone, Copy)]
+pub(crate) struct ExtractedBucket(pub usize);
 
 /// Detail levels per unit kind: L0 is the full mesh, the last level a
 /// couple of blocks for soldiers a few pixels tall.
@@ -223,6 +227,20 @@ impl LodBands {
         bands
     }
 
+    /// The nearest distance at which any kind can show level `lod`: its
+    /// switch distance for the kind that switches soonest, less the
+    /// jitter that pulls a soldier's switch in. Infinite when no kind
+    /// ever reaches the level.
+    pub(crate) fn level_start(&self, lod: usize) -> f32 {
+        if lod == 0 {
+            return 0.0;
+        }
+        self.plain
+            .iter()
+            .map(|t| t[lod - 1].sqrt() / (1.0 + 0.5 * LOD_JITTER))
+            .fold(f32::INFINITY, f32::min)
+    }
+
     /// Level for a squared distance: the farthest threshold passed wins.
     #[inline]
     fn level(thresholds: &[f32; NUM_LODS - 1], d2: f32) -> u8 {
@@ -234,6 +252,36 @@ impl LodBands {
         }
         lod
     }
+}
+
+/// Width of Bevy's default shadow filter in shadow texels: its Gaussian
+/// PCF (`sample_shadow_map_castano_thirteen`) takes taps from two texels
+/// either side of the pixel's own, so an outline detail narrower than
+/// five texels is smeared before it reaches the screen.
+const SHADOW_FILTER_TEXELS: f32 = 5.0;
+
+/// The level a soldier of `kind` casts his shadow with into a sun cascade
+/// of `texel` metres per shadow texel: the level the camera picks for a
+/// soldier as many pixels tall as his shadow can show detail, his height
+/// in shadow texels over the filter's width. As in `LodBands::level`, the
+/// farthest threshold passed wins. In the 40 m view that is L2 into the
+/// first cascade and L3 into the second; crops of the foreground knights
+/// at L1 and L2 look the same, and the shadow pass costs a third
+/// (devlog 0147). `FL_SHADOW_FILTER_TEXELS=2` casts a level finer, for
+/// A/B passes.
+pub(crate) fn shadow_level(cfg: &LodConfig, kind: usize, texel: f32) -> usize {
+    static FILTER: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    let filter = *FILTER.get_or_init(|| {
+        crate::util::env_or("FL_SHADOW_FILTER_TEXELS", SHADOW_FILTER_TEXELS).max(0.25)
+    });
+    let px = 2.0 * crate::unit_types::half_height(kind) / (texel * filter).max(1e-6);
+    cfg.px[kind]
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| **t > 0.0 && px < **t)
+        .map(|(j, _)| j + 1)
+        .max()
+        .unwrap_or(0)
 }
 
 /// Per-kind corpse cap (ring-buffered: oldest bodies fade from the field).
@@ -332,13 +380,19 @@ fn render_frame_end(clock: Res<RenderFrameClock>) {
 #[allow(clippy::type_complexity)] // bevy system params
 fn extract_instance_data(
     main_entities: Extract<
-        Query<(&RenderEntity, &InstanceMaterialData, Option<&UnitAtlas>, Option<&UnitRig>)>,
+        Query<(
+            &RenderEntity,
+            &InstanceMaterialData,
+            Option<&UnitAtlas>,
+            Option<&UnitRig>,
+            Option<&InstanceBucket>,
+        )>,
     >,
     mut extracted: Query<&mut ExtractedInstances>,
     mut commands: Commands,
 ) {
     let t0 = std::time::Instant::now();
-    for (render_entity, data, atlas, rig) in &main_entities {
+    for (render_entity, data, atlas, rig, bucket) in &main_entities {
         let e = render_entity.id();
         if let Ok(mut ex) = extracted.get_mut(e) {
             ex.0.clear();
@@ -351,6 +405,9 @@ fn extract_instance_data(
             }
             if let Some(rig) = rig {
                 entity.insert(rig.clone());
+            }
+            if let Some(bucket) = bucket {
+                entity.insert(ExtractedBucket(bucket.0));
             }
         }
     }
@@ -372,6 +429,7 @@ impl Plugin for UnitRenderPlugin {
             .init_resource::<LodConfig>()
             .init_resource::<Corpses>()
             .add_plugins(crate::render_units_gpu::GpuUnitRenderPlugin)
+            .add_plugins(crate::render_units_shadow::UnitShadowPlugin)
             .add_systems(Startup, setup_unit_mesh)
             // Must run after the camera moves: culling builds a FRESH
             // frustum from this frame's camera transform (the Frustum
@@ -428,6 +486,9 @@ fn setup_unit_mesh(
     // `SortedRenderPhase::render_range` skips every item after the first —
     // its draw function never runs and that bucket's units silently vanish
     // (the "LOD far bucket invisible" bug).
+    //
+    // NotShadowCaster: Bevy's own shadow queue would find no material on
+    // these entities. They cast through render_units_shadow.rs instead.
     for kind in 0..crate::unit_types::NUM_KINDS {
         let model = crate::unit_glb::kind_lods(kind);
         let lods = model.lods;
@@ -454,6 +515,7 @@ fn setup_unit_mesh(
                 rig.clone(),
                 NoFrustumCulling,
                 NoAutomaticBatching,
+                bevy::light::NotShadowCaster,
             ));
             if let Some(pulled) = pulled {
                 entity.insert(pulled);
@@ -991,10 +1053,17 @@ fn queue_custom(
         Res<BatchedInstanceBuffers<MeshUniform, MeshInputUniform>>,
     >,
     material_meshes: Query<
-        (Entity, &MainEntity, Option<&PullMeshGpu>, Has<ExtractedAtlas>),
+        (
+            Entity,
+            &MainEntity,
+            Option<&PullMeshGpu>,
+            Has<ExtractedAtlas>,
+            Option<&ExtractedBucket>,
+        ),
         With<ExtractedInstances>,
     >,
     gpu_input: Option<Res<GpuUnitInput>>,
+    receive_levels: Res<crate::render_units_shadow::ShadowReceiveLevels>,
     mut transparent_render_phases: ResMut<ViewSortedRenderPhases<Transparent3d>>,
     views: Query<&ExtractedView>,
     view_key_cache: Res<ViewKeyCache>,
@@ -1012,11 +1081,13 @@ fn queue_custom(
             continue;
         };
 
-        for (entity, main_entity, pull_mesh, atlas) in &material_meshes {
+        for (entity, main_entity, pull_mesh, atlas, bucket) in &material_meshes {
             let Some(mesh_instance) = render_mesh_instances.render_mesh_queue_data(*main_entity)
             else {
                 continue;
             };
+            // Arrows have no bucket and fly close: they receive.
+            let receive = bucket.is_none_or(|b| receive_levels.0[b.0 % NUM_LODS]);
             let Some(mesh) = meshes.get(mesh_instance.mesh_asset_id()) else {
                 continue;
             };
@@ -1037,13 +1108,14 @@ fn queue_custom(
                         bucket: pull_mesh.bucket as u32,
                         lod_debug,
                         atlas,
+                        receive,
                     },
                 ),
                 None => pipelines
                     .specialize(
                         &pipeline_cache,
                         &custom_pipeline,
-                        UnitMeshKey { mesh: key, atlas },
+                        UnitMeshKey { mesh: key, atlas, receive },
                         &mesh.layout,
                     )
                     .unwrap(),
@@ -1126,16 +1198,16 @@ pub(crate) fn prepare_instance_buffers(
     );
 }
 
-#[derive(Resource)]
+#[derive(Resource, Clone)]
 pub(crate) struct CustomPipeline {
     shader: Handle<Shader>,
     mesh_pipeline: MeshPipeline,
     /// Group 3 of a pulled bucket: the instance records, the index list,
     /// the bucket's mesh corners, the bucket table, then the atlas, its
-    /// sampler and the rig.
+    /// sampler, the rig and the sun.
     pub(crate) pull_layout: BindGroupLayoutDescriptor,
-    /// Group 3 of an instanced bucket: the atlas, its sampler and the rig,
-    /// at the same bindings as in `pull_layout`.
+    /// Group 3 of an instanced bucket: the atlas, its sampler, the rig and
+    /// the sun, at the same bindings as in `pull_layout`.
     bucket_layout: BindGroupLayoutDescriptor,
     /// One white texel with no team mask. An untextured bucket binds it to
     /// fill the atlas slot, and a textured one until its atlas uploads.
@@ -1157,7 +1229,7 @@ impl CustomPipeline {
     }
 }
 
-fn init_custom_pipeline(
+pub(crate) fn init_custom_pipeline(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
     mesh_pipeline: Res<MeshPipeline>,
@@ -1166,6 +1238,10 @@ fn init_custom_pipeline(
 ) {
     let rig = || {
         binding_types::uniform_buffer_sized(false, None).visibility(ShaderStages::VERTEX)
+    };
+    let sun = || {
+        binding_types::uniform_buffer::<crate::render_units_shadow::SunUniform>(false)
+            .visibility(ShaderStages::VERTEX)
     };
     let clips = || {
         binding_types::storage_buffer_read_only_sized(false, None)
@@ -1212,6 +1288,7 @@ fn init_custom_pipeline(
                     ),
                     (6, rig()),
                     (7, clips()),
+                    (8, sun()),
                 ),
             ),
         ),
@@ -1224,6 +1301,7 @@ fn init_custom_pipeline(
                     (5, binding_types::sampler(SamplerBindingType::Filtering)),
                     (6, rig()),
                     (7, clips()),
+                    (8, sun()),
                 ),
             ),
         ),
@@ -1276,11 +1354,15 @@ fn prepare_bucket_bind_groups(
     pipeline_cache: Res<PipelineCache>,
     device: Res<RenderDevice>,
     images: Res<RenderAssets<GpuImage>>,
+    sun: Res<crate::render_units_shadow::SunBuffer>,
     buckets: Query<
         (Entity, Option<&ExtractedAtlas>, &RigBuffer, Option<&BucketBindGroup>),
         (With<ExtractedInstances>, Without<PullMeshGpu>),
     >,
 ) {
+    let Some(sun) = sun.binding() else {
+        return;
+    };
     for (entity, atlas, rig, existing) in &buckets {
         if existing.is_some_and(|b| b.settled) {
             continue;
@@ -1294,6 +1376,7 @@ fn prepare_bucket_bind_groups(
                 (5, sampler),
                 (6, rig.rig.as_entire_binding()),
                 (7, rig.clips.as_entire_binding()),
+                (8, sun.clone()),
             )),
         );
         commands.entity(entity).insert(BucketBindGroup {
@@ -1320,6 +1403,29 @@ pub(crate) struct PullPipelineKey {
     lod_debug: bool,
     /// The bucket samples an atlas.
     atlas: bool,
+    /// The bucket's soldiers can stand inside a sun shadow cascade, so
+    /// the fragment samples the shadow (`ShadowReceiveLevels`).
+    receive: bool,
+}
+
+impl PullPipelineKey {
+    /// The depth-only variant a bucket casts its shadow with
+    /// (render_units_shadow.rs): no atlas, no level tint, no receive.
+    pub(crate) fn shadow(
+        mesh: MeshPipelineKey,
+        layout: MeshVertexBufferLayoutRef,
+        pull_mesh: &PullMeshGpu,
+    ) -> Self {
+        Self {
+            mesh,
+            layout,
+            verts: pull_mesh.count,
+            bucket: pull_mesh.bucket as u32,
+            lod_debug: false,
+            atlas: false,
+            receive: false,
+        }
+    }
 }
 
 /// Pipeline variant of an instanced bucket.
@@ -1328,6 +1434,15 @@ pub(crate) struct UnitMeshKey {
     mesh: MeshPipelineKey,
     /// The bucket samples an atlas.
     atlas: bool,
+    /// As `PullPipelineKey::receive`.
+    receive: bool,
+}
+
+impl UnitMeshKey {
+    /// The depth-only variant, as `PullPipelineKey::shadow`.
+    pub(crate) fn shadow(mesh: MeshPipelineKey) -> Self {
+        Self { mesh, atlas: false, receive: false }
+    }
 }
 
 /// Only a bucket with an atlas compiles the texture path. It carries
@@ -1338,6 +1453,20 @@ fn atlas_defs(descriptor: &mut RenderPipelineDescriptor, atlas: bool) {
         descriptor.vertex.shader_defs.push("UNIT_ATLAS".into());
         if let Some(fragment) = descriptor.fragment.as_mut() {
             fragment.shader_defs.push("UNIT_ATLAS".into());
+        }
+    }
+}
+
+/// Only a bucket whose soldiers can stand in a sun shadow cascade
+/// compiles the receive path: the shadow position rides from vertex to
+/// fragment and the fragment samples the map. The far levels carry three
+/// floats less per vertex, and they are most of the vertices in a wide
+/// view (devlog 0147).
+fn receive_defs(descriptor: &mut RenderPipelineDescriptor, receive: bool) {
+    if receive {
+        descriptor.vertex.shader_defs.push("UNIT_SHADOW_RECEIVE".into());
+        if let Some(fragment) = descriptor.fragment.as_mut() {
+            fragment.shader_defs.push("UNIT_SHADOW_RECEIVE".into());
         }
     }
 }
@@ -1365,6 +1494,7 @@ impl SpecializedRenderPipeline for CustomPipeline {
             defs.push("LOD_DEBUG".into());
         }
         atlas_defs(&mut descriptor, key.atlas);
+        receive_defs(&mut descriptor, key.receive);
         descriptor.set_layout(3, self.pull_layout.clone());
         descriptor
     }
@@ -1411,6 +1541,7 @@ impl SpecializedMeshPipeline for CustomPipeline {
         });
         descriptor.fragment.as_mut().unwrap().shader = self.shader.clone();
         atlas_defs(&mut descriptor, key.atlas);
+        receive_defs(&mut descriptor, key.receive);
         descriptor.set_layout(3, self.bucket_layout.clone());
         Ok(descriptor)
     }
@@ -1424,7 +1555,7 @@ type DrawCustom = (
     DrawMeshInstanced,
 );
 
-struct DrawMeshInstanced;
+pub(crate) struct DrawMeshInstanced;
 
 impl<P: PhaseItem> RenderCommand<P> for DrawMeshInstanced {
     type Param = (
