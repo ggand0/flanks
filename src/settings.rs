@@ -19,7 +19,7 @@
 //! Settings row are the same saved state.
 
 use bevy::ecs::hierarchy::ChildSpawnerCommands;
-use bevy::ecs::system::EntityCommands;
+use bevy::input::mouse::{AccumulatedMouseScroll, MouseScrollUnit};
 use bevy::prelude::*;
 use bevy::ui::FocusPolicy;
 use bevy::window::{MonitorSelection, PresentMode, PrimaryWindow, WindowMode};
@@ -254,6 +254,14 @@ struct TabButton(Tab);
 #[derive(Component)]
 struct TabBody(Tab);
 
+/// The scrolling node inside a tab body.
+#[derive(Component)]
+struct TabScroll;
+
+/// A tab body's scroll thumb, and the scrolling node it tracks.
+#[derive(Component)]
+struct ScrollThumb(Entity);
+
 /// On the slider track button; fill bar and value text are looked up
 /// by their own `Slider`-carrying marker components.
 #[derive(Component)]
@@ -290,6 +298,8 @@ impl Plugin for SettingsPlugin {
                     toggle_buttons,
                     tab_buttons,
                     sync_tabs,
+                    scroll_tab,
+                    sync_scroll_thumbs,
                     interface_keys.run_if(in_state(GameState::Battle)),
                     sync_widgets,
                     apply_video,
@@ -321,6 +331,9 @@ const VALUE_WIDTH: f32 = 52.0;
 /// panel under the cursor.
 const BODY_WIDTH: f32 = 560.0;
 const BODY_HEIGHT: f32 = 400.0;
+const THUMB_WIDTH: f32 = 4.0;
+/// Logical pixels one wheel notch scrolls a tab.
+const SCROLL_LINE: f32 = 32.0;
 
 impl Slider {
     /// Current position as a 0..1 fraction of the track.
@@ -607,21 +620,52 @@ fn controls_column(p: &mut ChildSpawnerCommands, sections: &[(&str, &[(&str, &st
     });
 }
 
-fn tab_body<'a>(
-    p: &'a mut ChildSpawnerCommands<'_>,
+/// A tab's body: a fixed-size area whose content scrolls with the mouse
+/// wheel when it is taller, with a thin thumb on the right showing where
+/// the view is.
+fn tab_body(
+    p: &mut ChildSpawnerCommands,
     tab: Tab,
     active: Tab,
-) -> EntityCommands<'a> {
+    content: impl FnOnce(&mut ChildSpawnerCommands),
+) {
     p.spawn((
         Node {
             display: if tab == active { Display::Flex } else { Display::None },
-            flex_direction: FlexDirection::Column,
             width: Val::Px(BODY_WIDTH),
             height: Val::Px(BODY_HEIGHT),
             ..default()
         },
         TabBody(tab),
     ))
+    .with_children(|body| {
+        let scroll = body
+            .spawn((
+                Node {
+                    flex_direction: FlexDirection::Column,
+                    width: Val::Percent(100.0),
+                    height: Val::Percent(100.0),
+                    overflow: Overflow::scroll_y(),
+                    padding: UiRect::right(Val::Px(THUMB_WIDTH + 8.0)),
+                    ..default()
+                },
+                ScrollPosition::default(),
+                TabScroll,
+            ))
+            .with_children(content)
+            .id();
+        body.spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                right: Val::Px(0.0),
+                width: Val::Px(THUMB_WIDTH),
+                ..default()
+            },
+            BackgroundColor(TRACK_BG),
+            Visibility::Hidden,
+            ScrollThumb(scroll),
+        ));
+    });
 }
 
 fn spawn_modal(commands: &mut Commands, s: &Settings, active: Tab) {
@@ -692,7 +736,7 @@ fn spawn_modal(commands: &mut Commands, s: &Settings, active: Tab) {
                         }
                     });
 
-                tab_body(panel, Tab::General, active).with_children(|body| {
+                tab_body(panel, Tab::General, active, |body| {
                     section_header(body, "Audio");
                     slider_row(body, "Master", Slider::Master, s);
                     slider_row(body, "Battle", Slider::Battle, s);
@@ -708,7 +752,7 @@ fn spawn_modal(commands: &mut Commands, s: &Settings, active: Tab) {
                     toggle_row(body, "Shadows", Toggle::Shadows, s);
                 });
 
-                tab_body(panel, Tab::Interface, active).with_children(|body| {
+                tab_body(panel, Tab::Interface, active, |body| {
                     section_header(body, "Screen");
                     toggle_row(body, "Battle HUD (F1)", Toggle::Hud, s);
                     toggle_row(body, "Unit panel (F2)", Toggle::UnitPanel, s);
@@ -719,7 +763,7 @@ fn spawn_modal(commands: &mut Commands, s: &Settings, active: Tab) {
                     toggle_row(body, "Front line", Toggle::FrontLine, s);
                 });
 
-                tab_body(panel, Tab::Controls, active).with_children(|body| {
+                tab_body(panel, Tab::Controls, active, |body| {
                     toggle_row(body, "Drag select", Toggle::BoxSelect, s);
                     body.spawn(Node {
                         flex_direction: FlexDirection::Row,
@@ -812,6 +856,57 @@ fn sync_tabs(
         let display = if body.0 == active.0 { Display::Flex } else { Display::None };
         if node.display != display {
             node.display = display;
+        }
+    }
+}
+
+/// The mouse wheel scrolls the open tab while the modal is up (the camera
+/// takes no wheel input under the modal).
+fn scroll_tab(
+    scroll: Res<AccumulatedMouseScroll>,
+    active: Res<ActiveTab>,
+    bodies: Query<(&TabBody, &Children)>,
+    mut scrolls: Query<(&mut ScrollPosition, &ComputedNode), With<TabScroll>>,
+) {
+    let lines = match scroll.unit {
+        MouseScrollUnit::Line => scroll.delta.y,
+        MouseScrollUnit::Pixel => scroll.delta.y / SCROLL_LINE,
+    };
+    if lines == 0.0 {
+        return;
+    }
+    for (body, children) in &bodies {
+        if body.0 != active.0 {
+            continue;
+        }
+        for child in children.iter() {
+            let Ok((mut pos, node)) = scrolls.get_mut(child) else { continue };
+            let max = ((node.content_size().y - node.size().y) * node.inverse_scale_factor()).max(0.0);
+            pos.y = (pos.y - lines * SCROLL_LINE).clamp(0.0, max);
+        }
+    }
+}
+
+/// Each thumb spans the visible share of its tab's content, at the scroll
+/// position. Hidden while everything fits.
+fn sync_scroll_thumbs(
+    scrolls: Query<&ComputedNode, With<TabScroll>>,
+    mut thumbs: Query<(&ScrollThumb, &mut Node, &mut Visibility)>,
+) {
+    for (thumb, mut node, mut vis) in &mut thumbs {
+        let Ok(scroll) = scrolls.get(thumb.0) else { continue };
+        let content = scroll.content_size().y;
+        let view = scroll.size().y;
+        if content <= view + 1.0 {
+            vis.set_if_neq(Visibility::Hidden);
+            continue;
+        }
+        vis.set_if_neq(Visibility::Inherited);
+        let top = Val::Percent(scroll.scroll_position.y / content * 100.0);
+        let height = Val::Percent(view / content * 100.0);
+        if node.top != top || node.height != height {
+            node.top = top;
+            node.height = height;
         }
     }
 }
