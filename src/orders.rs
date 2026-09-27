@@ -851,6 +851,7 @@ pub fn clear_arrived_orders(mut groups: ResMut<Groups>) {
 fn draw_order_gizmos(
     viz: Res<crate::sim::DebugViz>,
     groups: Res<Groups>,
+    selection: Res<Selection>,
     terrain: Res<Terrain>,
     mut gizmos: Gizmos,
 ) {
@@ -876,15 +877,15 @@ fn draw_order_gizmos(
     if !viz.0 {
         return;
     }
-    // Move-order targets (attack orders have the marker above).
-    for group in &groups.list {
+    // Move-order targets of the selected regiments (attack orders have
+    // the marker above). Every regiment's would pile up on the map.
+    for (g, group) in groups.list.iter().enumerate() {
+        if !selection.regiments.get(g).copied().unwrap_or(false) {
+            continue;
+        }
         if let Some(Order::Move(t)) = group.order {
             let base = Vec3::new(t.x, terrain.height_at(t.x, t.y) + 0.5, t.y);
-            let color = if group.team == 0 {
-                Color::srgb(0.4, 0.8, 1.0)
-            } else {
-                Color::srgb(1.0, 0.6, 0.2)
-            };
+            let color = Color::srgb(0.4, 0.8, 1.0);
             gizmos.circle(
                 Isometry3d::new(base, Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2)),
                 3.0,
