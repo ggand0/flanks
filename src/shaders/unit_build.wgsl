@@ -124,6 +124,8 @@ struct Params {
     n_cascades: u32,
     // Detail levels that cast: a soldier farther than these casts nothing.
     cast_lods: u32,
+    // The first slot of the ring list in `index_list`.
+    ring_base: u32,
 };
 
 struct DrawArgs {
@@ -140,10 +142,12 @@ struct DrawArgs {
 @group(0) @binding(4) var<storage, read_write> records: array<Record>;
 @group(0) @binding(5) var<storage, read_write> index_list: array<u32>;
 // 0..16 soldiers per bucket (living and fallen), 16..32 the fallen alone,
-// 32..48 the casters per cascade and kind (cascade * 4 + kind).
-@group(0) @binding(6) var<storage, read_write> counts: array<atomic<u32>, 48>;
-// 0..16 the camera's buckets, 16..32 the casters as in `counts`.
-@group(0) @binding(7) var<storage, read_write> args: array<DrawArgs, 32>;
+// 32..48 the casters per cascade and kind (cascade * 4 + kind), 48 the
+// selection rings.
+@group(0) @binding(6) var<storage, read_write> counts: array<atomic<u32>, 49>;
+// 0..16 the camera's buckets, 16..32 the casters as in `counts`, 32 the
+// selection rings.
+@group(0) @binding(7) var<storage, read_write> args: array<DrawArgs, 33>;
 // Copied back to the CPU by Bevy's readback plugin: the 32 counts, the
 // frame stamp and the soldier count, two spare, the 16 caster counts.
 @group(0) @binding(8) var<storage, read_write> readback: array<u32, 52>;
@@ -168,9 +172,15 @@ const SWING_RANGED: u32 = 128u;
 const REG_BROKEN: u32 = 1u;
 const REG_SELECTED: u32 = 2u;
 const REG_HOVERED: u32 = 4u;
+const REG_HOVER_OWN: u32 = 8u;
 
-const HIGHLIGHT: vec3<f32> = vec3<f32>(1.0, 1.0, 0.55);
-const HOSTILE: vec3<f32> = vec3<f32>(1.0, 0.30, 0.22);
+// Ring styles (selection_rings.rs `ring_style`).
+const RING_SELECTED: u32 = 0u;
+const RING_HOVER_OWN: u32 = 1u;
+const RING_HOVER_ENEMY: u32 = 2u;
+// The ring count in `counts`, and the rings' entry in `args`.
+const RING_COUNTER: u32 = 48u;
+const RING_ARG: u32 = 32u;
 
 // Detail level for a squared distance: the farthest threshold passed wins.
 fn level(t: vec4<f32>, d2: f32) -> u32 {
@@ -378,10 +388,6 @@ fn build_soldier(i: u32) {
     if (reg.flags & REG_BROKEN) != 0u {
         let gray = 0.299 * rgb.r + 0.587 * rgb.g + 0.114 * rgb.b;
         rgb = rgb * 0.55 + vec3<f32>(gray) * 0.45;
-    } else if (reg.flags & REG_SELECTED) != 0u {
-        rgb = rgb * 0.35 + HIGHLIGHT * 0.65;
-    } else if (reg.flags & REG_HOVERED) != 0u {
-        rgb = rgb * 0.45 + HOSTILE * 0.55;
     }
 
     // Facing interpolates like position, wrap-aware.
@@ -415,8 +421,26 @@ fn build_soldier(i: u32) {
     smoothing[i] = sm;
     if visible {
         append(kind * NUM_LODS + lod, i, lod);
+        if death_t == 0.0 && (reg.flags & (REG_SELECTED | REG_HOVERED | REG_HOVER_OWN)) != 0u {
+            append_ring(i, reg.flags, kind);
+        }
     }
     append_casters(casts, kind, i);
+}
+
+// A living soldier of a selected or hovered regiment gets a ring under
+// his feet: his record index, the ring style and his kind in one entry
+// (selection_rings.rs, unit_rings.wgsl). The enemy under the cursor wins
+// over the selection, the selection over a hovered own regiment.
+fn append_ring(i: u32, flags: u32, kind: u32) {
+    var style = RING_HOVER_OWN;
+    if (flags & REG_HOVERED) != 0u {
+        style = RING_HOVER_ENEMY;
+    } else if (flags & REG_SELECTED) != 0u {
+        style = RING_SELECTED;
+    }
+    let slot = atomicAdd(&counts[RING_COUNTER], 1u);
+    index_list[params.ring_base + slot] = i | (style << 28u) | (kind << 30u);
 }
 
 // The fallen: a frozen record in the corpse region of `records`. A cull,
@@ -484,5 +508,7 @@ fn finalize(@builtin(local_invocation_index) b: u32) {
     if b == 0u {
         readback[32u] = params.frame;
         readback[33u] = params.n;
+        // Six corners per ring (two triangles).
+        args[RING_ARG] = DrawArgs(atomicLoad(&counts[RING_COUNTER]) * 6u, 1u, 0u, 0u);
     }
 }

@@ -87,7 +87,18 @@ pub struct Terrain {
     dirty: Vec<bool>,
 }
 
+/// Vertex counts of the height field along x and z.
+pub const fn grid_verts() -> (usize, usize) {
+    (VERTS_X, VERTS_Z)
+}
+
 impl Terrain {
+    /// The vertex heights, row-major [z][x] (`grid_verts` wide and deep):
+    /// what the selection rings sample on the GPU.
+    pub fn heights(&self) -> &[f32] {
+        &self.heights
+    }
+
     pub fn min(&self) -> Vec2 {
         self.origin
     }

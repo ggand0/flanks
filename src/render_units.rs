@@ -749,7 +749,7 @@ fn attack_digit(sw: u8) -> f32 {
     if sw & crate::units::SWING_CHARGE != 0 { style + 3.0 } else { style }
 }
 
-#[allow(clippy::too_many_arguments)] // bevy system params
+#[allow(clippy::too_many_arguments, clippy::type_complexity)] // bevy system params
 fn sync_instance_data(
     units: Res<Units>,
     selection: Res<crate::orders::Selection>,
@@ -766,10 +766,12 @@ fn sync_instance_data(
     mut scratch: Local<Vec<[Vec<InstanceData>; NUM_BUCKETS]>>,
     mut corpse_scratch: Local<Vec<[Vec<InstanceData>; NUM_LODS]>>,
     mut smooth: Local<Vec<Smooth>>,
-    (gpu, frame, settings): (
+    (gpu, frame, settings, mut rings, mut ring_scratch): (
         Res<GpuSyncConfig>,
         Res<bevy::diagnostic::FrameCount>,
         Res<crate::settings::Settings>,
+        ResMut<crate::selection_rings::CpuRings>,
+        Local<Vec<Vec<(InstanceData, u32)>>>,
     ),
 ) {
     let _span = info_span!("sync_instances").entered();
@@ -809,14 +811,22 @@ fn sync_instance_data(
     let lod_debug = lod_cfg.debug;
     let cam_pos = cam_tf.translation;
 
-    const HIGHLIGHT: [f32; 4] = [1.0, 1.0, 0.55, 1.0];
-    // Attack-preview tint: the enemy regiment a right-click would target.
-    const HOSTILE: [f32; 4] = [1.0, 0.30, 0.22, 1.0];
-    let has_sel = selection.regiments.iter().any(|s| *s);
-    let hover_enemy = hover.enemy;
     // Broken regiments render desaturated (no extra instance data needed).
     let broken: Vec<bool> = groups.list.iter().map(|g| g.state.is_broken()).collect();
     let broken = &broken[..];
+    // Each regiment's ring style, as the GPU build picks it. The GPU path
+    // owns the display in check mode, so only the CPU path collects.
+    let ring_style: Vec<Option<u32>> = (0..groups.list.len())
+        .map(|g| {
+            let selected = selection.regiments.get(g).copied().unwrap_or(false) && !broken[g];
+            crate::selection_rings::ring_style(
+                selected,
+                hover.enemy == Some(g as u32),
+                hover.own == Some(g as u32),
+            )
+        })
+        .collect();
+    let ring_style = if gpu.enabled { &[][..] } else { &ring_style[..] };
     // One value per regiment: stance tier, cheer progress, wall signal.
     // Shared with the GPU path.
     let stance: Vec<f32> = groups.list.iter().map(stance_tier).collect();
@@ -833,8 +843,10 @@ fn sync_instance_data(
     if scratch.len() < n_chunks {
         scratch.resize_with(n_chunks, Default::default);
     }
+    if ring_scratch.len() < n_chunks {
+        ring_scratch.resize_with(n_chunks, Default::default);
+    }
     let units = &*units;
-    let selection = &*selection;
     let frustum = &frustum;
     let inv_dt = 1.0 / fixed_time.timestep().as_secs_f32().max(1e-6);
     // Per-unit walk-signal smoothing (~0.25 s): positional-correction
@@ -864,9 +876,10 @@ fn sync_instance_data(
     // deliberate act, not a snap.
     let wall_k = (dt / 0.5).min(1.0);
     bevy::tasks::ComputeTaskPool::get().scope(|scope| {
-        for (ci, (chunk_scratch, smooth_chunk)) in scratch
+        for (ci, ((chunk_scratch, smooth_chunk), chunk_rings)) in scratch
             .iter_mut()
             .zip(smooth.chunks_mut(SYNC_CHUNK))
+            .zip(ring_scratch.iter_mut())
             .enumerate()
             .take(n_chunks)
         {
@@ -874,6 +887,7 @@ fn sync_instance_data(
                 for vec in chunk_scratch.iter_mut() {
                     vec.clear();
                 }
+                chunk_rings.clear();
                 let start = ci * SYNC_CHUNK;
                 let end = (start + SYNC_CHUNK).min(units.len());
                 for i in start..end {
@@ -932,16 +946,6 @@ fn sync_instance_data(
                         for c in color.iter_mut().take(3) {
                             *c = *c * 0.55 + gray * 0.45;
                         }
-                    } else if has_sel
-                        && selection.regiments.get(gi).copied().unwrap_or(false)
-                    {
-                        for c in 0..3 {
-                            color[c] = color[c] * 0.35 + HIGHLIGHT[c] * 0.65;
-                        }
-                    } else if hover_enemy == Some(gi as u32) {
-                        for c in 0..3 {
-                            color[c] = color[c] * 0.45 + HOSTILE[c] * 0.55;
-                        }
                     }
                     if lod_debug {
                         lod_debug_tint(&mut color, lod);
@@ -982,13 +986,17 @@ fn sync_instance_data(
                     } else {
                         0.0
                     };
-                    chunk_scratch[bucket_of(kind, lod)].push(InstanceData {
+                    let instance = InstanceData {
                         position,
                         w: sm.bow,
                         color,
                         anim: [yaw, sm.walk, lunge, fx],
                         anim2: [sm.band, sm.wall, sm.gait, stagger],
-                    });
+                    };
+                    chunk_scratch[bucket_of(kind, lod)].push(instance);
+                    if !dying && let Some(Some(style)) = ring_style.get(gi) {
+                        chunk_rings.push((instance, style << 28 | (kind as u32) << 30));
+                    }
                 }
             });
         }
@@ -1022,6 +1030,15 @@ fn sync_instance_data(
         for chunk_scratch in scratch.iter().take(n_chunks) {
             data.extend_from_slice(&chunk_scratch[b]);
         }
+    }
+    // The rings' records, and one entry per ring pointing at its record
+    // as the GPU build's ring list does.
+    let rings = &mut *rings;
+    rings.records.clear();
+    rings.entries.clear();
+    for (instance, bits) in ring_scratch.iter().take(n_chunks).flatten() {
+        rings.entries.push(rings.records.len() as u32 | bits);
+        rings.records.push(*instance);
     }
     // Per-bucket counts: the living, read before the fallen join the
     // buckets, and the fallen as they join.

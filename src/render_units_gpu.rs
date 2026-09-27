@@ -70,8 +70,17 @@ pub const MAX_CASCADES: usize = bevy::pbr::MAX_CASCADES_PER_LIGHT;
 /// Caster lists: one per cascade and kind.
 const CASTER_LISTS: usize = MAX_CASCADES * NUM_KINDS;
 
-/// Indirect draw arguments: the camera's buckets, then the caster lists.
-pub const DRAW_ARGS: usize = NUM_BUCKETS + CASTER_LISTS;
+/// The selection rings' draw arguments, after the camera's buckets and
+/// the caster lists (selection_rings.rs).
+pub const RING_ARG: usize = NUM_BUCKETS + CASTER_LISTS;
+
+/// Indirect draw arguments: the camera's buckets, the caster lists, the
+/// selection rings.
+pub const DRAW_ARGS: usize = RING_ARG + 1;
+
+/// Build counters: per bucket the soldiers and the fallen, the caster
+/// lists, then the ring count.
+const COUNTERS: usize = 2 * NUM_BUCKETS + CASTER_LISTS + 1;
 
 /// Bytes of one set of per-bucket list entries in the bucket table: the
 /// camera's set, then one per cascade. A pulled draw binds one set, at a
@@ -109,8 +118,12 @@ pub struct RegimentRecord {
 }
 
 const REG_BROKEN: u32 = 1;
+/// Selected and able to take orders: rings in the selection colour.
 const REG_SELECTED: u32 = 2;
+/// The enemy regiment under the cursor: red rings, the attack preview.
 const REG_HOVERED: u32 = 4;
+/// The player's own regiment under the cursor or its card: faint rings.
+const REG_HOVER_OWN: u32 = 8;
 
 /// The compute pass uniform (`Params` in unit_build.wgsl, same field order).
 #[derive(ShaderType, Clone, Copy, Default)]
@@ -163,6 +176,8 @@ pub struct BuildParams {
     n_cascades: u32,
     /// render_units_shadow.rs CAST_LODS.
     cast_lods: u32,
+    /// The first slot of the ring list in the index list.
+    ring_base: u32,
 }
 
 const _: () = assert!(NUM_KINDS == 4, "BuildParams packs per-kind values in vec4s");
@@ -308,11 +323,17 @@ fn build_frame_params(
             if gd.state.is_broken() {
                 flags |= REG_BROKEN;
             }
-            if has_sel && selection.regiments.get(g).copied().unwrap_or(false) {
+            if has_sel
+                && selection.regiments.get(g).copied().unwrap_or(false)
+                && !gd.state.is_broken()
+            {
                 flags |= REG_SELECTED;
             }
             if hover.enemy == Some(g as u32) {
                 flags |= REG_HOVERED;
+            }
+            if hover.own == Some(g as u32) {
+                flags |= REG_HOVER_OWN;
             }
             RegimentRecord {
                 stance: stance_tier(gd),
@@ -753,6 +774,9 @@ pub struct UnitAlloc {
     kind_cap: [usize; NUM_KINDS],
     bases: [u32; NUM_BUCKETS],
     shadow_bases: [[u32; NUM_KINDS]; MAX_CASCADES],
+    /// The ring list: `live_cap` slots after the caster lists, a soldier
+    /// of a selected or hovered regiment each (selection_rings.rs).
+    pub ring_base: u32,
     counts: Buffer,
     pub args: Buffer,
     regiments: Buffer,
@@ -786,6 +810,8 @@ impl UnitAlloc {
                 total += kind_cap[kind] + CORPSE_CAP;
             }
         }
+        let ring_base = total as u32;
+        total += live_cap;
         let regiments_cap = 256;
         Self {
             soldiers: storage_buffer(
@@ -806,12 +832,8 @@ impl UnitAlloc {
             kind_cap,
             bases,
             shadow_bases,
-            counts: storage_buffer(
-                device,
-                "unit bucket counts",
-                (2 * NUM_BUCKETS + CASTER_LISTS) * 4,
-                BufferUsages::COPY_DST,
-            ),
+            ring_base,
+            counts: storage_buffer(device, "unit bucket counts", COUNTERS * 4, BufferUsages::COPY_DST),
             args: storage_buffer(
                 device,
                 "unit draw args",
@@ -954,6 +976,7 @@ fn prepare_gpu_units(
     params.corpse_len = UVec4::from_array(input.corpse_len);
     params.buckets = info[0].map(UVec4::from_array);
     params.shadow_lists = alloc.shadow_bases.map(UVec4::from_array);
+    params.ring_base = alloc.ring_base;
     params.shadow_corners = input.shadow_levels.map(|levels| {
         UVec4::from_array(std::array::from_fn(|kind| {
             info[0][kind * NUM_LODS + levels[kind] as usize][1]
