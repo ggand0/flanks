@@ -240,11 +240,12 @@ fn init_unit_shadow_pipeline(
     });
 }
 
-/// The shadow pass bind groups, rebuilt every frame: the view uniform
-/// buffer can move between frames.
+/// The shadow pass bind groups. The view one is remade when the view
+/// uniform buffer moves, which happens when it grows, not every frame.
 #[derive(Resource, Default)]
 struct UnitShadowBindGroups {
     view: Option<BindGroup>,
+    view_buffer: Option<BufferId>,
     empty: Option<BindGroup>,
 }
 
@@ -256,14 +257,18 @@ fn prepare_unit_shadow_bind_groups(
     globals: Res<GlobalsBuffer>,
     mut groups: ResMut<UnitShadowBindGroups>,
 ) {
-    groups.view = match (view_uniforms.uniforms.binding(), globals.buffer.binding()) {
-        (Some(view), Some(globals)) => Some(device.create_bind_group(
-            "unit shadow view bind group",
-            &pipeline_cache.get_bind_group_layout(&pipeline.view_layout),
-            &BindGroupEntries::with_indices(((0, view), (11, globals))),
-        )),
-        _ => None,
-    };
+    let buffer = view_uniforms.uniforms.buffer().map(|b| b.id());
+    if groups.view_buffer != buffer || groups.view.is_none() {
+        groups.view_buffer = buffer;
+        groups.view = match (view_uniforms.uniforms.binding(), globals.buffer.binding()) {
+            (Some(view), Some(globals)) => Some(device.create_bind_group(
+                "unit shadow view bind group",
+                &pipeline_cache.get_bind_group_layout(&pipeline.view_layout),
+                &BindGroupEntries::with_indices(((0, view), (11, globals))),
+            )),
+            _ => None,
+        };
+    }
     if groups.empty.is_none() {
         groups.empty = Some(device.create_bind_group(
             "unit shadow empty bind group",
@@ -479,9 +484,11 @@ impl Plugin for UnitShadowPlugin {
                 Core3d,
                 (
                     shadow_timer_begin
+                        .run_if(shadow_views_exist)
                         .after(crate::render_units_gpu::run_unit_build_pass)
                         .before(per_view_shadow_pass::<EARLY_SHADOW_PASS>),
                     shadow_timer_end
+                        .run_if(shadow_views_exist)
                         .after(per_view_shadow_pass::<EARLY_SHADOW_PASS>)
                         .before(Core3dSystems::MainPass),
                 ),
@@ -547,6 +554,13 @@ fn init_shadow_pass_timer(mut commands: Commands, device: Res<RenderDevice>, que
         period: queue.get_timestamp_period(),
         state: Arc::new(AtomicU8::new(TIMER_IDLE)),
     });
+}
+
+/// Whether the sun has shadow views this frame. Without them the timer
+/// stays out of the frame: touching the encoder from a system ends a
+/// command buffer, two per frame for nothing.
+fn shadow_views_exist(views: Query<(), With<LightEntity>>) -> bool {
+    !views.is_empty()
 }
 
 fn shadow_timer_begin(timer: Option<Res<ShadowPassTimer>>, mut ctx: RenderContext) {
