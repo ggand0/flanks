@@ -13,7 +13,7 @@ use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 
 use crate::formation::{
-    FormCmd, FormShape, FormSpacing, apply_formation_cmd, is_spearwall_kind,
+    FormCmd, FormSpacing, apply_formation_cmd, is_spearwall_kind,
 };
 use crate::game_state::{
     BTN_HOVER, BTN_NORMAL, BTN_PRESSED, CustomStyled, GameState, HudInputSet,
@@ -521,18 +521,6 @@ fn loose_shapes(tight: bool) -> Vec<IconShape> {
     out
 }
 
-/// Blob: a loose cluster of men — quincunx, symmetric.
-fn blob_shapes() -> Vec<IconShape> {
-    [(6.0, 6.0), (30.0, 6.0), (18.0, 18.0), (6.0, 30.0), (30.0, 30.0)]
-        .into_iter()
-        .map(|(x, y)| IconShape::Rect {
-            rect: (x, y, 8.0, 8.0),
-            radius: [4.0; 4],
-            rgb: ICON_RGB,
-        })
-        .collect()
-}
-
 /// Hold: one planted heater shield.
 fn hold_shapes() -> Vec<IconShape> {
     let mut out = Vec::new();
@@ -602,7 +590,6 @@ struct ButtonIcons {
     wall_spear: Handle<Image>,
     loose_spread: Handle<Image>,
     loose_tight: Handle<Image>,
-    blob: Handle<Image>,
     hold: Handle<Image>,
     fire_at_will: Handle<Image>,
     skirmish: Handle<Image>,
@@ -617,7 +604,6 @@ impl ButtonIcons {
             wall_spear: add(wall_spear_shapes()),
             loose_spread: add(loose_shapes(false)),
             loose_tight: add(loose_shapes(true)),
-            blob: add(blob_shapes()),
             hold: add(hold_shapes()),
             fire_at_will: add(fire_at_will_shapes()),
             skirmish: add(skirmish_shapes()),
@@ -791,12 +777,11 @@ fn spawn_card(strip: &mut ChildSpawnerCommands, g: usize, kind: u8, icon: Handle
 
 /// M2TW-style round icon buttons, right end of the bar.
 fn spawn_control_panel(bar: &mut ChildSpawnerCommands, icons: &ButtonIcons) {
-    const BUTTONS: [(ControlButton, &str); 7] = [
+    const BUTTONS: [(ControlButton, &str); 6] = [
         (ControlButton::Halt, "Halt (Backspace)"),
         (ControlButton::Form(FormCmd::Wall), "Shield Wall (F)"),
         (ControlButton::Form(FormCmd::Loose), "Loose (L)"),
-        (ControlButton::Form(FormCmd::Blob), "Blob (B)"),
-        (ControlButton::Form(FormCmd::Hold), "Hold (H)"),
+        (ControlButton::Form(FormCmd::Hold), "Hold (B)"),
         (ControlButton::Form(FormCmd::FireAtWill), "Fire at Will (T)"),
         (ControlButton::Form(FormCmd::Skirmish), "Skirmish (K)"),
     ];
@@ -903,9 +888,6 @@ fn spawn_control_panel(bar: &mut ChildSpawnerCommands, icons: &ButtonIcons) {
                             canvas,
                             ImageNode::new(match btn {
                                 ControlButton::Halt => icons.halt.clone(),
-                                ControlButton::Form(FormCmd::Blob) => {
-                                    icons.blob.clone()
-                                }
                                 ControlButton::Form(FormCmd::Hold) => {
                                     icons.hold.clone()
                                 }
@@ -1164,8 +1146,7 @@ fn refresh_control_buttons(
 ) {
     // One pass over the controllable selection accumulates every
     // all-in-mode flag the buttons need (no per-frame Vec).
-    let (mut any, mut all_wall, mut all_loose, mut all_blob, mut all_hold) =
-        (false, true, true, true, true);
+    let (mut any, mut all_wall, mut all_loose, mut all_hold) = (false, true, true, true);
     let mut all_spear = true;
     let (mut any_archer, mut all_faw, mut all_skirm) = (false, true, true);
     for g in selection.picked_controllable(&groups) {
@@ -1173,7 +1154,6 @@ fn refresh_control_buttons(
         any = true;
         all_wall &= gd.spacing == FormSpacing::Wall;
         all_loose &= gd.spacing == FormSpacing::Loose;
-        all_blob &= gd.shape == FormShape::Blob;
         all_hold &= gd.hold;
         all_spear &= is_spearwall_kind(gd.kind);
         if gd.kind == KIND_ARCHER {
@@ -1192,7 +1172,6 @@ fn refresh_control_buttons(
         ControlButton::Halt => false,
         ControlButton::Form(FormCmd::Wall) => all_wall,
         ControlButton::Form(FormCmd::Loose) => all_loose,
-        ControlButton::Form(FormCmd::Blob) => all_blob,
         ControlButton::Form(FormCmd::Hold) => all_hold,
         ControlButton::Form(FormCmd::FireAtWill) => any_archer && all_faw,
         ControlButton::Form(FormCmd::Skirmish) => any_archer && all_skirm,
