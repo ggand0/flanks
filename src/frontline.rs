@@ -538,7 +538,11 @@ fn update_groups(
             }
             group.melee_ticks = 0;
         }
-        group.fight_point = if group.melee_ticks > 0 && !group.hold {
+        // Under a Move order the regiment has no fight: the order takes it
+        // out (M2TW's WITHDRAW, devlog 0120), so its men leave the melee
+        // and walk where they were sent.
+        let moving = matches!(group.order, Some(crate::orders::Order::Move(_)));
+        group.fight_point = if group.melee_ticks > 0 && !group.hold && !moving {
             match group.order {
                 Some(crate::orders::Order::Attack(t)) if counts[t as usize] > 0 && !broken[t as usize] => {
                     Some(cents[t as usize])

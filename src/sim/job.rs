@@ -77,6 +77,7 @@ pub struct TickJob {
     pub(crate) anchors: Vec<Vec2>,
     pub(crate) reg_broken: Vec<bool>,
     pub(crate) press: Vec<bool>,
+    pub(crate) moving: Vec<bool>,
     pub(crate) engaged: Vec<bool>,
     pub(crate) contact: Vec<bool>,
     pub(crate) fight_point: Vec<Option<Vec2>>,
@@ -473,14 +474,23 @@ fn snapshot_regiments(job: &mut TickJob, groups: &Groups, terrain: &Terrain) {
         .collect();
     let group_broken: Vec<bool> = groups.list.iter().map(|g| g.state.is_broken()).collect();
     let anchors: Vec<Vec2> = groups.list.iter().map(|g| g.anchor).collect();
+    // Regiments under a Move order: the order takes them out of any fight
+    // (M2TW's WITHDRAW, devlog 0120). Their men walk where they were sent,
+    // pushing through what blocks them and striking only whoever stands in
+    // front of them; they close on no enemy and go after none they see.
+    let moving: Vec<bool> = groups
+        .list
+        .iter()
+        .map(|g| matches!(g.order, Some(crate::orders::Order::Move(_))))
+        .collect();
     // Regiments in combat-watch range of an enemy (sparse-fight
-    // acquisition): order type is irrelevant — a Move-order fight that
-    // went sparse stalls exactly the same way. HOLD regiments never
-    // acquire wide: they stand their ground and take what comes.
+    // acquisition). HOLD regiments never acquire wide: they stand their
+    // ground and take what comes; moving ones go where they were sent.
     let press: Vec<bool> = groups
         .list
         .iter()
-        .map(|g| (g.enemy_near || g.engaged) && !g.hold)
+        .zip(&moving)
+        .map(|(g, &m)| (g.enemy_near || g.engaged) && !g.hold && !m)
         .collect();
     // Regiments in melee: their shoved men wait for room instead of
     // threading back to their marks (a dressing block still threads).
@@ -553,6 +563,7 @@ fn snapshot_regiments(job: &mut TickJob, groups: &Groups, terrain: &Terrain) {
     job.anchors = anchors;
     job.reg_broken = group_broken;
     job.press = press;
+    job.moving = moving;
     job.engaged = engaged;
     job.contact = contact;
     job.fight_point = fight_point;

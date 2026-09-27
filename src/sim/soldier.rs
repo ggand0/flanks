@@ -191,6 +191,8 @@ pub(crate) struct Field<'a> {
     pub anchors: &'a [Vec2],
     pub broken: &'a [bool],
     pub press: &'a [bool],
+    /// Per regiment: under a Move order (sim/job.rs `moving`).
+    pub moving: &'a [bool],
     pub engaged: &'a [bool],
     pub contact: &'a [bool],
     pub fight_point: &'a [Option<Vec2>],
@@ -1180,7 +1182,7 @@ fn yield_to_crowd(st: &mut Step) {
 /// fight at the jog.
 #[inline]
 fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
-    let Field { pos_prev, speed, team, engaged, hold, tick, .. } = *f;
+    let Field { pos_prev, speed, team, engaged, hold, moving, tick, .. } = *f;
     let i = s.i;
     let p = st.p;
     let gi = st.gi;
@@ -1224,8 +1226,11 @@ fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
     } else {
         (u32::MAX, false)
     };
+    // A man sent somewhere by a Move order closes on nobody: he walks on,
+    // striking only a man in front of him (the swing above).
     if !dying
         && !routed
+        && !moving[gi]
         && (close_to as usize) < pos_prev.len()
         && team[close_to as usize] != team[i]
     {
