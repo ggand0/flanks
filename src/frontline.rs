@@ -318,6 +318,16 @@ fn update_field(
 const ENGAGE_LOCK_FRAC: f32 = 0.03;
 const ENGAGE_LOCK_FLOOR: u32 = 4;
 
+/// FL_RETARGET_FOCUS=0: the A/B switch for a regiment retargeted
+/// mid-fight. On (the default) its melee with the new target is a focus
+/// melee (sim/job.rs `focus`) for as long as the order stands. Off, the
+/// break-off ends the tick that melee starts and its men fight whoever
+/// they meet, the behaviour before commit 5efb0e4.
+fn retarget_focus() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("FL_RETARGET_FOCUS").is_ok_and(|v| v == "0"))
+}
+
 /// One regiment's sums over its men, in index order.
 #[derive(Clone, Copy)]
 struct RegimentSums {
@@ -597,6 +607,10 @@ fn update_groups(
                 group.reform = true;
             }
             group.melee_ticks = 0;
+        }
+        if group.retarget && group.melee_ticks > 0 && !retarget_focus() {
+            group.retarget = false;
+            info!("regiment {g} ends its break-off (FL_RETARGET_FOCUS=0)");
         }
         // No fight point without a fight: a Move order takes the regiment
         // out (M2TW's WITHDRAW, devlog 0120), so its men leave the melee

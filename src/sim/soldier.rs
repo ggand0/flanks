@@ -138,6 +138,17 @@ fn seek_radius() -> f32 {
     *R.get_or_init(|| crate::util::env_or("FL_SEEK_R", 15.0))
 }
 
+/// How near an enemy of any regiment must be, coming at a man whose
+/// regiment fights one ordered target (sim/job.rs `focus`), before he
+/// turns to fight him (FL_THREAT_R, meters). Beyond it he goes after the
+/// target's men only. A play-testing knob: M2TW's seek radius is not
+/// known (devlog 0120). At the combat jog a man covers 4 m in 1.4 s, a
+/// quarter second of which is his next look and a second a full turn.
+fn threat_radius() -> f32 {
+    static R: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *R.get_or_init(|| crate::util::env_or("FL_THREAT_R", 4.0))
+}
+
 /// Routing units flee at this fraction of their speed: fleeing at
 /// exactly max speed made pursuit a zero-kill treadmill.
 const ROUT_FLEE_FRAC: f32 = 0.9;
@@ -275,9 +286,6 @@ struct Step {
     corr: Vec2,
     crowd: f32,
     best_idx: u32,
-    /// An enemy he may go for is in reach: any, or with his regiment
-    /// focused on one target (sim/job.rs `focus`), a man of it.
-    target_in_reach: bool,
     sticky: bool,
     prev_target: u32,
     impale_idx: u32,
@@ -385,7 +393,6 @@ fn begin(f: &Field, s: &mut Soldier) -> Step {
         corr: Vec2::ZERO,
         crowd: 0.0,
         best_idx: u32::MAX,
-        target_in_reach: false,
         sticky: false,
         prev_target: u32::MAX,
         impale_idx: u32::MAX,
@@ -494,7 +501,7 @@ fn drive(f: &Field, s: &mut Soldier, st: &mut Step) {
 /// body runs onto, which is a damage event from the spearman.
 #[inline]
 fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
-    let Field { grid, speed, team, group, yaw_snap, wall, faces_spearwall, tick_seed, focus, .. } = *f;
+    let Field { grid, speed, team, yaw_snap, wall, faces_spearwall, tick_seed, .. } = *f;
     let i = s.i;
     let params = &TYPES[st.my_kind];
     let p = st.p;
@@ -514,6 +521,7 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
     let prev_target = *s.target;
     let mut best_d2 = f32::MAX;
     let mut best_idx = u32::MAX;
+    let mut sticky = false;
     // Moving at charge speed with unspent momentum: braced enemy spears in
     // the path are a collision hazard, and the scan must see out to SPEAR
     // reach, not just mine. A man already run through (flash) or reeling is
@@ -532,12 +540,6 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
     } else {
         QUERY_RADIUS.max(params.reach)
     };
-    // With his regiment focused on one target, a man of it in reach wins
-    // over any other enemy in reach; the others he still strikes when no
-    // man of it is in reach, in his own defence.
-    let my_focus = focus[gi];
-    let mut best_focus = my_focus.is_none();
-    let mut prev_in_reach = false;
     grid.for_each_candidate(p, scan_r, |o| {
         if o.idx as usize == i {
             return;
@@ -547,13 +549,10 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
         let enemy = (o.meta & crate::spatial::META_TEAM) != my_team_bit
             && (o.meta & crate::spatial::META_DYING) == 0;
         if enemy && d2 < reach2 {
-            prev_in_reach |= o.idx == prev_target;
-            let focus_man =
-                my_focus.is_none_or(|t| crate::spatial::meta_group(o.meta) as u32 == t);
-            if (focus_man && !best_focus) || (focus_man == best_focus && d2 < best_d2) {
+            sticky |= o.idx == prev_target;
+            if d2 < best_d2 {
                 best_d2 = d2;
                 best_idx = o.idx;
-                best_focus = focus_man;
             }
         }
         // Spear-line collision: he is a braced enemy spearman, and my body is
@@ -640,14 +639,7 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
     st.push = push;
     st.corr = corr;
     st.crowd = crowd;
-    // He sticks with the man he fights while that man is in reach, unless
-    // he fights another than his regiment's target and a man of it is in
-    // reach.
-    let target_in_reach = best_idx != u32::MAX && best_focus;
-    let sticky = prev_in_reach
-        && (my_focus.is_none_or(|t| group.get(prev_target as usize) == Some(&t)) || !target_in_reach);
     st.best_idx = best_idx;
-    st.target_in_reach = target_in_reach;
     st.sticky = sticky;
     st.prev_target = prev_target;
     st.impale_idx = impale_idx;
@@ -681,14 +673,21 @@ fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
     // no enemy in reach, and seeing him is what makes a man still in
     // formation react. A man fighting someone in reach out of formation needs
     // neither, and skips the lookup.
+    // With his regiment focused on one target (sim/job.rs `focus`), a man
+    // of another regiment is remembered only within his threat distance:
+    // one who is not on him he lets go, and follows his orders.
     let memo = prev_target as usize;
     let memo_valid = ((best_idx == u32::MAX && !dying && !routed)
         || (in_melee && !committed))
         && memo < pos_prev.len()
         && team[memo] != team[i]
-        && focus[gi].is_none_or(|t| group[memo] == t)
-        && pos_prev[memo].xz().distance_squared(p)
-            < (seek_radius() + 1.0) * (seek_radius() + 1.0);
+        && {
+            let d2 = pos_prev[memo].xz().distance_squared(p);
+            d2 < (seek_radius() + 1.0) * (seek_radius() + 1.0)
+                && focus[gi].is_none_or(|t| {
+                    group[memo] == t || d2 < threat_radius() * threat_radius()
+                })
+        };
     // Which way he is going: to that enemy, else to his regiment's fight.
     let memo_dir = if memo_valid {
         (pos_prev[memo].xz() - p).normalize_or_zero()
@@ -808,9 +807,10 @@ fn hold_the_frame(f: &Field, st: &mut Step) {
 
 /// The far look, every eighth tick: a pressing man with nobody in reach
 /// and open ground around him remembers the nearest enemy within his sight
-/// (15 m for a fighting regiment, 4 m on the approach), and a man still in
-/// formation notices a comrade of his regiment running to the fight within
-/// 6 m.
+/// (15 m for a fighting regiment, 4 m on the approach; with his regiment
+/// focused on one target, its men, and any man within his threat distance
+/// coming at him), and a man still in formation notices a comrade of his
+/// regiment running to the fight within 6 m.
 #[inline]
 fn acquire(f: &Field, s: &mut Soldier, st: &mut Step) {
     let Field { grid, press, engaged, focus, tick_seed, .. } = *f;
@@ -845,18 +845,44 @@ fn acquire(f: &Field, s: &mut Soldier, st: &mut Step) {
     {
         let look = if engaged[gi] { seek_radius() } else { WIDE_ACQUIRE_R };
         let mut far_d2 = look * look;
-        grid.for_each_candidate(p, look, |o| {
-            let enemy = (o.meta & crate::spatial::META_TEAM) != my_team_bit
-                && (o.meta & crate::spatial::META_DYING) == 0
-                && focus[gi].is_none_or(|t| crate::spatial::meta_group(o.meta) as u32 == t);
-            if enemy {
-                let d2 = (p - o.xz()).length_squared();
-                if d2 < far_d2 {
-                    far_d2 = d2;
-                    *s.target = o.idx;
+        if let Some(t) = focus[gi] {
+            // His regiment fights one ordered target (sim/job.rs `focus`):
+            // he looks for its men anywhere in his sight, and for any
+            // enemy within his threat distance who is coming at him,
+            // closing faster than GOING_SPEED. A man of another regiment
+            // standing off or going elsewhere is not his business. The
+            // same cells as the look below, with each man's velocity.
+            let threat2 = threat_radius() * threat_radius();
+            grid.for_each_candidate_vel(p, look, |o, ov| {
+                let enemy = (o.meta & crate::spatial::META_TEAM) != my_team_bit
+                    && (o.meta & crate::spatial::META_DYING) == 0;
+                if enemy {
+                    let d = p - o.xz();
+                    let d2 = d.length_squared();
+                    let closing = ov.dot(d);
+                    let counts = crate::spatial::meta_group(o.meta) as u32 == t
+                        || (d2 < threat2
+                            && closing > 0.0
+                            && closing * closing > GOING_SPEED * GOING_SPEED * d2);
+                    if counts && d2 < far_d2 {
+                        far_d2 = d2;
+                        *s.target = o.idx;
+                    }
                 }
-            }
-        });
+            });
+        } else {
+            grid.for_each_candidate(p, look, |o| {
+                let enemy = (o.meta & crate::spatial::META_TEAM) != my_team_bit
+                    && (o.meta & crate::spatial::META_DYING) == 0;
+                if enemy {
+                    let d2 = (p - o.xz()).length_squared();
+                    if d2 < far_d2 {
+                        far_d2 = d2;
+                        *s.target = o.idx;
+                    }
+                }
+            });
+        }
         // Further than the neighbor scan, within JOIN_SEE_R: a comrade of his
         // own regiment running to the fight.
         if watch_go
@@ -1251,13 +1277,19 @@ fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
         (u32::MAX, false)
     };
     // A man sent somewhere by a Move order closes on nobody: he walks on,
-    // striking only a man in front of him (the swing above).
+    // striking only a man in front of him (the swing above). With his
+    // regiment focused on one target he closes on a man of another
+    // regiment only within his threat distance (look_around).
     if !dying
         && !routed
         && !moving[gi]
         && (close_to as usize) < pos_prev.len()
         && team[close_to as usize] != team[i]
-        && focus[gi].is_none_or(|t| group[close_to as usize] == t)
+        && focus[gi].is_none_or(|t| {
+            group[close_to as usize] == t
+                || pos_prev[close_to as usize].xz().distance_squared(p)
+                    < threat_radius() * threat_radius()
+        })
     {
         let to_enemy = pos_prev[close_to as usize].xz() - p;
         let dist = to_enemy.length();
@@ -1320,19 +1352,13 @@ fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
     // Joining: no enemy to close on, so he heads for the enemy unit his
     // regiment fights, jogging over open ground, walking with a comrade close
     // ahead, waiting or sidestepping when blocked. He picks a soldier to
-    // fight once one is in sight (the acquisition above). With his regiment
-    // focused on one target, a man fighting another enemy in his own defence
-    // still works his way there, at a quarter pace while he winds up.
-    let swing_state = *s.swing & crate::units::SWING_STATE_MASK;
-    let fights_other = focus[gi].is_some_and(|t| group.get(*s.target as usize) != Some(&t));
-    let free = swing_state == crate::units::SWING_READY || fights_other;
-    let windup = if swing_state == crate::units::SWING_WINDUP { 0.25 } else { 1.0 };
+    // fight once one is in sight (the acquisition above).
     if committed
         && !memo_valid
         && let Some(fp) = join_fp
-        && !st.target_in_reach
+        && best_idx == u32::MAX
         && d_surge == Vec2::ZERO
-        && free
+        && *s.swing & crate::units::SWING_STATE_MASK == crate::units::SWING_READY
     {
         let to_fp = fp - p;
         let dist = to_fp.length();
@@ -1340,7 +1366,7 @@ fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
             let dir = to_fp / dist;
             desired = if !way_blocked {
                 let pace = if comrade_ahead { ADVANCE_PACE } else { COMBAT_JOG_PACE };
-                dir * pace * windup * (1.0 - jam)
+                dir * pace * (1.0 - jam)
             } else {
                 let window = (tick.wrapping_add((i as u32).wrapping_mul(7))
                     / SIDESTEP_WINDOW)
