@@ -259,12 +259,12 @@ fn respawn_vegetation(
 // Asset, world X/Z in metres, yaw in radians, uniform scale.
 // Two loose groups leave a broad central opening and an uneven woodland edge.
 const SANDBOX_COMPOSITION: &[(&str, f32, f32, f32, f32)] = &[
-    ("mature_oak", -16.0, -3.0, 0.45, 1.00),
-    ("oak", -26.0, 1.0, 2.10, 0.90),
+    ("mature_oak_pale", -16.0, -3.0, 0.45, 1.00),
+    ("oak_pale", -26.0, 1.0, 2.10, 0.90),
     ("leaning_oak_lighter", -19.0, 10.0, -1.10, 0.88),
     ("oak_lighter", -5.0, -18.0, -0.70, 0.95),
     ("mature_oak_lighter", 14.0, -12.0, 2.60, 0.90),
-    ("leaning_oak", 23.0, 12.0, 0.80, 1.08),
+    ("leaning_oak_pale", 23.0, 12.0, 0.80, 1.08),
     ("silver_birch_warm", 9.0, -4.0, 1.30, 0.96),
     ("silver_birch_warm", 27.0, 1.0, -0.40, 0.83),
     ("shrub_b_sandbox", -19.0, -7.0, 0.20, 1.18),
@@ -496,6 +496,24 @@ fn load_trees(
             "birch_warm_v1/birch_warm/silver_birch/tree.glb",
             Some(12.0),
             [2000, 450, 4],
+        ),
+        (
+            "oak_pale",
+            "oak_pale_v1/oak/tree.glb",
+            None,
+            [3000, 700, 4],
+        ),
+        (
+            "mature_oak_pale",
+            "oak_pale_v1/mature_oak/tree.glb",
+            None,
+            [3000, 700, 4],
+        ),
+        (
+            "leaning_oak_pale",
+            "oak_pale_v1/leaning_oak/tree.glb",
+            None,
+            [3000, 700, 4],
         ),
         (
             "shrub_a",
