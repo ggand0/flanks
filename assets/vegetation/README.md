@@ -4,10 +4,12 @@ Four original project tree shapes, low shrub variants and their textures, stored
 
 | File | Height | Near triangles | Middle triangles | Far triangles |
 |---|---:|---:|---:|---:|
-| `oak.glb` | 13.164 m | 2,672 | 636 | 4 |
-| `mature_oak.glb` | 13.719 m | 2,912 | 636 | 4 |
+| `oak.glb` | 13.164 m | 2,670 | 690 | 4 |
+| `oak_trunk.glb` | 13.164 m | 2,670 | 690 | 4 |
+| `oak_trunk_light.glb` | 13.164 m | 2,670 | 690 | 4 |
+| `mature_oak.glb` | 13.719 m | 2,960 | 690 | 4 |
 | `mature_oak_trunk.glb` | 13.719 m | 2,960 | 690 | 4 |
-| `leaning_oak.glb` | 9.001 m | 2,340 | 560 | 4 |
+| `leaning_oak.glb` | 9.001 m | 2,344 | 664 | 4 |
 | `silver_birch.glb` | 15.482 m | 1,936 | 450 | 4 |
 | `shrub_b.glb` | 0.800 m | 416 | 120 | 4 |
 | `shrub_b_v2.glb` | 0.800 m | 894 | 120 | 4 |
@@ -27,6 +29,8 @@ All shrubs are 2.5 m wide and 1.85 m deep. `shrub_b.glb` has rounded foliage lob
 
 `shrub_b_sandbox.glb` retains the v4 near mesh and textures. Its middle mesh uses 176 enlarged leaf sprays and the same woody branches; its far colour and normals are baked from v4. Grassland keeps `shrub_b_v4.glb`.
 
-`mature_oak_trunk.glb` uses joined woody branches, an uneven root flare and finer grey-brown bark with darker base colour. Its near and middle foliage matches `mature_oak.glb`; far colour and normals include the revised wood. Sandbox uses it for the western natural-colour mature oak. Its bark declares mirrored texture wrapping for coordinates that follow branch length.
+All six oak shape/foliage combinations share fine warm-grey bark, joined woody branches, uneven root flares and darker base weathering. Root dimensions scale with trunk radius. Bark coordinates follow branch length at 1.8 m per tile with mirrored wrapping. Near and middle foliage retains its authored geometry and colours; each far level includes the matching wood and foliage. Both Grassland and Sandbox use these assets.
+
+`mature_oak_trunk.glb` and `oak_trunk.glb` retain the darker grey-brown bark on the revised mature and upright trunks for other maps. `oak_trunk_light.glb` preserves the standalone upright light-bark specimen. These three files are not loaded by the default scene.
 
 The renderer selects detail by projected maximum mesh dimension including instance scale, with hysteresis and a mesh fallback for steep overhead views. Vegetation is visual only and does not alter terrain or pathfinding. Fetch Git LFS objects when cloning to obtain the models and embedded textures.

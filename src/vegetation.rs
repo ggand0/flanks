@@ -259,7 +259,7 @@ fn respawn_vegetation(
 // Asset, world X/Z in metres, yaw in radians, uniform scale.
 // Two loose groups leave a broad central opening and an uneven woodland edge.
 const SANDBOX_COMPOSITION: &[(&str, f32, f32, f32, f32)] = &[
-    ("mature_oak_trunk", -16.0, -3.0, 0.45, 1.00),
+    ("mature_oak", -16.0, -3.0, 0.45, 1.00),
     ("oak", -26.0, 1.0, 2.10, 0.90),
     ("leaning_oak_lighter", -19.0, 10.0, -1.10, 0.88),
     ("oak_lighter", -5.0, -18.0, -0.70, 0.95),
@@ -450,37 +450,37 @@ fn load_trees(
     for (name, fallback, review_z, budgets) in [
         (
             "oak",
-            "oak_palettes_birch_v1/natural/oak/tree.glb",
+            "oak_trunks_light_v1/natural/oak/tree.glb",
             Some(-132.0),
             [3000, 700, 4],
         ),
         (
             "oak_lighter",
-            "oak_palettes_birch_v1/lighter/oak/tree.glb",
+            "oak_trunks_light_v1/lighter/oak/tree.glb",
             Some(-108.0),
             [3000, 700, 4],
         ),
         (
             "mature_oak",
-            "tree_set_v3/mature_oak/tree.glb",
+            "oak_trunks_light_v1/natural/mature_oak/tree.glb",
             Some(-84.0),
             [3000, 700, 4],
         ),
         (
             "mature_oak_lighter",
-            "mature_oak_palettes_v1/lighter/mature_oak/tree.glb",
+            "oak_trunks_light_v1/lighter/mature_oak/tree.glb",
             Some(-60.0),
             [3000, 700, 4],
         ),
         (
             "leaning_oak",
-            "oak_palettes_birch_v1/natural/leaning_oak/tree.glb",
+            "oak_trunks_light_v1/natural/leaning_oak/tree.glb",
             Some(-36.0),
             [3000, 700, 4],
         ),
         (
             "leaning_oak_lighter",
-            "oak_palettes_birch_v1/lighter/leaning_oak/tree.glb",
+            "oak_trunks_light_v1/lighter/leaning_oak/tree.glb",
             Some(-12.0),
             [3000, 700, 4],
         ),
@@ -495,12 +495,6 @@ fn load_trees(
             "birch_warm_v1/birch_warm/silver_birch/tree.glb",
             Some(12.0),
             [2000, 450, 4],
-        ),
-        (
-            "mature_oak_trunk",
-            "oak_trunk_v1/mature_oak/tree.glb",
-            None,
-            [3000, 700, 4],
         ),
         (
             "shrub_b_sandbox",
