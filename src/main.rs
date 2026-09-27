@@ -144,15 +144,15 @@ fn main() {
 }
 
 /// Sun; terrain chunks come from TerrainPlugin.
-fn setup_world(mut commands: Commands) {
+fn setup_world(mut commands: Commands, settings: Res<settings::Settings>) {
     commands.spawn((
         DirectionalLight {
             illuminance: 8_000.0,
-            // FL_SHADOWS=0 turns every sun shadow off, units included:
-            // without shadow maps the light has no cascade views for the
-            // unit draw to cast into, and the unit shader skips the
-            // lookup on the light's flag.
-            shadow_maps_enabled: crate::util::env_or("FL_SHADOWS", 1_u32) != 0,
+            // The Shadows setting, or FL_SHADOWS=0, turns every sun
+            // shadow off, units included: without shadow maps the light
+            // has no cascade views for the unit draw to cast into, and
+            // the unit shader skips the lookup on the light's flag.
+            shadow_maps_enabled: settings::shadows_on(&settings),
             ..default()
         },
         // Lowish sun: flat-shaded relief needs directional contrast.
