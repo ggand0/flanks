@@ -1,9 +1,9 @@
 //! Selection rings: a circle on the ground under every soldier of a
-//! selected or hovered regiment, M2TW's selection marker. A see-through
-//! disc with a brighter rim and a notch at the front that shows where the
-//! soldier faces. Selected regiments take the move preview's green, the
-//! player's regiment under the cursor (or its card) a fainter green, the
-//! enemy under the cursor red.
+//! selected or hovered regiment, M2TW's selection marker. An evenly filled
+//! see-through disc with a point at the front where the soldier faces,
+//! ETW's teardrop. Selected regiments are a muted green, the player's
+//! regiment under the cursor (or its card) a fainter green, the enemy
+//! under the cursor a muted red.
 //!
 //! GPU path: the build pass (unit_build.wgsl `append_ring`) puts each
 //! visible soldier of a flagged regiment on the ring list in the tail of
@@ -188,13 +188,14 @@ fn extract_rings(mut main_world: ResMut<MainWorld>, mut input: ResMut<RingInput>
         let l = c.to_linear();
         Vec4::new(l.red, l.green, l.blue, a)
     };
-    // The move preview's slot green (orders.rs), its alpha as the scale.
-    let green = Color::srgb(0.55, 0.92, 0.62);
+    // Toned down from the move preview's slot green and the old hostile
+    // tint: a dense formation fills the ground with them.
+    let green = Color::srgb(0.42, 0.74, 0.46);
     input.params = RingParams {
         colors: [
             linear(green, 1.0),
             linear(green, 0.55),
-            linear(Color::srgb(1.0, 0.30, 0.22), 1.0),
+            linear(Color::srgb(0.80, 0.30, 0.24), 1.0),
         ],
         half_heights: Vec4::from_array(std::array::from_fn(crate::unit_types::half_height)),
         terrain: Vec4::new(terrain.origin.x, terrain.origin.y, crate::terrain::CELL, RADIUS),

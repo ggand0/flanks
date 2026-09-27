@@ -1,6 +1,6 @@
 // Selection rings (selection_rings.rs): one quad on the ground per ringed
-// soldier, drawn as a see-through disc with a brighter rim and a notch at
-// the front where he faces. Each corner sits on the terrain.
+// soldier, drawn as an evenly filled see-through disc with a point at the
+// front where he faces, ETW's teardrop. Each corner sits on the terrain.
 
 #import bevy_pbr::mesh_view_bindings::view
 #import bevy_pbr::view_transformations::position_world_to_clip
@@ -34,17 +34,14 @@ struct RingParams {
 @group(2) @binding(2) var<storage, read> heights: array<f32>;
 @group(2) @binding(3) var<uniform> ring: RingParams;
 
-// The quad's half size in ring radii: room for the notch.
-const EXTENT: f32 = 1.35;
-// Fill and rim opacity, before the style's scale.
-const FILL: f32 = 0.30;
-const RIM: f32 = 0.90;
-// Rim width in ring radii, at least 1.5 pixels.
-const RIM_WIDTH: f32 = 0.16;
-// The notch: a triangle from the rim out to its apex, in ring radii.
-const NOTCH_BASE: f32 = 0.94;
-const NOTCH_APEX: f32 = 1.30;
-const NOTCH_HALF_WIDTH: f32 = 0.24;
+// The quad's half size in ring radii: room for the point.
+const EXTENT: f32 = 1.5;
+// Opacity of the whole shape, before the style's scale. One even fill: a
+// brighter rim stacked the colour up where formations are dense.
+const FILL: f32 = 0.45;
+// The point's tip, in ring radii from the centre. The two lines from the
+// tip that touch the circle close the teardrop.
+const TIP: f32 = 1.45;
 // Above the ground, growing with distance so depth precision never lets
 // the terrain through.
 const LIFT: f32 = 0.03;
@@ -121,25 +118,22 @@ fn vertex(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
 fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let d = length(in.local);
     let aa = max(fwidth(d), 1e-4);
-    let inside = 1.0 - smoothstep(1.0 - aa, 1.0 + aa, d);
-    let rim_width = max(RIM_WIDTH, 1.5 * aa);
-    let rim = inside * smoothstep(1.0 - rim_width - aa, 1.0 - rim_width + aa, d);
-    var alpha = inside * FILL + rim * (RIM - FILL);
+    var shape = 1.0 - smoothstep(1.0 - aa, 1.0 + aa, d);
 
     if ring.grid.z != 0u {
-        // A triangle pointing out of the front of the rim: its half width
-        // narrows from the base to the apex.
-        let t = (NOTCH_APEX - in.local.y) / (NOTCH_APEX - NOTCH_BASE);
-        let edge = t * NOTCH_HALF_WIDTH - abs(in.local.x);
-        let notch_aa = max(fwidth(edge), 1e-4);
-        let notch = smoothstep(-notch_aa, notch_aa, edge)
-            * step(NOTCH_BASE - 0.1, in.local.y)
-            * (1.0 - smoothstep(NOTCH_APEX - aa, NOTCH_APEX + aa, in.local.y));
-        alpha = max(alpha, notch * RIM);
+        // The tangent lines from the tip touch the circle at height 1/TIP.
+        // Past that height the teardrop is the wedge between them; below
+        // it the disc already covers the wedge.
+        let touch = 1.0 / TIP;
+        let slope = sqrt(1.0 - touch * touch) / (TIP - touch);
+        let edge = (TIP - in.local.y) * slope - abs(in.local.x);
+        let edge_aa = max(fwidth(edge), 1e-4);
+        let wedge = smoothstep(-edge_aa, edge_aa, edge) * step(touch, in.local.y);
+        shape = max(shape, wedge);
     }
 
     let colour = ring.colors[in.style];
-    alpha *= colour.a;
+    let alpha = shape * FILL * colour.a;
     if alpha < 0.004 {
         discard;
     }
