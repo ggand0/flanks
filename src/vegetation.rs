@@ -384,22 +384,45 @@ fn load_trees(
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut trees = Vec::new();
     for (name, fallback, review_z, budgets) in [
-        ("oak", "oak_v2/oak.glb", -60.0, [3000, 700, 4]),
+        (
+            "oak",
+            "oak_palettes_birch_v1/natural/oak/tree.glb",
+            -132.0,
+            [3000, 700, 4],
+        ),
+        (
+            "oak_lighter",
+            "oak_palettes_birch_v1/lighter/oak/tree.glb",
+            -108.0,
+            [3000, 700, 4],
+        ),
         (
             "mature_oak",
             "tree_set_v3/mature_oak/tree.glb",
-            -36.0,
+            -84.0,
+            [3000, 700, 4],
+        ),
+        (
+            "mature_oak_lighter",
+            "mature_oak_palettes_v1/lighter/mature_oak/tree.glb",
+            -60.0,
             [3000, 700, 4],
         ),
         (
             "leaning_oak",
-            "tree_set_v1/leaning_oak/tree.glb",
+            "oak_palettes_birch_v1/natural/leaning_oak/tree.glb",
+            -36.0,
+            [3000, 700, 4],
+        ),
+        (
+            "leaning_oak_lighter",
+            "oak_palettes_birch_v1/lighter/leaning_oak/tree.glb",
             -12.0,
             [3000, 700, 4],
         ),
         (
             "silver_birch",
-            "tree_set_v1/silver_birch/tree.glb",
+            "oak_palettes_birch_v1/birch/silver_birch/tree.glb",
             12.0,
             [2000, 450, 4],
         ),
