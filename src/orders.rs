@@ -330,6 +330,7 @@ impl Plugin for OrdersPlugin {
                             .and_then(crate::game_state::deploying),
                     ),
                     test_orders_script,
+                    test_retarget_script,
                     draw_order_gizmos,
                 ),
             )
@@ -339,6 +340,108 @@ impl Plugin for OrdersPlugin {
                     .after(crate::sim::step_sim)
                     .in_set(crate::game_state::SimSet),
             );
+    }
+}
+
+/// When the retarget test fired, and each retargeted regiment with its old
+/// and new target.
+type RetargetTest = Option<(f32, Vec<(usize, usize, usize)>)>;
+
+/// FL_TEST_RETARGET=s: s seconds into the run, every engaged player
+/// regiment is ordered onto the nearest other unbroken enemy regiment, as a
+/// player retargeting mid-fight would. Every 5 s after, each one's men are
+/// counted: striking a man of the old target, of the new one, and still
+/// within 2.5 m of an old-target man.
+fn test_retarget_script(
+    time: Res<Time>,
+    units: Res<Units>,
+    mut groups: ResMut<Groups>,
+    mut state: Local<RetargetTest>,
+) {
+    let Some(at) = std::env::var("FL_TEST_RETARGET").ok().and_then(|v| v.parse::<f32>().ok()) else {
+        return;
+    };
+    let t = time.elapsed_secs();
+    if state.is_none() {
+        if t < at {
+            return;
+        }
+        let mut picks = Vec::new();
+        for g in 0..groups.list.len() {
+            let gd = &groups.list[g];
+            if gd.team != PLAYER_TEAM || gd.count == 0 || !gd.engaged || gd.state.is_broken() {
+                continue;
+            }
+            // The enemy it fights: its target, else the nearest enemy.
+            let near = |skip: Option<usize>| {
+                (0..groups.list.len())
+                    .filter(|&e| {
+                        let eg = &groups.list[e];
+                        eg.team != gd.team && eg.count > 0 && !eg.state.is_broken() && Some(e) != skip
+                    })
+                    .min_by(|&a, &b| {
+                        let da = groups.list[a].centroid.distance_squared(gd.centroid);
+                        let db = groups.list[b].centroid.distance_squared(gd.centroid);
+                        da.total_cmp(&db)
+                    })
+            };
+            let old = match gd.order {
+                Some(Order::Attack(t)) => Some(t as usize),
+                _ => near(None),
+            };
+            let Some(old) = old else { continue };
+            let Some(new) = near(Some(old)) else { continue };
+            picks.push((g, old, new));
+        }
+        for &(g, _, new) in &picks {
+            groups.list[g].order = Some(Order::Attack(new as u32));
+            groups.list[g].auto_order = false;
+        }
+        info!("[retarget-test] t={t:.0}s {} engaged regiments retargeted", picks.len());
+        *state = Some((t, picks));
+        return;
+    }
+    let Some((last, picks)) = state.as_mut() else { return };
+    if t - *last < 5.0 {
+        return;
+    }
+    *last = t;
+    // Who each man fights: the man he winds up at, by regiment, and
+    // whether an old-target man stands within 2.5 m of him.
+    let mut near_old = vec![false; units.len()];
+    for &(g, old, _) in picks.iter() {
+        let olds: Vec<Vec2> = (0..units.len())
+            .filter(|&j| units.group[j] as usize == old && units.death_t[j] == 0)
+            .map(|j| Vec2::new(units.pos[j].x, units.pos[j].z))
+            .collect();
+        for (i, near) in near_old.iter_mut().enumerate() {
+            if units.group[i] as usize == g && units.death_t[i] == 0 {
+                let p = Vec2::new(units.pos[i].x, units.pos[i].z);
+                *near = olds.iter().any(|q| q.distance_squared(p) < 2.5 * 2.5);
+            }
+        }
+    }
+    for &(g, old, new) in picks.iter().take(8) {
+        let (mut alive, mut at_old, mut at_new, mut touching_old) = (0, 0, 0, 0);
+        for (i, &near) in near_old.iter().enumerate() {
+            if units.group[i] as usize != g || units.death_t[i] != 0 {
+                continue;
+            }
+            alive += 1;
+            touching_old += near as usize;
+            if units.swing[i] & crate::units::SWING_STATE_MASK == crate::units::SWING_WINDUP {
+                let tg = units.target[i] as usize;
+                if tg < units.len() {
+                    at_old += (units.group[tg] as usize == old) as usize;
+                    at_new += (units.group[tg] as usize == new) as usize;
+                }
+            }
+        }
+        let gd = &groups.list[g];
+        info!(
+            "[retarget-test] t={t:.0}s reg {g} ({alive} men): striking old {old} {at_old}, new {new} {at_new}; touching old {touching_old}; retarget {} melee {}; old alive {} new alive {}",
+            gd.retarget, gd.melee_ticks, groups.list[old].count, groups.list[new].count
+        );
     }
 }
 
