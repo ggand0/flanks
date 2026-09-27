@@ -106,12 +106,16 @@ fn spawn_banners(
                 Transform::from_xyz(0.0, 2.1, 0.0),
             ))
             .id();
+        // The bars and the marker are UI: their shadows would be
+        // artifacts, and every caster is one more mesh each sun cascade
+        // walks per frame. The flag and the pole cast.
         let mut bar = |y: f32, z: f32, w: f32, h: f32, mat: &Handle<StandardMaterial>| {
             commands
                 .spawn((
                     Mesh3d(unit_cube.clone()),
                     MeshMaterial3d(mat.clone()),
                     Transform::from_xyz(0.0, y, z).with_scale(Vec3::new(w, h, 0.04)),
+                    bevy::light::NotShadowCaster,
                 ))
                 .id()
         };
@@ -127,6 +131,7 @@ fn spawn_banners(
                     std::f32::consts::FRAC_PI_4,
                 )),
                 Visibility::Hidden,
+                bevy::light::NotShadowCaster,
             ))
             .id();
         commands
