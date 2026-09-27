@@ -856,10 +856,11 @@ fn draw_order_gizmos(
     mut gizmos: Gizmos,
 ) {
     // Attack indicators are player-facing UI (not debug viz): a red marker
-    // hangs over every regiment the player is attacking.
+    // hangs over every regiment the selected regiments are attacking.
     let mut marked = vec![false; groups.list.len()];
-    for group in &groups.list {
+    for (g, group) in groups.list.iter().enumerate() {
         if group.team == PLAYER_TEAM
+            && selection.regiments.get(g).copied().unwrap_or(false)
             && let Some(Order::Attack(t)) = group.order
         {
             marked[t as usize] = true;
