@@ -6,12 +6,12 @@
 //! with the same vertex shader and pose code.
 //!
 //! GPU path: the build pass (unit_build.wgsl) puts every near soldier
-//! whose sphere overlaps a cascade's box on that cascade's caster list for
-//! his kind, off screen or not, so a cascade draws only what can shade it.
-//! A cascade draws a kind with one level for all its casters: the level
-//! the camera picks for a soldier as many pixels tall as his filtered
-//! shadow shows detail (`render_units::shadow_level`). No per-soldier CPU
-//! work.
+//! whose shadow can fall in view on the caster list, for his kind, of each
+//! cascade sampled at the view depths it falls at, off screen or not, so a
+//! cascade draws only what can shade something the camera sees. A cascade
+//! draws a kind with one level for all its casters: the level the camera
+//! picks for a soldier as many pixels tall as his filtered shadow shows
+//! detail (`render_units::shadow_level`). No per-soldier CPU work.
 //!
 //! CPU path (`FL_GPU_SYNC=0`): every cascade draws the camera's near
 //! buckets from their instance buffers, the fallback's simple form.
@@ -82,11 +82,11 @@ pub(crate) struct SunUniform {
 }
 
 /// Per detail level, whether a soldier drawn at it can stand inside a
-/// sun shadow cascade: the level's nearest switch distance is within
-/// the shadow distance. Only those levels compile the receive path
-/// (`render_units::receive_defs`). With the cascades ending at 110 m
-/// that is L0 and L1: L2 starts past 100 m at the default window. All
-/// false with shadows off.
+/// sun shadow cascade: the level's nearest switch distance, jitter
+/// counted, is within the shadow distance. Only those levels compile the
+/// receive path (`render_units::receive_defs`). With the cascades ending
+/// at 110 m that is L0 to L2 (L2 can start at 91 m at the default
+/// window); L3 starts past 400 m. All false with shadows off.
 #[derive(Resource, Clone, Copy, ExtractResource)]
 pub(crate) struct ShadowReceiveLevels(pub [bool; NUM_LODS]);
 
