@@ -139,6 +139,15 @@ fn main() {
             ),
         ))
         .insert_resource(ClearColor(Color::srgb(0.62, 0.70, 0.78)))
+        // Bevy's default drops an unfocused window to 60 updates a
+        // second. That silently caps every fps and frame-time reading
+        // the moment the desktop gets a click, so the loop runs
+        // continuously either way: a measurement reads frames generated,
+        // and a battle keeps going behind another window.
+        .insert_resource(bevy::winit::WinitSettings {
+            focused_mode: bevy::winit::UpdateMode::Continuous,
+            unfocused_mode: bevy::winit::UpdateMode::Continuous,
+        })
         .add_systems(Startup, setup_world)
         .run();
 }
