@@ -227,6 +227,20 @@ impl LodBands {
         bands
     }
 
+    /// The nearest distance at which any kind can show level `lod`: its
+    /// switch distance for the kind that switches soonest, less the
+    /// jitter that pulls a soldier's switch in. Infinite when no kind
+    /// ever reaches the level.
+    pub(crate) fn level_start(&self, lod: usize) -> f32 {
+        if lod == 0 {
+            return 0.0;
+        }
+        self.plain
+            .iter()
+            .map(|t| t[lod - 1].sqrt() / (1.0 + 0.5 * LOD_JITTER))
+            .fold(f32::INFINITY, f32::min)
+    }
+
     /// Level for a squared distance: the farthest threshold passed wins.
     #[inline]
     fn level(thresholds: &[f32; NUM_LODS - 1], d2: f32) -> u8 {
@@ -1039,10 +1053,17 @@ fn queue_custom(
         Res<BatchedInstanceBuffers<MeshUniform, MeshInputUniform>>,
     >,
     material_meshes: Query<
-        (Entity, &MainEntity, Option<&PullMeshGpu>, Has<ExtractedAtlas>),
+        (
+            Entity,
+            &MainEntity,
+            Option<&PullMeshGpu>,
+            Has<ExtractedAtlas>,
+            Option<&ExtractedBucket>,
+        ),
         With<ExtractedInstances>,
     >,
     gpu_input: Option<Res<GpuUnitInput>>,
+    receive_levels: Res<crate::render_units_shadow::ShadowReceiveLevels>,
     mut transparent_render_phases: ResMut<ViewSortedRenderPhases<Transparent3d>>,
     views: Query<&ExtractedView>,
     view_key_cache: Res<ViewKeyCache>,
@@ -1060,11 +1081,13 @@ fn queue_custom(
             continue;
         };
 
-        for (entity, main_entity, pull_mesh, atlas) in &material_meshes {
+        for (entity, main_entity, pull_mesh, atlas, bucket) in &material_meshes {
             let Some(mesh_instance) = render_mesh_instances.render_mesh_queue_data(*main_entity)
             else {
                 continue;
             };
+            // Arrows have no bucket and fly close: they receive.
+            let receive = bucket.is_none_or(|b| receive_levels.0[b.0 % NUM_LODS]);
             let Some(mesh) = meshes.get(mesh_instance.mesh_asset_id()) else {
                 continue;
             };
@@ -1085,13 +1108,14 @@ fn queue_custom(
                         bucket: pull_mesh.bucket as u32,
                         lod_debug,
                         atlas,
+                        receive,
                     },
                 ),
                 None => pipelines
                     .specialize(
                         &pipeline_cache,
                         &custom_pipeline,
-                        UnitMeshKey { mesh: key, atlas },
+                        UnitMeshKey { mesh: key, atlas, receive },
                         &mesh.layout,
                     )
                     .unwrap(),
@@ -1379,11 +1403,14 @@ pub(crate) struct PullPipelineKey {
     lod_debug: bool,
     /// The bucket samples an atlas.
     atlas: bool,
+    /// The bucket's soldiers can stand inside a sun shadow cascade, so
+    /// the fragment samples the shadow (`ShadowReceiveLevels`).
+    receive: bool,
 }
 
 impl PullPipelineKey {
     /// The depth-only variant a bucket casts its shadow with
-    /// (render_units_shadow.rs): no atlas, no level tint.
+    /// (render_units_shadow.rs): no atlas, no level tint, no receive.
     pub(crate) fn shadow(
         mesh: MeshPipelineKey,
         layout: MeshVertexBufferLayoutRef,
@@ -1396,6 +1423,7 @@ impl PullPipelineKey {
             bucket: pull_mesh.bucket as u32,
             lod_debug: false,
             atlas: false,
+            receive: false,
         }
     }
 }
@@ -1406,12 +1434,14 @@ pub(crate) struct UnitMeshKey {
     mesh: MeshPipelineKey,
     /// The bucket samples an atlas.
     atlas: bool,
+    /// As `PullPipelineKey::receive`.
+    receive: bool,
 }
 
 impl UnitMeshKey {
     /// The depth-only variant, as `PullPipelineKey::shadow`.
     pub(crate) fn shadow(mesh: MeshPipelineKey) -> Self {
-        Self { mesh, atlas: false }
+        Self { mesh, atlas: false, receive: false }
     }
 }
 
@@ -1423,6 +1453,20 @@ fn atlas_defs(descriptor: &mut RenderPipelineDescriptor, atlas: bool) {
         descriptor.vertex.shader_defs.push("UNIT_ATLAS".into());
         if let Some(fragment) = descriptor.fragment.as_mut() {
             fragment.shader_defs.push("UNIT_ATLAS".into());
+        }
+    }
+}
+
+/// Only a bucket whose soldiers can stand in a sun shadow cascade
+/// compiles the receive path: the shadow position rides from vertex to
+/// fragment and the fragment samples the map. The far levels carry three
+/// floats less per vertex, and they are most of the vertices in a wide
+/// view (devlog 0147).
+fn receive_defs(descriptor: &mut RenderPipelineDescriptor, receive: bool) {
+    if receive {
+        descriptor.vertex.shader_defs.push("UNIT_SHADOW_RECEIVE".into());
+        if let Some(fragment) = descriptor.fragment.as_mut() {
+            fragment.shader_defs.push("UNIT_SHADOW_RECEIVE".into());
         }
     }
 }
@@ -1450,6 +1494,7 @@ impl SpecializedRenderPipeline for CustomPipeline {
             defs.push("LOD_DEBUG".into());
         }
         atlas_defs(&mut descriptor, key.atlas);
+        receive_defs(&mut descriptor, key.receive);
         descriptor.set_layout(3, self.pull_layout.clone());
         descriptor
     }
@@ -1496,6 +1541,7 @@ impl SpecializedMeshPipeline for CustomPipeline {
         });
         descriptor.fragment.as_mut().unwrap().shader = self.shader.clone();
         atlas_defs(&mut descriptor, key.atlas);
+        receive_defs(&mut descriptor, key.receive);
         descriptor.set_layout(3, self.bucket_layout.clone());
         Ok(descriptor)
     }

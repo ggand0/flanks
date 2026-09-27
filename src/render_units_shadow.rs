@@ -57,8 +57,8 @@ use bevy::{
 use bevy::render::extract_resource::{ExtractResource, ExtractResourcePlugin};
 
 use crate::render_units::{
-    CustomPipeline, DrawMeshInstanced, ExtractedBucket, NUM_BUCKETS, NUM_LODS, PullPipelineKey,
-    UnitMeshKey,
+    CustomPipeline, DrawMeshInstanced, ExtractedBucket, LodBands, LodConfig, NUM_BUCKETS, NUM_LODS,
+    PullPipelineKey, UnitMeshKey,
 };
 use crate::render_units_gpu::{
     GpuUnitBuffers, GpuUnitInput, MAX_CASCADES, PullMeshGpu, PulledBucketGpu,
@@ -81,26 +81,54 @@ pub(crate) struct SunUniform {
     texel_sizes: Vec4,
 }
 
+/// Per detail level, whether a soldier drawn at it can stand inside a
+/// sun shadow cascade: the level's nearest switch distance is within
+/// the shadow distance. Only those levels compile the receive path
+/// (`render_units::receive_defs`). With the cascades ending at 110 m
+/// that is L0 and L1: L2 starts past 100 m at the default window. All
+/// false with shadows off.
+#[derive(Resource, Clone, Copy, ExtractResource)]
+pub(crate) struct ShadowReceiveLevels(pub [bool; NUM_LODS]);
+
+impl Default for ShadowReceiveLevels {
+    fn default() -> Self {
+        Self([true; NUM_LODS])
+    }
+}
+
 #[allow(clippy::type_complexity)] // bevy system params
 fn update_sun_uniform(
-    camera: Query<Entity, With<Camera3d>>,
+    camera: Query<(Entity, &Camera, &Projection), With<Camera3d>>,
     lights: Query<(
         &DirectionalLight,
         &GlobalTransform,
         &bevy::light::CascadeShadowConfig,
         &bevy::light::Cascades,
     )>,
+    lod_cfg: Res<LodConfig>,
     mut uniform: ResMut<SunUniform>,
+    mut receive: ResMut<ShadowReceiveLevels>,
 ) {
     let mut u = SunUniform::default();
+    let mut levels = [false; NUM_LODS];
     if let Some((light, transform, config, cascades)) = lights.iter().next() {
         u.direction_to_light = transform.back().as_vec3().extend(0.0);
-        let cascades = camera
-            .single()
-            .ok()
-            .filter(|_| light.shadow_maps_enabled)
-            .and_then(|cam| cascades.cascades.get(&cam));
-        if let Some(cascades) = cascades {
+        let cam = camera.single().ok().filter(|_| light.shadow_maps_enabled);
+        if let Some((cam, camera, projection)) = cam
+            && let Some(cascades) = cascades.cascades.get(&cam)
+        {
+            // As render_units.rs `sync_instance_data` builds the bands.
+            let px_per_unit = match (projection, camera.physical_viewport_size()) {
+                (Projection::Perspective(p), Some(size)) => {
+                    size.y as f32 / (2.0 * (p.fov * 0.5).tan())
+                }
+                _ => 0.0,
+            };
+            let bands = LodBands::new(&lod_cfg, px_per_unit);
+            let reach = config.bounds.last().copied().unwrap_or(0.0);
+            for (lod, on) in levels.iter_mut().enumerate() {
+                *on = bands.level_start(lod) < reach;
+            }
             u.params = Vec4::new(
                 1.0,
                 light.shadow_normal_bias,
@@ -114,6 +142,10 @@ fn update_sun_uniform(
         }
     }
     *uniform = u;
+    if receive.0 != levels {
+        receive.0 = levels;
+        info!("sun shadow: levels that receive {levels:?}");
+    }
 }
 
 /// Render world: the uniform's buffer, bound at group 3 binding 8 of
@@ -448,7 +480,11 @@ impl Plugin for UnitShadowPlugin {
     fn build(&self, app: &mut App) {
         app.register_diagnostic(Diagnostic::new(SHADOW_PASS_GPU).with_suffix(" ms"))
             .init_resource::<SunUniform>()
-            .add_plugins(ExtractResourcePlugin::<SunUniform>::default())
+            .init_resource::<ShadowReceiveLevels>()
+            .add_plugins((
+                ExtractResourcePlugin::<SunUniform>::default(),
+                ExtractResourcePlugin::<ShadowReceiveLevels>::default(),
+            ))
             .add_systems(Update, publish_shadow_pass_time)
             .add_systems(
                 PostUpdate,

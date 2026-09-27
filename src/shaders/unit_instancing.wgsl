@@ -46,9 +46,13 @@ struct VertexOutput {
     // Per instance, so flat. x = team colour, unorm8 rgb, and the death
     // darkening in the top byte; y = the hit flash, unorm8 in the low byte.
     @location(1) @interpolate(flat) packed: vec2<u32>,
+#ifdef UNIT_SHADOW_RECEIVE
     // World position pushed off the surface by the shadow map's normal
-    // bias: where the fragment samples the sun's shadow.
+    // bias: where the fragment samples the sun's shadow. Only buckets
+    // whose soldiers can stand in a cascade carry it
+    // (render_units_shadow.rs `ShadowReceiveLevels`).
     @location(2) shadow_position: vec3<f32>,
+#endif
 #ifdef UNIT_ATLAS
     @location(3) atlas_uv: vec2<f32>,
 #endif
@@ -1177,7 +1181,9 @@ fn unit_vertex(vertex: Vertex) -> VertexOutput {
         pack4x8unorm(vec4<f32>(vertex.i_color.rgb, death)),
         pack4x8unorm(vec4<f32>(clamp(fx, 0.0, 1.0) * step(fx, 1.0), 0.0, 0.0, 0.0)),
     );
+#ifdef UNIT_SHADOW_RECEIVE
     out.shadow_position = position + n * shadow_normal_bias(position);
+#endif
 #ifdef UNIT_ATLAS
     out.atlas_uv = vertex.atlas_uv;
 #endif
@@ -1251,11 +1257,13 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
 #else
     var rgb = in.color.rgb;
 #endif
+#ifdef UNIT_SHADOW_RECEIVE
     // The sun's share of the light, less what its shadow takes. A face
     // turned from the sun has no share and skips the lookup.
     if in.color.a > 0.0 {
         rgb *= 1.0 - in.color.a * (1.0 - sun_shadow(in.shadow_position, in.clip_position.xy));
     }
+#endif
     rgb = mix(rgb, vec3<f32>(1.0, 1.0, 1.0), flash * 0.8);
     rgb = rgb * (1.0 - 0.45 * team.a);
     return vec4<f32>(rgb, 1.0);
