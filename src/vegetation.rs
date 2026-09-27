@@ -421,8 +421,8 @@ fn load_trees(
             [3000, 700, 4],
         ),
         (
-            "silver_birch",
-            "oak_palettes_birch_v1/birch/silver_birch/tree.glb",
+            "silver_birch_warm",
+            "birch_warm_v1/birch_warm/silver_birch/tree.glb",
             12.0,
             [2000, 450, 4],
         ),
