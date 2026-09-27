@@ -227,36 +227,95 @@ fn respawn_vegetation(
         commands.entity(e).despawn();
     }
     match terrain.kind {
-        MapKind::Grassland | MapKind::Sandbox => {
+        MapKind::Grassland => {
             for (asset, tree) in trees.0.iter().enumerate() {
-                let levels = &tree.levels;
-                // Review specimens stay inside the western scenery margin.
-                let (x, z) = (-495.0, tree.review_z);
-                commands
-                    .spawn((
-                        Transform::from_xyz(
-                            x,
-                            terrain.height_at(x, z) - (levels[0].height * 0.01).clamp(0.01, 0.08),
-                            z,
-                        ),
-                        Visibility::Inherited,
-                        Plants,
-                        TreeLevel { asset, level: 0 },
-                    ))
-                    .with_children(|parent| {
-                        for (slot, part) in levels[0].parts.iter().enumerate() {
-                            parent.spawn((
-                                Mesh3d(part.mesh.clone()),
-                                MeshMaterial3d(part.material.clone()),
-                                TreePartSlot(slot),
-                            ));
-                        }
-                    });
+                let Some(z) = tree.review_z else { continue };
+                spawn_authored_plant(&mut commands, &terrain, tree, asset, (-495.0, z, 0.0, 1.0));
             }
+        }
+        MapKind::Sandbox => {
+            for &(name, x, z, yaw, scale) in SANDBOX_COMPOSITION {
+                let Some((asset, tree)) = trees
+                    .0
+                    .iter()
+                    .enumerate()
+                    .find(|(_, tree)| tree.name == name)
+                else {
+                    warn!("vegetation: sandbox composition is missing {name}");
+                    continue;
+                };
+                spawn_authored_plant(&mut commands, &terrain, tree, asset, (x, z, yaw, scale));
+            }
+            info!(
+                "vegetation: sandbox composition, {} plants",
+                SANDBOX_COMPOSITION.len()
+            );
         }
         MapKind::River => plant(&mut commands, &terrain, &mut meshes, &mut materials),
         MapKind::Classic => {}
     }
+}
+
+// Asset, world X/Z in metres, yaw in radians, uniform scale.
+// Two loose groups leave a broad central opening and an uneven woodland edge.
+const SANDBOX_COMPOSITION: &[(&str, f32, f32, f32, f32)] = &[
+    ("mature_oak_trunk", -16.0, -3.0, 0.45, 1.00),
+    ("oak", -26.0, 1.0, 2.10, 0.90),
+    ("leaning_oak_lighter", -19.0, 10.0, -1.10, 0.88),
+    ("oak_lighter", -5.0, -18.0, -0.70, 0.95),
+    ("mature_oak_lighter", 14.0, -12.0, 2.60, 0.90),
+    ("leaning_oak", 23.0, 12.0, 0.80, 1.08),
+    ("silver_birch_warm", 9.0, -4.0, 1.30, 0.96),
+    ("silver_birch_warm", 27.0, 1.0, -0.40, 0.83),
+    ("shrub_b_sandbox", -19.0, -7.0, 0.20, 1.18),
+    ("shrub_b_sandbox", -21.0, -4.0, 2.40, 0.82),
+    ("shrub_b_sandbox", -15.0, -7.0, 4.80, 1.02),
+    ("shrub_b_sandbox", -30.0, 4.0, 1.70, 0.93),
+    ("shrub_b_sandbox", -27.0, 7.0, 3.80, 1.15),
+    ("shrub_b_sandbox", -21.0, 15.0, 5.50, 0.90),
+    ("shrub_b_sandbox", -17.0, 14.0, 0.90, 1.24),
+    ("shrub_b_sandbox", -14.0, 16.0, 3.10, 0.76),
+    ("shrub_b_sandbox", -3.0, -12.0, 4.10, 0.88),
+    ("shrub_b_sandbox", -1.0, -15.0, 1.10, 1.06),
+    ("shrub_b_sandbox", 9.0, -14.0, 2.70, 1.20),
+    ("shrub_b_sandbox", 12.0, -7.0, 5.80, 0.86),
+    ("shrub_b_sandbox", 18.0, -5.0, 0.50, 1.03),
+    ("shrub_b_sandbox", 21.0, 18.0, 1.90, 1.16),
+    ("shrub_b_sandbox", 25.0, 18.0, 4.50, 0.74),
+    ("shrub_b_sandbox", 28.0, 12.0, 3.30, 0.96),
+    ("shrub_b_sandbox", 30.0, 1.0, 5.10, 1.08),
+    ("shrub_b_sandbox", 29.0, -3.0, 2.20, 0.80),
+    ("shrub_b_sandbox", 9.0, 14.0, 0.70, 1.12),
+    ("shrub_b_sandbox", 11.0, 16.0, 3.60, 0.72),
+];
+
+fn spawn_authored_plant(
+    commands: &mut Commands,
+    terrain: &Terrain,
+    tree: &TreeAsset,
+    asset: usize,
+    (x, z, yaw, scale): (f32, f32, f32, f32),
+) {
+    let near = &tree.levels[0];
+    let sink = (near.height * scale * 0.01).clamp(0.01, 0.08);
+    commands
+        .spawn((
+            Transform::from_xyz(x, terrain.height_at(x, z) - sink, z)
+                .with_rotation(Quat::from_rotation_y(yaw))
+                .with_scale(Vec3::splat(scale)),
+            Visibility::Inherited,
+            Plants,
+            TreeLevel { asset, level: 0 },
+        ))
+        .with_children(|parent| {
+            for (slot, part) in near.parts.iter().enumerate() {
+                parent.spawn((
+                    Mesh3d(part.mesh.clone()),
+                    MeshMaterial3d(part.material.clone()),
+                    TreePartSlot(slot),
+                ));
+            }
+        });
 }
 
 fn plant(
@@ -370,7 +429,7 @@ struct TreeAssets(Vec<TreeAsset>);
 
 struct TreeAsset {
     name: &'static str,
-    review_z: f32,
+    review_z: Option<f32>,
     levels: [TreeMesh; 3],
 }
 
@@ -392,50 +451,62 @@ fn load_trees(
         (
             "oak",
             "oak_palettes_birch_v1/natural/oak/tree.glb",
-            -132.0,
+            Some(-132.0),
             [3000, 700, 4],
         ),
         (
             "oak_lighter",
             "oak_palettes_birch_v1/lighter/oak/tree.glb",
-            -108.0,
+            Some(-108.0),
             [3000, 700, 4],
         ),
         (
             "mature_oak",
             "tree_set_v3/mature_oak/tree.glb",
-            -84.0,
+            Some(-84.0),
             [3000, 700, 4],
         ),
         (
             "mature_oak_lighter",
             "mature_oak_palettes_v1/lighter/mature_oak/tree.glb",
-            -60.0,
+            Some(-60.0),
             [3000, 700, 4],
         ),
         (
             "leaning_oak",
             "oak_palettes_birch_v1/natural/leaning_oak/tree.glb",
-            -36.0,
+            Some(-36.0),
             [3000, 700, 4],
         ),
         (
             "leaning_oak_lighter",
             "oak_palettes_birch_v1/lighter/leaning_oak/tree.glb",
-            -12.0,
+            Some(-12.0),
             [3000, 700, 4],
         ),
         (
             "shrub_b_v4",
             "shrub_b_v4_fuller/shrub_b/tree.glb",
-            0.0,
+            Some(0.0),
             [1900, 120, 4],
         ),
         (
             "silver_birch_warm",
             "birch_warm_v1/birch_warm/silver_birch/tree.glb",
-            12.0,
+            Some(12.0),
             [2000, 450, 4],
+        ),
+        (
+            "mature_oak_trunk",
+            "oak_trunk_v1/mature_oak/tree.glb",
+            None,
+            [3000, 700, 4],
+        ),
+        (
+            "shrub_b_sandbox",
+            "shrub_b_lod_v1/shrub_b/tree.glb",
+            None,
+            [1900, 600, 4],
         ),
     ] {
         let shipped = root.join(format!("assets/vegetation/{name}.glb"));
@@ -619,7 +690,17 @@ fn read_tree(path: &std::path::Path, budgets: [usize; 3]) -> Result<TreeData, St
                 if texture.tex_coord() != 0 {
                     return Err("atlas must use UV0".into());
                 }
-                let image = read_tree_image(texture.texture().source(), blob, false, opaque)?;
+                let mut image = read_tree_image(texture.texture().source(), blob, false, opaque)?;
+                // Tiled bark declares mirrored wrapping; atlas textures retain clamped edges.
+                let sampler = texture.texture().sampler();
+                if let ImageSampler::Descriptor(ref mut descriptor) = image.sampler {
+                    if sampler.wrap_s() == gltf::texture::WrappingMode::MirroredRepeat {
+                        descriptor.address_mode_u = ImageAddressMode::MirrorRepeat;
+                    }
+                    if sampler.wrap_t() == gltf::texture::WrappingMode::MirroredRepeat {
+                        descriptor.address_mode_v = ImageAddressMode::MirrorRepeat;
+                    }
+                }
                 let normal = material
                     .normal_texture()
                     .map(|texture| {
@@ -826,10 +907,10 @@ fn select_tree_level(
             continue;
         };
         let levels = &tree.levels;
-        let centre = transform.translation + Vec3::Y * levels[0].height * 0.5;
+        let centre = transform.transform_point(Vec3::Y * levels[0].height * 0.5);
+        let size = levels[0].detail_size * transform.scale.abs().max_element();
         let distance = camera_transform.translation.distance(centre).max(1.0);
-        let pixels =
-            levels[0].detail_size * viewport / (2.0 * (perspective.fov * 0.5).tan() * distance);
+        let pixels = size * viewport / (2.0 * (perspective.fov * 0.5).tan() * distance);
         let mut next = match selected.level {
             0 if pixels < 16.0 => 2,
             0 if pixels < 108.0 => 1,
