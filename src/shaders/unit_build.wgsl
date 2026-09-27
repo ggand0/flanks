@@ -2,7 +2,10 @@
 // `sync_instance_data`, one thread per soldier. Reads the per-tick
 // soldier snapshot, the per-frame regiment records and the camera,
 // writes the 64 byte instance record the vertex shader consumes, and
-// appends the soldier to his kind-by-level index list. A second entry
+// appends the soldier to his kind-by-level index list. A near soldier
+// whose shadow can fall in view also goes on the caster list for his kind
+// of each sun shadow cascade that serves the depths it falls at, whether
+// or not the camera sees him (render_units_shadow.rs). A second entry
 // turns the list counts into indirect draw arguments.
 //
 // Step order and constants follow the CPU pass line for line (the
@@ -105,6 +108,24 @@ struct Params {
     bow: vec4<f32>,
     // x = first index slot of the bucket, y = mesh corners per soldier.
     buckets: array<vec4<u32>, 16>,
+    // The camera's forward axis, for view depth.
+    cam_fwd: vec4<f32>,
+    // Where a soldier's shadow can fall: xz = the centre of the ground his
+    // cull sphere shades, from his position, w = its radius.
+    shadow_reach: vec4<f32>,
+    // The view depths each cascade is sampled at, blend band included.
+    cascade_near: vec4<f32>,
+    cascade_far: vec4<f32>,
+    // Per cascade, one entry per kind: the first slot of the cascade's
+    // caster list, and the corners per soldier of the level it casts with.
+    shadow_lists: array<vec4<u32>, 4>,
+    shadow_corners: array<vec4<u32>, 4>,
+    // Cascades to fill, 0 with shadows off.
+    n_cascades: u32,
+    // Detail levels that cast: a soldier farther than these casts nothing.
+    cast_lods: u32,
+    // The first slot of the ring list in `index_list`.
+    ring_base: u32,
 };
 
 struct DrawArgs {
@@ -120,12 +141,16 @@ struct DrawArgs {
 @group(0) @binding(3) var<storage, read_write> smoothing: array<Smooth>;
 @group(0) @binding(4) var<storage, read_write> records: array<Record>;
 @group(0) @binding(5) var<storage, read_write> index_list: array<u32>;
-// 0..16 soldiers per bucket (living and fallen), 16..32 the fallen alone.
-@group(0) @binding(6) var<storage, read_write> counts: array<atomic<u32>, 32>;
-@group(0) @binding(7) var<storage, read_write> args: array<DrawArgs, 16>;
+// 0..16 soldiers per bucket (living and fallen), 16..32 the fallen alone,
+// 32..48 the casters per cascade and kind (cascade * 4 + kind), 48 the
+// selection rings.
+@group(0) @binding(6) var<storage, read_write> counts: array<atomic<u32>, 49>;
+// 0..16 the camera's buckets, 16..32 the casters as in `counts`, 32 the
+// selection rings.
+@group(0) @binding(7) var<storage, read_write> args: array<DrawArgs, 33>;
 // Copied back to the CPU by Bevy's readback plugin: the 32 counts, the
-// frame stamp and the soldier count.
-@group(0) @binding(8) var<storage, read_write> readback: array<u32, 36>;
+// frame stamp and the soldier count, two spare, the 16 caster counts.
+@group(0) @binding(8) var<storage, read_write> readback: array<u32, 52>;
 
 const CULL_RADIUS: f32 = 2.5;
 const LOD_JITTER: f32 = 0.2;
@@ -147,9 +172,15 @@ const SWING_RANGED: u32 = 128u;
 const REG_BROKEN: u32 = 1u;
 const REG_SELECTED: u32 = 2u;
 const REG_HOVERED: u32 = 4u;
+const REG_HOVER_OWN: u32 = 8u;
 
-const HIGHLIGHT: vec3<f32> = vec3<f32>(1.0, 1.0, 0.55);
-const HOSTILE: vec3<f32> = vec3<f32>(1.0, 0.30, 0.22);
+// Ring styles (selection_rings.rs `ring_style`).
+const RING_SELECTED: u32 = 0u;
+const RING_HOVER_OWN: u32 = 1u;
+const RING_HOVER_ENEMY: u32 = 2u;
+// The ring count in `counts`, and the rings' entry in `args`.
+const RING_COUNTER: u32 = 48u;
+const RING_ARG: u32 = 32u;
 
 // Detail level for a squared distance: the farthest threshold passed wins.
 fn level(t: vec4<f32>, d2: f32) -> u32 {
@@ -193,6 +224,45 @@ fn lod_jitter(seed: f32) -> f32 {
 fn append(bucket: u32, entry: u32, lod: u32) {
     let slot = atomicAdd(&counts[bucket], 1u);
     index_list[params.buckets[bucket].x + slot] = entry | (lod << 30u);
+}
+
+// The cascades a soldier at `p` casts into, one bit each: none when the
+// ground his shadow can fall on is out of view, else every cascade that
+// is sampled at the view depths of that ground. His shadow lands where
+// it does whether or not the camera sees him.
+fn cascade_mask(p: vec3<f32>) -> u32 {
+    if params.n_cascades == 0u {
+        return 0u;
+    }
+    let reach = vec3<f32>(p.x + params.shadow_reach.x, p.y, p.z + params.shadow_reach.z);
+    let r = params.shadow_reach.w;
+    if params.cull != 0u {
+        let c = vec4<f32>(reach, 1.0);
+        for (var i = 0u; i < 5u; i++) {
+            if dot(params.planes[i], c) + r <= 0.0 {
+                return 0u;
+            }
+        }
+    }
+    let depth = dot(reach - params.cam_pos, params.cam_fwd.xyz);
+    var mask = 0u;
+    for (var c = 0u; c < params.n_cascades; c++) {
+        if depth + r >= params.cascade_near[c] && depth - r <= params.cascade_far[c] {
+            mask |= 1u << c;
+        }
+    }
+    return mask;
+}
+
+// Put record `entry` of a soldier of `kind` on the caster list of every
+// cascade in `mask`.
+fn append_casters(mask: u32, kind: u32, entry: u32) {
+    for (var c = 0u; c < params.n_cascades; c++) {
+        if (mask & (1u << c)) != 0u {
+            let slot = atomicAdd(&counts[32u + c * 4u + kind], 1u);
+            index_list[params.shadow_lists[c][kind] + slot] = entry;
+        }
+    }
 }
 
 fn build_soldier(i: u32) {
@@ -290,29 +360,34 @@ fn build_soldier(i: u32) {
     sm.gait = g - floor(g);
 
     let position = mix(prev, pos, params.alpha);
-    if culled(position) {
-        smoothing[i] = sm;
-        return;
-    }
-
-    // Detail level: jittered distance against this frame's thresholds,
-    // held inside the hysteresis bounds.
     let jitter = lod_jitter(s.seed);
     let d = position - params.cam_pos;
     let d2 = dot(d, d) * jitter * jitter;
-    let fine = level(params.bands[kind * 3u], d2);
-    let coarse = level(params.bands[kind * 3u + 1u], d2);
-    sm.lod = clamp(sm.lod, fine, coarse);
-    let lod = sm.lod;
+    let visible = !culled(position);
+    // Detail level: jittered distance against this frame's thresholds,
+    // held inside the hysteresis bounds. A soldier the camera does not see
+    // keeps his held level for when he comes back, and casts by the plain
+    // thresholds.
+    var lod = level(params.bands[kind * 3u + 2u], d2);
+    if visible {
+        let fine = level(params.bands[kind * 3u], d2);
+        let coarse = level(params.bands[kind * 3u + 1u], d2);
+        sm.lod = clamp(sm.lod, fine, coarse);
+        lod = sm.lod;
+    }
+    var casts = 0u;
+    if lod < params.cast_lods {
+        casts = cascade_mask(position);
+    }
+    if !visible && casts == 0u {
+        smoothing[i] = sm;
+        return;
+    }
 
     var rgb = vec3<f32>(s.cr, s.cg, s.cb);
     if (reg.flags & REG_BROKEN) != 0u {
         let gray = 0.299 * rgb.r + 0.587 * rgb.g + 0.114 * rgb.b;
         rgb = rgb * 0.55 + vec3<f32>(gray) * 0.45;
-    } else if (reg.flags & REG_SELECTED) != 0u {
-        rgb = rgb * 0.35 + HIGHLIGHT * 0.65;
-    } else if (reg.flags & REG_HOVERED) != 0u {
-        rgb = rgb * 0.45 + HOSTILE * 0.55;
     }
 
     // Facing interpolates like position, wrap-aware.
@@ -344,12 +419,33 @@ fn build_soldier(i: u32) {
         vec4<f32>(sm.band, sm.wall, sm.gait, stagger),
     );
     smoothing[i] = sm;
-    append(kind * NUM_LODS + lod, i, lod);
+    if visible {
+        append(kind * NUM_LODS + lod, i, lod);
+        if death_t == 0.0 && (reg.flags & (REG_SELECTED | REG_HOVERED | REG_HOVER_OWN)) != 0u {
+            append_ring(i, reg.flags, kind);
+        }
+    }
+    append_casters(casts, kind, i);
+}
+
+// A living soldier of a selected or hovered regiment gets a ring under
+// his feet: his record index, the ring style and his kind in one entry
+// (selection_rings.rs, unit_rings.wgsl). The enemy under the cursor wins
+// over the selection, the selection over a hovered own regiment.
+fn append_ring(i: u32, flags: u32, kind: u32) {
+    var style = RING_HOVER_OWN;
+    if (flags & REG_HOVERED) != 0u {
+        style = RING_HOVER_ENEMY;
+    } else if (flags & REG_SELECTED) != 0u {
+        style = RING_SELECTED;
+    }
+    let slot = atomicAdd(&counts[RING_COUNTER], 1u);
+    index_list[params.ring_base + slot] = i | (style << 28u) | (kind << 30u);
 }
 
 // The fallen: a frozen record in the corpse region of `records`. A cull,
 // a level pick from the plain thresholds (no hysteresis, bodies do not
-// move) and an index append.
+// move) and an index append, then the caster lists as for the living.
 fn build_corpse(j: u32) {
     var kind = 0u;
     var start = 0u;
@@ -364,16 +460,18 @@ fn build_corpse(j: u32) {
     let ridx = params.corpse_base + kind * params.corpse_cap + (j - start);
     let rec = records[ridx];
     let position = rec.pos_scale.xyz;
-    if culled(position) {
-        return;
-    }
     let jitter = lod_jitter(rec.color.a);
     let d = position - params.cam_pos;
     let d2 = dot(d, d) * jitter * jitter;
     let lod = level(params.bands[kind * 3u + 2u], d2);
-    let bucket = kind * NUM_LODS + lod;
-    atomicAdd(&counts[16u + bucket], 1u);
-    append(bucket, ridx, lod);
+    if !culled(position) {
+        let bucket = kind * NUM_LODS + lod;
+        atomicAdd(&counts[16u + bucket], 1u);
+        append(bucket, ridx, lod);
+    }
+    if lod < params.cast_lods {
+        append_casters(cascade_mask(position), kind, ridx);
+    }
 }
 
 @compute @workgroup_size(64)
@@ -390,10 +488,18 @@ fn build(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 }
 
-// One thread per bucket: the list count becomes the pulled draw's vertex
+// One thread per list: the list count becomes the pulled draw's vertex
 // count. `counts` was cleared before `build` ran.
-@compute @workgroup_size(16)
+@compute @workgroup_size(32)
 fn finalize(@builtin(local_invocation_index) b: u32) {
+    if b >= 16u {
+        // A caster list: cascade * 4 + kind.
+        let s = b - 16u;
+        let count = atomicLoad(&counts[32u + s]);
+        args[b] = DrawArgs(count * params.shadow_corners[s / 4u][s % 4u], 1u, 0u, 0u);
+        readback[36u + s] = count;
+        return;
+    }
     let count = atomicLoad(&counts[b]);
     let fallen = atomicLoad(&counts[16u + b]);
     args[b] = DrawArgs(count * params.buckets[b].y, 1u, 0u, 0u);
@@ -402,5 +508,7 @@ fn finalize(@builtin(local_invocation_index) b: u32) {
     if b == 0u {
         readback[32u] = params.frame;
         readback[33u] = params.n;
+        // Six corners per ring (two triangles).
+        args[RING_ARG] = DrawArgs(atomicLoad(&counts[RING_COUNTER]) * 6u, 1u, 0u, 0u);
     }
 }

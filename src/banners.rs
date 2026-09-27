@@ -91,12 +91,16 @@ fn spawn_banners(
     let unit_cube = meshes.add(Cuboid::new(1.0, 1.0, 1.0));
     let sel_mesh = meshes.add(Cuboid::new(0.4, 0.4, 0.4));
 
+    // The whole banner is UI: it grows with the camera distance, so a
+    // shadow would be an artifact that grows with it, and every caster is
+    // one more mesh each sun cascade walks per frame. Nothing here casts.
     for (g, gd) in groups.list.iter().enumerate() {
         let flag = commands
             .spawn((
                 Mesh3d(flag_meshes[gd.kind as usize].clone()),
                 MeshMaterial3d(flag_mats[gd.team as usize].clone()),
                 Transform::from_xyz(0.85, 3.55, 0.0),
+                bevy::light::NotShadowCaster,
             ))
             .id();
         let pole = commands
@@ -104,6 +108,7 @@ fn spawn_banners(
                 Mesh3d(pole_mesh.clone()),
                 MeshMaterial3d(pole_mat.clone()),
                 Transform::from_xyz(0.0, 2.1, 0.0),
+                bevy::light::NotShadowCaster,
             ))
             .id();
         let mut bar = |y: f32, z: f32, w: f32, h: f32, mat: &Handle<StandardMaterial>| {
@@ -112,6 +117,7 @@ fn spawn_banners(
                     Mesh3d(unit_cube.clone()),
                     MeshMaterial3d(mat.clone()),
                     Transform::from_xyz(0.0, y, z).with_scale(Vec3::new(w, h, 0.04)),
+                    bevy::light::NotShadowCaster,
                 ))
                 .id()
         };
@@ -127,6 +133,7 @@ fn spawn_banners(
                     std::f32::consts::FRAC_PI_4,
                 )),
                 Visibility::Hidden,
+                bevy::light::NotShadowCaster,
             ))
             .id();
         commands

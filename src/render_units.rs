@@ -47,7 +47,7 @@ use crate::units::Units;
 
 /// Bounding-sphere radius for per-instance frustum culling: cube diagonal
 /// plus a generous margin so nothing pops inside the screen edge.
-const CULL_RADIUS: f32 = 2.5;
+pub(crate) const CULL_RADIUS: f32 = 2.5;
 
 /// Instances drawn this frame after culling (overlay diagnostics).
 #[derive(Resource, Default)]
@@ -118,6 +118,10 @@ pub struct InstanceMaterialData(pub Vec<InstanceData>);
 /// per-instance color.
 #[derive(Component)]
 pub struct InstanceBucket(pub usize);
+
+/// Render world: the bucket a unit draw entity holds. Arrows have none.
+#[derive(Component, Clone, Copy)]
+pub(crate) struct ExtractedBucket(pub usize);
 
 /// Detail levels per unit kind: L0 is the full mesh, the last level a
 /// couple of blocks for soldiers a few pixels tall.
@@ -223,6 +227,20 @@ impl LodBands {
         bands
     }
 
+    /// The nearest distance at which any kind can show level `lod`: its
+    /// switch distance for the kind that switches soonest, less the
+    /// jitter that pulls a soldier's switch in. Infinite when no kind
+    /// ever reaches the level.
+    pub(crate) fn level_start(&self, lod: usize) -> f32 {
+        if lod == 0 {
+            return 0.0;
+        }
+        self.plain
+            .iter()
+            .map(|t| t[lod - 1].sqrt() / (1.0 + 0.5 * LOD_JITTER))
+            .fold(f32::INFINITY, f32::min)
+    }
+
     /// Level for a squared distance: the farthest threshold passed wins.
     #[inline]
     fn level(thresholds: &[f32; NUM_LODS - 1], d2: f32) -> u8 {
@@ -234,6 +252,36 @@ impl LodBands {
         }
         lod
     }
+}
+
+/// Width of Bevy's default shadow filter in shadow texels: its Gaussian
+/// PCF (`sample_shadow_map_castano_thirteen`) takes taps from two texels
+/// either side of the pixel's own, so an outline detail narrower than
+/// five texels is smeared before it reaches the screen.
+const SHADOW_FILTER_TEXELS: f32 = 5.0;
+
+/// The level a soldier of `kind` casts his shadow with into a sun cascade
+/// of `texel` metres per shadow texel: the level the camera picks for a
+/// soldier as many pixels tall as his shadow can show detail, his height
+/// in shadow texels over the filter's width. As in `LodBands::level`, the
+/// farthest threshold passed wins. In the 40 m view that is L2 into the
+/// first cascade and L3 into the second; crops of the foreground knights
+/// at L1 and L2 look the same, and the shadow pass costs a third
+/// (devlog 0147). `FL_SHADOW_FILTER_TEXELS=2` casts a level finer, for
+/// A/B passes.
+pub(crate) fn shadow_level(cfg: &LodConfig, kind: usize, texel: f32) -> usize {
+    static FILTER: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    let filter = *FILTER.get_or_init(|| {
+        crate::util::env_or("FL_SHADOW_FILTER_TEXELS", SHADOW_FILTER_TEXELS).max(0.25)
+    });
+    let px = 2.0 * crate::unit_types::half_height(kind) / (texel * filter).max(1e-6);
+    cfg.px[kind]
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| **t > 0.0 && px < **t)
+        .map(|(j, _)| j + 1)
+        .max()
+        .unwrap_or(0)
 }
 
 /// Per-kind corpse cap (ring-buffered: oldest bodies fade from the field).
@@ -332,13 +380,19 @@ fn render_frame_end(clock: Res<RenderFrameClock>) {
 #[allow(clippy::type_complexity)] // bevy system params
 fn extract_instance_data(
     main_entities: Extract<
-        Query<(&RenderEntity, &InstanceMaterialData, Option<&UnitAtlas>, Option<&UnitRig>)>,
+        Query<(
+            &RenderEntity,
+            &InstanceMaterialData,
+            Option<&UnitAtlas>,
+            Option<&UnitRig>,
+            Option<&InstanceBucket>,
+        )>,
     >,
     mut extracted: Query<&mut ExtractedInstances>,
     mut commands: Commands,
 ) {
     let t0 = std::time::Instant::now();
-    for (render_entity, data, atlas, rig) in &main_entities {
+    for (render_entity, data, atlas, rig, bucket) in &main_entities {
         let e = render_entity.id();
         if let Ok(mut ex) = extracted.get_mut(e) {
             ex.0.clear();
@@ -351,6 +405,9 @@ fn extract_instance_data(
             }
             if let Some(rig) = rig {
                 entity.insert(rig.clone());
+            }
+            if let Some(bucket) = bucket {
+                entity.insert(ExtractedBucket(bucket.0));
             }
         }
     }
@@ -372,6 +429,7 @@ impl Plugin for UnitRenderPlugin {
             .init_resource::<LodConfig>()
             .init_resource::<Corpses>()
             .add_plugins(crate::render_units_gpu::GpuUnitRenderPlugin)
+            .add_plugins(crate::render_units_shadow::UnitShadowPlugin)
             .add_systems(Startup, setup_unit_mesh)
             // Must run after the camera moves: culling builds a FRESH
             // frustum from this frame's camera transform (the Frustum
@@ -428,6 +486,9 @@ fn setup_unit_mesh(
     // `SortedRenderPhase::render_range` skips every item after the first —
     // its draw function never runs and that bucket's units silently vanish
     // (the "LOD far bucket invisible" bug).
+    //
+    // NotShadowCaster: Bevy's own shadow queue would find no material on
+    // these entities. They cast through render_units_shadow.rs instead.
     for kind in 0..crate::unit_types::NUM_KINDS {
         let model = crate::unit_glb::kind_lods(kind);
         let lods = model.lods;
@@ -454,6 +515,7 @@ fn setup_unit_mesh(
                 rig.clone(),
                 NoFrustumCulling,
                 NoAutomaticBatching,
+                bevy::light::NotShadowCaster,
             ));
             if let Some(pulled) = pulled {
                 entity.insert(pulled);
@@ -687,7 +749,7 @@ fn attack_digit(sw: u8) -> f32 {
     if sw & crate::units::SWING_CHARGE != 0 { style + 3.0 } else { style }
 }
 
-#[allow(clippy::too_many_arguments)] // bevy system params
+#[allow(clippy::too_many_arguments, clippy::type_complexity)] // bevy system params
 fn sync_instance_data(
     units: Res<Units>,
     selection: Res<crate::orders::Selection>,
@@ -704,9 +766,16 @@ fn sync_instance_data(
     mut scratch: Local<Vec<[Vec<InstanceData>; NUM_BUCKETS]>>,
     mut corpse_scratch: Local<Vec<[Vec<InstanceData>; NUM_LODS]>>,
     mut smooth: Local<Vec<Smooth>>,
-    (gpu, frame): (Res<GpuSyncConfig>, Res<bevy::diagnostic::FrameCount>),
+    (gpu, frame, settings, mut rings, mut ring_scratch): (
+        Res<GpuSyncConfig>,
+        Res<bevy::diagnostic::FrameCount>,
+        Res<crate::settings::Settings>,
+        ResMut<crate::selection_rings::CpuRings>,
+        Local<Vec<Vec<(InstanceData, u32)>>>,
+    ),
 ) {
     let _span = info_span!("sync_instances").entered();
+    let hit_flash = settings.interface.hit_flash;
     let t0 = std::time::Instant::now();
     let Ok((cam, projection, cam_tf)) = camera.single() else {
         return;
@@ -742,14 +811,22 @@ fn sync_instance_data(
     let lod_debug = lod_cfg.debug;
     let cam_pos = cam_tf.translation;
 
-    const HIGHLIGHT: [f32; 4] = [1.0, 1.0, 0.55, 1.0];
-    // Attack-preview tint: the enemy regiment a right-click would target.
-    const HOSTILE: [f32; 4] = [1.0, 0.30, 0.22, 1.0];
-    let has_sel = selection.regiments.iter().any(|s| *s);
-    let hover_enemy = hover.enemy;
     // Broken regiments render desaturated (no extra instance data needed).
     let broken: Vec<bool> = groups.list.iter().map(|g| g.state.is_broken()).collect();
     let broken = &broken[..];
+    // Each regiment's ring style, as the GPU build picks it. The GPU path
+    // owns the display in check mode, so only the CPU path collects.
+    let ring_style: Vec<Option<u32>> = (0..groups.list.len())
+        .map(|g| {
+            let selected = selection.regiments.get(g).copied().unwrap_or(false) && !broken[g];
+            crate::selection_rings::ring_style(
+                selected,
+                hover.enemy == Some(g as u32),
+                hover.own == Some(g as u32),
+            )
+        })
+        .collect();
+    let ring_style = if gpu.enabled { &[][..] } else { &ring_style[..] };
     // One value per regiment: stance tier, cheer progress, wall signal.
     // Shared with the GPU path.
     let stance: Vec<f32> = groups.list.iter().map(stance_tier).collect();
@@ -766,8 +843,10 @@ fn sync_instance_data(
     if scratch.len() < n_chunks {
         scratch.resize_with(n_chunks, Default::default);
     }
+    if ring_scratch.len() < n_chunks {
+        ring_scratch.resize_with(n_chunks, Default::default);
+    }
     let units = &*units;
-    let selection = &*selection;
     let frustum = &frustum;
     let inv_dt = 1.0 / fixed_time.timestep().as_secs_f32().max(1e-6);
     // Per-unit walk-signal smoothing (~0.25 s): positional-correction
@@ -797,9 +876,10 @@ fn sync_instance_data(
     // deliberate act, not a snap.
     let wall_k = (dt / 0.5).min(1.0);
     bevy::tasks::ComputeTaskPool::get().scope(|scope| {
-        for (ci, (chunk_scratch, smooth_chunk)) in scratch
+        for (ci, ((chunk_scratch, smooth_chunk), chunk_rings)) in scratch
             .iter_mut()
             .zip(smooth.chunks_mut(SYNC_CHUNK))
+            .zip(ring_scratch.iter_mut())
             .enumerate()
             .take(n_chunks)
         {
@@ -807,6 +887,7 @@ fn sync_instance_data(
                 for vec in chunk_scratch.iter_mut() {
                     vec.clear();
                 }
+                chunk_rings.clear();
                 let start = ci * SYNC_CHUNK;
                 let end = (start + SYNC_CHUNK).min(units.len());
                 for i in start..end {
@@ -865,16 +946,6 @@ fn sync_instance_data(
                         for c in color.iter_mut().take(3) {
                             *c = *c * 0.55 + gray * 0.45;
                         }
-                    } else if has_sel
-                        && selection.regiments.get(gi).copied().unwrap_or(false)
-                    {
-                        for c in 0..3 {
-                            color[c] = color[c] * 0.35 + HIGHLIGHT[c] * 0.65;
-                        }
-                    } else if hover_enemy == Some(gi as u32) {
-                        for c in 0..3 {
-                            color[c] = color[c] * 0.45 + HOSTILE[c] * 0.55;
-                        }
                     }
                     if lod_debug {
                         lod_debug_tint(&mut color, lod);
@@ -896,8 +967,10 @@ fn sync_instance_data(
                     // fx: [0,1) hit flash, [1,2] death progress.
                     let fx = if units.death_t[i] > 0 {
                         2.0 - units.death_t[i] as f32 / crate::sim::damage::DEATH_TICKS as f32
-                    } else {
+                    } else if hit_flash {
                         units.flash[i] as f32 * 0.25
+                    } else {
+                        0.0
                     };
                     // Stagger progress (1 at the blow, 0 recovered): the
                     // rocked-back pose. Death pose owns dying men.
@@ -913,13 +986,17 @@ fn sync_instance_data(
                     } else {
                         0.0
                     };
-                    chunk_scratch[bucket_of(kind, lod)].push(InstanceData {
+                    let instance = InstanceData {
                         position,
                         w: sm.bow,
                         color,
                         anim: [yaw, sm.walk, lunge, fx],
                         anim2: [sm.band, sm.wall, sm.gait, stagger],
-                    });
+                    };
+                    chunk_scratch[bucket_of(kind, lod)].push(instance);
+                    if !dying && let Some(Some(style)) = ring_style.get(gi) {
+                        chunk_rings.push((instance, style << 28 | (kind as u32) << 30));
+                    }
                 }
             });
         }
@@ -953,6 +1030,15 @@ fn sync_instance_data(
         for chunk_scratch in scratch.iter().take(n_chunks) {
             data.extend_from_slice(&chunk_scratch[b]);
         }
+    }
+    // The rings' records, and one entry per ring pointing at its record
+    // as the GPU build's ring list does.
+    let rings = &mut *rings;
+    rings.records.clear();
+    rings.entries.clear();
+    for (instance, bits) in ring_scratch.iter().take(n_chunks).flatten() {
+        rings.entries.push(rings.records.len() as u32 | bits);
+        rings.records.push(*instance);
     }
     // Per-bucket counts: the living, read before the fallen join the
     // buckets, and the fallen as they join.
@@ -991,10 +1077,17 @@ fn queue_custom(
         Res<BatchedInstanceBuffers<MeshUniform, MeshInputUniform>>,
     >,
     material_meshes: Query<
-        (Entity, &MainEntity, Option<&PullMeshGpu>, Has<ExtractedAtlas>),
+        (
+            Entity,
+            &MainEntity,
+            Option<&PullMeshGpu>,
+            Has<ExtractedAtlas>,
+            Option<&ExtractedBucket>,
+        ),
         With<ExtractedInstances>,
     >,
     gpu_input: Option<Res<GpuUnitInput>>,
+    receive_levels: Res<crate::render_units_shadow::ShadowReceiveLevels>,
     mut transparent_render_phases: ResMut<ViewSortedRenderPhases<Transparent3d>>,
     views: Query<&ExtractedView>,
     view_key_cache: Res<ViewKeyCache>,
@@ -1012,11 +1105,13 @@ fn queue_custom(
             continue;
         };
 
-        for (entity, main_entity, pull_mesh, atlas) in &material_meshes {
+        for (entity, main_entity, pull_mesh, atlas, bucket) in &material_meshes {
             let Some(mesh_instance) = render_mesh_instances.render_mesh_queue_data(*main_entity)
             else {
                 continue;
             };
+            // Arrows have no bucket and fly close: they receive.
+            let receive = bucket.is_none_or(|b| receive_levels.0[b.0 % NUM_LODS]);
             let Some(mesh) = meshes.get(mesh_instance.mesh_asset_id()) else {
                 continue;
             };
@@ -1037,13 +1132,14 @@ fn queue_custom(
                         bucket: pull_mesh.bucket as u32,
                         lod_debug,
                         atlas,
+                        receive,
                     },
                 ),
                 None => pipelines
                     .specialize(
                         &pipeline_cache,
                         &custom_pipeline,
-                        UnitMeshKey { mesh: key, atlas },
+                        UnitMeshKey { mesh: key, atlas, receive },
                         &mesh.layout,
                     )
                     .unwrap(),
@@ -1126,16 +1222,16 @@ pub(crate) fn prepare_instance_buffers(
     );
 }
 
-#[derive(Resource)]
+#[derive(Resource, Clone)]
 pub(crate) struct CustomPipeline {
     shader: Handle<Shader>,
     mesh_pipeline: MeshPipeline,
     /// Group 3 of a pulled bucket: the instance records, the index list,
     /// the bucket's mesh corners, the bucket table, then the atlas, its
-    /// sampler and the rig.
+    /// sampler, the rig and the sun.
     pub(crate) pull_layout: BindGroupLayoutDescriptor,
-    /// Group 3 of an instanced bucket: the atlas, its sampler and the rig,
-    /// at the same bindings as in `pull_layout`.
+    /// Group 3 of an instanced bucket: the atlas, its sampler, the rig and
+    /// the sun, at the same bindings as in `pull_layout`.
     bucket_layout: BindGroupLayoutDescriptor,
     /// One white texel with no team mask. An untextured bucket binds it to
     /// fill the atlas slot, and a textured one until its atlas uploads.
@@ -1157,7 +1253,7 @@ impl CustomPipeline {
     }
 }
 
-fn init_custom_pipeline(
+pub(crate) fn init_custom_pipeline(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
     mesh_pipeline: Res<MeshPipeline>,
@@ -1166,6 +1262,10 @@ fn init_custom_pipeline(
 ) {
     let rig = || {
         binding_types::uniform_buffer_sized(false, None).visibility(ShaderStages::VERTEX)
+    };
+    let sun = || {
+        binding_types::uniform_buffer::<crate::render_units_shadow::SunUniform>(false)
+            .visibility(ShaderStages::VERTEX)
     };
     let clips = || {
         binding_types::storage_buffer_read_only_sized(false, None)
@@ -1212,6 +1312,7 @@ fn init_custom_pipeline(
                     ),
                     (6, rig()),
                     (7, clips()),
+                    (8, sun()),
                 ),
             ),
         ),
@@ -1224,6 +1325,7 @@ fn init_custom_pipeline(
                     (5, binding_types::sampler(SamplerBindingType::Filtering)),
                     (6, rig()),
                     (7, clips()),
+                    (8, sun()),
                 ),
             ),
         ),
@@ -1276,11 +1378,15 @@ fn prepare_bucket_bind_groups(
     pipeline_cache: Res<PipelineCache>,
     device: Res<RenderDevice>,
     images: Res<RenderAssets<GpuImage>>,
+    sun: Res<crate::render_units_shadow::SunBuffer>,
     buckets: Query<
         (Entity, Option<&ExtractedAtlas>, &RigBuffer, Option<&BucketBindGroup>),
         (With<ExtractedInstances>, Without<PullMeshGpu>),
     >,
 ) {
+    let Some(sun) = sun.binding() else {
+        return;
+    };
     for (entity, atlas, rig, existing) in &buckets {
         if existing.is_some_and(|b| b.settled) {
             continue;
@@ -1294,6 +1400,7 @@ fn prepare_bucket_bind_groups(
                 (5, sampler),
                 (6, rig.rig.as_entire_binding()),
                 (7, rig.clips.as_entire_binding()),
+                (8, sun.clone()),
             )),
         );
         commands.entity(entity).insert(BucketBindGroup {
@@ -1320,6 +1427,29 @@ pub(crate) struct PullPipelineKey {
     lod_debug: bool,
     /// The bucket samples an atlas.
     atlas: bool,
+    /// The bucket's soldiers can stand inside a sun shadow cascade, so
+    /// the fragment samples the shadow (`ShadowReceiveLevels`).
+    receive: bool,
+}
+
+impl PullPipelineKey {
+    /// The depth-only variant a bucket casts its shadow with
+    /// (render_units_shadow.rs): no atlas, no level tint, no receive.
+    pub(crate) fn shadow(
+        mesh: MeshPipelineKey,
+        layout: MeshVertexBufferLayoutRef,
+        pull_mesh: &PullMeshGpu,
+    ) -> Self {
+        Self {
+            mesh,
+            layout,
+            verts: pull_mesh.count,
+            bucket: pull_mesh.bucket as u32,
+            lod_debug: false,
+            atlas: false,
+            receive: false,
+        }
+    }
 }
 
 /// Pipeline variant of an instanced bucket.
@@ -1328,6 +1458,15 @@ pub(crate) struct UnitMeshKey {
     mesh: MeshPipelineKey,
     /// The bucket samples an atlas.
     atlas: bool,
+    /// As `PullPipelineKey::receive`.
+    receive: bool,
+}
+
+impl UnitMeshKey {
+    /// The depth-only variant, as `PullPipelineKey::shadow`.
+    pub(crate) fn shadow(mesh: MeshPipelineKey) -> Self {
+        Self { mesh, atlas: false, receive: false }
+    }
 }
 
 /// Only a bucket with an atlas compiles the texture path. It carries
@@ -1338,6 +1477,20 @@ fn atlas_defs(descriptor: &mut RenderPipelineDescriptor, atlas: bool) {
         descriptor.vertex.shader_defs.push("UNIT_ATLAS".into());
         if let Some(fragment) = descriptor.fragment.as_mut() {
             fragment.shader_defs.push("UNIT_ATLAS".into());
+        }
+    }
+}
+
+/// Only a bucket whose soldiers can stand in a sun shadow cascade
+/// compiles the receive path: the shadow position rides from vertex to
+/// fragment and the fragment samples the map. The far levels carry three
+/// floats less per vertex, and they are most of the vertices in a wide
+/// view (devlog 0147).
+fn receive_defs(descriptor: &mut RenderPipelineDescriptor, receive: bool) {
+    if receive {
+        descriptor.vertex.shader_defs.push("UNIT_SHADOW_RECEIVE".into());
+        if let Some(fragment) = descriptor.fragment.as_mut() {
+            fragment.shader_defs.push("UNIT_SHADOW_RECEIVE".into());
         }
     }
 }
@@ -1365,6 +1518,7 @@ impl SpecializedRenderPipeline for CustomPipeline {
             defs.push("LOD_DEBUG".into());
         }
         atlas_defs(&mut descriptor, key.atlas);
+        receive_defs(&mut descriptor, key.receive);
         descriptor.set_layout(3, self.pull_layout.clone());
         descriptor
     }
@@ -1411,6 +1565,7 @@ impl SpecializedMeshPipeline for CustomPipeline {
         });
         descriptor.fragment.as_mut().unwrap().shader = self.shader.clone();
         atlas_defs(&mut descriptor, key.atlas);
+        receive_defs(&mut descriptor, key.receive);
         descriptor.set_layout(3, self.bucket_layout.clone());
         Ok(descriptor)
     }
@@ -1424,7 +1579,7 @@ type DrawCustom = (
     DrawMeshInstanced,
 );
 
-struct DrawMeshInstanced;
+pub(crate) struct DrawMeshInstanced;
 
 impl<P: PhaseItem> RenderCommand<P> for DrawMeshInstanced {
     type Param = (

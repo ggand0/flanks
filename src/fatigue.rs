@@ -59,12 +59,12 @@ const ORDER: [FatigueState; 6] = [
 /// multiplier (qualitative evidence only — "clear hard penalty at
 /// exhausted, cannot chase" — kept gentle pending a feel pass).
 const EFFECTS: [(&str, f32, f32, f32); 6] = [
-    ("fresh", 0.0, 0.0, 1.0),
-    ("warmed up", 0.0, 0.0, 1.0),
-    ("winded", -2.0, 0.0, 1.0),
-    ("tired", -3.0, -3.0, 0.95),
-    ("very tired", -4.0, -6.0, 0.88),
-    ("exhausted", -6.0, -8.0, 0.78),
+    ("Fresh", 0.0, 0.0, 1.0),
+    ("Warmed up", 0.0, 0.0, 1.0),
+    ("Winded", -2.0, 0.0, 1.0),
+    ("Tired", -3.0, -3.0, 0.95),
+    ("Very tired", -4.0, -6.0, 0.88),
+    ("Exhausted", -6.0, -8.0, 0.78),
 ];
 
 #[inline]

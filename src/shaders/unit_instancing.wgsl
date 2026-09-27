@@ -1,5 +1,7 @@
-#import bevy_pbr::mesh_functions::{get_world_from_local, mesh_position_local_to_clip}
-#import bevy_pbr::mesh_view_bindings::globals
+#import bevy_pbr::mesh_view_bindings::{globals, lights, view}
+#import bevy_pbr::mesh_view_types::DIRECTIONAL_LIGHT_FLAGS_SHADOWS_ENABLED_BIT
+#import bevy_pbr::shadows::fetch_directional_shadow
+#import bevy_pbr::view_transformations::position_world_to_clip
 
 struct Vertex {
     @location(0) position: vec3<f32>,
@@ -32,16 +34,27 @@ struct Vertex {
     @location(11) i_anim2: vec4<f32>,
 };
 
+// Kept narrow on purpose: a far view pushes 60M vertices through this
+// shader per frame, and every float here is paid that many times, while
+// the fragment runs about eight million times (devlog 0147).
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
+    // rgb = the lit vertex colour: part material blended with the team
+    // colour, times the sun and the sky. a = the sun's share of that
+    // light, the part the shadow takes away.
+    @location(0) color: vec4<f32>,
+    // Per instance, so flat. x = team colour, unorm8 rgb, and the death
+    // darkening in the top byte; y = the hit flash, unorm8 in the low byte.
+    @location(1) @interpolate(flat) packed: vec2<u32>,
+#ifdef UNIT_SHADOW_RECEIVE
+    // World position pushed off the surface by the shadow map's normal
+    // bias: where the fragment samples the sun's shadow. Only buckets
+    // whose soldiers can stand in a cascade carry it
+    // (render_units_shadow.rs `ShadowReceiveLevels`).
+    @location(2) shadow_position: vec3<f32>,
+#endif
 #ifdef UNIT_ATLAS
-    // rgb = lit vertex colour, a = hit flash.
-    @location(0) color: vec4<f32>,
-    // rgb = team colour for the atlas mask, a = death darkening.
-    @location(1) team: vec4<f32>,
-    @location(2) atlas_uv: vec2<f32>,
-#else
-    @location(0) color: vec4<f32>,
+    @location(3) atlas_uv: vec2<f32>,
 #endif
 };
 
@@ -106,6 +119,19 @@ struct Bow {
     clips: array<vec4<u32>, 2>,
 };
 @group(3) @binding(6) var<uniform> rig: Rig;
+// The scene's sun as the vertex stage sees it (render_units_shadow.rs
+// `SunUniform`): bevy binds its lights to the fragment stage only.
+struct Sun {
+    // xyz = direction toward the sun, zero without a light.
+    direction_to_light: vec4<f32>,
+    // x = 1 with shadow maps on, y = the light's shadow normal bias,
+    // z = the cascade overlap proportion, w = the cascade count.
+    params: vec4<f32>,
+    // Per cascade: its far bound in view depth, and its texel in metres.
+    far_bounds: vec4<f32>,
+    texel_sizes: vec4<f32>,
+};
+@group(3) @binding(8) var<uniform> sun: Sun;
 // The shot tables of this bucket's kind (unit_glb.rs `Shots::buffer`).
 // A pose is 8 vec4s: six joint turns as xyzw quaternions (the drawing
 // arm's shoulder, elbow and wrist, then the bow arm's), (bow yaw, limb
@@ -1131,51 +1157,114 @@ fn unit_vertex(vertex: Vertex) -> VertexOutput {
         );
 
     var out: VertexOutput;
-    // Instance entity sits at the origin with identity transform, so passing
-    // index 0 is fine (same hack as the upstream instancing example).
-    out.clip_position = mesh_position_local_to_clip(
-        get_world_from_local(0u),
-        vec4<f32>(position, 1.0)
-    );
-
-    // Flat-shaded lambert: normals are per-face, so per-vertex lighting is
-    // exact; normals are rotated with the instance above.
+    // The pose is built in world space: the bucket entity has no
+    // transform of its own.
+    out.clip_position = position_world_to_clip(position);
+#ifdef UNIT_SHADOW_DEPTH_CLAMP
+    // Shadow pass on a device without depth clip control: a soldier
+    // between the sun and the cascade's near plane lands on that plane
+    // instead of being clipped (render_units_shadow.rs).
+    out.clip_position.z = min(out.clip_position.z, out.clip_position.w);
+#endif
+    // Lambert from the scene's sun, so shading and shadow agree, over a
+    // hemispheric ambient brighter from above. Normals are per face
+    // (rotated with the instance above), so per-vertex light is exact.
     let n = normalize(normal);
-    let sun_dir = normalize(vec3<f32>(0.45, 0.85, 0.3));
-    let ndl = max(dot(n, sun_dir), 0.0);
-    let sky = 0.5 + 0.5 * n.y; // hemispheric ambient, brighter from above
-    let light = 0.30 + 0.20 * sky + 0.65 * ndl;
-
-    // Part material blended with the team color (a = team amount), then
-    // hit flash lerps toward white and death darkens. With an atlas the
-    // fragment does the last two after sampling it.
+    let sky = 0.30 + 0.20 * (0.5 + 0.5 * n.y);
+    let direct = 0.65 * max(dot(n, sun.direction_to_light.xyz), 0.0);
+    // Part material blended with the team color (a = team amount), lit.
+    // The fragment takes the shadow off the sun's share, then the hit
+    // flash lerps toward white and death darkens.
     let base = mix(vertex.v_color.rgb, vertex.i_color.rgb, vertex.v_color.a);
-    let flash = clamp(fx, 0.0, 1.0) * step(fx, 1.0);
+    out.color = vec4<f32>(base * (sky + direct), direct / (sky + direct));
+    out.packed = vec2<u32>(
+        pack4x8unorm(vec4<f32>(vertex.i_color.rgb, death)),
+        pack4x8unorm(vec4<f32>(clamp(fx, 0.0, 1.0) * step(fx, 1.0), 0.0, 0.0, 0.0)),
+    );
+#ifdef UNIT_SHADOW_RECEIVE
+    out.shadow_position = position + n * shadow_normal_bias(position);
+#endif
 #ifdef UNIT_ATLAS
-    out.color = vec4<f32>(base * light, flash);
-    out.team = vec4<f32>(vertex.i_color.rgb, death);
     out.atlas_uv = vertex.atlas_uv;
-#else
-    var rgb = base * light;
-    rgb = mix(rgb, vec3<f32>(1.0, 1.0, 1.0), flash * 0.8);
-    rgb = rgb * (1.0 - 0.45 * death);
-    out.color = vec4<f32>(rgb, 1.0);
 #endif
     return out;
 }
 
+// Depth along the camera's view axis, negative in front of it.
+fn view_depth(world_position: vec3<f32>) -> f32 {
+    return dot(vec4<f32>(
+        view.view_from_world[0].z,
+        view.view_from_world[1].z,
+        view.view_from_world[2].z,
+        view.view_from_world[3].z,
+    ), vec4<f32>(world_position, 1.0));
+}
+
+// How far off the surface the sun's shadow is sampled, in metres: the
+// light's normal bias scaled to the texel of the cascade this depth
+// reads, as bevy_pbr::shadows::sample_directional_cascade does per pixel
+// from the normal. The fragment no longer carries the normal, so the
+// offset is applied here. In a blend band the next cascade is read too,
+// with a larger texel: its bias serves both, a little more than the
+// first needs. 0 with shadows off.
+fn shadow_normal_bias(world_position: vec3<f32>) -> f32 {
+    if sun.params.x == 0.0 {
+        return 0.0;
+    }
+    let depth = -view_depth(world_position);
+    let n_cascades = u32(sun.params.w);
+    // bevy_pbr::shadows::get_cascade_index: the first cascade whose far
+    // bound is past this depth.
+    var c = n_cascades;
+    for (var i = 0u; i < n_cascades; i++) {
+        if depth < sun.far_bounds[i] {
+            c = i;
+            break;
+        }
+    }
+    if c >= n_cascades {
+        return 0.0;
+    }
+    if c + 1u < n_cascades && depth >= (1.0 - sun.params.z) * sun.far_bounds[c] {
+        c += 1u;
+    }
+    return sun.params.y * sun.texel_sizes[c];
+}
+
+// How much of the scene's sun reaches this point, 0..1: the first
+// directional light's shadow cascades at a position already pushed off
+// the surface by the normal bias, so no normal goes in. 1 past the last
+// cascade or with shadows off (FL_SHADOWS=0).
+fn sun_shadow(shadow_position: vec3<f32>, frag_xy: vec2<f32>) -> f32 {
+    if (lights.directional_lights[0].flags & DIRECTIONAL_LIGHT_FLAGS_SHADOWS_ENABLED_BIT) == 0u {
+        return 1.0;
+    }
+    let p = vec4<f32>(shadow_position, 1.0);
+    return fetch_directional_shadow(0u, p, vec3<f32>(0.0), view_depth(shadow_position), frag_xy);
+}
+
 @fragment
 fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
+    // rgb = team colour, a = death darkening.
+    let team = unpack4x8unorm(in.packed.x);
+    let flash = unpack4x8unorm(in.packed.y).x;
 #ifdef UNIT_ATLAS
     // The atlas mask tints rather than replaces, so cloth keeps its weave
     // under the team colour.
     let texel = textureSample(unit_atlas, unit_atlas_sampler, in.atlas_uv);
-    let tint = mix(vec3<f32>(1.0), in.team.rgb, texel.a);
+    let tint = mix(vec3<f32>(1.0), team.rgb, texel.a);
     var rgb = in.color.rgb * texel.rgb * tint;
-    rgb = mix(rgb, vec3<f32>(1.0, 1.0, 1.0), in.color.a * 0.8);
-    rgb = rgb * (1.0 - 0.45 * in.team.a);
-    return vec4<f32>(rgb, 1.0);
 #else
-    return in.color;
+    var rgb = in.color.rgb;
 #endif
+#ifdef UNIT_SHADOW_RECEIVE
+    // The sun's share of the light, less what its shadow takes. A face
+    // turned from the sun has no share and skips the lookup.
+    if in.color.a > 0.0 {
+        rgb *= 1.0 - in.color.a * (1.0 - sun_shadow(in.shadow_position, in.clip_position.xy));
+    }
+#endif
+    rgb = mix(rgb, vec3<f32>(1.0, 1.0, 1.0), flash * 0.8);
+    rgb = rgb * (1.0 - 0.45 * team.a);
+    return vec4<f32>(rgb, 1.0);
 }
