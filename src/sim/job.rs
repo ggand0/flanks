@@ -477,11 +477,13 @@ fn snapshot_regiments(job: &mut TickJob, groups: &Groups, terrain: &Terrain) {
     // Regiments under a Move order: the order takes them out of any fight
     // (M2TW's WITHDRAW, devlog 0120). Their men walk where they were sent,
     // pushing through what blocks them and striking only whoever stands in
-    // front of them; they close on no enemy and go after none they see.
+    // front of them; they close on no enemy and go after none they see. A
+    // regiment breaking off for a new attack target does the same on its
+    // way there (orders.rs `retarget`).
     let moving: Vec<bool> = groups
         .list
         .iter()
-        .map(|g| matches!(g.order, Some(crate::orders::Order::Move(_))))
+        .map(|g| matches!(g.order, Some(crate::orders::Order::Move(_))) || g.retarget)
         .collect();
     // Regiments in combat-watch range of an enemy (sparse-fight
     // acquisition). HOLD regiments never acquire wide: they stand their

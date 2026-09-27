@@ -331,6 +331,9 @@ struct RegimentSums {
     line_sum: f32,
     line_n: u32,
     fight_n: u32,
+    /// Of `fight_n`, the men striking a man of the regiment's attack
+    /// target.
+    target_fight_n: u32,
 }
 
 fn update_groups(
@@ -353,17 +356,26 @@ fn update_groups(
         .iter()
         .map(|g| crate::formation::facing_dir(g.facing))
         .collect();
+    let attack_target: Vec<Option<u32>> = groups
+        .list
+        .iter()
+        .map(|g| match g.order {
+            Some(crate::orders::Order::Attack(t)) => Some(t),
+            _ => None,
+        })
+        .collect();
     // The sums over the men, one task per regiment walking its runs in
     // index order: the same additions in the same order as one scan of
     // the army, regiment by regiment, so the same bits. Bevy's scope
     // returns the tasks' results in spawn order.
     let units = &*units;
     let runs = &*runs;
-    let (prev_cents_r, prev_bias_r, fwd_r) = (&prev_cents, &prev_bias, &fwd);
+    let (prev_cents_r, prev_bias_r, fwd_r, target_r) =
+        (&prev_cents, &prev_bias, &fwd, &attack_target);
     let sums: Vec<RegimentSums> = bevy::tasks::ComputeTaskPool::get().scope(|scope| {
         for g in 0..n {
             scope.spawn(async move {
-                let (pc, pb, f) = (prev_cents_r[g], prev_bias_r[g], fwd_r[g]);
+                let (pc, pb, f, tg) = (prev_cents_r[g], prev_bias_r[g], fwd_r[g], target_r[g]);
                 let mut a = RegimentSums {
                     pos: Vec2::ZERO,
                     count: 0,
@@ -375,6 +387,7 @@ fn update_groups(
                     line_sum: 0.0,
                     line_n: 0,
                     fight_n: 0,
+                    target_fight_n: 0,
                 };
                 for &(s, e) in runs.of(g) {
                     for i in s as usize..e as usize {
@@ -400,6 +413,9 @@ fn update_groups(
                         {
                             a.fight_n += 1;
                             let ti = units.target[i] as usize;
+                            if ti < units.len() && Some(units.group[ti]) == tg {
+                                a.target_fight_n += 1;
+                            }
                             if ti < units.len() {
                                 let d = Vec2::new(units.pos[ti].x - p.x, units.pos[ti].z - p.y);
                                 if d.dot(f) > 0.5 * d.length() {
@@ -488,6 +504,28 @@ fn update_groups(
         }
         let engaged = group.engage_hold > 0;
         let lock_threshold = ((group.count as f32 * ENGAGE_LOCK_FRAC) as u32).max(ENGAGE_LOCK_FLOOR);
+        // A new attack target while fighting: the regiment breaks off its
+        // fight and marches on the new one (orders.rs `retarget`), until
+        // enough of its men fight the new target or it disengages.
+        let target = attack_target[g];
+        if engaged && target.is_some() && target != group.seen_target && !group.retarget {
+            group.retarget = true;
+            if group.contact {
+                group.contact = false;
+                info!("regiment {g} releases its contact frame");
+            }
+            info!("regiment {g} breaks off for its new target");
+        }
+        group.seen_target = target;
+        if group.retarget
+            && (!engaged || target.is_none() || sums[g].target_fight_n >= lock_threshold)
+        {
+            group.retarget = false;
+            info!("regiment {g} fights its new target");
+        }
+        // Under a Move order, or breaking off for a new target, the
+        // regiment has no fight: its melee clock stops.
+        let moving = matches!(group.order, Some(crate::orders::Order::Move(_))) || group.retarget;
         if engaged != group.engaged {
             info!(
                 "regiment {g} {}",
@@ -520,6 +558,7 @@ fn update_groups(
         if engaged
             && !group.state.is_broken()
             && !group.crashing
+            && !moving
             && (group.melee_ticks > 0 || sums[g].fight_n >= lock_threshold)
         {
             group.melee_ticks = group.melee_ticks.saturating_add(1);
@@ -538,10 +577,9 @@ fn update_groups(
             }
             group.melee_ticks = 0;
         }
-        // Under a Move order the regiment has no fight: the order takes it
+        // No fight point without a fight: a Move order takes the regiment
         // out (M2TW's WITHDRAW, devlog 0120), so its men leave the melee
         // and walk where they were sent.
-        let moving = matches!(group.order, Some(crate::orders::Order::Move(_)));
         group.fight_point = if group.melee_ticks > 0 && !group.hold && !moving {
             match group.order {
                 Some(crate::orders::Order::Attack(t)) if counts[t as usize] > 0 && !broken[t as usize] => {
@@ -557,7 +595,13 @@ fn update_groups(
         let formed = group.shape == crate::formation::FormShape::Rect
             && !group.state.is_broken();
         let starts = sums[g].fight_n >= lock_threshold;
-        if formed && attacking && engaged && !group.crashing && (group.contact || starts) {
+        if formed
+            && attacking
+            && engaged
+            && !group.crashing
+            && !group.retarget
+            && (group.contact || starts)
+        {
             let f = fwd[g];
             let r = Vec2::new(f.y, -f.x);
             if !group.contact {

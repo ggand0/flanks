@@ -146,6 +146,16 @@ pub struct GroupData {
     /// Ticks the crash may last at most: the block's depth over the
     /// charge pace, the time its rear needs to arrive.
     pub crash_cap: u16,
+    /// The attack target the frontline pass saw last tick, to notice a
+    /// new one.
+    pub seen_target: Option<u32>,
+    /// Breaking off for a new target: the attack order named another
+    /// regiment while this one fought. Until enough of its men fight the
+    /// new target, or it disengages, it has no fight and no contact frame
+    /// and its men go after no enemy, as under a Move order: the block
+    /// marches on the new target and its men strike only whoever stands
+    /// in front of them.
+    pub retarget: bool,
     /// An enemy regiment's centroid is within combat-watch range: units
     /// of this regiment scan wider for adjacent enemies (sparse-fight
     /// acquisition, sim/soldier.rs) and brace when standing.
@@ -233,6 +243,8 @@ impl GroupData {
             crash_ticks: 0,
             adv_speed: 0.0,
             crash_cap: 0,
+            seen_target: None,
+            retarget: false,
             enemy_near: false,
             threat_dir: Vec2::ZERO,
             hostile_near: false,
