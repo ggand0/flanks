@@ -343,27 +343,34 @@ impl Plugin for OrdersPlugin {
     }
 }
 
-/// When the retarget test fired, and each retargeted regiment with its old
-/// and new target.
-type RetargetTest = Option<(f32, Vec<(usize, usize, usize)>)>;
+/// When the retarget test fired (the tick), and each retargeted regiment
+/// with its old and new target.
+type RetargetTest = Option<(u32, Vec<(usize, usize, usize)>)>;
 
-/// FL_TEST_RETARGET=s: s seconds into the run, every engaged player
-/// regiment is ordered onto the nearest other unbroken enemy regiment, as a
-/// player retargeting mid-fight would. Every 5 s after, each one's men are
-/// counted: striking a man of the old target, of the new one, and still
-/// within 2.5 m of an old-target man.
+/// The mid-fight retarget test. In the Retarget scenario (FL_TEST_RETARGET,
+/// regiments.rs `spawn_retarget_test`), or in any battle with
+/// FL_RETARGET_AT set: that many seconds in (20 in the scenario), every
+/// engaged player regiment is ordered onto the nearest other unbroken
+/// enemy regiment, as a player retargeting mid-fight would. Every 5 s
+/// after, each one's men are counted: striking a man of the old target,
+/// of the new one, and still within 2.5 m of an old-target man, with the
+/// regiment's distance to both. It fires on the sim tick, so two runs of
+/// one binary retarget on the same tick.
 fn test_retarget_script(
-    time: Res<Time>,
     units: Res<Units>,
+    pipeline: Res<crate::sim::TickPipeline>,
     mut groups: ResMut<Groups>,
     mut state: Local<RetargetTest>,
 ) {
-    let Some(at) = std::env::var("FL_TEST_RETARGET").ok().and_then(|v| v.parse::<f32>().ok()) else {
+    let scenario = std::env::var("FL_TEST_RETARGET").is_ok();
+    let at_s = std::env::var("FL_RETARGET_AT").ok().and_then(|v| v.parse::<f32>().ok());
+    let Some(at) = at_s.or(scenario.then_some(20.0)) else {
         return;
     };
-    let t = time.elapsed_secs();
+    let tick = pipeline.tick;
+    let secs = tick as f32 / 30.0;
     if state.is_none() {
-        if t < at {
+        if secs < at {
             return;
         }
         let mut picks = Vec::new();
@@ -397,15 +404,18 @@ fn test_retarget_script(
             groups.list[g].order = Some(Order::Attack(new as u32));
             groups.list[g].auto_order = false;
         }
-        info!("[retarget-test] t={t:.0}s {} engaged regiments retargeted", picks.len());
-        *state = Some((t, picks));
+        info!(
+            "[retarget-test] tick {tick} ({secs:.1} s): {} engaged regiments retargeted",
+            picks.len()
+        );
+        *state = Some((tick, picks));
         return;
     }
     let Some((last, picks)) = state.as_mut() else { return };
-    if t - *last < 5.0 {
+    if tick < *last + 150 {
         return;
     }
-    *last = t;
+    *last = tick;
     // Who each man fights: the man he winds up at, by regiment, and
     // whether an old-target man stands within 2.5 m of him.
     let mut near_old = vec![false; units.len()];
@@ -439,8 +449,13 @@ fn test_retarget_script(
         }
         let gd = &groups.list[g];
         info!(
-            "[retarget-test] t={t:.0}s reg {g} ({alive} men): striking old {old} {at_old}, new {new} {at_new}; touching old {touching_old}; retarget {} melee {}; old alive {} new alive {}",
-            gd.retarget, gd.melee_ticks, groups.list[old].count, groups.list[new].count
+            "[retarget-test] t={secs:.0}s reg {g} ({alive} men): striking old {old} {at_old}, new {new} {at_new}; touching old {touching_old}; to old {:.0} m, to new {:.0} m; retarget {} melee {}; old alive {} new alive {}",
+            gd.centroid.distance(groups.list[old].centroid),
+            gd.centroid.distance(groups.list[new].centroid),
+            gd.retarget,
+            gd.melee_ticks,
+            groups.list[old].count,
+            groups.list[new].count
         );
     }
 }
