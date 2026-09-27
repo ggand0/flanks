@@ -287,6 +287,7 @@ const SANDBOX_COMPOSITION: &[(&str, f32, f32, f32, f32)] = &[
     ("shrub_b_sandbox", 29.0, -3.0, 2.20, 0.80),
     ("shrub_b_sandbox", 9.0, 14.0, 0.70, 1.12),
     ("shrub_b_sandbox", 11.0, 16.0, 3.60, 0.72),
+    ("shrub_a", 14.0, 14.0, 0.30, 1.00),
 ];
 
 fn spawn_authored_plant(
@@ -495,6 +496,12 @@ fn load_trees(
             "birch_warm_v1/birch_warm/silver_birch/tree.glb",
             Some(12.0),
             [2000, 450, 4],
+        ),
+        (
+            "shrub_a",
+            "shrub_a_v1/shrub_a/tree.glb",
+            None,
+            [2800, 900, 4],
         ),
         (
             "shrub_b_sandbox",
