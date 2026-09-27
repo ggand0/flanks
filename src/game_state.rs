@@ -23,6 +23,9 @@ pub enum Scenario {
     Join,
     Routpass,
     Archery,
+    /// An empty battlefield with a free camera and no armies, for looking
+    /// at the map, the scenery and the light (`FL_SCENE=1`).
+    Scene,
 }
 
 impl Scenario {
@@ -37,6 +40,7 @@ impl Scenario {
         Self::Join,
         Self::Routpass,
         Self::Archery,
+        Self::Scene,
     ];
 
     fn label(self) -> &'static str {
@@ -51,6 +55,7 @@ impl Scenario {
             Self::Join => "Join Fight",
             Self::Routpass => "Rout Pass",
             Self::Archery => "Archery",
+            Self::Scene => "Scene",
         }
     }
 
@@ -64,6 +69,7 @@ impl Scenario {
         if std::env::var("FL_TEST_JOIN").is_ok() { return Self::Join; }
         if std::env::var("FL_TEST_ROUTPASS").is_ok() { return Self::Routpass; }
         if std::env::var("FL_TEST_ARCHERY").is_ok() { return Self::Archery; }
+        if std::env::var("FL_SCENE").is_ok() { return Self::Scene; }
         Self::Normal
     }
 }
@@ -627,6 +633,7 @@ fn sync_scenario_env(scenario: Scenario) {
         ("FL_TEST_JOIN", Scenario::Join),
         ("FL_TEST_ROUTPASS", Scenario::Routpass),
         ("FL_TEST_ARCHERY", Scenario::Archery),
+        ("FL_SCENE", Scenario::Scene),
     ];
     for (key, s) in vars {
         unsafe {
