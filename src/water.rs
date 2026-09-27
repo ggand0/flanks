@@ -21,7 +21,7 @@ pub struct WaterPlugin;
 impl Plugin for WaterPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(MaterialPlugin::<WaterMaterial>::default())
-            .add_systems(Startup, (spawn_water, spawn_bridge));
+            .add_systems(Update, respawn_river.after(terrain::MapRebuild));
     }
 }
 
@@ -100,22 +100,48 @@ fn build_water_mesh(terrain: &terrain::Terrain) -> Mesh {
         .with_inserted_indices(Indices::U32(indices))
 }
 
-fn spawn_water(
+/// The river surface and the bridge of the current map.
+#[derive(Component)]
+struct RiverScenery;
+
+/// The river and bridge follow the terrain's map: placed on the first
+/// frame, replaced on a map change, absent on the maps without a river.
+fn respawn_river(
+    mut seen: Local<Option<terrain::MapKind>>,
+    old: Query<Entity, With<RiverScenery>>,
     mut commands: Commands,
     terrain: Res<terrain::Terrain>,
     mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<WaterMaterial>>,
+    mut water_materials: ResMut<Assets<WaterMaterial>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    if *seen == Some(terrain.kind) {
+        return;
+    }
+    *seen = Some(terrain.kind);
+    for e in &old {
+        commands.entity(e).despawn();
+    }
+    place_water(&mut commands, &terrain, &mut meshes, &mut water_materials);
+    place_bridge(&mut commands, &terrain, &mut meshes, &mut materials);
+}
+
+fn place_water(
+    commands: &mut Commands,
+    terrain: &terrain::Terrain,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<WaterMaterial>,
 ) {
     if terrain.classic {
         return;
     }
-    let mesh = build_water_mesh(&terrain);
+    let mesh = build_water_mesh(terrain);
     let aabb = mesh.compute_aabb();
     let handle = meshes.add(mesh);
     let material = materials.add(WaterMaterial {
         sun_dir: sun_dir().extend(0.0),
     });
-    let mut e = commands.spawn((Mesh3d(handle), MeshMaterial3d(material)));
+    let mut e = commands.spawn((Mesh3d(handle), MeshMaterial3d(material), RiverScenery));
     if let Some(aabb) = aabb {
         e.insert(aabb);
     }
@@ -125,11 +151,11 @@ fn spawn_water(
 /// standing in the channel. Low-poly soup, same style as everything
 /// else. The walkable surface is terrain.rs's deck height override;
 /// this mesh is purely the visual.
-fn spawn_bridge(
-    mut commands: Commands,
-    terrain: Res<terrain::Terrain>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+fn place_bridge(
+    commands: &mut Commands,
+    terrain: &terrain::Terrain,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
 ) {
     if terrain.classic {
         return;
@@ -180,7 +206,7 @@ fn spawn_bridge(
         reflectance: 0.05,
         ..default()
     });
-    let mut e = commands.spawn((Mesh3d(handle), MeshMaterial3d(material)));
+    let mut e = commands.spawn((Mesh3d(handle), MeshMaterial3d(material), RiverScenery));
     if let Some(aabb) = aabb {
         e.insert(aabb);
     }

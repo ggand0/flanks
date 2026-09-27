@@ -47,11 +47,11 @@ Requires Rust 1.95 or newer.
 | Pause                           | Esc                       |
 | Debug overlays                  | G                         |
 
-A set of `FL_*` environment variables configure sandbox battles and scripted test scenarios (army size, AI on/off, random seed, and so on). `FL_MAP=river` enables an experimental map with a river and vegetation; `FL_VOLUME=0` mutes the game.
+A set of `FL_*` environment variables configure sandbox battles and scripted test scenarios (army size, AI on/off, random seed, and so on). The Map option in the menu switches between the grassland, the classic field from 0.1.0 and an experimental map with a river and vegetation; `FL_MAP=classic` or `FL_MAP=river` picks one at launch. `FL_VOLUME=0` mutes the game.
 
 ## Assets
 
-There are no external art assets: unit meshes, terrain, and all animation are generated in code. Sound effects are AI-generated (ElevenLabs), plus one [marching loop from Pixabay](https://pixabay.com/sound-effects/people-marching-loop-32908/). Audio files are covered by their respective licenses, not the source license below.
+Unit models are made for this project. The ground uses three CC0 textures from [Poly Haven](https://polyhaven.com/) and a layout image made for the project; see `assets/terrain/LICENSE.md`. Everything else is generated in code. Sound effects are AI-generated (ElevenLabs), plus one [marching loop from Pixabay](https://pixabay.com/sound-effects/people-marching-loop-32908/). Audio files are covered by their respective licenses, not the source license below.
 
 ## License
 

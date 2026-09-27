@@ -1,3 +1,5 @@
 # Unit models carry an embedded texture atlas, several MB each, and are
 # revised often.
 assets/units/*.glb filter=lfs diff=lfs merge=lfs -text
+assets/terrain/*.ktx2 filter=lfs diff=lfs merge=lfs -text
+assets/terrain/*.png filter=lfs diff=lfs merge=lfs -text
