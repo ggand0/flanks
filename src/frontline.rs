@@ -278,7 +278,7 @@ impl Plugin for FrontlinePlugin {
                     .before(crate::sim::step_sim)
                     .in_set(crate::game_state::SimSet),
             )
-            .add_systems(Update, (draw_front_gizmos, test_front_script));
+            .add_systems(Update, (draw_front_gizmos, draw_fight_points, test_front_script));
     }
 }
 
@@ -675,6 +675,54 @@ fn update_groups(
             }
         }
         group.charging = charging;
+    }
+}
+
+/// With the debug overlay on (F3): each selected regiment's fight point,
+/// where its men with nobody in reach go to join (sim/soldier.rs), as a
+/// ring on the ground joined to the regiment's centre. A regiment breaking
+/// off for a new target (orders.rs `retarget`) shows its line dashed
+/// toward that target instead, having no fight point.
+fn draw_fight_points(
+    settings: Res<crate::settings::Settings>,
+    selection: Res<crate::orders::Selection>,
+    groups: Res<crate::orders::Groups>,
+    terrain: Res<Terrain>,
+    mut gizmos: Gizmos,
+) {
+    if !settings.interface.debug_overlay {
+        return;
+    }
+    const FIGHT: Color = Color::srgb(0.95, 0.35, 0.85);
+    let lift = |p: Vec2, up: f32| Vec3::new(p.x, terrain.height_at(p.x, p.y) + up, p.y);
+    for (g, gd) in groups.list.iter().enumerate() {
+        if !selection.regiments.get(g).copied().unwrap_or(false) || gd.count == 0 {
+            continue;
+        }
+        let from = lift(gd.centroid, 2.0);
+        if let Some(fp) = gd.fight_point {
+            let at = lift(fp, 2.0);
+            gizmos.line(from, at, FIGHT);
+            gizmos.circle(
+                Isometry3d::new(lift(fp, 0.4), Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2)),
+                2.5,
+                FIGHT,
+            );
+            gizmos.line(lift(fp, 0.4), at, FIGHT);
+        } else if gd.retarget
+            && let Some(crate::orders::Order::Attack(t)) = gd.order
+            && let Some(tg) = groups.list.get(t as usize)
+        {
+            // Dashes toward the new target: 2 m on, 2 m off.
+            let to = lift(tg.centroid, 2.0);
+            let len = from.distance(to);
+            let dir = (to - from) / len.max(1e-3);
+            let mut d = 0.0;
+            while d < len {
+                gizmos.line(from + dir * d, from + dir * (d + 2.0).min(len), FIGHT);
+                d += 4.0;
+            }
+        }
     }
 }
 
