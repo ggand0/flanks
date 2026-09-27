@@ -20,10 +20,28 @@ pub enum Scenario {
     Arena,
     Charge,
     Pile,
+    /// The pile-on as a wide line at ease hit by a narrow block
+    /// (work/scripts/pile-wide.sh).
+    PileWide,
+    /// The pile-on with two attackers (work/scripts/pile-two.sh).
+    PileTwo,
     Join,
     Routpass,
     Archery,
 }
+
+/// The env var of every scripted scenario, as the scripts launch them.
+const SCENARIO_ENVS: [&str; 9] = [
+    "FL_TEST_SURROUND",
+    "FL_TEST_ROUT",
+    "FL_TEST_DIR",
+    "FL_ARENA",
+    "FL_TEST_CHARGE",
+    "FL_TEST_PILE",
+    "FL_TEST_JOIN",
+    "FL_TEST_ROUTPASS",
+    "FL_TEST_ARCHERY",
+];
 
 impl Scenario {
     const ALL: &[Scenario] = &[
@@ -34,6 +52,8 @@ impl Scenario {
         Self::Arena,
         Self::Charge,
         Self::Pile,
+        Self::PileWide,
+        Self::PileTwo,
         Self::Join,
         Self::Routpass,
         Self::Archery,
@@ -48,23 +68,38 @@ impl Scenario {
             Self::Arena => "Arena",
             Self::Charge => "Charge",
             Self::Pile => "Pile-on",
+            Self::PileWide => "Wide vs Narrow",
+            Self::PileTwo => "Two on One",
             Self::Join => "Join Fight",
             Self::Routpass => "Rout Pass",
             Self::Archery => "Archery",
         }
     }
 
+    /// The env var this scenario sets: its test logging and the systems
+    /// that stand down for scripts key off it. The pile-on variants share
+    /// FL_TEST_PILE and differ in their `PileSetup`.
+    fn env_key(self) -> Option<&'static str> {
+        match self {
+            Self::Normal => None,
+            Self::Surround => Some("FL_TEST_SURROUND"),
+            Self::Rout => Some("FL_TEST_ROUT"),
+            Self::Dir => Some("FL_TEST_DIR"),
+            Self::Arena => Some("FL_ARENA"),
+            Self::Charge => Some("FL_TEST_CHARGE"),
+            Self::Pile | Self::PileWide | Self::PileTwo => Some("FL_TEST_PILE"),
+            Self::Join => Some("FL_TEST_JOIN"),
+            Self::Routpass => Some("FL_TEST_ROUTPASS"),
+            Self::Archery => Some("FL_TEST_ARCHERY"),
+        }
+    }
+
     fn from_env() -> Self {
-        if std::env::var("FL_TEST_SURROUND").is_ok() { return Self::Surround; }
-        if std::env::var("FL_TEST_ROUT").is_ok() { return Self::Rout; }
-        if std::env::var("FL_TEST_DIR").is_ok() { return Self::Dir; }
-        if std::env::var("FL_ARENA").is_ok() { return Self::Arena; }
-        if std::env::var("FL_TEST_CHARGE").is_ok() { return Self::Charge; }
-        if std::env::var("FL_TEST_PILE").is_ok() { return Self::Pile; }
-        if std::env::var("FL_TEST_JOIN").is_ok() { return Self::Join; }
-        if std::env::var("FL_TEST_ROUTPASS").is_ok() { return Self::Routpass; }
-        if std::env::var("FL_TEST_ARCHERY").is_ok() { return Self::Archery; }
-        Self::Normal
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|s| s.env_key().is_some_and(|k| std::env::var(k).is_ok()))
+            .unwrap_or(Self::Normal)
     }
 }
 
@@ -176,7 +211,20 @@ struct MenuRoot;
 #[derive(Component)]
 enum MenuButton {
     StartBattle,
+    TestBattles,
     Quit,
+}
+
+/// The Test Battles panel over the menu. While it is open the menu's
+/// keys (Enter/Space start a battle) stand down.
+#[derive(Component)]
+struct TestBattlesRoot;
+
+#[derive(Component)]
+struct TestBattlesBack;
+
+fn test_battles_closed(open: Query<(), With<TestBattlesRoot>>) -> bool {
+    open.is_empty()
 }
 
 #[derive(Component)]
@@ -246,11 +294,13 @@ impl Plugin for GameShellPlugin {
                     // its backdrop blocks picking, and the gate keeps
                     // the keyboard shortcuts (Enter/Space/ESC) from
                     // acting behind it.
-                    (menu_buttons, menu_option_buttons, debug_scenario_buttons)
+                    (menu_buttons, menu_option_buttons)
                         .run_if(
                             in_state(GameState::Menu)
-                                .and_then(crate::settings::settings_closed),
+                                .and_then(crate::settings::settings_closed)
+                                .and_then(test_battles_closed),
                         ),
+                    (debug_scenario_buttons, close_test_battles).run_if(in_state(GameState::Menu)),
                     (toggle_pause, pause_buttons).run_if(
                         in_state(GameState::Battle)
                             .and_then(crate::settings::settings_closed),
@@ -353,7 +403,7 @@ fn spawn_menu(mut commands: Commands, config: Res<BattleConfig>) {
                 },
             ));
             p.spawn((
-                Text::new("Massed medieval battles, every soldier simulated"),
+                Text::new("Hold the line. Turn the flank."),
                 TextFont {
                     font_size: FontSize::Px(14.0),
                     ..default()
@@ -391,55 +441,30 @@ fn spawn_menu(mut commands: Commands, config: Res<BattleConfig>) {
             spawn_text_button(p, "Start Battle", MenuButton::StartBattle);
             spawn_text_button(p, "Settings", crate::settings::OpenSettingsButton);
             spawn_text_button(p, "Quit", MenuButton::Quit);
-            // Debug scenarios
+            // The test scenarios sit behind one small button.
             p.spawn((
-                Text::new("Debug Scenarios"),
-                TextFont {
-                    font_size: FontSize::Px(13.0),
-                    ..default()
-                },
-                TextColor(DIM_TEXT_COLOR),
+                Button,
                 Node {
-                    margin: UiRect::new(Val::Px(0.0), Val::Px(0.0), Val::Px(24.0), Val::Px(8.0)),
+                    padding: UiRect::axes(Val::Px(14.0), Val::Px(5.0)),
+                    margin: UiRect::top(Val::Px(18.0)),
                     ..default()
                 },
-            ));
-            p.spawn(Node {
-                flex_direction: FlexDirection::Row,
-                flex_wrap: FlexWrap::Wrap,
-                justify_content: JustifyContent::Center,
-                max_width: Val::Px(520.0),
-                ..default()
-            })
-            .with_children(|row| {
-                for &scenario in &Scenario::ALL[1..] {
-                    row.spawn((
-                        Button,
-                        Node {
-                            padding: UiRect::axes(Val::Px(12.0), Val::Px(5.0)),
-                            margin: UiRect::all(Val::Px(3.0)),
-                            justify_content: JustifyContent::Center,
-                            align_items: AlignItems::Center,
-                            ..default()
-                        },
-                        BackgroundColor(BTN_NORMAL),
-                        DebugButton(scenario),
-                    ))
-                    .with_children(|b| {
-                        b.spawn((
-                            Text::new(scenario.label()),
-                            TextFont {
-                                font_size: FontSize::Px(12.0),
-                                ..default()
-                            },
-                            TextColor(DIM_TEXT_COLOR),
-                        ));
-                    });
-                }
+                BackgroundColor(BTN_NORMAL),
+                MenuButton::TestBattles,
+            ))
+            .with_children(|b| {
+                b.spawn((
+                    Text::new("Test Battles"),
+                    TextFont {
+                        font_size: FontSize::Px(13.0),
+                        ..default()
+                    },
+                    TextColor(DIM_TEXT_COLOR),
+                ));
             });
 
             p.spawn((
-                Text::new("v0.1.0"),
+                Text::new(concat!("v", env!("CARGO_PKG_VERSION"))),
                 TextFont {
                     font_size: FontSize::Px(12.0),
                     ..default()
@@ -522,6 +547,7 @@ fn start_normal_battle(config: &mut BattleConfig, next: &mut NextState<GameState
 }
 
 fn menu_buttons(
+    mut commands: Commands,
     query: Query<(&Interaction, &MenuButton), Changed<Interaction>>,
     keys: Res<ButtonInput<KeyCode>>,
     mut config: ResMut<BattleConfig>,
@@ -552,6 +578,7 @@ fn menu_buttons(
                 MenuButton::StartBattle => {
                     start_normal_battle(&mut config, &mut next);
                 }
+                MenuButton::TestBattles => spawn_test_battles(&mut commands),
                 MenuButton::Quit => {
                     exit.write(AppExit::Success);
                 }
@@ -603,6 +630,118 @@ fn menu_option_buttons(
     }
 }
 
+/// The test scenarios in a panel over the menu, one button each.
+fn spawn_test_battles(commands: &mut Commands) {
+    commands
+        .spawn((
+            fullscreen_overlay(),
+            BackgroundColor(Color::srgba(0.01, 0.02, 0.03, 0.6)),
+            // Swallow clicks so the menu behind never reacts.
+            bevy::ui::FocusPolicy::Block,
+            Interaction::None,
+            GlobalZIndex(30),
+            DespawnOnExit(GameState::Menu),
+            TestBattlesRoot,
+        ))
+        .with_children(|p| {
+            p.spawn((
+                Node {
+                    flex_direction: FlexDirection::Column,
+                    align_items: AlignItems::Center,
+                    padding: UiRect::axes(Val::Px(28.0), Val::Px(20.0)),
+                    ..default()
+                },
+                BackgroundColor(PANEL_BG),
+            ))
+            .with_children(|panel| {
+                panel.spawn((
+                    Text::new("Test Battles"),
+                    TextFont {
+                        font_size: FontSize::Px(24.0),
+                        ..default()
+                    },
+                    TextColor(TEXT_COLOR),
+                    Node {
+                        margin: UiRect::bottom(Val::Px(14.0)),
+                        ..default()
+                    },
+                ));
+                panel
+                    .spawn(Node {
+                        flex_direction: FlexDirection::Row,
+                        flex_wrap: FlexWrap::Wrap,
+                        justify_content: JustifyContent::Center,
+                        max_width: Val::Px(480.0),
+                        ..default()
+                    })
+                    .with_children(|grid| {
+                        for &scenario in &Scenario::ALL[1..] {
+                            grid.spawn((
+                                Button,
+                                Node {
+                                    width: Val::Px(146.0),
+                                    padding: UiRect::vertical(Val::Px(7.0)),
+                                    margin: UiRect::all(Val::Px(4.0)),
+                                    justify_content: JustifyContent::Center,
+                                    ..default()
+                                },
+                                BackgroundColor(BTN_NORMAL),
+                                DebugButton(scenario),
+                            ))
+                            .with_children(|b| {
+                                b.spawn((
+                                    Text::new(scenario.label()),
+                                    TextFont {
+                                        font_size: FontSize::Px(14.0),
+                                        ..default()
+                                    },
+                                    TextColor(TEXT_COLOR),
+                                ));
+                            });
+                        }
+                    });
+                panel
+                    .spawn((
+                        Button,
+                        Node {
+                            padding: UiRect::axes(Val::Px(28.0), Val::Px(8.0)),
+                            margin: UiRect::top(Val::Px(16.0)),
+                            ..default()
+                        },
+                        BackgroundColor(BTN_NORMAL),
+                        TestBattlesBack,
+                    ))
+                    .with_children(|b| {
+                        b.spawn((
+                            Text::new("Back"),
+                            TextFont {
+                                font_size: FontSize::Px(16.0),
+                                ..default()
+                            },
+                            TextColor(TEXT_COLOR),
+                        ));
+                    });
+            });
+        });
+}
+
+/// Back or ESC closes the Test Battles panel.
+fn close_test_battles(
+    mut commands: Commands,
+    keys: Res<ButtonInput<KeyCode>>,
+    back: Query<&Interaction, (Changed<Interaction>, With<TestBattlesBack>)>,
+    open: Query<Entity, With<TestBattlesRoot>>,
+) {
+    if open.is_empty() {
+        return;
+    }
+    if keys.just_pressed(KeyCode::Escape) || back.iter().any(|i| *i == Interaction::Pressed) {
+        for e in &open {
+            commands.entity(e).despawn();
+        }
+    }
+}
+
 fn debug_scenario_buttons(
     query: Query<(&Interaction, &DebugButton), Changed<Interaction>>,
     mut config: ResMut<BattleConfig>,
@@ -617,20 +756,9 @@ fn debug_scenario_buttons(
 }
 
 fn sync_scenario_env(scenario: Scenario) {
-    let vars = [
-        ("FL_TEST_SURROUND", Scenario::Surround),
-        ("FL_TEST_ROUT", Scenario::Rout),
-        ("FL_TEST_DIR", Scenario::Dir),
-        ("FL_ARENA", Scenario::Arena),
-        ("FL_TEST_CHARGE", Scenario::Charge),
-        ("FL_TEST_PILE", Scenario::Pile),
-        ("FL_TEST_JOIN", Scenario::Join),
-        ("FL_TEST_ROUTPASS", Scenario::Routpass),
-        ("FL_TEST_ARCHERY", Scenario::Archery),
-    ];
-    for (key, s) in vars {
+    for key in SCENARIO_ENVS {
         unsafe {
-            if scenario == s {
+            if scenario.env_key() == Some(key) {
                 std::env::set_var(key, "1");
             } else {
                 std::env::remove_var(key);
@@ -706,7 +834,8 @@ fn spawn_deploy_ui(commands: &mut Commands) {
                 flex_direction: FlexDirection::Column,
                 align_items: AlignItems::Center,
                 justify_content: JustifyContent::SpaceBetween,
-                padding: UiRect::top(Val::Px(10.0)).with_bottom(Val::Px(150.0)),
+                // The banner starts under the balance of power bar.
+                padding: UiRect::top(Val::Px(36.0)).with_bottom(Val::Px(150.0)),
                 ..default()
             },
             GlobalZIndex(5),

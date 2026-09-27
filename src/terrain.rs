@@ -87,7 +87,18 @@ pub struct Terrain {
     dirty: Vec<bool>,
 }
 
+/// Vertex counts of the height field along x and z.
+pub const fn grid_verts() -> (usize, usize) {
+    (VERTS_X, VERTS_Z)
+}
+
 impl Terrain {
+    /// The vertex heights, row-major [z][x] (`grid_verts` wide and deep):
+    /// what the selection rings sample on the GPU.
+    pub fn heights(&self) -> &[f32] {
+        &self.heights
+    }
+
     pub fn min(&self) -> Vec2 {
         self.origin
     }
@@ -1024,8 +1035,10 @@ fn remesh_dirty(
     );
 }
 
-/// Debug tool: X carves a crater under the cursor.
+/// Debug tool: X carves a crater under the cursor, only with the debug
+/// overlay on (F3) so a stray key never digs up a normal battle.
 fn crater_tool(
+    settings: Res<crate::settings::Settings>,
     keys: Res<ButtonInput<KeyCode>>,
     mut terrain: ResMut<Terrain>,
     window: Query<&Window, With<PrimaryWindow>>,
@@ -1034,7 +1047,7 @@ fn crater_tool(
     mut cooldown: Local<f32>,
 ) {
     *cooldown -= time.delta_secs();
-    if !keys.pressed(KeyCode::KeyX) || *cooldown > 0.0 {
+    if !settings.interface.debug_overlay || !keys.pressed(KeyCode::KeyX) || *cooldown > 0.0 {
         return;
     }
     let Ok(window) = window.single() else { return };

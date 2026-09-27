@@ -1,6 +1,7 @@
 mod ai;
 mod arrows;
 mod audio;
+mod balance;
 mod banners;
 mod camera;
 mod combat;
@@ -18,6 +19,7 @@ mod render_units;
 mod render_units_gpu;
 mod render_units_shadow;
 mod selection;
+mod selection_rings;
 mod settings;
 mod sim;
 mod spatial;
@@ -119,9 +121,11 @@ fn main() {
             frontline::FrontlinePlugin,
             combat::CombatPlugin,
             render_units::UnitRenderPlugin,
+            selection_rings::SelectionRingsPlugin,
             camera::RtsCameraPlugin,
             overlay::OverlayPlugin,
             unit_cards::UnitCardsPlugin,
+            balance::BalancePlugin,
             picker::PickerPlugin,
         ))
         .insert_resource(Time::<Fixed>::from_hz(30.0))

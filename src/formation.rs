@@ -478,8 +478,6 @@ pub enum FormCmd {
     Wall,
     /// Loose order on/off.
     Loose,
-    /// Blob <-> ranks (the pre-formation look, kept for levies).
-    Blob,
     /// Hold position <-> at ease.
     Hold,
     /// Fire-at-will on/off (archer regiments in the selection only).
@@ -488,18 +486,17 @@ pub enum FormCmd {
     Skirmish,
 }
 
-/// Formation hotkeys for the selection — F: wall, L: loose, B: blob,
-/// H: hold position, T: fire-at-will, K: skirmish.
+/// Formation hotkeys for the selection: F wall, L loose, B hold
+/// position, T fire-at-will, K skirmish.
 fn formation_keys(
     keys: Res<ButtonInput<KeyCode>>,
     selection: Res<crate::orders::Selection>,
     mut groups: ResMut<Groups>,
 ) {
-    const KEYS: [(KeyCode, FormCmd); 6] = [
+    const KEYS: [(KeyCode, FormCmd); 5] = [
         (KeyCode::KeyF, FormCmd::Wall),
         (KeyCode::KeyL, FormCmd::Loose),
-        (KeyCode::KeyB, FormCmd::Blob),
-        (KeyCode::KeyH, FormCmd::Hold),
+        (KeyCode::KeyB, FormCmd::Hold),
         (KeyCode::KeyT, FormCmd::FireAtWill),
         (KeyCode::KeyK, FormCmd::Skirmish),
     ];
@@ -553,23 +550,6 @@ pub fn apply_formation_cmd(
             } else {
                 info!("{} regiments to LOOSE order", picked.len());
             }
-        }
-
-        FormCmd::Blob => {
-            let on = picked.iter().any(|&g| groups.list[g].shape != FormShape::Blob);
-            for &g in &picked {
-                let gd = &mut groups.list[g];
-                gd.shape = if on { FormShape::Blob } else { FormShape::Rect };
-                if gd.files == 0 {
-                    gd.files = default_files(gd.count);
-                }
-                gd.reform = true;
-            }
-            info!(
-                "{} regiments to {}",
-                picked.len(),
-                if on { "BLOB (mob)" } else { "ranks" }
-            );
         }
 
         FormCmd::Hold => {

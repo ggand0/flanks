@@ -119,6 +119,28 @@ pub struct UnitTypeParams {
     pub half_height: f32,
 }
 
+/// The kind's name on every screen (army picker, unit panel).
+pub fn kind_name(kind: u8) -> &'static str {
+    match kind {
+        KIND_HEAVY => "Knights",
+        KIND_SPEAR => "Spearmen",
+        KIND_ARCHER => "Bowmen",
+        _ => "Men-at-Arms",
+    }
+}
+
+/// The kind's class in M2TW's words (battle.txt: Heavy Infantry, Light
+/// Infantry, Spearmen, Missile), shown in brackets after the name as
+/// M2TW's unit panel does.
+pub fn kind_class(kind: u8) -> &'static str {
+    match kind {
+        KIND_HEAVY => "Heavy Infantry",
+        KIND_SPEAR => "Spearmen",
+        KIND_ARCHER => "Missile",
+        _ => "Light Infantry",
+    }
+}
+
 /// FL_UNIT_SCALE=f scales every soldier's height. At 1.0 they are 1.0 to
 /// 1.1 m tall, at 1.64 a knight is 1.8 m. Soldiers stand on the terrain
 /// at their half height, so this moves the sim and breaks the behaviour

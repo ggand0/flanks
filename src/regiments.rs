@@ -195,7 +195,18 @@ pub fn do_spawn_battle(
         Scenario::Dir => { spawn_dir_test(units, terrain, groups); return; }
         Scenario::Arena => { spawn_arena(units, terrain, groups); return; }
         Scenario::Charge => { spawn_charge_test(units, terrain, groups); return; }
-        Scenario::Pile => { spawn_pile_test(units, terrain, groups); return; }
+        Scenario::Pile => {
+            spawn_pile_test(units, terrain, groups, PileSetup::SIX);
+            return;
+        }
+        Scenario::PileWide => {
+            spawn_pile_test(units, terrain, groups, PileSetup::WIDE);
+            return;
+        }
+        Scenario::PileTwo => {
+            spawn_pile_test(units, terrain, groups, PileSetup::TWO);
+            return;
+        }
         Scenario::Join => { spawn_join_test(units, terrain, groups); return; }
         Scenario::Routpass => { spawn_routpass_test(units, terrain, groups); return; }
         Scenario::Archery => { spawn_archery_test(units, terrain, groups); return; }
@@ -611,29 +622,59 @@ fn charge_test_log(
     );
 }
 
-/// FL_TEST_PILE=1: the pile-on order — six blue regiments in a 3x2
-/// block, ALL attack-ordered at one holding orange regiment (the blob
-/// repro). Acceptance: the fight crowds the
-/// victim's perimeter and the second wave stands PRESSED against the
-/// fighting mass (not parked at parade pitch, not smeared into one
-/// ball); the victim collapses; blues re-dress rectangles afterward.
-fn spawn_pile_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
+/// The pile-on test's shape. The FL_PILE_* envs override each field,
+/// so the scripts that launch it with FL_TEST_PILE keep their setups.
+#[derive(Clone, Copy)]
+pub struct PileSetup {
+    /// Blue regiments attacking the one orange (1 to 6).
+    attackers: usize,
+    /// Files of each attacker, 0 for the default block.
+    attacker_files: u32,
+    /// Files of the victim, 0 for the default block.
+    victim_files: u32,
+    /// The victim stands at ease instead of in hold, so it answers with
+    /// its own attack order like a player's regiment.
+    victim_at_ease: bool,
+}
+
+impl PileSetup {
+    /// Six attackers on one holding regiment: the blob repro.
+    pub const SIX: Self =
+        Self { attackers: 6, attacker_files: 0, victim_files: 0, victim_at_ease: false };
+    /// A 100-file line at ease hit by one 12-file block: the M2TW test
+    /// of a deep unit hitting a wide one, which wraps it (devlog 0123).
+    pub const WIDE: Self =
+        Self { attackers: 1, attacker_files: 12, victim_files: 100, victim_at_ease: true };
+    /// Two regiments engage one at once (devlog 0123).
+    pub const TWO: Self =
+        Self { attackers: 2, attacker_files: 0, victim_files: 0, victim_at_ease: false };
+}
+
+/// FL_TEST_PILE=1: the pile-on order: blue regiments in a 3x2 block,
+/// all attack-ordered at one orange regiment (the blob repro with six).
+/// Acceptance: the fight crowds the victim's perimeter and the second
+/// wave stands pressed against the fighting mass (not parked at parade
+/// pitch, not smeared into one ball); the victim collapses; blues
+/// re-dress rectangles afterward.
+fn spawn_pile_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups, setup: PileSetup) {
+    let files_env = |key: &str, default: u32| {
+        std::env::var(key).ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(default)
+    };
     let mut list = Vec::new();
     spawn_regiment(units, terrain, &mut list, 1, KIND_LIGHT, Vec2::new(0.0, 60.0), 500, 1.0);
-    // FL_PILE_ATEASE=1: the victim stands at ease instead of in hold, so
-    // it answers with its own attack order like a player's regiment.
-    list[0].hold = std::env::var("FL_PILE_ATEASE").is_err();
-    // FL_PILE_VICTIM_FILES: stretch the victim into a wide line (the
-    // M2TW test: a deep unit hits a wide one, which wraps it).
-    if let Ok(files) = std::env::var("FL_PILE_VICTIM_FILES").map(|v| v.parse::<u32>().unwrap_or(0))
-        && files > 0
-    {
-        list[0].files = files;
+    // FL_PILE_ATEASE=1: the victim at ease.
+    list[0].hold = !(setup.victim_at_ease || std::env::var("FL_PILE_ATEASE").is_ok());
+    // FL_PILE_VICTIM_FILES: stretch the victim into a wide line.
+    let victim_files = files_env("FL_PILE_VICTIM_FILES", setup.victim_files);
+    if victim_files > 0 {
+        list[0].files = victim_files;
         crate::formation::assign_slots(units, 0, &mut list[0]);
     }
-    // FL_PILE_N: how many attackers (default six; two is "two regiments
-    // engage mine at once").
-    let n_attackers = crate::util::env_or("FL_PILE_N", 6_usize).clamp(1, 6);
+    // FL_PILE_N: how many attackers.
+    let n_attackers = crate::util::env_or("FL_PILE_N", setup.attackers).clamp(1, 6);
+    // FL_PILE_FILES: stretch the attackers into a wide line (the
+    // runaway-flank repro: files with no enemy in front of them).
+    let attacker_files = files_env("FL_PILE_FILES", setup.attacker_files);
     for row in 0..2 {
         for col in 0..3 {
             if row * 3 + col >= n_attackers {
@@ -643,12 +684,8 @@ fn spawn_pile_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
                 Vec2::new((col as f32 - 1.0) * 55.0, -40.0 - row as f32 * 35.0);
             spawn_regiment(units, terrain, &mut list, 0, KIND_LIGHT, anchor, 500, -1.0);
             let g = list.len() - 1;
-            // FL_PILE_FILES: stretch the attackers into a wide line (the
-            // runaway-flank repro: files with no enemy in front of them).
-            if let Ok(files) = std::env::var("FL_PILE_FILES").map(|v| v.parse::<u32>().unwrap_or(0))
-                && files > 0
-            {
-                list[g].files = files;
+            if attacker_files > 0 {
+                list[g].files = attacker_files;
                 crate::formation::assign_slots(units, g as u32, &mut list[g]);
             }
             list[g].order = Some(crate::orders::Order::Attack(0));

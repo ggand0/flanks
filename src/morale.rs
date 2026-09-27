@@ -219,6 +219,29 @@ pub fn band(gd: &crate::orders::GroupData) -> Band {
     }
 }
 
+/// Eager from this level up: the measured median of M2TW's `high` state,
+/// the way SHAKEN_AT and WAVER_AT sit at their states' medians. The
+/// engine's two states above it, impetuous and berserk, never occurred
+/// in the captures (devlog 0057), so they get no band.
+const EAGER_AT: f32 = 12.0;
+
+/// The unit panel's morale word, in M2TW's words. battle.txt lists
+/// Heroic, Impetuous, Eager, Steady, Shaken, Wavering, Broken in the
+/// order of the engine's states berserk, impetuous, high, firm, shaken,
+/// wavering, routing. Shattered is ours: a rout that never rallies.
+pub fn state_word(gd: &crate::orders::GroupData) -> &'static str {
+    match gd.state {
+        RegState::Routing { .. } => "Broken",
+        RegState::Shattered => "Shattered",
+        RegState::Steady => match band(gd) {
+            Band::Wavering => "Wavering",
+            Band::Shaken => "Shaken",
+            Band::Steady if gd.morale >= EAGER_AT => "Eager",
+            Band::Steady => "Steady",
+        },
+    }
+}
+
 /// Display normalization for bars/cards: full at the unit's calm base,
 /// empty exactly at the rout line.
 pub fn morale01(gd: &crate::orders::GroupData) -> f32 {

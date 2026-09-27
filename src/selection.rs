@@ -95,8 +95,26 @@ impl Plugin for SelectionPlugin {
                         .in_set(crate::game_state::MapInputSet),
                     draw_selection_gizmos,
                 ),
+            )
+            .add_systems(
+                OnEnter(crate::game_state::GameState::Battle),
+                select_all_on_start.after(crate::game_state::setup_battle),
             );
     }
+}
+
+/// FL_SELECT_ALL=1: the player's army starts selected, as after Ctrl+A,
+/// so the selection rings can be checked in screenshots without input.
+fn select_all_on_start(groups: Res<Groups>, mut selection: ResMut<Selection>) {
+    if std::env::var("FL_SELECT_ALL").is_err() {
+        return;
+    }
+    selection.regiments.clear();
+    selection
+        .regiments
+        .extend(groups.list.iter().map(|gd| gd.team == PLAYER_TEAM && gd.count > 0));
+    selection.recount(&groups);
+    info!("FL_SELECT_ALL: {} units selected", selection.count_units);
 }
 
 pub fn cursor_ground_point(
