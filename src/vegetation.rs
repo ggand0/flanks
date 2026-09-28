@@ -204,7 +204,8 @@ fn push_transformed(dst: &mut Soup, src: &Soup, c: Vec3, yaw: f32, scale: f32, a
     }
 }
 
-/// The plants of the current map, one merged mesh per terrain chunk.
+/// The plants of the current map: one entity per authored plant, or one
+/// merged mesh per terrain chunk on the river map.
 #[derive(Component)]
 struct Plants;
 
@@ -228,10 +229,14 @@ fn respawn_vegetation(
     }
     match terrain.kind {
         MapKind::Grassland => {
-            for (asset, tree) in trees.0.iter().enumerate() {
-                let Some(z) = tree.review_z else { continue };
-                spawn_authored_plant(&mut commands, &terrain, tree, asset, (-495.0, z, 0.0, 1.0));
+            let specs: Vec<_> = trees.0.iter().map(|tree| (tree.name, tree.reach)).collect();
+            let planting = grassland_planting(&specs, &terrain, crate::regiments::army_gap());
+            for plant in &planting.plants {
+                let (x, z) = (plant.pos.x, plant.pos.y);
+                let placement = (x, z, plant.yaw, plant.scale);
+                spawn_authored_plant(&mut commands, &terrain, &trees.0[plant.asset], plant.asset, placement);
             }
+            planting.log(&specs);
         }
         MapKind::Sandbox => {
             for &(name, x, z, yaw, scale) in SANDBOX_COMPOSITION {
@@ -317,6 +322,371 @@ fn spawn_authored_plant(
                 ));
             }
         });
+}
+
+// The grassland planting. The two deployment strips cover most of the
+// field, so the plants stand in what is left: the 30 m side margins, the
+// outer ends of the army gap and the 8 m rear margins. Every plant keeps
+// its whole crown out of both strips, out of the open centre of the gap
+// and inside the field, checked at the largest scale its kind is drawn
+// at. Plants are scenery: nothing in the sim reads them.
+
+/// Half-width of the open centre of the army gap, kept free of plants.
+const OPEN_CENTRE: f32 = 320.0;
+/// Scale ranges; clearance is checked at the upper end.
+const TREE_SCALE: (f32, f32) = (0.85, 1.10);
+const SHRUB_SCALE: (f32, f32) = (0.75, 1.20);
+/// Steepest ground a plant stands on, rise per metre.
+const MAX_SLOPE: f32 = 0.35;
+/// Candidate positions tried for each plant before it is given up.
+const TRIES: u32 = 10;
+
+/// The grassland's assets by role. Each oak shape comes in two foliage
+/// colours, picked at random per tree.
+const MATURE_OAKS: &[&str] = &["mature_oak_pale", "mature_oak_lighter"];
+const UPRIGHT_OAKS: &[&str] = &["oak_pale", "oak_lighter"];
+const LEANING_OAKS: &[&str] = &["leaning_oak_pale", "leaning_oak_lighter"];
+const BIRCHES: &[&str] = &["silver_birch_warm"];
+const SHRUB_A: &str = "shrub_a";
+const SHRUB_B: &str = "shrub_b_sandbox";
+
+/// Where a stand draws its candidates, in world x and z.
+enum Area {
+    Box(Rect),
+    Ellipse { centre: Vec2, radii: Vec2 },
+    /// A hedge: shrubs step along the line from `a` to `b`.
+    Hedge { a: Vec2, b: Vec2 },
+}
+
+impl Area {
+    fn sample(&self, u: f32, v: f32) -> Vec2 {
+        match *self {
+            Area::Box(r) => r.min + (r.max - r.min) * Vec2::new(u, v),
+            Area::Ellipse { centre, radii } => centre + radii * disc(u, v),
+            Area::Hedge { a, b } => a.lerp(b, u),
+        }
+    }
+}
+
+const fn strip(x0: f32, x1: f32, z0: f32, z1: f32) -> Area {
+    Area::Box(Rect { min: Vec2::new(x0, z0), max: Vec2::new(x1, z1) })
+}
+
+/// A point in the unit disc, uniform over its area.
+fn disc(u: f32, v: f32) -> Vec2 {
+    Vec2::from_angle(v * std::f32::consts::TAU) * u.sqrt()
+}
+
+/// One planting group. Trees come in clusters, most opening on a mature
+/// oak with a few more around it, some alone. Shrubs come in small groups,
+/// most of them at the edge of the stand's trees.
+struct Stand {
+    /// Name in the placement log.
+    name: &'static str,
+    area: Area,
+    trees: u32,
+    shrubs: u32,
+    /// Share of the trees that are birches.
+    birch: f32,
+    /// Share of the other trees, cluster anchors aside, that are leaning oaks.
+    leaning: f32,
+    /// Share of the shrubs that are upright A; the rest are low B.
+    shrub_a: f32,
+}
+
+// West is -x. The west margin carries the main broken oak edge, the east
+// margin fewer and shorter groups with more leaning oaks, over drier
+// ground. Openings between the stretches keep it from reading as a wall.
+// The dry ground crosses the army gap at x = 310 to 335 in the layout
+// image, so the eastern hedge stands there, just outside the open centre,
+// with an opening at z = -5 to 7.
+const GRASSLAND_STANDS: &[Stand] = &[
+    Stand { name: "west 1", area: strip(-512.0, -482.0, -372.0, -300.0), trees: 12, shrubs: 10, birch: 0.22, leaning: 0.20, shrub_a: 0.24 },
+    Stand { name: "west 2", area: strip(-512.0, -482.0, -262.0, -205.0), trees: 8, shrubs: 8, birch: 0.25, leaning: 0.20, shrub_a: 0.24 },
+    Stand { name: "west 3", area: strip(-512.0, -482.0, -170.0, -70.0), trees: 16, shrubs: 12, birch: 0.20, leaning: 0.20, shrub_a: 0.24 },
+    Stand { name: "west 4", area: strip(-512.0, -482.0, 45.0, 150.0), trees: 16, shrubs: 12, birch: 0.20, leaning: 0.20, shrub_a: 0.24 },
+    Stand { name: "west 5", area: strip(-512.0, -482.0, 190.0, 250.0), trees: 8, shrubs: 8, birch: 0.25, leaning: 0.20, shrub_a: 0.24 },
+    Stand { name: "west 6", area: strip(-512.0, -482.0, 290.0, 372.0), trees: 12, shrubs: 10, birch: 0.22, leaning: 0.20, shrub_a: 0.24 },
+    Stand { name: "west gap copse", area: Area::Ellipse { centre: Vec2::new(-435.0, 0.0), radii: Vec2::new(80.0, 30.0) }, trees: 18, shrubs: 16, birch: 0.20, leaning: 0.25, shrub_a: 0.24 },
+    Stand { name: "west gap outlier", area: Area::Ellipse { centre: Vec2::new(-362.0, -4.0), radii: Vec2::new(20.0, 22.0) }, trees: 4, shrubs: 6, birch: 0.25, leaning: 0.35, shrub_a: 0.24 },
+    Stand { name: "east 1", area: strip(482.0, 512.0, -330.0, -290.0), trees: 5, shrubs: 6, birch: 0.15, leaning: 0.45, shrub_a: 0.24 },
+    Stand { name: "east 2", area: strip(482.0, 512.0, -190.0, -160.0), trees: 3, shrubs: 4, birch: 0.15, leaning: 0.50, shrub_a: 0.24 },
+    Stand { name: "east 3", area: strip(482.0, 512.0, -95.0, -60.0), trees: 4, shrubs: 5, birch: 0.15, leaning: 0.45, shrub_a: 0.24 },
+    Stand { name: "east 4", area: strip(482.0, 512.0, 80.0, 120.0), trees: 5, shrubs: 5, birch: 0.15, leaning: 0.45, shrub_a: 0.24 },
+    Stand { name: "east 5", area: strip(482.0, 512.0, 215.0, 240.0), trees: 3, shrubs: 3, birch: 0.15, leaning: 0.50, shrub_a: 0.24 },
+    Stand { name: "east 6", area: strip(482.0, 512.0, 300.0, 350.0), trees: 5, shrubs: 5, birch: 0.15, leaning: 0.45, shrub_a: 0.24 },
+    Stand { name: "east gap copse", area: Area::Ellipse { centre: Vec2::new(430.0, 5.0), radii: Vec2::new(65.0, 30.0) }, trees: 12, shrubs: 12, birch: 0.18, leaning: 0.40, shrub_a: 0.24 },
+    Stand { name: "east hedge south", area: Area::Hedge { a: Vec2::new(329.0, -26.0), b: Vec2::new(334.0, -5.0) }, trees: 0, shrubs: 9, birch: 0.0, leaning: 0.0, shrub_a: 0.35 },
+    Stand { name: "east hedge north", area: Area::Hedge { a: Vec2::new(334.0, 7.0), b: Vec2::new(328.0, 27.0) }, trees: 0, shrubs: 8, birch: 0.0, leaning: 0.0, shrub_a: 0.35 },
+    Stand { name: "player rear 1", area: strip(-310.0, -265.0, -384.0, -376.0), trees: 0, shrubs: 5, birch: 0.0, leaning: 0.0, shrub_a: 0.0 },
+    Stand { name: "player rear 2", area: strip(-60.0, -20.0, -384.0, -376.0), trees: 0, shrubs: 4, birch: 0.0, leaning: 0.0, shrub_a: 0.0 },
+    Stand { name: "player rear 3", area: strip(210.0, 255.0, -384.0, -376.0), trees: 0, shrubs: 5, birch: 0.0, leaning: 0.0, shrub_a: 0.0 },
+    Stand { name: "enemy rear 1", area: strip(-200.0, -160.0, 376.0, 384.0), trees: 0, shrubs: 4, birch: 0.0, leaning: 0.0, shrub_a: 0.0 },
+    Stand { name: "enemy rear 2", area: strip(70.0, 115.0, 376.0, 384.0), trees: 0, shrubs: 5, birch: 0.0, leaning: 0.0, shrub_a: 0.0 },
+    Stand { name: "enemy rear 3", area: strip(340.0, 380.0, 376.0, 384.0), trees: 0, shrubs: 4, birch: 0.0, leaning: 0.0, shrub_a: 0.0 },
+];
+
+/// The ground the grassland plants must keep clear of.
+struct Clearance {
+    /// The two deployment strips and the open centre between them.
+    keep_out: [Rect; 3],
+    field: Rect,
+}
+
+impl Clearance {
+    fn new(terrain: &Terrain, army_gap: f32) -> Self {
+        let (lo, hi) = crate::orders::deploy_zone_for(terrain, army_gap);
+        Self {
+            keep_out: [
+                Rect::from_corners(lo, hi),
+                Rect::from_corners(Vec2::new(lo.x, -hi.y), Vec2::new(hi.x, -lo.y)),
+                Rect::from_corners(Vec2::new(-OPEN_CENTRE, hi.y), Vec2::new(OPEN_CENTRE, -hi.y)),
+            ],
+            field: Rect::from_corners(terrain.min(), terrain.max()),
+        }
+    }
+
+    /// Whether a crown of radius `r` around `p` stays inside the field
+    /// and out of every keep-out rectangle.
+    fn clear(&self, p: Vec2, r: f32) -> bool {
+        let inside = self.field.inflate(-r);
+        inside.contains(p) && self.keep_out.iter().all(|k| distance_to_rect(p, *k) >= r)
+    }
+}
+
+fn distance_to_rect(p: Vec2, r: Rect) -> f32 {
+    (r.min - p).max(p - r.max).max(Vec2::ZERO).length()
+}
+
+/// One grassland plant: an index into the asset list, its root on the
+/// ground plane, yaw, scale, and its crown radius at that scale.
+struct Placed {
+    asset: usize,
+    pos: Vec2,
+    yaw: f32,
+    scale: f32,
+    radius: f32,
+    tree: bool,
+    stand: usize,
+}
+
+#[derive(Default)]
+struct Planting {
+    plants: Vec<Placed>,
+    /// Candidates turned down, by reason.
+    rejected_clearance: u32,
+    rejected_slope: u32,
+    rejected_spacing: u32,
+    /// Role names with no loaded asset.
+    missing: Vec<&'static str>,
+}
+
+/// A stream of vegetation-only draws: the stateless `hash01` on seeds of
+/// its own, so no sim random source is touched.
+struct Draws(u32);
+
+impl Draws {
+    fn new(stand: usize) -> Self {
+        Self(0x7e6e_0000_u32.wrapping_add((stand as u32).wrapping_mul(0x0001_3579)))
+    }
+
+    fn next(&mut self) -> f32 {
+        self.0 = self.0.wrapping_add(1);
+        hash01(self.0.wrapping_mul(0x9e37_79b9) ^ 0x5eed_7ee5)
+    }
+
+    fn pick<'a>(&mut self, names: &[&'a str]) -> &'a str {
+        names[((self.next() * names.len() as f32) as usize).min(names.len() - 1)]
+    }
+}
+
+impl Planting {
+    /// Place one plant if its crown is clear, its ground is gentle and it
+    /// keeps its distance from the plants already placed.
+    #[allow(clippy::too_many_arguments)] // one candidate, all of it
+    fn try_place(
+        &mut self,
+        specs: &[(&'static str, f32)],
+        clearance: &Clearance,
+        terrain: &Terrain,
+        name: &'static str,
+        pos: Vec2,
+        yaw: f32,
+        scale: f32,
+        stand: usize,
+    ) -> bool {
+        let Some(asset) = specs.iter().position(|(n, _)| *n == name) else {
+            if !self.missing.contains(&name) {
+                self.missing.push(name);
+            }
+            return false;
+        };
+        let reach = specs[asset].1;
+        let tree = !name.starts_with("shrub");
+        let largest = if tree { TREE_SCALE.1 } else { SHRUB_SCALE.1 };
+        if !clearance.clear(pos, reach * largest) {
+            self.rejected_clearance += 1;
+            return false;
+        }
+        if terrain.slope_at(pos.x, pos.y) > MAX_SLOPE {
+            self.rejected_slope += 1;
+            return false;
+        }
+        let radius = reach * scale;
+        // Crowns of neighbouring trees may overlap a little, shrubs sit
+        // under a tree's crown edge, and shrubs keep off each other.
+        let crowded = self.plants.iter().any(|p| {
+            let share = match (tree, p.tree) {
+                (true, true) => 0.55,
+                (false, false) => 0.75,
+                _ => 0.5,
+            };
+            pos.distance(p.pos) < share * (radius + p.radius)
+        });
+        if crowded {
+            self.rejected_spacing += 1;
+            return false;
+        }
+        self.plants.push(Placed { asset, pos, yaw, scale, radius, tree, stand });
+        true
+    }
+
+    fn log(&self, specs: &[(&'static str, f32)]) {
+        for p in &self.plants {
+            debug!(
+                "vegetation: grassland plant {} at {:.1} {:.1} yaw {:.2} scale {:.2} crown {:.2} m, {}",
+                specs[p.asset].0,
+                p.pos.x,
+                p.pos.y,
+                p.yaw,
+                p.scale,
+                p.radius,
+                GRASSLAND_STANDS[p.stand].name
+            );
+        }
+        for (s, stand) in GRASSLAND_STANDS.iter().enumerate() {
+            let here = self.plants.iter().filter(|p| p.stand == s);
+            let trees = here.clone().filter(|p| p.tree).count();
+            let shrubs = here.count() - trees;
+            info!(
+                "vegetation: grassland {}: {trees} of {} trees, {shrubs} of {} shrubs",
+                stand.name, stand.trees, stand.shrubs
+            );
+        }
+        for (asset, (name, reach)) in specs.iter().enumerate() {
+            let n = self.plants.iter().filter(|p| p.asset == asset).count();
+            if n > 0 {
+                info!("vegetation: grassland {name}: {n}, crown reach {reach:.2} m at scale 1");
+            }
+        }
+        for name in &self.missing {
+            warn!("vegetation: grassland has no loaded {name}");
+        }
+        let trees = self.plants.iter().filter(|p| p.tree).count();
+        info!(
+            "vegetation: grassland planted {trees} trees and {} shrubs; candidates turned down: {} for clearance, {} for slope, {} for spacing",
+            self.plants.len() - trees,
+            self.rejected_clearance,
+            self.rejected_slope,
+            self.rejected_spacing
+        );
+    }
+}
+
+/// The grassland's plants for this field and army gap, the same on every
+/// run. `specs` pairs each loaded asset's name with its crown reach.
+fn grassland_planting(specs: &[(&'static str, f32)], terrain: &Terrain, army_gap: f32) -> Planting {
+    let clearance = Clearance::new(terrain, army_gap);
+    let mut out = Planting::default();
+    for (s, stand) in GRASSLAND_STANDS.iter().enumerate() {
+        let mut d = Draws::new(s);
+        let tree_scale = |d: &mut Draws| TREE_SCALE.0 + (TREE_SCALE.1 - TREE_SCALE.0) * d.next();
+        let shrub_scale = |d: &mut Draws| SHRUB_SCALE.0 + (SHRUB_SCALE.1 - SHRUB_SCALE.0) * d.next();
+
+        let mut trees = 0;
+        let mut clusters = 0;
+        while trees < stand.trees && clusters < stand.trees * 3 {
+            clusters += 1;
+            let centre = stand.area.sample(d.next(), d.next());
+            // One cluster in five is a lone tree; the rest gather two to five.
+            let size = if d.next() < 0.2 { 1 } else { 2 + (d.next() * 4.0) as u32 };
+            let spread = 7.0 + 9.0 * d.next();
+            for k in 0..size.min(stand.trees - trees) {
+                let names = if k == 0 && size > 1 {
+                    MATURE_OAKS
+                } else if d.next() < stand.birch {
+                    BIRCHES
+                } else if d.next() < stand.leaning {
+                    LEANING_OAKS
+                } else if d.next() < 0.15 {
+                    MATURE_OAKS
+                } else {
+                    UPRIGHT_OAKS
+                };
+                let name = d.pick(names);
+                let scale = tree_scale(&mut d);
+                let yaw = d.next() * std::f32::consts::TAU;
+                // The anchor stands near the centre, the rest spread around it.
+                let scatter = if k == 0 { 3.0 } else { spread };
+                for _ in 0..TRIES {
+                    let pos = centre + disc(d.next(), d.next()) * scatter;
+                    if out.try_place(specs, &clearance, terrain, name, pos, yaw, scale, s) {
+                        trees += 1;
+                        break;
+                    }
+                }
+            }
+        }
+
+        let mut shrubs = 0;
+        if let Area::Hedge { a, b } = stand.area {
+            // A broken run: a shrub every 2.4 to 3.4 m, a little off the line.
+            let length = a.distance(b);
+            let side = (b - a).normalize().perp();
+            let mut t = 0.0;
+            while t <= length && shrubs < stand.shrubs {
+                let name = if d.next() < stand.shrub_a { SHRUB_A } else { SHRUB_B };
+                let pos = a.lerp(b, t / length) + side * (d.next() - 0.5) * 1.6;
+                let (yaw, scale) = (d.next() * std::f32::consts::TAU, shrub_scale(&mut d));
+                if out.try_place(specs, &clearance, terrain, name, pos, yaw, scale, s) {
+                    shrubs += 1;
+                }
+                t += 2.4 + d.next();
+            }
+            continue;
+        }
+        let stand_trees: Vec<(Vec2, f32)> = out
+            .plants
+            .iter()
+            .filter(|p| p.stand == s && p.tree)
+            .map(|p| (p.pos, p.radius))
+            .collect();
+        let mut groups = 0;
+        while shrubs < stand.shrubs && groups < stand.shrubs * 3 {
+            groups += 1;
+            // Most groups gather at the crown edge of one of the stand's trees.
+            let hub = if !stand_trees.is_empty() && d.next() < 0.7 {
+                let i = ((d.next() * stand_trees.len() as f32) as usize).min(stand_trees.len() - 1);
+                let (root, radius) = stand_trees[i];
+                root + Vec2::from_angle(d.next() * std::f32::consts::TAU) * radius * (0.9 + 0.5 * d.next())
+            } else {
+                stand.area.sample(d.next(), d.next())
+            };
+            let size = 2 + (d.next() * 4.0) as u32;
+            for _ in 0..size.min(stand.shrubs - shrubs) {
+                let name = if d.next() < stand.shrub_a { SHRUB_A } else { SHRUB_B };
+                let (yaw, scale) = (d.next() * std::f32::consts::TAU, shrub_scale(&mut d));
+                for _ in 0..TRIES {
+                    let pos = hub + disc(d.next(), d.next()) * 3.5;
+                    if out.try_place(specs, &clearance, terrain, name, pos, yaw, scale, s) {
+                        shrubs += 1;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 fn plant(
@@ -430,7 +800,11 @@ struct TreeAssets(Vec<TreeAsset>);
 
 struct TreeAsset {
     name: &'static str,
-    review_z: Option<f32>,
+    /// Crown radius in metres at scale 1: the farthest horizontal distance
+    /// of any near or middle vertex from the trunk base, so the circle
+    /// covers the plant at every yaw, leaning crowns included. The far
+    /// card is left out: its planes carry transparent padding.
+    reach: f32,
     levels: [TreeMesh; 3],
 }
 
@@ -448,83 +822,70 @@ fn load_trees(
 ) {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut trees = Vec::new();
-    for (name, fallback, review_z, budgets) in [
+    for (name, fallback, budgets) in [
         (
             "oak",
             "oak_trunks_light_v1/natural/oak/tree.glb",
-            Some(-132.0),
             [3000, 700, 4],
         ),
         (
             "oak_lighter",
             "oak_trunks_light_v1/lighter/oak/tree.glb",
-            Some(-108.0),
             [3000, 700, 4],
         ),
         (
             "mature_oak",
             "oak_trunks_light_v1/natural/mature_oak/tree.glb",
-            Some(-84.0),
             [3000, 700, 4],
         ),
         (
             "mature_oak_lighter",
             "oak_trunks_light_v1/lighter/mature_oak/tree.glb",
-            Some(-60.0),
             [3000, 700, 4],
         ),
         (
             "leaning_oak",
             "oak_trunks_light_v1/natural/leaning_oak/tree.glb",
-            Some(-36.0),
             [3000, 700, 4],
         ),
         (
             "leaning_oak_lighter",
             "oak_trunks_light_v1/lighter/leaning_oak/tree.glb",
-            Some(-12.0),
             [3000, 700, 4],
         ),
         (
             "shrub_b_v4",
             "shrub_b_v4_fuller/shrub_b/tree.glb",
-            Some(0.0),
             [1900, 120, 4],
         ),
         (
             "silver_birch_warm",
             "birch_warm_v1/birch_warm/silver_birch/tree.glb",
-            Some(12.0),
             [2000, 450, 4],
         ),
         (
             "oak_pale",
             "oak_pale_v1/oak/tree.glb",
-            None,
             [3000, 700, 4],
         ),
         (
             "mature_oak_pale",
             "oak_pale_v1/mature_oak/tree.glb",
-            None,
             [3000, 700, 4],
         ),
         (
             "leaning_oak_pale",
             "oak_pale_v1/leaning_oak/tree.glb",
-            None,
             [3000, 700, 4],
         ),
         (
             "shrub_a",
             "shrub_a_v1/shrub_a/tree.glb",
-            None,
             [2800, 900, 4],
         ),
         (
             "shrub_b_sandbox",
             "shrub_b_lod_v1/shrub_b/tree.glb",
-            None,
             [1900, 600, 4],
         ),
     ] {
@@ -536,6 +897,7 @@ fn load_trees(
         };
         match read_tree(&path, budgets) {
             Ok((levels, textures)) => {
+                let reach = horizontal_reach(&levels);
                 let material_handles: Vec<_> = textures
                     .into_iter()
                     .map(|(image, normal, opaque)| {
@@ -581,7 +943,7 @@ fn load_trees(
                 );
                 trees.push(TreeAsset {
                     name,
-                    review_z,
+                    reach,
                     levels,
                 });
             }
@@ -592,6 +954,20 @@ fn load_trees(
 }
 
 type TreeLevelData = (Vec<(Mesh, usize)>, f32);
+
+/// `TreeAsset::reach` of a decoded tree.
+fn horizontal_reach(levels: &[TreeLevelData; 3]) -> f32 {
+    levels[..2]
+        .iter()
+        .flat_map(|(parts, _)| parts)
+        .filter_map(|(mesh, _)| match mesh.attribute(Mesh::ATTRIBUTE_POSITION) {
+            Some(bevy::mesh::VertexAttributeValues::Float32x3(positions)) => Some(positions),
+            _ => None,
+        })
+        .flatten()
+        .map(|p| Vec2::new(p[0], p[2]).length())
+        .fold(0.0, f32::max)
+}
 type TreeData = ([TreeLevelData; 3], Vec<(Image, Option<Image>, bool)>);
 
 /// Decode the whole asset before publishing handles, so a failed import leaves no assets behind.
@@ -1022,5 +1398,71 @@ mod tests {
         assert!(data[38] > 80);
         assert!(data[36] > 200);
         assert!(data[39] >= 128);
+    }
+
+    /// The grassland's assets and their crown reach, read from the shipped files.
+    fn grassland_specs() -> Vec<(&'static str, f32)> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let names = MATURE_OAKS
+            .iter()
+            .chain(UPRIGHT_OAKS)
+            .chain(LEANING_OAKS)
+            .chain(BIRCHES)
+            .chain(&[SHRUB_A, SHRUB_B]);
+        names
+            .map(|&name| {
+                let path = root.join(format!("assets/vegetation/{name}.glb"));
+                let (levels, _) =
+                    read_tree(&path, [3000, 900, 4]).unwrap_or_else(|e| panic!("{name}: {e}"));
+                (name, horizontal_reach(&levels))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn grassland_crowns_keep_clear_of_deployment_and_the_open_centre() {
+        let terrain = crate::terrain::build_terrain(MapKind::Grassland);
+        let specs = grassland_specs();
+        let (min, max) = (terrain.min(), terrain.max());
+        for army_gap in [20.0, 60.0, 120.0] {
+            let planting = grassland_planting(&specs, &terrain, army_gap);
+            assert!(planting.missing.is_empty(), "missing {:?}", planting.missing);
+            let trees = planting.plants.iter().filter(|p| p.tree).count();
+            assert!(trees > 50 && planting.plants.len() - trees > 50, "gap {army_gap}: {trees} trees");
+            let (lo, hi) = crate::orders::deploy_zone_for(&terrain, army_gap);
+            let keep_out = [
+                (lo, hi),
+                (Vec2::new(lo.x, -hi.y), Vec2::new(hi.x, -lo.y)),
+                (Vec2::new(-OPEN_CENTRE, hi.y), Vec2::new(OPEN_CENTRE, -hi.y)),
+            ];
+            for p in &planting.plants {
+                let (low, high) = if p.tree { TREE_SCALE } else { SHRUB_SCALE };
+                assert!((low..=high).contains(&p.scale));
+                // Checked at the largest scale the kind is drawn at.
+                let r = specs[p.asset].1 * high;
+                let name = specs[p.asset].0;
+                assert!(
+                    p.pos.x - r >= min.x && p.pos.x + r <= max.x && p.pos.y - r >= min.y && p.pos.y + r <= max.y,
+                    "gap {army_gap}: {name} at {} leaves the field", p.pos
+                );
+                for (a, b) in keep_out {
+                    let nearest = p.pos.clamp(a, b);
+                    assert!(
+                        p.pos.distance(nearest) >= r - 1e-4,
+                        "gap {army_gap}: {name} at {} reaches into {a}..{b}", p.pos
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn grassland_planting_is_the_same_every_run() {
+        let terrain = crate::terrain::build_terrain(MapKind::Grassland);
+        let specs = grassland_specs();
+        let key = |p: &Placed| (p.asset, p.pos.to_array(), p.yaw, p.scale);
+        let first: Vec<_> = grassland_planting(&specs, &terrain, 60.0).plants.iter().map(key).collect();
+        let second: Vec<_> = grassland_planting(&specs, &terrain, 60.0).plants.iter().map(key).collect();
+        assert_eq!(first, second);
     }
 }

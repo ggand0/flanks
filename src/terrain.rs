@@ -512,7 +512,7 @@ fn generate_terrain(mut commands: Commands) {
 /// The heightfield and the blocked mask of one map. Grassland has its
 /// own analytic landforms; classic and river share the noise formula,
 /// and river alone carves the channel, terraces and impassable walls.
-fn build_terrain(kind: MapKind) -> Terrain {
+pub(crate) fn build_terrain(kind: MapKind) -> Terrain {
     let classic = kind != MapKind::River;
     let origin = Vec2::new(
         -(VERTS_X as f32 - 1.0) * CELL * 0.5,
