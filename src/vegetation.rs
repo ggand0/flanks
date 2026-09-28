@@ -1,4 +1,4 @@
-//! Authored grassland vegetation and the river's procedural plant meshes.
+//! Authored trees and shrubs on the grassland, river and sandbox maps.
 //! Vegetation is visual only and does not affect terrain or pathfinding.
 
 use bevy::asset::RenderAssetUsages;
@@ -11,7 +11,8 @@ use bevy::prelude::*;
 use bevy::render::render_resource::{Face, TextureFormat};
 
 use crate::terrain::{
-    CELL, CHUNK_CELLS, CHUNKS_X, CHUNKS_Z, MapKind, Terrain, fbm, river_center_x, river_half_width,
+    BRIDGE_HALF_SPAN, BRIDGE_Z, MapKind, RIVER_CORRIDOR, Terrain, fbm, river_center_x,
+    river_half_width,
 };
 use crate::units::hash01;
 
@@ -30,7 +31,7 @@ impl Plugin for VegetationPlugin {
     }
 }
 
-/// Flat-shaded triangle builder shared with the river bridge.
+/// Flat-shaded triangle builder for the river bridge.
 pub(crate) struct Soup {
     positions: Vec<[f32; 3]>,
     normals: Vec<[f32; 3]>,
@@ -82,36 +83,6 @@ impl Soup {
         self.quad(v[7], v[6], v[5], v[4], color); // +Y
     }
 
-    /// 4-sided pyramid: square base half-width `hw` at y0, apex at y1.
-    /// Bottom face skipped (hidden).
-    pub(crate) fn pyramid(&mut self, c: Vec3, hw: f32, y0: f32, y1: f32, color: [f32; 4]) {
-        let b = [
-            Vec3::new(c.x - hw, y0, c.z - hw),
-            Vec3::new(c.x + hw, y0, c.z - hw),
-            Vec3::new(c.x + hw, y0, c.z + hw),
-            Vec3::new(c.x - hw, y0, c.z + hw),
-        ];
-        let apex = Vec3::new(c.x, y1, c.z);
-        for i in 0..4 {
-            let (a, b2) = (b[i], b[(i + 1) % 4]);
-            // Winding varies per face; emit both orders and let the
-            // cross product give the geometric normal either way by
-            // picking the outward one.
-            let n = (b2 - a).cross(apex - a);
-            let mid = (a + b2) * 0.5;
-            let outward = Vec3::new(mid.x - c.x, 0.0, mid.z - c.z);
-            if n.dot(outward) > 0.0 {
-                self.tri(a, b2, apex, color);
-            } else {
-                self.tri(b2, a, apex, color);
-            }
-        }
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.positions.is_empty()
-    }
-
     pub(crate) fn into_mesh(self) -> Mesh {
         Mesh::new(
             PrimitiveTopology::TriangleList,
@@ -127,83 +98,6 @@ pub(crate) fn srgb(r: f32, g: f32, b: f32) -> [f32; 4] {
     Color::srgb(r, g, b).to_linear().to_f32_array()
 }
 
-/// Rotate+scale+translate a local-space point into world space.
-fn xform(p: Vec3, yaw: f32, scale: f32, at: Vec3) -> Vec3 {
-    let (s, c) = yaw.sin_cos();
-    let q = Vec3::new(p.x * c + p.z * s, p.y, -p.x * s + p.z * c) * scale;
-    at + q
-}
-
-enum Kind {
-    Pine,
-    Broadleaf,
-    Bush,
-}
-
-/// Append one plant (local archetype transformed by yaw/scale/at) to the soup.
-fn add_plant(soup: &mut Soup, kind: Kind, yaw: f32, scale: f32, at: Vec3, seed: u32) {
-    let jitter = |i: u32, base: [f32; 4]| {
-        let k = 0.9 + 0.2 * hash01(seed.wrapping_mul(7).wrapping_add(i));
-        [base[0] * k, base[1] * k, base[2] * k, base[3]]
-    };
-    let trunk = srgb(0.33, 0.23, 0.13);
-    // Cuboid/pyramid helpers applied through the plant transform.
-    fn cub(soup: &mut Soup, c: Vec3, h: Vec3, col: [f32; 4], yaw: f32, scale: f32, at: Vec3) {
-        let mut tmp = Soup::new();
-        tmp.cuboid(Vec3::ZERO, h, col);
-        push_transformed(soup, &tmp, c, yaw, scale, at);
-    }
-    #[allow(clippy::too_many_arguments)] // primitive builder, all scalars
-    fn pyr(soup: &mut Soup, hw: f32, y0: f32, y1: f32, col: [f32; 4], yaw: f32, scale: f32, at: Vec3) {
-        let mut tmp = Soup::new();
-        tmp.pyramid(Vec3::ZERO, hw, y0, y1, col);
-        push_transformed(soup, &tmp, Vec3::ZERO, yaw, scale, at);
-    }
-    match kind {
-        Kind::Pine => {
-            let dark = jitter(1, srgb(0.17, 0.34, 0.17));
-            cub(soup, Vec3::new(0.0, 0.8, 0.0), Vec3::new(0.25, 0.8, 0.25), trunk, yaw, scale, at);
-            for i in 0..3 {
-                let fi = i as f32;
-                pyr(
-                    soup,
-                    2.1 - fi * 0.55,
-                    1.2 + fi * 1.5,
-                    3.6 + fi * 1.5,
-                    jitter(2 + i, dark),
-                    yaw,
-                    scale,
-                    at,
-                );
-            }
-        }
-        Kind::Broadleaf => {
-            let leaf = jitter(1, srgb(0.28, 0.46, 0.18));
-            cub(soup, Vec3::new(0.0, 1.1, 0.0), Vec3::new(0.3, 1.1, 0.3), trunk, yaw, scale, at);
-            cub(soup, Vec3::new(0.0, 3.4, 0.0), Vec3::new(1.9, 1.4, 1.9), jitter(2, leaf), yaw, scale, at);
-            cub(soup, Vec3::new(1.2, 2.8, 0.5), Vec3::new(1.2, 0.9, 1.2), jitter(3, leaf), yaw, scale, at);
-            cub(soup, Vec3::new(-1.0, 3.0, -0.6), Vec3::new(1.1, 0.8, 1.1), jitter(4, leaf), yaw, scale, at);
-        }
-        Kind::Bush => {
-            let olive = jitter(1, srgb(0.30, 0.38, 0.16));
-            cub(soup, Vec3::new(0.0, 0.5, 0.0), Vec3::new(0.9, 0.55, 0.9), olive, yaw, scale, at);
-            cub(soup, Vec3::new(0.5, 0.35, 0.4), Vec3::new(0.6, 0.4, 0.6), jitter(2, olive), yaw, scale, at);
-        }
-    }
-}
-
-/// Re-emit `src` triangles transformed: local offset `c`, then yaw,
-/// scale, translate to `at`. Normals recomputed from world positions.
-fn push_transformed(dst: &mut Soup, src: &Soup, c: Vec3, yaw: f32, scale: f32, at: Vec3) {
-    for (ti, t) in src.positions.chunks_exact(3).enumerate() {
-        let p = |i: usize| {
-            let lp = Vec3::from_array(t[i]) + c;
-            xform(lp, yaw, scale, at)
-        };
-        dst.tri(p(0), p(1), p(2), src.colors[ti * 3]);
-    }
-}
-
 /// The plants of the current map: one entity per authored plant, or one
 /// merged mesh per terrain chunk on the river map.
 #[derive(Component)]
@@ -216,8 +110,6 @@ fn respawn_vegetation(
     old: Query<Entity, With<Plants>>,
     mut commands: Commands,
     terrain: Res<Terrain>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
     trees: Res<TreeAssets>,
 ) {
     if *seen == Some(terrain.kind) {
@@ -236,7 +128,11 @@ fn respawn_vegetation(
                 let placement = (x, z, plant.yaw, plant.scale);
                 spawn_authored_plant(&mut commands, &terrain, &trees.0[plant.asset], plant.asset, placement);
             }
-            planting.log(&specs);
+            let groups: Vec<_> = GRASSLAND_STANDS
+                .iter()
+                .map(|stand| (stand.name, Some((stand.trees, stand.shrubs))))
+                .collect();
+            planting.log(&specs, "grassland", &groups);
         }
         MapKind::Sandbox => {
             for &(name, x, z, yaw, scale) in SANDBOX_COMPOSITION {
@@ -256,7 +152,16 @@ fn respawn_vegetation(
                 SANDBOX_COMPOSITION.len()
             );
         }
-        MapKind::River => plant(&mut commands, &terrain, &mut meshes, &mut materials),
+        MapKind::River => {
+            let specs: Vec<_> = trees.0.iter().map(|tree| (tree.name, tree.reach)).collect();
+            let planting = river_planting(&specs, &terrain);
+            for plant in &planting.plants {
+                let placement = (plant.pos.x, plant.pos.y, plant.yaw, plant.scale);
+                spawn_authored_plant(&mut commands, &terrain, &trees.0[plant.asset], plant.asset, placement);
+            }
+            let groups = RIVER_ZONES.map(|zone| (zone, None));
+            planting.log(&specs, "river", &groups);
+        }
         MapKind::Classic => {}
     }
 }
@@ -525,13 +430,14 @@ impl Draws {
 }
 
 impl Planting {
-    /// Place one plant if its crown is clear, its ground is gentle and it
-    /// keeps its distance from the plants already placed.
+    /// Place one plant if `clear` accepts its crown at the largest scale of
+    /// its kind, its ground is gentle and it keeps its distance from the
+    /// plants already placed. `stand` is the group it is logged under.
     #[allow(clippy::too_many_arguments)] // one candidate, all of it
     fn try_place(
         &mut self,
         specs: &[(&'static str, f32)],
-        clearance: &Clearance,
+        clear: &dyn Fn(Vec2, f32) -> bool,
         terrain: &Terrain,
         name: &'static str,
         pos: Vec2,
@@ -548,7 +454,7 @@ impl Planting {
         let reach = specs[asset].1;
         let tree = !name.starts_with("shrub");
         let largest = if tree { TREE_SCALE.1 } else { SHRUB_SCALE.1 };
-        if !clearance.clear(pos, reach * largest, GRASSLAND_STANDS[stand].inside) {
+        if !clear(pos, reach * largest) {
             self.rejected_clearance += 1;
             return false;
         }
@@ -575,40 +481,43 @@ impl Planting {
         true
     }
 
-    fn log(&self, specs: &[(&'static str, f32)]) {
+    /// Log every plant at debug level, then the counts per group and per
+    /// asset and the candidates turned down. `groups` names the groups
+    /// `Placed::stand` indexes, with the planned tree and shrub counts.
+    fn log(&self, specs: &[(&'static str, f32)], map: &str, groups: &[(&str, Option<(u32, u32)>)]) {
         for p in &self.plants {
             debug!(
-                "vegetation: grassland plant {} at {:.1} {:.1} yaw {:.2} scale {:.2} crown {:.2} m, {}",
+                "vegetation: {map} plant {} at {:.1} {:.1} yaw {:.2} scale {:.2} crown {:.2} m, {}",
                 specs[p.asset].0,
                 p.pos.x,
                 p.pos.y,
                 p.yaw,
                 p.scale,
                 p.radius,
-                GRASSLAND_STANDS[p.stand].name
+                groups[p.stand].0
             );
         }
-        for (s, stand) in GRASSLAND_STANDS.iter().enumerate() {
-            let here = self.plants.iter().filter(|p| p.stand == s);
+        for (g, (name, planned)) in groups.iter().enumerate() {
+            let here = self.plants.iter().filter(|p| p.stand == g);
             let trees = here.clone().filter(|p| p.tree).count();
             let shrubs = here.count() - trees;
-            info!(
-                "vegetation: grassland {}: {trees} of {} trees, {shrubs} of {} shrubs",
-                stand.name, stand.trees, stand.shrubs
-            );
+            match planned {
+                Some((t, s)) => info!("vegetation: {map} {name}: {trees} of {t} trees, {shrubs} of {s} shrubs"),
+                None => info!("vegetation: {map} {name}: {trees} trees, {shrubs} shrubs"),
+            }
         }
         for (asset, (name, reach)) in specs.iter().enumerate() {
             let n = self.plants.iter().filter(|p| p.asset == asset).count();
             if n > 0 {
-                info!("vegetation: grassland {name}: {n}, crown reach {reach:.2} m at scale 1");
+                info!("vegetation: {map} {name}: {n}, crown reach {reach:.2} m at scale 1");
             }
         }
         for name in &self.missing {
-            warn!("vegetation: grassland has no loaded {name}");
+            warn!("vegetation: {map} has no loaded {name}");
         }
         let trees = self.plants.iter().filter(|p| p.tree).count();
         info!(
-            "vegetation: grassland planted {trees} trees and {} shrubs; candidates turned down: {} for clearance, {} for slope, {} for spacing",
+            "vegetation: {map} planted {trees} trees and {} shrubs; candidates turned down: {} for clearance, {} for slope, {} for spacing",
             self.plants.len() - trees,
             self.rejected_clearance,
             self.rejected_slope,
@@ -623,6 +532,7 @@ fn grassland_planting(specs: &[(&'static str, f32)], terrain: &Terrain, army_gap
     let clearance = Clearance::new(terrain, army_gap);
     let mut out = Planting::default();
     for (s, stand) in GRASSLAND_STANDS.iter().enumerate() {
+        let clear = |p: Vec2, r: f32| clearance.clear(p, r, stand.inside);
         let mut d = Draws::new(s);
         let tree_scale = |d: &mut Draws| TREE_SCALE.0 + (TREE_SCALE.1 - TREE_SCALE.0) * d.next();
         let shrub_scale = |d: &mut Draws| SHRUB_SCALE.0 + (SHRUB_SCALE.1 - SHRUB_SCALE.0) * d.next();
@@ -654,7 +564,7 @@ fn grassland_planting(specs: &[(&'static str, f32)], terrain: &Terrain, army_gap
                 let scatter = if k == 0 { 3.0 } else { spread };
                 for _ in 0..TRIES {
                     let pos = centre + disc(d.next(), d.next()) * scatter;
-                    if out.try_place(specs, &clearance, terrain, name, pos, yaw, scale, s) {
+                    if out.try_place(specs, &clear, terrain, name, pos, yaw, scale, s) {
                         trees += 1;
                         break;
                     }
@@ -672,7 +582,7 @@ fn grassland_planting(specs: &[(&'static str, f32)], terrain: &Terrain, army_gap
                 let name = if d.next() < stand.shrub_a { SHRUB_A } else { SHRUB_B };
                 let pos = a.lerp(b, t / length) + side * (d.next() - 0.5) * 1.6;
                 let (yaw, scale) = (d.next() * std::f32::consts::TAU, shrub_scale(&mut d));
-                if out.try_place(specs, &clearance, terrain, name, pos, yaw, scale, s) {
+                if out.try_place(specs, &clear, terrain, name, pos, yaw, scale, s) {
                     shrubs += 1;
                 }
                 t += 2.4 + d.next();
@@ -702,7 +612,7 @@ fn grassland_planting(specs: &[(&'static str, f32)], terrain: &Terrain, army_gap
                 let (yaw, scale) = (d.next() * std::f32::consts::TAU, shrub_scale(&mut d));
                 for _ in 0..TRIES {
                     let pos = hub + disc(d.next(), d.next()) * 3.5;
-                    if out.try_place(specs, &clearance, terrain, name, pos, yaw, scale, s) {
+                    if out.try_place(specs, &clear, terrain, name, pos, yaw, scale, s) {
                         shrubs += 1;
                         break;
                     }
@@ -713,96 +623,139 @@ fn grassland_planting(specs: &[(&'static str, f32)], terrain: &Terrain, army_gap
     out
 }
 
-fn plant(
-    commands: &mut Commands,
-    terrain: &Terrain,
-    meshes: &mut Assets<Mesh>,
-    materials: &mut Assets<StandardMaterial>,
-) {
-    if terrain.classic {
-        return;
+// The river map: woods where the forest noise runs high, off the middle of
+// the field and off the river's corridor, as the old box trees stood. The
+// noise depth gives each wood a core of broad oaks, an edge of leaning oaks
+// and birches with shrubs under it, and a fringe of scrub; birches take the
+// higher ground. Low shrubs and the odd birch line the banks. The authored
+// crowns are about twice as wide as the box trees were, so the woods keep
+// their cover with far fewer trunks. No deployment clearance on this map.
+
+/// Candidate spacing of the river woods, metres.
+const RIVER_STEP: f32 = 7.5;
+/// Candidate spacing along each bank, metres.
+const BANK_STEP: f32 = 7.0;
+
+/// The river map's groups, as `Placed::stand` indexes them.
+const RIVER_ZONES: [&str; 4] = ["wood core", "wood edge", "scrub fringe", "riverbank"];
+
+/// One of `choices` by weight, the weights summing to 1.
+fn pick_weighted<'a>(d: &mut Draws, choices: &[(&'a [&'a str], f32)]) -> &'a [&'a str] {
+    let mut u = d.next();
+    for &(names, weight) in choices {
+        if u < weight {
+            return names;
+        }
+        u -= weight;
     }
-    let material = materials.add(StandardMaterial {
-        base_color: Color::WHITE,
-        perceptual_roughness: 1.0,
-        reflectance: 0.05,
-        ..default()
-    });
+    choices[choices.len() - 1].0
+}
 
-    let min = terrain.min();
-    let max = terrain.max();
-    let chunk_world = CELL * CHUNK_CELLS as f32;
-    let mut chunks: Vec<Soup> = (0..CHUNKS_X * CHUNKS_Z).map(|_| Soup::new()).collect();
+/// The river map's plants, the same on every run.
+fn river_planting(specs: &[(&'static str, f32)], terrain: &Terrain) -> Planting {
+    use std::f32::consts::TAU;
+    let field = Rect::from_corners(terrain.min(), terrain.max());
+    // Clear of the channel and its banks by `margin` past the corridor.
+    let off_river = |p: Vec2, margin: f32| {
+        (p.x - river_center_x(p.y)).abs() >= river_half_width(p.y) * RIVER_CORRIDOR + margin
+    };
+    let tree_clear = |p: Vec2, r: f32| field.inflate(-r).contains(p) && off_river(p, 4.0 + r * 0.5);
+    let shrub_clear = |p: Vec2, r: f32| field.inflate(-r).contains(p) && off_river(p, 1.0 + r);
+    let tree_scale = |d: &mut Draws| TREE_SCALE.0 + (TREE_SCALE.1 - TREE_SCALE.0) * d.next();
+    let shrub_scale = |d: &mut Draws| SHRUB_SCALE.0 + (SHRUB_SCALE.1 - SHRUB_SCALE.0) * d.next();
+    let shrub = |d: &mut Draws| if d.next() < 0.2 { SHRUB_A } else { SHRUB_B };
+    let mut out = Planting::default();
 
-    // Jittered grid candidates; noise decides the forest patches.
-    const STEP: f32 = 6.5;
-    let nx = ((max.x - min.x) / STEP) as usize;
-    let nz = ((max.y - min.y) / STEP) as usize;
-    let mut count = 0u32;
+    let size = field.size();
+    let (nx, nz) = ((size.x / RIVER_STEP) as u32, (size.y / RIVER_STEP) as u32);
     for gz in 0..nz {
         for gx in 0..nx {
-            let seed = (gz as u32) * 65_537 + gx as u32;
-            let jx = (hash01(seed * 3 + 1) - 0.5) * STEP * 0.9;
-            let jz = (hash01(seed * 3 + 2) - 0.5) * STEP * 0.9;
-            let p =
-                Vec2::new(min.x + gx as f32 * STEP, min.y + gz as f32 * STEP) + Vec2::new(jx, jz);
-            let r = p.length();
-            // Patchy forest noise; bushes spill past the forest edge.
-            let forest = fbm(p / 100.0 + Vec2::splat(211.3));
-            let kind = if forest > 0.55 && r > 200.0 {
-                if hash01(seed * 5 + 3) < 0.55 {
-                    Kind::Pine
-                } else {
-                    Kind::Broadleaf
-                }
-            } else if forest > 0.47 && r > 150.0 && hash01(seed * 5 + 4) < 0.35 {
-                Kind::Bush
-            } else {
-                continue;
-            };
+            let mut d = Draws::new(1_000 + (gz * nx + gx) as usize);
+            let jitter = (Vec2::new(d.next(), d.next()) - 0.5) * RIVER_STEP * 0.9;
+            let p = field.min + (Vec2::new(gx as f32, gz as f32) + 0.5) * RIVER_STEP + jitter;
             let h = terrain.height_at(p.x, p.y);
             if !(1.0..13.0).contains(&h) {
                 continue;
             }
-            if terrain.slope_at(p.x, p.y) > 0.45 {
-                continue;
-            }
-            // Clear of the river corridor (incl. its banks).
-            let river_d = (p.x - river_center_x(p.y)).abs();
-            if river_d < river_half_width(p.y) * 2.3 + 8.0 {
-                continue;
-            }
-            // Pines take over on higher ground.
-            let kind = if h > 7.0 && matches!(kind, Kind::Broadleaf) {
-                Kind::Pine
+            let forest = fbm(p / 100.0 + Vec2::splat(211.3));
+            let r = p.length();
+            let (zone, names) = if forest > 0.62 && r > 200.0 {
+                if d.next() > 0.9 {
+                    continue;
+                }
+                let names = pick_weighted(
+                    &mut d,
+                    &[(MATURE_OAKS, 0.4), (UPRIGHT_OAKS, 0.35), (LEANING_OAKS, 0.15), (BIRCHES, 0.1)],
+                );
+                (0, names)
+            } else if forest > 0.55 && r > 200.0 {
+                if d.next() > 0.7 {
+                    continue;
+                }
+                let names = pick_weighted(
+                    &mut d,
+                    &[(LEANING_OAKS, 0.35), (BIRCHES, 0.25), (UPRIGHT_OAKS, 0.25), (MATURE_OAKS, 0.15)],
+                );
+                (1, names)
+            } else if forest > 0.47 && r > 150.0 {
+                // Scrub in small groups, with the odd lone tree standing out of it.
+                let u = d.next();
+                if u < 0.04 {
+                    (2, if d.next() < 0.5 { LEANING_OAKS } else { BIRCHES })
+                } else if u < 0.4 {
+                    for _ in 0..1 + (d.next() * 3.0) as u32 {
+                        let at = p + disc(d.next(), d.next()) * 2.5;
+                        let (yaw, scale) = (d.next() * TAU, shrub_scale(&mut d));
+                        out.try_place(specs, &shrub_clear, terrain, shrub(&mut d), at, yaw, scale, 2);
+                    }
+                    continue;
+                } else {
+                    continue;
+                }
             } else {
-                kind
+                continue;
             };
-            let yaw = hash01(seed * 11 + 5) * std::f32::consts::TAU;
-            let scale = 1.0 + 0.6 * hash01(seed * 11 + 6);
-            let at = Vec3::new(p.x, h - 0.15, p.y); // sink slightly into ground
-            let cx = (((p.x - min.x) / chunk_world) as usize).min(CHUNKS_X - 1);
-            let cz = (((p.y - min.y) / chunk_world) as usize).min(CHUNKS_Z - 1);
-            add_plant(&mut chunks[cz * CHUNKS_X + cx], kind, yaw, scale, at, seed);
-            count += 1;
+            let names = if h > 8.0 && d.next() < 0.15 { BIRCHES } else { names };
+            let (name, yaw, scale) = (d.pick(names), d.next() * TAU, tree_scale(&mut d));
+            if !out.try_place(specs, &tree_clear, terrain, name, p, yaw, scale, zone) || zone != 1 {
+                continue;
+            }
+            // Shrubs gather under the wood's edge trees.
+            let radius = out.plants[out.plants.len() - 1].radius;
+            for _ in 0..(d.next() * 3.0) as u32 {
+                let at = p + Vec2::from_angle(d.next() * TAU) * radius * (0.7 + 0.5 * d.next());
+                let (yaw, scale) = (d.next() * TAU, shrub_scale(&mut d));
+                out.try_place(specs, &shrub_clear, terrain, shrub(&mut d), at, yaw, scale, 1);
+            }
         }
     }
 
-    let mut spawned = 0u32;
-    for soup in chunks.into_iter() {
-        if soup.is_empty() {
-            continue;
+    // The banks, both sides, clear of the bridge: small groups of shrubs
+    // and, off the middle of the field like the woods, the odd birch.
+    let steps = (size.y / BANK_STEP) as u32;
+    for (s, side) in [-1.0_f32, 1.0].into_iter().enumerate() {
+        for i in 0..steps {
+            let mut d = Draws::new(500_000 + (i * 2) as usize + s);
+            let z = field.min.y + (i as f32 + d.next()) * BANK_STEP;
+            if (z - BRIDGE_Z).abs() < BRIDGE_HALF_SPAN + 12.0 || d.next() > 0.45 {
+                continue;
+            }
+            let offset = river_half_width(z) * RIVER_CORRIDOR + 2.5 + 5.0 * d.next();
+            let p = Vec2::new(river_center_x(z) + side * offset, z);
+            if p.length() > 200.0 && d.next() < 0.18 {
+                let (yaw, scale) = (d.next() * TAU, tree_scale(&mut d));
+                let clear = |q: Vec2, r: f32| field.inflate(-r).contains(q) && off_river(q, 2.0);
+                out.try_place(specs, &clear, terrain, BIRCHES[0], p, yaw, scale, 3);
+            } else {
+                for _ in 0..1 + (d.next() * 3.0) as u32 {
+                    let at = p + disc(d.next(), d.next()) * 2.5;
+                    let (yaw, scale) = (d.next() * TAU, shrub_scale(&mut d));
+                    out.try_place(specs, &shrub_clear, terrain, shrub(&mut d), at, yaw, scale, 3);
+                }
+            }
         }
-        let mesh = soup.into_mesh();
-        let aabb = mesh.compute_aabb();
-        let handle = meshes.add(mesh);
-        let mut e = commands.spawn((Mesh3d(handle), MeshMaterial3d(material.clone()), Plants));
-        if let Some(aabb) = aabb {
-            e.insert(aabb);
-        }
-        spawned += 1;
     }
-    info!("vegetation: {count} plants in {spawned} chunks");
+    out
 }
 
 struct TreePart {
