@@ -28,10 +28,12 @@ pub enum Scenario {
     Join,
     Routpass,
     Archery,
+    /// A new attack target mid-fight (regiments.rs `spawn_retarget_test`).
+    Retarget,
 }
 
 /// The env var of every scripted scenario, as the scripts launch them.
-const SCENARIO_ENVS: [&str; 9] = [
+const SCENARIO_ENVS: [&str; 10] = [
     "FL_TEST_SURROUND",
     "FL_TEST_ROUT",
     "FL_TEST_DIR",
@@ -41,6 +43,7 @@ const SCENARIO_ENVS: [&str; 9] = [
     "FL_TEST_JOIN",
     "FL_TEST_ROUTPASS",
     "FL_TEST_ARCHERY",
+    "FL_TEST_RETARGET",
 ];
 
 impl Scenario {
@@ -57,6 +60,7 @@ impl Scenario {
         Self::Join,
         Self::Routpass,
         Self::Archery,
+        Self::Retarget,
     ];
 
     fn label(self) -> &'static str {
@@ -73,6 +77,7 @@ impl Scenario {
             Self::Join => "Join Fight",
             Self::Routpass => "Rout Pass",
             Self::Archery => "Archery",
+            Self::Retarget => "Retarget",
         }
     }
 
@@ -91,6 +96,7 @@ impl Scenario {
             Self::Join => Some("FL_TEST_JOIN"),
             Self::Routpass => Some("FL_TEST_ROUTPASS"),
             Self::Archery => Some("FL_TEST_ARCHERY"),
+            Self::Retarget => Some("FL_TEST_RETARGET"),
         }
     }
 
