@@ -392,6 +392,9 @@ struct Stand {
     leaning: f32,
     /// Share of the shrubs that are upright A; the rest are low B.
     shrub_a: f32,
+    /// When set, the stand's crowns stay inside this rectangle, which may
+    /// lie in a deployment zone, instead of outside the zones.
+    inside: Option<Rect>,
 }
 
 // West is -x. The west margin carries the main broken oak edge, the east
@@ -400,30 +403,45 @@ struct Stand {
 // The dry ground crosses the army gap at x = 310 to 335 in the layout
 // image, so the eastern hedge stands there, just outside the open centre,
 // with an opening at z = -5 to 7.
+/// The rear corners of the two deployment zones that no rank reaches.
+const PLAYER_REAR_CORNER: Rect = Rect { min: Vec2::new(-482.0, -376.0), max: Vec2::new(-335.0, -327.0) };
+const ENEMY_REAR_CORNER: Rect = Rect { min: Vec2::new(335.0, 327.0), max: Vec2::new(482.0, 376.0) };
+
 const GRASSLAND_STANDS: &[Stand] = &[
-    Stand { name: "west 1", area: strip(-512.0, -482.0, -372.0, -300.0), trees: 12, shrubs: 10, birch: 0.22, leaning: 0.20, shrub_a: 0.24 },
-    Stand { name: "west 2", area: strip(-512.0, -482.0, -262.0, -205.0), trees: 8, shrubs: 8, birch: 0.25, leaning: 0.20, shrub_a: 0.24 },
-    Stand { name: "west 3", area: strip(-512.0, -482.0, -170.0, -70.0), trees: 16, shrubs: 12, birch: 0.20, leaning: 0.20, shrub_a: 0.24 },
-    Stand { name: "west 4", area: strip(-512.0, -482.0, 45.0, 150.0), trees: 16, shrubs: 12, birch: 0.20, leaning: 0.20, shrub_a: 0.24 },
-    Stand { name: "west 5", area: strip(-512.0, -482.0, 190.0, 250.0), trees: 8, shrubs: 8, birch: 0.25, leaning: 0.20, shrub_a: 0.24 },
-    Stand { name: "west 6", area: strip(-512.0, -482.0, 290.0, 372.0), trees: 12, shrubs: 10, birch: 0.22, leaning: 0.20, shrub_a: 0.24 },
-    Stand { name: "west gap copse", area: Area::Ellipse { centre: Vec2::new(-435.0, 0.0), radii: Vec2::new(80.0, 30.0) }, trees: 18, shrubs: 16, birch: 0.20, leaning: 0.25, shrub_a: 0.24 },
-    Stand { name: "west gap outlier", area: Area::Ellipse { centre: Vec2::new(-362.0, -4.0), radii: Vec2::new(20.0, 22.0) }, trees: 4, shrubs: 6, birch: 0.25, leaning: 0.35, shrub_a: 0.24 },
-    Stand { name: "east 1", area: strip(482.0, 512.0, -330.0, -290.0), trees: 5, shrubs: 6, birch: 0.15, leaning: 0.45, shrub_a: 0.24 },
-    Stand { name: "east 2", area: strip(482.0, 512.0, -190.0, -160.0), trees: 3, shrubs: 4, birch: 0.15, leaning: 0.50, shrub_a: 0.24 },
-    Stand { name: "east 3", area: strip(482.0, 512.0, -95.0, -60.0), trees: 4, shrubs: 5, birch: 0.15, leaning: 0.45, shrub_a: 0.24 },
-    Stand { name: "east 4", area: strip(482.0, 512.0, 80.0, 120.0), trees: 5, shrubs: 5, birch: 0.15, leaning: 0.45, shrub_a: 0.24 },
-    Stand { name: "east 5", area: strip(482.0, 512.0, 215.0, 240.0), trees: 3, shrubs: 3, birch: 0.15, leaning: 0.50, shrub_a: 0.24 },
-    Stand { name: "east 6", area: strip(482.0, 512.0, 300.0, 350.0), trees: 5, shrubs: 5, birch: 0.15, leaning: 0.45, shrub_a: 0.24 },
-    Stand { name: "east gap copse", area: Area::Ellipse { centre: Vec2::new(430.0, 5.0), radii: Vec2::new(65.0, 30.0) }, trees: 12, shrubs: 12, birch: 0.18, leaning: 0.40, shrub_a: 0.24 },
-    Stand { name: "east hedge south", area: Area::Hedge { a: Vec2::new(329.0, -26.0), b: Vec2::new(334.0, -5.0) }, trees: 0, shrubs: 9, birch: 0.0, leaning: 0.0, shrub_a: 0.35 },
-    Stand { name: "east hedge north", area: Area::Hedge { a: Vec2::new(334.0, 7.0), b: Vec2::new(328.0, 27.0) }, trees: 0, shrubs: 8, birch: 0.0, leaning: 0.0, shrub_a: 0.35 },
-    Stand { name: "player rear 1", area: strip(-310.0, -265.0, -384.0, -376.0), trees: 0, shrubs: 5, birch: 0.0, leaning: 0.0, shrub_a: 0.0 },
-    Stand { name: "player rear 2", area: strip(-60.0, -20.0, -384.0, -376.0), trees: 0, shrubs: 4, birch: 0.0, leaning: 0.0, shrub_a: 0.0 },
-    Stand { name: "player rear 3", area: strip(210.0, 255.0, -384.0, -376.0), trees: 0, shrubs: 5, birch: 0.0, leaning: 0.0, shrub_a: 0.0 },
-    Stand { name: "enemy rear 1", area: strip(-200.0, -160.0, 376.0, 384.0), trees: 0, shrubs: 4, birch: 0.0, leaning: 0.0, shrub_a: 0.0 },
-    Stand { name: "enemy rear 2", area: strip(70.0, 115.0, 376.0, 384.0), trees: 0, shrubs: 5, birch: 0.0, leaning: 0.0, shrub_a: 0.0 },
-    Stand { name: "enemy rear 3", area: strip(340.0, 380.0, 376.0, 384.0), trees: 0, shrubs: 4, birch: 0.0, leaning: 0.0, shrub_a: 0.0 },
+    Stand { name: "west 1", area: strip(-512.0, -482.0, -372.0, -300.0), trees: 12, shrubs: 10, birch: 0.22, leaning: 0.20, shrub_a: 0.24, inside: None },
+    Stand { name: "west 2", area: strip(-512.0, -482.0, -262.0, -205.0), trees: 8, shrubs: 8, birch: 0.25, leaning: 0.20, shrub_a: 0.24, inside: None },
+    Stand { name: "west 3", area: strip(-512.0, -482.0, -170.0, -70.0), trees: 16, shrubs: 12, birch: 0.20, leaning: 0.20, shrub_a: 0.24, inside: None },
+    Stand { name: "west 4", area: strip(-512.0, -482.0, 45.0, 150.0), trees: 16, shrubs: 12, birch: 0.20, leaning: 0.20, shrub_a: 0.24, inside: None },
+    Stand { name: "west 5", area: strip(-512.0, -482.0, 190.0, 250.0), trees: 8, shrubs: 8, birch: 0.25, leaning: 0.20, shrub_a: 0.24, inside: None },
+    Stand { name: "west 6", area: strip(-512.0, -482.0, 290.0, 372.0), trees: 12, shrubs: 10, birch: 0.22, leaning: 0.20, shrub_a: 0.24, inside: None },
+    // The gap copses belong at the outer ends of the army gap, where the
+    // flank fights reach. Soldiers pass through trunks until trees collide
+    // with them, so for now the copses stand in the rear corners of the
+    // deployment zones, beyond the ranks: with 100 regiments of 1,000 the
+    // full ranks end by |z| = 327 at any army gap from 20 to 120 m, and the
+    // last, partial rank stays within |x| = 330. With the collisions,
+    // restore the three commented stands and drop the rear-corner ones.
+    // Stand { name: "west gap copse", area: Area::Ellipse { centre: Vec2::new(-435.0, 0.0), radii: Vec2::new(80.0, 30.0) }, trees: 18, shrubs: 16, birch: 0.20, leaning: 0.25, shrub_a: 0.24, inside: None },
+    // Stand { name: "west gap outlier", area: Area::Ellipse { centre: Vec2::new(-362.0, -4.0), radii: Vec2::new(20.0, 22.0) }, trees: 4, shrubs: 6, birch: 0.25, leaning: 0.35, shrub_a: 0.24, inside: None },
+    // Stand { name: "east gap copse", area: Area::Ellipse { centre: Vec2::new(430.0, 5.0), radii: Vec2::new(65.0, 30.0) }, trees: 12, shrubs: 12, birch: 0.18, leaning: 0.40, shrub_a: 0.24, inside: None },
+    Stand { name: "player rear copse", area: Area::Ellipse { centre: Vec2::new(-410.0, -352.0), radii: Vec2::new(70.0, 22.0) }, trees: 18, shrubs: 16, birch: 0.20, leaning: 0.25, shrub_a: 0.24, inside: Some(PLAYER_REAR_CORNER) },
+    Stand { name: "player rear outlier", area: Area::Ellipse { centre: Vec2::new(-350.0, -350.0), radii: Vec2::new(14.0, 18.0) }, trees: 4, shrubs: 6, birch: 0.25, leaning: 0.35, shrub_a: 0.24, inside: Some(PLAYER_REAR_CORNER) },
+    Stand { name: "east 1", area: strip(482.0, 512.0, -330.0, -290.0), trees: 5, shrubs: 6, birch: 0.15, leaning: 0.45, shrub_a: 0.24, inside: None },
+    Stand { name: "east 2", area: strip(482.0, 512.0, -190.0, -160.0), trees: 3, shrubs: 4, birch: 0.15, leaning: 0.50, shrub_a: 0.24, inside: None },
+    Stand { name: "east 3", area: strip(482.0, 512.0, -95.0, -60.0), trees: 4, shrubs: 5, birch: 0.15, leaning: 0.45, shrub_a: 0.24, inside: None },
+    Stand { name: "east 4", area: strip(482.0, 512.0, 80.0, 120.0), trees: 5, shrubs: 5, birch: 0.15, leaning: 0.45, shrub_a: 0.24, inside: None },
+    Stand { name: "east 5", area: strip(482.0, 512.0, 215.0, 240.0), trees: 3, shrubs: 3, birch: 0.15, leaning: 0.50, shrub_a: 0.24, inside: None },
+    Stand { name: "east 6", area: strip(482.0, 512.0, 300.0, 350.0), trees: 5, shrubs: 5, birch: 0.15, leaning: 0.45, shrub_a: 0.24, inside: None },
+    // In the rear corner for now, as the note above the player's rear copse says.
+    Stand { name: "enemy rear copse", area: Area::Ellipse { centre: Vec2::new(410.0, 352.0), radii: Vec2::new(68.0, 22.0) }, trees: 12, shrubs: 12, birch: 0.18, leaning: 0.40, shrub_a: 0.24, inside: Some(ENEMY_REAR_CORNER) },
+    Stand { name: "east hedge south", area: Area::Hedge { a: Vec2::new(329.0, -26.0), b: Vec2::new(334.0, -5.0) }, trees: 0, shrubs: 9, birch: 0.0, leaning: 0.0, shrub_a: 0.35, inside: None },
+    Stand { name: "east hedge north", area: Area::Hedge { a: Vec2::new(334.0, 7.0), b: Vec2::new(328.0, 27.0) }, trees: 0, shrubs: 8, birch: 0.0, leaning: 0.0, shrub_a: 0.35, inside: None },
+    Stand { name: "player rear 1", area: strip(-310.0, -265.0, -384.0, -376.0), trees: 0, shrubs: 5, birch: 0.0, leaning: 0.0, shrub_a: 0.0, inside: None },
+    Stand { name: "player rear 2", area: strip(-60.0, -20.0, -384.0, -376.0), trees: 0, shrubs: 4, birch: 0.0, leaning: 0.0, shrub_a: 0.0, inside: None },
+    Stand { name: "player rear 3", area: strip(210.0, 255.0, -384.0, -376.0), trees: 0, shrubs: 5, birch: 0.0, leaning: 0.0, shrub_a: 0.0, inside: None },
+    Stand { name: "enemy rear 1", area: strip(-200.0, -160.0, 376.0, 384.0), trees: 0, shrubs: 4, birch: 0.0, leaning: 0.0, shrub_a: 0.0, inside: None },
+    Stand { name: "enemy rear 2", area: strip(70.0, 115.0, 376.0, 384.0), trees: 0, shrubs: 5, birch: 0.0, leaning: 0.0, shrub_a: 0.0, inside: None },
+    Stand { name: "enemy rear 3", area: strip(340.0, 380.0, 376.0, 384.0), trees: 0, shrubs: 4, birch: 0.0, leaning: 0.0, shrub_a: 0.0, inside: None },
 ];
 
 /// The ground the grassland plants must keep clear of.
@@ -447,10 +465,16 @@ impl Clearance {
     }
 
     /// Whether a crown of radius `r` around `p` stays inside the field
-    /// and out of every keep-out rectangle.
-    fn clear(&self, p: Vec2, r: f32) -> bool {
-        let inside = self.field.inflate(-r);
-        inside.contains(p) && self.keep_out.iter().all(|k| distance_to_rect(p, *k) >= r)
+    /// and out of every keep-out rectangle, or, for a stand confined to
+    /// `inside`, within that rectangle.
+    fn clear(&self, p: Vec2, r: f32, inside: Option<Rect>) -> bool {
+        match inside {
+            Some(rect) => rect.inflate(-r).contains(p) && self.field.inflate(-r).contains(p),
+            None => {
+                self.field.inflate(-r).contains(p)
+                    && self.keep_out.iter().all(|k| distance_to_rect(p, *k) >= r)
+            }
+        }
     }
 }
 
@@ -524,7 +548,7 @@ impl Planting {
         let reach = specs[asset].1;
         let tree = !name.starts_with("shrub");
         let largest = if tree { TREE_SCALE.1 } else { SHRUB_SCALE.1 };
-        if !clearance.clear(pos, reach * largest) {
+        if !clearance.clear(pos, reach * largest, GRASSLAND_STANDS[stand].inside) {
             self.rejected_clearance += 1;
             return false;
         }
@@ -1441,6 +1465,14 @@ mod tests {
                 // Checked at the largest scale the kind is drawn at.
                 let r = specs[p.asset].1 * high;
                 let name = specs[p.asset].0;
+                if let Some(rect) = GRASSLAND_STANDS[p.stand].inside {
+                    let (a, b) = (rect.min, rect.max);
+                    assert!(
+                        p.pos.x - r >= a.x && p.pos.x + r <= b.x && p.pos.y - r >= a.y && p.pos.y + r <= b.y,
+                        "gap {army_gap}: {name} at {} leaves {a}..{b}", p.pos
+                    );
+                    continue;
+                }
                 assert!(
                     p.pos.x - r >= min.x && p.pos.x + r <= max.x && p.pos.y - r >= min.y && p.pos.y + r <= max.y,
                     "gap {army_gap}: {name} at {} leaves the field", p.pos
