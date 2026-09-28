@@ -144,6 +144,7 @@ pub fn apply_damage(
     ctx: &ApplyContext,
     cstats: &mut crate::combat::CombatStats,
     dir_stats: &mut DirTestStats,
+    mut sounds: Option<&mut crate::audio::SoundEvents>,
 ) -> usize {
     let Units {
         pos,
@@ -268,6 +269,20 @@ pub fn apply_damage(
                     groups.list[group[v] as usize].recent_deaths += 1;
                     // The attacker's regiment is winning its exchange.
                     groups.list[group[a] as usize].recent_kills += 1;
+                }
+                // The blow's sound: whichever defence took it, drawn in
+                // proportion to the points each put up (parry, shield,
+                // armour). Audio only; the sim never reads it.
+                if let Some(se) = sounds.as_deref_mut() {
+                    let roll = crate::units::hash01(
+                        tick_seed ^ ev.victim.wrapping_mul(0x27D4_EB2F) ^ ev.attacker.wrapping_mul(0x1656_67B1),
+                    );
+                    se.push_blow(crate::audio::Blow {
+                        victim: pos[v],
+                        attacker: pos[a],
+                        material: crate::audio::struck_material(skill, shield, armour, kind[v], roll),
+                        killed: died,
+                    });
                 }
                 // Charge impact: momentum becomes a shove and a
                 // stun. Walls barely budge and never stagger; a braced
