@@ -483,20 +483,18 @@ struct Pools {
 /// The looping bed layers.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Bed {
-    Far,
     Mid,
     /// Massed boots (Pixabay loop) while an own regiment marches.
     March,
 }
 
 impl Bed {
-    const ALL: [Bed; 3] = [Bed::Far, Bed::Mid, Bed::March];
+    const ALL: [Bed; 2] = [Bed::Mid, Bed::March];
 
     /// The layer's takes under assets/. The first one's loudness is the
     /// layer's level; the others are matched to it.
     fn takes(self) -> &'static [&'static str] {
         match self {
-            Bed::Far => &["bed_battle_far.mp3"],
             Bed::Mid => &["bed_battle_mid0.mp3", "bed_battle_mid1.mp3"],
             Bed::March => &["sfx_new/bed_march_loop_14.5s.mp3"],
         }
@@ -521,7 +519,7 @@ struct BedTake {
     current: bool,
 }
 
-/// FL_BED_MUTE=mid,far: silence the named layers (far, mid, march, and
+/// FL_BED_MUTE=mid,close: silence the named layers (mid, march, and
 /// close for the fight loops), to hear the others alone.
 fn layer_muted(layer: &str) -> bool {
     static MUTED: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
@@ -852,7 +850,6 @@ fn update_beds(
     let paused = virt_time.is_paused();
     let focus = Vec2::new(cam.focus.x, cam.focus.z);
 
-    let mut engaged_total = 0usize;
     let mut engaged_near = 0usize;
     let mut min_dist = f32::MAX;
     let mut marching_own = false;
@@ -861,7 +858,6 @@ fn update_beds(
             continue;
         }
         if g.engaged {
-            engaged_total += 1;
             let d = g.centroid.distance(focus);
             min_dist = min_dist.min(d);
             if d < 300.0 {
@@ -892,7 +888,6 @@ fn update_beds(
             return 0.0;
         }
         match bed {
-            Bed::Far => 0.70 * ((engaged_total as f32) / 8.0).clamp(0.0, 1.0) * duck,
             Bed::Mid => {
                 0.45 * ((engaged_near as f32) / 5.0).clamp(0.0, 1.0) * prox.sqrt() * duck
             }
