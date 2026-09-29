@@ -13,7 +13,7 @@ use bevy::prelude::*;
 
 use crate::camera::RtsCamera;
 use crate::game_state::GameState;
-use crate::mixer::{Bank, ClipId, Clips, Mixer, NO_UNIT, Request};
+use crate::mixer::{Bank, Bus, ClipId, Clips, Mixer, NO_UNIT, Request};
 use crate::orders::{Groups, RegState};
 use crate::sim::SimStats;
 use crate::units::hash01;
@@ -32,7 +32,7 @@ pub(crate) fn battle_vol(s: &crate::settings::Settings) -> f32 {
 }
 
 /// Effective UI-sound volume (selection/order clicks).
-fn ui_vol(s: &crate::settings::Settings) -> f32 {
+pub(crate) fn ui_vol(s: &crate::settings::Settings) -> f32 {
     s.audio.master * s.audio.ui * env_master()
 }
 
@@ -131,8 +131,7 @@ impl Plugin for BattleAudioPlugin {
             // Beds cut on leaving battle; one-shots survive into the
             // results screen (the victory/defeat sting must finish)
             // and are only culled when the menu comes up.
-            .add_systems(OnExit(GameState::Battle), (silence_beds, clear_sound_events))
-            .add_systems(OnEnter(GameState::Menu), stop_one_shots);
+            .add_systems(OnExit(GameState::Battle), (silence_beds, clear_sound_events));
     }
 }
 
@@ -324,6 +323,40 @@ const fn bank(
     }
 }
 
+/// An unplaced sound's bank (UI click, sting): the table level without
+/// the centre-pan compensation, since it plays at full level in both
+/// channels.
+const fn flat_bank(name: &'static str, rel_db: f32, sustained: bool) -> Bank {
+    let b = bank(name, name, 0, 250.0, 0.0, rel_db, sustained, (1.0, 1.0));
+    Bank {
+        vol_db: b.vol_db - mix::PAN_CENTRE,
+        ..b
+    }
+}
+
+// Horns, UI clicks and stings at their approved level relative to the
+// soldiers (old gain on the pool's loudness, relative to the death
+// scream).
+/// M2TW `war_horn`: placed, full level within 40 m, priority 240, fixed
+/// pitch, carried across the field.
+const HORN_CHARGE: Bank = Bank {
+    mindist: 40.0,
+    zoom_floor: 1.0,
+    ..bank("horn", "horn", 2, 240.0, 0.0, 5.0, true, (1.0, 1.0))
+};
+const HORN_ROUT: Bank = Bank {
+    mindist: 40.0,
+    zoom_floor: 1.0,
+    ..bank("horn", "horn", 2, 240.0, 0.0, 9.5, false, (1.0, 1.0))
+};
+/// M2TW `unit_warhorns_delay 9`: one war horn per army per 9 s.
+const WAR_HORN_GAP_S: f32 = 9.0;
+const UI_SELECT: Bank = flat_bank("ui", -8.8, false);
+const UI_ORDER: Bank = flat_bank("ui", -7.5, false);
+const UI_ATTACK: Bank = flat_bank("ui", 3.7, false);
+const STING_VICTORY: Bank = flat_bank("sting", 3.5, true);
+const STING_DEFEAT: Bank = flat_bank("sting", -1.1, true);
+
 // Blows: one shared group, the shield thud loudest, the rings quiet.
 const HIT_WOOD: Bank = bank("hit wood", "blows", 32, 90.0, -2.0, -5.7, false, (0.8, 1.2));
 const HIT_FLESH: Bank = bank("hit flesh", "blows", 32, 90.0, -2.0, -11.6, false, (0.8, 1.2));
@@ -398,20 +431,15 @@ struct Pools {
     rout_panic: Vec<ClipId>,
     rout_crowd: Vec<ClipId>,
     feet: Vec<ClipId>,
-}
-
-/// Plain Bevy players: UI, horns, stings.
-#[derive(Resource)]
-struct AudioBank {
-    horn_charge: Vec<Handle<AudioSource>>,
-    horn_rout: Handle<AudioSource>,
-    ui_select: Handle<AudioSource>,
-    /// Click feedback for a move order (mixed quieter than select).
-    ui_order: Handle<AudioSource>,
+    horn_charge: Vec<ClipId>,
+    horn_rout: ClipId,
+    ui_select: ClipId,
+    /// Click feedback for a move order.
+    ui_order: ClipId,
     /// Click feedback for an attack order on an enemy regiment.
-    ui_attack: Handle<AudioSource>,
-    sting_victory: Handle<AudioSource>,
-    sting_defeat: Handle<AudioSource>,
+    ui_attack: ClipId,
+    sting_victory: ClipId,
+    sting_defeat: ClipId,
 }
 
 /// The looping bed layers.
@@ -481,9 +509,6 @@ fn spawn_bed_take(commands: &mut Commands, assets: &AssetServer, bed: Bed, take:
 }
 
 fn setup_audio(mut commands: Commands, assets: Res<AssetServer>, mut clips: ResMut<Clips>) {
-    let load_set = |names: &[&str]| -> Vec<Handle<AudioSource>> {
-        names.iter().map(|n| assets.load(format!("{n}.mp3"))).collect()
-    };
     let clips = &mut *clips;
 
     commands.insert_resource(Pools {
@@ -720,16 +745,13 @@ fn setup_audio(mut commands: Commands, assets: Res<AssetServer>, mut clips: ResM
             &assets,
             &["sfx_rout/feet_run_wash_mass_01", "sfx_rout/feet_run_wash_mass_02"],
         ),
-    });
-
-    commands.insert_resource(AudioBank {
-        horn_charge: load_set(&["sig_horn_charge", "sig_horn_charge_02"]),
-        horn_rout: assets.load("sfx_new/sig_horn_rout.mp3"),
-        ui_select: assets.load("sfx_new/ui_select1.mp3"),
-        ui_order: assets.load("sfx_new/ui_order0.mp3"),
-        ui_attack: assets.load("sfx_new/ui_attack.mp3"),
-        sting_victory: assets.load("sting_victory.mp3"),
-        sting_defeat: assets.load("sting_defeat.mp3"),
+        horn_charge: pool(clips, &assets, &["sig_horn_charge", "sig_horn_charge_02"]),
+        horn_rout: load(clips, &assets, "sfx_new/sig_horn_rout.mp3"),
+        ui_select: load(clips, &assets, "sfx_new/ui_select1.mp3"),
+        ui_order: load(clips, &assets, "sfx_new/ui_order0.mp3"),
+        ui_attack: load(clips, &assets, "sfx_new/ui_attack.mp3"),
+        sting_victory: load(clips, &assets, "sting_victory.mp3"),
+        sting_defeat: load(clips, &assets, "sting_defeat.mp3"),
     });
 
     for bed in Bed::ALL {
@@ -740,16 +762,6 @@ fn setup_audio(mut commands: Commands, assets: Res<AssetServer>, mut clips: ResM
 fn silence_beds(mut sinks: Query<&mut AudioSink, With<BedTake>>) {
     for mut sink in &mut sinks {
         sink.set_volume(Volume::Linear(0.0));
-    }
-}
-
-/// Despawn every in-flight one-shot (war cries, horns, sting tails).
-fn stop_one_shots(
-    mut commands: Commands,
-    playing: Query<Entity, (With<AudioPlayer>, Without<BedTake>)>,
-) {
-    for e in &playing {
-        commands.entity(e).despawn();
     }
 }
 
@@ -900,26 +912,6 @@ fn update_beds(
 /// surveying the whole map.
 pub(crate) fn zoom_attenuation(cam_distance: f32) -> f32 {
     (90.0 / cam_distance.max(90.0)).clamp(0.12, 1.0)
-}
-
-/// Spawn a fire-and-forget one-shot with volume/pitch jitter. `vol` is
-/// the final linear volume; callers scale by `battle_vol`/`ui_vol`.
-fn one_shot(commands: &mut Commands, h: Handle<AudioSource>, vol: f32, speed: f32) {
-    commands.spawn((
-        AudioPlayer::new(h),
-        PlaybackSettings {
-            volume: Volume::Linear(vol),
-            speed,
-            ..PlaybackSettings::DESPAWN
-        },
-    ));
-}
-
-fn pick(v: &[Handle<AudioSource>], seed: u32) -> Option<Handle<AudioSource>> {
-    if v.is_empty() {
-        return None;
-    }
-    Some(v[(hash01(seed) * v.len() as f32) as usize % v.len()].clone())
 }
 
 // ------------------------------------------------------------ positional sounds
@@ -1456,34 +1448,35 @@ const ROUT_SHOUT_RATE: f32 = 0.35;
 struct CueState {
     prev_state: Vec<u8>,
     prev_outcome: bool,
+    /// Seconds until the army may sound another war horn.
     horn_gate: f32,
-    vox_gate: f32,
     frame: u32,
 }
 
-/// Discrete cues: selection and order clicks, the charge horn on new
-/// orders, the rout horn on an own break, victory/defeat stings.
+/// Discrete cues: selection and order clicks (unplaced, UI channel), the
+/// war horn on new orders at the ordered regiments and on an own break at
+/// the breaking regiment (placed, one per army per 9 s), and the outcome
+/// sting (unplaced).
 #[allow(clippy::too_many_arguments)] // bevy system params
 fn event_cues(
-    mut commands: Commands,
-    bank: Option<Res<AudioBank>>,
+    mut mixer: ResMut<Mixer>,
+    pools: Option<Res<Pools>>,
     groups: Res<Groups>,
+    selection: Res<crate::selection::Selection>,
+    terrain: Res<crate::terrain::Terrain>,
     mut cues: MessageReader<UiCue>,
     outcome: Res<crate::ai::BattleOutcome>,
     time: Res<Time>,
-    settings: Res<crate::settings::Settings>,
     mut st: Local<CueState>,
 ) {
-    let Some(bank) = bank else { return };
-    let bv = battle_vol(&settings);
-    let uv = ui_vol(&settings);
+    let Some(pools) = pools else { return };
     st.frame = st.frame.wrapping_add(1);
     st.horn_gate -= time.delta_secs();
-    st.vox_gate -= time.delta_secs();
     st.prev_state.resize(groups.list.len(), 0);
 
     // UI click feedback: one clip per action kind per frame, straight
-    // from the input systems — every click sounds, repeats included.
+    // from the input systems; every click sounds, repeats included.
+    // Deployment placements click like a move but never horn.
     let (mut cue_select, mut cue_move, mut cue_attack, mut cue_deploy) =
         (false, false, false, false);
     for cue in cues.read() {
@@ -1495,10 +1488,36 @@ fn event_cues(
         }
     }
     if cue_select {
-        one_shot(&mut commands, bank.ui_select.clone(), 0.5 * uv, 1.0);
+        mixer.play_flat(Bus::Ui, pools.ui_select, UI_SELECT);
+    }
+    if cue_attack {
+        mixer.play_flat(Bus::Ui, pools.ui_attack, UI_ATTACK);
+    }
+    if cue_move || cue_deploy {
+        mixer.play_flat(Bus::Ui, pools.ui_order, UI_ORDER);
     }
 
-    let mut new_break_own = false;
+    let at = |c: Vec2| Vec3::new(c.x, terrain.height_at(c.x, c.y) + 1.5, c.y);
+    let seed = st.frame.wrapping_mul(211);
+    // The war horn sounds from the regiments the order went to.
+    if (cue_attack || cue_move) && st.horn_gate <= 0.0 {
+        let (mut sum, mut n, mut first) = (Vec2::ZERO, 0.0, NO_UNIT);
+        for (g, gd) in groups.list.iter().enumerate() {
+            if selection.regiments.get(g).copied().unwrap_or(false) && gd.team == 0 && gd.count > 0 {
+                sum += gd.centroid;
+                n += 1.0;
+                first = first.min(g as u32);
+            }
+        }
+        if n > 0.0 {
+            play(&mut mixer, &pools.horn_charge, HORN_CHARGE, at(sum / n), seed, 0.0, first);
+            st.horn_gate = WAR_HORN_GAP_S;
+        }
+    }
+
+    // The rout horn from an own regiment that breaks. Its crowd cry plays
+    // in regiment_sounds; rally has no cue until a fresh asset exists.
+    let mut broke: Option<usize> = None;
     for (g, gd) in groups.list.iter().enumerate() {
         let state = match gd.state {
             RegState::Steady => 0u8,
@@ -1506,43 +1525,24 @@ fn event_cues(
             RegState::Shattered => 2,
         };
         if state >= 1 && st.prev_state[g] == 0 && gd.count > 0 && gd.team == 0 {
-            new_break_own = true;
+            broke = Some(g);
         }
         st.prev_state[g] = state;
     }
-
-    let seed = st.frame.wrapping_mul(211);
-
-    // Order-click feedback: immediate and ungated, like the selection
-    // click — this is UI, not battlefield sound. Deployment placements
-    // click like a move but never horn.
-    if cue_attack {
-        one_shot(&mut commands, bank.ui_attack.clone(), 0.45 * uv, 1.0);
-    }
-    if cue_move || cue_deploy {
-        one_shot(&mut commands, bank.ui_order.clone(), 0.35 * uv, 1.0);
-    }
-    if (cue_attack || cue_move) && st.horn_gate <= 0.0 {
-        if let Some(h) = pick(&bank.horn_charge, seed) {
-            one_shot(&mut commands, h, 0.55 * bv, 1.0);
-        }
-        st.horn_gate = 3.0;
-    }
-    // The rout horn for an own break, one per 1.5 s. The break's crowd
-    // cry plays at the regiment (regiment_sounds); rally has no cue until
-    // a fresh asset exists.
-    if st.vox_gate <= 0.0 && new_break_own {
-        one_shot(&mut commands, bank.horn_rout.clone(), 0.5 * bv, 1.0);
-        st.vox_gate = 1.5;
+    if let Some(g) = broke
+        && st.horn_gate <= 0.0
+    {
+        play(&mut mixer, &[pools.horn_rout], HORN_ROUT, at(groups.list[g].centroid), seed ^ 0x77, 0.0, g as u32);
+        st.horn_gate = WAR_HORN_GAP_S;
     }
 
     // Outcome sting, once.
     if !st.prev_outcome && outcome.0.is_some() {
-        let h = match outcome.0 {
-            Some(0) => bank.sting_victory.clone(),
-            _ => bank.sting_defeat.clone(),
+        let (clip, bank) = match outcome.0 {
+            Some(0) => (pools.sting_victory, STING_VICTORY),
+            _ => (pools.sting_defeat, STING_DEFEAT),
         };
-        one_shot(&mut commands, h, 0.8 * bv, 1.0);
+        mixer.play_flat(Bus::Battle, clip, bank);
         st.prev_outcome = true;
     }
 }

@@ -185,6 +185,9 @@ enum Cmd {
         looped: bool,
         delay: u32,
         meter: u8,
+        /// Not placed in the world (UI, stings): kept when a battle's
+        /// placed voices are stopped.
+        flat: bool,
     },
     Gain {
         id: u32,
@@ -196,6 +199,7 @@ enum Cmd {
     },
     StopAll {
         fade: u32,
+        keep_flat: bool,
     },
 }
 
@@ -236,6 +240,7 @@ struct Voice {
     env: f32,
     env_step: f32,
     meter: u8,
+    flat: bool,
 }
 
 /// The asset Bevy plays: a handle to the shared command queue.
@@ -294,6 +299,7 @@ impl MixerSource {
                 looped,
                 delay,
                 meter,
+                flat,
             } => self.voices.push(Voice {
                 id,
                 pcm,
@@ -306,6 +312,7 @@ impl MixerSource {
                 env: 1.0,
                 env_step: 0.0,
                 meter,
+                flat,
             }),
             Cmd::Gain { id, gain } => {
                 if let Some(v) = self.voices.iter_mut().find(|v| v.id == id) {
@@ -317,8 +324,8 @@ impl MixerSource {
                     v.env_step = -1.0 / fade.max(1) as f32;
                 }
             }
-            Cmd::StopAll { fade } => {
-                for v in &mut self.voices {
+            Cmd::StopAll { fade, keep_flat } => {
+                for v in self.voices.iter_mut().filter(|v| !(keep_flat && v.flat)) {
                     v.env_step = -1.0 / fade.max(1) as f32;
                 }
             }
@@ -502,6 +509,10 @@ const TRACK_FADE_S: f32 = 0.2;
 #[derive(Resource)]
 pub struct Mixer {
     shared: Arc<Mutex<Shared>>,
+    /// The UI channel's queue (its own player, under the UI volume).
+    ui_shared: Arc<Mutex<Shared>>,
+    /// Unplaced sounds asked for this frame.
+    flat: Vec<(Bus, ClipId, Bank)>,
     live: Vec<Live>,
     requests: Vec<Request>,
     /// Tracked loops submitted this frame, by key.
@@ -613,13 +624,21 @@ impl Mixer {
         }
     }
 
-    /// Stop every voice (leaving the battle).
+    /// An unplaced sound (UI click, sting) on `bus`, at the bank's level,
+    /// centred.
+    pub fn play_flat(&mut self, bus: Bus, clip: ClipId, bank: Bank) {
+        self.flat.push((bus, clip, bank));
+    }
+
+    /// Stop every placed voice (leaving the battle). Unplaced ones, the
+    /// outcome sting among them, play on into the results screen.
     pub fn stop_all(&mut self) {
         self.requests.clear();
         self.tracked.clear();
         self.live.clear();
         self.cmds.push(Cmd::StopAll {
             fade: (0.1 * OUT_RATE as f32) as u32,
+            keep_flat: true,
         });
     }
 
@@ -759,6 +778,7 @@ impl Mixer {
                 looped,
                 delay,
                 meter,
+                flat: false,
             });
             group_add(&mut groups, r.bank.group, 1);
             if log_enabled() {
@@ -781,6 +801,36 @@ impl Mixer {
             });
             self.started += 1;
         }
+        // Unplaced sounds: no distance, no pan, no voice ranking.
+        let mut ui_cmds = Vec::new();
+        for (bus, clip, bank) in std::mem::take(&mut self.flat) {
+            let Some((pcm, clip_gain)) = clips.pcm(clip) else { continue };
+            let g = db_to_lin(bank.vol_db) * clip_gain;
+            self.next_id = self.next_id.wrapping_add(1);
+            let meter = self.meter_index(bank.group);
+            let cmd = Cmd::Start {
+                id: self.next_id,
+                pcm: pcm.clone(),
+                gain: [g, g],
+                speed: 1.0,
+                looped: false,
+                delay: 0,
+                meter,
+                flat: true,
+            };
+            match bus {
+                Bus::Battle => self.cmds.push(cmd),
+                Bus::Ui => ui_cmds.push(cmd),
+            }
+        }
+        {
+            let mut ui = self.ui_shared.lock().unwrap();
+            ui.cmds.append(&mut ui_cmds);
+            // Nothing on the UI channel is tracked; drop its reports.
+            ui.finished.clear();
+            ui.meter = [0.0; METER_GROUPS];
+            (ui.meter_total, ui.meter_frames) = (0.0, 0);
+        }
         if !self.cmds.is_empty() {
             self.shared.lock().unwrap().cmds.append(&mut self.cmds);
         }
@@ -798,9 +848,17 @@ fn group_count(groups: &[(&'static str, u16)], g: &'static str) -> u16 {
     groups.iter().find(|e| e.0 == g).map_or(0, |e| e.1)
 }
 
-/// The mixer's Bevy player.
+/// The mixer's two output channels: placed and unplaced battle sounds
+/// under the battle volume, UI clicks under the UI volume.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Bus {
+    Battle,
+    Ui,
+}
+
+/// A mixer channel's Bevy player.
 #[derive(Component)]
-pub struct MixerPlayer;
+pub struct MixerPlayer(Bus);
 
 /// Clips decoded to mono PCM at [`OUT_RATE`], loaded through the asset
 /// server and decoded off the main thread as they arrive.
@@ -898,12 +956,15 @@ fn decode_clips(mut clips: ResMut<Clips>, sources: Res<Assets<AudioSource>>) {
 
 fn setup_mixer(mut commands: Commands, mut streams: ResMut<Assets<MixerStream>>) {
     let shared = Arc::new(Mutex::new(Shared::default()));
-    let handle = streams.add(MixerStream {
-        shared: shared.clone(),
-    });
-    commands.spawn((AudioPlayer::<MixerStream>(handle), MixerPlayer));
+    let ui_shared = Arc::new(Mutex::new(Shared::default()));
+    for (bus, sh) in [(Bus::Battle, &shared), (Bus::Ui, &ui_shared)] {
+        let handle = streams.add(MixerStream { shared: sh.clone() });
+        commands.spawn((AudioPlayer::<MixerStream>(handle), MixerPlayer(bus)));
+    }
     commands.insert_resource(Mixer {
         shared,
+        ui_shared,
+        flat: Vec::new(),
         live: Vec::with_capacity(MAX_VOICES),
         requests: Vec::new(),
         tracked: Vec::new(),
@@ -928,7 +989,7 @@ pub fn flush_mixer(
     camera: Query<(&Transform, &crate::camera::RtsCamera)>,
     time: Res<Time<Real>>,
     settings: Res<crate::settings::Settings>,
-    mut sink: Query<&mut bevy::audio::AudioSink, With<MixerPlayer>>,
+    mut sinks: Query<(&MixerPlayer, &mut bevy::audio::AudioSink)>,
     virt_time: Res<Time<Virtual>>,
     mut next_log: Local<f64>,
 ) {
@@ -940,14 +1001,18 @@ pub fn flush_mixer(
             zoom: crate::audio::zoom_attenuation(cam.distance),
         };
     }
-    if let Ok(mut s) = sink.single_mut() {
+    for (player, mut s) in &mut sinks {
         use bevy::audio::AudioSinkPlayback;
-        let v = crate::audio::battle_vol(&settings);
+        let v = match player.0 {
+            Bus::Battle => crate::audio::battle_vol(&settings),
+            Bus::Ui => crate::audio::ui_vol(&settings),
+        };
         if (s.volume().to_linear() - v).abs() > 1e-3 {
             s.set_volume(bevy::audio::Volume::Linear(v));
         }
-        // A paused battle holds every battlefield voice where it is.
-        let paused = virt_time.is_paused();
+        // A paused battle holds every battlefield voice where it is; UI
+        // clicks still sound.
+        let paused = player.0 == Bus::Battle && virt_time.is_paused();
         if paused != s.is_paused() {
             if paused {
                 s.pause();
@@ -970,6 +1035,16 @@ fn stop_mixer(mut mixer: ResMut<Mixer>) {
     mixer.shared.lock().unwrap().cmds.extend(cmds);
 }
 
+/// Back at the menu: stop the unplaced voices too (a sting's tail).
+fn stop_flat(mixer: Res<Mixer>) {
+    for sh in [&mixer.shared, &mixer.ui_shared] {
+        sh.lock().unwrap().cmds.push(Cmd::StopAll {
+            fade: (0.1 * OUT_RATE as f32) as u32,
+            keep_flat: false,
+        });
+    }
+}
+
 pub struct MixerPlugin;
 
 impl Plugin for MixerPlugin {
@@ -979,6 +1054,7 @@ impl Plugin for MixerPlugin {
             .init_resource::<Clips>()
             .add_systems(Startup, setup_mixer)
             .add_systems(Update, decode_clips)
-            .add_systems(OnExit(crate::game_state::GameState::Battle), stop_mixer);
+            .add_systems(OnExit(crate::game_state::GameState::Battle), stop_mixer)
+            .add_systems(OnEnter(crate::game_state::GameState::Menu), stop_flat);
     }
 }
