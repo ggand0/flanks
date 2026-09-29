@@ -892,7 +892,7 @@ fn update_beds(
             return 0.0;
         }
         match bed {
-            Bed::Far => 0.22 * ((engaged_total as f32) / 8.0).clamp(0.0, 1.0) * duck,
+            Bed::Far => 0.70 * ((engaged_total as f32) / 8.0).clamp(0.0, 1.0) * duck,
             Bed::Mid => {
                 0.45 * ((engaged_near as f32) / 5.0).clamp(0.0, 1.0) * prox.sqrt() * duck
             }
