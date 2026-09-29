@@ -801,18 +801,8 @@ fn load_trees(
     let mut trees = Vec::new();
     for (name, fallback, budgets) in [
         (
-            "oak",
-            "oak_trunks_light_v1/natural/oak/tree.glb",
-            [3000, 700, 4],
-        ),
-        (
             "oak_lighter",
             "oak_trunks_light_v1/lighter/oak/tree.glb",
-            [3000, 700, 4],
-        ),
-        (
-            "mature_oak",
-            "oak_trunks_light_v1/natural/mature_oak/tree.glb",
             [3000, 700, 4],
         ),
         (
@@ -821,19 +811,9 @@ fn load_trees(
             [3000, 700, 4],
         ),
         (
-            "leaning_oak",
-            "oak_trunks_light_v1/natural/leaning_oak/tree.glb",
-            [3000, 700, 4],
-        ),
-        (
             "leaning_oak_lighter",
             "oak_trunks_light_v1/lighter/leaning_oak/tree.glb",
             [3000, 700, 4],
-        ),
-        (
-            "shrub_b_v4",
-            "shrub_b_v4_fuller/shrub_b/tree.glb",
-            [1900, 120, 4],
         ),
         (
             "silver_birch_warm",
