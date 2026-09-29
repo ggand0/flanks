@@ -513,6 +513,22 @@ struct BedTake {
     current: bool,
 }
 
+/// FL_BED_MUTE=mid,far: silence the named bed layers (far, mid, close,
+/// march), to hear the others alone.
+fn bed_muted(bed: Bed) -> bool {
+    static MUTED: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    MUTED
+        .get_or_init(|| {
+            std::env::var("FL_BED_MUTE")
+                .unwrap_or_default()
+                .split(',')
+                .map(|s| s.trim().to_lowercase())
+                .collect()
+        })
+        .iter()
+        .any(|m| *m == format!("{bed:?}").to_lowercase())
+}
+
 /// Crossfade between two takes of a bed layer (s).
 const BED_XFADE_S: f32 = 3.0;
 
@@ -850,7 +866,7 @@ fn update_beds(
     // Level before the master volume; the sink gets it times `m`.
     let m = battle_vol(&settings);
     let level = |bed: &Bed| -> f32 {
-        if paused {
+        if paused || bed_muted(*bed) {
             return 0.0;
         }
         match bed {
