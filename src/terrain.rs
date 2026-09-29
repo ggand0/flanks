@@ -904,8 +904,9 @@ fn band_color(h: f32, slope: f32, p: Vec2, classic: bool) -> [f32; 4] {
     }
     c.to_linear().to_f32_array()
 }
-/// Flat-shaded triangle soup for one chunk: 2 triangles per cell, per-face
-/// normal and one hard-banded color per triangle. World coords baked in.
+
+/// One chunk's mesh as unindexed triangles, 2 per cell, each with its face
+/// normal and one hard-banded color. World coords baked in.
 fn build_band_mesh(terrain: &Terrain, cx: usize, cz: usize) -> Mesh {
     let n_tris = CHUNK_CELLS * CHUNK_CELLS * 2;
     let mut positions = Vec::with_capacity(n_tris * 3);
