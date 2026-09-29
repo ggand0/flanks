@@ -418,6 +418,21 @@ const FIGHT_LOOP: Bank = Bank {
 /// M2TW `cam_cull_radius_unit`: no unit sound beyond this distance from
 /// the camera (m).
 const FIGHT_CULL_M: f32 = 100.0;
+/// The fight loop pool holds the close takes first, then the mid takes.
+const FIGHT_CLOSE_TAKES: usize = 6;
+
+/// FL_FIGHT_TAKES=mid or close: every fighting regiment picks only from the
+/// mid or only from the close takes, to judge one set alone.
+fn fight_takes(n: usize) -> std::ops::Range<usize> {
+    static SET: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let set = SET.get_or_init(|| std::env::var("FL_FIGHT_TAKES").unwrap_or_default().trim().to_lowercase());
+    match set.as_str() {
+        "mid" => FIGHT_CLOSE_TAKES.min(n)..n,
+        "close" => 0..FIGHT_CLOSE_TAKES.min(n),
+        _ => 0..n,
+    }
+}
+
 /// Tracked-loop keys of the fight loops, clear of the arrow ids.
 const FIGHT_KEY: u64 = 1 << 40;
 const CHARGE_SHEET: Bank = bank("charge sheet", "charge sheet", 0, 170.0, -1.0, 3.6, true, (0.8, 1.1));
@@ -1124,6 +1139,7 @@ fn fight_loops(
         return;
     }
     let eye = mixer.listener.eye;
+    let takes = fight_takes(pools.fight_loop.len());
     for (g, gd) in groups.list.iter().enumerate() {
         if !gd.engaged || gd.count == 0 {
             continue;
@@ -1136,9 +1152,8 @@ fn fight_loops(
         mixer.track(
             FIGHT_KEY | g as u64,
             Request {
-                clip: pools.fight_loop
-                    [(hash01((g as u32).wrapping_mul(0x27D4_EB2F) ^ 0x3B7) * pools.fight_loop.len() as f32) as usize
-                        % pools.fight_loop.len()],
+                clip: pools.fight_loop[takes.start
+                    + (hash01((g as u32).wrapping_mul(0x27D4_EB2F) ^ 0x3B7) * takes.len() as f32) as usize % takes.len()],
                 bank: FIGHT_LOOP,
                 pos: at,
                 speed_roll: hash01((g as u32).wrapping_mul(0x9E37_79B1) ^ 0x2F1),
