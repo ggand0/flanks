@@ -353,8 +353,8 @@ const HORN_ROUT: Bank = Bank {
 /// M2TW `unit_warhorns_delay 9`: one war horn per army per 9 s.
 const WAR_HORN_GAP_S: f32 = 9.0;
 const UI_SELECT: Bank = flat_bank("ui", -8.8, false);
-/// A move order clicks as loud as an attack order.
-const UI_ORDER: Bank = flat_bank("ui", 3.7, false);
+/// A move order clicks 5.6 dB under an attack order.
+const UI_ORDER: Bank = flat_bank("ui", -1.9, false);
 const UI_ATTACK: Bank = flat_bank("ui", 3.7, false);
 const STING_VICTORY: Bank = flat_bank("sting", 3.5, true);
 const STING_DEFEAT: Bank = flat_bank("sting", -1.1, true);
@@ -551,7 +551,6 @@ fn setup_audio(mut commands: Commands, assets: Res<AssetServer>, mut clips: ResM
         hit_flesh: pool(clips, &assets, &[
             "sfx_new/sfx_blunt_damage_01",
             "sfx_new/sfx_blunt_damage_02",
-            "sfx_new/sfx_spear_damage_01",
             "sfx_new/sfx_sword_damage_01",
             "sfx_new/sfx_sword_damage_02",
         ]),
