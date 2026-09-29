@@ -51,11 +51,6 @@ pub enum UiCue {
 
 /// Bed smoothing time constant (seconds to ~2/3 of the way to target).
 const BED_SMOOTH: f32 = 0.35;
-/// The battle beds start to dip when the positional mix runs louder than
-/// this (dBFS, per channel)...
-const BED_DUCK_FROM_DB: f32 = -40.0;
-/// ...and dip at most this much (dB).
-const BED_DUCK_MAX_DB: f32 = 6.0;
 
 /// Per-clip loudness manifest (tools/audio_loudness.py): the gain in dB
 /// that brings each clip to the common loudness, and its length in
@@ -483,19 +478,17 @@ struct Pools {
 /// The looping bed layers.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Bed {
-    Mid,
     /// Massed boots (Pixabay loop) while an own regiment marches.
     March,
 }
 
 impl Bed {
-    const ALL: [Bed; 2] = [Bed::Mid, Bed::March];
+    const ALL: [Bed; 1] = [Bed::March];
 
     /// The layer's takes under assets/. The first one's loudness is the
     /// layer's level; the others are matched to it.
     fn takes(self) -> &'static [&'static str] {
         match self {
-            Bed::Mid => &["bed_battle_mid0.mp3", "bed_battle_mid1.mp3"],
             Bed::March => &["sfx_new/bed_march_loop_14.5s.mp3"],
         }
     }
@@ -688,6 +681,8 @@ fn setup_audio(mut commands: Commands, assets: Res<AssetServer>, mut clips: ResM
             "bed_melee_close3",
             "bed_melee_close4",
             "bed_melee_close5",
+            "bed_battle_mid0",
+            "bed_battle_mid1",
         ]),
         charge_yell: pool(
             clips,
@@ -837,50 +832,19 @@ fn update_beds(
     mut commands: Commands,
     assets: Res<AssetServer>,
     groups: Res<Groups>,
-    camera: Query<&RtsCamera>,
     time: Res<Time<Real>>,
     virt_time: Res<Time<Virtual>>,
     settings: Res<crate::settings::Settings>,
-    mixer: Res<Mixer>,
     mut takes: Query<(Entity, &mut BedTake, Option<&mut AudioSink>)>,
     mut clock: Local<([f32; Bed::ALL.len()], u32)>,
     mut next_log: Local<f32>,
 ) {
-    let Ok(cam) = camera.single() else { return };
     let paused = virt_time.is_paused();
-    let focus = Vec2::new(cam.focus.x, cam.focus.z);
+    let marching_own = groups
+        .list
+        .iter()
+        .any(|g| g.count > 0 && !g.engaged && g.team == 0 && g.order.is_some() && !g.state.is_broken());
 
-    let mut engaged_near = 0usize;
-    let mut min_dist = f32::MAX;
-    let mut marching_own = false;
-    for g in &groups.list {
-        if g.count == 0 {
-            continue;
-        }
-        if g.engaged {
-            let d = g.centroid.distance(focus);
-            min_dist = min_dist.min(d);
-            if d < 300.0 {
-                engaged_near += 1;
-            }
-        } else if g.team == 0 && g.order.is_some() && !g.state.is_broken() {
-            marching_own = true;
-        }
-    }
-
-    // Zooming out raises the "how far can you hear" floor a bit.
-    let hear = 220.0 + cam.distance * 0.5;
-    let prox = if min_dist == f32::MAX {
-        0.0
-    } else {
-        (1.0 - (min_dist / hear)).clamp(0.0, 1.0)
-    };
-
-    // The beds dip while the fight at the look point is loud, so they never
-    // mask the men in front of the camera: 0.5 dB per dB the positional mix
-    // runs over BED_DUCK_FROM_DB, at most BED_DUCK_MAX_DB.
-    let duck_db = ((mixer.recent_db() - BED_DUCK_FROM_DB) * 0.5).clamp(0.0, BED_DUCK_MAX_DB);
-    let duck = crate::mixer::db_to_lin(-duck_db);
     // Level before the master volume; the sink gets it times `m`.
     let m = battle_vol(&settings);
     let level = |bed: &Bed| -> f32 {
@@ -888,9 +852,6 @@ fn update_beds(
             return 0.0;
         }
         match bed {
-            Bed::Mid => {
-                0.45 * ((engaged_near as f32) / 5.0).clamp(0.0, 1.0) * prox.sqrt() * duck
-            }
             Bed::March => {
                 if marching_own {
                     0.28
@@ -958,7 +919,7 @@ fn update_beds(
             .collect();
         crate::mixer::audio_log(
             time.elapsed_secs_f64(),
-            &format!("beds: dip {duck_db:.1} dB | {}", line.join(", ")),
+            &format!("beds: {}", line.join(", ")),
         );
     }
 }
@@ -1175,7 +1136,9 @@ fn fight_loops(
         mixer.track(
             FIGHT_KEY | g as u64,
             Request {
-                clip: pools.fight_loop[g % pools.fight_loop.len()],
+                clip: pools.fight_loop
+                    [(hash01((g as u32).wrapping_mul(0x27D4_EB2F) ^ 0x3B7) * pools.fight_loop.len() as f32) as usize
+                        % pools.fight_loop.len()],
                 bank: FIGHT_LOOP,
                 pos: at,
                 speed_roll: hash01((g as u32).wrapping_mul(0x9E37_79B1) ^ 0x2F1),

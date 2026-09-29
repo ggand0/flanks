@@ -286,8 +286,6 @@ struct Shared {
     meter: [f64; METER_GROUPS],
     meter_total: f64,
     meter_frames: u64,
-    /// Mean output power over the last ~0.3 s (the beds dip under it).
-    recent_ms: f32,
 }
 
 /// Fractional bits of a voice's read position.
@@ -332,7 +330,6 @@ impl Decodable for MixerStream {
             meter: [0.0; METER_GROUPS],
             meter_total: 0.0,
             meter_frames: 0,
-            recent_ms: 0.0,
         }
     }
 }
@@ -353,7 +350,6 @@ pub struct MixerSource {
     meter: [f64; METER_GROUPS],
     meter_total: f64,
     meter_frames: u64,
-    recent_ms: f32,
 }
 
 impl MixerSource {
@@ -418,7 +414,6 @@ impl MixerSource {
                 }
                 sh.meter_total += self.meter_total;
                 sh.meter_frames += self.meter_frames;
-                sh.recent_ms = self.recent_ms;
                 (self.meter_total, self.meter_frames) = (0.0, 0);
                 std::mem::take(&mut sh.cmds)
             }
@@ -493,13 +488,10 @@ impl MixerSource {
             keep
         });
 
-        // Output power for the meter and the bed dip.
+        // Output power for the meter.
         let block_energy: f32 = self.buf.iter().map(|s| s * s).sum();
         self.meter_total += block_energy as f64;
         self.meter_frames += BLOCK as u64;
-        let ms = block_energy / (2 * BLOCK) as f32;
-        // About 0.3 s to follow (56 blocks of 5.3 ms).
-        self.recent_ms += (ms - self.recent_ms) * (1.0 / 56.0);
 
         // Peak limiter: a dense near fight can sum past full scale.
         let peak = self.buf.iter().fold(0.0f32, |m, s| m.max(s.abs()));
@@ -600,8 +592,6 @@ pub struct Mixer {
     /// Banks of playing voices cut for a stronger sound since the clip
     /// log last read them (FL_LOG_AUDIO).
     pub cut_log: Vec<&'static str>,
-    /// Mean power of the positional mix over the last ~0.3 s.
-    recent_ms: f32,
     /// The crowd dip now (dB), and when it was last updated.
     duck_db: f32,
     duck_at: f64,
@@ -691,11 +681,6 @@ impl Mixer {
         self.live.iter().filter(|l| l.bank.name == bank).map(|l| l.pos).collect()
     }
 
-    /// Loudness of the positional mix over the last ~0.3 s, in dBFS.
-    pub fn recent_db(&self) -> f32 {
-        10.0 * self.recent_ms.max(1e-12).log10()
-    }
-
     fn meter_index(&mut self, group: &'static str) -> u8 {
         match self.meter_names.iter().position(|g| *g == group) {
             Some(i) => i as u8,
@@ -738,7 +723,6 @@ impl Mixer {
             let mut sh = self.shared.lock().unwrap();
             let mut finished = std::mem::take(&mut sh.finished);
             sh.cmds.append(&mut self.cmds);
-            self.recent_ms = sh.recent_ms;
             drop(sh);
             finished.sort_unstable();
             self.live.retain(|l| finished.binary_search(&l.id).is_err());
@@ -1085,7 +1069,6 @@ fn setup_mixer(mut commands: Commands, mut streams: ResMut<Assets<MixerStream>>)
         meter_names: Vec::new(),
         start_log: Vec::new(),
         cut_log: Vec::new(),
-        recent_ms: 0.0,
         duck_db: 0.0,
         duck_at: 0.0,
     });

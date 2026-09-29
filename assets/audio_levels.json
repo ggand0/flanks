@@ -12,17 +12,17 @@
   },
   "bed_battle_mid0.mp3": {
    "measure": "integrated",
-   "lufs": -14.6,
-   "true_peak_db": 0.2,
-   "seconds": 18.02,
-   "gain_db": -8.4
+   "lufs": -18.8,
+   "true_peak_db": -4.0,
+   "seconds": 17.04,
+   "gain_db": -4.2
   },
   "bed_battle_mid1.mp3": {
    "measure": "integrated",
-   "lufs": -13.4,
-   "true_peak_db": -0.2,
-   "seconds": 18.02,
-   "gain_db": -9.6
+   "lufs": -18.3,
+   "true_peak_db": -4.9,
+   "seconds": 17.04,
+   "gain_db": -4.7
   },
   "bed_melee_close0.mp3": {
    "measure": "integrated",
