@@ -59,11 +59,12 @@ const BED_DUCK_FROM_DB: f32 = -40.0;
 const BED_DUCK_MAX_DB: f32 = 6.0;
 
 /// Per-clip loudness manifest (tools/audio_loudness.py): the gain in dB
-/// that brings each clip to the common loudness, by path under assets/.
-fn norm_db(path: &str) -> f32 {
-    static GAINS: std::sync::OnceLock<std::collections::HashMap<String, f32>> =
-        std::sync::OnceLock::new();
-    let gains = GAINS.get_or_init(|| {
+/// that brings each clip to the common loudness, and its length in
+/// seconds, by path under assets/.
+fn clip_info(path: &str) -> (f32, f32) {
+    type Manifest = std::collections::HashMap<String, (f32, f32)>;
+    static CLIPS: std::sync::OnceLock<Manifest> = std::sync::OnceLock::new();
+    let clips = CLIPS.get_or_init(|| {
         let v: serde_json::Value =
             serde_json::from_str(include_str!("../assets/audio_levels.json")).unwrap_or_default();
         v["clips"]
@@ -71,18 +72,24 @@ fn norm_db(path: &str) -> f32 {
             .map(|clips| {
                 clips
                     .iter()
-                    .filter_map(|(k, c)| Some((k.clone(), c["gain_db"].as_f64()? as f32)))
+                    .filter_map(|(k, c)| {
+                        Some((k.clone(), (c["gain_db"].as_f64()? as f32, c["seconds"].as_f64()? as f32)))
+                    })
                     .collect()
             })
             .unwrap_or_default()
     });
-    match gains.get(path) {
-        Some(g) => *g,
+    match clips.get(path) {
+        Some(c) => *c,
         None => {
             warn!("audio: {path} is not in assets/audio_levels.json; run tools/audio_loudness.py");
-            0.0
+            (0.0, 0.0)
         }
     }
+}
+
+fn norm_db(path: &str) -> f32 {
+    clip_info(path).0
 }
 
 /// Load `<name>.mp3` for every name, each at the common loudness.
@@ -259,7 +266,10 @@ fn clear_sound_events(mut ev: ResMut<SoundEvents>) {
 /// (the metal ring 19 dB under the shield). Priorities and distance
 /// priorities are M2TW's. Group caps are the voices the approved mix held
 /// (about 31 for the steel, 18 for the grunts and screams together, 1-2
-/// death screams, 14 bow strings), nearest first.
+/// death screams, 14 bow strings), nearest first. The charge yells and
+/// sheets, the volley and the arrow air sit 7 dB over that balance, which
+/// cancels MIX_GAIN_DB for them: they play at the approved mix's absolute
+/// level while the melee plays 7 dB under it.
 mod mix {
     /// A death scream's output level in the approved mix: pool median
     /// -7.7 LUFS at gain 0.24 (-12.4 dB).
@@ -326,18 +336,26 @@ const ARROW_WOOD: Bank = bank("arrow wood", "arrow strike", 8, 90.0, -2.0, -14.5
 const ARROW_DEATH_HIT: Bank = bank("death hit", "arrow strike", 8, 180.0, -2.0, -4.9, false, (0.8, 1.2));
 const ARROW_GROUND: Bank = bank("arrow ground", "arrow ground", 6, 90.0, -2.0, -30.7, false, (0.8, 1.2));
 /// A looped air sound on three arrows in ten, followed in flight.
-const ARROW_FLY: Bank = bank("arrow fly", "arrow fly", 12, 170.0, 0.0, -26.7, true, (0.5, 1.5));
+const ARROW_FLY: Bank = bank("arrow fly", "arrow fly", 12, 170.0, 0.0, -19.7, true, (0.5, 1.5));
 /// A shaft dropping past the look point.
 const ARROW_WHIZZ: Bank = bank("arrow whizz", "arrow whizz", 4, 170.0, 0.0, -22.9, false, (0.7, 1.3));
 /// One group release per volley share (M2TW unit_missile_attack).
-const VOLLEY: Bank = bank("volley", "volley", 4, 190.0, -1.0, -3.4, true, (0.9, 1.1));
-const CHARGE_YELL: Bank = bank("charge yell", "charge yell", 40, 80.0, 0.0, -0.4, false, (0.9, 1.1));
-const CHARGE_SHEET: Bank = bank("charge sheet", "charge sheet", 0, 170.0, -1.0, -3.4, true, (0.8, 1.1));
+const VOLLEY: Bank = bank("volley", "volley", 4, 190.0, -1.0, 3.6, true, (0.9, 1.1));
+/// A charge yell is heard across the charging block (about 60 m wide):
+/// full level within a sheet's distance.
+const CHARGE_YELL: Bank = Bank {
+    mindist: mix::SHEET_M,
+    ..bank("charge yell", "charge yell", 40, 80.0, 0.0, 6.6, false, (0.9, 1.1))
+};
+const CHARGE_SHEET: Bank = bank("charge sheet", "charge sheet", 0, 170.0, -1.0, 3.6, true, (0.8, 1.1));
 const CHEER_SHEET: Bank = bank("cheer sheet", "cheer sheet", 0, 170.0, -1.0, -2.0, true, (0.9, 1.0));
 const WHOOP: Bank = bank("whoop", "whoop", 10, 100.0, 0.0, 1.1, false, (0.92, 1.08));
 const ROUT_SHOUT: Bank = bank("rout shout", "rout shout", 3, 120.0, 0.0, 3.9, false, (0.94, 1.06));
 const ROUT_PANIC: Bank = bank("rout panic", "rout panic", 4, 110.0, 0.0, -6.4, true, (0.92, 1.08));
 const FEET: Bank = bank("feet", "feet", 6, 70.0, 0.0, -11.3, true, (0.94, 1.06));
+/// A crowd cry from a regiment the moment it breaks, one at a time, at
+/// the approved break cue's level (0.55 on clips of -12.5 LUFS).
+const ROUT_CROWD: Bank = bank("rout crowd", "rout crowd", 1, 150.0, -1.0, 2.4, true, (1.0, 1.0));
 
 /// One sim tick in seconds: a tick's events are spread over it.
 const TICK_S: f32 = 1.0 / 30.0;
@@ -369,13 +387,13 @@ struct Pools {
     whoop: Vec<ClipId>,
     rout_shout: Vec<ClipId>,
     rout_panic: Vec<ClipId>,
+    rout_crowd: Vec<ClipId>,
     feet: Vec<ClipId>,
 }
 
-/// Plain Bevy players: UI, horns, crowd vox on a break, stings.
+/// Plain Bevy players: UI, horns, stings.
 #[derive(Resource)]
 struct AudioBank {
-    vox_rout: Vec<Handle<AudioSource>>,
     horn_charge: Vec<Handle<AudioSource>>,
     horn_rout: Handle<AudioSource>,
     ui_select: Handle<AudioSource>,
@@ -387,15 +405,70 @@ struct AudioBank {
     sting_defeat: Handle<AudioSource>,
 }
 
-/// Looping bed entities, indexed by `Bed`.
-#[derive(Component, Clone, Copy, PartialEq)]
+/// The looping bed layers.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Bed {
     Far,
     Mid,
     Close,
-    Drums,
-    /// Massed boots (Pixabay loop) — plays with the drums on the march.
+    /// Massed boots (Pixabay loop) while an own regiment marches.
     March,
+}
+
+impl Bed {
+    const ALL: [Bed; 4] = [Bed::Far, Bed::Mid, Bed::Close, Bed::March];
+
+    /// The layer's takes under assets/. The first one's loudness is the
+    /// layer's level; the others are matched to it.
+    fn takes(self) -> &'static [&'static str] {
+        match self {
+            Bed::Far => &["bed_battle_far.mp3"],
+            Bed::Mid => &["bed_battle_mid0.mp3", "bed_battle_mid1.mp3"],
+            Bed::Close => &[
+                "bed_melee_close0.mp3",
+                "bed_melee_close1.mp3",
+                "bed_melee_close2.mp3",
+            ],
+            Bed::March => &["sfx_new/bed_march_loop_14.5s.mp3"],
+        }
+    }
+
+    /// Gain that matches take `i` to the layer's first take.
+    fn take_gain(self, i: usize) -> f32 {
+        let t = self.takes();
+        crate::mixer::db_to_lin(norm_db(t[i]) - norm_db(t[0]))
+    }
+}
+
+/// One playing take of a bed layer. A layer with several takes hands over
+/// to another one before the current take ends, crossfading.
+#[derive(Component)]
+struct BedTake {
+    bed: Bed,
+    take: usize,
+    /// Crossfade position 0..1: rises while the take is current, falls
+    /// once it has been handed over.
+    xfade: f32,
+    current: bool,
+}
+
+/// Crossfade between two takes of a bed layer (s).
+const BED_XFADE_S: f32 = 3.0;
+
+fn spawn_bed_take(commands: &mut Commands, assets: &AssetServer, bed: Bed, take: usize, xfade: f32) {
+    commands.spawn((
+        AudioPlayer::new(assets.load(bed.takes()[take])),
+        PlaybackSettings {
+            volume: Volume::Linear(0.0),
+            ..PlaybackSettings::LOOP
+        },
+        BedTake {
+            bed,
+            take,
+            xfade,
+            current: true,
+        },
+    ));
 }
 
 fn setup_audio(mut commands: Commands, assets: Res<AssetServer>, mut clips: ResMut<Clips>) {
@@ -618,6 +691,18 @@ fn setup_audio(mut commands: Commands, assets: Res<AssetServer>, mut clips: ResM
             &assets,
             &["sfx_rout/vox_panic_01", "sfx_rout/vox_panic_02", "sfx_rout/vox_panic_03"],
         ),
+        // vox_rally_01/02 are benched: unusable, use nowhere.
+        rout_crowd: pool(
+            clips,
+            &assets,
+            &[
+                "vox_rout_01",
+                "vox_rout_02",
+                "vox_rout_03",
+                "sfx_rout/vox_rout_04",
+                "sfx_rout/vox_rout_05",
+            ],
+        ),
         // Massed washes layered from single-man source loops by
         // work/scripts/build-feet-wash.sh (ElevenLabs would only produce
         // one or two runners per take).
@@ -629,14 +714,6 @@ fn setup_audio(mut commands: Commands, assets: Res<AssetServer>, mut clips: ResM
     });
 
     commands.insert_resource(AudioBank {
-        // vox_rally_01/02 are benched: unusable, use nowhere.
-        vox_rout: load_set(&[
-            "vox_rout_01",
-            "vox_rout_02",
-            "vox_rout_03",
-            "sfx_rout/vox_rout_04",
-            "sfx_rout/vox_rout_05",
-        ]),
         horn_charge: load_set(&["sig_horn_charge", "sig_horn_charge_02"]),
         horn_rout: assets.load("sfx_new/sig_horn_rout.mp3"),
         ui_select: assets.load("sfx_new/ui_select1.mp3"),
@@ -646,34 +723,12 @@ fn setup_audio(mut commands: Commands, assets: Res<AssetServer>, mut clips: ResM
         sting_defeat: assets.load("sting_defeat.mp3"),
     });
 
-    let bed = |path: &'static str| {
-        (
-            AudioPlayer::new(assets.load(path)),
-            PlaybackSettings {
-                volume: Volume::Linear(0.0),
-                ..PlaybackSettings::LOOP
-            },
-        )
-    };
-    for b in [Bed::Far, Bed::Mid, Bed::Close, Bed::Drums, Bed::March] {
-        commands.spawn((bed(b.path()), b));
+    for bed in Bed::ALL {
+        spawn_bed_take(&mut commands, &assets, bed, 0, 1.0);
     }
 }
 
-impl Bed {
-    /// The bed's clip under assets/.
-    fn path(self) -> &'static str {
-        match self {
-            Bed::Far => "bed_battle_far.mp3",
-            Bed::Mid => "bed_battle_mid0.mp3",
-            Bed::Close => "bed_melee_close0.mp3",
-            Bed::Drums => "sig_drums_march.mp3",
-            Bed::March => "sfx_new/bed_march_loop_14.5s.mp3",
-        }
-    }
-}
-
-fn silence_beds(mut sinks: Query<&mut AudioSink, With<Bed>>) {
+fn silence_beds(mut sinks: Query<&mut AudioSink, With<BedTake>>) {
     for mut sink in &mut sinks {
         sink.set_volume(Volume::Linear(0.0));
     }
@@ -682,16 +737,19 @@ fn silence_beds(mut sinks: Query<&mut AudioSink, With<Bed>>) {
 /// Despawn every in-flight one-shot (war cries, horns, sting tails).
 fn stop_one_shots(
     mut commands: Commands,
-    playing: Query<Entity, (With<AudioPlayer>, Without<Bed>)>,
+    playing: Query<Entity, (With<AudioPlayer>, Without<BedTake>)>,
 ) {
     for e in &playing {
         commands.entity(e).despawn();
     }
 }
 
-/// Crossfade the beds from battle state around the camera focus.
+/// Crossfade the beds from battle state around the camera focus, and
+/// rotate each layer's takes.
 #[allow(clippy::too_many_arguments)] // bevy system params
 fn update_beds(
+    mut commands: Commands,
+    assets: Res<AssetServer>,
     groups: Res<Groups>,
     stats: Res<SimStats>,
     camera: Query<&RtsCamera>,
@@ -699,7 +757,8 @@ fn update_beds(
     virt_time: Res<Time<Virtual>>,
     settings: Res<crate::settings::Settings>,
     mixer: Res<Mixer>,
-    mut sinks: Query<(&Bed, &mut AudioSink)>,
+    mut takes: Query<(Entity, &mut BedTake, Option<&mut AudioSink>)>,
+    mut clock: Local<([f32; 4], u32)>,
     mut next_log: Local<f32>,
 ) {
     let Ok(cam) = camera.single() else { return };
@@ -758,13 +817,6 @@ fn update_beds(
             Bed::Close => {
                 0.60 * prox * prox * (0.25 + 0.75 * hits) * (0.35 + 0.65 * zoom_att) * duck
             }
-            Bed::Drums => {
-                if marching_own {
-                    0.30
-                } else {
-                    0.0
-                }
-            }
             Bed::March => {
                 if marching_own {
                     0.28
@@ -775,14 +827,49 @@ fn update_beds(
         }
     };
 
+    // Hand each multi-take layer over to another take before the current
+    // one ends (a paused battle holds the clocks).
+    let dt = if paused { 0.0 } else { time.delta_secs() };
+    let (left, roll) = &mut *clock;
+    for (i, bed) in Bed::ALL.into_iter().enumerate() {
+        let n = bed.takes().len();
+        if n < 2 {
+            continue;
+        }
+        left[i] -= dt;
+        if left[i] > 0.0 {
+            continue;
+        }
+        let mut current = 0;
+        for (_, mut t, _) in &mut takes {
+            if t.bed == bed && t.current {
+                t.current = false;
+                current = t.take;
+            }
+        }
+        *roll = roll.wrapping_add(1);
+        let next = (current + 1 + (hash01(roll.wrapping_mul(0x9E37_79B1)) * (n - 1) as f32) as usize % (n - 1)) % n;
+        spawn_bed_take(&mut commands, &assets, bed, next, 0.0);
+        left[i] = clip_info(bed.takes()[next]).1 - BED_XFADE_S;
+    }
+
     let blend = (time.delta_secs() / BED_SMOOTH).min(1.0);
+    let step = time.delta_secs() / BED_XFADE_S;
     let mut levels = Vec::new();
-    for (bed, mut sink) in &mut sinks {
-        let cur = sink.volume().to_linear();
-        let lv = level(bed);
-        let v = cur + (lv * m - cur) * blend;
-        sink.set_volume(Volume::Linear(v));
-        levels.push((*bed, lv));
+    for (e, mut t, sink) in &mut takes {
+        t.xfade = if t.current { (t.xfade + step).min(1.0) } else { t.xfade - step };
+        if !t.current && t.xfade <= 0.0 {
+            commands.entity(e).despawn();
+            continue;
+        }
+        // Equal-power crossfade.
+        let w = (t.xfade.clamp(0.0, 1.0) * std::f32::consts::FRAC_PI_2).sin();
+        let lv = level(&t.bed) * t.bed.take_gain(t.take) * w;
+        if let Some(mut sink) = sink {
+            let cur = sink.volume().to_linear();
+            sink.set_volume(Volume::Linear(cur + (lv * m - cur) * blend));
+        }
+        levels.push((t.bed.takes()[t.take], lv));
     }
 
     // FL_LOG_AUDIO: each bed's level, its clip's loudness plus its volume
@@ -793,10 +880,7 @@ fn update_beds(
         let line: Vec<String> = levels
             .iter()
             .filter(|(_, v)| *v > 1e-4)
-            .map(|(bed, v)| {
-                let path = bed.path();
-                format!("{path} {:.0}", -23.0 - norm_db(path) + 20.0 * v.log10())
-            })
+            .map(|(path, v)| format!("{path} {:.0}", -23.0 - norm_db(path) + 20.0 * v.log10()))
             .collect();
         info!("beds: dip {duck_db:.1} dB | {}", line.join(", "));
     }
@@ -1175,6 +1259,7 @@ fn regiment_sounds(
         if new_break {
             st.panic_left[g] = ROUT_PANIC_S;
         }
+        let break_cry = new_break;
         st.volley_cool[g] -= dt;
 
         // Out of earshot: keep the clocks honest, ask for nothing.
@@ -1235,7 +1320,10 @@ fn regiment_sounds(
             st.whoop_acc[g] = 0.0;
         }
 
-        // Rout.
+        // Rout: the crowd cry at the break, then panic, shouts and feet.
+        if break_cry && !far {
+            play(&mut mixer, &pools.rout_crowd, ROUT_CROWD, centre, seed ^ 0x163, 0.0);
+        }
         if broken {
             st.panic_left[g] = (st.panic_left[g] - dt).max(0.0);
             if st.panic_left[g] > 0.0 {
@@ -1325,9 +1413,8 @@ struct CueState {
     frame: u32,
 }
 
-/// Discrete cues: selection and order clicks, charge horn on new
-/// orders, rout/rally vox + horn, victory/defeat stings. The charge
-/// war cries live in `charge_vox`.
+/// Discrete cues: selection and order clicks, the charge horn on new
+/// orders, the rout horn on an own break, victory/defeat stings.
 #[allow(clippy::too_many_arguments)] // bevy system params
 fn event_cues(
     mut commands: Commands,
@@ -1364,18 +1451,14 @@ fn event_cues(
     }
 
     let mut new_break_own = false;
-    let mut new_break_any = false;
     for (g, gd) in groups.list.iter().enumerate() {
         let state = match gd.state {
             RegState::Steady => 0u8,
             RegState::Routing { .. } => 1,
             RegState::Shattered => 2,
         };
-        if state >= 1 && st.prev_state[g] == 0 && gd.count > 0 {
-            new_break_any = true;
-            if gd.team == 0 {
-                new_break_own = true;
-            }
+        if state >= 1 && st.prev_state[g] == 0 && gd.count > 0 && gd.team == 0 {
+            new_break_own = true;
         }
         st.prev_state[g] = state;
     }
@@ -1397,21 +1480,12 @@ fn event_cues(
         }
         st.horn_gate = 3.0;
     }
-    if st.vox_gate <= 0.0 {
-        // One vox per gate window, most dramatic first.
-        if new_break_any {
-            if let Some(h) = pick(&bank.vox_rout, seed ^ 0x66) {
-                one_shot(&mut commands, h, 0.55 * bv, 1.0);
-            }
-            if new_break_own {
-                one_shot(&mut commands, bank.horn_rout.clone(), 0.5 * bv, 1.0);
-            }
-            // The victors' roar moved to celebrate_vox: the M2TW cheer
-            // is a STATE (the last nearby foe gone), not a break edge.
-            // Rally has no vox for now (the old clips are benched);
-            // a rally cue needs a fresh asset first.
-            st.vox_gate = 1.5;
-        }
+    // The rout horn for an own break, one per 1.5 s. The break's crowd
+    // cry plays at the regiment (regiment_sounds); rally has no cue until
+    // a fresh asset exists.
+    if st.vox_gate <= 0.0 && new_break_own {
+        one_shot(&mut commands, bank.horn_rout.clone(), 0.5 * bv, 1.0);
+        st.vox_gate = 1.5;
     }
 
     // Outcome sting, once.
