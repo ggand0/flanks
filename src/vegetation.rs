@@ -31,75 +31,8 @@ impl Plugin for VegetationPlugin {
     }
 }
 
-/// Flat-shaded triangle builder for the river bridge.
-pub(crate) struct Soup {
-    positions: Vec<[f32; 3]>,
-    normals: Vec<[f32; 3]>,
-    colors: Vec<[f32; 4]>,
-}
-
-impl Soup {
-    pub(crate) fn new() -> Self {
-        Self {
-            positions: Vec::new(),
-            normals: Vec::new(),
-            colors: Vec::new(),
-        }
-    }
-
-    pub(crate) fn tri(&mut self, a: Vec3, b: Vec3, c: Vec3, color: [f32; 4]) {
-        let n = (b - a).cross(c - a).normalize_or_zero();
-        for v in [a, b, c] {
-            self.positions.push(v.to_array());
-            self.normals.push(n.to_array());
-            self.colors.push(color);
-        }
-    }
-
-    pub(crate) fn quad(&mut self, a: Vec3, b: Vec3, c: Vec3, d: Vec3, color: [f32; 4]) {
-        self.tri(a, b, c, color);
-        self.tri(a, c, d, color);
-    }
-
-    /// Axis-aligned cuboid (pre-rotation); `c` = center, `h` = half extents.
-    pub(crate) fn cuboid(&mut self, c: Vec3, h: Vec3, color: [f32; 4]) {
-        let p = |x: f32, y: f32, z: f32| c + Vec3::new(x * h.x, y * h.y, z * h.z);
-        // 8 corners.
-        let v = [
-            p(-1.0, -1.0, -1.0),
-            p(1.0, -1.0, -1.0),
-            p(1.0, -1.0, 1.0),
-            p(-1.0, -1.0, 1.0),
-            p(-1.0, 1.0, -1.0),
-            p(1.0, 1.0, -1.0),
-            p(1.0, 1.0, 1.0),
-            p(-1.0, 1.0, 1.0),
-        ];
-        // Outward-wound faces (bottom skipped: buried).
-        self.quad(v[3], v[2], v[6], v[7], color); // +Z
-        self.quad(v[1], v[0], v[4], v[5], color); // -Z
-        self.quad(v[2], v[1], v[5], v[6], color); // +X
-        self.quad(v[0], v[3], v[7], v[4], color); // -X
-        self.quad(v[7], v[6], v[5], v[4], color); // +Y
-    }
-
-    pub(crate) fn into_mesh(self) -> Mesh {
-        Mesh::new(
-            PrimitiveTopology::TriangleList,
-            RenderAssetUsages::default(),
-        )
-        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, self.positions)
-        .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, self.normals)
-        .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, self.colors)
-    }
-}
-
-pub(crate) fn srgb(r: f32, g: f32, b: f32) -> [f32; 4] {
-    Color::srgb(r, g, b).to_linear().to_f32_array()
-}
-
-/// The plants of the current map: one entity per authored plant, or one
-/// merged mesh per terrain chunk on the river map.
+/// The plants of the current map: a root entity per plant, with one child
+/// per mesh part.
 #[derive(Component)]
 struct Plants;
 
@@ -123,11 +56,7 @@ fn respawn_vegetation(
         MapKind::Grassland => {
             let specs: Vec<_> = trees.0.iter().map(|tree| (tree.name, tree.reach)).collect();
             let planting = grassland_planting(&specs, &terrain, crate::regiments::army_gap());
-            for plant in &planting.plants {
-                let (x, z) = (plant.pos.x, plant.pos.y);
-                let placement = (x, z, plant.yaw, plant.scale);
-                spawn_authored_plant(&mut commands, &terrain, &trees.0[plant.asset], plant.asset, placement);
-            }
+            spawn_planting(&mut commands, &terrain, &trees, &planting);
             let groups: Vec<_> = GRASSLAND_STANDS
                 .iter()
                 .map(|stand| (stand.name, Some((stand.trees, stand.shrubs))))
@@ -155,10 +84,7 @@ fn respawn_vegetation(
         MapKind::River => {
             let specs: Vec<_> = trees.0.iter().map(|tree| (tree.name, tree.reach)).collect();
             let planting = river_planting(&specs, &terrain);
-            for plant in &planting.plants {
-                let placement = (plant.pos.x, plant.pos.y, plant.yaw, plant.scale);
-                spawn_authored_plant(&mut commands, &terrain, &trees.0[plant.asset], plant.asset, placement);
-            }
+            spawn_planting(&mut commands, &terrain, &trees, &planting);
             let groups = RIVER_ZONES.map(|zone| (zone, None));
             planting.log(&specs, "river", &groups);
         }
@@ -199,6 +125,13 @@ const SANDBOX_COMPOSITION: &[(&str, f32, f32, f32, f32)] = &[
     ("shrub_b_sandbox", 11.0, 16.0, 3.60, 0.72),
     ("shrub_a", 14.0, 14.0, 0.30, 1.00),
 ];
+
+fn spawn_planting(commands: &mut Commands, terrain: &Terrain, trees: &TreeAssets, planting: &Planting) {
+    for p in &planting.plants {
+        let placement = (p.pos.x, p.pos.y, p.yaw, p.scale);
+        spawn_authored_plant(commands, terrain, &trees.0[p.asset], p.asset, placement);
+    }
+}
 
 fn spawn_authored_plant(
     commands: &mut Commands,
@@ -302,16 +235,16 @@ struct Stand {
     inside: Option<Rect>,
 }
 
+/// The rear corners of the two deployment zones that no rank reaches.
+const PLAYER_REAR_CORNER: Rect = Rect { min: Vec2::new(-482.0, -376.0), max: Vec2::new(-335.0, -327.0) };
+const ENEMY_REAR_CORNER: Rect = Rect { min: Vec2::new(335.0, 327.0), max: Vec2::new(482.0, 376.0) };
+
 // West is -x. The west margin carries the main broken oak edge, the east
 // margin fewer and shorter groups with more leaning oaks, over drier
 // ground. Openings between the stretches keep it from reading as a wall.
 // The dry ground crosses the army gap at x = 310 to 335 in the layout
 // image, so the eastern hedge stands there, just outside the open centre,
 // with an opening at z = -5 to 7.
-/// The rear corners of the two deployment zones that no rank reaches.
-const PLAYER_REAR_CORNER: Rect = Rect { min: Vec2::new(-482.0, -376.0), max: Vec2::new(-335.0, -327.0) };
-const ENEMY_REAR_CORNER: Rect = Rect { min: Vec2::new(335.0, 327.0), max: Vec2::new(482.0, 376.0) };
-
 const GRASSLAND_STANDS: &[Stand] = &[
     Stand { name: "west 1", area: strip(-512.0, -482.0, -372.0, -300.0), trees: 12, shrubs: 10, birch: 0.22, leaning: 0.20, shrub_a: 0.24, inside: None },
     Stand { name: "west 2", area: strip(-512.0, -482.0, -262.0, -205.0), trees: 8, shrubs: 8, birch: 0.25, leaning: 0.20, shrub_a: 0.24, inside: None },
@@ -387,8 +320,8 @@ fn distance_to_rect(p: Vec2, r: Rect) -> f32 {
     (r.min - p).max(p - r.max).max(Vec2::ZERO).length()
 }
 
-/// One grassland plant: an index into the asset list, its root on the
-/// ground plane, yaw, scale, and its crown radius at that scale.
+/// One placed plant: an index into the asset list, its root on the ground
+/// plane, yaw, scale, and its crown radius at that scale.
 struct Placed {
     asset: usize,
     pos: Vec2,
@@ -912,6 +845,8 @@ fn load_trees(
 
 type TreeLevelData = (Vec<(Mesh, usize)>, f32);
 
+type TreeData = ([TreeLevelData; 3], Vec<(Image, Option<Image>, bool)>);
+
 /// `TreeAsset::reach` of a decoded tree.
 fn horizontal_reach(levels: &[TreeLevelData; 3]) -> f32 {
     levels[..2]
@@ -925,7 +860,6 @@ fn horizontal_reach(levels: &[TreeLevelData; 3]) -> f32 {
         .map(|p| Vec2::new(p[0], p[2]).length())
         .fold(0.0, f32::max)
 }
-type TreeData = ([TreeLevelData; 3], Vec<(Image, Option<Image>, bool)>);
 
 /// Decode the whole asset before publishing handles, so a failed import leaves no assets behind.
 fn read_tree(path: &std::path::Path, budgets: [usize; 3]) -> Result<TreeData, String> {

@@ -14,7 +14,6 @@ use crate::terrain::{
     self, BRIDGE_DECK_LIFT, BRIDGE_HALF_SPAN, BRIDGE_Z, bridge_deck_half_len, river_bed_depth,
     river_center_x, river_half_width, river_water_level,
 };
-use crate::vegetation::{Soup, srgb};
 
 pub struct WaterPlugin;
 
@@ -145,6 +144,73 @@ fn place_water(
     if let Some(aabb) = aabb {
         e.insert(aabb);
     }
+}
+
+/// Flat-shaded triangle builder for the bridge.
+struct Soup {
+    positions: Vec<[f32; 3]>,
+    normals: Vec<[f32; 3]>,
+    colors: Vec<[f32; 4]>,
+}
+
+impl Soup {
+    fn new() -> Self {
+        Self {
+            positions: Vec::new(),
+            normals: Vec::new(),
+            colors: Vec::new(),
+        }
+    }
+
+    fn tri(&mut self, a: Vec3, b: Vec3, c: Vec3, color: [f32; 4]) {
+        let n = (b - a).cross(c - a).normalize_or_zero();
+        for v in [a, b, c] {
+            self.positions.push(v.to_array());
+            self.normals.push(n.to_array());
+            self.colors.push(color);
+        }
+    }
+
+    fn quad(&mut self, a: Vec3, b: Vec3, c: Vec3, d: Vec3, color: [f32; 4]) {
+        self.tri(a, b, c, color);
+        self.tri(a, c, d, color);
+    }
+
+    /// Axis-aligned cuboid (pre-rotation); `c` = center, `h` = half extents.
+    fn cuboid(&mut self, c: Vec3, h: Vec3, color: [f32; 4]) {
+        let p = |x: f32, y: f32, z: f32| c + Vec3::new(x * h.x, y * h.y, z * h.z);
+        // 8 corners.
+        let v = [
+            p(-1.0, -1.0, -1.0),
+            p(1.0, -1.0, -1.0),
+            p(1.0, -1.0, 1.0),
+            p(-1.0, -1.0, 1.0),
+            p(-1.0, 1.0, -1.0),
+            p(1.0, 1.0, -1.0),
+            p(1.0, 1.0, 1.0),
+            p(-1.0, 1.0, 1.0),
+        ];
+        // Outward-wound faces (bottom skipped: buried).
+        self.quad(v[3], v[2], v[6], v[7], color); // +Z
+        self.quad(v[1], v[0], v[4], v[5], color); // -Z
+        self.quad(v[2], v[1], v[5], v[6], color); // +X
+        self.quad(v[0], v[3], v[7], v[4], color); // -X
+        self.quad(v[7], v[6], v[5], v[4], color); // +Y
+    }
+
+    fn into_mesh(self) -> Mesh {
+        Mesh::new(
+            PrimitiveTopology::TriangleList,
+            RenderAssetUsages::default(),
+        )
+        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, self.positions)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, self.normals)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, self.colors)
+    }
+}
+
+fn srgb(r: f32, g: f32, b: f32) -> [f32; 4] {
+    Color::srgb(r, g, b).to_linear().to_f32_array()
 }
 
 /// The stone bridge at BRIDGE_Z: flat deck slab + parapets + two piers
