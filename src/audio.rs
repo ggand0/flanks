@@ -1283,7 +1283,8 @@ fn regiment_sounds(
     let listener = ev.listener;
 
     // A string snap per loose, at the archer: the nearest few per frame
-    // (a volley tick looses hundreds; the bow-string cap keeps the nearest).
+    // (a volley tick looses hundreds; the nearest take the free bow-string
+    // voices).
     let mut looses = std::mem::take(&mut ev.looses);
     for &(g, p) in &looses {
         let g = g as usize;

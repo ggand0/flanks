@@ -47,7 +47,8 @@ const METER_GROUPS: usize = 32;
 /// separation (one ear silent) reads as a sound inside one ear on
 /// headphones.
 const PAN_WIDTH: f32 = 0.8;
-/// Fade applied when the allocator takes a voice for a stronger sound.
+/// Fade applied when the allocator, at the voice limit, takes a voice of
+/// another group for a stronger sound.
 const STEAL_FADE_S: f32 = 0.03;
 /// A sound must outrank a live voice by this much to take it, so two
 /// near-equal sounds do not trade a voice back and forth (0.1 is 10 m of
@@ -77,8 +78,9 @@ pub struct Bank {
     pub speed: (f32, f32),
     /// Banks sharing a group share its voice cap and its meter.
     pub group: &'static str,
-    /// Most voices the group may hold at once (0: no limit). The nearest
-    /// sounds keep the voices.
+    /// Most voices the group may hold at once (0: no limit). A full group
+    /// drops new sounds instead of cutting one of its own; the nearest of
+    /// a frame's requests take the voices that free up.
     pub max_live: u16,
     /// Part in the crowd dip under a nearby volley.
     pub duck: Duck,
@@ -604,7 +606,8 @@ impl Mixer {
 
     /// A looped voice that follows a moving source (an arrow in flight).
     /// Submit every frame while the source lives, under a stable key; a
-    /// key missing from a frame fades out.
+    /// key missing from a frame fades out. A loop keeps its voice until
+    /// then; a new key waits for a free one.
     pub fn track(&mut self, key: u64, r: Request) {
         self.tracked.push((key, r));
     }
@@ -721,7 +724,7 @@ impl Mixer {
     }
 
     /// Retire finished voices, re-aim the live ones at the moved listener,
-    /// then give free or weaker voices to the strongest requests.
+    /// then give the free voices to the strongest requests.
     fn flush(&mut self, clips: &Clips, now: f64) {
         {
             let mut sh = self.shared.lock().unwrap();
@@ -734,9 +737,12 @@ impl Mixer {
         }
         self.live.retain(|l| l.ends > now);
 
-        // Tracked loops: move the ones still reported, fade the rest.
+        // Tracked loops: move the ones still reported, fade the rest. The
+        // keys stay sorted for the search; a playing loop's report is only
+        // marked as taken.
         let mut tracked = std::mem::take(&mut self.tracked);
         tracked.sort_unstable_by_key(|t| t.0);
+        let mut taken = vec![false; tracked.len()];
         let fade = (TRACK_FADE_S * OUT_RATE as f32) as u32;
         let cmds = &mut self.cmds;
         self.live.retain_mut(|l| {
@@ -744,7 +750,7 @@ impl Mixer {
             match tracked.binary_search_by_key(&key, |t| t.0) {
                 Ok(i) => {
                     l.pos = tracked[i].1.pos;
-                    tracked[i].0 = u64::MAX;
+                    taken[i] = true;
                     true
                 }
                 Err(_) => {
@@ -780,7 +786,11 @@ impl Mixer {
             }
         }
 
-        let new_tracked = tracked.into_iter().filter(|t| t.0 != u64::MAX).map(|(k, r)| (Some(k), r));
+        let new_tracked = tracked
+            .into_iter()
+            .zip(taken)
+            .filter(|(_, taken)| !taken)
+            .map(|((k, r), _)| (Some(k), r));
         let mut ranked: Vec<(f32, [f32; 2], Option<u64>, Request)> = std::mem::take(&mut self.requests)
             .into_iter()
             .map(|r| (None, r))
@@ -791,9 +801,10 @@ impl Mixer {
             })
             .collect();
         ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
-        // Once a request fails to take a voice from a full pool, every
-        // lower-ranked one would fail against the same weakest voice.
-        let mut pool_closed = false;
+        // Groups that can no longer take a voice this frame at the voice
+        // limit: a later request of the group ranks no higher, and the
+        // voices it could take only get stronger.
+        let mut closed: Vec<&'static str> = Vec::new();
         // Live voices per cap group.
         let mut groups: Vec<(&'static str, u16)> = Vec::new();
         for l in &self.live {
@@ -802,39 +813,37 @@ impl Mixer {
         for (rank, gain, key, r) in ranked {
             let Some((pcm, clip_gain)) = clips.pcm(r.clip) else { continue };
             let gain = [gain[0] * clip_gain, gain[1] * clip_gain];
-            // A capped group competes only with itself once full;
-            // otherwise every voice is fair game.
-            let capped = r.bank.max_live > 0 && group_count(&groups, r.bank.group) >= r.bank.max_live;
-            if !capped && pool_closed {
+            // A full group drops the sound: a playing voice is never cut for
+            // another of its own group, so a yell plays to its end and an
+            // arrow's air loop lasts until the arrow lands. A tracked loop
+            // asks again next frame; only one-shots are lost.
+            let full = r.bank.max_live > 0 && group_count(&groups, r.bank.group) >= r.bank.max_live;
+            if full || closed.contains(&r.bank.group) {
                 if key.is_none() {
                     self.dropped += 1;
                 }
                 continue;
             }
-            if capped || self.live.len() >= MAX_VOICES {
-                // Take the weakest voice if this sound outranks it.
+            if self.live.len() >= MAX_VOICES {
+                // At the voice limit, take the weakest voice of another
+                // group if this sound outranks it.
                 let weakest = self
                     .live
                     .iter()
                     .enumerate()
-                    .filter(|(_, l)| !capped || l.bank.group == r.bank.group)
+                    .filter(|(_, l)| l.bank.group != r.bank.group)
                     .map(|(i, l)| (i, Self::rank(&l.bank, listener.dist(l.pos))))
                     .min_by(|a, b| a.1.total_cmp(&b.1));
-                let Some((wi, weakest)) = weakest else {
-                    if key.is_none() {
-                        self.dropped += 1;
+                let wi = match weakest {
+                    Some((wi, weakest)) if rank > weakest + STEAL_MARGIN => wi,
+                    _ => {
+                        if key.is_none() {
+                            self.dropped += 1;
+                        }
+                        closed.push(r.bank.group);
+                        continue;
                     }
-                    continue;
                 };
-                if rank <= weakest + STEAL_MARGIN {
-                    // A tracked loop asks again next frame; only one-shots
-                    // are lost.
-                    if key.is_none() {
-                        self.dropped += 1;
-                    }
-                    pool_closed |= !capped;
-                    continue;
-                }
                 let victim = self.live.swap_remove(wi);
                 group_add(&mut groups, victim.bank.group, -1);
                 if log_enabled() && victim.key.is_none() {
