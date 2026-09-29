@@ -540,8 +540,8 @@ struct BedTake {
     current: bool,
 }
 
-/// FL_BED_MUTE=mid,close: silence the named layers (mid, march, and
-/// close for the fight loops), to hear the others alone.
+/// FL_BED_MUTE=march,close: silence the named layers (march, and close
+/// for the fight loops), to hear the others alone.
 fn layer_muted(layer: &str) -> bool {
     static MUTED: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     MUTED
@@ -855,8 +855,8 @@ fn silence_beds(mut sinks: Query<&mut AudioSink, With<BedTake>>) {
     }
 }
 
-/// Crossfade the beds from battle state around the camera focus, and
-/// rotate each layer's takes.
+/// Fade the march bed in while an own regiment marches, and rotate each
+/// layer's takes.
 #[allow(clippy::too_many_arguments)] // bevy system params
 fn update_beds(
     mut commands: Commands,
