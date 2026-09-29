@@ -259,28 +259,27 @@ fn clear_sound_events(mut ev: ResMut<SoundEvents>) {
 
 /// The mix table. Each layer's level in dB relative to a death scream, at
 /// full level (inside the bank's mindist of the look point, close zoom).
-/// Starting values: the balance of the mix approved by ear before
-/// positional audio, measured as each pool's median loudness plus its old
-/// gain; the blows keep the material balance of the first positional mix
+/// Starting values: the balance of the mix before positional audio,
+/// measured as each pool's median loudness plus its old gain; the blows keep the material balance of the first positional mix
 /// (the metal ring 19 dB under the shield). Priorities and distance
-/// priorities are M2TW's. Group caps are the voices the approved mix held
+/// priorities are M2TW's. Group caps are the voices the old mix held
 /// (about 31 for the steel, 18 for the grunts and screams together, 1-2
 /// death screams, 14 bow strings), nearest first. The charge sheets, the
 /// volley, the arrow air and the rout cry sit 7 dB over that balance,
-/// which cancels MIX_GAIN_DB for them: they play at the approved mix's
+/// which cancels MIX_GAIN_DB for them: they play at the old mix's
 /// absolute level while the melee plays 7 dB under it. The charge yells
 /// sit 5 dB over it with a larger cap (more yells, each a little
 /// quieter), and the bow strings 10 dB over it so the volley does not
 /// cover them.
 mod mix {
-    /// A death scream's output level in the approved mix: pool median
+    /// A death scream's output level in the old mix: pool median
     /// -7.7 LUFS at gain 0.24 (-12.4 dB).
     pub const DEATH_SCREAM_OUT: f32 = -20.1;
     /// Normalized clip loudness (tools/audio_loudness.py targets).
     pub const ONE_SHOT: f32 = -20.0;
     pub const SUSTAINED: f32 = -23.0;
     /// An equal-power pan puts a centred mono voice 3 dB down per channel;
-    /// the approved mix played it at full level in both.
+    /// the old mix played it at full level in both.
     pub const PAN_CENTRE: f32 = 3.0;
     /// Full level within this distance of the look point: one man, and a
     /// whole regiment's sheet.
@@ -288,9 +287,9 @@ mod mix {
     pub const SHEET_M: f32 = 30.0;
 }
 
-/// Every positional level shifts by this (dB): the one by-ear knob over the
-/// table. -7 puts a dense melee at the look point near -16 dBFS, where the
-/// approved mix sat, instead of -9 dBFS on the limiter.
+/// Every positional level shifts by this (dB): the one setting over the
+/// table tuned by ear. -7 puts a dense melee at the look point near -16
+/// dBFS, where the old mix sat, instead of -9 dBFS on the limiter.
 const MIX_GAIN_DB: f32 = -7.0;
 
 #[allow(clippy::too_many_arguments)]
@@ -332,7 +331,7 @@ const fn flat_bank(name: &'static str, rel_db: f32, sustained: bool) -> Bank {
     }
 }
 
-// Horns, UI clicks and stings at their approved level relative to the
+// Horns, UI clicks and stings at their old level relative to the
 // soldiers (old gain on the pool's loudness, relative to the death
 // scream).
 /// M2TW `war_horn`: placed, full level within 40 m, priority 240, fixed
@@ -455,7 +454,7 @@ const ROUT_SHOUT: Bank = bank("rout shout", "rout shout", 3, 120.0, 0.0, 3.9, fa
 const ROUT_PANIC: Bank = bank("rout panic", "rout panic", 4, 110.0, 0.0, -6.4, true, (0.92, 1.08));
 const FEET: Bank = bank("feet", "feet", 6, 70.0, 0.0, -11.3, true, (0.94, 1.06));
 /// A crowd cry from a regiment the moment it breaks, one at a time, 2 dB
-/// over the approved break cue's absolute level (0.55 on clips of -12.5
+/// over the old break cue's absolute level (0.55 on clips of -12.5
 /// LUFS), so it clears the melee around the breaking regiment.
 const ROUT_CROWD: Bank = bank("rout crowd", "rout crowd", 1, 150.0, -1.0, 11.4, true, (1.0, 1.0));
 
@@ -829,9 +828,7 @@ fn setup_audio(mut commands: Commands, assets: Res<AssetServer>, mut clips: ResM
                 "sfx_rout/vox_rout_05",
             ],
         ),
-        // Massed washes layered from single-man source loops by
-        // work/scripts/build-feet-wash.sh (ElevenLabs would only produce
-        // one or two runners per take).
+        // Massed running feet, layered from single-man loops.
         feet: pool(
             clips,
             &assets,
@@ -968,12 +965,12 @@ pub(crate) fn zoom_attenuation(cam_distance: f32) -> f32 {
 /// Ask the mixer for a clip from `pool` at `pos`, a sound of regiment
 /// `unit` (NO_UNIT for none).
 fn play(mixer: &mut Mixer, pool: &[ClipId], bank: Bank, pos: Vec3, seed: u32, delay: f32, unit: u32) {
-    play_owned(mixer, pool, bank, pos, seed, delay, unit, 0);
+    play_tagged(mixer, pool, bank, pos, seed, delay, unit, 0);
 }
 
-/// `play`, tagging the voice with `owner` so it can be faded out later.
+/// `play`, tagging the voice with `tag` so it can be faded out later.
 #[allow(clippy::too_many_arguments)]
-fn play_owned(
+fn play_tagged(
     mixer: &mut Mixer,
     pool: &[ClipId],
     bank: Bank,
@@ -981,7 +978,7 @@ fn play_owned(
     seed: u32,
     delay: f32,
     unit: u32,
-    owner: u64,
+    tag: u64,
 ) {
     if pool.is_empty() {
         return;
@@ -993,7 +990,7 @@ fn play_owned(
         pos,
         speed_roll: hash01(seed ^ 0x5BD1_E995),
         delay,
-        owner,
+        tag,
         unit,
     });
 }
@@ -1124,7 +1121,7 @@ fn arrow_sounds(
                     pos: p,
                     speed_roll: hash01(id.wrapping_mul(0x85EB)),
                     delay: 0.0,
-                    owner: 0,
+                    tag: 0,
                     unit: arrows.group[i],
                 },
             );
@@ -1179,7 +1176,7 @@ fn fight_loops(
                 pos: at,
                 speed_roll: hash01((g as u32).wrapping_mul(0x9E37_79B1) ^ 0x2F1),
                 delay: 0.0,
-                owner: 0,
+                tag: 0,
                 unit: g as u32,
             },
         );
@@ -1295,9 +1292,9 @@ const YELLS_PER_FRAME: u32 = 12;
 /// The charge group sound's fade when the charge ends (M2TW
 /// `unit_charge fadeout 1`).
 const CHARGE_FADE_OUT_S: f32 = 1.0;
-/// Owner tag of a regiment's charge group sounds (the regiment index in
+/// Tag of a regiment's charge group sounds (the regiment index in
 /// the low bits).
-const CHARGE_OWNER: u64 = 1 << 40;
+const CHARGE_TAG: u64 = 1 << 40;
 /// The celebrate window is 150 ticks (frontline.rs).
 const CELEBRATE_S: f32 = 5.0;
 /// A new volley sound when this share of the regiment's living men has
@@ -1404,9 +1401,9 @@ fn regiment_sounds(
         // M2TW's 1 s (`unit_charge fadeout 1`) instead of playing its
         // clip out; yells already started play to their end.
         let charging = gd.charging && alive;
-        let charge_owner = CHARGE_OWNER | g as u64;
+        let charge_tag = CHARGE_TAG | g as u64;
         if st.prev_charging[g] && !charging {
-            mixer.fade_owner(charge_owner, CHARGE_FADE_OUT_S);
+            mixer.fade_tag(charge_tag, CHARGE_FADE_OUT_S);
         }
         st.prev_charging[g] = charging;
         if charging {
@@ -1414,7 +1411,7 @@ fn regiment_sounds(
             if st.charge_sheet_t[g] <= 0.0 {
                 if !far {
                     let set = if gd.count >= 300 { &pools.charge_large } else { &pools.charge_medium };
-                    play_owned(&mut mixer, set, CHARGE_SHEET, centre, seed ^ 0x13, 0.0, g as u32, charge_owner);
+                    play_tagged(&mut mixer, set, CHARGE_SHEET, centre, seed ^ 0x13, 0.0, g as u32, charge_tag);
                 }
                 st.charge_sheet_t[g] = 2.0 + 0.5 * r(0x23);
             }

@@ -127,8 +127,8 @@ pub struct Request {
     /// one frame.
     pub delay: f32,
     /// The caller's tag for voices it may fade out together later
-    /// (`Mixer::fade_owner`); 0 for none.
-    pub owner: u64,
+    /// (`Mixer::fade_tag`); 0 for none.
+    pub tag: u64,
     /// The regiment the sound comes from (`NO_UNIT` for none), for the
     /// FL_LOG_AUDIO clip log.
     pub unit: u32,
@@ -558,7 +558,7 @@ struct Live {
     key: Option<u64>,
     /// The clip's normalization gain (linear).
     clip_gain: f32,
-    owner: u64,
+    tag: u64,
 }
 
 /// Fade of a tracked loop whose source is gone (M2TW ARROW_FLY
@@ -662,12 +662,12 @@ impl Mixer {
     }
 
     /// Fade out, over `secs`, every playing voice the caller tagged with
-    /// `owner`.
-    pub fn fade_owner(&mut self, owner: u64, secs: f32) {
+    /// `tag`.
+    pub fn fade_tag(&mut self, tag: u64, secs: f32) {
         let fade = (secs * OUT_RATE as f32) as u32;
         let cmds = &mut self.cmds;
         self.live.retain(|l| {
-            if l.owner == owner {
+            if l.tag == tag {
                 cmds.push(Cmd::Stop { id: l.id, fade });
                 false
             } else {
@@ -791,7 +791,7 @@ impl Mixer {
             })
             .collect();
         ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
-        // Groups that can no longer take a voice this frame at the voice
+        // Groups that cannot take another voice this frame at the voice
         // limit: a later request of the group ranks no higher, and the
         // voices it could take only get stronger.
         let mut closed: Vec<&'static str> = Vec::new();
@@ -884,7 +884,7 @@ impl Mixer {
                 ends: now + secs,
                 key,
                 clip_gain,
-                owner: r.owner,
+                tag: r.tag,
             });
             self.started += 1;
         }
