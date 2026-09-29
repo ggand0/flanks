@@ -4,10 +4,9 @@ Build a 1.7 m tall, 2.2 m wide, 1.85 m deep multi-stem shrub. Seven stems and fo
 
 The build extracts the project's original foliage and bark textures from `assets/vegetation/shrub_b_sandbox.glb`. Fetch that file through Git LFS first. Blender 5.2 and NumPy are required; raw verification also uses Pillow. No private authoring scene or external texture is needed.
 
-From the repository root, with no game running:
+From the repository root:
 
 ```sh
-work/scripts/flanks-run.sh
 blender --background --factory-startup --python-exit-code 1 \
   --python tools/blender/shrub_a/build_shrub.py
 python3 tools/blender/glb_inspect.py assets_dev/vegetation/shrub_a_rebuild/shrub_a/tree.glb

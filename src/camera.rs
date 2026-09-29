@@ -173,7 +173,7 @@ pub fn apply_camera_transform(
         // material transitions in motion, without injecting desktop input.
         if sweep < 0.0 {
             let phase = time.elapsed_secs() / -sweep * std::f32::consts::TAU;
-            // Small vegetation needs the configured close distance during review sweeps.
+            // The sweep starts at FL_CAM_DIST, so small plants can be seen up close.
             let close_distance = crate::util::env_or("FL_CAM_DIST", 40.0_f32).clamp(1.0, 900.0);
             cam.distance = close_distance + (900.0 - close_distance) * (0.5 - 0.5 * phase.cos());
             cam.yaw += phase.sin() * 0.35;
