@@ -1,0 +1,1526 @@
+{
+ "about": "BS.1770 loudness of the mono downmix per clip; written by tools/audio_loudness.py",
+ "target_one_shot_lufs": -20.0,
+ "target_sustained_lufs": -23.0,
+ "clips": {
+  "bed_battle_far.mp3": {
+   "measure": "integrated",
+   "lufs": -18.8,
+   "true_peak_db": -3.2,
+   "seconds": 18.02,
+   "gain_db": -4.2
+  },
+  "bed_battle_mid0.mp3": {
+   "measure": "integrated",
+   "lufs": -18.8,
+   "true_peak_db": -4.0,
+   "seconds": 17.04,
+   "gain_db": -4.2
+  },
+  "bed_battle_mid1.mp3": {
+   "measure": "integrated",
+   "lufs": -18.3,
+   "true_peak_db": -4.9,
+   "seconds": 17.04,
+   "gain_db": -4.7
+  },
+  "bed_melee_close0.mp3": {
+   "measure": "integrated",
+   "lufs": -18.3,
+   "true_peak_db": -2.2,
+   "seconds": 13.92,
+   "gain_db": -4.7
+  },
+  "bed_melee_close1.mp3": {
+   "measure": "integrated",
+   "lufs": -18.0,
+   "true_peak_db": -1.7,
+   "seconds": 13.92,
+   "gain_db": -5.0
+  },
+  "bed_melee_close2.mp3": {
+   "measure": "integrated",
+   "lufs": -18.0,
+   "true_peak_db": -1.6,
+   "seconds": 13.92,
+   "gain_db": -5.0
+  },
+  "bed_melee_close3.mp3": {
+   "measure": "integrated",
+   "lufs": -18.0,
+   "true_peak_db": -1.4,
+   "seconds": 13.92,
+   "gain_db": -5.0
+  },
+  "bed_melee_close4.mp3": {
+   "measure": "integrated",
+   "lufs": -17.7,
+   "true_peak_db": -2.0,
+   "seconds": 13.92,
+   "gain_db": -5.3
+  },
+  "bed_melee_close5.mp3": {
+   "measure": "integrated",
+   "lufs": -17.8,
+   "true_peak_db": -1.4,
+   "seconds": 13.92,
+   "gain_db": -5.2
+  },
+  "bed_melee_midclose0.mp3": {
+   "measure": "integrated",
+   "lufs": -22.1,
+   "true_peak_db": -6.3,
+   "seconds": 17.04,
+   "gain_db": -0.9
+  },
+  "bed_melee_midclose1.mp3": {
+   "measure": "integrated",
+   "lufs": -22.3,
+   "true_peak_db": -6.6,
+   "seconds": 17.04,
+   "gain_db": -0.7
+  },
+  "bed_melee_midclose2.mp3": {
+   "measure": "integrated",
+   "lufs": -21.7,
+   "true_peak_db": -4.6,
+   "seconds": 17.04,
+   "gain_db": -1.3
+  },
+  "bed_melee_midclose3.mp3": {
+   "measure": "integrated",
+   "lufs": -21.9,
+   "true_peak_db": -6.8,
+   "seconds": 17.04,
+   "gain_db": -1.1
+  },
+  "sfx_bow/arrow_incoming_02_several.mp3": {
+   "measure": "momentary_max",
+   "lufs": -23.1,
+   "true_peak_db": -10.1,
+   "seconds": 1.03,
+   "gain_db": 3.1
+  },
+  "sfx_bow/arrow_incoming_03.mp3": {
+   "measure": "momentary_max",
+   "lufs": -31.5,
+   "true_peak_db": -20.2,
+   "seconds": 2.64,
+   "gain_db": 11.5
+  },
+  "sfx_bow/sfx_arrow_flesh_01.mp3": {
+   "measure": "momentary_max",
+   "lufs": -19.9,
+   "true_peak_db": -0.0,
+   "seconds": 0.72,
+   "gain_db": -0.1
+  },
+  "sfx_bow/sfx_arrow_flesh_02.mp3": {
+   "measure": "momentary_max",
+   "lufs": -21.3,
+   "true_peak_db": -1.2,
+   "seconds": 0.29,
+   "gain_db": 1.3
+  },
+  "sfx_bow/sfx_arrow_flesh_03.mp3": {
+   "measure": "momentary_max",
+   "lufs": -13.6,
+   "true_peak_db": 1.0,
+   "seconds": 0.65,
+   "gain_db": -6.4
+  },
+  "sfx_bow/sfx_arrow_fly_loop_01.mp3": {
+   "measure": "integrated",
+   "lufs": -35.2,
+   "true_peak_db": -24.4,
+   "seconds": 1.9,
+   "gain_db": 12.2
+  },
+  "sfx_bow/sfx_arrow_fly_loop_02.mp3": {
+   "measure": "integrated",
+   "lufs": -26.6,
+   "true_peak_db": -16.0,
+   "seconds": 1.9,
+   "gain_db": 3.6
+  },
+  "sfx_bow/sfx_arrow_flyby_01.mp3": {
+   "measure": "momentary_max",
+   "lufs": -24.4,
+   "true_peak_db": -8.6,
+   "seconds": 0.36,
+   "gain_db": 4.4
+  },
+  "sfx_bow/sfx_arrow_flyby_02.mp3": {
+   "measure": "momentary_max",
+   "lufs": -15.3,
+   "true_peak_db": 0.7,
+   "seconds": 0.67,
+   "gain_db": -4.7
+  },
+  "sfx_bow/sfx_arrow_ground_01.mp3": {
+   "measure": "momentary_max",
+   "lufs": -29.3,
+   "true_peak_db": -9.7,
+   "seconds": 0.74,
+   "gain_db": 9.3
+  },
+  "sfx_bow/sfx_arrow_ground_02.mp3": {
+   "measure": "momentary_max",
+   "lufs": -35.8,
+   "true_peak_db": -13.1,
+   "seconds": 0.62,
+   "gain_db": 15.8
+  },
+  "sfx_bow/sfx_arrow_ground_03.mp3": {
+   "measure": "momentary_max",
+   "lufs": -30.4,
+   "true_peak_db": -9.8,
+   "seconds": 0.7,
+   "gain_db": 10.4
+  },
+  "sfx_bow/sfx_arrow_wood_01.mp3": {
+   "measure": "momentary_max",
+   "lufs": -15.8,
+   "true_peak_db": 0.5,
+   "seconds": 0.79,
+   "gain_db": -4.2
+  },
+  "sfx_bow/sfx_arrow_wood_02.mp3": {
+   "measure": "momentary_max",
+   "lufs": -20.4,
+   "true_peak_db": -0.6,
+   "seconds": 0.77,
+   "gain_db": 0.4
+  },
+  "sfx_bow/sfx_bow_loose_01.mp3": {
+   "measure": "momentary_max",
+   "lufs": -21.2,
+   "true_peak_db": -1.9,
+   "seconds": 0.79,
+   "gain_db": 1.2
+  },
+  "sfx_bow/sfx_bow_loose_02.mp3": {
+   "measure": "momentary_max",
+   "lufs": -18.6,
+   "true_peak_db": 0.1,
+   "seconds": 1.08,
+   "gain_db": -1.4
+  },
+  "sfx_bow/sfx_bow_loose_03.mp3": {
+   "measure": "momentary_max",
+   "lufs": -21.1,
+   "true_peak_db": -0.0,
+   "seconds": 0.74,
+   "gain_db": 1.1
+  },
+  "sfx_bow/sfx_bow_loose_04.mp3": {
+   "measure": "momentary_max",
+   "lufs": -28.2,
+   "true_peak_db": -6.9,
+   "seconds": 0.91,
+   "gain_db": 8.2
+  },
+  "sfx_bow/sfx_volley_away_01.wav": {
+   "measure": "integrated",
+   "lufs": -15.7,
+   "true_peak_db": -2.0,
+   "seconds": 4.0,
+   "gain_db": -7.3
+  },
+  "sfx_bow/sfx_volley_away_02.mp3": {
+   "measure": "momentary_max",
+   "lufs": -17.5,
+   "true_peak_db": -5.3,
+   "seconds": 1.08,
+   "gain_db": -2.5
+  },
+  "sfx_bow/sfx_volley_away_03.mp3": {
+   "measure": "momentary_max",
+   "lufs": -18.8,
+   "true_peak_db": -7.1,
+   "seconds": 0.96,
+   "gain_db": -1.2
+  },
+  "sfx_bow/volley_02_flight_incoming.wav": {
+   "measure": "integrated",
+   "lufs": -13.7,
+   "true_peak_db": -1.7,
+   "seconds": 4.0,
+   "gain_db": -9.3
+  },
+  "sfx_celebrate/group_cheer_large_01.mp3": {
+   "measure": "integrated",
+   "lufs": -13.5,
+   "true_peak_db": 0.1,
+   "seconds": 6.12,
+   "gain_db": -9.5
+  },
+  "sfx_celebrate/group_cheer_large_02_short.mp3": {
+   "measure": "integrated",
+   "lufs": -13.7,
+   "true_peak_db": 0.0,
+   "seconds": 4.1,
+   "gain_db": -9.3
+  },
+  "sfx_celebrate/group_cheer_large_03_ok.mp3": {
+   "measure": "integrated",
+   "lufs": -18.1,
+   "true_peak_db": -3.5,
+   "seconds": 6.07,
+   "gain_db": -4.9
+  },
+  "sfx_celebrate/group_cheer_large_04.mp3": {
+   "measure": "integrated",
+   "lufs": -16.3,
+   "true_peak_db": -1.3,
+   "seconds": 6.07,
+   "gain_db": -6.7
+  },
+  "sfx_celebrate/group_cheer_large_05_ok.mp3": {
+   "measure": "integrated",
+   "lufs": -14.5,
+   "true_peak_db": -1.4,
+   "seconds": 5.9,
+   "gain_db": -8.5
+  },
+  "sfx_celebrate/group_cheer_small_01_mocking.mp3": {
+   "measure": "integrated",
+   "lufs": -15.5,
+   "true_peak_db": -1.8,
+   "seconds": 4.1,
+   "gain_db": -7.5
+  },
+  "sfx_celebrate/group_cheer_small_02_mocking.mp3": {
+   "measure": "integrated",
+   "lufs": -20.8,
+   "true_peak_db": -6.2,
+   "seconds": 4.1,
+   "gain_db": -2.2
+  },
+  "sfx_celebrate/group_cheer_small_04_laughing.mp3": {
+   "measure": "integrated",
+   "lufs": -14.4,
+   "true_peak_db": -0.1,
+   "seconds": 4.2,
+   "gain_db": -8.6
+  },
+  "sfx_celebrate/group_cheer_small_05_laughing.mp3": {
+   "measure": "integrated",
+   "lufs": -13.8,
+   "true_peak_db": -0.5,
+   "seconds": 4.2,
+   "gain_db": -9.2
+  },
+  "sfx_celebrate/group_cheer_small_06_laughing.mp3": {
+   "measure": "integrated",
+   "lufs": -12.9,
+   "true_peak_db": 0.0,
+   "seconds": 4.2,
+   "gain_db": -10.1
+  },
+  "sfx_celebrate/group_cheer_small_07_joyous_shouts.mp3": {
+   "measure": "integrated",
+   "lufs": -10.4,
+   "true_peak_db": 0.2,
+   "seconds": 4.2,
+   "gain_db": -12.6
+  },
+  "sfx_celebrate/group_cheer_small_08_joyous_shouts.mp3": {
+   "measure": "integrated",
+   "lufs": -11.3,
+   "true_peak_db": 0.3,
+   "seconds": 4.2,
+   "gain_db": -11.7
+  },
+  "sfx_celebrate/vox_whoop_01.mp3": {
+   "measure": "momentary_max",
+   "lufs": -6.1,
+   "true_peak_db": -0.0,
+   "seconds": 2.04,
+   "gain_db": -13.9
+  },
+  "sfx_celebrate/vox_whoop_02_joyous_shout.mp3": {
+   "measure": "momentary_max",
+   "lufs": -7.4,
+   "true_peak_db": -0.1,
+   "seconds": 2.04,
+   "gain_db": -12.6
+  },
+  "sfx_celebrate/vox_whoop_03_laugh.mp3": {
+   "measure": "integrated",
+   "lufs": -18.8,
+   "true_peak_db": -1.4,
+   "seconds": 3.02,
+   "gain_db": -4.2
+  },
+  "sfx_celebrate/vox_whoop_04_whoops_4s(skipfornow).mp3": {
+   "measure": "integrated",
+   "lufs": -8.5,
+   "true_peak_db": -0.0,
+   "seconds": 4.15,
+   "gain_db": -14.5
+  },
+  "sfx_celebrate/vox_whoop_05_knight_laugh.mp3": {
+   "measure": "integrated",
+   "lufs": -17.4,
+   "true_peak_db": -0.3,
+   "seconds": 4.15,
+   "gain_db": -5.6
+  },
+  "sfx_celebrate/vox_whoop_06_cheer_yeah.mp3": {
+   "measure": "momentary_max",
+   "lufs": -10.2,
+   "true_peak_db": -0.7,
+   "seconds": 2.3,
+   "gain_db": -9.8
+  },
+  "sfx_celebrate/vox_whoop_07_roar_yeah.mp3": {
+   "measure": "momentary_max",
+   "lufs": -7.2,
+   "true_peak_db": 0.4,
+   "seconds": 2.3,
+   "gain_db": -12.8
+  },
+  "sfx_celebrate/vox_whoop_08_knight_shout_yes.mp3": {
+   "measure": "momentary_max",
+   "lufs": -5.6,
+   "true_peak_db": 0.2,
+   "seconds": 2.3,
+   "gain_db": -14.4
+  },
+  "sfx_celebrate/vox_whoop_09_knight_shout_yeaa.mp3": {
+   "measure": "momentary_max",
+   "lufs": -5.7,
+   "true_peak_db": 0.2,
+   "seconds": 2.3,
+   "gain_db": -14.3
+  },
+  "sfx_charge/group_charge_large_01.mp3": {
+   "measure": "integrated",
+   "lufs": -10.3,
+   "true_peak_db": 0.4,
+   "seconds": 3.91,
+   "gain_db": -12.7
+  },
+  "sfx_charge/group_charge_large_02.mp3": {
+   "measure": "integrated",
+   "lufs": -10.8,
+   "true_peak_db": 0.3,
+   "seconds": 3.91,
+   "gain_db": -12.2
+  },
+  "sfx_charge/group_charge_medium.mp3": {
+   "measure": "integrated",
+   "lufs": -10.3,
+   "true_peak_db": 0.4,
+   "seconds": 3.91,
+   "gain_db": -12.7
+  },
+  "sfx_charge/vox_yell_01.mp3": {
+   "measure": "momentary_max",
+   "lufs": -8.4,
+   "true_peak_db": -0.0,
+   "seconds": 1.51,
+   "gain_db": -11.6
+  },
+  "sfx_charge/vox_yell_01b.mp3": {
+   "measure": "momentary_max",
+   "lufs": -7.3,
+   "true_peak_db": 0.2,
+   "seconds": 1.51,
+   "gain_db": -12.7
+  },
+  "sfx_charge/vox_yell_02.mp3": {
+   "measure": "momentary_max",
+   "lufs": -11.7,
+   "true_peak_db": -2.0,
+   "seconds": 1.51,
+   "gain_db": -8.3
+  },
+  "sfx_charge/vox_yell_02b.mp3": {
+   "measure": "momentary_max",
+   "lufs": -9.6,
+   "true_peak_db": -1.2,
+   "seconds": 2.04,
+   "gain_db": -10.4
+  },
+  "sfx_charge/vox_yell_03a.mp3": {
+   "measure": "momentary_max",
+   "lufs": -10.4,
+   "true_peak_db": -0.1,
+   "seconds": 1.51,
+   "gain_db": -9.6
+  },
+  "sfx_charge/vox_yell_03b.mp3": {
+   "measure": "momentary_max",
+   "lufs": -7.9,
+   "true_peak_db": 0.4,
+   "seconds": 1.51,
+   "gain_db": -12.1
+  },
+  "sfx_charge/vox_yell_03c.mp3": {
+   "measure": "momentary_max",
+   "lufs": -6.8,
+   "true_peak_db": 0.4,
+   "seconds": 1.51,
+   "gain_db": -13.2
+  },
+  "sfx_charge/vox_yell_03d.mp3": {
+   "measure": "momentary_max",
+   "lufs": -8.2,
+   "true_peak_db": 0.4,
+   "seconds": 1.51,
+   "gain_db": -11.8
+  },
+  "sfx_charge/vox_yell_04.mp3": {
+   "measure": "momentary_max",
+   "lufs": -14.4,
+   "true_peak_db": -4.7,
+   "seconds": 1.22,
+   "gain_db": -5.6
+  },
+  "sfx_charge/vox_yell_04b.mp3": {
+   "measure": "momentary_max",
+   "lufs": -12.3,
+   "true_peak_db": -2.3,
+   "seconds": 1.22,
+   "gain_db": -7.7
+  },
+  "sfx_charge/vox_yell_05a.mp3": {
+   "measure": "momentary_max",
+   "lufs": -8.8,
+   "true_peak_db": 0.1,
+   "seconds": 2.04,
+   "gain_db": -11.2
+  },
+  "sfx_charge/vox_yell_05b.mp3": {
+   "measure": "momentary_max",
+   "lufs": -10.7,
+   "true_peak_db": -0.7,
+   "seconds": 2.04,
+   "gain_db": -9.3
+  },
+  "sfx_charge/vox_yell_06a.mp3": {
+   "measure": "momentary_max",
+   "lufs": -8.1,
+   "true_peak_db": 0.2,
+   "seconds": 1.39,
+   "gain_db": -11.9
+  },
+  "sfx_charge/vox_yell_06b.mp3": {
+   "measure": "momentary_max",
+   "lufs": -8.1,
+   "true_peak_db": 0.2,
+   "seconds": 1.39,
+   "gain_db": -11.9
+  },
+  "sfx_charge/vox_yell_07.mp3": {
+   "measure": "momentary_max",
+   "lufs": -6.0,
+   "true_peak_db": 0.9,
+   "seconds": 1.51,
+   "gain_db": -14.0
+  },
+  "sfx_charge/vox_yell_08.mp3": {
+   "measure": "momentary_max",
+   "lufs": -8.5,
+   "true_peak_db": 0.0,
+   "seconds": 1.03,
+   "gain_db": -11.5
+  },
+  "sfx_charge/vox_yell_09_young_a.mp3": {
+   "measure": "momentary_max",
+   "lufs": -7.6,
+   "true_peak_db": 0.3,
+   "seconds": 2.04,
+   "gain_db": -12.4
+  },
+  "sfx_charge/vox_yell_09_young_b.mp3": {
+   "measure": "momentary_max",
+   "lufs": -12.8,
+   "true_peak_db": -0.9,
+   "seconds": 2.04,
+   "gain_db": -7.2
+  },
+  "sfx_charge/vox_yell_09_young_c.mp3": {
+   "measure": "momentary_max",
+   "lufs": -5.9,
+   "true_peak_db": 0.5,
+   "seconds": 2.04,
+   "gain_db": -14.1
+  },
+  "sfx_charge/vox_yell_09_young_d.mp3": {
+   "measure": "momentary_max",
+   "lufs": -6.7,
+   "true_peak_db": 0.2,
+   "seconds": 2.04,
+   "gain_db": -13.3
+  },
+  "sfx_charge/vox_yell_09a.mp3": {
+   "measure": "momentary_max",
+   "lufs": -10.0,
+   "true_peak_db": -0.3,
+   "seconds": 2.04,
+   "gain_db": -10.0
+  },
+  "sfx_charge/vox_yell_09b.mp3": {
+   "measure": "momentary_max",
+   "lufs": -10.6,
+   "true_peak_db": -0.6,
+   "seconds": 2.04,
+   "gain_db": -9.4
+  },
+  "sfx_charge/vox_yell_09c.mp3": {
+   "measure": "momentary_max",
+   "lufs": -11.8,
+   "true_peak_db": -2.3,
+   "seconds": 2.04,
+   "gain_db": -8.2
+  },
+  "sfx_charge/vox_yell_09d.mp3": {
+   "measure": "momentary_max",
+   "lufs": -8.6,
+   "true_peak_db": -0.4,
+   "seconds": 2.04,
+   "gain_db": -11.4
+  },
+  "sfx_charge/vox_yell_10_young_a.mp3": {
+   "measure": "momentary_max",
+   "lufs": -7.3,
+   "true_peak_db": 0.2,
+   "seconds": 2.04,
+   "gain_db": -12.7
+  },
+  "sfx_charge/vox_yell_10_young_b.mp3": {
+   "measure": "momentary_max",
+   "lufs": -7.8,
+   "true_peak_db": -0.2,
+   "seconds": 2.04,
+   "gain_db": -12.2
+  },
+  "sfx_charge/vox_yell_10a.mp3": {
+   "measure": "momentary_max",
+   "lufs": -8.6,
+   "true_peak_db": 0.1,
+   "seconds": 2.04,
+   "gain_db": -11.4
+  },
+  "sfx_charge/vox_yell_10b.mp3": {
+   "measure": "momentary_max",
+   "lufs": -9.1,
+   "true_peak_db": -2.3,
+   "seconds": 2.04,
+   "gain_db": -10.9
+  },
+  "sfx_charge/vox_yell_10c.mp3": {
+   "measure": "momentary_max",
+   "lufs": -7.6,
+   "true_peak_db": -0.2,
+   "seconds": 2.04,
+   "gain_db": -12.4
+  },
+  "sfx_clang_01.mp3": {
+   "measure": "momentary_max",
+   "lufs": -18.1,
+   "true_peak_db": -1.3,
+   "seconds": 0.84,
+   "gain_db": -1.9
+  },
+  "sfx_clang_02.mp3": {
+   "measure": "momentary_max",
+   "lufs": -15.5,
+   "true_peak_db": -0.8,
+   "seconds": 0.84,
+   "gain_db": -4.5
+  },
+  "sfx_clang_03.mp3": {
+   "measure": "momentary_max",
+   "lufs": -14.0,
+   "true_peak_db": -0.4,
+   "seconds": 0.84,
+   "gain_db": -6.0
+  },
+  "sfx_clang_04.mp3": {
+   "measure": "momentary_max",
+   "lufs": -12.4,
+   "true_peak_db": 0.6,
+   "seconds": 0.84,
+   "gain_db": -7.6
+  },
+  "sfx_clang_05.mp3": {
+   "measure": "momentary_max",
+   "lufs": -18.5,
+   "true_peak_db": -1.8,
+   "seconds": 0.84,
+   "gain_db": -1.5
+  },
+  "sfx_death_01.mp3": {
+   "measure": "momentary_max",
+   "lufs": -9.8,
+   "true_peak_db": -0.2,
+   "seconds": 1.22,
+   "gain_db": -10.2
+  },
+  "sfx_death_02.mp3": {
+   "measure": "momentary_max",
+   "lufs": -9.7,
+   "true_peak_db": 0.2,
+   "seconds": 1.22,
+   "gain_db": -10.3
+  },
+  "sfx_death_03.mp3": {
+   "measure": "momentary_max",
+   "lufs": -7.7,
+   "true_peak_db": 0.5,
+   "seconds": 1.22,
+   "gain_db": -12.3
+  },
+  "sfx_death_04.mp3": {
+   "measure": "momentary_max",
+   "lufs": -6.3,
+   "true_peak_db": 0.4,
+   "seconds": 1.22,
+   "gain_db": -13.7
+  },
+  "sfx_death_05.mp3": {
+   "measure": "momentary_max",
+   "lufs": -7.5,
+   "true_peak_db": 0.4,
+   "seconds": 2.04,
+   "gain_db": -12.5
+  },
+  "sfx_melee/attack_grunts/attack_grunt0.mp3": {
+   "measure": "momentary_max",
+   "lufs": -10.7,
+   "true_peak_db": 0.0,
+   "seconds": 1.03,
+   "gain_db": -9.3
+  },
+  "sfx_melee/attack_grunts/attack_grunt_knight0.mp3": {
+   "measure": "momentary_max",
+   "lufs": -9.9,
+   "true_peak_db": 0.0,
+   "seconds": 1.03,
+   "gain_db": -10.1
+  },
+  "sfx_melee/attack_grunts/attack_grunt_knight1.mp3": {
+   "measure": "momentary_max",
+   "lufs": -8.9,
+   "true_peak_db": -0.1,
+   "seconds": 1.03,
+   "gain_db": -11.1
+  },
+  "sfx_melee/attack_grunts/attack_grunt_knight10.mp3": {
+   "measure": "momentary_max",
+   "lufs": -7.5,
+   "true_peak_db": 0.1,
+   "seconds": 1.03,
+   "gain_db": -12.5
+  },
+  "sfx_melee/attack_grunts/attack_grunt_knight11.mp3": {
+   "measure": "momentary_max",
+   "lufs": -5.7,
+   "true_peak_db": 0.4,
+   "seconds": 1.03,
+   "gain_db": -14.3
+  },
+  "sfx_melee/attack_grunts/attack_grunt_knight2.mp3": {
+   "measure": "momentary_max",
+   "lufs": -13.9,
+   "true_peak_db": -0.1,
+   "seconds": 1.03,
+   "gain_db": -6.1
+  },
+  "sfx_melee/attack_grunts/attack_grunt_knight3.mp3": {
+   "measure": "momentary_max",
+   "lufs": -9.7,
+   "true_peak_db": -0.1,
+   "seconds": 1.03,
+   "gain_db": -10.3
+  },
+  "sfx_melee/attack_grunts/attack_grunt_knight4.mp3": {
+   "measure": "momentary_max",
+   "lufs": -6.8,
+   "true_peak_db": 0.4,
+   "seconds": 1.03,
+   "gain_db": -13.2
+  },
+  "sfx_melee/attack_grunts/attack_grunt_knight5.mp3": {
+   "measure": "momentary_max",
+   "lufs": -10.0,
+   "true_peak_db": 0.7,
+   "seconds": 1.03,
+   "gain_db": -10.0
+  },
+  "sfx_melee/attack_grunts/attack_grunt_knight6.mp3": {
+   "measure": "momentary_max",
+   "lufs": -12.0,
+   "true_peak_db": -0.3,
+   "seconds": 1.03,
+   "gain_db": -8.0
+  },
+  "sfx_melee/attack_grunts/attack_grunt_knight7.mp3": {
+   "measure": "momentary_max",
+   "lufs": -10.9,
+   "true_peak_db": -0.3,
+   "seconds": 1.03,
+   "gain_db": -9.1
+  },
+  "sfx_melee/attack_grunts/attack_grunt_knight8.mp3": {
+   "measure": "momentary_max",
+   "lufs": -7.7,
+   "true_peak_db": 0.4,
+   "seconds": 1.03,
+   "gain_db": -12.3
+  },
+  "sfx_melee/attack_grunts/attack_grunt_knight9.mp3": {
+   "measure": "momentary_max",
+   "lufs": -7.4,
+   "true_peak_db": 0.0,
+   "seconds": 1.03,
+   "gain_db": -12.6
+  },
+  "sfx_melee/attack_grunts/attack_grunt_old_knight0.mp3": {
+   "measure": "momentary_max",
+   "lufs": -10.2,
+   "true_peak_db": -1.3,
+   "seconds": 1.03,
+   "gain_db": -9.8
+  },
+  "sfx_melee/attack_grunts/attack_grunt_old_knight1.mp3": {
+   "measure": "momentary_max",
+   "lufs": -8.5,
+   "true_peak_db": -0.1,
+   "seconds": 1.03,
+   "gain_db": -11.5
+  },
+  "sfx_melee/attack_grunts/attack_grunt_old_knight2.mp3": {
+   "measure": "momentary_max",
+   "lufs": -6.1,
+   "true_peak_db": 0.3,
+   "seconds": 1.03,
+   "gain_db": -13.9
+  },
+  "sfx_melee/attack_grunts/attack_grunt_young_knight0.mp3": {
+   "measure": "momentary_max",
+   "lufs": -12.7,
+   "true_peak_db": 0.0,
+   "seconds": 1.03,
+   "gain_db": -7.3
+  },
+  "sfx_melee/attack_grunts/attack_grunt_young_knight1.mp3": {
+   "measure": "momentary_max",
+   "lufs": -17.1,
+   "true_peak_db": -5.4,
+   "seconds": 1.03,
+   "gain_db": -2.9
+  },
+  "sfx_melee/attack_grunts/attack_grunt_young_knight2.mp3": {
+   "measure": "momentary_max",
+   "lufs": -6.7,
+   "true_peak_db": 0.2,
+   "seconds": 1.03,
+   "gain_db": -13.3
+  },
+  "sfx_melee/attack_grunts/attack_grunt_young_knight3.mp3": {
+   "measure": "momentary_max",
+   "lufs": -7.2,
+   "true_peak_db": 0.3,
+   "seconds": 1.03,
+   "gain_db": -12.8
+  },
+  "sfx_melee/attack_grunts/attack_grunt_young_knight4.mp3": {
+   "measure": "momentary_max",
+   "lufs": -10.2,
+   "true_peak_db": -0.6,
+   "seconds": 1.03,
+   "gain_db": -9.8
+  },
+  "sfx_melee/attack_screams/attack_scream0_bitfunny.mp3": {
+   "measure": "momentary_max",
+   "lufs": -7.3,
+   "true_peak_db": 0.4,
+   "seconds": 1.03,
+   "gain_db": -12.7
+  },
+  "sfx_melee/attack_screams/attack_scream1_young.mp3": {
+   "measure": "momentary_max",
+   "lufs": -8.8,
+   "true_peak_db": 0.1,
+   "seconds": 1.03,
+   "gain_db": -11.2
+  },
+  "sfx_melee/attack_screams/attack_scream2_good.mp3": {
+   "measure": "momentary_max",
+   "lufs": -6.4,
+   "true_peak_db": 0.4,
+   "seconds": 1.03,
+   "gain_db": -13.6
+  },
+  "sfx_melee/attack_screams/attack_scream3.mp3": {
+   "measure": "momentary_max",
+   "lufs": -6.1,
+   "true_peak_db": 0.6,
+   "seconds": 1.03,
+   "gain_db": -13.9
+  },
+  "sfx_melee/attack_screams/attack_scream4.mp3": {
+   "measure": "momentary_max",
+   "lufs": -6.4,
+   "true_peak_db": 0.4,
+   "seconds": 1.03,
+   "gain_db": -13.6
+  },
+  "sfx_melee/attack_screams/attack_scream5.mp3": {
+   "measure": "momentary_max",
+   "lufs": -6.8,
+   "true_peak_db": 0.6,
+   "seconds": 1.03,
+   "gain_db": -13.2
+  },
+  "sfx_melee/attack_screams/attack_scream6.mp3": {
+   "measure": "momentary_max",
+   "lufs": -7.0,
+   "true_peak_db": 0.2,
+   "seconds": 1.03,
+   "gain_db": -13.0
+  },
+  "sfx_melee/attack_screams/attack_scream7.mp3": {
+   "measure": "momentary_max",
+   "lufs": -5.3,
+   "true_peak_db": 0.7,
+   "seconds": 1.03,
+   "gain_db": -14.7
+  },
+  "sfx_melee/attack_screams/attack_scream_young0.mp3": {
+   "measure": "momentary_max",
+   "lufs": -7.5,
+   "true_peak_db": 0.3,
+   "seconds": 1.03,
+   "gain_db": -12.5
+  },
+  "sfx_melee/attack_screams/attack_scream_young1.mp3": {
+   "measure": "momentary_max",
+   "lufs": -5.8,
+   "true_peak_db": 0.7,
+   "seconds": 1.03,
+   "gain_db": -14.2
+  },
+  "sfx_melee/attack_screams/attack_scream_young2.mp3": {
+   "measure": "momentary_max",
+   "lufs": -8.8,
+   "true_peak_db": 0.1,
+   "seconds": 1.03,
+   "gain_db": -11.2
+  },
+  "sfx_melee/attack_screams/attack_scream_young3.mp3": {
+   "measure": "momentary_max",
+   "lufs": -6.8,
+   "true_peak_db": 0.3,
+   "seconds": 1.03,
+   "gain_db": -13.2
+  },
+  "sfx_melee/battle_screams/battle_scream0.mp3": {
+   "measure": "momentary_max",
+   "lufs": -9.7,
+   "true_peak_db": -0.1,
+   "seconds": 2.04,
+   "gain_db": -10.3
+  },
+  "sfx_melee/battle_screams/battle_scream1.mp3": {
+   "measure": "momentary_max",
+   "lufs": -8.1,
+   "true_peak_db": 0.3,
+   "seconds": 2.04,
+   "gain_db": -11.9
+  },
+  "sfx_melee/battle_screams/battle_scream3.mp3": {
+   "measure": "momentary_max",
+   "lufs": -6.7,
+   "true_peak_db": 0.3,
+   "seconds": 2.04,
+   "gain_db": -13.3
+  },
+  "sfx_melee/battle_screams/battle_scream4.mp3": {
+   "measure": "momentary_max",
+   "lufs": -8.8,
+   "true_peak_db": -0.0,
+   "seconds": 2.04,
+   "gain_db": -11.2
+  },
+  "sfx_melee/battle_screams/battle_scream6.mp3": {
+   "measure": "momentary_max",
+   "lufs": -11.7,
+   "true_peak_db": -1.0,
+   "seconds": 1.51,
+   "gain_db": -8.3
+  },
+  "sfx_melee/battle_screams/battle_scream7.mp3": {
+   "measure": "momentary_max",
+   "lufs": -6.2,
+   "true_peak_db": 0.4,
+   "seconds": 1.51,
+   "gain_db": -13.8
+  },
+  "sfx_melee/battle_screams/battle_scream8.mp3": {
+   "measure": "momentary_max",
+   "lufs": -5.2,
+   "true_peak_db": 0.5,
+   "seconds": 1.51,
+   "gain_db": -14.8
+  },
+  "sfx_melee/battle_screams/battle_scream9.mp3": {
+   "measure": "momentary_max",
+   "lufs": -6.8,
+   "true_peak_db": 0.3,
+   "seconds": 1.51,
+   "gain_db": -13.2
+  },
+  "sfx_melee/hit_grunts/choked_groan(big_damage)1.mp3": {
+   "measure": "momentary_max",
+   "lufs": -11.5,
+   "true_peak_db": -0.1,
+   "seconds": 1.03,
+   "gain_db": -8.5
+  },
+  "sfx_melee/hit_grunts/damage_gasp0.mp3": {
+   "measure": "momentary_max",
+   "lufs": -19.2,
+   "true_peak_db": -5.8,
+   "seconds": 1.03,
+   "gain_db": -0.8
+  },
+  "sfx_melee/hit_grunts/damage_gasp1.mp3": {
+   "measure": "momentary_max",
+   "lufs": -13.2,
+   "true_peak_db": -2.4,
+   "seconds": 1.03,
+   "gain_db": -6.8
+  },
+  "sfx_melee/hit_grunts/damage_gasp2.mp3": {
+   "measure": "momentary_max",
+   "lufs": -14.5,
+   "true_peak_db": -3.2,
+   "seconds": 1.03,
+   "gain_db": -5.5
+  },
+  "sfx_melee/hit_grunts/damage_grunt0.mp3": {
+   "measure": "momentary_max",
+   "lufs": -8.8,
+   "true_peak_db": 0.0,
+   "seconds": 1.03,
+   "gain_db": -11.2
+  },
+  "sfx_melee/hit_grunts/damage_grunt10.mp3": {
+   "measure": "momentary_max",
+   "lufs": -13.6,
+   "true_peak_db": -2.1,
+   "seconds": 1.03,
+   "gain_db": -6.4
+  },
+  "sfx_melee/hit_grunts/damage_grunt11.mp3": {
+   "measure": "momentary_max",
+   "lufs": -14.9,
+   "true_peak_db": -2.1,
+   "seconds": 1.03,
+   "gain_db": -5.1
+  },
+  "sfx_melee/hit_grunts/damage_grunt12.mp3": {
+   "measure": "momentary_max",
+   "lufs": -11.9,
+   "true_peak_db": 0.0,
+   "seconds": 1.03,
+   "gain_db": -8.1
+  },
+  "sfx_melee/hit_grunts/damage_grunt2.mp3": {
+   "measure": "momentary_max",
+   "lufs": -12.4,
+   "true_peak_db": 0.1,
+   "seconds": 1.03,
+   "gain_db": -7.6
+  },
+  "sfx_melee/hit_grunts/damage_grunt3.mp3": {
+   "measure": "momentary_max",
+   "lufs": -15.8,
+   "true_peak_db": -3.1,
+   "seconds": 1.03,
+   "gain_db": -4.2
+  },
+  "sfx_melee/hit_grunts/damage_grunt4.mp3": {
+   "measure": "momentary_max",
+   "lufs": -21.9,
+   "true_peak_db": -10.5,
+   "seconds": 1.03,
+   "gain_db": 1.9
+  },
+  "sfx_melee/hit_grunts/damage_grunt6.mp3": {
+   "measure": "momentary_max",
+   "lufs": -12.4,
+   "true_peak_db": -0.0,
+   "seconds": 1.03,
+   "gain_db": -7.6
+  },
+  "sfx_melee/hit_grunts/damage_grunt7.mp3": {
+   "measure": "momentary_max",
+   "lufs": -13.3,
+   "true_peak_db": -0.1,
+   "seconds": 1.03,
+   "gain_db": -6.7
+  },
+  "sfx_melee/hit_grunts/damage_grunt8.mp3": {
+   "measure": "momentary_max",
+   "lufs": -15.4,
+   "true_peak_db": -3.7,
+   "seconds": 1.03,
+   "gain_db": -4.6
+  },
+  "sfx_melee/hit_grunts/damage_grunt9.mp3": {
+   "measure": "momentary_max",
+   "lufs": -13.1,
+   "true_peak_db": -1.9,
+   "seconds": 1.03,
+   "gain_db": -6.9
+  },
+  "sfx_melee/hit_grunts/stabbed0.mp3": {
+   "measure": "momentary_max",
+   "lufs": -20.0,
+   "true_peak_db": -2.9,
+   "seconds": 1.03,
+   "gain_db": 0.0
+  },
+  "sfx_new/armor_clang_01.mp3": {
+   "measure": "momentary_max",
+   "lufs": -16.6,
+   "true_peak_db": 0.3,
+   "seconds": 1.1,
+   "gain_db": -3.4
+  },
+  "sfx_new/armor_clang_02.mp3": {
+   "measure": "momentary_max",
+   "lufs": -11.1,
+   "true_peak_db": 1.0,
+   "seconds": 1.1,
+   "gain_db": -8.9
+  },
+  "sfx_new/bed_march_loop_14.5s.mp3": {
+   "measure": "integrated",
+   "lufs": -22.1,
+   "true_peak_db": -3.3,
+   "seconds": 14.69,
+   "gain_db": -0.9
+  },
+  "sfx_new/sfx_blunt_damage_01.mp3": {
+   "measure": "momentary_max",
+   "lufs": -12.7,
+   "true_peak_db": 2.0,
+   "seconds": 1.1,
+   "gain_db": -7.3
+  },
+  "sfx_new/sfx_blunt_damage_02.mp3": {
+   "measure": "momentary_max",
+   "lufs": -16.6,
+   "true_peak_db": -0.4,
+   "seconds": 1.1,
+   "gain_db": -3.4
+  },
+  "sfx_new/sfx_spear_damage_01.mp3": {
+   "measure": "momentary_max",
+   "lufs": -13.8,
+   "true_peak_db": 0.9,
+   "seconds": 1.1,
+   "gain_db": -6.2
+  },
+  "sfx_new/sfx_sword_damage_01.mp3": {
+   "measure": "momentary_max",
+   "lufs": -14.7,
+   "true_peak_db": 0.7,
+   "seconds": 1.1,
+   "gain_db": -5.3
+  },
+  "sfx_new/sfx_sword_damage_02.mp3": {
+   "measure": "momentary_max",
+   "lufs": -9.5,
+   "true_peak_db": 1.8,
+   "seconds": 1.1,
+   "gain_db": -10.5
+  },
+  "sfx_new/sig_horn_rout.mp3": {
+   "measure": "momentary_max",
+   "lufs": -4.6,
+   "true_peak_db": 0.9,
+   "seconds": 2.52,
+   "gain_db": -15.4
+  },
+  "sfx_new/sword_clang_06.mp3": {
+   "measure": "momentary_max",
+   "lufs": -13.0,
+   "true_peak_db": 0.5,
+   "seconds": 1.1,
+   "gain_db": -7.0
+  },
+  "sfx_new/sword_clang_07.mp3": {
+   "measure": "momentary_max",
+   "lufs": -16.3,
+   "true_peak_db": -0.7,
+   "seconds": 1.1,
+   "gain_db": -3.7
+  },
+  "sfx_new/sword_clang_08.mp3": {
+   "measure": "momentary_max",
+   "lufs": -10.1,
+   "true_peak_db": 1.0,
+   "seconds": 1.1,
+   "gain_db": -9.9
+  },
+  "sfx_new/sword_clang_09.mp3": {
+   "measure": "momentary_max",
+   "lufs": -18.1,
+   "true_peak_db": -0.8,
+   "seconds": 1.1,
+   "gain_db": -1.9
+  },
+  "sfx_new/ui_attack.mp3": {
+   "measure": "momentary_max",
+   "lufs": -9.5,
+   "true_peak_db": 1.2,
+   "seconds": 0.65,
+   "gain_db": -10.5
+  },
+  "sfx_new/ui_order0.mp3": {
+   "measure": "momentary_max",
+   "lufs": -18.5,
+   "true_peak_db": -0.5,
+   "seconds": 1.25,
+   "gain_db": -1.5
+  },
+  "sfx_new/ui_select.mp3": {
+   "measure": "momentary_max",
+   "lufs": -28.1,
+   "true_peak_db": -1.7,
+   "seconds": 0.34,
+   "gain_db": 8.1
+  },
+  "sfx_new/ui_select1.mp3": {
+   "measure": "momentary_max",
+   "lufs": -22.9,
+   "true_peak_db": 0.2,
+   "seconds": 0.67,
+   "gain_db": 2.9
+  },
+  "sfx_new/vox_warcry_01.mp3": {
+   "measure": "integrated",
+   "lufs": -13.3,
+   "true_peak_db": -1.1,
+   "seconds": 4.82,
+   "gain_db": -9.7
+  },
+  "sfx_new/vox_warcry_02.mp3": {
+   "measure": "integrated",
+   "lufs": -12.7,
+   "true_peak_db": -0.3,
+   "seconds": 4.82,
+   "gain_db": -10.3
+  },
+  "sfx_rout/fallback0.mp3": {
+   "measure": "momentary_max",
+   "lufs": -6.5,
+   "true_peak_db": 0.1,
+   "seconds": 1.32,
+   "gain_db": -13.5
+  },
+  "sfx_rout/fallback1.mp3": {
+   "measure": "momentary_max",
+   "lufs": -9.3,
+   "true_peak_db": 0.3,
+   "seconds": 1.27,
+   "gain_db": -10.7
+  },
+  "sfx_rout/fallback2.mp3": {
+   "measure": "momentary_max",
+   "lufs": -7.2,
+   "true_peak_db": 0.3,
+   "seconds": 1.27,
+   "gain_db": -12.8
+  },
+  "sfx_rout/feet_run_wash_01_single_noloop.mp3": {
+   "measure": "integrated",
+   "lufs": -27.9,
+   "true_peak_db": -7.6,
+   "seconds": 3.91,
+   "gain_db": 4.9
+  },
+  "sfx_rout/feet_run_wash_02_single_loop.mp3": {
+   "measure": "integrated",
+   "lufs": -29.1,
+   "true_peak_db": -4.5,
+   "seconds": 3.91,
+   "gain_db": 6.1
+  },
+  "sfx_rout/feet_run_wash_03_single_loop.mp3": {
+   "measure": "integrated",
+   "lufs": -26.6,
+   "true_peak_db": -3.7,
+   "seconds": 3.91,
+   "gain_db": 3.6
+  },
+  "sfx_rout/feet_run_wash_04_single_loop.mp3": {
+   "measure": "integrated",
+   "lufs": -27.1,
+   "true_peak_db": -2.4,
+   "seconds": 3.91,
+   "gain_db": 4.1
+  },
+  "sfx_rout/feet_run_wash_05_loop_twoppl.mp3": {
+   "measure": "integrated",
+   "lufs": -27.9,
+   "true_peak_db": -1.7,
+   "seconds": 6.19,
+   "gain_db": 4.9
+  },
+  "sfx_rout/feet_run_wash_06_loop_twoppl.mp3": {
+   "measure": "integrated",
+   "lufs": -24.4,
+   "true_peak_db": -0.3,
+   "seconds": 6.19,
+   "gain_db": 1.4
+  },
+  "sfx_rout/feet_run_wash_07_single_loop.mp3": {
+   "measure": "integrated",
+   "lufs": -21.9,
+   "true_peak_db": -0.2,
+   "seconds": 6.19,
+   "gain_db": -1.1
+  },
+  "sfx_rout/feet_run_wash_08_single_loop.mp3": {
+   "measure": "integrated",
+   "lufs": -22.3,
+   "true_peak_db": -3.7,
+   "seconds": 6.19,
+   "gain_db": -0.7
+  },
+  "sfx_rout/feet_run_wash_mass_01.mp3": {
+   "measure": "integrated",
+   "lufs": -17.0,
+   "true_peak_db": -0.1,
+   "seconds": 6.02,
+   "gain_db": -6.0
+  },
+  "sfx_rout/feet_run_wash_mass_02.mp3": {
+   "measure": "integrated",
+   "lufs": -17.7,
+   "true_peak_db": -0.8,
+   "seconds": 6.02,
+   "gain_db": -5.3
+  },
+  "sfx_rout/retreat0.mp3": {
+   "measure": "momentary_max",
+   "lufs": -8.6,
+   "true_peak_db": -0.7,
+   "seconds": 1.51,
+   "gain_db": -11.4
+  },
+  "sfx_rout/retreat1.mp3": {
+   "measure": "momentary_max",
+   "lufs": -8.7,
+   "true_peak_db": -0.2,
+   "seconds": 1.32,
+   "gain_db": -11.3
+  },
+  "sfx_rout/run_away!0.mp3": {
+   "measure": "momentary_max",
+   "lufs": -6.1,
+   "true_peak_db": 0.9,
+   "seconds": 1.03,
+   "gain_db": -13.9
+  },
+  "sfx_rout/run_away!1_funny.mp3": {
+   "measure": "momentary_max",
+   "lufs": -5.3,
+   "true_peak_db": 0.4,
+   "seconds": 1.03,
+   "gain_db": -14.7
+  },
+  "sfx_rout/vox_panic_01.mp3": {
+   "measure": "integrated",
+   "lufs": -17.6,
+   "true_peak_db": -3.6,
+   "seconds": 3.02,
+   "gain_db": -5.4
+  },
+  "sfx_rout/vox_panic_02.mp3": {
+   "measure": "integrated",
+   "lufs": -15.4,
+   "true_peak_db": -0.1,
+   "seconds": 3.02,
+   "gain_db": -7.6
+  },
+  "sfx_rout/vox_panic_03.mp3": {
+   "measure": "integrated",
+   "lufs": -14.3,
+   "true_peak_db": -0.2,
+   "seconds": 3.91,
+   "gain_db": -8.7
+  },
+  "sfx_rout/vox_rout_04.mp3": {
+   "measure": "integrated",
+   "lufs": -14.5,
+   "true_peak_db": -0.1,
+   "seconds": 3.02,
+   "gain_db": -8.5
+  },
+  "sfx_rout/vox_rout_05.mp3": {
+   "measure": "integrated",
+   "lufs": -11.8,
+   "true_peak_db": -0.4,
+   "seconds": 3.02,
+   "gain_db": -11.2
+  },
+  "sfx_rout/withdraw0.mp3": {
+   "measure": "momentary_max",
+   "lufs": -5.5,
+   "true_peak_db": 0.4,
+   "seconds": 1.32,
+   "gain_db": -14.5
+  },
+  "sfx_rout/withdraw1.mp3": {
+   "measure": "momentary_max",
+   "lufs": -5.8,
+   "true_peak_db": 0.3,
+   "seconds": 1.32,
+   "gain_db": -14.2
+  },
+  "sfx_rout/withdraw2.mp3": {
+   "measure": "momentary_max",
+   "lufs": -7.6,
+   "true_peak_db": 0.1,
+   "seconds": 1.32,
+   "gain_db": -12.4
+  },
+  "sfx_shield_01.mp3": {
+   "measure": "momentary_max",
+   "lufs": -30.2,
+   "true_peak_db": -9.6,
+   "seconds": 0.84,
+   "gain_db": 10.2
+  },
+  "sfx_shield_02.mp3": {
+   "measure": "momentary_max",
+   "lufs": -19.1,
+   "true_peak_db": -0.3,
+   "seconds": 0.84,
+   "gain_db": -0.9
+  },
+  "sfx_shield_03.mp3": {
+   "measure": "momentary_max",
+   "lufs": -17.8,
+   "true_peak_db": 0.3,
+   "seconds": 0.84,
+   "gain_db": -2.2
+  },
+  "sfx_swing_01.mp3": {
+   "measure": "momentary_max",
+   "lufs": -17.6,
+   "true_peak_db": -1.5,
+   "seconds": 0.72,
+   "gain_db": -2.4
+  },
+  "sfx_swing_02.mp3": {
+   "measure": "momentary_max",
+   "lufs": -18.1,
+   "true_peak_db": -3.7,
+   "seconds": 0.72,
+   "gain_db": -1.9
+  },
+  "sig_drums_march.mp3": {
+   "measure": "integrated",
+   "lufs": -20.3,
+   "true_peak_db": -0.8,
+   "seconds": 8.04,
+   "gain_db": -2.7
+  },
+  "sig_horn_charge.mp3": {
+   "measure": "integrated",
+   "lufs": -10.8,
+   "true_peak_db": -1.5,
+   "seconds": 3.02,
+   "gain_db": -12.2
+  },
+  "sig_horn_charge_02.mp3": {
+   "measure": "integrated",
+   "lufs": -9.1,
+   "true_peak_db": -0.9,
+   "seconds": 3.02,
+   "gain_db": -13.9
+  },
+  "sig_horn_rout_01.mp3": {
+   "measure": "momentary_max",
+   "lufs": -7.0,
+   "true_peak_db": 0.2,
+   "seconds": 2.42,
+   "gain_db": -13.0
+  },
+  "sting_defeat.mp3": {
+   "measure": "integrated",
+   "lufs": -19.3,
+   "true_peak_db": -1.8,
+   "seconds": 3.91,
+   "gain_db": -3.7
+  },
+  "sting_victory.mp3": {
+   "measure": "integrated",
+   "lufs": -14.7,
+   "true_peak_db": -0.5,
+   "seconds": 3.91,
+   "gain_db": -8.3
+  },
+  "ui_select.mp3": {
+   "measure": "momentary_max",
+   "lufs": -24.3,
+   "true_peak_db": -4.5,
+   "seconds": 0.5,
+   "gain_db": 4.3
+  },
+  "vox_rally_01.mp3": {
+   "measure": "integrated",
+   "lufs": -11.0,
+   "true_peak_db": 0.0,
+   "seconds": 4.1,
+   "gain_db": -12.0
+  },
+  "vox_rally_02.mp3": {
+   "measure": "integrated",
+   "lufs": -12.6,
+   "true_peak_db": -0.3,
+   "seconds": 4.1,
+   "gain_db": -10.4
+  },
+  "vox_rout_01.mp3": {
+   "measure": "integrated",
+   "lufs": -14.4,
+   "true_peak_db": -0.5,
+   "seconds": 4.1,
+   "gain_db": -8.6
+  },
+  "vox_rout_02.mp3": {
+   "measure": "integrated",
+   "lufs": -12.5,
+   "true_peak_db": 0.1,
+   "seconds": 4.1,
+   "gain_db": -10.5
+  },
+  "vox_rout_03.mp3": {
+   "measure": "integrated",
+   "lufs": -12.5,
+   "true_peak_db": -0.2,
+   "seconds": 4.1,
+   "gain_db": -10.5
+  },
+  "vox_warcry_singleperson_01.mp3": {
+   "measure": "integrated",
+   "lufs": -11.4,
+   "true_peak_db": 0.0,
+   "seconds": 4.1,
+   "gain_db": -11.6
+  }
+ }
+}

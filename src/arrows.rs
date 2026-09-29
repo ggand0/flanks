@@ -302,6 +302,7 @@ fn update_arrows(
     mut stuck: ResMut<StuckArrows>,
     mut tracks: ResMut<RegTracks>,
     time: Res<Time>,
+    mut sounds: Option<ResMut<crate::audio::SoundEvents>>,
     mut tick: Local<u32>,
 ) {
     let _span = info_span!("update_arrows").entered();
@@ -330,6 +331,9 @@ fn update_arrows(
                 continue;
             }
             stats.loosed += 1;
+            if let Some(se) = sounds.as_deref_mut() {
+                se.push_loose(s.group, s.pos);
+            }
             arrows.pos.push(s.pos);
             arrows.pos_prev.push(s.pos);
             arrows.vel.push(s.vel);
@@ -437,6 +441,9 @@ fn update_arrows(
                 anim2: [0.0, 0.0, pitch, 0.0],
             });
             stats.landed += 1;
+            if let Some(se) = sounds.as_deref_mut() {
+                se.push_arrow_ground(Vec3::new(p.x, ground, p.z));
+            }
             arrows.swap_remove(i);
             continue;
         }
@@ -469,6 +476,21 @@ fn update_arrows(
         let dmg = missile::BASE_DMG * missile::FACTOR_MULT.powf(factor) * h.jit * combat_scale;
         units.hp[v] -= dmg;
         units.flash[v] = 4;
+        if let Some(se) = sounds.as_deref_mut() {
+            // A shaft cannot be parried: shield or armour takes it.
+            se.push_arrow_hit(crate::audio::ArrowHit {
+                pos: units.pos[v],
+                group: units.group[v],
+                material: crate::audio::struck_material(
+                    0.0,
+                    shield,
+                    pv.armour,
+                    units.kind[v],
+                    hash01((*tick).wrapping_mul(0x27D4_EB2F) ^ (v as u32).wrapping_mul(0x1656_67B1)),
+                ),
+                killed: units.hp[v] <= 0.0,
+            });
+        }
         if units.hp[v] <= 0.0 {
             units.death_t[v] = crate::sim::damage::DEATH_TICKS;
             cstats.kills[units.team[v] as usize] += 1;

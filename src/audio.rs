@@ -1,18 +1,19 @@
-//! Battle audio: aggregate beds + rate-limited one-shots. NEVER per-unit
-//! sound — at 200k units the mix is driven by sim statistics near the
-//! camera (hits/tick, engaged regiments, morale transitions), exactly the
-//! signals the overlay already trusts.
+//! Battle audio. Battlefield sounds are positional: the sim reports each
+//! landed blow, loosed arrow and arrow strike where it happens, regiments
+//! in a charge, celebration or rout emit their group sheets and single
+//! voices from their own ground, and the mixer (mixer.rs) plays each clip
+//! at a common loudness, levels it by the mix table below, fades it with
+//! distance from the point the camera looks at, and caps each layer's
+//! voices. Beds, UI clicks, horns and stings stay plain Bevy players.
 //!
-//! Asset list, generation prompts, and retry notes: tmp/audio-plan.md.
 //! Missing files degrade gracefully (their triggers just stay silent).
 
 use bevy::audio::{AudioSink, AudioSinkPlayback, PlaybackSettings, Volume};
 use bevy::prelude::*;
 
 use crate::camera::RtsCamera;
-use crate::combat::CombatStats;
 use crate::game_state::GameState;
-use crate::sim::SimStats;
+use crate::mixer::{Bank, Bus, ClipId, Clips, Duck, Mixer, NO_UNIT, Request};
 use crate::orders::{Groups, RegState};
 use crate::units::hash01;
 
@@ -25,12 +26,12 @@ pub fn env_master() -> f32 {
 }
 
 /// Effective battle-sound volume (beds, combat, vox, horns, stings).
-fn battle_vol(s: &crate::settings::Settings) -> f32 {
+pub(crate) fn battle_vol(s: &crate::settings::Settings) -> f32 {
     s.audio.master * s.audio.battle * env_master()
 }
 
 /// Effective UI-sound volume (selection/order clicks).
-fn ui_vol(s: &crate::settings::Settings) -> f32 {
+pub(crate) fn ui_vol(s: &crate::settings::Settings) -> f32 {
     s.audio.master * s.audio.ui * env_master()
 }
 
@@ -51,23 +52,48 @@ pub enum UiCue {
 /// Bed smoothing time constant (seconds to ~2/3 of the way to target).
 const BED_SMOOTH: f32 = 0.35;
 
-/// Hard ceiling on simultaneously playing one-shots. Every one-shot is
-/// a live decoder on rodio's single mixer thread; the underruns
-/// ("Buffer underrun/overrun" errors, audible dropouts) appeared north
-/// of ~100 concurrent. The first guess of 40 audibly starved the loose
-/// and impact layers themselves (a volley's looses alone stack ~50
-/// clips), so the ceiling sits between the two: high enough for the
-/// full volley chorus, under the measured breaking point. The budgets
-/// shape the sound; this guard protects the mixer.
-const MAX_LIVE_ONE_SHOTS: usize = 64;
+/// Per-clip loudness manifest (tools/audio_loudness.py): the gain in dB
+/// that brings each clip to the common loudness, and its length in
+/// seconds, by path under assets/.
+fn clip_info(path: &str) -> (f32, f32) {
+    type Manifest = std::collections::HashMap<String, (f32, f32)>;
+    static CLIPS: std::sync::OnceLock<Manifest> = std::sync::OnceLock::new();
+    let clips = CLIPS.get_or_init(|| {
+        let v: serde_json::Value =
+            serde_json::from_str(include_str!("../assets/audio_levels.json")).unwrap_or_default();
+        v["clips"]
+            .as_object()
+            .map(|clips| {
+                clips
+                    .iter()
+                    .filter_map(|(k, c)| {
+                        Some((k.clone(), (c["gain_db"].as_f64()? as f32, c["seconds"].as_f64()? as f32)))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+    match clips.get(path) {
+        Some(c) => *c,
+        None => {
+            warn!("audio: {path} is not in assets/audio_levels.json; run tools/audio_loudness.py");
+            (0.0, 0.0)
+        }
+    }
+}
 
-/// Massed-volley sheet cues: BENCHED — the pre-rendered 2.5 s sheets
-/// don't track the actual flight (they fire on rate edges, so onset,
-/// length, and position all drift from what's on screen). The likely
-/// replacement is many INDIVIDUAL whoosh/swish one-shots budgeted from
-/// the live arrow cloud so the volley layers itself organically, like
-/// every other sound here. Set to true to hear the sheets again.
-const VOLLEY_SHEETS_ON: bool = false;
+fn norm_db(path: &str) -> f32 {
+    clip_info(path).0
+}
+
+/// Load `<name>.mp3` for every name, each at the common loudness.
+fn pool(clips: &mut Clips, assets: &AssetServer, names: &[&str]) -> Vec<ClipId> {
+    names.iter().map(|n| load(clips, assets, &format!("{n}.mp3"))).collect()
+}
+
+fn load(clips: &mut Clips, assets: &AssetServer, path: &str) -> ClipId {
+    clips.load(assets, path, norm_db(path))
+}
 
 pub struct BattleAudioPlugin;
 
@@ -75,21 +101,24 @@ impl Plugin for BattleAudioPlugin {
     fn build(&self, app: &mut App) {
         // Battle-only: outside the battle the sim stats these systems
         // read are stale, and quitting to the menu must not leave the
-        // beds ringing (or stale stats spawning clangs) behind it.
+        // beds ringing behind it.
         app.add_message::<UiCue>()
+            .add_plugins(crate::mixer::MixerPlugin)
+            .init_resource::<SoundEvents>()
+            .init_resource::<MemberSamples>()
             .add_systems(Startup, setup_audio)
             .add_systems(
                 Update,
                 (
                     update_beds,
-                    combat_one_shots,
-                    melee_vox,
-                    archer_one_shots,
-                    arrow_fly_loops,
+                    refresh_member_samples,
+                    blow_sounds,
+                    arrow_sounds,
+                    regiment_sounds,
+                    fight_loops,
                     event_cues,
-                    charge_vox,
-                    celebrate_vox,
-                    rout_vox,
+                    crate::mixer::flush_mixer,
+                    clip_log,
                 )
                     .chain()
                     .run_if(in_state(GameState::Battle)),
@@ -97,177 +126,500 @@ impl Plugin for BattleAudioPlugin {
             // Beds cut on leaving battle; one-shots survive into the
             // results screen (the victory/defeat sting must finish)
             // and are only culled when the menu comes up.
-            .add_systems(OnExit(GameState::Battle), (silence_beds, stop_fly_loops))
-            .add_systems(OnEnter(GameState::Menu), stop_one_shots);
+            .add_systems(OnExit(GameState::Battle), (silence_beds, clear_sound_events));
     }
 }
 
-#[derive(Resource)]
-struct AudioBank {
-    clang: Vec<Handle<AudioSource>>,
-    shield: Vec<Handle<AudioSource>>,
-    /// Flesh/armor damage connects (blunt, spear, sword) — mixed into the
-    /// hit pool at low probability so not every hit rings like a bell.
-    damage: Vec<Handle<AudioSource>>,
-    death: Vec<Handle<AudioSource>>,
-    vox_rout: Vec<Handle<AudioSource>>,
-    /// Rout soundscape (sfx_rout/, the film retreats' direction +
-    /// M2TW Individual_Retreat): commanders shouting Retreat/Withdraw
-    /// over a mostly silent fleeing mass, panic screams only in the
-    /// first moments of a break, massed running feet underneath.
-    rout_shout: Vec<Handle<AudioSource>>,
-    rout_panic: Vec<Handle<AudioSource>>,
-    feet_wash: Vec<Handle<AudioSource>>,
-    /// Rolling group cheers while a regiment CELEBRATES (sfx_celebrate/,
-    /// M2TW unit_celebrate state bank), size-banded like the charge
-    /// sheets, plus single-man victory whoops over them.
-    celebrate_small: Vec<Handle<AudioSource>>,
-    celebrate_large: Vec<Handle<AudioSource>>,
-    celebrate_whoop: Vec<Handle<AudioSource>>,
-    /// Melee human layer (sfx_melee/, M2TW soldier_voice vocals):
-    /// attacker effort grunts and screams, victim hit grunts, and
-    /// sustained battle screams over a locked fight.
-    melee_attack_grunt: Vec<Handle<AudioSource>>,
-    melee_attack_scream: Vec<Handle<AudioSource>>,
-    melee_hit_grunt: Vec<Handle<AudioSource>>,
-    melee_battle_scream: Vec<Handle<AudioSource>>,
-    /// Single-man charge yells (sfx_charge/, M2TW Individual_Charge:
-    /// one in five charging soldiers screams his own clip).
-    yell_charge: Vec<Handle<AudioSource>>,
-    /// Group charge sheets (M2TW unit_charge bank), size-banded:
-    /// medium under 300 men, large above.
-    group_charge_medium: Vec<Handle<AudioSource>>,
-    group_charge_large: Vec<Handle<AudioSource>>,
-    horn_charge: Vec<Handle<AudioSource>>,
-    horn_rout: Handle<AudioSource>,
-    ui_select: Handle<AudioSource>,
-    /// Click feedback for a move order (mixed quieter than select).
-    ui_order: Handle<AudioSource>,
-    /// Click feedback for an attack order on an enemy regiment.
-    ui_attack: Handle<AudioSource>,
-    sting_victory: Handle<AudioSource>,
-    sting_defeat: Handle<AudioSource>,
-    // --- archer set (sfx_bow/, prompts in tmp/archer-sfx-prompts.md) ---
-    /// Single string-snap releases, budgeted from ArrowStats.loosed.
-    bow_loose: Vec<Handle<AudioSource>>,
-    /// Body hits; the wood knocks mix in at low odds (shielded men).
-    arrow_flesh: Vec<Handle<AudioSource>>,
-    arrow_wood: Vec<Handle<AudioSource>>,
-    /// Shafts thudding into dirt (the miss patter).
-    arrow_ground: Vec<Handle<AudioSource>>,
-    /// Near-miss whistle for close-up incoming fire.
-    arrow_flyby: Vec<Handle<AudioSource>>,
-    /// Seamless in-flight air loop, attached per arrow (the M2TW
-    /// ARROW_FLY model). Missing files stay silent until generated.
-    arrow_fly_loop: Vec<Handle<AudioSource>>,
-    /// Massed-volley sheets: loosed away / falling on the camera.
-    volley_away: Vec<Handle<AudioSource>>,
-    volley_incoming: Vec<Handle<AudioSource>>,
+// ------------------------------------------------------------ sim events
+
+/// Sim sounds are kept within this distance of the point the camera looks
+/// at, plus half the camera's distance (a zoomed-out view hears farther).
+const EVENT_CULL_M: f32 = 150.0;
+/// Cap per event list, so a frame that never drains cannot grow them.
+const EVENT_CAP: usize = 4096;
+
+/// What a blow or an arrow struck, which picks its sound (M2TW
+/// weapon_hit `hit metal / wood / flesh`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Material {
+    /// Blade on blade: the blow was parried.
+    Steel,
+    /// Metal armour.
+    Metal,
+    /// A shield.
+    Wood,
+    /// Flesh or leather: M2TW plays one sample set for both.
+    Flesh,
 }
 
-/// Looping bed entities, indexed by `Bed`.
-#[derive(Component, Clone, Copy, PartialEq)]
+/// The material a landed blow struck, drawn in proportion to the defence
+/// points that met it: parry skill (blade on blade), shield (wood) and
+/// armour (the victim's armour sound). No defence in play: flesh. `roll`
+/// is uniform in 0..1. M2TW picks the material per hit too, by a rule its
+/// config does not show.
+pub fn struck_material(skill: f32, shield: f32, armour: f32, kind: u8, roll: f32) -> Material {
+    let total = skill.max(0.0) + shield.max(0.0) + armour.max(0.0);
+    if total <= 0.0 {
+        return Material::Flesh;
+    }
+    let x = roll * total;
+    if x < skill {
+        Material::Steel
+    } else if x < skill + shield {
+        Material::Wood
+    } else {
+        armour_material(kind)
+    }
+}
+
+/// The armour sound of a kind. M2TW's EDU gives every unit one
+/// (`stat_pri_armour`): armour 0-1 is flesh, 2-4 mostly leather, 5 and
+/// up mostly metal.
+pub fn armour_material(kind: u8) -> Material {
+    use crate::unit_types::{KIND_HEAVY, KIND_SPEAR};
+    match kind {
+        KIND_HEAVY | KIND_SPEAR => Material::Metal,
+        _ => Material::Flesh,
+    }
+}
+
+/// A landed melee blow.
+pub struct Blow {
+    pub victim: Vec3,
+    pub attacker: Vec3,
+    pub victim_group: u32,
+    pub attacker_group: u32,
+    pub material: Material,
+    pub killed: bool,
+}
+
+/// An arrow that struck a man.
+pub struct ArrowHit {
+    pub pos: Vec3,
+    /// The struck man's regiment.
+    pub group: u32,
+    pub material: Material,
+    pub killed: bool,
+}
+
+/// Sim events near the camera's look point, written where they happen
+/// (the damage pass, the arrow flight) and drained by the audio systems
+/// each frame.
+#[derive(Resource, Default)]
+pub struct SoundEvents {
+    /// The camera's look point, written by the audio each frame.
+    pub listener: Vec3,
+    /// Events farther than this from the look point are dropped.
+    pub cull_r: f32,
+    pub blows: Vec<Blow>,
+    pub arrow_hits: Vec<ArrowHit>,
+    pub arrow_ground: Vec<Vec3>,
+    /// Loosed arrows: the shooter's regiment and the launch point.
+    pub looses: Vec<(u32, Vec3)>,
+}
+
+impl SoundEvents {
+    fn hears(&self, p: Vec3) -> bool {
+        p.xz().distance_squared(self.listener.xz()) < self.cull_r * self.cull_r
+    }
+
+    pub fn push_blow(&mut self, b: Blow) {
+        if self.blows.len() < EVENT_CAP && self.hears(b.victim) {
+            self.blows.push(b);
+        }
+    }
+
+    pub fn push_arrow_hit(&mut self, h: ArrowHit) {
+        if self.arrow_hits.len() < EVENT_CAP && self.hears(h.pos) {
+            self.arrow_hits.push(h);
+        }
+    }
+
+    pub fn push_arrow_ground(&mut self, p: Vec3) {
+        if self.arrow_ground.len() < EVENT_CAP && self.hears(p) {
+            self.arrow_ground.push(p);
+        }
+    }
+
+    pub fn push_loose(&mut self, group: u32, p: Vec3) {
+        if self.looses.len() < EVENT_CAP && self.hears(p) {
+            self.looses.push((group, p));
+        }
+    }
+}
+
+fn clear_sound_events(mut ev: ResMut<SoundEvents>) {
+    ev.blows.clear();
+    ev.arrow_hits.clear();
+    ev.arrow_ground.clear();
+    ev.looses.clear();
+}
+
+// ------------------------------------------------------------ banks
+
+/// The mix table. Each layer's level in dB relative to a death scream, at
+/// full level (inside the bank's mindist of the look point, close zoom).
+/// Starting values: the balance of the mix before positional audio,
+/// measured as each pool's median loudness plus its old gain; the blows
+/// keep the material balance of the first positional mix (the metal ring
+/// 19 dB under the shield). Priorities and distance
+/// priorities are M2TW's. Group caps are the voices the old mix held
+/// (about 31 for the steel, 18 for the grunts and screams together, 1-2
+/// death screams, 14 bow strings), nearest first. The charge sheets, the
+/// volley, the arrow air and the rout cry sit 7 dB over that balance,
+/// which cancels MIX_GAIN_DB for them: they play at the old mix's
+/// absolute level while the melee plays 7 dB under it. The charge yells
+/// sit 5 dB over it with a larger cap (more yells, each a little
+/// quieter), and the bow strings 10 dB over it so the volley does not
+/// cover them.
+mod mix {
+    /// A death scream's output level in the old mix: pool median
+    /// -7.7 LUFS at gain 0.24 (-12.4 dB).
+    pub const DEATH_SCREAM_OUT: f32 = -20.1;
+    /// Normalized clip loudness (tools/audio_loudness.py targets).
+    pub const ONE_SHOT: f32 = -20.0;
+    pub const SUSTAINED: f32 = -23.0;
+    /// An equal-power pan puts a centred mono voice 3 dB down per channel;
+    /// the old mix played it at full level in both.
+    pub const PAN_CENTRE: f32 = 3.0;
+    /// Full level within this distance of the look point: one man, and a
+    /// whole regiment's sheet.
+    pub const MAN_M: f32 = 20.0;
+    pub const SHEET_M: f32 = 30.0;
+}
+
+/// Every positional level shifts by this (dB): the one setting over the
+/// table tuned by ear. -7 puts a dense melee at the look point near -16
+/// dBFS, where the old mix sat, instead of -9 dBFS on the limiter.
+const MIX_GAIN_DB: f32 = -7.0;
+
+#[allow(clippy::too_many_arguments)]
+const fn bank(
+    name: &'static str,
+    group: &'static str,
+    max_live: u16,
+    priority: f32,
+    dist_priority: f32,
+    rel_db: f32,
+    sustained: bool,
+    speed: (f32, f32),
+) -> Bank {
+    let clip = if sustained { mix::SUSTAINED } else { mix::ONE_SHOT };
+    Bank {
+        name,
+        priority,
+        dist_priority,
+        mindist: if sustained { mix::SHEET_M } else { mix::MAN_M },
+        vol_db: mix::DEATH_SCREAM_OUT + rel_db - clip + mix::PAN_CENTRE + MIX_GAIN_DB,
+        zoom_floor: if sustained { 0.5 } else { 0.0 },
+        speed,
+        group,
+        max_live,
+        duck: Duck::None,
+        fade_in: 0.0,
+        fade_out: 0.0,
+    }
+}
+
+/// An unplaced sound's bank (UI click, sting): the table level without
+/// the centre-pan compensation, since it plays at full level in both
+/// channels.
+const fn flat_bank(name: &'static str, rel_db: f32, sustained: bool) -> Bank {
+    let b = bank(name, name, 0, 250.0, 0.0, rel_db, sustained, (1.0, 1.0));
+    Bank {
+        vol_db: b.vol_db - mix::PAN_CENTRE,
+        ..b
+    }
+}
+
+// Horns, UI clicks and stings at their old level relative to the
+// soldiers (old gain on the pool's loudness, relative to the death
+// scream).
+/// M2TW `war_horn`: placed, full level within 40 m, priority 240, fixed
+/// pitch, carried across the field.
+const HORN_CHARGE: Bank = Bank {
+    mindist: 40.0,
+    zoom_floor: 1.0,
+    ..bank("horn", "horn", 2, 240.0, 0.0, 5.0, true, (1.0, 1.0))
+};
+const HORN_ROUT: Bank = Bank {
+    mindist: 40.0,
+    zoom_floor: 1.0,
+    ..bank("horn", "horn", 2, 240.0, 0.0, 9.5, false, (1.0, 1.0))
+};
+/// M2TW `unit_warhorns_delay 9`: one war horn per army per 9 s.
+const WAR_HORN_GAP_S: f32 = 9.0;
+const UI_SELECT: Bank = flat_bank("ui", -8.8, false);
+/// A move order clicks 5.6 dB under an attack order.
+const UI_ORDER: Bank = flat_bank("ui", -1.9, false);
+const UI_ATTACK: Bank = flat_bank("ui", 3.7, false);
+const STING_VICTORY: Bank = flat_bank("sting", 3.5, true);
+const STING_DEFEAT: Bank = flat_bank("sting", -1.1, true);
+
+// Blows: one shared group, the shield thud loudest, the rings quiet.
+const HIT_WOOD: Bank = bank("hit wood", "blows", 32, 90.0, -2.0, -5.7, false, (0.8, 1.2));
+const HIT_FLESH: Bank = bank("hit flesh", "blows", 32, 90.0, -2.0, -11.6, false, (0.8, 1.2));
+const HIT_METAL: Bank = bank("hit metal", "blows", 32, 90.0, -2.0, -24.7, false, (0.6, 1.1));
+const HIT_STEEL: Bank = bank("hit steel", "blows", 32, 90.0, -2.0, -24.9, false, (0.6, 1.1));
+/// Killing blow. Our flesh-connect pool stands in until a death-hit pool
+/// exists.
+const DEATH_HIT: Bank = bank("death hit", "blows", 32, 180.0, -2.0, -4.9, false, (0.8, 1.2));
+const DEATH_SCREAM: Bank = bank("death scream", "death scream", 3, 130.0, 0.0, 0.0, false, (0.9, 1.1));
+const ATTACK_GRUNT: Bank = Bank {
+    duck: Duck::Target,
+    ..bank("attack grunt", "voices", 18, 120.0, 0.0, -5.5, false, (0.92, 1.08))
+};
+const ATTACK_SCREAM: Bank = Bank {
+    duck: Duck::Target,
+    ..bank("attack scream", "voices", 18, 120.0, 0.0, 1.6, false, (0.92, 1.08))
+};
+const VICTIM_GRUNT: Bank = Bank {
+    duck: Duck::Target,
+    ..bank("victim grunt", "voices", 18, 120.0, 0.0, -8.2, false, (0.92, 1.08))
+};
+const BATTLE_SCREAM: Bank = Bank {
+    duck: Duck::Target,
+    ..bank("battle scream", "battle scream", 8, 100.0, 0.0, 2.2, false, (0.92, 1.08))
+};
+/// Bow string on each loose, at the archer.
+const BOW_STRING: Bank = Bank {
+    duck: Duck::Trigger,
+    ..bank("bow string", "bow string", 16, 110.0, 0.0, -9.4, false, (0.88, 1.12))
+};
+const ARROW_FLESH: Bank = bank("arrow flesh", "arrow strike", 8, 90.0, -2.0, -16.3, false, (0.8, 1.2));
+const ARROW_WOOD: Bank = bank("arrow wood", "arrow strike", 8, 90.0, -2.0, -14.5, false, (0.8, 1.2));
+const ARROW_DEATH_HIT: Bank = bank("death hit", "arrow strike", 8, 180.0, -2.0, -4.9, false, (0.8, 1.2));
+const ARROW_GROUND: Bank = bank("arrow ground", "arrow ground", 6, 90.0, -2.0, -30.7, false, (0.8, 1.2));
+/// A looped air sound on three arrows in ten, followed in flight.
+const ARROW_FLY: Bank = bank("arrow fly", "arrow fly", 12, 170.0, 0.0, -19.7, true, (0.5, 1.5));
+/// A shaft dropping past the look point.
+const ARROW_WHIZZ: Bank = bank("arrow whizz", "arrow whizz", 4, 170.0, 0.0, -22.9, false, (0.7, 1.3));
+/// One group release per volley share (M2TW unit_missile_attack).
+const VOLLEY: Bank = Bank {
+    duck: Duck::Trigger,
+    ..bank("volley", "volley", 4, 190.0, -1.0, 3.6, true, (0.9, 1.1))
+};
+/// A charge yell is heard across the charging block (about 60 m wide):
+/// full level within a sheet's distance.
+const CHARGE_YELL: Bank = Bank {
+    mindist: mix::SHEET_M,
+    duck: Duck::Target,
+    ..bank("charge yell", "charge yell", 64, 80.0, 0.0, 4.6, false, (0.9, 1.1))
+};
+/// M2TW `unit_fighting` (vanilla = SSHIP, devlog 0165): one loop per
+/// regiment in melee, placed at the regiment, priority 220 whatever the
+/// distance, pitch 0.9-1.1, fading in and out over 2 s. M2TW picks
+/// Small / Medium / Large by the men fighting; our takes are picked at
+/// random. This bank plays the close takes.
+const FIGHT_LOOP: Bank = Bank {
+    fade_in: 2.0,
+    fade_out: 2.0,
+    ..bank("fight loop", "fight loop", 0, 220.0, 0.0, -3.0, true, (0.9, 1.1))
+};
+/// The mid and mid-close takes, 2 dB over the close ones: at the same
+/// average loudness their steadier, duller sound read about 1 dB quieter
+/// at its loudest moments.
+const FIGHT_LOOP_MID: Bank = Bank {
+    fade_in: 2.0,
+    fade_out: 2.0,
+    ..bank("fight loop", "fight loop", 0, 220.0, 0.0, -1.0, true, (0.9, 1.1))
+};
+/// M2TW `cam_cull_radius_unit`: no unit sound beyond this distance from
+/// the camera (m).
+const FIGHT_CULL_M: f32 = 100.0;
+/// The fight loop pool holds the close takes first, then the mid takes,
+/// then the mid-close takes.
+const FIGHT_CLOSE_TAKES: usize = 6;
+const FIGHT_MID_TAKES: usize = 2;
+
+/// FL_FIGHT_TAKES=close, mid or midclose: every fighting regiment picks only
+/// from that set of takes, to judge one set alone.
+fn fight_takes(n: usize) -> std::ops::Range<usize> {
+    static SET: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let set = SET.get_or_init(|| std::env::var("FL_FIGHT_TAKES").unwrap_or_default().trim().to_lowercase());
+    let mid_end = (FIGHT_CLOSE_TAKES + FIGHT_MID_TAKES).min(n);
+    match set.as_str() {
+        "close" => 0..FIGHT_CLOSE_TAKES.min(n),
+        "mid" => FIGHT_CLOSE_TAKES.min(n)..mid_end,
+        "midclose" => mid_end..n,
+        _ => 0..n,
+    }
+}
+
+/// Tracked-loop keys of the fight loops, clear of the arrow ids.
+const FIGHT_KEY: u64 = 1 << 40;
+const CHARGE_SHEET: Bank = bank("charge sheet", "charge sheet", 0, 170.0, -1.0, 3.6, true, (0.8, 1.1));
+const CHEER_SHEET: Bank = bank("cheer sheet", "cheer sheet", 0, 170.0, -1.0, -2.0, true, (0.9, 1.0));
+const WHOOP: Bank = bank("whoop", "whoop", 10, 100.0, 0.0, 1.1, false, (0.92, 1.08));
+const ROUT_SHOUT: Bank = bank("rout shout", "rout shout", 3, 120.0, 0.0, 3.9, false, (0.94, 1.06));
+const ROUT_PANIC: Bank = bank("rout panic", "rout panic", 4, 110.0, 0.0, -6.4, true, (0.92, 1.08));
+const FEET: Bank = bank("feet", "feet", 6, 70.0, 0.0, -11.3, true, (0.94, 1.06));
+/// A crowd cry from a regiment the moment it breaks, one at a time, 2 dB
+/// over the old break cue's absolute level (0.55 on clips of -12.5
+/// LUFS), so it clears the melee around the breaking regiment.
+const ROUT_CROWD: Bank = bank("rout crowd", "rout crowd", 1, 150.0, -1.0, 11.4, true, (1.0, 1.0));
+
+/// One sim tick in seconds: a tick's events are spread over it.
+const TICK_S: f32 = 1.0 / 30.0;
+
+/// The positional clip pools, decoded into the mixer.
+#[derive(Resource)]
+struct Pools {
+    bow_string: Vec<ClipId>,
+    hit_steel: Vec<ClipId>,
+    hit_metal: Vec<ClipId>,
+    hit_wood: Vec<ClipId>,
+    hit_flesh: Vec<ClipId>,
+    death_scream: Vec<ClipId>,
+    attack_grunt: Vec<ClipId>,
+    attack_scream: Vec<ClipId>,
+    victim_grunt: Vec<ClipId>,
+    battle_scream: Vec<ClipId>,
+    arrow_flesh: Vec<ClipId>,
+    arrow_wood: Vec<ClipId>,
+    arrow_ground: Vec<ClipId>,
+    arrow_fly: Vec<ClipId>,
+    arrow_whizz: Vec<ClipId>,
+    volley: Vec<ClipId>,
+    charge_yell: Vec<ClipId>,
+    fight_loop: Vec<ClipId>,
+    charge_medium: Vec<ClipId>,
+    charge_large: Vec<ClipId>,
+    cheer_small: Vec<ClipId>,
+    cheer_large: Vec<ClipId>,
+    whoop: Vec<ClipId>,
+    rout_shout: Vec<ClipId>,
+    rout_panic: Vec<ClipId>,
+    rout_crowd: Vec<ClipId>,
+    feet: Vec<ClipId>,
+    horn_charge: Vec<ClipId>,
+    horn_rout: ClipId,
+    ui_select: ClipId,
+    /// Click feedback for a move order.
+    ui_order: ClipId,
+    /// Click feedback for an attack order on an enemy regiment.
+    ui_attack: ClipId,
+    sting_victory: ClipId,
+    sting_defeat: ClipId,
+}
+
+/// The looping bed layers.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Bed {
-    Far,
-    Mid,
-    Close,
-    Drums,
-    /// Massed boots (Pixabay loop) — plays with the drums on the march.
+    /// Massed boots (Pixabay loop) while an own regiment marches.
     March,
 }
 
-fn setup_audio(mut commands: Commands, assets: Res<AssetServer>) {
-    let load_set = |names: &[&str]| -> Vec<Handle<AudioSource>> {
-        names.iter().map(|n| assets.load(format!("{n}.mp3"))).collect()
-    };
+impl Bed {
+    const ALL: [Bed; 1] = [Bed::March];
 
-    commands.insert_resource(AudioBank {
+    /// The layer's takes under assets/. The first one's loudness is the
+    /// layer's level; the others are matched to it.
+    fn takes(self) -> &'static [&'static str] {
+        match self {
+            Bed::March => &["sfx_new/bed_march_loop_14.5s.mp3"],
+        }
+    }
+
+    /// Gain that matches take `i` to the layer's first take.
+    fn take_gain(self, i: usize) -> f32 {
+        let t = self.takes();
+        crate::mixer::db_to_lin(norm_db(t[i]) - norm_db(t[0]))
+    }
+}
+
+/// One playing take of a bed layer. A layer with several takes hands over
+/// to another one before the current take ends, crossfading.
+#[derive(Component)]
+struct BedTake {
+    bed: Bed,
+    take: usize,
+    /// Crossfade position 0..1: rises while the take is current, falls
+    /// once it has been handed over.
+    xfade: f32,
+    current: bool,
+}
+
+/// FL_BED_MUTE=march,close: silence the named layers (march, and close
+/// for the fight loops), to hear the others alone.
+fn layer_muted(layer: &str) -> bool {
+    static MUTED: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    MUTED
+        .get_or_init(|| {
+            std::env::var("FL_BED_MUTE")
+                .unwrap_or_default()
+                .split(',')
+                .map(|s| s.trim().to_lowercase())
+                .collect()
+        })
+        .iter()
+        .any(|m| m == layer)
+}
+
+fn bed_muted(bed: Bed) -> bool {
+    layer_muted(&format!("{bed:?}").to_lowercase())
+}
+
+/// FL_SOLDIER_SFX=0.5: the share of melee soldier sounds that play (every
+/// sound of a blow, and battle screams), 1 by default, to judge the fight
+/// loops under fewer or none of them.
+fn soldier_sfx_share() -> f32 {
+    static SHARE: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *SHARE.get_or_init(|| crate::util::env_or("FL_SOLDIER_SFX", 1.0_f32).clamp(0.0, 1.0))
+}
+
+/// Crossfade between two takes of a bed layer (s).
+const BED_XFADE_S: f32 = 3.0;
+
+fn spawn_bed_take(commands: &mut Commands, assets: &AssetServer, bed: Bed, take: usize, xfade: f32) {
+    commands.spawn((
+        AudioPlayer::new(assets.load(bed.takes()[take])),
+        PlaybackSettings {
+            volume: Volume::Linear(0.0),
+            ..PlaybackSettings::LOOP
+        },
+        BedTake {
+            bed,
+            take,
+            xfade,
+            current: true,
+        },
+    ));
+}
+
+fn setup_audio(mut commands: Commands, assets: Res<AssetServer>, mut clips: ResMut<Clips>) {
+    let clips = &mut *clips;
+
+    commands.insert_resource(Pools {
+        bow_string: pool(clips, &assets, &[
+            "sfx_bow/sfx_bow_loose_01",
+            "sfx_bow/sfx_bow_loose_02",
+            "sfx_bow/sfx_bow_loose_03",
+            "sfx_bow/sfx_bow_loose_04",
+        ]),
         // The second batch (sfx_new/) won out over the first clangs.
-        clang: load_set(&[
+        hit_steel: pool(clips, &assets, &[
             "sfx_new/sword_clang_06",
             "sfx_new/sword_clang_07",
             "sfx_new/sword_clang_08",
             "sfx_new/sword_clang_09",
-            "sfx_new/armor_clang_01",
-            "sfx_new/armor_clang_02",
         ]),
-        shield: load_set(&["sfx_shield_01", "sfx_shield_02", "sfx_shield_03"]),
-        damage: load_set(&[
+        hit_metal: pool(clips, &assets, &["sfx_new/armor_clang_01", "sfx_new/armor_clang_02"]),
+        hit_wood: pool(clips, &assets, &["sfx_shield_01", "sfx_shield_02", "sfx_shield_03"]),
+        hit_flesh: pool(clips, &assets, &[
             "sfx_new/sfx_blunt_damage_01",
             "sfx_new/sfx_blunt_damage_02",
-            "sfx_new/sfx_spear_damage_01",
             "sfx_new/sfx_sword_damage_01",
             "sfx_new/sfx_sword_damage_02",
         ]),
-        death: load_set(&[
+        death_scream: pool(clips, &assets, &[
             "sfx_death_01",
             "sfx_death_02",
             "sfx_death_03",
             "sfx_death_04",
             "sfx_death_05",
         ]),
-        // vox_rally_01/02 are benched: unusable, use nowhere.
-        vox_rout: load_set(&[
-            "vox_rout_01",
-            "vox_rout_02",
-            "vox_rout_03",
-            "sfx_rout/vox_rout_04",
-            "sfx_rout/vox_rout_05",
-        ]),
-        rout_shout: load_set(&[
-            "sfx_rout/fallback0",
-            "sfx_rout/fallback1",
-            "sfx_rout/fallback2",
-            "sfx_rout/retreat0",
-            "sfx_rout/retreat1",
-            "sfx_rout/run_away!0",
-            "sfx_rout/run_away!1_funny",
-            "sfx_rout/withdraw0",
-            "sfx_rout/withdraw1",
-            "sfx_rout/withdraw2",
-        ]),
-        rout_panic: load_set(&[
-            "sfx_rout/vox_panic_01",
-            "sfx_rout/vox_panic_02",
-            "sfx_rout/vox_panic_03",
-        ]),
-        // Massed washes layered from the single-man source loops by
-        // tmp/build-feet-wash.sh (ElevenLabs would only produce one
-        // or two runners per take).
-        feet_wash: load_set(&[
-            "sfx_rout/feet_run_wash_mass_01",
-            "sfx_rout/feet_run_wash_mass_02",
-        ]),
-        // The sfx_new/vox_rally_03/04_celebrate one-shots are benched
-        // (superseded); the celebrate state cheers from these.
-        celebrate_small: load_set(&[
-            "sfx_celebrate/group_cheer_small_01_mocking",
-            "sfx_celebrate/group_cheer_small_02_mocking",
-            "sfx_celebrate/group_cheer_small_04_laughing",
-            "sfx_celebrate/group_cheer_small_05_laughing",
-            "sfx_celebrate/group_cheer_small_06_laughing",
-            "sfx_celebrate/group_cheer_small_07_joyous_shouts",
-            "sfx_celebrate/group_cheer_small_08_joyous_shouts",
-        ]),
-        celebrate_large: load_set(&[
-            "sfx_celebrate/group_cheer_large_01",
-            "sfx_celebrate/group_cheer_large_02_short",
-            "sfx_celebrate/group_cheer_large_03_ok",
-            "sfx_celebrate/group_cheer_large_04",
-            "sfx_celebrate/group_cheer_large_05_ok",
-        ]),
-        // vox_whoop_04 benched by its own filename (skipfornow).
-        celebrate_whoop: load_set(&[
-            "sfx_celebrate/vox_whoop_01",
-            "sfx_celebrate/vox_whoop_02_joyous_shout",
-            "sfx_celebrate/vox_whoop_03_laugh",
-            "sfx_celebrate/vox_whoop_05_knight_laugh",
-            "sfx_celebrate/vox_whoop_06_cheer_yeah",
-            "sfx_celebrate/vox_whoop_07_roar_yeah",
-            "sfx_celebrate/vox_whoop_08_knight_shout_yes",
-            "sfx_celebrate/vox_whoop_09_knight_shout_yeaa",
-        ]),
-        melee_attack_grunt: load_set(&[
+        attack_grunt: pool(clips, &assets, &[
             "sfx_melee/attack_grunts/attack_grunt0",
             "sfx_melee/attack_grunts/attack_grunt_knight0",
             "sfx_melee/attack_grunts/attack_grunt_knight1",
@@ -290,7 +642,7 @@ fn setup_audio(mut commands: Commands, assets: Res<AssetServer>) {
             "sfx_melee/attack_grunts/attack_grunt_young_knight3",
             "sfx_melee/attack_grunts/attack_grunt_young_knight4",
         ]),
-        melee_attack_scream: load_set(&[
+        attack_scream: pool(clips, &assets, &[
             "sfx_melee/attack_screams/attack_scream0_bitfunny",
             "sfx_melee/attack_screams/attack_scream1_young",
             "sfx_melee/attack_screams/attack_scream2_good",
@@ -304,7 +656,7 @@ fn setup_audio(mut commands: Commands, assets: Res<AssetServer>) {
             "sfx_melee/attack_screams/attack_scream_young2",
             "sfx_melee/attack_screams/attack_scream_young3",
         ]),
-        melee_hit_grunt: load_set(&[
+        victim_grunt: pool(clips, &assets, &[
             "sfx_melee/hit_grunts/choked_groan(big_damage)1",
             "sfx_melee/hit_grunts/damage_gasp0",
             "sfx_melee/hit_grunts/damage_gasp1",
@@ -322,7 +674,7 @@ fn setup_audio(mut commands: Commands, assets: Res<AssetServer>) {
             "sfx_melee/hit_grunts/damage_grunt12",
             "sfx_melee/hit_grunts/stabbed0",
         ]),
-        melee_battle_scream: load_set(&[
+        battle_scream: pool(clips, &assets, &[
             "sfx_melee/battle_screams/battle_scream0",
             "sfx_melee/battle_screams/battle_scream1",
             "sfx_melee/battle_screams/battle_scream3",
@@ -332,193 +684,207 @@ fn setup_audio(mut commands: Commands, assets: Res<AssetServer>) {
             "sfx_melee/battle_screams/battle_scream8",
             "sfx_melee/battle_screams/battle_scream9",
         ]),
-        // The old vox_warcry crowd clips are benched: the charge is
-        // layered from these pools now.
-        yell_charge: load_set(&[
-            "sfx_charge/vox_yell_01",
-            "sfx_charge/vox_yell_01b",
-            "sfx_charge/vox_yell_02",
-            "sfx_charge/vox_yell_02b",
-            "sfx_charge/vox_yell_03a",
-            "sfx_charge/vox_yell_03b",
-            "sfx_charge/vox_yell_03c",
-            "sfx_charge/vox_yell_03d",
-            "sfx_charge/vox_yell_04",
-            "sfx_charge/vox_yell_04b",
-            "sfx_charge/vox_yell_05a",
-            "sfx_charge/vox_yell_05b",
-            "sfx_charge/vox_yell_06a",
-            "sfx_charge/vox_yell_06b",
-            "sfx_charge/vox_yell_07",
-            "sfx_charge/vox_yell_08",
-            "sfx_charge/vox_yell_09a",
-            "sfx_charge/vox_yell_09b",
-            "sfx_charge/vox_yell_09c",
-            "sfx_charge/vox_yell_09d",
-            "sfx_charge/vox_yell_09_young_a",
-            "sfx_charge/vox_yell_09_young_b",
-            "sfx_charge/vox_yell_09_young_c",
-            "sfx_charge/vox_yell_09_young_d",
-            "sfx_charge/vox_yell_10a",
-            "sfx_charge/vox_yell_10b",
-            "sfx_charge/vox_yell_10c",
-            "sfx_charge/vox_yell_10_young_a",
-            "sfx_charge/vox_yell_10_young_b",
-        ]),
-        group_charge_medium: load_set(&["sfx_charge/group_charge_medium"]),
-        group_charge_large: load_set(&[
-            "sfx_charge/group_charge_large_01",
-            "sfx_charge/group_charge_large_02",
-        ]),
-        horn_charge: load_set(&["sig_horn_charge", "sig_horn_charge_02"]),
-        horn_rout: assets.load("sfx_new/sig_horn_rout.mp3"),
-        ui_select: assets.load("sfx_new/ui_select1.mp3"),
-        ui_order: assets.load("sfx_new/ui_order0.mp3"),
-        ui_attack: assets.load("sfx_new/ui_attack.mp3"),
-        sting_victory: assets.load("sting_victory.mp3"),
-        sting_defeat: assets.load("sting_defeat.mp3"),
-        bow_loose: load_set(&[
-            "sfx_bow/sfx_bow_loose_01",
-            "sfx_bow/sfx_bow_loose_02",
-            "sfx_bow/sfx_bow_loose_03",
-            "sfx_bow/sfx_bow_loose_04",
-        ]),
-        arrow_flesh: load_set(&[
+        arrow_flesh: pool(clips, &assets, &[
             "sfx_bow/sfx_arrow_flesh_01",
             "sfx_bow/sfx_arrow_flesh_02",
             "sfx_bow/sfx_arrow_flesh_03",
         ]),
-        arrow_wood: load_set(&["sfx_bow/sfx_arrow_wood_01", "sfx_bow/sfx_arrow_wood_02"]),
-        arrow_ground: load_set(&[
+        arrow_wood: pool(clips, &assets, &["sfx_bow/sfx_arrow_wood_01", "sfx_bow/sfx_arrow_wood_02"]),
+        arrow_ground: pool(clips, &assets, &[
             "sfx_bow/sfx_arrow_ground_01",
             "sfx_bow/sfx_arrow_ground_02",
             "sfx_bow/sfx_arrow_ground_03",
         ]),
-        arrow_flyby: load_set(&["sfx_bow/sfx_arrow_flyby_01", "sfx_bow/sfx_arrow_flyby_02"]),
-        arrow_fly_loop: load_set(&[
-            "sfx_bow/sfx_arrow_fly_loop_01",
-            "sfx_bow/sfx_arrow_fly_loop_02",
+        arrow_fly: pool(clips, &assets, &["sfx_bow/sfx_arrow_fly_loop_01", "sfx_bow/sfx_arrow_fly_loop_02"]),
+        arrow_whizz: pool(clips, &assets, &["sfx_bow/sfx_arrow_flyby_01", "sfx_bow/sfx_arrow_flyby_02"]),
+        volley: vec![
+            load(clips, &assets, "sfx_bow/sfx_volley_away_01.wav"),
+            load(clips, &assets, "sfx_bow/sfx_volley_away_02.mp3"),
+            load(clips, &assets, "sfx_bow/sfx_volley_away_03.mp3"),
+        ],
+        fight_loop: pool(clips, &assets, &[
+            "bed_melee_close0",
+            "bed_melee_close1",
+            "bed_melee_close2",
+            "bed_melee_close3",
+            "bed_melee_close4",
+            "bed_melee_close5",
+            "bed_battle_mid0",
+            "bed_battle_mid1",
+            "bed_melee_midclose0",
+            "bed_melee_midclose1",
+            "bed_melee_midclose2",
+            "bed_melee_midclose3",
         ]),
-        volley_away: vec![
-            assets.load("sfx_bow/sfx_volley_away_01.wav"),
-            assets.load("sfx_bow/sfx_volley_away_02.mp3"),
-            assets.load("sfx_bow/sfx_volley_away_03.mp3"),
-        ],
-        volley_incoming: vec![
-            assets.load("sfx_bow/volley_02_flight_incoming.wav"),
-            assets.load("sfx_bow/arrow_incoming_02_several.mp3"),
-            assets.load("sfx_bow/arrow_incoming_03.mp3"),
-        ],
+        charge_yell: pool(
+            clips,
+            &assets,
+            &[
+                "sfx_charge/vox_yell_01",
+                "sfx_charge/vox_yell_01b",
+                "sfx_charge/vox_yell_02",
+                "sfx_charge/vox_yell_02b",
+                "sfx_charge/vox_yell_03a",
+                "sfx_charge/vox_yell_03b",
+                "sfx_charge/vox_yell_03c",
+                "sfx_charge/vox_yell_03d",
+                "sfx_charge/vox_yell_04",
+                "sfx_charge/vox_yell_04b",
+                "sfx_charge/vox_yell_05a",
+                "sfx_charge/vox_yell_05b",
+                "sfx_charge/vox_yell_06a",
+                "sfx_charge/vox_yell_06b",
+                "sfx_charge/vox_yell_07",
+                "sfx_charge/vox_yell_08",
+                "sfx_charge/vox_yell_09a",
+                "sfx_charge/vox_yell_09b",
+                "sfx_charge/vox_yell_09c",
+                "sfx_charge/vox_yell_09d",
+                "sfx_charge/vox_yell_09_young_a",
+                "sfx_charge/vox_yell_09_young_b",
+                "sfx_charge/vox_yell_09_young_c",
+                "sfx_charge/vox_yell_09_young_d",
+                "sfx_charge/vox_yell_10a",
+                "sfx_charge/vox_yell_10b",
+                "sfx_charge/vox_yell_10c",
+                "sfx_charge/vox_yell_10_young_a",
+                "sfx_charge/vox_yell_10_young_b",
+            ],
+        ),
+        charge_medium: pool(clips, &assets, &["sfx_charge/group_charge_medium"]),
+        charge_large: pool(
+            clips,
+            &assets,
+            &["sfx_charge/group_charge_large_01", "sfx_charge/group_charge_large_02"],
+        ),
+        cheer_small: pool(
+            clips,
+            &assets,
+            &[
+                "sfx_celebrate/group_cheer_small_01_mocking",
+                "sfx_celebrate/group_cheer_small_02_mocking",
+                "sfx_celebrate/group_cheer_small_04_laughing",
+                "sfx_celebrate/group_cheer_small_05_laughing",
+                "sfx_celebrate/group_cheer_small_06_laughing",
+                "sfx_celebrate/group_cheer_small_07_joyous_shouts",
+                "sfx_celebrate/group_cheer_small_08_joyous_shouts",
+            ],
+        ),
+        cheer_large: pool(
+            clips,
+            &assets,
+            &[
+                "sfx_celebrate/group_cheer_large_01",
+                "sfx_celebrate/group_cheer_large_02_short",
+                "sfx_celebrate/group_cheer_large_03_ok",
+                "sfx_celebrate/group_cheer_large_04",
+                "sfx_celebrate/group_cheer_large_05_ok",
+            ],
+        ),
+        // vox_whoop_04 benched by its own filename (skipfornow).
+        whoop: pool(
+            clips,
+            &assets,
+            &[
+                "sfx_celebrate/vox_whoop_01",
+                "sfx_celebrate/vox_whoop_02_joyous_shout",
+                "sfx_celebrate/vox_whoop_03_laugh",
+                "sfx_celebrate/vox_whoop_05_knight_laugh",
+                "sfx_celebrate/vox_whoop_06_cheer_yeah",
+                "sfx_celebrate/vox_whoop_07_roar_yeah",
+                "sfx_celebrate/vox_whoop_08_knight_shout_yes",
+                "sfx_celebrate/vox_whoop_09_knight_shout_yeaa",
+            ],
+        ),
+        rout_shout: pool(
+            clips,
+            &assets,
+            &[
+                "sfx_rout/fallback0",
+                "sfx_rout/fallback1",
+                "sfx_rout/fallback2",
+                "sfx_rout/retreat0",
+                "sfx_rout/retreat1",
+                "sfx_rout/run_away!0",
+                "sfx_rout/run_away!1_funny",
+                "sfx_rout/withdraw0",
+                "sfx_rout/withdraw1",
+                "sfx_rout/withdraw2",
+            ],
+        ),
+        rout_panic: pool(
+            clips,
+            &assets,
+            &["sfx_rout/vox_panic_01", "sfx_rout/vox_panic_02", "sfx_rout/vox_panic_03"],
+        ),
+        // vox_rally_01/02 are benched: unusable, use nowhere.
+        rout_crowd: pool(
+            clips,
+            &assets,
+            &[
+                "vox_rout_01",
+                "vox_rout_02",
+                "vox_rout_03",
+                "sfx_rout/vox_rout_04",
+                "sfx_rout/vox_rout_05",
+            ],
+        ),
+        // Massed running feet, layered from single-man loops.
+        feet: pool(
+            clips,
+            &assets,
+            &["sfx_rout/feet_run_wash_mass_01", "sfx_rout/feet_run_wash_mass_02"],
+        ),
+        horn_charge: pool(clips, &assets, &["sig_horn_charge", "sig_horn_charge_02"]),
+        horn_rout: load(clips, &assets, "sfx_new/sig_horn_rout.mp3"),
+        ui_select: load(clips, &assets, "sfx_new/ui_select1.mp3"),
+        ui_order: load(clips, &assets, "sfx_new/ui_order0.mp3"),
+        ui_attack: load(clips, &assets, "sfx_new/ui_attack.mp3"),
+        sting_victory: load(clips, &assets, "sting_victory.mp3"),
+        sting_defeat: load(clips, &assets, "sting_defeat.mp3"),
     });
 
-    let bed = |name: &str| {
-        (
-            AudioPlayer::new(assets.load(format!("{name}.mp3"))),
-            PlaybackSettings {
-                volume: Volume::Linear(0.0),
-                ..PlaybackSettings::LOOP
-            },
-        )
-    };
-    commands.spawn((bed("bed_battle_far"), Bed::Far));
-    commands.spawn((bed("bed_battle_mid0"), Bed::Mid));
-    commands.spawn((bed("bed_melee_close0"), Bed::Close));
-    commands.spawn((bed("sig_drums_march"), Bed::Drums));
-    commands.spawn((bed("sfx_new/bed_march_loop_14.5s"), Bed::March));
+    for bed in Bed::ALL {
+        spawn_bed_take(&mut commands, &assets, bed, 0, 1.0);
+    }
 }
 
-fn silence_beds(mut sinks: Query<&mut AudioSink, With<Bed>>) {
+fn silence_beds(mut sinks: Query<&mut AudioSink, With<BedTake>>) {
     for mut sink in &mut sinks {
         sink.set_volume(Volume::Linear(0.0));
     }
 }
 
-/// Looping fly sounds must not ring into the results screen (one-shots
-/// may — the sting must finish; a loop never finishes).
-fn stop_fly_loops(mut commands: Commands, loops: Query<Entity, With<ArrowFlyLoop>>) {
-    for e in &loops {
-        commands.entity(e).despawn();
-    }
-}
-
-/// Despawn every in-flight one-shot (war cries, horns, sting tails).
-fn stop_one_shots(
-    mut commands: Commands,
-    playing: Query<Entity, (With<AudioPlayer>, Without<Bed>)>,
-) {
-    for e in &playing {
-        commands.entity(e).despawn();
-    }
-}
-
-/// Crossfade the beds from battle state around the camera focus.
+/// Fade the march bed in while an own regiment marches, and rotate each
+/// layer's takes.
+#[allow(clippy::too_many_arguments)] // bevy system params
 fn update_beds(
+    mut commands: Commands,
+    assets: Res<AssetServer>,
     groups: Res<Groups>,
-    stats: Res<SimStats>,
-    camera: Query<&RtsCamera>,
     time: Res<Time<Real>>,
     virt_time: Res<Time<Virtual>>,
     settings: Res<crate::settings::Settings>,
-    mut sinks: Query<(&Bed, &mut AudioSink)>,
+    mut takes: Query<(Entity, &mut BedTake, Option<&mut AudioSink>)>,
+    mut clock: Local<([f32; Bed::ALL.len()], u32)>,
+    mut next_log: Local<f32>,
 ) {
-    let Ok(cam) = camera.single() else { return };
     let paused = virt_time.is_paused();
-    let focus = Vec2::new(cam.focus.x, cam.focus.z);
+    let marching_own = groups
+        .list
+        .iter()
+        .any(|g| g.count > 0 && !g.engaged && g.team == 0 && g.order.is_some() && !g.state.is_broken());
 
-    let mut engaged_total = 0usize;
-    let mut engaged_near = 0usize;
-    let mut min_dist = f32::MAX;
-    let mut marching_own = false;
-    for g in &groups.list {
-        if g.count == 0 {
-            continue;
-        }
-        if g.engaged {
-            engaged_total += 1;
-            let d = g.centroid.distance(focus);
-            min_dist = min_dist.min(d);
-            if d < 300.0 {
-                engaged_near += 1;
-            }
-        } else if g.team == 0 && g.order.is_some() && !g.state.is_broken() {
-            marching_own = true;
-        }
-    }
-
-    // Zooming out raises the "how far can you hear" floor a bit.
-    let hear = 220.0 + cam.distance * 0.5;
-    let prox = if min_dist == f32::MAX {
-        0.0
-    } else {
-        (1.0 - (min_dist / hear)).clamp(0.0, 1.0)
-    };
-    let hits = (stats.events as f32 / 40.0).clamp(0.0, 1.0);
-
-    // Zoomed out you should hear the DIN of battle, not individual steel:
-    // the close-melee layer fades toward the mid/far beds with distance.
-    let zoom_att = zoom_attenuation(cam.distance);
-
+    // Level before the master volume; the sink gets it times `m`.
     let m = battle_vol(&settings);
-    let target = |bed: &Bed| -> f32 {
-        if paused {
+    let level = |bed: &Bed| -> f32 {
+        if paused || bed_muted(*bed) {
             return 0.0;
         }
         match bed {
-            Bed::Far => 0.22 * ((engaged_total as f32) / 8.0).clamp(0.0, 1.0) * m,
-            Bed::Mid => 0.45 * ((engaged_near as f32) / 5.0).clamp(0.0, 1.0) * prox.sqrt() * m,
-            Bed::Close => {
-                0.60 * prox * prox * (0.25 + 0.75 * hits) * (0.35 + 0.65 * zoom_att) * m
-            }
-            Bed::Drums => {
-                if marching_own {
-                    0.30 * m
-                } else {
-                    0.0
-                }
-            }
             Bed::March => {
                 if marching_own {
-                    0.28 * m
+                    0.28
                 } else {
                     0.0
                 }
@@ -526,476 +892,652 @@ fn update_beds(
         }
     };
 
+    // Hand each multi-take layer over to another take before the current
+    // one ends (a paused battle holds the clocks).
+    let dt = if paused { 0.0 } else { time.delta_secs() };
+    let (left, roll) = &mut *clock;
+    for (i, bed) in Bed::ALL.into_iter().enumerate() {
+        let n = bed.takes().len();
+        if n < 2 {
+            continue;
+        }
+        left[i] -= dt;
+        if left[i] > 0.0 {
+            continue;
+        }
+        let mut current = 0;
+        for (_, mut t, _) in &mut takes {
+            if t.bed == bed && t.current {
+                t.current = false;
+                current = t.take;
+            }
+        }
+        *roll = roll.wrapping_add(1);
+        let next = (current + 1 + (hash01(roll.wrapping_mul(0x9E37_79B1)) * (n - 1) as f32) as usize % (n - 1)) % n;
+        spawn_bed_take(&mut commands, &assets, bed, next, 0.0);
+        left[i] = clip_info(bed.takes()[next]).1 - BED_XFADE_S;
+    }
+
     let blend = (time.delta_secs() / BED_SMOOTH).min(1.0);
-    for (bed, mut sink) in &mut sinks {
-        let cur = sink.volume().to_linear();
-        let v = cur + (target(bed) - cur) * blend;
-        sink.set_volume(Volume::Linear(v));
+    let step = time.delta_secs() / BED_XFADE_S;
+    let mut levels = Vec::new();
+    for (e, mut t, sink) in &mut takes {
+        t.xfade = if t.current { (t.xfade + step).min(1.0) } else { t.xfade - step };
+        if !t.current && t.xfade <= 0.0 {
+            commands.entity(e).despawn();
+            continue;
+        }
+        // Equal-power crossfade.
+        let w = (t.xfade.clamp(0.0, 1.0) * std::f32::consts::FRAC_PI_2).sin();
+        let lv = level(&t.bed) * t.bed.take_gain(t.take) * w;
+        if let Some(mut sink) = sink {
+            let cur = sink.volume().to_linear();
+            sink.set_volume(Volume::Linear(cur + (lv * m - cur) * blend));
+        }
+        levels.push((t.bed.takes()[t.take], lv));
+    }
+
+    // FL_LOG_AUDIO: each bed's level, its clip's loudness plus its volume
+    // (LUFS, comparable to the mixer's per-group dBFS within a few dB).
+    static LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *LOG.get_or_init(|| std::env::var("FL_LOG_AUDIO").is_ok()) && time.elapsed_secs() >= *next_log {
+        *next_log = time.elapsed_secs() + 1.0;
+        let line: Vec<String> = levels
+            .iter()
+            .filter(|(_, v)| *v > 1e-4)
+            .map(|(path, v)| format!("{path} {:.0}", -23.0 - norm_db(path) + 20.0 * v.log10()))
+            .collect();
+        crate::mixer::audio_log(
+            time.elapsed_secs_f64(),
+            &format!("beds: {}", line.join(", ")),
+        );
     }
 }
 
-/// Mean XZ of the live arrow pool — where "the volley" is for
-/// proximity purposes. None when nothing is in the air.
-fn arrow_cloud(arrows: &crate::arrows::Arrows) -> Option<Vec2> {
-    if arrows.len() == 0 {
-        return None;
-    }
-    let mut sum = Vec2::ZERO;
-    for p in &arrows.pos {
-        sum += p.xz();
-    }
-    Some(sum / arrows.len() as f32)
-}
-
-/// Poor-man's proximity: how "inside the battle" the camera is by zoom.
-/// 1.0 at RTS close-up (<= 90 m), fading to a floor when surveying the
-/// whole map. Real per-source spatial audio is a future item; this alone
-/// stops individual clangs/screams from following you to max zoom.
-fn zoom_attenuation(cam_distance: f32) -> f32 {
+/// How "inside the battle" the camera is by zoom, for the beds and every
+/// positional sound: 1.0 at RTS close-up (<= 90 m), fading to a floor when
+/// surveying the whole map.
+pub(crate) fn zoom_attenuation(cam_distance: f32) -> f32 {
     (90.0 / cam_distance.max(90.0)).clamp(0.12, 1.0)
 }
 
-/// Spawn a fire-and-forget one-shot with volume/pitch jitter. `vol` is
-/// the final linear volume; callers scale by `battle_vol`/`ui_vol`.
-fn one_shot(commands: &mut Commands, h: Handle<AudioSource>, vol: f32, speed: f32) {
-    commands.spawn((
-        AudioPlayer::new(h),
-        PlaybackSettings {
-            volume: Volume::Linear(vol),
-            speed,
-            ..PlaybackSettings::DESPAWN
-        },
-    ));
+// ------------------------------------------------------------ positional sounds
+
+/// Ask the mixer for a clip from `pool` at `pos`, a sound of regiment
+/// `unit` (NO_UNIT for none).
+fn play(mixer: &mut Mixer, pool: &[ClipId], bank: Bank, pos: Vec3, seed: u32, delay: f32, unit: u32) {
+    play_tagged(mixer, pool, bank, pos, seed, delay, unit, 0);
 }
 
-fn pick(v: &[Handle<AudioSource>], seed: u32) -> Option<Handle<AudioSource>> {
-    if v.is_empty() {
-        return None;
+/// `play`, tagging the voice with `tag` so it can be faded out later.
+#[allow(clippy::too_many_arguments)]
+fn play_tagged(
+    mixer: &mut Mixer,
+    pool: &[ClipId],
+    bank: Bank,
+    pos: Vec3,
+    seed: u32,
+    delay: f32,
+    unit: u32,
+    tag: u64,
+) {
+    if pool.is_empty() {
+        return;
     }
-    Some(v[(hash01(seed) * v.len() as f32) as usize % v.len()].clone())
+    let clip = pool[(hash01(seed) * pool.len() as f32) as usize % pool.len()];
+    mixer.request(Request {
+        clip,
+        bank,
+        pos,
+        speed_roll: hash01(seed ^ 0x5BD1_E995),
+        delay,
+        tag,
+        unit,
+    });
 }
 
-/// Clangs and death screams, budgeted from global sim stats scaled by
-/// how close the camera is to the nearest engagement.
-#[allow(clippy::too_many_arguments)] // bevy system params
-fn combat_one_shots(
-    mut commands: Commands,
-    bank: Option<Res<AudioBank>>,
-    stats: Res<SimStats>,
-    combat: Res<CombatStats>,
-    groups: Res<Groups>,
+/// Melee blows (M2TW weapon_hit + soldier_voice, per blow): at the victim
+/// the struck material, or on a killing blow the death hit and the death
+/// scream; the attacker's grunt (p .4) and scream (p .25), the victim's
+/// grunt and groan (p .25 each).
+fn blow_sounds(
+    mut mixer: ResMut<Mixer>,
+    mut ev: ResMut<SoundEvents>,
+    pools: Option<Res<Pools>>,
     camera: Query<&RtsCamera>,
-    time: Res<Time>,
-    settings: Res<crate::settings::Settings>,
-    (astats, arrows): (
-        Res<crate::arrows::ArrowStats>,
-        Res<crate::arrows::Arrows>,
-    ),
-    mut clang_acc: Local<f32>,
-    mut prev_kills: Local<u64>,
-    mut death_cooldown: Local<f32>,
     mut frame: Local<u32>,
 ) {
+    if let Ok(cam) = camera.single() {
+        ev.listener = cam.focus;
+        ev.cull_r = EVENT_CULL_M + 0.5 * cam.distance;
+    }
+    let Some(pools) = pools else { return };
     *frame = frame.wrapping_add(1);
-    let Some(bank) = bank else { return };
-    let Ok(cam) = camera.single() else { return };
-    let bv = battle_vol(&settings);
-    let focus = Vec2::new(cam.focus.x, cam.focus.z);
-    let hear = 200.0 + cam.distance * 0.4;
-    // M2TW fires EVERY hit's weapon sound positionally (weapon_hit
-    // bank: probability 1, no rate knob anywhere in the format) and
-    // thins by distance ATTENUATION and voice priority, never by
-    // rate. Emulated here: hits are attributed to engaged regiments
-    // by strength and weighted by earshot, giving the audible share
-    // of this tick's hits; the rate cap below stands in for the
-    // voice limit. Camera distance shapes the VOLUME only.
-    let (mut min_dist, mut engaged_total, mut engaged_audible) = (f32::MAX, 0.0f32, 0.0f32);
-    for g in groups.list.iter().filter(|g| g.engaged && g.count > 0) {
-        let d = g.centroid.distance(focus);
-        min_dist = min_dist.min(d);
-        engaged_total += g.count as f32;
-        engaged_audible += g.count as f32 * (1.0 - d / hear).clamp(0.0, 1.0);
-    }
-    let audible = if engaged_total > 0.0 {
-        engaged_audible / engaged_total
-    } else {
-        0.0
-    };
-    let prox = if min_dist == f32::MAX {
-        0.0
-    } else {
-        (1.0 - min_dist / hear).clamp(0.0, 1.0)
-    };
-
-    let zoom_att = zoom_attenuation(cam.distance);
-
-    // Steel: every audible hit wants its clang, up to the rate cap
-    // (~24 live 0.8 s clips at the cap — the voice-limit analog).
-    const STEEL_RATE_CAP: f32 = 30.0;
-    let near_hit_rate = stats.events as f32 * 30.0 * audible;
-    *clang_acc += near_hit_rate.min(STEEL_RATE_CAP) * time.delta_secs();
-    *clang_acc = (*clang_acc).min(4.0);
-    let mut n = (*clang_acc).floor() as u32;
-    *clang_acc -= n as f32;
-    n = n.min(3); // hard cap per frame
-    for k in 0..n {
-        let seed = frame.wrapping_mul(31) ^ k;
-        let r = hash01(seed ^ 0xA5);
-        let set = if r < 0.2 {
-            &bank.shield
-        } else if r < 0.4 {
-            &bank.damage
-        } else {
-            &bank.clang
-        };
-        if let Some(h) = pick(set, seed) {
-            one_shot(
-                &mut commands,
-                h,
-                (0.16 + 0.10 * hash01(seed ^ 0x11))
-                    * (0.3 + 0.7 * prox)
-                    * zoom_att
-                    * bv,
-                0.92 + 0.16 * hash01(seed ^ 0x22),
-            );
-        }
-    }
-
-    // Death screams: on kill deltas, rate-limited, and strictly a
-    // close-up sound — a scream you can pick out from a hilltop is wrong.
-    // Men dying under arrows die far from any ENGAGED regiment, so the
-    // melee-proximity gate alone kept volley kills silent: when shafts
-    // are landing on bodies this tick, the falling cloud's proximity
-    // counts too.
-    let mut prox = prox;
-    if astats.hits > 0
-        && let Some(cloud) = arrow_cloud(&arrows)
-    {
-        prox = prox.max((1.0 - cloud.distance(focus) / hear).clamp(0.0, 1.0));
-    }
-    *death_cooldown -= time.delta_secs();
-    let kills: u64 = combat.kills[0] + combat.kills[1];
-    if kills > *prev_kills && *death_cooldown <= 0.0 && prox > 0.25 && zoom_att > 0.35 {
-        let seed = frame.wrapping_mul(97);
-        if let Some(h) = pick(&bank.death, seed) {
-            one_shot(
-                &mut commands,
-                h,
-                (0.18 + 0.12 * hash01(seed ^ 0x33)) * prox * zoom_att * bv,
-                0.9 + 0.2 * hash01(seed ^ 0x44),
-            );
-        }
-        *death_cooldown = 0.5 + 0.5 * hash01(seed ^ 0x55);
-    }
-    *prev_kills = kills;
-}
-
-/// A looping fly sound riding ONE arrow (the M2TW ARROW_FLY model:
-/// `looped, probability .3, fadein .2, fadeout .2` — a fraction of
-/// arrows carry a positional air loop that dies WITH the arrow, so the
-/// whoosh audibly resolves into its own impact). We track the stable
-/// arrow id (pool indices reshuffle every tick) and steer the sink's
-/// volume by live distance each frame.
-#[derive(Component)]
-struct ArrowFlyLoop {
-    arrow_id: u32,
-    /// Seconds of fade-out left once the arrow is gone; f32::MAX = live.
-    fading: f32,
-}
-
-/// M2TW: probability .3 — only this fraction of arrows sing.
-const FLY_LOOP_PROB: f32 = 0.3;
-/// Concurrent fly loops (each is one more decoder on the mixer).
-const MAX_FLY_LOOPS: usize = 12;
-/// M2TW: fadeout .2 s at the arrow's death.
-const FLY_LOOP_FADE: f32 = 0.2;
-
-/// Attach, follow, and retire the per-arrow fly loops.
-#[allow(clippy::too_many_arguments)] // bevy system params
-fn arrow_fly_loops(
-    mut commands: Commands,
-    bank: Option<Res<AudioBank>>,
-    arrows: Res<crate::arrows::Arrows>,
-    camera: Query<&RtsCamera>,
-    time: Res<Time>,
-    virt_time: Res<Time<Virtual>>,
-    settings: Res<crate::settings::Settings>,
-    mut loops: Query<(Entity, &mut ArrowFlyLoop, Option<&mut AudioSink>)>,
-) {
-    let Some(bank) = bank else { return };
-    let Ok(cam) = camera.single() else { return };
-    let dt = time.delta_secs();
-    let paused = virt_time.is_paused();
-    let bv = battle_vol(&settings);
-    let zoom_att = zoom_attenuation(cam.distance);
-    let focus = Vec2::new(cam.focus.x, cam.focus.z);
-    let hear = 140.0 + cam.distance * 0.3;
-
-    // One pass over the pool: positions of tracked ids + spawn candidates.
-    let mut tracked: Vec<u32> = loops.iter().map(|(_, l, _)| l.arrow_id).collect();
-    let mut found: Vec<(u32, f32)> = Vec::with_capacity(tracked.len()); // (id, dist)
-    let mut budget = MAX_FLY_LOOPS.saturating_sub(tracked.len());
-    for i in 0..arrows.len() {
-        let id = arrows.id[i];
-        let d = arrows.pos[i].xz().distance(focus);
-        if tracked.contains(&id) {
-            found.push((id, d));
+    let base = frame.wrapping_mul(0x9E37_79B1);
+    for (k, b) in ev.blows.drain(..).enumerate() {
+        let s = base ^ (k as u32).wrapping_mul(0x85EB_CA6B);
+        let r = |salt: u32| hash01(s ^ salt);
+        if r(0x5A) >= soldier_sfx_share() {
             continue;
         }
-        // New candidates: the M2TW probability gate (stable per id, so
-        // an arrow is either a singer for its whole flight or never),
-        // in earshot, budget-capped.
-        if budget > 0
-            && !paused
-            && d < hear
-            && hash01(id.wrapping_mul(0x9E37_79B1)) < FLY_LOOP_PROB
-            && let Some(h) = pick(&bank.arrow_fly_loop, id)
-        {
-            commands.spawn((
-                AudioPlayer::new(h),
-                PlaybackSettings {
-                    volume: Volume::Linear(0.0),
-                    speed: 0.85 + 0.3 * hash01(id.wrapping_mul(0x85EB)),
-                    ..PlaybackSettings::LOOP
-                },
-                ArrowFlyLoop {
-                    arrow_id: id,
-                    fading: f32::MAX,
-                },
-            ));
-            tracked.push(id);
-            budget -= 1;
-        }
-    }
-
-    for (e, mut fl, sink) in &mut loops {
-        let live = found.iter().find(|(id, _)| *id == fl.arrow_id);
-        if live.is_none() && fl.fading == f32::MAX {
-            // Its arrow landed this frame: begin the M2TW fade-out (the
-            // impact one-shot is taking over right now).
-            fl.fading = FLY_LOOP_FADE;
-        }
-        let Some(mut sink) = sink else { continue };
-        if fl.fading < f32::MAX {
-            fl.fading -= dt;
-            if fl.fading <= 0.0 {
-                commands.entity(e).despawn();
-                continue;
+        let delay = TICK_S * r(0x11);
+        let (pool, bank) = match b.material {
+            Material::Steel => (&pools.hit_steel, HIT_STEEL),
+            Material::Metal => (&pools.hit_metal, HIT_METAL),
+            Material::Wood => (&pools.hit_wood, HIT_WOOD),
+            Material::Flesh => (&pools.hit_flesh, HIT_FLESH),
+        };
+        if b.killed {
+            play(&mut mixer, &pools.hit_flesh, DEATH_HIT, b.victim, s ^ 0x31, delay, b.victim_group);
+            play(&mut mixer, &pools.death_scream, DEATH_SCREAM, b.victim, s ^ 0x41, delay, b.victim_group);
+        } else {
+            play(&mut mixer, pool, bank, b.victim, s ^ 0x21, delay, b.victim_group);
+            if r(0x51) < 0.25 {
+                play(&mut mixer, &pools.victim_grunt, VICTIM_GRUNT, b.victim, s ^ 0x61, delay, b.victim_group);
             }
-            let cur = sink.volume().to_linear();
-            sink.set_volume(Volume::Linear(cur * (fl.fading / FLY_LOOP_FADE).clamp(0.0, 1.0)));
-        } else if paused {
-            sink.set_volume(Volume::Linear(0.0));
-        } else if let Some((_, d)) = live {
-            let prox = (1.0 - d / hear).clamp(0.0, 1.0);
-            sink.set_volume(Volume::Linear(0.16 * prox * prox * zoom_att.max(0.3) * bv));
+            if r(0x71) < 0.25 {
+                play(&mut mixer, &pools.victim_grunt, VICTIM_GRUNT, b.victim, s ^ 0x81, delay, b.victim_group);
+            }
+        }
+        if r(0x91) < 0.4 {
+            play(&mut mixer, &pools.attack_grunt, ATTACK_GRUNT, b.attacker, s ^ 0xA1, delay, b.attacker_group);
+        }
+        if r(0xB1) < 0.25 {
+            play(&mut mixer, &pools.attack_scream, ATTACK_SCREAM, b.attacker, s ^ 0xC1, delay, b.attacker_group);
         }
     }
 }
 
-/// State for `archer_one_shots`, bundled into one Local.
+/// Seconds a whizzed arrow id is remembered (one whizz per pass).
+const WHIZZ_MEMORY_S: f32 = 3.0;
+/// A falling shaft this close to the look point may whistle past it.
+const WHIZZ_R: f32 = 25.0;
+/// Arrows this close to the look point may carry an air loop.
+const FLY_R: f32 = 40.0;
+
 #[derive(Default)]
-struct ArrowAudioState {
-    loose_acc: f32,
-    impact_acc: f32,
-    ground_acc: f32,
-    /// Loosed-per-second EMA (the volley-onset detector).
-    rate_ema: f32,
-    away_high: bool,
-    away_gate: f32,
-    incoming_high: bool,
-    incoming_gate: f32,
-    flyby_acc: f32,
+struct ArrowSoundState {
+    whizzed: Vec<(u32, f32)>,
     frame: u32,
 }
 
-/// Archer sound: string snaps and impact thuds budgeted from the
-/// per-tick ArrowStats counters (same fractional-accumulator pattern as
-/// the melee clangs), plus the two massed-volley sheets as edge cues —
-/// `volley_away` when the loose rate spikes near friendly bows,
-/// `volley_incoming` when a cloud of falling arrows is about to land
-/// near the camera. Assets: sfx_bow/ (tmp/archer-sfx-prompts.md).
+/// Arrow strikes and misses where they land, the air loop on three
+/// arrows in ten (ARROW_FLY, followed in flight), and the whizz of three
+/// falling shafts in ten near the look point.
 #[allow(clippy::too_many_arguments)] // bevy system params
-fn archer_one_shots(
-    mut commands: Commands,
-    bank: Option<Res<AudioBank>>,
-    astats: Res<crate::arrows::ArrowStats>,
+fn arrow_sounds(
+    mut mixer: ResMut<Mixer>,
+    mut ev: ResMut<SoundEvents>,
+    pools: Option<Res<Pools>>,
     arrows: Res<crate::arrows::Arrows>,
-    groups: Res<Groups>,
-    camera: Query<&RtsCamera>,
     time: Res<Time>,
     virt_time: Res<Time<Virtual>>,
-    settings: Res<crate::settings::Settings>,
-    playing: Query<(), (With<AudioPlayer>, Without<Bed>)>,
-    mut st: Local<ArrowAudioState>,
+    mut st: Local<ArrowSoundState>,
 ) {
-    let Some(bank) = bank else { return };
-    let Ok(cam) = camera.single() else { return };
-    // Mixer-protection allowance for this frame (see MAX_LIVE_ONE_SHOTS).
-    let mut allowance = MAX_LIVE_ONE_SHOTS.saturating_sub(playing.iter().count()) as u32;
-    // A paused sim freezes the per-tick counters at their last values:
-    // integrating them while paused would drip phantom arrows forever.
+    let Some(pools) = pools else { return };
+    st.frame = st.frame.wrapping_add(1);
+    let base = st.frame.wrapping_mul(0x9E37_79B1);
+    for (k, h) in ev.arrow_hits.drain(..).enumerate() {
+        let s = base ^ (k as u32).wrapping_mul(0x85EB_CA6B) ^ 0x1234;
+        let delay = TICK_S * hash01(s ^ 0x11);
+        let (pool, bank) = match h.material {
+            Material::Wood => (&pools.arrow_wood, ARROW_WOOD),
+            // No arrow-on-metal clips yet: the body strike stands in.
+            Material::Steel | Material::Metal | Material::Flesh => (&pools.arrow_flesh, ARROW_FLESH),
+        };
+        if h.killed {
+            play(&mut mixer, &pools.hit_flesh, ARROW_DEATH_HIT, h.pos, s ^ 0x31, delay, h.group);
+            play(&mut mixer, &pools.death_scream, DEATH_SCREAM, h.pos, s ^ 0x41, delay, h.group);
+        } else {
+            play(&mut mixer, pool, bank, h.pos, s ^ 0x21, delay, h.group);
+        }
+    }
+    for (k, p) in ev.arrow_ground.drain(..).enumerate() {
+        let s = base ^ (k as u32).wrapping_mul(0x85EB_CA6B) ^ 0x5678;
+        play(&mut mixer, &pools.arrow_ground, ARROW_GROUND, p, s, TICK_S * hash01(s ^ 0x11), NO_UNIT);
+    }
+
+    // A paused battle holds the whizz memory with the arrows.
+    let dt = if virt_time.is_paused() { 0.0 } else { time.delta_secs() };
+    st.whizzed.retain_mut(|w| {
+        w.1 -= dt;
+        w.1 > 0.0
+    });
+    let listener = ev.listener.xz();
+    let (fly_r2, whizz_r2) = (FLY_R * FLY_R, WHIZZ_R * WHIZZ_R);
+    for i in 0..arrows.len() {
+        let p = arrows.pos[i];
+        let d2 = p.xz().distance_squared(listener);
+        if d2 > fly_r2.max(whizz_r2) {
+            continue;
+        }
+        let id = arrows.id[i];
+        if d2 < fly_r2 && !pools.arrow_fly.is_empty() && hash01(id.wrapping_mul(0x9E37_79B1)) < 0.3 {
+            let clip = pools.arrow_fly[id as usize % pools.arrow_fly.len()];
+            mixer.track(
+                id as u64,
+                Request {
+                    clip,
+                    bank: ARROW_FLY,
+                    pos: p,
+                    speed_roll: hash01(id.wrapping_mul(0x85EB)),
+                    delay: 0.0,
+                    tag: 0,
+                    unit: arrows.group[i],
+                },
+            );
+        }
+        if d2 < whizz_r2
+            && arrows.vel[i].y < 0.0
+            && hash01(id.wrapping_mul(0x27D4_EB2F)) < 0.3
+            && !st.whizzed.iter().any(|w| w.0 == id)
+        {
+            st.whizzed.push((id, WHIZZ_MEMORY_S));
+            play(&mut mixer, &pools.arrow_whizz, ARROW_WHIZZ, p, id ^ 0x77, 0.0, arrows.group[i]);
+        }
+    }
+}
+
+/// M2TW `unit_fighting`: every regiment in melee plays its fight loop at its
+/// own position while the camera is within FIGHT_CULL_M of it. A regiment
+/// keeps one take (its index picks it) and one pitch; the mixer fades the
+/// loop in when the regiment engages and out when it stops or leaves the
+/// cull radius. Runs while paused too, so a pause does not end the loops.
+fn fight_loops(
+    mut mixer: ResMut<Mixer>,
+    pools: Option<Res<Pools>>,
+    groups: Res<Groups>,
+    terrain: Res<crate::terrain::Terrain>,
+) {
+    let Some(pools) = pools else { return };
+    if pools.fight_loop.is_empty() || layer_muted("close") {
+        return;
+    }
+    let eye = mixer.listener.eye;
+    let takes = fight_takes(pools.fight_loop.len());
+    if takes.is_empty() {
+        return;
+    }
+    for (g, gd) in groups.list.iter().enumerate() {
+        if !gd.engaged || gd.count == 0 {
+            continue;
+        }
+        let c = gd.centroid;
+        let at = Vec3::new(c.x, terrain.height_at(c.x, c.y) + 1.0, c.y);
+        if at.distance(eye) > FIGHT_CULL_M {
+            continue;
+        }
+        let take =
+            takes.start + (hash01((g as u32).wrapping_mul(0x27D4_EB2F) ^ 0x3B7) * takes.len() as f32) as usize % takes.len();
+        mixer.track(
+            FIGHT_KEY | g as u64,
+            Request {
+                clip: pools.fight_loop[take],
+                bank: if take < FIGHT_CLOSE_TAKES { FIGHT_LOOP } else { FIGHT_LOOP_MID },
+                pos: at,
+                speed_roll: hash01((g as u32).wrapping_mul(0x9E37_79B1) ^ 0x2F1),
+                delay: 0.0,
+                tag: 0,
+                unit: g as u32,
+            },
+        );
+    }
+}
+
+/// A few living men of each regiment, refreshed a slice of the army per
+/// frame (a full pass every ~0.4 s at 200k), so single voices can come
+/// from real soldiers without a per-regiment member list.
+#[derive(Resource, Default)]
+struct MemberSamples {
+    cursor: usize,
+    /// Per regiment: sampled unit indices of the last complete pass.
+    active: Vec<Vec<u32>>,
+    building: Vec<Vec<u32>>,
+    seen: Vec<u32>,
+}
+
+const MEMBER_SAMPLES: usize = 16;
+const MEMBER_SCAN_PER_FRAME: usize = 4096;
+
+fn refresh_member_samples(
+    units: Res<crate::units::Units>,
+    groups: Res<Groups>,
+    mut ms: ResMut<MemberSamples>,
+) {
+    let n = units.group.len();
+    let ng = groups.list.len();
+    let ms = &mut *ms;
+    if ms.building.len() != ng {
+        ms.active = vec![Vec::new(); ng];
+        ms.building = vec![Vec::new(); ng];
+        ms.seen = vec![0; ng];
+        ms.cursor = 0;
+    }
+    if n == 0 {
+        return;
+    }
+    let end = (ms.cursor + MEMBER_SCAN_PER_FRAME).min(n);
+    for i in ms.cursor..end {
+        let g = units.group[i] as usize;
+        if g >= ng || units.death_t[i] != 0 {
+            continue;
+        }
+        // Reservoir sample: every living man of the regiment equally likely.
+        ms.seen[g] += 1;
+        let b = &mut ms.building[g];
+        if b.len() < MEMBER_SAMPLES {
+            b.push(i as u32);
+        } else {
+            let r = (hash01(i as u32 ^ ms.seen[g].wrapping_mul(0x9E37)) * ms.seen[g] as f32) as usize;
+            if r < MEMBER_SAMPLES {
+                b[r] = i as u32;
+            }
+        }
+    }
+    ms.cursor = end;
+    if ms.cursor >= n {
+        ms.cursor = 0;
+        std::mem::swap(&mut ms.active, &mut ms.building);
+        for b in &mut ms.building {
+            b.clear();
+        }
+        ms.seen.fill(0);
+    }
+}
+
+impl MemberSamples {
+    /// A living man of regiment `g` (his current position).
+    fn man(&self, units: &crate::units::Units, g: usize, roll: f32) -> Option<Vec3> {
+        let s = self.active.get(g)?;
+        if s.is_empty() {
+            return None;
+        }
+        let start = (roll * s.len() as f32) as usize % s.len();
+        (0..s.len()).find_map(|k| {
+            let i = s[(start + k) % s.len()] as usize;
+            (i < units.group.len() && units.group[i] as usize == g && units.death_t[i] == 0)
+                .then(|| units.pos[i])
+        })
+    }
+}
+
+/// Per-regiment clocks for the group sheets and single voices.
+#[derive(Default)]
+struct RegimentSoundState {
+    charge_sheet_t: Vec<f32>,
+    yell_acc: Vec<f32>,
+    cheer_sheet_t: Vec<f32>,
+    whoop_acc: Vec<f32>,
+    prev_broken: Vec<bool>,
+    prev_charging: Vec<bool>,
+    panic_left: Vec<f32>,
+    panic_acc: Vec<f32>,
+    shout_acc: Vec<f32>,
+    feet_t: Vec<f32>,
+    scream_acc: Vec<f32>,
+    volley_n: Vec<u32>,
+    volley_at: Vec<Vec3>,
+    volley_cool: Vec<f32>,
+    frame: u32,
+}
+
+/// Charge yell window: M2TW's p .2 per man spread over the ~4.5 s middle
+/// of the measured 2.8..7 s charge.
+const CHARGE_YELL_WINDOW_S: f32 = 4.5;
+/// Single voices a regiment may ask for in one frame (the allocator
+/// keeps the strongest; this only bounds the work).
+const VOICES_PER_FRAME: u32 = 6;
+/// Charge yells a regiment may ask for in one frame: a 1000-man charge
+/// wants about 44 a second.
+const YELLS_PER_FRAME: u32 = 12;
+/// The charge group sound's fade when the charge ends (M2TW
+/// `unit_charge fadeout 1`).
+const CHARGE_FADE_OUT_S: f32 = 1.0;
+/// Tag of a regiment's charge group sounds (the regiment index in
+/// the low bits).
+const CHARGE_TAG: u64 = 1 << 40;
+/// The celebrate window is 150 ticks (frontline.rs).
+const CELEBRATE_S: f32 = 5.0;
+/// A new volley sound when this share of the regiment's living men has
+/// loosed since the last one.
+const VOLLEY_SHARE: f32 = 0.15;
+/// Shortest gap between two volley sounds of one regiment (s).
+const VOLLEY_GAP_S: f32 = 1.0;
+/// Bow strings asked for per frame, nearest looses first.
+const STRINGS_PER_FRAME: usize = 32;
+
+/// Regiment-level sounds, each from the regiment's own ground: the charge
+/// (group sheet on the M2TW 2.0 + 0.5 s clock, one yell per five men),
+/// the celebration (rolling cheer sheets, whoops from one man in twelve),
+/// the rout (panic at the break, officers shouting, running feet), battle
+/// screams over a melee, the bow string on each loose, and the archer
+/// volley (one group release each time a share of the regiment has
+/// loosed).
+#[allow(clippy::too_many_arguments)] // bevy system params
+fn regiment_sounds(
+    mut mixer: ResMut<Mixer>,
+    mut ev: ResMut<SoundEvents>,
+    pools: Option<Res<Pools>>,
+    groups: Res<Groups>,
+    units: Res<crate::units::Units>,
+    members: Res<MemberSamples>,
+    terrain: Res<crate::terrain::Terrain>,
+    time: Res<Time>,
+    virt_time: Res<Time<Virtual>>,
+    mut st: Local<RegimentSoundState>,
+) {
+    let Some(pools) = pools else { return };
+    let ng = groups.list.len();
+    let st = &mut *st;
+    for v in [
+        &mut st.charge_sheet_t,
+        &mut st.yell_acc,
+        &mut st.cheer_sheet_t,
+        &mut st.whoop_acc,
+        &mut st.panic_left,
+        &mut st.panic_acc,
+        &mut st.shout_acc,
+        &mut st.feet_t,
+        &mut st.scream_acc,
+        &mut st.volley_cool,
+    ] {
+        v.resize(ng, 0.0);
+    }
+    st.prev_broken.resize(ng, false);
+    st.prev_charging.resize(ng, false);
+    st.volley_n.resize(ng, 0);
+    st.volley_at.resize(ng, Vec3::ZERO);
     if virt_time.is_paused() {
+        ev.looses.clear();
         return;
     }
     st.frame = st.frame.wrapping_add(1);
     let dt = time.delta_secs();
-    st.away_gate -= dt;
-    st.incoming_gate -= dt;
-    let bv = battle_vol(&settings);
-    let zoom_att = zoom_attenuation(cam.distance);
-    let focus = Vec2::new(cam.focus.x, cam.focus.z);
-    let hear = 200.0 + cam.distance * 0.4;
+    let listener = ev.listener;
 
-    // Where the bows are: nearest archer regiment still carrying arrows.
-    let shooter_dist = groups
-        .list
-        .iter()
-        .filter(|g| {
-            g.kind == crate::unit_types::KIND_ARCHER && g.count > 0 && g.ammo_left > 0
-        })
-        .map(|g| g.centroid.distance(focus))
-        .fold(f32::MAX, f32::min);
-    let shooter_prox = if shooter_dist == f32::MAX {
-        0.0
-    } else {
-        (1.0 - shooter_dist / hear).clamp(0.0, 1.0)
-    };
-
-    // Where the arrows are: the volley cloud, and how many shafts are
-    // dropping around the camera (the flyby feed).
-    let cloud_prox = arrow_cloud(&arrows)
-        .map(|c| (1.0 - c.distance(focus) / hear).clamp(0.0, 1.0))
-        .unwrap_or(0.0);
-    let mut falling_near = 0usize;
-    for i in 0..arrows.len() {
-        if arrows.vel[i].y < 0.0 && arrows.pos[i].xz().distance_squared(focus) < 80.0 * 80.0 {
-            falling_near += 1;
+    // A string snap per loose, at the archer: the nearest few per frame
+    // (a volley tick looses hundreds; the nearest take the free bow-string
+    // voices).
+    let mut looses = std::mem::take(&mut ev.looses);
+    for &(g, p) in &looses {
+        let g = g as usize;
+        if g < ng && st.volley_cool[g] <= 0.0 {
+            st.volley_n[g] += 1;
+            st.volley_at[g] += p;
         }
     }
-
-    // String snaps: a volley is the EVENT, not garnish over a din (the
-    // melee-clang tuning read as "a dozen archers" in play) — a
-    // large share of looses each spawn a jittered snap and the clips
-    // LAYER into the ripple of a massed release. Distance thins the
-    // count only mildly; it mostly quiets the clips.
-    st.loose_acc +=
-        astats.loosed as f32 * 30.0 * dt * 0.35 * shooter_prox * (0.4 + 0.6 * zoom_att);
-    st.loose_acc = st.loose_acc.min(5.0);
-    let mut n = (st.loose_acc).floor() as u32;
-    st.loose_acc -= n as f32;
-    n = n.min(4).min(allowance);
-    allowance -= n;
-    for k in 0..n {
-        let seed = st.frame.wrapping_mul(53) ^ k ^ 0x51;
-        if let Some(h) = pick(&bank.bow_loose, seed) {
-            one_shot(
-                &mut commands,
-                h,
-                (0.09 + 0.06 * hash01(seed ^ 0x12)) * zoom_att * bv,
-                0.88 + 0.24 * hash01(seed ^ 0x23),
-            );
-        }
+    let near = |p: &Vec3| p.xz().distance_squared(listener.xz());
+    if looses.len() > STRINGS_PER_FRAME {
+        looses.select_nth_unstable_by(STRINGS_PER_FRAME, |a, b| near(&a.1).total_cmp(&near(&b.1)));
+        looses.truncate(STRINGS_PER_FRAME);
     }
+    for (k, &(lg, p)) in looses.iter().enumerate() {
+        let s = st.frame.wrapping_mul(0x9E37_79B1) ^ (k as u32).wrapping_mul(0x85EB_CA6B) ^ 0x4242;
+        play(&mut mixer, &pools.bow_string, BOW_STRING, p, s, TICK_S * hash01(s ^ 0x11), lg);
+    }
+    looses.clear();
+    ev.looses = looses;
 
-    // Body hits (wood knock at low odds — the shaft that found a shield)
-    // and the dirt patter of the misses, near the falling cloud. Same
-    // mass-scale budgeting as the looses.
-    st.impact_acc += astats.hits as f32 * 30.0 * dt * 0.30 * cloud_prox * (0.4 + 0.6 * zoom_att);
-    st.impact_acc = st.impact_acc.min(4.0);
-    let mut n = (st.impact_acc).floor() as u32;
-    st.impact_acc -= n as f32;
-    n = n.min(3).min(allowance);
-    allowance -= n;
-    for k in 0..n {
-        let seed = st.frame.wrapping_mul(71) ^ k ^ 0x62;
-        let set = if hash01(seed ^ 0xA7) < 0.2 {
-            &bank.arrow_wood
+    for (g, gd) in groups.list.iter().enumerate() {
+        let seed = st.frame.wrapping_mul(0x9E37_79B1) ^ (g as u32).wrapping_mul(0x85EB_CA6B);
+        let r = |salt: u32| hash01(seed ^ salt);
+        let alive = gd.count > 0;
+        let broken = alive && gd.state.is_broken();
+        let new_break = broken && !st.prev_broken[g];
+        st.prev_broken[g] = broken;
+        if new_break {
+            st.panic_left[g] = ROUT_PANIC_S;
+        }
+        let break_cry = new_break;
+        st.volley_cool[g] -= dt;
+
+        // Out of earshot: keep the clocks honest, ask for nothing.
+        let far = !alive || gd.centroid.distance(listener.xz()) - gd.radius > ev.cull_r;
+        // Group sheets sound from the regiment's centre, at head height.
+        let (cx, cz) = (gd.centroid.x, gd.centroid.y);
+        let centre = Vec3::new(cx, terrain.height_at(cx, cz) + 1.5, cz);
+        let men = gd.count as f32;
+
+        // Charge. When the charge ends its group sound fades out over
+        // M2TW's 1 s (`unit_charge fadeout 1`) instead of playing its
+        // clip out; yells already started play to their end.
+        let charging = gd.charging && alive;
+        let charge_tag = CHARGE_TAG | g as u64;
+        if st.prev_charging[g] && !charging {
+            mixer.fade_tag(charge_tag, CHARGE_FADE_OUT_S);
+        }
+        st.prev_charging[g] = charging;
+        if charging {
+            st.charge_sheet_t[g] -= dt;
+            if st.charge_sheet_t[g] <= 0.0 {
+                if !far {
+                    let set = if gd.count >= 300 { &pools.charge_large } else { &pools.charge_medium };
+                    play_tagged(&mut mixer, set, CHARGE_SHEET, centre, seed ^ 0x13, 0.0, g as u32, charge_tag);
+                }
+                st.charge_sheet_t[g] = 2.0 + 0.5 * r(0x23);
+            }
+            st.yell_acc[g] += men * (0.2 / CHARGE_YELL_WINDOW_S) * dt;
+            let n = (st.yell_acc[g] as u32).min(YELLS_PER_FRAME);
+            st.yell_acc[g] -= st.yell_acc[g].floor();
+            if !far {
+                for k in 0..n {
+                    if let Some(at) = members.man(&units, g, r(0x33 + k)) {
+                        play(&mut mixer, &pools.charge_yell, CHARGE_YELL, at, seed ^ (0x43 + k), 0.2 * r(0x53 + k), g as u32);
+                    }
+                }
+            }
         } else {
-            &bank.arrow_flesh
-        };
-        if let Some(h) = pick(set, seed) {
-            one_shot(
-                &mut commands,
-                h,
-                (0.11 + 0.08 * hash01(seed ^ 0x13)) * zoom_att * bv,
-                0.88 + 0.24 * hash01(seed ^ 0x24),
-            );
+            st.charge_sheet_t[g] = 0.0;
+            st.yell_acc[g] = 0.0;
         }
-    }
-    let ground = astats.landed.saturating_sub(astats.hits);
-    st.ground_acc += ground as f32 * 30.0 * dt * 0.10 * cloud_prox * (0.4 + 0.6 * zoom_att);
-    st.ground_acc = st.ground_acc.min(3.0);
-    let mut n = (st.ground_acc).floor() as u32;
-    st.ground_acc -= n as f32;
-    n = n.min(2).min(allowance);
-    allowance -= n;
-    for k in 0..n {
-        let seed = st.frame.wrapping_mul(89) ^ k ^ 0x73;
-        if let Some(h) = pick(&bank.arrow_ground, seed) {
-            one_shot(
-                &mut commands,
-                h,
-                (0.07 + 0.05 * hash01(seed ^ 0x14)) * zoom_att * bv,
-                0.86 + 0.28 * hash01(seed ^ 0x25),
-            );
-        }
-    }
 
-    // Volley-away sheet: the loose rate spiking = a massed release.
-    let rate = astats.loosed as f32 * 30.0;
-    st.rate_ema += (rate - st.rate_ema) * (dt / 0.25).min(1.0);
-    let high = st.rate_ema > 60.0;
-    if VOLLEY_SHEETS_ON && high && !st.away_high && st.away_gate <= 0.0 && shooter_prox > 0.05 {
-        let seed = st.frame.wrapping_mul(131);
-        if let Some(h) = pick(&bank.volley_away, seed) {
-            let vol = 0.5 * (0.3 + 0.7 * shooter_prox) * bv;
-            one_shot(&mut commands, h, vol, 0.96 + 0.08 * hash01(seed ^ 0x15));
-            info!("volley away (vol {vol:.2}, rate {:.0}/s)", st.rate_ema);
+        // Celebration.
+        if gd.celebrate > 0 && alive {
+            st.cheer_sheet_t[g] -= dt;
+            if st.cheer_sheet_t[g] <= 0.0 {
+                if !far {
+                    let set = if gd.count >= 300 { &pools.cheer_large } else { &pools.cheer_small };
+                    play(&mut mixer, set, CHEER_SHEET, centre, seed ^ 0x63, 0.0, g as u32);
+                }
+                // M2TW randomdelay 1: the 4-6 s clips roll into each other.
+                st.cheer_sheet_t[g] = 2.5 + 1.0 * r(0x73);
+            }
+            st.whoop_acc[g] += men * (0.08 / CELEBRATE_S) * dt;
+            let n = (st.whoop_acc[g] as u32).min(VOICES_PER_FRAME);
+            st.whoop_acc[g] -= st.whoop_acc[g].floor();
+            if !far {
+                for k in 0..n {
+                    if let Some(at) = members.man(&units, g, r(0x83 + k)) {
+                        play(&mut mixer, &pools.whoop, WHOOP, at, seed ^ (0x93 + k), 0.3 * r(0xA3 + k), g as u32);
+                    }
+                }
+            }
+        } else {
+            st.cheer_sheet_t[g] = 0.0;
+            st.whoop_acc[g] = 0.0;
         }
-        st.away_gate = 2.0;
-    }
-    st.away_high = high;
 
-    // Incoming sheet: a cloud of descending shafts over the camera.
-    let inc = falling_near > 25;
-    if VOLLEY_SHEETS_ON && inc && !st.incoming_high && st.incoming_gate <= 0.0 && zoom_att > 0.2
-    {
-        let seed = st.frame.wrapping_mul(151);
-        if let Some(h) = pick(&bank.volley_incoming, seed) {
-            let vol = 0.45 * zoom_att.max(0.5) * bv;
-            one_shot(&mut commands, h, vol, 0.96 + 0.08 * hash01(seed ^ 0x16));
-            info!("volley incoming (vol {vol:.2}, {falling_near} falling near)");
+        // Rout: the crowd cry at the break, then panic, shouts and feet.
+        if break_cry && !far {
+            play(&mut mixer, &pools.rout_crowd, ROUT_CROWD, centre, seed ^ 0x163, 0.0, g as u32);
         }
-        st.incoming_gate = 2.5;
-    }
-    st.incoming_high = inc;
+        if broken {
+            st.panic_left[g] = (st.panic_left[g] - dt).max(0.0);
+            if st.panic_left[g] > 0.0 {
+                st.panic_acc[g] += men * ROUT_PANIC_RATE * dt;
+            }
+            st.shout_acc[g] += ROUT_SHOUT_RATE * dt;
+            st.feet_t[g] -= dt;
+            if !far {
+                let n = (st.panic_acc[g] as u32).min(VOICES_PER_FRAME);
+                for k in 0..n {
+                    if let Some(at) = members.man(&units, g, r(0xB3 + k)) {
+                        play(&mut mixer, &pools.rout_panic, ROUT_PANIC, at, seed ^ (0xC3 + k), 0.2 * r(0xD3 + k), g as u32);
+                    }
+                }
+                if st.shout_acc[g] >= 1.0
+                    && let Some(at) = members.man(&units, g, r(0xE3))
+                {
+                    play(&mut mixer, &pools.rout_shout, ROUT_SHOUT, at, seed ^ 0xF3, 0.0, g as u32);
+                }
+                if st.feet_t[g] <= 0.0 {
+                    play(&mut mixer, &pools.feet, FEET, centre, seed ^ 0x103, 0.0, g as u32);
+                }
+            }
+            st.panic_acc[g] -= st.panic_acc[g].floor();
+            st.shout_acc[g] -= st.shout_acc[g].floor();
+            if st.feet_t[g] <= 0.0 {
+                // The 6 s washes overlap into a steady drumming.
+                st.feet_t[g] = 3.0 + 1.0 * r(0x113);
+            }
+        } else {
+            st.panic_left[g] = 0.0;
+            st.panic_acc[g] = 0.0;
+            st.shout_acc[g] = 0.0;
+            st.feet_t[g] = 0.0;
+        }
 
-    // Flyby whooshes: budgeted from the COUNT of shafts currently
-    // falling around the camera (an arrow spends ~1.5 s in the zone, so
-    // ~0.5/s per shaft means most of them whistle once) — a volley
-    // passing overhead layers itself into a rushing stream that starts,
-    // thickens, and fades with the actual flight; a lone skirmish
-    // arrow stays a lone whistle. Camera must be down in it (zoom).
-    if zoom_att > 0.35 {
-        st.flyby_acc += falling_near as f32 * dt * 0.28 * zoom_att;
-    }
-    st.flyby_acc = st.flyby_acc.min(3.0);
-    let mut n = (st.flyby_acc).floor() as u32;
-    st.flyby_acc -= n as f32;
-    n = n.min(2).min(allowance);
-    for k in 0..n {
-        let seed = st.frame.wrapping_mul(173) ^ k ^ 0x84;
-        if let Some(h) = pick(&bank.arrow_flyby, seed) {
-            one_shot(
-                &mut commands,
-                h,
-                (0.05 + 0.04 * hash01(seed ^ 0x17)) * zoom_att * bv,
-                0.86 + 0.28 * hash01(seed ^ 0x28),
-            );
+        // Battle screams over a regiment in melee. M2TW's trigger for
+        // Individual_Battle_Scream is not in its config; the rate is
+        // devlog 0072's (about one scream every 1-2 s over a close
+        // 1000-man melee), each from one of the regiment's men.
+        if gd.engaged && alive {
+            st.scream_acc[g] += men * BATTLE_SCREAM_RATE * soldier_sfx_share() * dt;
+            let n = (st.scream_acc[g] as u32).min(VOICES_PER_FRAME);
+            st.scream_acc[g] -= st.scream_acc[g].floor();
+            if !far {
+                for k in 0..n {
+                    if let Some(at) = members.man(&units, g, r(0x133 + k)) {
+                        play(&mut mixer, &pools.battle_scream, BATTLE_SCREAM, at, seed ^ (0x143 + k), 0.3 * r(0x153 + k), g as u32);
+                    }
+                }
+            }
+        } else {
+            st.scream_acc[g] = 0.0;
+        }
+
+        // Archer volley.
+        let volley_n = st.volley_n[g];
+        if volley_n > 0 && volley_n as f32 >= (men * VOLLEY_SHARE).max(5.0) {
+            let at = st.volley_at[g] / volley_n as f32;
+            play(&mut mixer, &pools.volley, VOLLEY, at, seed ^ 0x123, 0.0, g as u32);
+            st.volley_n[g] = 0;
+            st.volley_at[g] = Vec3::ZERO;
+            st.volley_cool[g] = VOLLEY_GAP_S;
         }
     }
 }
+
+/// Panic at a break lasts this long, then the fleeing mass goes quiet
+/// (film retreats, devlog 0074).
+const ROUT_PANIC_S: f32 = 7.0;
+/// Panic screams per man per second inside that window.
+const ROUT_PANIC_RATE: f32 = 0.00066;
+/// Battle screams per engaged man per second.
+const BATTLE_SCREAM_RATE: f32 = 0.0008;
+/// Officer shouts per routing regiment per second (devlog 0074: one voice
+/// every ~3 s, not a machine gun).
+const ROUT_SHOUT_RATE: f32 = 0.35;
 
 /// Edge-detection state for `event_cues`, bundled into one Local (the
 /// bare-Local version blew past Bevy's 16 system-param limit).
@@ -1003,35 +1545,35 @@ fn archer_one_shots(
 struct CueState {
     prev_state: Vec<u8>,
     prev_outcome: bool,
+    /// Seconds until the army may sound another war horn.
     horn_gate: f32,
-    vox_gate: f32,
     frame: u32,
 }
 
-/// Discrete cues: selection and order clicks, charge horn on new
-/// orders, rout/rally vox + horn, victory/defeat stings. The charge
-/// war cries live in `charge_vox`.
+/// Discrete cues: selection and order clicks (unplaced, UI channel), the
+/// war horn on new orders at the ordered regiments and on an own break at
+/// the breaking regiment (placed, one per army per 9 s), and the outcome
+/// sting (unplaced).
 #[allow(clippy::too_many_arguments)] // bevy system params
 fn event_cues(
-    mut commands: Commands,
-    bank: Option<Res<AudioBank>>,
+    mut mixer: ResMut<Mixer>,
+    pools: Option<Res<Pools>>,
     groups: Res<Groups>,
+    selection: Res<crate::selection::Selection>,
+    terrain: Res<crate::terrain::Terrain>,
     mut cues: MessageReader<UiCue>,
     outcome: Res<crate::ai::BattleOutcome>,
     time: Res<Time>,
-    settings: Res<crate::settings::Settings>,
     mut st: Local<CueState>,
 ) {
-    let Some(bank) = bank else { return };
-    let bv = battle_vol(&settings);
-    let uv = ui_vol(&settings);
+    let Some(pools) = pools else { return };
     st.frame = st.frame.wrapping_add(1);
     st.horn_gate -= time.delta_secs();
-    st.vox_gate -= time.delta_secs();
     st.prev_state.resize(groups.list.len(), 0);
 
     // UI click feedback: one clip per action kind per frame, straight
-    // from the input systems — every click sounds, repeats included.
+    // from the input systems; every click sounds, repeats included.
+    // Deployment placements click like a move but never horn.
     let (mut cue_select, mut cue_move, mut cue_attack, mut cue_deploy) =
         (false, false, false, false);
     for cue in cues.read() {
@@ -1043,548 +1585,191 @@ fn event_cues(
         }
     }
     if cue_select {
-        one_shot(&mut commands, bank.ui_select.clone(), 0.5 * uv, 1.0);
+        mixer.play_flat(Bus::Ui, pools.ui_select, UI_SELECT);
+    }
+    if cue_attack {
+        mixer.play_flat(Bus::Ui, pools.ui_attack, UI_ATTACK);
+    }
+    if cue_move || cue_deploy {
+        mixer.play_flat(Bus::Ui, pools.ui_order, UI_ORDER);
     }
 
-    let mut new_break_own = false;
-    let mut new_break_any = false;
+    let at = |c: Vec2| Vec3::new(c.x, terrain.height_at(c.x, c.y) + 1.5, c.y);
+    let seed = st.frame.wrapping_mul(211);
+    // The war horn sounds from the regiments the order went to.
+    if (cue_attack || cue_move) && st.horn_gate <= 0.0 {
+        let (mut sum, mut n, mut first) = (Vec2::ZERO, 0.0, NO_UNIT);
+        for (g, gd) in groups.list.iter().enumerate() {
+            if selection.regiments.get(g).copied().unwrap_or(false) && gd.team == 0 && gd.count > 0 {
+                sum += gd.centroid;
+                n += 1.0;
+                first = first.min(g as u32);
+            }
+        }
+        if n > 0.0 {
+            play(&mut mixer, &pools.horn_charge, HORN_CHARGE, at(sum / n), seed, 0.0, first);
+            st.horn_gate = WAR_HORN_GAP_S;
+        }
+    }
+
+    // The rout horn from an own regiment that breaks. Its crowd cry plays
+    // in regiment_sounds; rally has no cue until a fresh asset exists.
+    let mut broke: Option<usize> = None;
     for (g, gd) in groups.list.iter().enumerate() {
         let state = match gd.state {
             RegState::Steady => 0u8,
             RegState::Routing { .. } => 1,
             RegState::Shattered => 2,
         };
-        if state >= 1 && st.prev_state[g] == 0 && gd.count > 0 {
-            new_break_any = true;
-            if gd.team == 0 {
-                new_break_own = true;
-            }
+        if state >= 1 && st.prev_state[g] == 0 && gd.count > 0 && gd.team == 0 {
+            broke = Some(g);
         }
         st.prev_state[g] = state;
     }
-
-    let seed = st.frame.wrapping_mul(211);
-
-    // Order-click feedback: immediate and ungated, like the selection
-    // click — this is UI, not battlefield sound. Deployment placements
-    // click like a move but never horn.
-    if cue_attack {
-        one_shot(&mut commands, bank.ui_attack.clone(), 0.45 * uv, 1.0);
-    }
-    if cue_move || cue_deploy {
-        one_shot(&mut commands, bank.ui_order.clone(), 0.35 * uv, 1.0);
-    }
-    if (cue_attack || cue_move) && st.horn_gate <= 0.0 {
-        if let Some(h) = pick(&bank.horn_charge, seed) {
-            one_shot(&mut commands, h, 0.55 * bv, 1.0);
-        }
-        st.horn_gate = 3.0;
-    }
-    if st.vox_gate <= 0.0 {
-        // One vox per gate window, most dramatic first.
-        if new_break_any {
-            if let Some(h) = pick(&bank.vox_rout, seed ^ 0x66) {
-                one_shot(&mut commands, h, 0.55 * bv, 1.0);
-            }
-            if new_break_own {
-                one_shot(&mut commands, bank.horn_rout.clone(), 0.5 * bv, 1.0);
-            }
-            // The victors' roar moved to celebrate_vox: the M2TW cheer
-            // is a STATE (the last nearby foe gone), not a break edge.
-            // Rally has no vox for now (the old clips are benched);
-            // a rally cue needs a fresh asset first.
-            st.vox_gate = 1.5;
-        }
+    if let Some(g) = broke
+        && st.horn_gate <= 0.0
+    {
+        play(&mut mixer, &[pools.horn_rout], HORN_ROUT, at(groups.list[g].centroid), seed ^ 0x77, 0.0, g as u32);
+        st.horn_gate = WAR_HORN_GAP_S;
     }
 
     // Outcome sting, once.
     if !st.prev_outcome && outcome.0.is_some() {
-        let h = match outcome.0 {
-            Some(0) => bank.sting_victory.clone(),
-            _ => bank.sting_defeat.clone(),
+        let (clip, bank) = match outcome.0 {
+            Some(0) => (pools.sting_victory, STING_VICTORY),
+            _ => (pools.sting_defeat, STING_DEFEAT),
         };
-        one_shot(&mut commands, h, 0.8 * bv, 1.0);
+        mixer.play_flat(Bus::Battle, clip, bank);
         st.prev_outcome = true;
     }
 }
 
-/// State for `charge_vox`, bundled into one Local.
-#[derive(Default)]
-struct ChargeVoxState {
-    yell_acc: f32,
-    /// Per-regiment group-sheet clock: seconds until the next sheet.
-    sheet_t: Vec<f32>,
-    frame: u32,
-}
-
-/// The M2TW charge soundscape, two layers (mined from its configs).
-/// Foreground: single-man charge yells — M2TW plays
-/// `Individual_Charge` on one in five charging soldiers, each his own
-/// positional clip — budgeted here from the men charging near the
-/// camera, the same fractional-accumulator pattern as the clangs and
-/// bow looses. Background: the `unit_charge` group sheet — one quiet
-/// size-banded crowd clip per charging regiment, retriggered every
-/// 2.0..2.5 s while the charge state lasts, overlapping itself into a
-/// wash. The yells carry the moment; the sheet is texture under them.
-#[allow(clippy::too_many_arguments)] // bevy system params
-fn charge_vox(
-    mut commands: Commands,
-    bank: Option<Res<AudioBank>>,
+/// FL_LOG_AUDIO: once a second, the clips started most often, each with
+/// its sound, its median distance from the look point, and the regiments
+/// it came from with their state. Finds a clip repeating out of one spot.
+fn clip_log(
+    mut mixer: ResMut<Mixer>,
+    clips: Res<Clips>,
     groups: Res<Groups>,
-    camera: Query<&RtsCamera>,
-    time: Res<Time>,
-    virt_time: Res<Time<Virtual>>,
-    settings: Res<crate::settings::Settings>,
-    playing: Query<(), (With<AudioPlayer>, Without<Bed>)>,
-    mut st: Local<ChargeVoxState>,
+    time: Res<Time<Real>>,
+    mut next: Local<f32>,
 ) {
-    let Some(bank) = bank else { return };
-    let Ok(cam) = camera.single() else { return };
-    if virt_time.is_paused() {
+    if !crate::mixer::log_enabled() {
         return;
     }
-    st.frame = st.frame.wrapping_add(1);
-    let dt = time.delta_secs();
-    let bv = battle_vol(&settings);
-    let zoom_att = zoom_attenuation(cam.distance);
-    let focus = Vec2::new(cam.focus.x, cam.focus.z);
-    let hear = 220.0 + cam.distance * 0.5;
-    let mut allowance = MAX_LIVE_ONE_SHOTS.saturating_sub(playing.iter().count()) as u32;
-    st.sheet_t.resize(groups.list.len(), 0.0);
-
-    // One pass: the yell feed (charging men, proximity-squared
-    // weighted) and the per-regiment sheet clocks.
-    let mut men_near = 0.0f32;
-    let mut best_prox = 0.0f32;
-    for (g, gd) in groups.list.iter().enumerate() {
-        if !gd.charging || gd.count == 0 {
-            // A finished charge resets its clock: the next one opens
-            // with an immediate sheet.
-            st.sheet_t[g] = 0.0;
-            continue;
-        }
-        let prox = (1.0 - gd.centroid.distance(focus) / hear).clamp(0.0, 1.0);
-        men_near += gd.count as f32 * prox * prox;
-        best_prox = best_prox.max(prox);
-
-        st.sheet_t[g] -= dt;
-        if st.sheet_t[g] <= 0.0 {
-            let seed = st.frame.wrapping_mul(191) ^ (g as u32).wrapping_mul(0x9E37);
-            if prox > 0.05 && allowance > 0 {
-                let set = if gd.count >= 300 {
-                    &bank.group_charge_large
-                } else {
-                    &bank.group_charge_medium
-                };
-                if let Some(h) = pick(set, seed) {
-                    // Sits under the yell layer but must stay audible
-                    // through it: a sustained wash reads quieter than
-                    // its gain suggests (first cut at 0.10 vanished
-                    // entirely under yells + beds).
-                    one_shot(
-                        &mut commands,
-                        h,
-                        0.22 * (0.3 + 0.7 * prox) * zoom_att.max(0.55) * bv,
-                        0.94 + 0.12 * hash01(seed ^ 0x31),
-                    );
-                    allowance -= 1;
-                }
+    if time.elapsed_secs() < *next {
+        return;
+    }
+    *next = time.elapsed_secs() + 1.0;
+    let starts = std::mem::take(&mut mixer.start_log);
+    let cuts = std::mem::take(&mut mixer.cut_log);
+    // Per clip: its sound, distances, and starts per regiment.
+    type ClipStarts<'a> = (ClipId, &'a str, Vec<f32>, Vec<(u32, u32)>);
+    let mut per: Vec<ClipStarts> = Vec::new();
+    for r in &starts {
+        let i = match per.iter().position(|e| e.0 == r.clip) {
+            Some(i) => i,
+            None => {
+                per.push((r.clip, r.bank, Vec::new(), Vec::new()));
+                per.len() - 1
             }
-            // M2TW: delay 2.0 randomdelay .5 — the 4 s clips overlap.
-            st.sheet_t[g] = 2.0 + 0.5 * hash01(seed ^ 0x42);
-        }
-    }
-
-    // Yell budget: 0.2 yells per man (M2TW probability) spread over the
-    // measured 2.8..7 s charge window (~4.5 s mid). Our
-    // regiments run far bigger than M2TW's 60-150 men, so the caps and
-    // the one-shot allowance keep a 1000-man charge a chorus instead
-    // of a decoder flood.
-    if best_prox > 0.0 {
-        st.yell_acc += men_near * (0.2 / 4.5) * dt * (0.4 + 0.6 * zoom_att);
-    }
-    st.yell_acc = st.yell_acc.min(3.0);
-    let mut n = st.yell_acc.floor() as u32;
-    st.yell_acc -= n as f32;
-    n = n.min(2).min(allowance);
-    for k in 0..n {
-        let seed = st.frame.wrapping_mul(227) ^ k ^ 0x95;
-        if let Some(h) = pick(&bank.yell_charge, seed) {
-            one_shot(
-                &mut commands,
-                h,
-                (0.20 + 0.10 * hash01(seed ^ 0x18))
-                    * (0.25 + 0.75 * best_prox)
-                    * zoom_att
-                    * bv,
-                0.90 + 0.20 * hash01(seed ^ 0x29),
-            );
-        }
-    }
-}
-
-/// State for `rout_vox`, bundled into one Local.
-#[derive(Default)]
-struct RoutVoxState {
-    prev_broken: Vec<bool>,
-    /// Seconds of the initial-panic window left, per regiment.
-    panic_left: Vec<f32>,
-    /// Per-regiment feet-wash clock (seconds until the next wash).
-    wash_t: Vec<f32>,
-    panic_acc: f32,
-    shout_acc: f32,
-    frame: u32,
-}
-
-/// The rout soundscape, after film retreats
-/// (Napoleon 2023, The Patriot), matching the M2TW config: after the
-/// first panicked moments men flee mostly SILENT — what carries is
-/// officers shouting Retreat / Withdraw / Fall back (M2TW
-/// Individual_Retreat is exactly such voice lines, sparse at p .08)
-/// and the drumming feet of the running mass (unit_run bank; M2TW's
-/// own group retreat sheet is benched in its config, so none here
-/// either). Three layers per BROKEN regiment: panic screams only
-/// inside a 7 s window after the break, sparse command shouts while
-/// any rout runs in earshot, and a rolling feet wash underneath.
-/// The break EDGE itself (crowd vox + horn) stays in event_cues.
-#[allow(clippy::too_many_arguments)] // bevy system params
-fn rout_vox(
-    mut commands: Commands,
-    bank: Option<Res<AudioBank>>,
-    groups: Res<Groups>,
-    camera: Query<&RtsCamera>,
-    time: Res<Time>,
-    virt_time: Res<Time<Virtual>>,
-    settings: Res<crate::settings::Settings>,
-    playing: Query<(), (With<AudioPlayer>, Without<Bed>)>,
-    mut st: Local<RoutVoxState>,
-) {
-    let Some(bank) = bank else { return };
-    let Ok(cam) = camera.single() else { return };
-    if virt_time.is_paused() {
-        return;
-    }
-    st.frame = st.frame.wrapping_add(1);
-    let dt = time.delta_secs();
-    let bv = battle_vol(&settings);
-    let zoom_att = zoom_attenuation(cam.distance);
-    let focus = Vec2::new(cam.focus.x, cam.focus.z);
-    let hear = 220.0 + cam.distance * 0.5;
-    let mut allowance = MAX_LIVE_ONE_SHOTS.saturating_sub(playing.iter().count()) as u32;
-    let n_groups = groups.list.len();
-    st.prev_broken.resize(n_groups, false);
-    st.panic_left.resize(n_groups, 0.0);
-    st.wash_t.resize(n_groups, 0.0);
-
-    let mut panic_men = 0.0f32;
-    let mut best_prox = 0.0f32;
-    for (g, gd) in groups.list.iter().enumerate() {
-        let broken = gd.state.is_broken() && gd.count > 0;
-        if broken && !st.prev_broken[g] {
-            st.panic_left[g] = 7.0;
-        }
-        st.prev_broken[g] = broken;
-        if !broken {
-            st.panic_left[g] = 0.0;
-            st.wash_t[g] = 0.0;
-            continue;
-        }
-        st.panic_left[g] = (st.panic_left[g] - dt).max(0.0);
-        let prox = (1.0 - gd.centroid.distance(focus) / hear).clamp(0.0, 1.0);
-        best_prox = best_prox.max(prox);
-        if st.panic_left[g] > 0.0 {
-            panic_men += gd.count as f32 * prox * prox;
-        }
-
-        // Feet wash: rolling 6 s clips per fleeing regiment, first on
-        // the break edge, sized by regiment strength.
-        st.wash_t[g] -= dt;
-        if st.wash_t[g] <= 0.0 {
-            let seed = st.frame.wrapping_mul(331) ^ (g as u32).wrapping_mul(0x9E37);
-            if prox > 0.05
-                && allowance > 0
-                && let Some(h) = pick(&bank.feet_wash, seed)
-            {
-                let size = (gd.count as f32 / 300.0).min(1.0);
-                one_shot(
-                    &mut commands,
-                    h,
-                    0.20 * (0.5 + 0.5 * size)
-                        * (0.3 + 0.7 * prox)
-                        * zoom_att.max(0.5)
-                        * bv,
-                    0.94 + 0.12 * hash01(seed ^ 0x91),
-                );
-                allowance -= 1;
-            }
-            st.wash_t[g] = 3.0 + 1.0 * hash01(seed ^ 0xA2);
-        }
-    }
-
-    // Initial panic: screams only in the first moments of a break,
-    // then the mass goes quiet (the film observation).
-    st.panic_acc += (panic_men * 0.00066).min(1.5) * dt;
-    st.panic_acc = st.panic_acc.min(2.0);
-    let mut n = st.panic_acc.floor() as u32;
-    st.panic_acc -= n as f32;
-    n = n.min(1).min(allowance);
-    allowance -= n;
-    for k in 0..n {
-        let seed = st.frame.wrapping_mul(347) ^ k ^ 0xB3;
-        if let Some(h) = pick(&bank.rout_panic, seed) {
-            one_shot(
-                &mut commands,
-                h,
-                (0.24 + 0.08 * hash01(seed ^ 0xC4)) * (0.25 + 0.75 * best_prox) * zoom_att * bv,
-                0.92 + 0.16 * hash01(seed ^ 0xD5),
-            );
-        }
-    }
-
-    // Command shouts: one officer voice every ~3 s while any rout
-    // runs in earshot — not per man, and never a machine gun during
-    // a mass collapse.
-    st.shout_acc += best_prox * 0.35 * dt;
-    st.shout_acc = st.shout_acc.min(1.5);
-    let mut n = st.shout_acc.floor() as u32;
-    st.shout_acc -= n as f32;
-    n = n.min(1).min(allowance);
-    for k in 0..n {
-        let seed = st.frame.wrapping_mul(353) ^ k ^ 0xE6;
-        if let Some(h) = pick(&bank.rout_shout, seed) {
-            one_shot(
-                &mut commands,
-                h,
-                (0.30 + 0.08 * hash01(seed ^ 0xF7)) * (0.25 + 0.75 * best_prox) * zoom_att * bv,
-                0.94 + 0.12 * hash01(seed ^ 0x19),
-            );
-        }
-    }
-}
-
-/// State for `celebrate_vox`, bundled into one Local.
-#[derive(Default)]
-struct CelebrateVoxState {
-    whoop_acc: f32,
-    /// Per-regiment cheer-sheet clock (seconds until the next sheet).
-    sheet_t: Vec<f32>,
-    frame: u32,
-}
-
-/// Victory celebration (M2TW unit_celebrate state bank):
-/// while a regiment's `celebrate` window runs (the last nearby foe
-/// routed or died, ~5 s, frontline.rs), it cheers as a STATE — a
-/// rolling size-banded group cheer per regiment, first sheet on the
-/// edge, retriggered so the 4-6 s clips overlap (M2TW: fadein 1
-/// fadeout 3, randomdelay 1, FULL volume — the loudest group event
-/// in the bank set), with single-man whoops budgeted over it
-/// (Individual_Celebrate p .08).
-#[allow(clippy::too_many_arguments)] // bevy system params
-fn celebrate_vox(
-    mut commands: Commands,
-    bank: Option<Res<AudioBank>>,
-    groups: Res<Groups>,
-    camera: Query<&RtsCamera>,
-    time: Res<Time>,
-    virt_time: Res<Time<Virtual>>,
-    settings: Res<crate::settings::Settings>,
-    playing: Query<(), (With<AudioPlayer>, Without<Bed>)>,
-    mut st: Local<CelebrateVoxState>,
-) {
-    let Some(bank) = bank else { return };
-    let Ok(cam) = camera.single() else { return };
-    if virt_time.is_paused() {
-        return;
-    }
-    st.frame = st.frame.wrapping_add(1);
-    let dt = time.delta_secs();
-    let bv = battle_vol(&settings);
-    let zoom_att = zoom_attenuation(cam.distance);
-    let focus = Vec2::new(cam.focus.x, cam.focus.z);
-    let hear = 220.0 + cam.distance * 0.5;
-    let mut allowance = MAX_LIVE_ONE_SHOTS.saturating_sub(playing.iter().count()) as u32;
-    st.sheet_t.resize(groups.list.len(), 0.0);
-
-    let mut men_near = 0.0f32;
-    let mut best_prox = 0.0f32;
-    for (g, gd) in groups.list.iter().enumerate() {
-        if gd.celebrate == 0 || gd.count == 0 {
-            // A finished cheer resets its clock: the next one opens
-            // with an immediate sheet on the celebrate edge.
-            st.sheet_t[g] = 0.0;
-            continue;
-        }
-        let prox = (1.0 - gd.centroid.distance(focus) / hear).clamp(0.0, 1.0);
-        men_near += gd.count as f32 * prox * prox;
-        best_prox = best_prox.max(prox);
-
-        st.sheet_t[g] -= dt;
-        if st.sheet_t[g] <= 0.0 {
-            let seed = st.frame.wrapping_mul(307) ^ (g as u32).wrapping_mul(0x9E37);
-            if prox > 0.05 && allowance > 0 {
-                let set = if gd.count >= 300 {
-                    &bank.celebrate_large
-                } else {
-                    &bank.celebrate_small
-                };
-                if let Some(h) = pick(set, seed) {
-                    // M2TW plays this bank at full volume: the loudest
-                    // sheet in our ledger, above the charge sheets.
-                    one_shot(
-                        &mut commands,
-                        h,
-                        0.40 * (0.3 + 0.7 * prox) * zoom_att.max(0.5) * bv,
-                        0.96 + 0.08 * hash01(seed ^ 0x51),
-                    );
-                    allowance -= 1;
-                }
-            }
-            // Retrigger under the clip length so the cheers roll.
-            st.sheet_t[g] = 2.5 + 1.0 * hash01(seed ^ 0x62);
-        }
-    }
-
-    // Individual whoops: M2TW p .08 per man, spread over the 5 s
-    // celebrate window, proximity-thinned.
-    const WHOOP_RATE_CAP: f32 = 10.0;
-    st.whoop_acc += (men_near * (0.08 / 5.0)).min(WHOOP_RATE_CAP) * dt;
-    st.whoop_acc = st.whoop_acc.min(2.0);
-    let mut n = st.whoop_acc.floor() as u32;
-    st.whoop_acc -= n as f32;
-    n = n.min(2).min(allowance);
-    for k in 0..n {
-        let seed = st.frame.wrapping_mul(311) ^ k ^ 0xA7;
-        if let Some(h) = pick(&bank.celebrate_whoop, seed) {
-            one_shot(
-                &mut commands,
-                h,
-                (0.22 + 0.08 * hash01(seed ^ 0x73))
-                    * (0.25 + 0.75 * best_prox)
-                    * zoom_att
-                    * bv,
-                0.92 + 0.16 * hash01(seed ^ 0x84),
-            );
-        }
-    }
-}
-
-/// State for `melee_vox`, bundled into one Local.
-#[derive(Default)]
-struct MeleeVoxState {
-    hit_acc: f32,
-    ambient_acc: f32,
-    frame: u32,
-}
-
-/// The melee human layer (M2TW soldier_voice vocals):
-/// men, not steel, carry the sound of a fight. Two feeds. Per-HIT
-/// vocals ride the same sim hit counter as the clangs — each spawn
-/// picks the attacker's grunt, the victim's grunt, or the attacker's
-/// scream at the M2TW probability ratio (.4 / .25 / .25). A slow
-/// ambient stream of battle screams (M2TW p .2, the loudest clips)
-/// comes from the mass of ENGAGED men near the camera. M2TW plays
-/// all of these at tiny mindist (0.75-2 m) — a strictly close-up
-/// layer, so zoom attenuates it harder than the beds.
-#[allow(clippy::too_many_arguments)] // bevy system params
-fn melee_vox(
-    mut commands: Commands,
-    bank: Option<Res<AudioBank>>,
-    stats: Res<SimStats>,
-    groups: Res<Groups>,
-    camera: Query<&RtsCamera>,
-    time: Res<Time>,
-    virt_time: Res<Time<Virtual>>,
-    settings: Res<crate::settings::Settings>,
-    playing: Query<(), (With<AudioPlayer>, Without<Bed>)>,
-    mut st: Local<MeleeVoxState>,
-) {
-    let Some(bank) = bank else { return };
-    let Ok(cam) = camera.single() else { return };
-    if virt_time.is_paused() {
-        return;
-    }
-    st.frame = st.frame.wrapping_add(1);
-    let dt = time.delta_secs();
-    let bv = battle_vol(&settings);
-    let zoom_att = zoom_attenuation(cam.distance);
-    let focus = Vec2::new(cam.focus.x, cam.focus.z);
-    let hear = 200.0 + cam.distance * 0.4;
-
-    // Same audible-share model as the clangs (see combat_one_shots):
-    // hits attributed to engaged regiments by strength, weighted by
-    // earshot. Camera distance shapes volume, never rate.
-    let (mut min_dist, mut engaged_total, mut engaged_audible) = (f32::MAX, 0.0f32, 0.0f32);
-    let mut men_near = 0.0f32;
-    for gd in groups.list.iter().filter(|g| g.engaged && g.count > 0) {
-        let d = gd.centroid.distance(focus);
-        min_dist = min_dist.min(d);
-        let p = (1.0 - d / hear).clamp(0.0, 1.0);
-        engaged_total += gd.count as f32;
-        engaged_audible += gd.count as f32 * p;
-        men_near += gd.count as f32 * p * p;
-    }
-    let audible = if engaged_total > 0.0 {
-        engaged_audible / engaged_total
-    } else {
-        0.0
-    };
-    let prox = if min_dist == f32::MAX {
-        0.0
-    } else {
-        (1.0 - min_dist / hear).clamp(0.0, 1.0)
-    };
-    let mut allowance = MAX_LIVE_ONE_SHOTS.saturating_sub(playing.iter().count()) as u32;
-
-    // Per-hit vocals at 0.6 per steel: M2TW rides ~.9 vocals per hit
-    // but each QUIETER than the material hit — steel is the carrier,
-    // voices the garnish (weapon_hit p 1 vol -10..0 vs vocals
-    // p .4/.25/.25 vol -20/-15). Whiffed swings go unheard (the sim
-    // only counts hits); acceptable undercount.
-    const VOCAL_RATE_CAP: f32 = 18.0;
-    let near_hit_rate = stats.events as f32 * 30.0 * audible;
-    st.hit_acc += (near_hit_rate * 0.6).min(VOCAL_RATE_CAP) * dt;
-    st.hit_acc = st.hit_acc.min(3.0);
-    let mut n = st.hit_acc.floor() as u32;
-    st.hit_acc -= n as f32;
-    n = n.min(2).min(allowance);
-    allowance -= n;
-    for k in 0..n {
-        let seed = st.frame.wrapping_mul(241) ^ k ^ 0xC3;
-        let r = hash01(seed ^ 0xD1);
-        let (set, vol) = if r < 0.45 {
-            (&bank.melee_attack_grunt, 0.13 + 0.06 * hash01(seed ^ 0x1A))
-        } else if r < 0.73 {
-            (&bank.melee_hit_grunt, 0.15 + 0.06 * hash01(seed ^ 0x2B))
-        } else {
-            (&bank.melee_attack_scream, 0.22 + 0.08 * hash01(seed ^ 0x3C))
         };
-        if let Some(h) = pick(set, seed) {
-            one_shot(
-                &mut commands,
-                h,
-                vol * (0.25 + 0.75 * prox) * zoom_att * bv,
-                0.92 + 0.16 * hash01(seed ^ 0x4D),
-            );
+        per[i].2.push(r.dist);
+        match per[i].3.iter_mut().find(|u| u.0 == r.unit) {
+            Some(u) => u.1 += 1,
+            None => per[i].3.push((r.unit, 1)),
         }
+    }
+    per.sort_by_key(|e| std::cmp::Reverse(e.2.len()));
+    let state = |g: u32| -> String {
+        let Some(gd) = groups.list.get(g as usize) else { return "no unit".into() };
+        let mut s = vec![if gd.team == 0 { "own" } else { "enemy" }, crate::unit_types::kind_name(gd.kind)];
+        for (on, name) in [
+            (gd.charging, "charging"),
+            (gd.crashing, "crashing"),
+            (gd.engaged, "engaged"),
+            (gd.contact, "contact"),
+            (gd.state.is_broken(), "broken"),
+            (gd.celebrate > 0, "celebrating"),
+        ] {
+            if on {
+                s.push(name);
+            }
+        }
+        format!("g{g} {}", s.join(" "))
+    };
+    let lines: Vec<String> = per
+        .iter_mut()
+        .take(6)
+        .map(|(clip, bank, d, units)| {
+            d.sort_by(|a, b| a.total_cmp(b));
+            units.sort_by_key(|u| std::cmp::Reverse(u.1));
+            let from: Vec<String> = units.iter().take(3).map(|(g, n)| format!("{} x{n}", state(*g))).collect();
+            format!(
+                "{} x{} ({bank}, {:.0} m; {})",
+                clips.path(*clip),
+                d.len(),
+                d[d.len() / 2],
+                from.join(", ")
+            )
+        })
+        .collect();
+    if !lines.is_empty() {
+        crate::mixer::audio_log(time.elapsed_secs_f64(), &format!("clips: {}", lines.join(" | ")));
     }
 
-    // Ambient battle screams: ~one every 1-2 s over a close 1000-man
-    // melee, fading out fast with distance and zoom (zoom shapes the
-    // volume below, not this rate).
-    st.ambient_acc += men_near * dt * 0.0008;
-    st.ambient_acc = st.ambient_acc.min(2.0);
-    let mut n = st.ambient_acc.floor() as u32;
-    st.ambient_acc -= n as f32;
-    n = n.min(1).min(allowance);
-    for k in 0..n {
-        let seed = st.frame.wrapping_mul(263) ^ k ^ 0xE5;
-        if let Some(h) = pick(&bank.melee_battle_scream, seed) {
-            one_shot(
-                &mut commands,
-                h,
-                (0.26 + 0.08 * hash01(seed ^ 0x5E)) * (0.25 + 0.75 * prox) * zoom_att * bv,
-                0.92 + 0.16 * hash01(seed ^ 0x6F),
-            );
+    // The voices alone: per voice sound, its starts, how many playing
+    // voices of it were cut for a stronger sound, its most repeated clip
+    // and median distance, and the regiments it came from.
+    let mut voices: Vec<String> = Vec::new();
+    for bank in VOICE_BANKS {
+        let mine: Vec<&crate::mixer::StartRecord> = starts.iter().filter(|r| r.bank == bank).collect();
+        if mine.is_empty() {
+            continue;
         }
+        let cut = cuts.iter().filter(|c| **c == bank).count();
+        let mut by_clip: Vec<(ClipId, u32)> = Vec::new();
+        let mut by_unit: Vec<(u32, u32)> = Vec::new();
+        let mut d: Vec<f32> = Vec::new();
+        for r in &mine {
+            match by_clip.iter_mut().find(|c| c.0 == r.clip) {
+                Some(c) => c.1 += 1,
+                None => by_clip.push((r.clip, 1)),
+            }
+            match by_unit.iter_mut().find(|u| u.0 == r.unit) {
+                Some(u) => u.1 += 1,
+                None => by_unit.push((r.unit, 1)),
+            }
+            d.push(r.dist);
+        }
+        by_clip.sort_by_key(|c| std::cmp::Reverse(c.1));
+        by_unit.sort_by_key(|u| std::cmp::Reverse(u.1));
+        d.sort_by(|a, b| a.total_cmp(b));
+        let from: Vec<String> = by_unit.iter().take(3).map(|(g, n)| format!("{} x{n}", state(*g))).collect();
+        voices.push(format!(
+            "{bank} {} starts, {cut} cut, top {} x{}, {:.0} m; {}",
+            mine.len(),
+            clips.path(by_clip[0].0),
+            by_clip[0].1,
+            d[d.len() / 2],
+            from.join(", ")
+        ));
+    }
+    if !voices.is_empty() {
+        crate::mixer::audio_log(time.elapsed_secs_f64(), &format!("voices: {}", voices.join(" | ")));
     }
 }
+
+/// The human-voice banks, for the FL_LOG_AUDIO voice line.
+const VOICE_BANKS: [&str; 10] = [
+    "attack grunt",
+    "attack scream",
+    "victim grunt",
+    "battle scream",
+    "death scream",
+    "charge yell",
+    "whoop",
+    "rout shout",
+    "rout panic",
+    "rout crowd",
+];

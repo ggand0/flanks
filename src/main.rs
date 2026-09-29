@@ -10,6 +10,7 @@ mod formation;
 mod gait;
 mod frontline;
 mod game_state;
+mod mixer;
 mod morale;
 mod orders;
 mod overlay;

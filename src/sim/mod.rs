@@ -550,6 +550,7 @@ pub fn step_sim(
     mut stats: ResMut<SimStats>,
     mut pipeline: ResMut<TickPipeline>,
     mut dir_stats: ResMut<DirTestStats>,
+    mut sounds: Option<ResMut<crate::audio::SoundEvents>>,
 ) {
     let finished = pipeline.taken.take();
     if units.pos.is_empty() {
@@ -633,6 +634,7 @@ pub fn step_sim(
         },
         &mut cstats,
         &mut dir_stats,
+        sounds.as_deref_mut(),
     );
 
     pipeline.tick = pipeline.tick.wrapping_add(1);
