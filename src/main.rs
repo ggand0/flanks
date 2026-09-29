@@ -170,18 +170,19 @@ fn setup_world(mut commands: Commands, settings: Res<settings::Settings>) {
         },
         // Lowish sun: flat-shaded relief needs directional contrast.
         Transform::from_rotation(Quat::from_euler(EulerRot::YXZ, 0.7, -0.75, 0.0)),
-        // Two cascades out to where soldiers stop casting (about 100 m,
-        // where the camera draws them at L2). The first covers the
-        // close-up, where a soldier's shadow at his feet needs the finest
-        // texels. Every cascade is one more view Bevy walks every mesh
-        // for each frame, plus a pass, and a third one out to 280 m held
-        // banner poles only: the hills cast nothing at this sun. Trees at
-        // distance will want it back: FL_SHADOW_CASCADES=3
-        // FL_SHADOW_DIST=280.
+        // Three cascades out to 280 m, split at 40 and 106 m. The first
+        // covers the close-up, where a soldier's shadow at his feet needs
+        // the finest texels. Soldiers stop casting at about 100 m, where
+        // the camera draws them at L2, so the third holds trees and
+        // terrain: it gives trees their ground shadow and shaded canopy
+        // to mid distance, where without it they read pale. Every cascade
+        // is one more view Bevy walks every mesh for each frame, plus a
+        // pass, about 0.2 ms of render thread whatever it holds.
+        // FL_SHADOW_CASCADES=2 FL_SHADOW_DIST=110 drops the third.
         bevy::light::CascadeShadowConfigBuilder {
-            num_cascades: crate::util::env_or("FL_SHADOW_CASCADES", 2_usize).clamp(1, 4),
+            num_cascades: crate::util::env_or("FL_SHADOW_CASCADES", 3_usize).clamp(1, 4),
             first_cascade_far_bound: 40.0,
-            maximum_distance: crate::util::env_or("FL_SHADOW_DIST", 110.0_f32).max(41.0),
+            maximum_distance: crate::util::env_or("FL_SHADOW_DIST", 280.0_f32).max(41.0),
             ..default()
         }
         .build(),

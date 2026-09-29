@@ -85,7 +85,7 @@ pub(crate) struct SunUniform {
 /// sun shadow cascade: the level's nearest switch distance, jitter
 /// counted, is within the shadow distance. Only those levels compile the
 /// receive path (`render_units::receive_defs`). With the cascades ending
-/// at 110 m that is L0 to L2 (L2 can start at 91 m at the default
+/// at 280 m that is L0 to L2 (L2 can start at 91 m at the default
 /// window); L3 starts past 400 m. All false with shadows off.
 #[derive(Resource, Clone, Copy, ExtractResource)]
 pub(crate) struct ShadowReceiveLevels(pub [bool; NUM_LODS]);

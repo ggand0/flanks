@@ -209,6 +209,9 @@ pub fn do_spawn_battle(
         }
         Scenario::Join => { spawn_join_test(units, terrain, groups); return; }
         Scenario::Routpass => { spawn_routpass_test(units, terrain, groups); return; }
+        // The scene: no armies. The victory check stays quiet on an empty
+        // regiment list and the camera is free in the Battle state.
+        Scenario::Scene => { groups.list.clear(); return; }
         Scenario::Archery => { spawn_archery_test(units, terrain, groups); return; }
         Scenario::Retarget => { spawn_retarget_test(units, terrain, groups); return; }
         Scenario::Normal => {}

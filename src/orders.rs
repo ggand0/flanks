@@ -642,10 +642,16 @@ pub fn line_order(groups: &mut Groups, selected: &[usize], a: Vec2, b: Vec2) {
 /// land, inside the same margins the spawner keeps. Returned as
 /// (min, max) corners in ground coordinates.
 fn deploy_zone(terrain: &Terrain) -> (Vec2, Vec2) {
-    use crate::regiments::{EDGE_MARGIN, SIDE_MARGIN, army_gap};
+    deploy_zone_for(terrain, crate::regiments::army_gap())
+}
+
+/// `deploy_zone` with the army gap given. The enemy deploys in its
+/// mirror across z = 0; the grassland plants keep clear of both.
+pub(crate) fn deploy_zone_for(terrain: &Terrain, army_gap: f32) -> (Vec2, Vec2) {
+    use crate::regiments::{EDGE_MARGIN, SIDE_MARGIN};
     (
         Vec2::new(terrain.min().x + SIDE_MARGIN, terrain.min().y + EDGE_MARGIN),
-        Vec2::new(terrain.max().x - SIDE_MARGIN, -army_gap() * 0.5),
+        Vec2::new(terrain.max().x - SIDE_MARGIN, -army_gap * 0.5),
     )
 }
 

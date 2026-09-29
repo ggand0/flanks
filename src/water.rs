@@ -14,7 +14,6 @@ use crate::terrain::{
     self, BRIDGE_DECK_LIFT, BRIDGE_HALF_SPAN, BRIDGE_Z, bridge_deck_half_len, river_bed_depth,
     river_center_x, river_half_width, river_water_level,
 };
-use crate::vegetation::{Soup, srgb};
 
 pub struct WaterPlugin;
 
@@ -147,10 +146,77 @@ fn place_water(
     }
 }
 
-/// The stone bridge at BRIDGE_Z: flat deck slab + parapets + two piers
-/// standing in the channel. Low-poly soup, same style as everything
-/// else. The walkable surface is terrain.rs's deck height override;
-/// this mesh is purely the visual.
+/// Builds the bridge mesh from triangles, each with its own face normal.
+struct FaceMesh {
+    positions: Vec<[f32; 3]>,
+    normals: Vec<[f32; 3]>,
+    colors: Vec<[f32; 4]>,
+}
+
+impl FaceMesh {
+    fn new() -> Self {
+        Self {
+            positions: Vec::new(),
+            normals: Vec::new(),
+            colors: Vec::new(),
+        }
+    }
+
+    fn tri(&mut self, a: Vec3, b: Vec3, c: Vec3, color: [f32; 4]) {
+        let n = (b - a).cross(c - a).normalize_or_zero();
+        for v in [a, b, c] {
+            self.positions.push(v.to_array());
+            self.normals.push(n.to_array());
+            self.colors.push(color);
+        }
+    }
+
+    fn quad(&mut self, a: Vec3, b: Vec3, c: Vec3, d: Vec3, color: [f32; 4]) {
+        self.tri(a, b, c, color);
+        self.tri(a, c, d, color);
+    }
+
+    /// Axis-aligned cuboid (pre-rotation); `c` = center, `h` = half extents.
+    fn cuboid(&mut self, c: Vec3, h: Vec3, color: [f32; 4]) {
+        let p = |x: f32, y: f32, z: f32| c + Vec3::new(x * h.x, y * h.y, z * h.z);
+        // 8 corners.
+        let v = [
+            p(-1.0, -1.0, -1.0),
+            p(1.0, -1.0, -1.0),
+            p(1.0, -1.0, 1.0),
+            p(-1.0, -1.0, 1.0),
+            p(-1.0, 1.0, -1.0),
+            p(1.0, 1.0, -1.0),
+            p(1.0, 1.0, 1.0),
+            p(-1.0, 1.0, 1.0),
+        ];
+        // Outward-wound faces (bottom skipped: buried).
+        self.quad(v[3], v[2], v[6], v[7], color); // +Z
+        self.quad(v[1], v[0], v[4], v[5], color); // -Z
+        self.quad(v[2], v[1], v[5], v[6], color); // +X
+        self.quad(v[0], v[3], v[7], v[4], color); // -X
+        self.quad(v[7], v[6], v[5], v[4], color); // +Y
+    }
+
+    fn into_mesh(self) -> Mesh {
+        Mesh::new(
+            PrimitiveTopology::TriangleList,
+            RenderAssetUsages::default(),
+        )
+        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, self.positions)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, self.normals)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, self.colors)
+    }
+}
+
+fn srgb(r: f32, g: f32, b: f32) -> [f32; 4] {
+    Color::srgb(r, g, b).to_linear().to_f32_array()
+}
+
+/// The stone bridge at BRIDGE_Z: a flat deck slab, parapets and two piers
+/// standing in the channel, built from boxes with one normal per face.
+/// The walkable surface is terrain.rs's deck height override; this mesh
+/// is only the visual.
 fn place_bridge(
     commands: &mut Commands,
     terrain: &terrain::Terrain,
@@ -171,16 +237,16 @@ fn place_bridge(
     let stone_light = srgb(0.58, 0.56, 0.52);
     let stone_dark = srgb(0.44, 0.42, 0.38);
 
-    let mut soup = Soup::new();
+    let mut faces = FaceMesh::new();
     // Deck slab (top at deck_y).
-    soup.cuboid(
+    faces.cuboid(
         Vec3::new(cx, deck_y - 0.2, BRIDGE_Z),
         Vec3::new(deck_half, 0.2, BRIDGE_HALF_SPAN),
         stone_light,
     );
     // Parapets along both long edges.
     for side in [-1.0f32, 1.0] {
-        soup.cuboid(
+        faces.cuboid(
             Vec3::new(cx, deck_y + 0.45, BRIDGE_Z + side * (BRIDGE_HALF_SPAN - 0.3)),
             Vec3::new(deck_half, 0.45, 0.3),
             stone,
@@ -190,14 +256,14 @@ fn place_bridge(
     for off in [-0.55f32, 0.55] {
         let px = cx + off * hw;
         let bed = wl - terrain::RIVER_DEPTH;
-        soup.cuboid(
+        faces.cuboid(
             Vec3::new(px, (bed + deck_y - 0.4) * 0.5, BRIDGE_Z),
             Vec3::new(1.5, (deck_y - 0.4 - bed) * 0.5, BRIDGE_HALF_SPAN - 0.6),
             stone_dark,
         );
     }
 
-    let mesh = soup.into_mesh();
+    let mesh = faces.into_mesh();
     let aabb = mesh.compute_aabb();
     let handle = meshes.add(mesh);
     let material = materials.add(StandardMaterial {

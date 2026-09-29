@@ -33,6 +33,9 @@ pub enum MapKind {
     Classic,
     /// Experimental: the same noise with terraces, a river and a bridge.
     River,
+    /// The grassland's heights and ground again, as a scratch field for
+    /// scenery and vegetation experiments that must not touch Grassland.
+    Sandbox,
 }
 
 impl MapKind {
@@ -40,6 +43,7 @@ impl MapKind {
         match std::env::var("FL_MAP").as_deref() {
             Ok("river") => Self::River,
             Ok("classic") => Self::Classic,
+            Ok("sandbox") => Self::Sandbox,
             _ => Self::Grassland,
         }
     }
@@ -49,6 +53,7 @@ impl MapKind {
             Self::Grassland => "Grassland",
             Self::Classic => "Classic",
             Self::River => "River",
+            Self::Sandbox => "Sandbox",
         }
     }
 
@@ -56,7 +61,8 @@ impl MapKind {
         match self {
             Self::Grassland => Self::Classic,
             Self::Classic => Self::River,
-            Self::River => Self::Grassland,
+            Self::River => Self::Sandbox,
+            Self::Sandbox => Self::Grassland,
         }
     }
 }
@@ -506,7 +512,7 @@ fn generate_terrain(mut commands: Commands) {
 /// The heightfield and the blocked mask of one map. Grassland has its
 /// own analytic landforms; classic and river share the noise formula,
 /// and river alone carves the channel, terraces and impassable walls.
-fn build_terrain(kind: MapKind) -> Terrain {
+pub(crate) fn build_terrain(kind: MapKind) -> Terrain {
     let classic = kind != MapKind::River;
     let origin = Vec2::new(
         -(VERTS_X as f32 - 1.0) * CELL * 0.5,
@@ -516,7 +522,7 @@ fn build_terrain(kind: MapKind) -> Terrain {
     for z in 0..VERTS_Z {
         for x in 0..VERTS_X {
             let p = origin + Vec2::new(x as f32, z as f32) * CELL;
-            if kind == MapKind::Grassland {
+            if matches!(kind, MapKind::Grassland | MapKind::Sandbox) {
                 heights[z * VERTS_X + x] = classic_height(p);
                 continue;
             }
@@ -619,7 +625,7 @@ fn ground_base() -> StandardMaterial {
 fn ground_layers(assets: &AssetServer, images: &mut Assets<Image>, terrain: &Terrain) -> GroundLayers {
     // Only the grassland has a painted layout; the other maps derive
     // their coverage from their own relief and put stone on steep faces.
-    let authored = terrain.kind == MapKind::Grassland;
+    let authored = matches!(terrain.kind, MapKind::Grassland | MapKind::Sandbox);
     GroundLayers {
         pasture: ground_texture(
             assets,
@@ -898,8 +904,9 @@ fn band_color(h: f32, slope: f32, p: Vec2, classic: bool) -> [f32; 4] {
     }
     c.to_linear().to_f32_array()
 }
-/// Flat-shaded triangle soup for one chunk: 2 triangles per cell, per-face
-/// normal and one hard-banded color per triangle. World coords baked in.
+
+/// One chunk's mesh as unindexed triangles, 2 per cell, each with its face
+/// normal and one hard-banded color. World coords baked in.
 fn build_band_mesh(terrain: &Terrain, cx: usize, cz: usize) -> Mesh {
     let n_tris = CHUNK_CELLS * CHUNK_CELLS * 2;
     let mut positions = Vec::with_capacity(n_tris * 3);
