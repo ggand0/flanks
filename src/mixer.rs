@@ -98,6 +98,9 @@ pub struct Request {
     /// so a tick's blows are spread over the tick instead of stacking on
     /// one frame.
     pub delay: f32,
+    /// The caller's tag for voices it may fade out together later
+    /// (`Mixer::fade_owner`); 0 for none.
+    pub owner: u64,
 }
 
 /// Where the battle is heard from: level by distance from the point the
@@ -466,6 +469,7 @@ struct Live {
     key: Option<u64>,
     /// The clip's normalization gain (linear).
     clip_gain: f32,
+    owner: u64,
 }
 
 /// Fade of a tracked loop whose source is gone (M2TW ARROW_FLY
@@ -554,6 +558,21 @@ impl Mixer {
         self.started = 0;
         self.dropped = 0;
         line
+    }
+
+    /// Fade out, over `secs`, every playing voice the caller tagged with
+    /// `owner`.
+    pub fn fade_owner(&mut self, owner: u64, secs: f32) {
+        let fade = (secs * OUT_RATE as f32) as u32;
+        let cmds = &mut self.cmds;
+        self.live.retain(|l| {
+            if l.owner == owner {
+                cmds.push(Cmd::Stop { id: l.id, fade });
+                false
+            } else {
+                true
+            }
+        });
     }
 
     /// Loudness of the positional mix over the last ~0.3 s, in dBFS.
@@ -727,6 +746,7 @@ impl Mixer {
                 ends: now + secs,
                 key,
                 clip_gain,
+                owner: r.owner,
             });
             self.started += 1;
         }

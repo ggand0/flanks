@@ -266,10 +266,13 @@ fn clear_sound_events(mut ev: ResMut<SoundEvents>) {
 /// (the metal ring 19 dB under the shield). Priorities and distance
 /// priorities are M2TW's. Group caps are the voices the approved mix held
 /// (about 31 for the steel, 18 for the grunts and screams together, 1-2
-/// death screams, 14 bow strings), nearest first. The charge yells and
-/// sheets, the volley and the arrow air sit 7 dB over that balance, which
-/// cancels MIX_GAIN_DB for them: they play at the approved mix's absolute
-/// level while the melee plays 7 dB under it.
+/// death screams, 14 bow strings), nearest first. The charge sheets, the
+/// volley, the arrow air and the rout cry sit 7 dB over that balance,
+/// which cancels MIX_GAIN_DB for them: they play at the approved mix's
+/// absolute level while the melee plays 7 dB under it. The charge yells
+/// sit 5 dB over it with a larger cap (more yells, each a little
+/// quieter), and the bow strings 10 dB over it so the volley does not
+/// cover them.
 mod mix {
     /// A death scream's output level in the approved mix: pool median
     /// -7.7 LUFS at gain 0.24 (-12.4 dB).
@@ -330,7 +333,7 @@ const ATTACK_SCREAM: Bank = bank("attack scream", "voices", 18, 120.0, 0.0, 1.6,
 const VICTIM_GRUNT: Bank = bank("victim grunt", "voices", 18, 120.0, 0.0, -8.2, false, (0.92, 1.08));
 const BATTLE_SCREAM: Bank = bank("battle scream", "battle scream", 8, 100.0, 0.0, 2.2, false, (0.92, 1.08));
 /// Bow string on each loose, at the archer.
-const BOW_STRING: Bank = bank("bow string", "bow string", 16, 110.0, 0.0, -19.4, false, (0.88, 1.12));
+const BOW_STRING: Bank = bank("bow string", "bow string", 16, 110.0, 0.0, -9.4, false, (0.88, 1.12));
 const ARROW_FLESH: Bank = bank("arrow flesh", "arrow strike", 8, 90.0, -2.0, -16.3, false, (0.8, 1.2));
 const ARROW_WOOD: Bank = bank("arrow wood", "arrow strike", 8, 90.0, -2.0, -14.5, false, (0.8, 1.2));
 const ARROW_DEATH_HIT: Bank = bank("death hit", "arrow strike", 8, 180.0, -2.0, -4.9, false, (0.8, 1.2));
@@ -345,7 +348,7 @@ const VOLLEY: Bank = bank("volley", "volley", 4, 190.0, -1.0, 3.6, true, (0.9, 1
 /// full level within a sheet's distance.
 const CHARGE_YELL: Bank = Bank {
     mindist: mix::SHEET_M,
-    ..bank("charge yell", "charge yell", 40, 80.0, 0.0, 6.6, false, (0.9, 1.1))
+    ..bank("charge yell", "charge yell", 64, 80.0, 0.0, 4.6, false, (0.9, 1.1))
 };
 const CHARGE_SHEET: Bank = bank("charge sheet", "charge sheet", 0, 170.0, -1.0, 3.6, true, (0.8, 1.1));
 const CHEER_SHEET: Bank = bank("cheer sheet", "cheer sheet", 0, 170.0, -1.0, -2.0, true, (0.9, 1.0));
@@ -354,8 +357,9 @@ const ROUT_SHOUT: Bank = bank("rout shout", "rout shout", 3, 120.0, 0.0, 3.9, fa
 const ROUT_PANIC: Bank = bank("rout panic", "rout panic", 4, 110.0, 0.0, -6.4, true, (0.92, 1.08));
 const FEET: Bank = bank("feet", "feet", 6, 70.0, 0.0, -11.3, true, (0.94, 1.06));
 /// A crowd cry from a regiment the moment it breaks, one at a time, at
-/// the approved break cue's level (0.55 on clips of -12.5 LUFS).
-const ROUT_CROWD: Bank = bank("rout crowd", "rout crowd", 1, 150.0, -1.0, 2.4, true, (1.0, 1.0));
+/// the approved break cue's absolute level (0.55 on clips of -12.5 LUFS),
+/// so it clears the melee around the breaking regiment.
+const ROUT_CROWD: Bank = bank("rout crowd", "rout crowd", 1, 150.0, -1.0, 9.4, true, (1.0, 1.0));
 
 /// One sim tick in seconds: a tick's events are spread over it.
 const TICK_S: f32 = 1.0 / 30.0;
@@ -917,6 +921,11 @@ fn pick(v: &[Handle<AudioSource>], seed: u32) -> Option<Handle<AudioSource>> {
 
 /// Ask the mixer for a clip from `pool` at `pos`.
 fn play(mixer: &mut Mixer, pool: &[ClipId], bank: Bank, pos: Vec3, seed: u32, delay: f32) {
+    play_owned(mixer, pool, bank, pos, seed, delay, 0);
+}
+
+/// `play`, tagging the voice with `owner` so it can be faded out later.
+fn play_owned(mixer: &mut Mixer, pool: &[ClipId], bank: Bank, pos: Vec3, seed: u32, delay: f32, owner: u64) {
     if pool.is_empty() {
         return;
     }
@@ -927,6 +936,7 @@ fn play(mixer: &mut Mixer, pool: &[ClipId], bank: Bank, pos: Vec3, seed: u32, de
         pos,
         speed_roll: hash01(seed ^ 0x5BD1_E995),
         delay,
+        owner,
     });
 }
 
@@ -1053,6 +1063,7 @@ fn arrow_sounds(
                     pos: p,
                     speed_roll: hash01(id.wrapping_mul(0x85EB)),
                     delay: 0.0,
+                    owner: 0,
                 },
             );
         }
@@ -1152,6 +1163,7 @@ struct RegimentSoundState {
     cheer_sheet_t: Vec<f32>,
     whoop_acc: Vec<f32>,
     prev_broken: Vec<bool>,
+    prev_charging: Vec<bool>,
     panic_left: Vec<f32>,
     panic_acc: Vec<f32>,
     shout_acc: Vec<f32>,
@@ -1169,6 +1181,15 @@ const CHARGE_YELL_WINDOW_S: f32 = 4.5;
 /// Single voices a regiment may ask for in one frame (the allocator
 /// keeps the strongest; this only bounds the work).
 const VOICES_PER_FRAME: u32 = 6;
+/// Charge yells a regiment may ask for in one frame: a 1000-man charge
+/// wants about 44 a second.
+const YELLS_PER_FRAME: u32 = 12;
+/// The charge group sound's fade when the charge ends (M2TW
+/// `unit_charge fadeout 1`).
+const CHARGE_FADE_OUT_S: f32 = 1.0;
+/// Owner tag of a regiment's charge group sounds (the regiment index in
+/// the low bits).
+const CHARGE_OWNER: u64 = 1 << 40;
 /// The celebrate window is 150 ticks (frontline.rs).
 const CELEBRATE_S: f32 = 5.0;
 /// A new volley sound when this share of the regiment's living men has
@@ -1217,6 +1238,7 @@ fn regiment_sounds(
         v.resize(ng, 0.0);
     }
     st.prev_broken.resize(ng, false);
+    st.prev_charging.resize(ng, false);
     st.volley_n.resize(ng, 0);
     st.volley_at.resize(ng, Vec3::ZERO);
     if virt_time.is_paused() {
@@ -1269,18 +1291,26 @@ fn regiment_sounds(
         let centre = Vec3::new(cx, terrain.height_at(cx, cz) + 1.5, cz);
         let men = gd.count as f32;
 
-        // Charge.
-        if gd.charging && alive {
+        // Charge. When the charge ends its group sound fades out over
+        // M2TW's 1 s (`unit_charge fadeout 1`) instead of playing its
+        // clip out; yells already started play to their end.
+        let charging = gd.charging && alive;
+        let charge_owner = CHARGE_OWNER | g as u64;
+        if st.prev_charging[g] && !charging {
+            mixer.fade_owner(charge_owner, CHARGE_FADE_OUT_S);
+        }
+        st.prev_charging[g] = charging;
+        if charging {
             st.charge_sheet_t[g] -= dt;
             if st.charge_sheet_t[g] <= 0.0 {
                 if !far {
                     let set = if gd.count >= 300 { &pools.charge_large } else { &pools.charge_medium };
-                    play(&mut mixer, set, CHARGE_SHEET, centre, seed ^ 0x13, 0.0);
+                    play_owned(&mut mixer, set, CHARGE_SHEET, centre, seed ^ 0x13, 0.0, charge_owner);
                 }
                 st.charge_sheet_t[g] = 2.0 + 0.5 * r(0x23);
             }
             st.yell_acc[g] += men * (0.2 / CHARGE_YELL_WINDOW_S) * dt;
-            let n = (st.yell_acc[g] as u32).min(VOICES_PER_FRAME);
+            let n = (st.yell_acc[g] as u32).min(YELLS_PER_FRAME);
             st.yell_acc[g] -= st.yell_acc[g].floor();
             if !far {
                 for k in 0..n {
