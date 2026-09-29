@@ -414,7 +414,7 @@ const CHARGE_YELL: Bank = Bank {
 const FIGHT_LOOP: Bank = Bank {
     fade_in: 2.0,
     fade_out: 2.0,
-    ..bank("fight loop", "fight loop", 0, 220.0, 0.0, -5.0, true, (0.9, 1.1))
+    ..bank("fight loop", "fight loop", 0, 220.0, 0.0, -3.0, true, (0.9, 1.1))
 };
 /// The mid and mid-close takes, 2 dB over the close ones: at the same
 /// average loudness their steadier, duller sound read about 1 dB quieter
@@ -422,7 +422,7 @@ const FIGHT_LOOP: Bank = Bank {
 const FIGHT_LOOP_MID: Bank = Bank {
     fade_in: 2.0,
     fade_out: 2.0,
-    ..bank("fight loop", "fight loop", 0, 220.0, 0.0, -3.0, true, (0.9, 1.1))
+    ..bank("fight loop", "fight loop", 0, 220.0, 0.0, -1.0, true, (0.9, 1.1))
 };
 /// M2TW `cam_cull_radius_unit`: no unit sound beyond this distance from
 /// the camera (m).
