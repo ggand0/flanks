@@ -486,6 +486,9 @@ impl Bed {
                 "bed_melee_close0.mp3",
                 "bed_melee_close1.mp3",
                 "bed_melee_close2.mp3",
+                "bed_melee_close3.mp3",
+                "bed_melee_close4.mp3",
+                "bed_melee_close5.mp3",
             ],
             Bed::March => &["sfx_new/bed_march_loop_14.5s.mp3"],
         }
