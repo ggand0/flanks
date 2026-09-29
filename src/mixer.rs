@@ -676,11 +676,6 @@ impl Mixer {
         });
     }
 
-    /// Where the live voices of a bank are (the F3 charge view).
-    pub fn live_positions(&self, bank: &str) -> Vec<Vec3> {
-        self.live.iter().filter(|l| l.bank.name == bank).map(|l| l.pos).collect()
-    }
-
     fn meter_index(&mut self, group: &'static str) -> u8 {
         match self.meter_names.iter().position(|g| *g == group) {
             Some(i) => i as u8,
