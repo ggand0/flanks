@@ -1,10 +1,10 @@
-//! Battle audio. Battlefield sounds are positional and follow M2TW's
-//! sound banks (devlog 0161): the sim reports each landed blow, loosed
-//! arrow and arrow strike where it happens, regiments in a charge,
-//! celebration or rout emit their group sheets and single voices from
-//! their own ground, and the mixer (mixer.rs) ranks it all by bank
-//! priority and distance from the camera. Beds, UI clicks, horns and
-//! stings stay plain Bevy players.
+//! Battle audio. Battlefield sounds are positional: the sim reports each
+//! landed blow, loosed arrow and arrow strike where it happens, regiments
+//! in a charge, celebration or rout emit their group sheets and single
+//! voices from their own ground, and the mixer (mixer.rs) plays each clip
+//! at a common loudness, levels it by the mix table below, fades it with
+//! distance from the point the camera looks at, and caps each layer's
+//! voices. Beds, UI clicks, horns and stings stay plain Bevy players.
 //!
 //! Missing files degrade gracefully (their triggers just stay silent).
 
@@ -52,6 +52,47 @@ pub enum UiCue {
 
 /// Bed smoothing time constant (seconds to ~2/3 of the way to target).
 const BED_SMOOTH: f32 = 0.35;
+/// The battle beds start to dip when the positional mix runs louder than
+/// this (dBFS, per channel)...
+const BED_DUCK_FROM_DB: f32 = -40.0;
+/// ...and dip at most this much (dB).
+const BED_DUCK_MAX_DB: f32 = 6.0;
+
+/// Per-clip loudness manifest (tools/audio_loudness.py): the gain in dB
+/// that brings each clip to the common loudness, by path under assets/.
+fn norm_db(path: &str) -> f32 {
+    static GAINS: std::sync::OnceLock<std::collections::HashMap<String, f32>> =
+        std::sync::OnceLock::new();
+    let gains = GAINS.get_or_init(|| {
+        let v: serde_json::Value =
+            serde_json::from_str(include_str!("../assets/audio_levels.json")).unwrap_or_default();
+        v["clips"]
+            .as_object()
+            .map(|clips| {
+                clips
+                    .iter()
+                    .filter_map(|(k, c)| Some((k.clone(), c["gain_db"].as_f64()? as f32)))
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+    match gains.get(path) {
+        Some(g) => *g,
+        None => {
+            warn!("audio: {path} is not in assets/audio_levels.json; run tools/audio_loudness.py");
+            0.0
+        }
+    }
+}
+
+/// Load `<name>.mp3` for every name, each at the common loudness.
+fn pool(clips: &mut Clips, assets: &AssetServer, names: &[&str]) -> Vec<ClipId> {
+    names.iter().map(|n| load(clips, assets, &format!("{n}.mp3"))).collect()
+}
+
+fn load(clips: &mut Clips, assets: &AssetServer, path: &str) -> ClipId {
+    clips.load(assets, path, norm_db(path))
+}
 
 pub struct BattleAudioPlugin;
 
@@ -89,9 +130,9 @@ impl Plugin for BattleAudioPlugin {
 
 // ------------------------------------------------------------ sim events
 
-/// Unit sounds trigger only this close to the camera (M2TW
-/// `cam_cull_radius_unit 100`).
-pub const EVENT_CULL_M: f32 = 100.0;
+/// Sim sounds are kept within this distance of the point the camera looks
+/// at, plus half the camera's distance (a zoomed-out view hears farther).
+const EVENT_CULL_M: f32 = 150.0;
 /// Cap per event list, so a frame that never drains cannot grow them.
 const EVENT_CAP: usize = 4096;
 
@@ -155,12 +196,15 @@ pub struct ArrowHit {
     pub killed: bool,
 }
 
-/// Sim events near the camera, written where they happen (the damage
-/// pass, the arrow flight) and drained by the audio systems each frame.
+/// Sim events near the camera's look point, written where they happen
+/// (the damage pass, the arrow flight) and drained by the audio systems
+/// each frame.
 #[derive(Resource, Default)]
 pub struct SoundEvents {
-    /// The camera position, written by the audio each frame.
+    /// The camera's look point, written by the audio each frame.
     pub listener: Vec3,
+    /// Events farther than this from the look point are dropped.
+    pub cull_r: f32,
     pub blows: Vec<Blow>,
     pub arrow_hits: Vec<ArrowHit>,
     pub arrow_ground: Vec<Vec3>,
@@ -170,7 +214,7 @@ pub struct SoundEvents {
 
 impl SoundEvents {
     fn hears(&self, p: Vec3) -> bool {
-        p.distance_squared(self.listener) < EVENT_CULL_M * EVENT_CULL_M
+        p.xz().distance_squared(self.listener.xz()) < self.cull_r * self.cull_r
     }
 
     pub fn push_blow(&mut self, b: Blow) {
@@ -207,89 +251,93 @@ fn clear_sound_events(mut ev: ResMut<SoundEvents>) {
 
 // ------------------------------------------------------------ banks
 
-// Columns: name, priority, distancepriority, mindist, M2TW config volume
-// (dB), our level (dB), speed range. The first four and the M2TW volume
-// come from descr_sounds_weapons.txt, export_descr_sounds_soldier_voice.txt
-// and descr_sounds_units_*.txt. The M2TW volume sets the range (see
-// `Bank::cut_db`). Our level puts our pool where M2TW's lands for the same
-// bank: M2TW pool RMS + its config volume - our pool RMS, the RMS
-// measured on M2TW's own samples from its sound packs and on ours. Where
-// M2TW's sample could not be measured the level is estimated and says so.
+/// The mix table. Each layer's level in dB relative to a death scream, at
+/// full level (inside the bank's mindist of the look point, close zoom).
+/// Starting values: the balance of the mix approved by ear before
+/// positional audio, measured as each pool's median loudness plus its old
+/// gain; the blows keep the material balance of the first positional mix
+/// (the metal ring 19 dB under the shield). Priorities and distance
+/// priorities are M2TW's. Group caps are the voices the approved mix held
+/// (about 31 for the steel, 18 for the grunts and screams together, 1-2
+/// death screams, 14 bow strings), nearest first.
+mod mix {
+    /// A death scream's output level in the approved mix: pool median
+    /// -7.7 LUFS at gain 0.24 (-12.4 dB).
+    pub const DEATH_SCREAM_OUT: f32 = -20.1;
+    /// Normalized clip loudness (tools/audio_loudness.py targets).
+    pub const ONE_SHOT: f32 = -20.0;
+    pub const SUSTAINED: f32 = -23.0;
+    /// An equal-power pan puts a centred mono voice 3 dB down per channel;
+    /// the approved mix played it at full level in both.
+    pub const PAN_CENTRE: f32 = 3.0;
+    /// Full level within this distance of the look point: one man, and a
+    /// whole regiment's sheet.
+    pub const MAN_M: f32 = 20.0;
+    pub const SHEET_M: f32 = 30.0;
+}
+
+/// Every positional level shifts by this (dB): the one by-ear knob over the
+/// table. -7 puts a dense melee at the look point near -16 dBFS, where the
+/// approved mix sat, instead of -9 dBFS on the limiter.
+const MIX_GAIN_DB: f32 = -7.0;
+
 #[allow(clippy::too_many_arguments)]
 const fn bank(
     name: &'static str,
+    group: &'static str,
+    max_live: u16,
     priority: f32,
     dist_priority: f32,
-    mindist: f32,
-    m2tw_vol_db: f32,
-    vol_db: f32,
+    rel_db: f32,
+    sustained: bool,
     speed: (f32, f32),
 ) -> Bank {
+    let clip = if sustained { mix::SUSTAINED } else { mix::ONE_SHOT };
     Bank {
         name,
         priority,
         dist_priority,
-        mindist,
-        vol_db: vol_db + MIX_GAIN_DB,
-        cut_db: m2tw_vol_db,
+        mindist: if sustained { mix::SHEET_M } else { mix::MAN_M },
+        vol_db: mix::DEATH_SCREAM_OUT + rel_db - clip + mix::PAN_CENTRE + MIX_GAIN_DB,
+        zoom_floor: if sustained { 0.5 } else { 0.0 },
         speed,
-        max_live: 0,
+        group,
+        max_live,
     }
 }
 
-/// Every sound level shifts by this (dB): the one by-ear knob over the
-/// measured hierarchy.
-const MIX_GAIN_DB: f32 = 0.0;
-
-/// M2TW's sword `hit metal` for both clang pools: the armour clangs and
-/// the blade-on-blade parries.
-const HIT_METAL: Bank = bank("hit metal", 90.0, -2.0, 0.75, -20.0, -10.9, (0.6, 1.1));
-const HIT_STEEL: Bank = bank("hit steel", 90.0, -2.0, 0.75, -20.0, -10.3, (0.6, 1.1));
-const HIT_WOOD: Bank = bank("hit wood", 90.0, -2.0, 0.75, 0.0, 13.3, (0.8, 1.2));
-const HIT_FLESH: Bank = bank("hit flesh", 90.0, -2.0, 1.0, 0.0, -0.4, (0.8, 1.2));
+// Blows: one shared group, the shield thud loudest, the rings quiet.
+const HIT_WOOD: Bank = bank("hit wood", "blows", 32, 90.0, -2.0, -5.7, false, (0.8, 1.2));
+const HIT_FLESH: Bank = bank("hit flesh", "blows", 32, 90.0, -2.0, -11.6, false, (0.8, 1.2));
+const HIT_METAL: Bank = bank("hit metal", "blows", 32, 90.0, -2.0, -24.7, false, (0.6, 1.1));
+const HIT_STEEL: Bank = bank("hit steel", "blows", 32, 90.0, -2.0, -24.9, false, (0.6, 1.1));
 /// Killing blow. Our flesh-connect pool stands in until a death-hit pool
 /// exists.
-const DEATH_HIT: Bank = bank("death hit", 180.0, -2.0, 1.3, 0.0, 4.0, (0.8, 1.2));
-const DEATH_SCREAM: Bank = bank("death scream", 130.0, 0.0, 1.5, 0.0, 1.6, (0.9, 1.1));
-const ATTACK_GRUNT: Bank = bank("attack grunt", 120.0, 0.0, 0.75, -20.0, -21.6, (0.92, 1.08));
-const ATTACK_SCREAM: Bank = bank("attack scream", 120.0, 0.0, 0.75, -15.0, -17.3, (0.92, 1.08));
-const VICTIM_GRUNT: Bank = bank("victim grunt", 120.0, 0.0, 0.75, -20.0, -15.3, (0.92, 1.08));
-const BATTLE_SCREAM: Bank = bank("battle scream", 100.0, 0.0, 2.0, -10.0, -15.8, (0.92, 1.08));
-/// Arrow strikes: M2TW `weapon missile piercing` under the weapon_hit
-/// defaults (mindist 3). The wood level assumes M2TW's wood samples sit
-/// at its flesh ones (not measured).
-const ARROW_FLESH: Bank = bank("arrow flesh", 90.0, -2.0, 3.0, 0.0, 5.5, (0.8, 1.2));
-const ARROW_WOOD: Bank = bank("arrow wood", 90.0, -2.0, 3.0, 0.0, 7.1, (0.8, 1.2));
-/// Missile death_hit: mindist 2.
-const ARROW_DEATH_HIT: Bank = bank("death hit", 180.0, -2.0, 2.0, 0.0, 4.0, (0.8, 1.2));
-/// Misses into the dirt: M2TW Arrow_Hit_dirt samples at 0 dB (the
-/// missile ground event is not in the config; weapon_hit defaults).
-const ARROW_GROUND: Bank = bank("arrow ground", 90.0, -2.0, 3.0, 0.0, 14.0, (0.8, 1.2));
-/// ARROW_FLY: a looped air sound on three arrows in ten. M2TW sets no
-/// instance limit in its config; 12 keeps a volley from taking every
-/// voice (ours).
-const ARROW_FLY: Bank = Bank {
-    max_live: 12,
-    ..bank("arrow fly", 170.0, 0.0, 3.0, -30.0, -9.0, (0.5, 1.5))
-};
-/// ARROW_WHIZZ_SOUND: a shaft passing within 3 m of the camera
-/// (probradius 3).
-const ARROW_WHIZZ: Bank = bank("arrow whizz", 170.0, 0.0, 1.2, 0.0, 6.9, (0.7, 1.3));
-/// unit_missile_attack stage fire: one group release per volley.
-const VOLLEY: Bank = bank("volley", 190.0, -1.0, 5.0, -10.0, -2.7, (0.9, 1.1));
-const CHARGE_YELL: Bank = bank("charge yell", 80.0, 0.0, 4.0, -30.0, -28.3, (0.9, 1.1));
-const CHARGE_SHEET: Bank = bank("charge sheet", 170.0, -1.0, 10.0, -25.0, -25.0, (0.8, 1.1));
-const CHEER_SHEET: Bank = bank("cheer sheet", 170.0, -1.0, 5.0, 0.0, 1.8, (0.9, 1.0));
-/// Individual_Celebrate (mindist 2, volume 0); level estimated at M2TW's
-/// death-scream samples.
-const WHOOP: Bank = bank("whoop", 100.0, 0.0, 2.0, 0.0, -0.5, (0.92, 1.08));
-/// Individual_Retreat (mindist 2, volume 0); level estimated as WHOOP.
-const ROUT_SHOUT: Bank = bank("rout shout", 120.0, 0.0, 2.0, 0.0, -1.1, (0.94, 1.06));
-/// Our panic screams at a break sit at M2TW's death-scream level.
-const ROUT_PANIC: Bank = bank("rout panic", 110.0, 0.0, 1.5, 0.0, 5.6, (0.92, 1.08));
-/// unit_run group sheet (mindist 6, volume -10, priority 70); level
-/// estimated at -15 dB M2TW samples.
-const FEET: Bank = bank("feet", 70.0, 0.0, 6.0, -10.0, -11.7, (0.94, 1.06));
+const DEATH_HIT: Bank = bank("death hit", "blows", 32, 180.0, -2.0, -4.9, false, (0.8, 1.2));
+const DEATH_SCREAM: Bank = bank("death scream", "death scream", 3, 130.0, 0.0, 0.0, false, (0.9, 1.1));
+const ATTACK_GRUNT: Bank = bank("attack grunt", "voices", 18, 120.0, 0.0, -5.5, false, (0.92, 1.08));
+const ATTACK_SCREAM: Bank = bank("attack scream", "voices", 18, 120.0, 0.0, 1.6, false, (0.92, 1.08));
+const VICTIM_GRUNT: Bank = bank("victim grunt", "voices", 18, 120.0, 0.0, -8.2, false, (0.92, 1.08));
+const BATTLE_SCREAM: Bank = bank("battle scream", "battle scream", 8, 100.0, 0.0, 2.2, false, (0.92, 1.08));
+/// Bow string on each loose, at the archer.
+const BOW_STRING: Bank = bank("bow string", "bow string", 16, 110.0, 0.0, -19.4, false, (0.88, 1.12));
+const ARROW_FLESH: Bank = bank("arrow flesh", "arrow strike", 8, 90.0, -2.0, -16.3, false, (0.8, 1.2));
+const ARROW_WOOD: Bank = bank("arrow wood", "arrow strike", 8, 90.0, -2.0, -14.5, false, (0.8, 1.2));
+const ARROW_DEATH_HIT: Bank = bank("death hit", "arrow strike", 8, 180.0, -2.0, -4.9, false, (0.8, 1.2));
+const ARROW_GROUND: Bank = bank("arrow ground", "arrow ground", 6, 90.0, -2.0, -30.7, false, (0.8, 1.2));
+/// A looped air sound on three arrows in ten, followed in flight.
+const ARROW_FLY: Bank = bank("arrow fly", "arrow fly", 12, 170.0, 0.0, -26.7, true, (0.5, 1.5));
+/// A shaft dropping past the look point.
+const ARROW_WHIZZ: Bank = bank("arrow whizz", "arrow whizz", 4, 170.0, 0.0, -22.9, false, (0.7, 1.3));
+/// One group release per volley share (M2TW unit_missile_attack).
+const VOLLEY: Bank = bank("volley", "volley", 4, 190.0, -1.0, -3.4, true, (0.9, 1.1));
+const CHARGE_YELL: Bank = bank("charge yell", "charge yell", 40, 80.0, 0.0, -0.4, false, (0.9, 1.1));
+const CHARGE_SHEET: Bank = bank("charge sheet", "charge sheet", 0, 170.0, -1.0, -3.4, true, (0.8, 1.1));
+const CHEER_SHEET: Bank = bank("cheer sheet", "cheer sheet", 0, 170.0, -1.0, -2.0, true, (0.9, 1.0));
+const WHOOP: Bank = bank("whoop", "whoop", 10, 100.0, 0.0, 1.1, false, (0.92, 1.08));
+const ROUT_SHOUT: Bank = bank("rout shout", "rout shout", 3, 120.0, 0.0, 3.9, false, (0.94, 1.06));
+const ROUT_PANIC: Bank = bank("rout panic", "rout panic", 4, 110.0, 0.0, -6.4, true, (0.92, 1.08));
+const FEET: Bank = bank("feet", "feet", 6, 70.0, 0.0, -11.3, true, (0.94, 1.06));
 
 /// One sim tick in seconds: a tick's events are spread over it.
 const TICK_S: f32 = 1.0 / 30.0;
@@ -297,6 +345,7 @@ const TICK_S: f32 = 1.0 / 30.0;
 /// The positional clip pools, decoded into the mixer.
 #[derive(Resource)]
 struct Pools {
+    bow_string: Vec<ClipId>,
     hit_steel: Vec<ClipId>,
     hit_metal: Vec<ClipId>,
     hit_wood: Vec<ClipId>,
@@ -353,33 +402,39 @@ fn setup_audio(mut commands: Commands, assets: Res<AssetServer>, mut clips: ResM
     let load_set = |names: &[&str]| -> Vec<Handle<AudioSource>> {
         names.iter().map(|n| assets.load(format!("{n}.mp3"))).collect()
     };
-    let mut pool = |names: &[&str]| clips.pool(&assets, names);
+    let clips = &mut *clips;
 
     commands.insert_resource(Pools {
+        bow_string: pool(clips, &assets, &[
+            "sfx_bow/sfx_bow_loose_01",
+            "sfx_bow/sfx_bow_loose_02",
+            "sfx_bow/sfx_bow_loose_03",
+            "sfx_bow/sfx_bow_loose_04",
+        ]),
         // The second batch (sfx_new/) won out over the first clangs.
-        hit_steel: pool(&[
+        hit_steel: pool(clips, &assets, &[
             "sfx_new/sword_clang_06",
             "sfx_new/sword_clang_07",
             "sfx_new/sword_clang_08",
             "sfx_new/sword_clang_09",
         ]),
-        hit_metal: pool(&["sfx_new/armor_clang_01", "sfx_new/armor_clang_02"]),
-        hit_wood: pool(&["sfx_shield_01", "sfx_shield_02", "sfx_shield_03"]),
-        hit_flesh: pool(&[
+        hit_metal: pool(clips, &assets, &["sfx_new/armor_clang_01", "sfx_new/armor_clang_02"]),
+        hit_wood: pool(clips, &assets, &["sfx_shield_01", "sfx_shield_02", "sfx_shield_03"]),
+        hit_flesh: pool(clips, &assets, &[
             "sfx_new/sfx_blunt_damage_01",
             "sfx_new/sfx_blunt_damage_02",
             "sfx_new/sfx_spear_damage_01",
             "sfx_new/sfx_sword_damage_01",
             "sfx_new/sfx_sword_damage_02",
         ]),
-        death_scream: pool(&[
+        death_scream: pool(clips, &assets, &[
             "sfx_death_01",
             "sfx_death_02",
             "sfx_death_03",
             "sfx_death_04",
             "sfx_death_05",
         ]),
-        attack_grunt: pool(&[
+        attack_grunt: pool(clips, &assets, &[
             "sfx_melee/attack_grunts/attack_grunt0",
             "sfx_melee/attack_grunts/attack_grunt_knight0",
             "sfx_melee/attack_grunts/attack_grunt_knight1",
@@ -402,7 +457,7 @@ fn setup_audio(mut commands: Commands, assets: Res<AssetServer>, mut clips: ResM
             "sfx_melee/attack_grunts/attack_grunt_young_knight3",
             "sfx_melee/attack_grunts/attack_grunt_young_knight4",
         ]),
-        attack_scream: pool(&[
+        attack_scream: pool(clips, &assets, &[
             "sfx_melee/attack_screams/attack_scream0_bitfunny",
             "sfx_melee/attack_screams/attack_scream1_young",
             "sfx_melee/attack_screams/attack_scream2_good",
@@ -416,7 +471,7 @@ fn setup_audio(mut commands: Commands, assets: Res<AssetServer>, mut clips: ResM
             "sfx_melee/attack_screams/attack_scream_young2",
             "sfx_melee/attack_screams/attack_scream_young3",
         ]),
-        victim_grunt: pool(&[
+        victim_grunt: pool(clips, &assets, &[
             "sfx_melee/hit_grunts/choked_groan(big_damage)1",
             "sfx_melee/hit_grunts/damage_gasp0",
             "sfx_melee/hit_grunts/damage_gasp1",
@@ -434,7 +489,7 @@ fn setup_audio(mut commands: Commands, assets: Res<AssetServer>, mut clips: ResM
             "sfx_melee/hit_grunts/damage_grunt12",
             "sfx_melee/hit_grunts/stabbed0",
         ]),
-        battle_scream: pool(&[
+        battle_scream: pool(clips, &assets, &[
             "sfx_melee/battle_screams/battle_scream0",
             "sfx_melee/battle_screams/battle_scream1",
             "sfx_melee/battle_screams/battle_scream3",
@@ -444,25 +499,26 @@ fn setup_audio(mut commands: Commands, assets: Res<AssetServer>, mut clips: ResM
             "sfx_melee/battle_screams/battle_scream8",
             "sfx_melee/battle_screams/battle_scream9",
         ]),
-        arrow_flesh: pool(&[
+        arrow_flesh: pool(clips, &assets, &[
             "sfx_bow/sfx_arrow_flesh_01",
             "sfx_bow/sfx_arrow_flesh_02",
             "sfx_bow/sfx_arrow_flesh_03",
         ]),
-        arrow_wood: pool(&["sfx_bow/sfx_arrow_wood_01", "sfx_bow/sfx_arrow_wood_02"]),
-        arrow_ground: pool(&[
+        arrow_wood: pool(clips, &assets, &["sfx_bow/sfx_arrow_wood_01", "sfx_bow/sfx_arrow_wood_02"]),
+        arrow_ground: pool(clips, &assets, &[
             "sfx_bow/sfx_arrow_ground_01",
             "sfx_bow/sfx_arrow_ground_02",
             "sfx_bow/sfx_arrow_ground_03",
         ]),
-        arrow_fly: pool(&["sfx_bow/sfx_arrow_fly_loop_01", "sfx_bow/sfx_arrow_fly_loop_02"]),
-        arrow_whizz: pool(&["sfx_bow/sfx_arrow_flyby_01", "sfx_bow/sfx_arrow_flyby_02"]),
+        arrow_fly: pool(clips, &assets, &["sfx_bow/sfx_arrow_fly_loop_01", "sfx_bow/sfx_arrow_fly_loop_02"]),
+        arrow_whizz: pool(clips, &assets, &["sfx_bow/sfx_arrow_flyby_01", "sfx_bow/sfx_arrow_flyby_02"]),
         volley: vec![
-            clips.load(&assets, "sfx_bow/sfx_volley_away_01.wav"),
-            clips.load(&assets, "sfx_bow/sfx_volley_away_02.mp3"),
-            clips.load(&assets, "sfx_bow/sfx_volley_away_03.mp3"),
+            load(clips, &assets, "sfx_bow/sfx_volley_away_01.wav"),
+            load(clips, &assets, "sfx_bow/sfx_volley_away_02.mp3"),
+            load(clips, &assets, "sfx_bow/sfx_volley_away_03.mp3"),
         ],
-        charge_yell: clips.pool(
+        charge_yell: pool(
+            clips,
             &assets,
             &[
                 "sfx_charge/vox_yell_01",
@@ -496,12 +552,14 @@ fn setup_audio(mut commands: Commands, assets: Res<AssetServer>, mut clips: ResM
                 "sfx_charge/vox_yell_10_young_b",
             ],
         ),
-        charge_medium: clips.pool(&assets, &["sfx_charge/group_charge_medium"]),
-        charge_large: clips.pool(
+        charge_medium: pool(clips, &assets, &["sfx_charge/group_charge_medium"]),
+        charge_large: pool(
+            clips,
             &assets,
             &["sfx_charge/group_charge_large_01", "sfx_charge/group_charge_large_02"],
         ),
-        cheer_small: clips.pool(
+        cheer_small: pool(
+            clips,
             &assets,
             &[
                 "sfx_celebrate/group_cheer_small_01_mocking",
@@ -513,7 +571,8 @@ fn setup_audio(mut commands: Commands, assets: Res<AssetServer>, mut clips: ResM
                 "sfx_celebrate/group_cheer_small_08_joyous_shouts",
             ],
         ),
-        cheer_large: clips.pool(
+        cheer_large: pool(
+            clips,
             &assets,
             &[
                 "sfx_celebrate/group_cheer_large_01",
@@ -524,7 +583,8 @@ fn setup_audio(mut commands: Commands, assets: Res<AssetServer>, mut clips: ResM
             ],
         ),
         // vox_whoop_04 benched by its own filename (skipfornow).
-        whoop: clips.pool(
+        whoop: pool(
+            clips,
             &assets,
             &[
                 "sfx_celebrate/vox_whoop_01",
@@ -537,7 +597,8 @@ fn setup_audio(mut commands: Commands, assets: Res<AssetServer>, mut clips: ResM
                 "sfx_celebrate/vox_whoop_09_knight_shout_yeaa",
             ],
         ),
-        rout_shout: clips.pool(
+        rout_shout: pool(
+            clips,
             &assets,
             &[
                 "sfx_rout/fallback0",
@@ -552,14 +613,16 @@ fn setup_audio(mut commands: Commands, assets: Res<AssetServer>, mut clips: ResM
                 "sfx_rout/withdraw2",
             ],
         ),
-        rout_panic: clips.pool(
+        rout_panic: pool(
+            clips,
             &assets,
             &["sfx_rout/vox_panic_01", "sfx_rout/vox_panic_02", "sfx_rout/vox_panic_03"],
         ),
         // Massed washes layered from single-man source loops by
         // work/scripts/build-feet-wash.sh (ElevenLabs would only produce
         // one or two runners per take).
-        feet: clips.pool(
+        feet: pool(
+            clips,
             &assets,
             &["sfx_rout/feet_run_wash_mass_01", "sfx_rout/feet_run_wash_mass_02"],
         ),
@@ -583,20 +646,31 @@ fn setup_audio(mut commands: Commands, assets: Res<AssetServer>, mut clips: ResM
         sting_defeat: assets.load("sting_defeat.mp3"),
     });
 
-    let bed = |name: &str| {
+    let bed = |path: &'static str| {
         (
-            AudioPlayer::new(assets.load(format!("{name}.mp3"))),
+            AudioPlayer::new(assets.load(path)),
             PlaybackSettings {
                 volume: Volume::Linear(0.0),
                 ..PlaybackSettings::LOOP
             },
         )
     };
-    commands.spawn((bed("bed_battle_far"), Bed::Far));
-    commands.spawn((bed("bed_battle_mid0"), Bed::Mid));
-    commands.spawn((bed("bed_melee_close0"), Bed::Close));
-    commands.spawn((bed("sig_drums_march"), Bed::Drums));
-    commands.spawn((bed("sfx_new/bed_march_loop_14.5s"), Bed::March));
+    for b in [Bed::Far, Bed::Mid, Bed::Close, Bed::Drums, Bed::March] {
+        commands.spawn((bed(b.path()), b));
+    }
+}
+
+impl Bed {
+    /// The bed's clip under assets/.
+    fn path(self) -> &'static str {
+        match self {
+            Bed::Far => "bed_battle_far.mp3",
+            Bed::Mid => "bed_battle_mid0.mp3",
+            Bed::Close => "bed_melee_close0.mp3",
+            Bed::Drums => "sig_drums_march.mp3",
+            Bed::March => "sfx_new/bed_march_loop_14.5s.mp3",
+        }
+    }
 }
 
 fn silence_beds(mut sinks: Query<&mut AudioSink, With<Bed>>) {
@@ -616,6 +690,7 @@ fn stop_one_shots(
 }
 
 /// Crossfade the beds from battle state around the camera focus.
+#[allow(clippy::too_many_arguments)] // bevy system params
 fn update_beds(
     groups: Res<Groups>,
     stats: Res<SimStats>,
@@ -623,7 +698,9 @@ fn update_beds(
     time: Res<Time<Real>>,
     virt_time: Res<Time<Virtual>>,
     settings: Res<crate::settings::Settings>,
+    mixer: Res<Mixer>,
     mut sinks: Query<(&Bed, &mut AudioSink)>,
+    mut next_log: Local<f32>,
 ) {
     let Ok(cam) = camera.single() else { return };
     let paused = virt_time.is_paused();
@@ -662,27 +739,35 @@ fn update_beds(
     // the close-melee layer fades toward the mid/far beds with distance.
     let zoom_att = zoom_attenuation(cam.distance);
 
+    // The battle beds dip while the fight at the look point is loud, so a
+    // bed never masks the men in front of the camera: 0.5 dB per dB the
+    // positional mix runs over BED_DUCK_FROM_DB, at most BED_DUCK_MAX_DB.
+    let duck_db = ((mixer.recent_db() - BED_DUCK_FROM_DB) * 0.5).clamp(0.0, BED_DUCK_MAX_DB);
+    let duck = crate::mixer::db_to_lin(-duck_db);
+    // Level before the master volume; the sink gets it times `m`.
     let m = battle_vol(&settings);
-    let target = |bed: &Bed| -> f32 {
+    let level = |bed: &Bed| -> f32 {
         if paused {
             return 0.0;
         }
         match bed {
-            Bed::Far => 0.22 * ((engaged_total as f32) / 8.0).clamp(0.0, 1.0) * m,
-            Bed::Mid => 0.45 * ((engaged_near as f32) / 5.0).clamp(0.0, 1.0) * prox.sqrt() * m,
+            Bed::Far => 0.22 * ((engaged_total as f32) / 8.0).clamp(0.0, 1.0) * duck,
+            Bed::Mid => {
+                0.45 * ((engaged_near as f32) / 5.0).clamp(0.0, 1.0) * prox.sqrt() * duck
+            }
             Bed::Close => {
-                0.60 * prox * prox * (0.25 + 0.75 * hits) * (0.35 + 0.65 * zoom_att) * m
+                0.60 * prox * prox * (0.25 + 0.75 * hits) * (0.35 + 0.65 * zoom_att) * duck
             }
             Bed::Drums => {
                 if marching_own {
-                    0.30 * m
+                    0.30
                 } else {
                     0.0
                 }
             }
             Bed::March => {
                 if marching_own {
-                    0.28 * m
+                    0.28
                 } else {
                     0.0
                 }
@@ -691,17 +776,36 @@ fn update_beds(
     };
 
     let blend = (time.delta_secs() / BED_SMOOTH).min(1.0);
+    let mut levels = Vec::new();
     for (bed, mut sink) in &mut sinks {
         let cur = sink.volume().to_linear();
-        let v = cur + (target(bed) - cur) * blend;
+        let lv = level(bed);
+        let v = cur + (lv * m - cur) * blend;
         sink.set_volume(Volume::Linear(v));
+        levels.push((*bed, lv));
+    }
+
+    // FL_LOG_AUDIO: each bed's level, its clip's loudness plus its volume
+    // (LUFS, comparable to the mixer's per-group dBFS within a few dB).
+    static LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *LOG.get_or_init(|| std::env::var("FL_LOG_AUDIO").is_ok()) && time.elapsed_secs() >= *next_log {
+        *next_log = time.elapsed_secs() + 1.0;
+        let line: Vec<String> = levels
+            .iter()
+            .filter(|(_, v)| *v > 1e-4)
+            .map(|(bed, v)| {
+                let path = bed.path();
+                format!("{path} {:.0}", -23.0 - norm_db(path) + 20.0 * v.log10())
+            })
+            .collect();
+        info!("beds: dip {duck_db:.1} dB | {}", line.join(", "));
     }
 }
 
-/// How "inside the battle" the camera is by zoom, for the beds: 1.0 at
-/// RTS close-up (<= 90 m), fading to a floor when surveying the whole
-/// map.
-fn zoom_attenuation(cam_distance: f32) -> f32 {
+/// How "inside the battle" the camera is by zoom, for the beds and every
+/// positional sound: 1.0 at RTS close-up (<= 90 m), fading to a floor when
+/// surveying the whole map.
+pub(crate) fn zoom_attenuation(cam_distance: f32) -> f32 {
     (90.0 / cam_distance.max(90.0)).clamp(0.12, 1.0)
 }
 
@@ -750,11 +854,12 @@ fn blow_sounds(
     mut mixer: ResMut<Mixer>,
     mut ev: ResMut<SoundEvents>,
     pools: Option<Res<Pools>>,
-    camera: Query<&Transform, With<RtsCamera>>,
+    camera: Query<&RtsCamera>,
     mut frame: Local<u32>,
 ) {
-    if let Ok(t) = camera.single() {
-        ev.listener = t.translation;
+    if let Ok(cam) = camera.single() {
+        ev.listener = cam.focus;
+        ev.cull_r = EVENT_CULL_M + 0.5 * cam.distance;
     }
     let Some(pools) = pools else { return };
     *frame = frame.wrapping_add(1);
@@ -792,9 +897,10 @@ fn blow_sounds(
 
 /// Seconds a whizzed arrow id is remembered (one whizz per pass).
 const WHIZZ_MEMORY_S: f32 = 3.0;
-/// ARROW_WHIZZ_SOUND probradius: a shaft this close to the camera
-/// whistles past it.
-const WHIZZ_R: f32 = 3.0;
+/// A falling shaft this close to the look point may whistle past it.
+const WHIZZ_R: f32 = 25.0;
+/// Arrows this close to the look point may carry an air loop.
+const FLY_R: f32 = 40.0;
 
 #[derive(Default)]
 struct ArrowSoundState {
@@ -803,8 +909,8 @@ struct ArrowSoundState {
 }
 
 /// Arrow strikes and misses where they land, the air loop on three
-/// arrows in ten (ARROW_FLY, followed in flight), and the whizz of a
-/// shaft passing the camera.
+/// arrows in ten (ARROW_FLY, followed in flight), and the whizz of three
+/// falling shafts in ten near the look point.
 #[allow(clippy::too_many_arguments)] // bevy system params
 fn arrow_sounds(
     mut mixer: ResMut<Mixer>,
@@ -844,13 +950,12 @@ fn arrow_sounds(
         w.1 -= dt;
         w.1 > 0.0
     });
-    let listener = ev.listener;
-    let fly_r2 = ARROW_FLY.max_dist() * ARROW_FLY.max_dist();
-    let near2 = fly_r2.max(WHIZZ_R * WHIZZ_R);
+    let listener = ev.listener.xz();
+    let (fly_r2, whizz_r2) = (FLY_R * FLY_R, WHIZZ_R * WHIZZ_R);
     for i in 0..arrows.len() {
         let p = arrows.pos[i];
-        let d2 = p.distance_squared(listener);
-        if d2 > near2 {
+        let d2 = p.xz().distance_squared(listener);
+        if d2 > fly_r2.max(whizz_r2) {
             continue;
         }
         let id = arrows.id[i];
@@ -867,7 +972,11 @@ fn arrow_sounds(
                 },
             );
         }
-        if d2 < WHIZZ_R * WHIZZ_R && !st.whizzed.iter().any(|w| w.0 == id) {
+        if d2 < whizz_r2
+            && arrows.vel[i].y < 0.0
+            && hash01(id.wrapping_mul(0x27D4_EB2F)) < 0.3
+            && !st.whizzed.iter().any(|w| w.0 == id)
+        {
             st.whizzed.push((id, WHIZZ_MEMORY_S));
             play(&mut mixer, &pools.arrow_whizz, ARROW_WHIZZ, p, id ^ 0x77, 0.0);
         }
@@ -983,13 +1092,16 @@ const CELEBRATE_S: f32 = 5.0;
 const VOLLEY_SHARE: f32 = 0.15;
 /// Shortest gap between two volley sounds of one regiment (s).
 const VOLLEY_GAP_S: f32 = 1.0;
+/// Bow strings asked for per frame, nearest looses first.
+const STRINGS_PER_FRAME: usize = 32;
 
 /// Regiment-level sounds, each from the regiment's own ground: the charge
 /// (group sheet on the M2TW 2.0 + 0.5 s clock, one yell per five men),
 /// the celebration (rolling cheer sheets, whoops from one man in twelve),
 /// the rout (panic at the break, officers shouting, running feet), battle
-/// screams over a melee, and the archer volley (one group release each
-/// time a share of the regiment has loosed).
+/// screams over a melee, the bow string on each loose, and the archer
+/// volley (one group release each time a share of the regiment has
+/// loosed).
 #[allow(clippy::too_many_arguments)] // bevy system params
 fn regiment_sounds(
     mut mixer: ResMut<Mixer>,
@@ -1031,13 +1143,27 @@ fn regiment_sounds(
     let dt = time.delta_secs();
     let listener = ev.listener;
 
-    for (g, p) in ev.looses.drain(..) {
+    // A string snap per loose, at the archer: the nearest few per frame
+    // (a volley tick looses hundreds; the bow-string cap keeps the nearest).
+    let mut looses = std::mem::take(&mut ev.looses);
+    for &(g, p) in &looses {
         let g = g as usize;
         if g < ng && st.volley_cool[g] <= 0.0 {
             st.volley_n[g] += 1;
             st.volley_at[g] += p;
         }
     }
+    let near = |p: &Vec3| p.xz().distance_squared(listener.xz());
+    if looses.len() > STRINGS_PER_FRAME {
+        looses.select_nth_unstable_by(STRINGS_PER_FRAME, |a, b| near(&a.1).total_cmp(&near(&b.1)));
+        looses.truncate(STRINGS_PER_FRAME);
+    }
+    for (k, &(_, p)) in looses.iter().enumerate() {
+        let s = st.frame.wrapping_mul(0x9E37_79B1) ^ (k as u32).wrapping_mul(0x85EB_CA6B) ^ 0x4242;
+        play(&mut mixer, &pools.bow_string, BOW_STRING, p, s, TICK_S * hash01(s ^ 0x11));
+    }
+    looses.clear();
+    ev.looses = looses;
 
     for (g, gd) in groups.list.iter().enumerate() {
         let seed = st.frame.wrapping_mul(0x9E37_79B1) ^ (g as u32).wrapping_mul(0x85EB_CA6B);
@@ -1052,8 +1178,7 @@ fn regiment_sounds(
         st.volley_cool[g] -= dt;
 
         // Out of earshot: keep the clocks honest, ask for nothing.
-        let far = !alive
-            || gd.centroid.distance(listener.xz()) - gd.radius > EVENT_CULL_M + 10.0;
+        let far = !alive || gd.centroid.distance(listener.xz()) - gd.radius > ev.cull_r;
         // Group sheets sound from the regiment's centre, at head height.
         let (cx, cz) = (gd.centroid.x, gd.centroid.y);
         let centre = Vec3::new(cx, terrain.height_at(cx, cz) + 1.5, cz);
