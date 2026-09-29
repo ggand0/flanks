@@ -260,8 +260,9 @@ fn clear_sound_events(mut ev: ResMut<SoundEvents>) {
 /// The mix table. Each layer's level in dB relative to a death scream, at
 /// full level (inside the bank's mindist of the look point, close zoom).
 /// Starting values: the balance of the mix before positional audio,
-/// measured as each pool's median loudness plus its old gain; the blows keep the material balance of the first positional mix
-/// (the metal ring 19 dB under the shield). Priorities and distance
+/// measured as each pool's median loudness plus its old gain; the blows
+/// keep the material balance of the first positional mix (the metal ring
+/// 19 dB under the shield). Priorities and distance
 /// priorities are M2TW's. Group caps are the voices the old mix held
 /// (about 31 for the steel, 18 for the grunts and screams together, 1-2
 /// death screams, 14 bow strings), nearest first. The charge sheets, the
