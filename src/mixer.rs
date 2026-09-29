@@ -555,6 +555,9 @@ pub struct Mixer {
     meter_names: Vec<&'static str>,
     /// Voice starts since the clip log last read them (FL_LOG_AUDIO).
     pub start_log: Vec<StartRecord>,
+    /// Banks of playing voices cut for a stronger sound since the clip
+    /// log last read them (FL_LOG_AUDIO).
+    pub cut_log: Vec<&'static str>,
     /// Mean power of the positional mix over the last ~0.3 s.
     recent_ms: f32,
     /// The crowd dip now (dB), and when it was last updated.
@@ -797,6 +800,9 @@ impl Mixer {
                 }
                 let victim = self.live.swap_remove(wi);
                 group_add(&mut groups, victim.bank.group, -1);
+                if log_enabled() && victim.key.is_none() {
+                    self.cut_log.push(victim.bank.name);
+                }
                 self.cmds.push(Cmd::Stop {
                     id: victim.id,
                     fade: (STEAL_FADE_S * OUT_RATE as f32) as u32,
@@ -1019,6 +1025,7 @@ fn setup_mixer(mut commands: Commands, mut streams: ResMut<Assets<MixerStream>>)
         dropped: 0,
         meter_names: Vec::new(),
         start_log: Vec::new(),
+        cut_log: Vec::new(),
         recent_ms: 0.0,
         duck_db: 0.0,
         duck_at: 0.0,

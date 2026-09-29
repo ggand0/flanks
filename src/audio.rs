@@ -1585,6 +1585,7 @@ fn clip_log(
     }
     *next = time.elapsed_secs() + 1.0;
     let starts = std::mem::take(&mut mixer.start_log);
+    let cuts = std::mem::take(&mut mixer.cut_log);
     // Per clip: its sound, distances, and starts per regiment.
     type ClipStarts<'a> = (ClipId, &'a str, Vec<f32>, Vec<(u32, u32)>);
     let mut per: Vec<ClipStarts> = Vec::new();
@@ -1639,4 +1640,59 @@ fn clip_log(
     if !lines.is_empty() {
         info!("clips: {}", lines.join(" | "));
     }
+
+    // The voices alone: per voice sound, its starts, how many playing
+    // voices of it were cut for a stronger sound, its most repeated clip
+    // and median distance, and the regiments it came from.
+    let mut voices: Vec<String> = Vec::new();
+    for bank in VOICE_BANKS {
+        let mine: Vec<&crate::mixer::StartRecord> = starts.iter().filter(|r| r.bank == bank).collect();
+        if mine.is_empty() {
+            continue;
+        }
+        let cut = cuts.iter().filter(|c| **c == bank).count();
+        let mut by_clip: Vec<(ClipId, u32)> = Vec::new();
+        let mut by_unit: Vec<(u32, u32)> = Vec::new();
+        let mut d: Vec<f32> = Vec::new();
+        for r in &mine {
+            match by_clip.iter_mut().find(|c| c.0 == r.clip) {
+                Some(c) => c.1 += 1,
+                None => by_clip.push((r.clip, 1)),
+            }
+            match by_unit.iter_mut().find(|u| u.0 == r.unit) {
+                Some(u) => u.1 += 1,
+                None => by_unit.push((r.unit, 1)),
+            }
+            d.push(r.dist);
+        }
+        by_clip.sort_by_key(|c| std::cmp::Reverse(c.1));
+        by_unit.sort_by_key(|u| std::cmp::Reverse(u.1));
+        d.sort_by(|a, b| a.total_cmp(b));
+        let from: Vec<String> = by_unit.iter().take(3).map(|(g, n)| format!("{} x{n}", state(*g))).collect();
+        voices.push(format!(
+            "{bank} {} starts, {cut} cut, top {} x{}, {:.0} m; {}",
+            mine.len(),
+            clips.path(by_clip[0].0),
+            by_clip[0].1,
+            d[d.len() / 2],
+            from.join(", ")
+        ));
+    }
+    if !voices.is_empty() {
+        info!("voices: {}", voices.join(" | "));
+    }
 }
+
+/// The human-voice banks, for the FL_LOG_AUDIO voice line.
+const VOICE_BANKS: [&str; 10] = [
+    "attack grunt",
+    "attack scream",
+    "victim grunt",
+    "battle scream",
+    "death scream",
+    "charge yell",
+    "whoop",
+    "rout shout",
+    "rout panic",
+    "rout crowd",
+];
