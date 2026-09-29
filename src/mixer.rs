@@ -145,6 +145,38 @@ pub fn log_enabled() -> bool {
     *LOG.get_or_init(|| std::env::var("FL_LOG_AUDIO").is_ok())
 }
 
+/// Write one FL_LOG_AUDIO line to the console and to this launch's audio
+/// log, tmp/runs/audio/audio-<unix seconds>.log in the repo, stamped with
+/// seconds since launch.
+pub fn audio_log(t: f64, line: &str) {
+    use std::io::Write;
+    static FILE: std::sync::OnceLock<Option<Mutex<std::fs::File>>> = std::sync::OnceLock::new();
+    info!("{line}");
+    let file = FILE.get_or_init(|| {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tmp/runs/audio");
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let path = dir.join(format!("audio-{stamp}.log"));
+        let file = std::fs::create_dir_all(&dir).and_then(|_| std::fs::File::create(&path));
+        match file {
+            Ok(f) => {
+                info!("audio log: {}", path.display());
+                Some(Mutex::new(f))
+            }
+            Err(e) => {
+                warn!("audio log: cannot write {}: {e}", path.display());
+                None
+            }
+        }
+    });
+    if let Some(f) = file
+        && let Ok(mut f) = f.lock()
+    {
+        let _ = writeln!(f, "{t:8.1} {line}");
+    }
+}
+
 /// Where the battle is heard from: level by distance from the point the
 /// camera looks at, left/right by direction from the camera.
 #[derive(Clone, Copy, Debug)]
@@ -1080,7 +1112,8 @@ pub fn flush_mixer(
     mixer.flush(&clips, now);
     if log_enabled() && now >= *next_log {
         *next_log = now + 1.0;
-        info!("{}", mixer.log_line());
+        let line = mixer.log_line();
+        audio_log(now, &line);
     }
 }
 

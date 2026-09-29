@@ -923,7 +923,10 @@ fn update_beds(
             .filter(|(_, v)| *v > 1e-4)
             .map(|(path, v)| format!("{path} {:.0}", -23.0 - norm_db(path) + 20.0 * v.log10()))
             .collect();
-        info!("beds: dip {duck_db:.1} dB | {}", line.join(", "));
+        crate::mixer::audio_log(
+            time.elapsed_secs_f64(),
+            &format!("beds: dip {duck_db:.1} dB | {}", line.join(", ")),
+        );
     }
 }
 
@@ -1638,7 +1641,7 @@ fn clip_log(
         })
         .collect();
     if !lines.is_empty() {
-        info!("clips: {}", lines.join(" | "));
+        crate::mixer::audio_log(time.elapsed_secs_f64(), &format!("clips: {}", lines.join(" | ")));
     }
 
     // The voices alone: per voice sound, its starts, how many playing
@@ -1679,7 +1682,7 @@ fn clip_log(
         ));
     }
     if !voices.is_empty() {
-        info!("voices: {}", voices.join(" | "));
+        crate::mixer::audio_log(time.elapsed_secs_f64(), &format!("voices: {}", voices.join(" | ")));
     }
 }
 
