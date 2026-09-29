@@ -37,8 +37,9 @@ pub const CELEBRATE_TICKS: u16 = 150;
 /// The fixed tick.
 const TICK_DT: f32 = 1.0 / 30.0;
 /// A crashing block has been stopped when its smoothed forward speed
-/// falls under this (m/s). Its crash lasts at most the time its rear
-/// needs to arrive at the charge pace, and never longer than the cap.
+/// falls under this (m/s), and a charging one when its smoothed speed
+/// toward its target does. A crash lasts at most the time its rear needs
+/// to arrive at the charge pace, and never longer than the cap.
 const CRASH_STALL: f32 = 0.3;
 const CRASH_PACE: f32 = 4.0;
 const CRASH_MAX_TICKS: u16 = 240;
@@ -659,9 +660,26 @@ fn update_groups(
         }
         group.engaged = engaged;
 
+        // How fast the regiment's centre closes on its attack target: the
+        // mean of its men's velocities toward it, smoothed like adv_speed.
+        let toward = match group.order {
+            Some(crate::orders::Order::Attack(t)) if counts[t as usize] > 0 => {
+                (cents[t as usize] - group.centroid).normalize_or_zero()
+            }
+            _ => Vec2::ZERO,
+        };
+        let v_toward = (group.centroid - prev_cents[g]).dot(toward) / TICK_DT;
+        group.approach_speed += (v_toward - group.approach_speed) * 0.1;
+        // A charge is a run at the enemy: a regiment starts one when it
+        // closes on its target at a walk or faster, and keeps it until it
+        // has all but stopped. A regiment held up behind its own ranks
+        // never runs, so it never charges (no sprint, no charge pace, no
+        // charge cries) until it is free to run again.
+        let running = group.approach_speed
+            >= if group.charging { CRASH_STALL } else { crate::sim::soldier::GOING_SPEED };
+
         // Charge phase: explicit attack order, inside charge range of the
-        // target, not yet in contact. Pure predicate — no latch, nothing
-        // inferred from density or speed.
+        // target, not yet in contact, and running at it.
         let charging = if engaged || group.state.is_broken() {
             false
         } else if let Some(crate::orders::Order::Attack(t)) = group.order {
@@ -676,6 +694,7 @@ fn update_groups(
             counts[t] > 0
                 && cents[t].distance(group.centroid) < CHARGE_RANGE
                 && !(group.kind == crate::unit_types::KIND_ARCHER && group.ammo_left > 0)
+                && running
         } else {
             false
         };

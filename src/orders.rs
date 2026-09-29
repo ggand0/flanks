@@ -133,7 +133,8 @@ pub struct GroupData {
     /// regiment. None when not in melee or in hold (guard) mode.
     pub fight_point: Option<Vec2>,
     /// In the charge phase: attack order, inside charge range of the
-    /// target, not yet in contact. Drives the war cry + sprint pose.
+    /// target, not yet in contact, and running at it (frontline.rs).
+    /// Drives the charge pace, the sprint pose and the charge cries.
     pub charging: bool,
     /// The crash of a charge (frontline.rs): from the moment a charging
     /// regiment engages until the enemy has stopped its block. The frame
@@ -143,6 +144,9 @@ pub struct GroupData {
     /// The centroid's forward speed, smoothed (m/s): the crash ends when
     /// it dies (the enemy has stopped the block).
     pub adv_speed: f32,
+    /// The centroid's speed toward its attack target, smoothed (m/s): a
+    /// charge runs only while the regiment closes on its target.
+    pub approach_speed: f32,
     /// Ticks the crash may last at most: the block's depth over the
     /// charge pace, the time its rear needs to arrive.
     pub crash_cap: u16,
@@ -242,6 +246,7 @@ impl GroupData {
             crashing: false,
             crash_ticks: 0,
             adv_speed: 0.0,
+            approach_speed: 0.0,
             crash_cap: 0,
             seen_target: None,
             retarget: false,

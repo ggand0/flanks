@@ -99,8 +99,10 @@ fn join_react_chance() -> f32 {
     static P: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
     *P.get_or_init(|| crate::util::env_or("FL_JOIN_REACT", 0.2_f32).clamp(0.0, 1.0))
 }
-/// Ground speed toward the fight that reads as "going to it".
-const GOING_SPEED: f32 = 1.0;
+/// Ground speed toward the fight that reads as "going to it". A regiment
+/// starts a charge only when its centre closes on its target this fast
+/// (frontline.rs).
+pub(crate) const GOING_SPEED: f32 = 1.0;
 /// How far a man notices a comrade of his own regiment running to the
 /// fight (on his far look, below).
 const JOIN_SEE_R: f32 = 6.0;
