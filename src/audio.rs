@@ -356,10 +356,10 @@ const WHOOP: Bank = bank("whoop", "whoop", 10, 100.0, 0.0, 1.1, false, (0.92, 1.
 const ROUT_SHOUT: Bank = bank("rout shout", "rout shout", 3, 120.0, 0.0, 3.9, false, (0.94, 1.06));
 const ROUT_PANIC: Bank = bank("rout panic", "rout panic", 4, 110.0, 0.0, -6.4, true, (0.92, 1.08));
 const FEET: Bank = bank("feet", "feet", 6, 70.0, 0.0, -11.3, true, (0.94, 1.06));
-/// A crowd cry from a regiment the moment it breaks, one at a time, at
-/// the approved break cue's absolute level (0.55 on clips of -12.5 LUFS),
-/// so it clears the melee around the breaking regiment.
-const ROUT_CROWD: Bank = bank("rout crowd", "rout crowd", 1, 150.0, -1.0, 9.4, true, (1.0, 1.0));
+/// A crowd cry from a regiment the moment it breaks, one at a time, 6 dB
+/// over the approved break cue's absolute level (0.55 on clips of -12.5
+/// LUFS), so it clears the melee around the breaking regiment.
+const ROUT_CROWD: Bank = bank("rout crowd", "rout crowd", 1, 150.0, -1.0, 15.4, true, (1.0, 1.0));
 
 /// One sim tick in seconds: a tick's events are spread over it.
 const TICK_S: f32 = 1.0 / 30.0;
