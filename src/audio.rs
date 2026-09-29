@@ -521,9 +521,9 @@ struct BedTake {
     current: bool,
 }
 
-/// FL_BED_MUTE=mid,far: silence the named bed layers (far, mid, march),
-/// to hear the others alone.
-fn bed_muted(bed: Bed) -> bool {
+/// FL_BED_MUTE=mid,far: silence the named layers (far, mid, march, and
+/// close for the fight loops), to hear the others alone.
+fn layer_muted(layer: &str) -> bool {
     static MUTED: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     MUTED
         .get_or_init(|| {
@@ -534,7 +534,11 @@ fn bed_muted(bed: Bed) -> bool {
                 .collect()
         })
         .iter()
-        .any(|m| *m == format!("{bed:?}").to_lowercase())
+        .any(|m| m == layer)
+}
+
+fn bed_muted(bed: Bed) -> bool {
+    layer_muted(&format!("{bed:?}").to_lowercase())
 }
 
 /// FL_SOLDIER_SFX=0.5: the share of melee soldier sounds that play (every
@@ -1160,7 +1164,7 @@ fn fight_loops(
     terrain: Res<crate::terrain::Terrain>,
 ) {
     let Some(pools) = pools else { return };
-    if pools.fight_loop.is_empty() {
+    if pools.fight_loop.is_empty() || layer_muted("close") {
         return;
     }
     let eye = mixer.listener.eye;
