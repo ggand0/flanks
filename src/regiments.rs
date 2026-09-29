@@ -213,6 +213,7 @@ pub fn do_spawn_battle(
         // regiment list and the camera is free in the Battle state.
         Scenario::Scene => { groups.list.clear(); return; }
         Scenario::Archery => { spawn_archery_test(units, terrain, groups); return; }
+        Scenario::Retarget => { spawn_retarget_test(units, terrain, groups); return; }
         Scenario::Normal => {}
     }
 
@@ -697,6 +698,63 @@ fn spawn_pile_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups, se
     }
     groups.list = list;
     info!("[pile-test] {n_attackers} blue regiments attack ONE orange regiment");
+}
+
+/// FL_TEST_RETARGET=1: a new attack target mid-fight. Blue R attacks
+/// orange A head-on; orange B stands under no order one block width
+/// plus 12 m to the side of A (FL_RT_B_DIST, 60 for the 500-man blocks:
+/// the near flanks are 12 m apart, adjacent regiments in a line). At
+/// 20 s (FL_RETARGET_AT) the retarget hook (orders.rs
+/// `test_retarget_script`) orders R onto B, as a player would, and logs
+/// every 5 s whom R's men fight. A attacks R at spawn, a player order
+/// that persists, so A follows R when R leaves: the pursuit case.
+/// FL_RT_A_HOLD=1 keeps A in hold instead: the standing case. FL_RT_N
+/// lays that many triplets on a grid, each in its own cell, and
+/// FL_RT_SIZE sets the regiment size (500): FL_RT_N=48 FL_RT_SIZE=1000
+/// is the cost case, 144k men and every third regiment retargeted at
+/// once, as many as the 1024 by 768 m field holds.
+/// Acceptance: R's block marches on B and fights it; its men answer A's
+/// men who come at them and walk back to none who do not.
+fn spawn_retarget_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
+    let size: usize = crate::util::env_or("FL_RT_SIZE", 500);
+    let n: usize = crate::util::env_or("FL_RT_N", 1).max(1);
+    let cols = ((size as f32 * 2.2).sqrt().ceil() as usize).max(1);
+    let block_w = cols as f32 * SPACING;
+    let block_d = size.div_ceil(cols) as f32 * SPACING;
+    let b_dist: f32 = crate::util::env_or("FL_RT_B_DIST", (block_w + 12.0).round());
+    let a_hold = std::env::var("FL_RT_A_HOLD").is_ok_and(|v| v == "1");
+    // The triplets on a grid: each cell holds R below A and B side by
+    // side, with 10 m of clear ground to the next cell (the regiment gap
+    // of a normal battle), as many per row as the field is wide.
+    let cell_w = b_dist + block_w + 10.0;
+    let cell_d = 50.0 + block_d + 10.0;
+    let usable_w = (terrain.max().x - terrain.min().x) - 2.0 * SIDE_MARGIN;
+    let per_row = ((usable_w / cell_w).floor() as usize).clamp(1, n);
+    let n_rows = n.div_ceil(per_row);
+    if n_rows as f32 * cell_d > terrain.max().y - terrain.min().y - 2.0 * EDGE_MARGIN {
+        warn!("retarget layout: {n_rows} rows of {cell_d:.0} m do not fit the field");
+    }
+    let x0 = -(per_row as f32 - 1.0) * cell_w / 2.0;
+    let z0 = -(n_rows as f32 - 1.0) * cell_d / 2.0;
+    let mut list = Vec::new();
+    for k in 0..n {
+        let o = Vec2::new(x0 + (k % per_row) as f32 * cell_w, z0 + (k / per_row) as f32 * cell_d);
+        let r = list.len();
+        spawn_regiment(units, terrain, &mut list, 0, KIND_LIGHT, o + Vec2::new(0.0, -40.0), size, -1.0);
+        list[r].order = Some(crate::orders::Order::Attack(r as u32 + 1));
+        spawn_regiment(units, terrain, &mut list, 1, KIND_LIGHT, o + Vec2::new(0.0, 10.0), size, 1.0);
+        if a_hold {
+            list[r + 1].hold = true;
+        } else {
+            list[r + 1].order = Some(crate::orders::Order::Attack(r as u32));
+        }
+        spawn_regiment(units, terrain, &mut list, 1, KIND_LIGHT, o + Vec2::new(b_dist, 10.0), size, 1.0);
+    }
+    groups.list = list;
+    info!(
+        "[retarget-test] {n} triplet(s) of {size}, {per_row} per row: R attacks A; B stands {b_dist:.0} m to the side; A {}",
+        if a_hold { "holds" } else { "attacks R" }
+    );
 }
 
 /// FL_TEST_JOIN=1: the join-the-fight order (regression repro). Orange

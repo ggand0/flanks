@@ -278,7 +278,7 @@ impl Plugin for FrontlinePlugin {
                     .before(crate::sim::step_sim)
                     .in_set(crate::game_state::SimSet),
             )
-            .add_systems(Update, (draw_front_gizmos, test_front_script));
+            .add_systems(Update, (draw_front_gizmos, draw_fight_points, test_front_script));
     }
 }
 
@@ -318,6 +318,16 @@ fn update_field(
 const ENGAGE_LOCK_FRAC: f32 = 0.03;
 const ENGAGE_LOCK_FLOOR: u32 = 4;
 
+/// FL_RETARGET_FOCUS=0: the A/B switch for a regiment retargeted
+/// mid-fight. On (the default) its melee with the new target is a focus
+/// melee (sim/job.rs `focus`) for as long as the order stands. Off, the
+/// break-off ends the tick that melee starts and its men fight whoever
+/// they meet, the behaviour before commit 5efb0e4.
+fn retarget_focus() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("FL_RETARGET_FOCUS").is_ok_and(|v| v == "0"))
+}
+
 /// One regiment's sums over its men, in index order.
 #[derive(Clone, Copy)]
 struct RegimentSums {
@@ -331,6 +341,11 @@ struct RegimentSums {
     line_sum: f32,
     line_n: u32,
     fight_n: u32,
+    /// Of `fight_n`, the men striking a man of the regiment's attack
+    /// target, and of `line_sum`/`line_n` their share.
+    target_fight_n: u32,
+    target_line_sum: f32,
+    target_line_n: u32,
 }
 
 fn update_groups(
@@ -353,17 +368,26 @@ fn update_groups(
         .iter()
         .map(|g| crate::formation::facing_dir(g.facing))
         .collect();
+    let attack_target: Vec<Option<u32>> = groups
+        .list
+        .iter()
+        .map(|g| match g.order {
+            Some(crate::orders::Order::Attack(t)) => Some(t),
+            _ => None,
+        })
+        .collect();
     // The sums over the men, one task per regiment walking its runs in
     // index order: the same additions in the same order as one scan of
     // the army, regiment by regiment, so the same bits. Bevy's scope
     // returns the tasks' results in spawn order.
     let units = &*units;
     let runs = &*runs;
-    let (prev_cents_r, prev_bias_r, fwd_r) = (&prev_cents, &prev_bias, &fwd);
+    let (prev_cents_r, prev_bias_r, fwd_r, target_r) =
+        (&prev_cents, &prev_bias, &fwd, &attack_target);
     let sums: Vec<RegimentSums> = bevy::tasks::ComputeTaskPool::get().scope(|scope| {
         for g in 0..n {
             scope.spawn(async move {
-                let (pc, pb, f) = (prev_cents_r[g], prev_bias_r[g], fwd_r[g]);
+                let (pc, pb, f, tg) = (prev_cents_r[g], prev_bias_r[g], fwd_r[g], target_r[g]);
                 let mut a = RegimentSums {
                     pos: Vec2::ZERO,
                     count: 0,
@@ -375,6 +399,9 @@ fn update_groups(
                     line_sum: 0.0,
                     line_n: 0,
                     fight_n: 0,
+                    target_fight_n: 0,
+                    target_line_sum: 0.0,
+                    target_line_n: 0,
                 };
                 for &(s, e) in runs.of(g) {
                     for i in s as usize..e as usize {
@@ -400,11 +427,19 @@ fn update_groups(
                         {
                             a.fight_n += 1;
                             let ti = units.target[i] as usize;
+                            let at_target = ti < units.len() && Some(units.group[ti]) == tg;
+                            if at_target {
+                                a.target_fight_n += 1;
+                            }
                             if ti < units.len() {
                                 let d = Vec2::new(units.pos[ti].x - p.x, units.pos[ti].z - p.y);
                                 if d.dot(f) > 0.5 * d.length() {
                                     a.line_sum += p.dot(f);
                                     a.line_n += 1;
+                                    if at_target {
+                                        a.target_line_sum += p.dot(f);
+                                        a.target_line_n += 1;
+                                    }
                                 }
                             }
                         }
@@ -488,6 +523,37 @@ fn update_groups(
         }
         let engaged = group.engage_hold > 0;
         let lock_threshold = ((group.count as f32 * ENGAGE_LOCK_FRAC) as u32).max(ENGAGE_LOCK_FLOOR);
+        // A new attack target while fighting (orders.rs `retarget`): the
+        // regiment leaves its fight and marches on the new one, and its
+        // melee, when it comes, is with that target alone. It lasts while
+        // the order stands and the regiment stays engaged.
+        let target = attack_target[g];
+        if engaged && target.is_some() && target != group.seen_target {
+            group.retarget = true;
+            group.melee_ticks = 0;
+            if group.contact {
+                group.contact = false;
+                info!("regiment {g} releases its contact frame");
+            }
+            info!("regiment {g} breaks off for its new target");
+        }
+        group.seen_target = target;
+        if group.retarget && (!engaged || target.is_none()) {
+            group.retarget = false;
+            info!("regiment {g} ends its break-off");
+        }
+        // The men who count toward starting a melee and laying a contact
+        // frame: all who strike, or after a retarget only those striking
+        // the target.
+        let (fight_n, line_sum, line_n) = if group.retarget {
+            (sums[g].target_fight_n, sums[g].target_line_sum, sums[g].target_line_n)
+        } else {
+            (sums[g].fight_n, sums[g].line_sum, sums[g].line_n)
+        };
+        // Under a Move order, or on the way to a new target, the regiment
+        // has no fight: its melee clock stops.
+        let breaking_off = group.retarget && group.melee_ticks == 0 && fight_n < lock_threshold;
+        let moving = matches!(group.order, Some(crate::orders::Order::Move(_))) || breaking_off;
         if engaged != group.engaged {
             info!(
                 "regiment {g} {}",
@@ -520,8 +586,12 @@ fn update_groups(
         if engaged
             && !group.state.is_broken()
             && !group.crashing
-            && (group.melee_ticks > 0 || sums[g].fight_n >= lock_threshold)
+            && !moving
+            && (group.melee_ticks > 0 || fight_n >= lock_threshold)
         {
+            if group.retarget && group.melee_ticks == 0 {
+                info!("regiment {g} fights its new target");
+            }
             group.melee_ticks = group.melee_ticks.saturating_add(1);
         } else {
             // The melee is over: its men come back into formation
@@ -538,9 +608,19 @@ fn update_groups(
             }
             group.melee_ticks = 0;
         }
-        group.fight_point = if group.melee_ticks > 0 && !group.hold {
+        if group.retarget && group.melee_ticks > 0 && !retarget_focus() {
+            group.retarget = false;
+            info!("regiment {g} ends its break-off (FL_RETARGET_FOCUS=0)");
+        }
+        // No fight point without a fight: a Move order takes the regiment
+        // out (M2TW's WITHDRAW, devlog 0120), so its men leave the melee
+        // and walk where they were sent.
+        // An ordered target stays the fight while it has men, routing
+        // too: the regiment pursues it, as its march does (orders.rs
+        // `goal`), instead of turning to whatever formed enemy is near.
+        group.fight_point = if group.melee_ticks > 0 && !group.hold && !moving {
             match group.order {
-                Some(crate::orders::Order::Attack(t)) if counts[t as usize] > 0 && !broken[t as usize] => {
+                Some(crate::orders::Order::Attack(t)) if counts[t as usize] > 0 => {
                     Some(cents[t as usize])
                 }
                 _ => nearest_formed,
@@ -552,7 +632,7 @@ fn update_groups(
             if counts[t as usize] > 0 && !broken[t as usize]);
         let formed = group.shape == crate::formation::FormShape::Rect
             && !group.state.is_broken();
-        let starts = sums[g].fight_n >= lock_threshold;
+        let starts = fight_n >= lock_threshold;
         if formed && attacking && engaged && !group.crashing && (group.contact || starts) {
             let f = fwd[g];
             let r = Vec2::new(f.y, -f.x);
@@ -567,8 +647,8 @@ fn update_groups(
                     _ => (group.centroid - group.home_bias).dot(r),
                 };
                 let mut depth = (group.centroid - group.home_bias).dot(f);
-                if sums[g].line_n > 0 {
-                    depth = sums[g].line_sum / sums[g].line_n as f32 - sums[g].front_off;
+                if line_n > 0 {
+                    depth = line_sum / line_n as f32 - sums[g].front_off;
                 }
                 group.anchor = r * group.contact_lateral + f * depth;
                 info!("regiment {g} holds a contact frame");
@@ -627,6 +707,54 @@ fn update_groups(
             }
         }
         group.charging = charging;
+    }
+}
+
+/// With the debug overlay on (F3): each selected regiment's fight point,
+/// where its men with nobody in reach go to join (sim/soldier.rs), as a
+/// ring on the ground joined to the regiment's centre. A regiment breaking
+/// off for a new target (orders.rs `retarget`) shows its line dashed
+/// toward that target instead, having no fight point.
+fn draw_fight_points(
+    settings: Res<crate::settings::Settings>,
+    selection: Res<crate::orders::Selection>,
+    groups: Res<crate::orders::Groups>,
+    terrain: Res<Terrain>,
+    mut gizmos: Gizmos,
+) {
+    if !settings.interface.debug_overlay {
+        return;
+    }
+    const FIGHT: Color = Color::srgb(0.95, 0.35, 0.85);
+    let lift = |p: Vec2, up: f32| Vec3::new(p.x, terrain.height_at(p.x, p.y) + up, p.y);
+    for (g, gd) in groups.list.iter().enumerate() {
+        if !selection.regiments.get(g).copied().unwrap_or(false) || gd.count == 0 {
+            continue;
+        }
+        let from = lift(gd.centroid, 2.0);
+        if let Some(fp) = gd.fight_point {
+            let at = lift(fp, 2.0);
+            gizmos.line(from, at, FIGHT);
+            gizmos.circle(
+                Isometry3d::new(lift(fp, 0.4), Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2)),
+                2.5,
+                FIGHT,
+            );
+            gizmos.line(lift(fp, 0.4), at, FIGHT);
+        } else if gd.retarget
+            && let Some(crate::orders::Order::Attack(t)) = gd.order
+            && let Some(tg) = groups.list.get(t as usize)
+        {
+            // Dashes toward the new target: 2 m on, 2 m off.
+            let to = lift(tg.centroid, 2.0);
+            let len = from.distance(to);
+            let dir = (to - from) / len.max(1e-3);
+            let mut d = 0.0;
+            while d < len {
+                gizmos.line(from + dir * d, from + dir * (d + 2.0).min(len), FIGHT);
+                d += 4.0;
+            }
+        }
     }
 }
 
