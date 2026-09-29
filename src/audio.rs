@@ -353,7 +353,8 @@ const HORN_ROUT: Bank = Bank {
 /// M2TW `unit_warhorns_delay 9`: one war horn per army per 9 s.
 const WAR_HORN_GAP_S: f32 = 9.0;
 const UI_SELECT: Bank = flat_bank("ui", -8.8, false);
-const UI_ORDER: Bank = flat_bank("ui", -7.5, false);
+/// A move order clicks as loud as an attack order.
+const UI_ORDER: Bank = flat_bank("ui", 3.7, false);
 const UI_ATTACK: Bank = flat_bank("ui", 3.7, false);
 const STING_VICTORY: Bank = flat_bank("sting", 3.5, true);
 const STING_DEFEAT: Bank = flat_bank("sting", -1.1, true);
@@ -414,10 +415,10 @@ const WHOOP: Bank = bank("whoop", "whoop", 10, 100.0, 0.0, 1.1, false, (0.92, 1.
 const ROUT_SHOUT: Bank = bank("rout shout", "rout shout", 3, 120.0, 0.0, 3.9, false, (0.94, 1.06));
 const ROUT_PANIC: Bank = bank("rout panic", "rout panic", 4, 110.0, 0.0, -6.4, true, (0.92, 1.08));
 const FEET: Bank = bank("feet", "feet", 6, 70.0, 0.0, -11.3, true, (0.94, 1.06));
-/// A crowd cry from a regiment the moment it breaks, one at a time, 6 dB
+/// A crowd cry from a regiment the moment it breaks, one at a time, 2 dB
 /// over the approved break cue's absolute level (0.55 on clips of -12.5
 /// LUFS), so it clears the melee around the breaking regiment.
-const ROUT_CROWD: Bank = bank("rout crowd", "rout crowd", 1, 150.0, -1.0, 15.4, true, (1.0, 1.0));
+const ROUT_CROWD: Bank = bank("rout crowd", "rout crowd", 1, 150.0, -1.0, 11.4, true, (1.0, 1.0));
 
 /// One sim tick in seconds: a tick's events are spread over it.
 const TICK_S: f32 = 1.0 / 30.0;
