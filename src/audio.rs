@@ -418,7 +418,7 @@ const CHARGE_YELL: Bank = Bank {
 const FIGHT_LOOP: Bank = Bank {
     fade_in: 2.0,
     fade_out: 2.0,
-    ..bank("fight loop", "fight loop", 0, 220.0, 0.0, 0.0, true, (0.9, 1.1))
+    ..bank("fight loop", "fight loop", 0, 220.0, 0.0, -4.0, true, (0.9, 1.1))
 };
 /// M2TW `cam_cull_radius_unit`: no unit sound beyond this distance from
 /// the camera (m).
