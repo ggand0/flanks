@@ -26,44 +26,44 @@
   },
   "bed_melee_close0.mp3": {
    "measure": "integrated",
-   "lufs": -18.2,
-   "true_peak_db": -2.0,
-   "seconds": 14.9,
-   "gain_db": -4.8
+   "lufs": -18.3,
+   "true_peak_db": -2.2,
+   "seconds": 13.92,
+   "gain_db": -4.7
   },
   "bed_melee_close1.mp3": {
    "measure": "integrated",
-   "lufs": -17.9,
+   "lufs": -18.0,
    "true_peak_db": -1.7,
-   "seconds": 14.9,
-   "gain_db": -5.1
+   "seconds": 13.92,
+   "gain_db": -5.0
   },
   "bed_melee_close2.mp3": {
    "measure": "integrated",
    "lufs": -18.0,
    "true_peak_db": -1.6,
-   "seconds": 14.9,
+   "seconds": 13.92,
    "gain_db": -5.0
   },
   "bed_melee_close3.mp3": {
    "measure": "integrated",
    "lufs": -18.0,
    "true_peak_db": -1.4,
-   "seconds": 14.9,
+   "seconds": 13.92,
    "gain_db": -5.0
   },
   "bed_melee_close4.mp3": {
    "measure": "integrated",
-   "lufs": -17.8,
+   "lufs": -17.7,
    "true_peak_db": -2.0,
-   "seconds": 14.9,
-   "gain_db": -5.2
+   "seconds": 13.92,
+   "gain_db": -5.3
   },
   "bed_melee_close5.mp3": {
    "measure": "integrated",
    "lufs": -17.8,
    "true_peak_db": -1.4,
-   "seconds": 14.9,
+   "seconds": 13.92,
    "gain_db": -5.2
   },
   "sfx_bow/arrow_incoming_02_several.mp3": {

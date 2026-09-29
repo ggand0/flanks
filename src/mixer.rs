@@ -84,6 +84,11 @@ pub struct Bank {
     pub max_live: u16,
     /// Part in the crowd dip under a nearby volley.
     pub duck: Duck,
+    /// Fade in when a voice of this bank starts, and fade out when a
+    /// tracked loop's source stops being reported (s; M2TW `fadein` /
+    /// `fadeout`). 0 starts at once and ends a loop over TRACK_FADE_S.
+    pub fade_in: f32,
+    pub fade_out: f32,
 }
 
 /// The crowd dip: while a `Trigger` sound plays within DUCK_RADIUS_M of
@@ -245,6 +250,8 @@ enum Cmd {
         speed: f32,
         looped: bool,
         delay: u32,
+        /// Frames the voice fades in over (0: full level at once).
+        fade_in: u32,
         meter: u8,
         /// Not placed in the world (UI, stings): kept when a battle's
         /// placed voices are stopped.
@@ -359,6 +366,7 @@ impl MixerSource {
                 speed,
                 looped,
                 delay,
+                fade_in,
                 meter,
                 flat,
             } => self.voices.push(Voice {
@@ -370,8 +378,8 @@ impl MixerSource {
                 gain,
                 target: gain,
                 delay,
-                env: 1.0,
-                env_step: 0.0,
+                env: if fade_in > 0 { 0.0 } else { 1.0 },
+                env_step: if fade_in > 0 { 1.0 / fade_in as f32 } else { 0.0 },
                 meter,
                 flat,
             }),
@@ -743,7 +751,6 @@ impl Mixer {
         let mut tracked = std::mem::take(&mut self.tracked);
         tracked.sort_unstable_by_key(|t| t.0);
         let mut taken = vec![false; tracked.len()];
-        let fade = (TRACK_FADE_S * OUT_RATE as f32) as u32;
         let cmds = &mut self.cmds;
         self.live.retain_mut(|l| {
             let Some(key) = l.key else { return true };
@@ -754,7 +761,11 @@ impl Mixer {
                     true
                 }
                 Err(_) => {
-                    cmds.push(Cmd::Stop { id: l.id, fade });
+                    let secs = if l.bank.fade_out > 0.0 { l.bank.fade_out } else { TRACK_FADE_S };
+                    cmds.push(Cmd::Stop {
+                        id: l.id,
+                        fade: (secs * OUT_RATE as f32) as u32,
+                    });
                     false
                 }
             }
@@ -873,6 +884,7 @@ impl Mixer {
                 speed,
                 looped,
                 delay,
+                fade_in: (r.bank.fade_in * OUT_RATE as f32) as u32,
                 meter,
                 flat: false,
             });
@@ -911,6 +923,7 @@ impl Mixer {
                 speed: 1.0,
                 looped: false,
                 delay: 0,
+                fade_in: 0,
                 meter,
                 flat: true,
             };

@@ -15,7 +15,6 @@ use crate::camera::RtsCamera;
 use crate::game_state::GameState;
 use crate::mixer::{Bank, Bus, ClipId, Clips, Duck, Mixer, NO_UNIT, Request};
 use crate::orders::{Groups, RegState};
-use crate::sim::SimStats;
 use crate::units::hash01;
 
 /// Env master override (FL_VOLUME, linear). Multiplies the settings
@@ -121,6 +120,7 @@ impl Plugin for BattleAudioPlugin {
                     blow_sounds,
                     arrow_sounds,
                     regiment_sounds,
+                    fight_loops,
                     event_cues,
                     crate::mixer::flush_mixer,
                     clip_log,
@@ -321,6 +321,8 @@ const fn bank(
         group,
         max_live,
         duck: Duck::None,
+        fade_in: 0.0,
+        fade_out: 0.0,
     }
 }
 
@@ -409,6 +411,20 @@ const CHARGE_YELL: Bank = Bank {
     duck: Duck::Target,
     ..bank("charge yell", "charge yell", 64, 80.0, 0.0, 4.6, false, (0.9, 1.1))
 };
+/// M2TW `unit_fighting` (vanilla = SSHIP, devlog 0165): one loop per
+/// regiment in melee, placed at the regiment, priority 220 whatever the
+/// distance, pitch 0.9-1.1, fading in and out over 2 s. M2TW picks
+/// Small / Medium / Large by the men fighting; our six takes are one size.
+const FIGHT_LOOP: Bank = Bank {
+    fade_in: 2.0,
+    fade_out: 2.0,
+    ..bank("fight loop", "fight loop", 0, 220.0, 0.0, 0.0, true, (0.9, 1.1))
+};
+/// M2TW `cam_cull_radius_unit`: no unit sound beyond this distance from
+/// the camera (m).
+const FIGHT_CULL_M: f32 = 100.0;
+/// Tracked-loop keys of the fight loops, clear of the arrow ids.
+const FIGHT_KEY: u64 = 1 << 40;
 const CHARGE_SHEET: Bank = bank("charge sheet", "charge sheet", 0, 170.0, -1.0, 3.6, true, (0.8, 1.1));
 const CHEER_SHEET: Bank = bank("cheer sheet", "cheer sheet", 0, 170.0, -1.0, -2.0, true, (0.9, 1.0));
 const WHOOP: Bank = bank("whoop", "whoop", 10, 100.0, 0.0, 1.1, false, (0.92, 1.08));
@@ -443,6 +459,7 @@ struct Pools {
     arrow_whizz: Vec<ClipId>,
     volley: Vec<ClipId>,
     charge_yell: Vec<ClipId>,
+    fight_loop: Vec<ClipId>,
     charge_medium: Vec<ClipId>,
     charge_large: Vec<ClipId>,
     cheer_small: Vec<ClipId>,
@@ -468,13 +485,12 @@ struct Pools {
 enum Bed {
     Far,
     Mid,
-    Close,
     /// Massed boots (Pixabay loop) while an own regiment marches.
     March,
 }
 
 impl Bed {
-    const ALL: [Bed; 4] = [Bed::Far, Bed::Mid, Bed::Close, Bed::March];
+    const ALL: [Bed; 3] = [Bed::Far, Bed::Mid, Bed::March];
 
     /// The layer's takes under assets/. The first one's loudness is the
     /// layer's level; the others are matched to it.
@@ -482,14 +498,6 @@ impl Bed {
         match self {
             Bed::Far => &["bed_battle_far.mp3"],
             Bed::Mid => &["bed_battle_mid0.mp3", "bed_battle_mid1.mp3"],
-            Bed::Close => &[
-                "bed_melee_close0.mp3",
-                "bed_melee_close1.mp3",
-                "bed_melee_close2.mp3",
-                "bed_melee_close3.mp3",
-                "bed_melee_close4.mp3",
-                "bed_melee_close5.mp3",
-            ],
             Bed::March => &["sfx_new/bed_march_loop_14.5s.mp3"],
         }
     }
@@ -513,8 +521,8 @@ struct BedTake {
     current: bool,
 }
 
-/// FL_BED_MUTE=mid,far: silence the named bed layers (far, mid, close,
-/// march), to hear the others alone.
+/// FL_BED_MUTE=mid,far: silence the named bed layers (far, mid, march),
+/// to hear the others alone.
 fn bed_muted(bed: Bed) -> bool {
     static MUTED: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     MUTED
@@ -663,6 +671,14 @@ fn setup_audio(mut commands: Commands, assets: Res<AssetServer>, mut clips: ResM
             load(clips, &assets, "sfx_bow/sfx_volley_away_02.mp3"),
             load(clips, &assets, "sfx_bow/sfx_volley_away_03.mp3"),
         ],
+        fight_loop: pool(clips, &assets, &[
+            "bed_melee_close0",
+            "bed_melee_close1",
+            "bed_melee_close2",
+            "bed_melee_close3",
+            "bed_melee_close4",
+            "bed_melee_close5",
+        ]),
         charge_yell: pool(
             clips,
             &assets,
@@ -811,14 +827,13 @@ fn update_beds(
     mut commands: Commands,
     assets: Res<AssetServer>,
     groups: Res<Groups>,
-    stats: Res<SimStats>,
     camera: Query<&RtsCamera>,
     time: Res<Time<Real>>,
     virt_time: Res<Time<Virtual>>,
     settings: Res<crate::settings::Settings>,
     mixer: Res<Mixer>,
     mut takes: Query<(Entity, &mut BedTake, Option<&mut AudioSink>)>,
-    mut clock: Local<([f32; 4], u32)>,
+    mut clock: Local<([f32; Bed::ALL.len()], u32)>,
     mut next_log: Local<f32>,
 ) {
     let Ok(cam) = camera.single() else { return };
@@ -852,16 +867,10 @@ fn update_beds(
     } else {
         (1.0 - (min_dist / hear)).clamp(0.0, 1.0)
     };
-    let hits = (stats.events as f32 / 40.0).clamp(0.0, 1.0);
 
-    // Zoomed out you should hear the DIN of battle, not individual steel:
-    // the close-melee layer fades toward the mid/far beds with distance.
-    let zoom_att = zoom_attenuation(cam.distance);
-
-    // The far and mid beds dip while the fight at the look point is loud, so
-    // they never mask the men in front of the camera: 0.5 dB per dB the
-    // positional mix runs over BED_DUCK_FROM_DB, at most BED_DUCK_MAX_DB.
-    // The close melee loop does not dip: its takes are those men.
+    // The beds dip while the fight at the look point is loud, so they never
+    // mask the men in front of the camera: 0.5 dB per dB the positional mix
+    // runs over BED_DUCK_FROM_DB, at most BED_DUCK_MAX_DB.
     let duck_db = ((mixer.recent_db() - BED_DUCK_FROM_DB) * 0.5).clamp(0.0, BED_DUCK_MAX_DB);
     let duck = crate::mixer::db_to_lin(-duck_db);
     // Level before the master volume; the sink gets it times `m`.
@@ -875,7 +884,6 @@ fn update_beds(
             Bed::Mid => {
                 0.45 * ((engaged_near as f32) / 5.0).clamp(0.0, 1.0) * prox.sqrt() * duck
             }
-            Bed::Close => prox * prox * (0.25 + 0.75 * hits) * (0.35 + 0.65 * zoom_att),
             Bed::March => {
                 if marching_own {
                     0.28
@@ -1126,6 +1134,46 @@ fn arrow_sounds(
             st.whizzed.push((id, WHIZZ_MEMORY_S));
             play(&mut mixer, &pools.arrow_whizz, ARROW_WHIZZ, p, id ^ 0x77, 0.0, arrows.group[i]);
         }
+    }
+}
+
+/// M2TW `unit_fighting`: every regiment in melee plays its fight loop at its
+/// own position while the camera is within FIGHT_CULL_M of it. A regiment
+/// keeps one take (its index picks it) and one pitch; the mixer fades the
+/// loop in when the regiment engages and out when it stops or leaves the
+/// cull radius. Runs while paused too, so a pause does not end the loops.
+fn fight_loops(
+    mut mixer: ResMut<Mixer>,
+    pools: Option<Res<Pools>>,
+    groups: Res<Groups>,
+    terrain: Res<crate::terrain::Terrain>,
+) {
+    let Some(pools) = pools else { return };
+    if pools.fight_loop.is_empty() {
+        return;
+    }
+    let eye = mixer.listener.eye;
+    for (g, gd) in groups.list.iter().enumerate() {
+        if !gd.engaged || gd.count == 0 {
+            continue;
+        }
+        let c = gd.centroid;
+        let at = Vec3::new(c.x, terrain.height_at(c.x, c.y) + 1.0, c.y);
+        if at.distance(eye) > FIGHT_CULL_M {
+            continue;
+        }
+        mixer.track(
+            FIGHT_KEY | g as u64,
+            Request {
+                clip: pools.fight_loop[g % pools.fight_loop.len()],
+                bank: FIGHT_LOOP,
+                pos: at,
+                speed_roll: hash01((g as u32).wrapping_mul(0x9E37_79B1) ^ 0x2F1),
+                delay: 0.0,
+                owner: 0,
+                unit: g as u32,
+            },
+        );
     }
 }
 
