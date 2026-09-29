@@ -537,6 +537,14 @@ fn bed_muted(bed: Bed) -> bool {
         .any(|m| *m == format!("{bed:?}").to_lowercase())
 }
 
+/// FL_SOLDIER_SFX=0.5: the share of melee soldier sounds that play (every
+/// sound of a blow, and battle screams), 1 by default, to judge the fight
+/// loops under fewer or none of them.
+fn soldier_sfx_share() -> f32 {
+    static SHARE: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *SHARE.get_or_init(|| crate::util::env_or("FL_SOLDIER_SFX", 1.0_f32).clamp(0.0, 1.0))
+}
+
 /// Crossfade between two takes of a bed layer (s).
 const BED_XFADE_S: f32 = 3.0;
 
@@ -1019,6 +1027,9 @@ fn blow_sounds(
     for (k, b) in ev.blows.drain(..).enumerate() {
         let s = base ^ (k as u32).wrapping_mul(0x85EB_CA6B);
         let r = |salt: u32| hash01(s ^ salt);
+        if r(0x5A) >= soldier_sfx_share() {
+            continue;
+        }
         let delay = TICK_S * r(0x11);
         let (pool, bank) = match b.material {
             Material::Steel => (&pools.hit_steel, HIT_STEEL),
@@ -1495,7 +1506,7 @@ fn regiment_sounds(
         // devlog 0072's (about one scream every 1-2 s over a close
         // 1000-man melee), each from one of the regiment's men.
         if gd.engaged && alive {
-            st.scream_acc[g] += men * BATTLE_SCREAM_RATE * dt;
+            st.scream_acc[g] += men * BATTLE_SCREAM_RATE * soldier_sfx_share() * dt;
             let n = (st.scream_acc[g] as u32).min(VOICES_PER_FRAME);
             st.scream_acc[g] -= st.scream_acc[g].floor();
             if !far {
