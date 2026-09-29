@@ -1035,8 +1035,10 @@ fn stop_mixer(mut mixer: ResMut<Mixer>) {
     mixer.shared.lock().unwrap().cmds.extend(cmds);
 }
 
-/// Back at the menu: stop the unplaced voices too (a sting's tail).
-fn stop_flat(mixer: Res<Mixer>) {
+/// Back at the menu: stop the unplaced voices too (a sting's tail). The
+/// first menu comes before Startup has made the mixer.
+fn stop_flat(mixer: Option<Res<Mixer>>) {
+    let Some(mixer) = mixer else { return };
     for sh in [&mixer.shared, &mixer.ui_shared] {
         sh.lock().unwrap().cmds.push(Cmd::StopAll {
             fade: (0.1 * OUT_RATE as f32) as u32,
