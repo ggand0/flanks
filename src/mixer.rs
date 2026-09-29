@@ -675,6 +675,11 @@ impl Mixer {
         });
     }
 
+    /// Where the live voices of a bank are (the F3 charge view).
+    pub fn live_positions(&self, bank: &str) -> Vec<Vec3> {
+        self.live.iter().filter(|l| l.bank.name == bank).map(|l| l.pos).collect()
+    }
+
     /// Loudness of the positional mix over the last ~0.3 s, in dBFS.
     pub fn recent_db(&self) -> f32 {
         10.0 * self.recent_ms.max(1e-12).log10()

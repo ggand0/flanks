@@ -4,6 +4,7 @@ mod audio;
 mod balance;
 mod banners;
 mod camera;
+mod charge_debug;
 mod combat;
 mod fatigue;
 mod formation;
@@ -112,6 +113,7 @@ fn main() {
             ai::AiPlugin,
             banners::BannersPlugin,
             audio::BattleAudioPlugin,
+            charge_debug::ChargeDebugPlugin,
             sim::SimPlugin,
             arrows::ArrowsPlugin,
         ))
