@@ -409,26 +409,39 @@ const CHARGE_YELL: Bank = Bank {
 /// M2TW `unit_fighting` (vanilla = SSHIP, devlog 0165): one loop per
 /// regiment in melee, placed at the regiment, priority 220 whatever the
 /// distance, pitch 0.9-1.1, fading in and out over 2 s. M2TW picks
-/// Small / Medium / Large by the men fighting; our six takes are one size.
+/// Small / Medium / Large by the men fighting; our takes are picked at
+/// random. This bank plays the close takes.
 const FIGHT_LOOP: Bank = Bank {
     fade_in: 2.0,
     fade_out: 2.0,
     ..bank("fight loop", "fight loop", 0, 220.0, 0.0, -5.0, true, (0.9, 1.1))
 };
+/// The mid and mid-close takes, 2 dB over the close ones: at the same
+/// average loudness their steadier, duller sound read about 1 dB quieter
+/// at its loudest moments.
+const FIGHT_LOOP_MID: Bank = Bank {
+    fade_in: 2.0,
+    fade_out: 2.0,
+    ..bank("fight loop", "fight loop", 0, 220.0, 0.0, -3.0, true, (0.9, 1.1))
+};
 /// M2TW `cam_cull_radius_unit`: no unit sound beyond this distance from
 /// the camera (m).
 const FIGHT_CULL_M: f32 = 100.0;
-/// The fight loop pool holds the close takes first, then the mid takes.
+/// The fight loop pool holds the close takes first, then the mid takes,
+/// then the mid-close takes.
 const FIGHT_CLOSE_TAKES: usize = 6;
+const FIGHT_MID_TAKES: usize = 2;
 
-/// FL_FIGHT_TAKES=mid or close: every fighting regiment picks only from the
-/// mid or only from the close takes, to judge one set alone.
+/// FL_FIGHT_TAKES=close, mid or midclose: every fighting regiment picks only
+/// from that set of takes, to judge one set alone.
 fn fight_takes(n: usize) -> std::ops::Range<usize> {
     static SET: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     let set = SET.get_or_init(|| std::env::var("FL_FIGHT_TAKES").unwrap_or_default().trim().to_lowercase());
+    let mid_end = (FIGHT_CLOSE_TAKES + FIGHT_MID_TAKES).min(n);
     match set.as_str() {
-        "mid" => FIGHT_CLOSE_TAKES.min(n)..n,
         "close" => 0..FIGHT_CLOSE_TAKES.min(n),
+        "mid" => FIGHT_CLOSE_TAKES.min(n)..mid_end,
+        "midclose" => mid_end..n,
         _ => 0..n,
     }
 }
@@ -698,6 +711,10 @@ fn setup_audio(mut commands: Commands, assets: Res<AssetServer>, mut clips: ResM
             "bed_melee_close5",
             "bed_battle_mid0",
             "bed_battle_mid1",
+            "bed_melee_midclose0",
+            "bed_melee_midclose1",
+            "bed_melee_midclose2",
+            "bed_melee_midclose3",
         ]),
         charge_yell: pool(
             clips,
@@ -1140,6 +1157,9 @@ fn fight_loops(
     }
     let eye = mixer.listener.eye;
     let takes = fight_takes(pools.fight_loop.len());
+    if takes.is_empty() {
+        return;
+    }
     for (g, gd) in groups.list.iter().enumerate() {
         if !gd.engaged || gd.count == 0 {
             continue;
@@ -1149,12 +1169,13 @@ fn fight_loops(
         if at.distance(eye) > FIGHT_CULL_M {
             continue;
         }
+        let take =
+            takes.start + (hash01((g as u32).wrapping_mul(0x27D4_EB2F) ^ 0x3B7) * takes.len() as f32) as usize % takes.len();
         mixer.track(
             FIGHT_KEY | g as u64,
             Request {
-                clip: pools.fight_loop[takes.start
-                    + (hash01((g as u32).wrapping_mul(0x27D4_EB2F) ^ 0x3B7) * takes.len() as f32) as usize % takes.len()],
-                bank: FIGHT_LOOP,
+                clip: pools.fight_loop[take],
+                bank: if take < FIGHT_CLOSE_TAKES { FIGHT_LOOP } else { FIGHT_LOOP_MID },
                 pos: at,
                 speed_roll: hash01((g as u32).wrapping_mul(0x9E37_79B1) ^ 0x2F1),
                 delay: 0.0,
