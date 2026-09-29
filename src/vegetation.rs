@@ -624,12 +624,12 @@ fn grassland_planting(specs: &[(&'static str, f32)], terrain: &Terrain, army_gap
 }
 
 // The river map: woods where the forest noise runs high, off the middle of
-// the field and off the river's corridor, as the old box trees stood. The
-// noise depth gives each wood a core of broad oaks, an edge of leaning oaks
-// and birches with shrubs under it, and a fringe of scrub; birches take the
-// higher ground. Low shrubs and the odd birch line the banks. The authored
-// crowns are about twice as wide as the box trees were, so the woods keep
-// their cover with far fewer trunks. No deployment clearance on this map.
+// the field and off the river's corridor. The noise depth gives each wood a
+// core of broad oaks, an edge of leaning oaks and birches with shrubs under
+// it, and a fringe of scrub; birches take the higher ground. Low shrubs and
+// the odd birch line the banks. A tree's crown reaches 4 to 8 m from its
+// trunk, so the grid is coarse and the spacing rule thins the cores
+// further. No deployment clearance on this map.
 
 /// Candidate spacing of the river woods, metres.
 const RIVER_STEP: f32 = 7.5;
