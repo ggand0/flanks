@@ -858,9 +858,10 @@ fn update_beds(
     // the close-melee layer fades toward the mid/far beds with distance.
     let zoom_att = zoom_attenuation(cam.distance);
 
-    // The battle beds dip while the fight at the look point is loud, so a
-    // bed never masks the men in front of the camera: 0.5 dB per dB the
+    // The far and mid beds dip while the fight at the look point is loud, so
+    // they never mask the men in front of the camera: 0.5 dB per dB the
     // positional mix runs over BED_DUCK_FROM_DB, at most BED_DUCK_MAX_DB.
+    // The close melee loop does not dip: its takes are those men.
     let duck_db = ((mixer.recent_db() - BED_DUCK_FROM_DB) * 0.5).clamp(0.0, BED_DUCK_MAX_DB);
     let duck = crate::mixer::db_to_lin(-duck_db);
     // Level before the master volume; the sink gets it times `m`.
@@ -874,9 +875,7 @@ fn update_beds(
             Bed::Mid => {
                 0.45 * ((engaged_near as f32) / 5.0).clamp(0.0, 1.0) * prox.sqrt() * duck
             }
-            Bed::Close => {
-                0.60 * prox * prox * (0.25 + 0.75 * hits) * (0.35 + 0.65 * zoom_att) * duck
-            }
+            Bed::Close => prox * prox * (0.25 + 0.75 * hits) * (0.35 + 0.65 * zoom_att),
             Bed::March => {
                 if marching_own {
                     0.28
