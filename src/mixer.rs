@@ -80,7 +80,28 @@ pub struct Bank {
     /// Most voices the group may hold at once (0: no limit). The nearest
     /// sounds keep the voices.
     pub max_live: u16,
+    /// Part in the crowd dip under a nearby volley.
+    pub duck: Duck,
 }
+
+/// The crowd dip: while a `Trigger` sound plays within DUCK_RADIUS_M of
+/// the look point, every `Target` sound dips by up to DUCK_DB.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Duck {
+    None,
+    /// Sets the dip off (the volley, the bow strings).
+    Trigger,
+    /// Dips under it (the charge yells, grunts and screams).
+    Target,
+}
+
+/// How far the crowd dips under a nearby volley (dB).
+const DUCK_DB: f32 = 6.0;
+/// A volley counts as nearby within this distance of the look point (m).
+const DUCK_RADIUS_M: f32 = 30.0;
+/// The dip's attack and release (s).
+const DUCK_ATTACK_S: f32 = 0.05;
+const DUCK_RELEASE_S: f32 = 0.5;
 
 /// A decoded clip in [`Clips`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -135,6 +156,8 @@ pub struct Listener {
     pub right: Vec3,
     /// Zoom fade, 1 at close zoom.
     pub zoom: f32,
+    /// The crowd dip's current gain on `Duck::Target` sounds.
+    pub duck: f32,
 }
 
 impl Default for Listener {
@@ -144,6 +167,7 @@ impl Default for Listener {
             eye: Vec3::ZERO,
             right: Vec3::X,
             zoom: 1.0,
+            duck: 1.0,
         }
     }
 }
@@ -165,7 +189,10 @@ impl Listener {
         // Equal-power pan by the source's direction from the camera.
         let side = (pos - self.eye).normalize_or_zero().dot(self.right);
         let a = (side * PAN_WIDTH + 1.0) * std::f32::consts::FRAC_PI_4;
-        let g = db_to_lin(bank.vol_db) * dist_gain * self.zoom.max(bank.zoom_floor);
+        let mut g = db_to_lin(bank.vol_db) * dist_gain * self.zoom.max(bank.zoom_floor);
+        if bank.duck == Duck::Target {
+            g *= self.duck;
+        }
         Some(([g * a.cos(), g * a.sin()], d))
     }
 }
@@ -530,6 +557,9 @@ pub struct Mixer {
     pub start_log: Vec<StartRecord>,
     /// Mean power of the positional mix over the last ~0.3 s.
     recent_ms: f32,
+    /// The crowd dip now (dB), and when it was last updated.
+    duck_db: f32,
+    duck_at: f64,
 }
 
 impl Mixer {
@@ -579,12 +609,13 @@ impl Mixer {
         // Share of real time the audio thread spent mixing.
         let load = ns as f64 / (blocks.max(1) as f64 * BLOCK as f64 / OUT_RATE as f64 * 1e9);
         let line = format!(
-            "mixer: {} live, {} started, {} dropped, mix {:.1}% of a core (peak {} voices) | {} | out {:.0} dBFS: {}",
+            "mixer: {} live, {} started, {} dropped, mix {:.1}% of a core (peak {} voices), crowd dip {:.1} dB | {} | out {:.0} dBFS: {}",
             self.live.len(),
             self.started,
             self.dropped,
             100.0 * load,
             peak,
+            self.duck_db,
             banks.join(", "),
             db(total),
             levels.join(", ")
@@ -682,6 +713,19 @@ impl Mixer {
                 }
             }
         });
+
+        // The crowd dip: set off by a volley or bow strings playing near the
+        // look point, following them in fast and letting go slowly.
+        let dt = (now - self.duck_at).clamp(0.0, 0.1) as f32;
+        self.duck_at = now;
+        let near_volley = self
+            .live
+            .iter()
+            .any(|l| l.bank.duck == Duck::Trigger && self.listener.dist(l.pos) < DUCK_RADIUS_M);
+        let want = if near_volley { DUCK_DB } else { 0.0 };
+        let tau = if want > self.duck_db { DUCK_ATTACK_S } else { DUCK_RELEASE_S };
+        self.duck_db += (want - self.duck_db) * (dt / tau).min(1.0);
+        self.listener.duck = db_to_lin(-self.duck_db);
 
         let listener = self.listener;
         for l in &mut self.live {
@@ -976,6 +1020,8 @@ fn setup_mixer(mut commands: Commands, mut streams: ResMut<Assets<MixerStream>>)
         meter_names: Vec::new(),
         start_log: Vec::new(),
         recent_ms: 0.0,
+        duck_db: 0.0,
+        duck_at: 0.0,
     });
 }
 
@@ -994,11 +1040,13 @@ pub fn flush_mixer(
     mut next_log: Local<f64>,
 ) {
     if let Ok((t, cam)) = camera.single() {
+        let duck = mixer.listener.duck;
         mixer.listener = Listener {
             pos: cam.focus,
             eye: t.translation,
             right: *t.right(),
             zoom: crate::audio::zoom_attenuation(cam.distance),
+            duck,
         };
     }
     for (player, mut s) in &mut sinks {

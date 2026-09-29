@@ -13,7 +13,7 @@ use bevy::prelude::*;
 
 use crate::camera::RtsCamera;
 use crate::game_state::GameState;
-use crate::mixer::{Bank, Bus, ClipId, Clips, Mixer, NO_UNIT, Request};
+use crate::mixer::{Bank, Bus, ClipId, Clips, Duck, Mixer, NO_UNIT, Request};
 use crate::orders::{Groups, RegState};
 use crate::sim::SimStats;
 use crate::units::hash01;
@@ -320,6 +320,7 @@ const fn bank(
         speed,
         group,
         max_live,
+        duck: Duck::None,
     }
 }
 
@@ -366,12 +367,27 @@ const HIT_STEEL: Bank = bank("hit steel", "blows", 32, 90.0, -2.0, -24.9, false,
 /// exists.
 const DEATH_HIT: Bank = bank("death hit", "blows", 32, 180.0, -2.0, -4.9, false, (0.8, 1.2));
 const DEATH_SCREAM: Bank = bank("death scream", "death scream", 3, 130.0, 0.0, 0.0, false, (0.9, 1.1));
-const ATTACK_GRUNT: Bank = bank("attack grunt", "voices", 18, 120.0, 0.0, -5.5, false, (0.92, 1.08));
-const ATTACK_SCREAM: Bank = bank("attack scream", "voices", 18, 120.0, 0.0, 1.6, false, (0.92, 1.08));
-const VICTIM_GRUNT: Bank = bank("victim grunt", "voices", 18, 120.0, 0.0, -8.2, false, (0.92, 1.08));
-const BATTLE_SCREAM: Bank = bank("battle scream", "battle scream", 8, 100.0, 0.0, 2.2, false, (0.92, 1.08));
+const ATTACK_GRUNT: Bank = Bank {
+    duck: Duck::Target,
+    ..bank("attack grunt", "voices", 18, 120.0, 0.0, -5.5, false, (0.92, 1.08))
+};
+const ATTACK_SCREAM: Bank = Bank {
+    duck: Duck::Target,
+    ..bank("attack scream", "voices", 18, 120.0, 0.0, 1.6, false, (0.92, 1.08))
+};
+const VICTIM_GRUNT: Bank = Bank {
+    duck: Duck::Target,
+    ..bank("victim grunt", "voices", 18, 120.0, 0.0, -8.2, false, (0.92, 1.08))
+};
+const BATTLE_SCREAM: Bank = Bank {
+    duck: Duck::Target,
+    ..bank("battle scream", "battle scream", 8, 100.0, 0.0, 2.2, false, (0.92, 1.08))
+};
 /// Bow string on each loose, at the archer.
-const BOW_STRING: Bank = bank("bow string", "bow string", 16, 110.0, 0.0, -9.4, false, (0.88, 1.12));
+const BOW_STRING: Bank = Bank {
+    duck: Duck::Trigger,
+    ..bank("bow string", "bow string", 16, 110.0, 0.0, -9.4, false, (0.88, 1.12))
+};
 const ARROW_FLESH: Bank = bank("arrow flesh", "arrow strike", 8, 90.0, -2.0, -16.3, false, (0.8, 1.2));
 const ARROW_WOOD: Bank = bank("arrow wood", "arrow strike", 8, 90.0, -2.0, -14.5, false, (0.8, 1.2));
 const ARROW_DEATH_HIT: Bank = bank("death hit", "arrow strike", 8, 180.0, -2.0, -4.9, false, (0.8, 1.2));
@@ -381,11 +397,15 @@ const ARROW_FLY: Bank = bank("arrow fly", "arrow fly", 12, 170.0, 0.0, -19.7, tr
 /// A shaft dropping past the look point.
 const ARROW_WHIZZ: Bank = bank("arrow whizz", "arrow whizz", 4, 170.0, 0.0, -22.9, false, (0.7, 1.3));
 /// One group release per volley share (M2TW unit_missile_attack).
-const VOLLEY: Bank = bank("volley", "volley", 4, 190.0, -1.0, 3.6, true, (0.9, 1.1));
+const VOLLEY: Bank = Bank {
+    duck: Duck::Trigger,
+    ..bank("volley", "volley", 4, 190.0, -1.0, 3.6, true, (0.9, 1.1))
+};
 /// A charge yell is heard across the charging block (about 60 m wide):
 /// full level within a sheet's distance.
 const CHARGE_YELL: Bank = Bank {
     mindist: mix::SHEET_M,
+    duck: Duck::Target,
     ..bank("charge yell", "charge yell", 64, 80.0, 0.0, 4.6, false, (0.9, 1.1))
 };
 const CHARGE_SHEET: Bank = bank("charge sheet", "charge sheet", 0, 170.0, -1.0, 3.6, true, (0.8, 1.1));
