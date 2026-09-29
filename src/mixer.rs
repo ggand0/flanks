@@ -101,6 +101,27 @@ pub struct Request {
     /// The caller's tag for voices it may fade out together later
     /// (`Mixer::fade_owner`); 0 for none.
     pub owner: u64,
+    /// The regiment the sound comes from (`NO_UNIT` for none), for the
+    /// FL_LOG_AUDIO clip log.
+    pub unit: u32,
+}
+
+/// `Request::unit` for a sound that belongs to no regiment.
+pub const NO_UNIT: u32 = u32::MAX;
+
+/// A voice start, kept for the FL_LOG_AUDIO clip log.
+pub struct StartRecord {
+    pub clip: ClipId,
+    pub bank: &'static str,
+    /// Metres from the look point.
+    pub dist: f32,
+    pub unit: u32,
+}
+
+/// FL_LOG_AUDIO is set.
+pub fn log_enabled() -> bool {
+    static LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LOG.get_or_init(|| std::env::var("FL_LOG_AUDIO").is_ok())
 }
 
 /// Where the battle is heard from: level by distance from the point the
@@ -494,6 +515,8 @@ pub struct Mixer {
     pub dropped: u32,
     /// Bank group names by meter index.
     meter_names: Vec<&'static str>,
+    /// Voice starts since the clip log last read them (FL_LOG_AUDIO).
+    pub start_log: Vec<StartRecord>,
     /// Mean power of the positional mix over the last ~0.3 s.
     recent_ms: f32,
 }
@@ -738,6 +761,14 @@ impl Mixer {
                 meter,
             });
             group_add(&mut groups, r.bank.group, 1);
+            if log_enabled() {
+                self.start_log.push(StartRecord {
+                    clip: r.clip,
+                    bank: r.bank.name,
+                    dist: listener.dist(r.pos),
+                    unit: r.unit,
+                });
+            }
             self.live.push(Live {
                 id,
                 bank: r.bank,
@@ -780,6 +811,8 @@ pub struct Clips {
 
 struct ClipSlot {
     handle: Handle<AudioSource>,
+    /// Path under assets/.
+    path: String,
     /// Normalization gain from the loudness manifest (linear).
     gain: f32,
     pcm: Option<Arc<[i16]>>,
@@ -794,12 +827,18 @@ impl Clips {
         let id = ClipId(self.slots.len() as u16);
         self.slots.push(ClipSlot {
             handle: assets.load(path.to_string()),
+            path: path.to_string(),
             gain: db_to_lin(gain_db),
             pcm: None,
             task: None,
             failed: false,
         });
         id
+    }
+
+    /// The clip's path under assets/.
+    pub fn path(&self, id: ClipId) -> &str {
+        self.slots.get(id.0 as usize).map_or("?", |s| s.path.as_str())
     }
 
     fn pcm(&self, id: ClipId) -> Option<(&Arc<[i16]>, f32)> {
@@ -874,6 +913,7 @@ fn setup_mixer(mut commands: Commands, mut streams: ResMut<Assets<MixerStream>>)
         started: 0,
         dropped: 0,
         meter_names: Vec::new(),
+        start_log: Vec::new(),
         recent_ms: 0.0,
     });
 }
@@ -918,8 +958,7 @@ pub fn flush_mixer(
     }
     let now = time.elapsed_secs_f64();
     mixer.flush(&clips, now);
-    static LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *LOG.get_or_init(|| std::env::var("FL_LOG_AUDIO").is_ok()) && now >= *next_log {
+    if log_enabled() && now >= *next_log {
         *next_log = now + 1.0;
         info!("{}", mixer.log_line());
     }

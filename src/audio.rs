@@ -13,7 +13,7 @@ use bevy::prelude::*;
 
 use crate::camera::RtsCamera;
 use crate::game_state::GameState;
-use crate::mixer::{Bank, ClipId, Clips, Mixer, Request};
+use crate::mixer::{Bank, ClipId, Clips, Mixer, NO_UNIT, Request};
 use crate::orders::{Groups, RegState};
 use crate::sim::SimStats;
 use crate::units::hash01;
@@ -123,6 +123,7 @@ impl Plugin for BattleAudioPlugin {
                     regiment_sounds,
                     event_cues,
                     crate::mixer::flush_mixer,
+                    clip_log,
                 )
                     .chain()
                     .run_if(in_state(GameState::Battle)),
@@ -192,6 +193,8 @@ pub fn armour_material(kind: u8) -> Material {
 pub struct Blow {
     pub victim: Vec3,
     pub attacker: Vec3,
+    pub victim_group: u32,
+    pub attacker_group: u32,
     pub material: Material,
     pub killed: bool,
 }
@@ -199,6 +202,8 @@ pub struct Blow {
 /// An arrow that struck a man.
 pub struct ArrowHit {
     pub pos: Vec3,
+    /// The struck man's regiment.
+    pub group: u32,
     pub material: Material,
     pub killed: bool,
 }
@@ -919,13 +924,24 @@ fn pick(v: &[Handle<AudioSource>], seed: u32) -> Option<Handle<AudioSource>> {
 
 // ------------------------------------------------------------ positional sounds
 
-/// Ask the mixer for a clip from `pool` at `pos`.
-fn play(mixer: &mut Mixer, pool: &[ClipId], bank: Bank, pos: Vec3, seed: u32, delay: f32) {
-    play_owned(mixer, pool, bank, pos, seed, delay, 0);
+/// Ask the mixer for a clip from `pool` at `pos`, a sound of regiment
+/// `unit` (NO_UNIT for none).
+fn play(mixer: &mut Mixer, pool: &[ClipId], bank: Bank, pos: Vec3, seed: u32, delay: f32, unit: u32) {
+    play_owned(mixer, pool, bank, pos, seed, delay, unit, 0);
 }
 
 /// `play`, tagging the voice with `owner` so it can be faded out later.
-fn play_owned(mixer: &mut Mixer, pool: &[ClipId], bank: Bank, pos: Vec3, seed: u32, delay: f32, owner: u64) {
+#[allow(clippy::too_many_arguments)]
+fn play_owned(
+    mixer: &mut Mixer,
+    pool: &[ClipId],
+    bank: Bank,
+    pos: Vec3,
+    seed: u32,
+    delay: f32,
+    unit: u32,
+    owner: u64,
+) {
     if pool.is_empty() {
         return;
     }
@@ -937,6 +953,7 @@ fn play_owned(mixer: &mut Mixer, pool: &[ClipId], bank: Bank, pos: Vec3, seed: u
         speed_roll: hash01(seed ^ 0x5BD1_E995),
         delay,
         owner,
+        unit,
     });
 }
 
@@ -969,22 +986,22 @@ fn blow_sounds(
             Material::Flesh => (&pools.hit_flesh, HIT_FLESH),
         };
         if b.killed {
-            play(&mut mixer, &pools.hit_flesh, DEATH_HIT, b.victim, s ^ 0x31, delay);
-            play(&mut mixer, &pools.death_scream, DEATH_SCREAM, b.victim, s ^ 0x41, delay);
+            play(&mut mixer, &pools.hit_flesh, DEATH_HIT, b.victim, s ^ 0x31, delay, b.victim_group);
+            play(&mut mixer, &pools.death_scream, DEATH_SCREAM, b.victim, s ^ 0x41, delay, b.victim_group);
         } else {
-            play(&mut mixer, pool, bank, b.victim, s ^ 0x21, delay);
+            play(&mut mixer, pool, bank, b.victim, s ^ 0x21, delay, b.victim_group);
             if r(0x51) < 0.25 {
-                play(&mut mixer, &pools.victim_grunt, VICTIM_GRUNT, b.victim, s ^ 0x61, delay);
+                play(&mut mixer, &pools.victim_grunt, VICTIM_GRUNT, b.victim, s ^ 0x61, delay, b.victim_group);
             }
             if r(0x71) < 0.25 {
-                play(&mut mixer, &pools.victim_grunt, VICTIM_GRUNT, b.victim, s ^ 0x81, delay);
+                play(&mut mixer, &pools.victim_grunt, VICTIM_GRUNT, b.victim, s ^ 0x81, delay, b.victim_group);
             }
         }
         if r(0x91) < 0.4 {
-            play(&mut mixer, &pools.attack_grunt, ATTACK_GRUNT, b.attacker, s ^ 0xA1, delay);
+            play(&mut mixer, &pools.attack_grunt, ATTACK_GRUNT, b.attacker, s ^ 0xA1, delay, b.attacker_group);
         }
         if r(0xB1) < 0.25 {
-            play(&mut mixer, &pools.attack_scream, ATTACK_SCREAM, b.attacker, s ^ 0xC1, delay);
+            play(&mut mixer, &pools.attack_scream, ATTACK_SCREAM, b.attacker, s ^ 0xC1, delay, b.attacker_group);
         }
     }
 }
@@ -1027,15 +1044,15 @@ fn arrow_sounds(
             Material::Steel | Material::Metal | Material::Flesh => (&pools.arrow_flesh, ARROW_FLESH),
         };
         if h.killed {
-            play(&mut mixer, &pools.hit_flesh, ARROW_DEATH_HIT, h.pos, s ^ 0x31, delay);
-            play(&mut mixer, &pools.death_scream, DEATH_SCREAM, h.pos, s ^ 0x41, delay);
+            play(&mut mixer, &pools.hit_flesh, ARROW_DEATH_HIT, h.pos, s ^ 0x31, delay, h.group);
+            play(&mut mixer, &pools.death_scream, DEATH_SCREAM, h.pos, s ^ 0x41, delay, h.group);
         } else {
-            play(&mut mixer, pool, bank, h.pos, s ^ 0x21, delay);
+            play(&mut mixer, pool, bank, h.pos, s ^ 0x21, delay, h.group);
         }
     }
     for (k, p) in ev.arrow_ground.drain(..).enumerate() {
         let s = base ^ (k as u32).wrapping_mul(0x85EB_CA6B) ^ 0x5678;
-        play(&mut mixer, &pools.arrow_ground, ARROW_GROUND, p, s, TICK_S * hash01(s ^ 0x11));
+        play(&mut mixer, &pools.arrow_ground, ARROW_GROUND, p, s, TICK_S * hash01(s ^ 0x11), NO_UNIT);
     }
 
     // A paused battle holds the whizz memory with the arrows.
@@ -1064,6 +1081,7 @@ fn arrow_sounds(
                     speed_roll: hash01(id.wrapping_mul(0x85EB)),
                     delay: 0.0,
                     owner: 0,
+                    unit: arrows.group[i],
                 },
             );
         }
@@ -1073,7 +1091,7 @@ fn arrow_sounds(
             && !st.whizzed.iter().any(|w| w.0 == id)
         {
             st.whizzed.push((id, WHIZZ_MEMORY_S));
-            play(&mut mixer, &pools.arrow_whizz, ARROW_WHIZZ, p, id ^ 0x77, 0.0);
+            play(&mut mixer, &pools.arrow_whizz, ARROW_WHIZZ, p, id ^ 0x77, 0.0, arrows.group[i]);
         }
     }
 }
@@ -1264,9 +1282,9 @@ fn regiment_sounds(
         looses.select_nth_unstable_by(STRINGS_PER_FRAME, |a, b| near(&a.1).total_cmp(&near(&b.1)));
         looses.truncate(STRINGS_PER_FRAME);
     }
-    for (k, &(_, p)) in looses.iter().enumerate() {
+    for (k, &(lg, p)) in looses.iter().enumerate() {
         let s = st.frame.wrapping_mul(0x9E37_79B1) ^ (k as u32).wrapping_mul(0x85EB_CA6B) ^ 0x4242;
-        play(&mut mixer, &pools.bow_string, BOW_STRING, p, s, TICK_S * hash01(s ^ 0x11));
+        play(&mut mixer, &pools.bow_string, BOW_STRING, p, s, TICK_S * hash01(s ^ 0x11), lg);
     }
     looses.clear();
     ev.looses = looses;
@@ -1305,7 +1323,7 @@ fn regiment_sounds(
             if st.charge_sheet_t[g] <= 0.0 {
                 if !far {
                     let set = if gd.count >= 300 { &pools.charge_large } else { &pools.charge_medium };
-                    play_owned(&mut mixer, set, CHARGE_SHEET, centre, seed ^ 0x13, 0.0, charge_owner);
+                    play_owned(&mut mixer, set, CHARGE_SHEET, centre, seed ^ 0x13, 0.0, g as u32, charge_owner);
                 }
                 st.charge_sheet_t[g] = 2.0 + 0.5 * r(0x23);
             }
@@ -1315,7 +1333,7 @@ fn regiment_sounds(
             if !far {
                 for k in 0..n {
                     if let Some(at) = members.man(&units, g, r(0x33 + k)) {
-                        play(&mut mixer, &pools.charge_yell, CHARGE_YELL, at, seed ^ (0x43 + k), 0.2 * r(0x53 + k));
+                        play(&mut mixer, &pools.charge_yell, CHARGE_YELL, at, seed ^ (0x43 + k), 0.2 * r(0x53 + k), g as u32);
                     }
                 }
             }
@@ -1330,7 +1348,7 @@ fn regiment_sounds(
             if st.cheer_sheet_t[g] <= 0.0 {
                 if !far {
                     let set = if gd.count >= 300 { &pools.cheer_large } else { &pools.cheer_small };
-                    play(&mut mixer, set, CHEER_SHEET, centre, seed ^ 0x63, 0.0);
+                    play(&mut mixer, set, CHEER_SHEET, centre, seed ^ 0x63, 0.0, g as u32);
                 }
                 // M2TW randomdelay 1: the 4-6 s clips roll into each other.
                 st.cheer_sheet_t[g] = 2.5 + 1.0 * r(0x73);
@@ -1341,7 +1359,7 @@ fn regiment_sounds(
             if !far {
                 for k in 0..n {
                     if let Some(at) = members.man(&units, g, r(0x83 + k)) {
-                        play(&mut mixer, &pools.whoop, WHOOP, at, seed ^ (0x93 + k), 0.3 * r(0xA3 + k));
+                        play(&mut mixer, &pools.whoop, WHOOP, at, seed ^ (0x93 + k), 0.3 * r(0xA3 + k), g as u32);
                     }
                 }
             }
@@ -1352,7 +1370,7 @@ fn regiment_sounds(
 
         // Rout: the crowd cry at the break, then panic, shouts and feet.
         if break_cry && !far {
-            play(&mut mixer, &pools.rout_crowd, ROUT_CROWD, centre, seed ^ 0x163, 0.0);
+            play(&mut mixer, &pools.rout_crowd, ROUT_CROWD, centre, seed ^ 0x163, 0.0, g as u32);
         }
         if broken {
             st.panic_left[g] = (st.panic_left[g] - dt).max(0.0);
@@ -1365,16 +1383,16 @@ fn regiment_sounds(
                 let n = (st.panic_acc[g] as u32).min(VOICES_PER_FRAME);
                 for k in 0..n {
                     if let Some(at) = members.man(&units, g, r(0xB3 + k)) {
-                        play(&mut mixer, &pools.rout_panic, ROUT_PANIC, at, seed ^ (0xC3 + k), 0.2 * r(0xD3 + k));
+                        play(&mut mixer, &pools.rout_panic, ROUT_PANIC, at, seed ^ (0xC3 + k), 0.2 * r(0xD3 + k), g as u32);
                     }
                 }
                 if st.shout_acc[g] >= 1.0
                     && let Some(at) = members.man(&units, g, r(0xE3))
                 {
-                    play(&mut mixer, &pools.rout_shout, ROUT_SHOUT, at, seed ^ 0xF3, 0.0);
+                    play(&mut mixer, &pools.rout_shout, ROUT_SHOUT, at, seed ^ 0xF3, 0.0, g as u32);
                 }
                 if st.feet_t[g] <= 0.0 {
-                    play(&mut mixer, &pools.feet, FEET, centre, seed ^ 0x103, 0.0);
+                    play(&mut mixer, &pools.feet, FEET, centre, seed ^ 0x103, 0.0, g as u32);
                 }
             }
             st.panic_acc[g] -= st.panic_acc[g].floor();
@@ -1401,7 +1419,7 @@ fn regiment_sounds(
             if !far {
                 for k in 0..n {
                     if let Some(at) = members.man(&units, g, r(0x133 + k)) {
-                        play(&mut mixer, &pools.battle_scream, BATTLE_SCREAM, at, seed ^ (0x143 + k), 0.3 * r(0x153 + k));
+                        play(&mut mixer, &pools.battle_scream, BATTLE_SCREAM, at, seed ^ (0x143 + k), 0.3 * r(0x153 + k), g as u32);
                     }
                 }
             }
@@ -1413,7 +1431,7 @@ fn regiment_sounds(
         let volley_n = st.volley_n[g];
         if volley_n > 0 && volley_n as f32 >= (men * VOLLEY_SHARE).max(5.0) {
             let at = st.volley_at[g] / volley_n as f32;
-            play(&mut mixer, &pools.volley, VOLLEY, at, seed ^ 0x123, 0.0);
+            play(&mut mixer, &pools.volley, VOLLEY, at, seed ^ 0x123, 0.0, g as u32);
             st.volley_n[g] = 0;
             st.volley_at[g] = Vec3::ZERO;
             st.volley_cool[g] = VOLLEY_GAP_S;
@@ -1526,5 +1544,79 @@ fn event_cues(
         };
         one_shot(&mut commands, h, 0.8 * bv, 1.0);
         st.prev_outcome = true;
+    }
+}
+
+/// FL_LOG_AUDIO: once a second, the clips started most often, each with
+/// its sound, its median distance from the look point, and the regiments
+/// it came from with their state. Finds a clip repeating out of one spot.
+fn clip_log(
+    mut mixer: ResMut<Mixer>,
+    clips: Res<Clips>,
+    groups: Res<Groups>,
+    time: Res<Time<Real>>,
+    mut next: Local<f32>,
+) {
+    if !crate::mixer::log_enabled() {
+        return;
+    }
+    if time.elapsed_secs() < *next {
+        return;
+    }
+    *next = time.elapsed_secs() + 1.0;
+    let starts = std::mem::take(&mut mixer.start_log);
+    // Per clip: its sound, distances, and starts per regiment.
+    type ClipStarts<'a> = (ClipId, &'a str, Vec<f32>, Vec<(u32, u32)>);
+    let mut per: Vec<ClipStarts> = Vec::new();
+    for r in &starts {
+        let i = match per.iter().position(|e| e.0 == r.clip) {
+            Some(i) => i,
+            None => {
+                per.push((r.clip, r.bank, Vec::new(), Vec::new()));
+                per.len() - 1
+            }
+        };
+        per[i].2.push(r.dist);
+        match per[i].3.iter_mut().find(|u| u.0 == r.unit) {
+            Some(u) => u.1 += 1,
+            None => per[i].3.push((r.unit, 1)),
+        }
+    }
+    per.sort_by_key(|e| std::cmp::Reverse(e.2.len()));
+    let state = |g: u32| -> String {
+        let Some(gd) = groups.list.get(g as usize) else { return "no unit".into() };
+        let mut s = vec![if gd.team == 0 { "own" } else { "enemy" }, crate::unit_types::kind_name(gd.kind)];
+        for (on, name) in [
+            (gd.charging, "charging"),
+            (gd.crashing, "crashing"),
+            (gd.engaged, "engaged"),
+            (gd.contact, "contact"),
+            (gd.state.is_broken(), "broken"),
+            (gd.celebrate > 0, "celebrating"),
+        ] {
+            if on {
+                s.push(name);
+            }
+        }
+        format!("g{g} {}", s.join(" "))
+    };
+    let lines: Vec<String> = per
+        .iter_mut()
+        .take(6)
+        .map(|(clip, bank, d, units)| {
+            d.sort_by(|a, b| a.total_cmp(b));
+            units.sort_by_key(|u| std::cmp::Reverse(u.1));
+            let from: Vec<String> = units.iter().take(3).map(|(g, n)| format!("{} x{n}", state(*g))).collect();
+            format!(
+                "{} x{} ({bank}, {:.0} m; {})",
+                clips.path(*clip),
+                d.len(),
+                d[d.len() / 2],
+                from.join(", ")
+            )
+        })
+        .collect();
+    if !lines.is_empty() {
+        info!("clips: {}", lines.join(" | "));
     }
 }

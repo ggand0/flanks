@@ -280,6 +280,8 @@ pub fn apply_damage(
                     se.push_blow(crate::audio::Blow {
                         victim: pos[v],
                         attacker: pos[a],
+                        victim_group: group[v],
+                        attacker_group: group[a],
                         material: crate::audio::struck_material(skill, shield, armour, kind[v], roll),
                         killed: died,
                     });

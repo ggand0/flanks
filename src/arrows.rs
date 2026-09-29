@@ -480,6 +480,7 @@ fn update_arrows(
             // A shaft cannot be parried: shield or armour takes it.
             se.push_arrow_hit(crate::audio::ArrowHit {
                 pos: units.pos[v],
+                group: units.group[v],
                 material: crate::audio::struck_material(
                     0.0,
                     shield,
