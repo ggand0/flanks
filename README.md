@@ -2,22 +2,25 @@
 
 # FLANKS
 
-FLANKS is a real-time medieval battle game written in Rust and Bevy.
-Every soldier on the field is individually simulated, and battles can scale up to a few hundred thousand soldiers (200k tested on an RTX 3090). The combat model builds on mechanics measured from Medieval 2: Total War, with the goal of going beyond the classics rather than recreating them. It is an early prototype under active development.
+FLANKS is a real-time medieval battle game written in Rust and Bevy, inspired by Medieval II: Total War.
+Every soldier on the field is individually simulated, and battles can scale up to a few hundred thousand soldiers (200k tested on an RTX 3090). It is an early prototype under active development.
 
 ## Features
 
-- Mass battles: two armies of up to 100 regiments, 1,000 soldiers each
-- Regiment-based orders that keep formations intact: lasso selection, move and attack orders, battle lines drawn by dragging
+- Two armies of up to 100 units each, 1,000 soldiers per unit
+- Army size selectable in the menu, from 20k to 200k soldiers in total depending on your hardware
+- Customize your army before the battle, set the enemy army by hand, pick one of five styles for it or leave it random, then deploy your units inside your zone
+- Unit orders that keep formations intact: lasso or box selection, move and attack orders, battle lines drawn by dragging
 - Formations: shield wall, spear wall, loose order, hold position
-- Melee combat with swing timers, directional defense, charge impact, and physical spear walls
-- Archer regiments: every arrow is a simulated projectile with a real flight arc, and it hits whatever it lands on
-- Morale and fatigue based on values measured from the M2TW engine: regiments waver, rout, rally, or shatter
-- Skirmish AI opponent and battle outcomes
-- Unit cards, regiment banners, and a live morale inspect panel
-- Battle audio: layered battle din, steel, screams, horns, and war cries
-- Low-poly soldiers animated on the GPU, optimized to render the whole field at interactive framerates
-- Army size selectable in the menu, from 20k to 200k total soldiers depending on your hardware
+- Melee combat with swing timers, directional defense, charge impact and spear walls
+- Archer units with fire at will and skirmish modes; arrows hit whoever they land on, friends included
+- Morale and fatigue systems: units waver, rout, rally or shatter
+- An AI opponent; the battle ends when one army breaks
+- Textured 3D soldiers (knights, men-at-arms, spearmen and bowmen) with four levels of detail, animated on the GPU
+- Sun shadows over the ground and the soldiers
+- Three maps: a grassland with trees and textured ground, the classic field from 0.1.0, and an experimental river map
+- Unit cards, banners, selection rings under each soldier, a balance of power bar, and a unit panel showing each unit's state, morale and fatigue
+- Positional battle audio: marching, clashing steel, war cries, melee voices, horns, victory cheers and routing shouts
 
 ## Build and run
 
@@ -25,33 +28,37 @@ Every soldier on the field is individually simulated, and battles can scale up t
 cargo run --profile opt-dev
 ```
 
-Requires Rust 1.95 or newer.
+Requires Rust 1.95 or newer. The models and ground textures are stored with [Git LFS](https://git-lfs.com/): install it before cloning, or run `git lfs pull` in an existing clone.
 
 ## Controls
 
 | Action                          | Input                     |
 |---------------------------------|---------------------------|
-| Select regiments                | LMB drag (lasso or loop)  |
+| Select units                    | Left click or drag (lasso, or a box in Settings) |
+| Select unit cards               | Click; Ctrl + click adds or removes, Shift + click selects a range |
+| Select all / infantry / missile | Ctrl + A / I / M          |
+| Clear the selection             | Enter                     |
 | Move / attack                   | Right click               |
-| Draw a battle line              | RMB drag                  |
+| Draw a battle line              | Right drag                |
 | Halt selection                  | Backspace                 |
 | Shield / spear wall             | F                         |
 | Loose order                     | L                         |
-| Blob (mob) formation            | B                         |
-| Hold position                   | H                         |
+| Hold position                   | B                         |
 | Fire at will (archers)          | T                         |
 | Skirmish mode (archers)         | K                         |
 | Control groups                  | Ctrl + 1..9 store, 1..9 recall |
+| Begin the battle after deploying | Enter                    |
 | Pan camera                      | WASD or screen edges      |
 | Zoom / rotate camera            | Scroll / middle drag      |
 | Pause                           | Esc                       |
-| Debug overlays                  | G                         |
+| Battle HUD / unit panel / debug overlay | F1 / F2 / F3      |
+| Banners and map lines           | G                         |
 
-A set of `FL_*` environment variables configure sandbox battles and scripted test scenarios (army size, AI on/off, random seed, and so on). The Map option in the menu switches between the grassland, the classic field from 0.1.0 and an experimental map with a river and vegetation; `FL_MAP=classic` or `FL_MAP=river` picks one at launch. `FL_VOLUME=0` mutes the game.
+The Controls tab in Settings lists every binding. The Map option in the menu switches between the grassland, the classic field and the river map; `FL_MAP=classic` or `FL_MAP=river` picks one at launch. `FL_VOLUME=0` mutes the game. A set of `FL_*` environment variables configures sandbox battles and scripted test scenarios (army size, AI on/off, random seed, and so on).
 
 ## Assets
 
-Unit models are made for this project. The ground uses three CC0 textures from [Poly Haven](https://polyhaven.com/) and a layout image made for the project; see `assets/terrain/LICENSE.md`. Everything else is generated in code. Sound effects are AI-generated (ElevenLabs), plus one [marching loop from Pixabay](https://pixabay.com/sound-effects/people-marching-loop-32908/). Audio files are covered by their respective licenses, not the source license below.
+The soldier, arrow, tree and shrub models are made for this project. The ground uses three CC0 textures from [Poly Haven](https://polyhaven.com/) and a layout image made for the project; see `assets/terrain/LICENSE.md`. Everything else is generated in code. Sound effects are AI-generated (ElevenLabs), plus one [marching loop from Pixabay](https://pixabay.com/sound-effects/people-marching-loop-32908/). Audio files are covered by their respective licenses, not the source license below.
 
 ## License
 
