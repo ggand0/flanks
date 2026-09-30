@@ -59,7 +59,7 @@ pub struct InfluenceField {
 }
 
 impl InfluenceField {
-    fn new(min: Vec2, max: Vec2) -> Self {
+    pub(crate) fn new(min: Vec2, max: Vec2) -> Self {
         let w = ((max.x - min.x) / FIELD_CELL).ceil() as usize + 1;
         let h = ((max.y - min.y) / FIELD_CELL).ceil() as usize + 1;
         Self {
@@ -741,7 +741,7 @@ fn draw_fight_points(
     terrain: Res<Terrain>,
     mut gizmos: Gizmos,
 ) {
-    if !settings.interface.debug_overlay {
+    if !settings.interface.debug_overlay() {
         return;
     }
     const FIGHT: Color = Color::srgb(0.95, 0.35, 0.85);

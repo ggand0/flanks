@@ -1,5 +1,22 @@
 //! Small shared helpers.
 
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+/// The folder that holds `assets/`: the executable's own folder in a
+/// packaged build, else the repository the binary was built from (a run
+/// from `target/`). Never the working directory, so any launch path works.
+pub fn game_root() -> &'static Path {
+    static ROOT: OnceLock<PathBuf> = OnceLock::new();
+    ROOT.get_or_init(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(Path::to_path_buf))
+            .filter(|dir| dir.join("assets").is_dir())
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")))
+    })
+}
+
 /// Parse an env-var override, falling back to `default`. The FL_* knobs
 /// (unit counts, combat scale, camera pose, ...) all go through here.
 pub fn env_or<T: std::str::FromStr + Copy>(key: &str, default: T) -> T {

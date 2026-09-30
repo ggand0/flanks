@@ -33,7 +33,7 @@ const CLOSE_RANKS_FRAC: f32 = 0.06;
 const CLOSE_RANKS_PERIOD: u32 = 90;
 
 /// Formation shape of a regiment.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum FormShape {
     /// Rank-and-file grid with facing — the default battle formation.
     Rect,
@@ -43,7 +43,7 @@ pub enum FormShape {
 }
 
 /// Slot density of a Rect formation.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum FormSpacing {
     Normal,
     /// Open order: spread against missiles (arrows later), weak in melee.

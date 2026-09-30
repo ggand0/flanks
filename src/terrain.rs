@@ -22,9 +22,15 @@ pub const CHUNKS_Z: usize = 12;
 const VERTS_X: usize = CHUNKS_X * CHUNK_CELLS + 1;
 const VERTS_Z: usize = CHUNKS_Z * CHUNK_CELLS + 1;
 
-/// The battlefields the menu's Map row cycles through. `FL_MAP=classic`
-/// or `FL_MAP=river` picks one at launch; anything else is the grassland.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+/// Half the battlefield's width (x) and depth (z) in metres. Every map is
+/// this size, centred on the origin (`Terrain::min`, `Terrain::max`).
+pub const HALF_EXTENTS: Vec2 =
+    Vec2::new((VERTS_X - 1) as f32 * CELL * 0.5, (VERTS_Z - 1) as f32 * CELL * 0.5);
+
+/// The battlefields in the menu's Map row. At launch a setup's map wins
+/// (an `FL_SETUP` file, or the Demo's with `FL_DEMO=1`), then
+/// `FL_MAP=classic`, `river` or `sandbox`; anything else is the grassland.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub enum MapKind {
     /// Broad pasture shoulders around an open lowland: the default.
     #[default]
@@ -40,6 +46,9 @@ pub enum MapKind {
 
 impl MapKind {
     pub fn from_env() -> Self {
+        if let Some(setup) = crate::battle_setup::from_env() {
+            return setup.map;
+        }
         match std::env::var("FL_MAP").as_deref() {
             Ok("river") => Self::River,
             Ok("classic") => Self::Classic,
@@ -57,14 +66,8 @@ impl MapKind {
         }
     }
 
-    pub fn next(self) -> Self {
-        match self {
-            Self::Grassland => Self::Classic,
-            Self::Classic => Self::River,
-            Self::River => Self::Sandbox,
-            Self::Sandbox => Self::Grassland,
-        }
-    }
+    /// Every map, in the menu's order.
+    pub const ALL: [Self; 4] = [Self::Grassland, Self::Classic, Self::River, Self::Sandbox];
 }
 
 /// Sent by the menu when the Map row changes. The terrain regenerates
@@ -1054,7 +1057,7 @@ fn crater_tool(
     mut cooldown: Local<f32>,
 ) {
     *cooldown -= time.delta_secs();
-    if !settings.interface.debug_overlay || !keys.pressed(KeyCode::KeyX) || *cooldown > 0.0 {
+    if !settings.interface.debug_overlay() || !keys.pressed(KeyCode::KeyX) || *cooldown > 0.0 {
         return;
     }
     let Ok(window) = window.single() else { return };

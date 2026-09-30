@@ -245,7 +245,7 @@ fn model_path(kind: usize) -> Option<PathBuf> {
 /// A model file by name: the one `FL_GLB_<NAME>` names, then the shipped
 /// asset, then the working copy.
 fn model_file(name: &str) -> Option<PathBuf> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = crate::util::game_root();
     let var = format!("FL_GLB_{}", name.to_uppercase());
     if let Ok(named) = std::env::var(&var) {
         let named = root.join(named);

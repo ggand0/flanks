@@ -15,6 +15,18 @@ use crate::units::Units;
 #[derive(Component)]
 struct OverlayText;
 
+/// The one-line stats readout, F3's middle state.
+#[derive(Component)]
+struct StatsLine;
+
+/// A number in the stats line.
+#[derive(Component)]
+enum StatsValue {
+    Fps,
+    Soldiers,
+    Sim,
+}
+
 /// The unit panel (bottom-right), after M2TW's: army, name [class]
 /// (men), what the regiment is doing, its morale and fatigue words. The
 /// debug overlay adds the morale level, the formation and the live
@@ -158,7 +170,7 @@ impl Plugin for OverlayPlugin {
             FrameTimeDiagnosticsPlugin::default(),
             RenderDiagnosticsPlugin,
         ))
-            .add_systems(Startup, (spawn_overlay, spawn_inspect_panel))
+            .add_systems(Startup, (spawn_overlay, spawn_stats_line, spawn_inspect_panel))
             .add_systems(
                 OnEnter(crate::game_state::GameState::Battle),
                 reset_frame_stats,
@@ -188,7 +200,7 @@ impl Plugin for OverlayPlugin {
             .add_systems(FixedLast, fixed_end)
             .add_systems(
                 Update,
-                (show_overlay, update_overlay, update_inspect_panel, report_catchup)
+                (show_overlay, update_overlay, update_stats_line, update_inspect_panel, report_catchup)
                     .run_if(in_state(crate::game_state::GameState::Battle)),
             )
             .add_systems(
@@ -202,32 +214,34 @@ impl Plugin for OverlayPlugin {
     }
 }
 
-/// The overlay text follows the Debug overlay setting (F3). Only its
-/// visibility: `update_overlay` keeps writing the periodic log.
+/// The F3 readouts follow the Overlay setting. Only their visibility:
+/// `update_overlay` keeps writing the periodic log.
 fn show_overlay(
     settings: Res<crate::settings::Settings>,
     mut overlay: Query<&mut Visibility, With<OverlayText>>,
+    mut stats_line: Query<&mut Visibility, (With<StatsLine>, Without<OverlayText>)>,
 ) {
-    let want = if settings.interface.debug_overlay {
-        Visibility::Visible
-    } else {
-        Visibility::Hidden
-    };
+    use crate::settings::Overlay;
+    let mode = settings.interface.overlay;
+    let shown = |on: bool| if on { Visibility::Visible } else { Visibility::Hidden };
     for mut vis in &mut overlay {
-        if *vis != want {
-            *vis = want;
-        }
+        vis.set_if_neq(shown(mode == Overlay::Full));
+    }
+    for mut vis in &mut stats_line {
+        vis.set_if_neq(shown(mode == Overlay::Stats));
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn hide_overlay(
     mut overlay: Query<&mut Visibility, With<OverlayText>>,
     mut panel: Query<&mut Visibility, (With<InspectPanel>, Without<OverlayText>)>,
+    mut stats_line: Query<
+        &mut Visibility,
+        (With<StatsLine>, Without<OverlayText>, Without<InspectPanel>),
+    >,
 ) {
-    for mut vis in &mut overlay {
-        *vis = Visibility::Hidden;
-    }
-    for mut vis in &mut panel {
+    for mut vis in overlay.iter_mut().chain(panel.iter_mut()).chain(stats_line.iter_mut()) {
         *vis = Visibility::Hidden;
     }
 }
@@ -249,6 +263,101 @@ fn spawn_overlay(mut commands: Commands) {
         Visibility::Hidden,
         OverlayText,
     ));
+}
+
+/// The stats line: bright numbers and dim units on a dark pill, so it
+/// reads over bright ground and sky in captures.
+fn spawn_stats_line(mut commands: Commands) {
+    use crate::game_state::TEXT_COLOR;
+    // Lighter than the menu's dim grey, which is lost on the pill.
+    const UNIT_COLOR: Color = Color::srgb(0.74, 0.74, 0.69);
+    let font = TextFont {
+        font_size: FontSize::Px(16.0),
+        ..default()
+    };
+    let number = |value| (TextSpan::default(), font.clone(), TextColor(TEXT_COLOR), value);
+    let unit = |text: &str| (TextSpan::new(text), font.clone(), TextColor(UNIT_COLOR));
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                top: Val::Px(8.0),
+                left: Val::Px(8.0),
+                padding: UiRect::axes(Val::Px(12.0), Val::Px(5.0)),
+                border_radius: BorderRadius::all(Val::Px(6.0)),
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.55)),
+            Visibility::Hidden,
+            StatsLine,
+        ))
+        .with_children(|pill| {
+            pill.spawn((Text::default(), font.clone(), TextColor(TEXT_COLOR)))
+                .with_children(|t| {
+                    t.spawn(number(StatsValue::Fps));
+                    t.spawn(unit(" fps | "));
+                    t.spawn(number(StatsValue::Soldiers));
+                    t.spawn(unit(" soldiers | sim "));
+                    t.spawn(number(StatsValue::Sim));
+                    t.spawn(unit(" ms"));
+                });
+        });
+}
+
+/// The stats line's numbers: the full overlay's fps, soldiers alive on
+/// both sides, and the sim tick (its grid, step and field phases).
+/// Soldiers add up the units' living counts: those start at full
+/// strength, so the number is right in deployment, before the sim has
+/// filled `CombatStats`. The font is monospaced, so fps and sim are
+/// right-aligned in a fixed width: a value crossing 10 or 100 no longer
+/// resizes the pill every update. The soldier count loses a digit at most
+/// twice a battle.
+fn update_stats_line(
+    settings: Res<crate::settings::Settings>,
+    diagnostics: Res<DiagnosticsStore>,
+    groups: Res<Groups>,
+    stats: Res<SimStats>,
+    mut spans: Query<(&mut TextSpan, &StatsValue)>,
+) {
+    if settings.interface.overlay != crate::settings::Overlay::Stats {
+        return;
+    }
+    let (_, fps) = frame_rate(&diagnostics);
+    for (mut span, value) in &mut spans {
+        let text = match value {
+            StatsValue::Fps => format!("{fps:>3.0}"),
+            StatsValue::Soldiers => thousands(groups.list.iter().map(|g| g.count).sum()),
+            StatsValue::Sim => format!("{:>4.1}", stats.grid_ms + stats.step_ms + stats.field_ms),
+        };
+        if span.0 != text {
+            span.0 = text;
+        }
+    }
+}
+
+/// 199640 as "199,640".
+fn thousands(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Mean frame time in ms over the diagnostic's history (about two
+/// seconds), and the rate that mean implies. The smoothed values chase
+/// the latest frame: frames that carry a sim tick are longer than the
+/// ones between them, so a smoothed readout flickered between two rates.
+fn frame_rate(diagnostics: &DiagnosticsStore) -> (f64, f64) {
+    let frame_ms = diagnostics
+        .get(&FrameTimeDiagnosticsPlugin::FRAME_TIME)
+        .and_then(|d| d.average())
+        .unwrap_or(0.0);
+    (frame_ms, if frame_ms > 0.0 { 1000.0 / frame_ms } else { 0.0 })
 }
 
 /// The panel's army line takes the team's colour, muted to sit on the
@@ -357,7 +466,7 @@ fn update_inspect_panel(
         action_word(gd),
         crate::morale::state_word(gd),
     );
-    if ui.debug_overlay {
+    if ui.debug_overlay() {
         // Formation line: shape/files, spacing mode, engagement stance.
         let formation = match gd.shape {
             crate::formation::FormShape::Blob => "mob".to_string(),
@@ -422,15 +531,7 @@ fn update_overlay(
     mut pacing: ResMut<FramePacing>,
     mut phases: ResMut<FramePhases>,
 ) {
-    // Mean frame time over the diagnostic's history (about two seconds),
-    // and the rate that mean implies. The smoothed values chase the
-    // latest frame: frames that carry a sim tick are longer than the
-    // ones between them, so the readout flickered between two rates.
-    let frame_ms = diagnostics
-        .get(&FrameTimeDiagnosticsPlugin::FRAME_TIME)
-        .and_then(|d| d.average())
-        .unwrap_or(0.0);
-    let fps = if frame_ms > 0.0 { 1000.0 / frame_ms } else { 0.0 };
+    let (frame_ms, fps) = frame_rate(&diagnostics);
 
     let banner = match outcome.0 {
         Some(0) => "\n=== VICTORY: the enemy army is broken ===",
@@ -547,5 +648,19 @@ fn update_overlay(
                 info!("  gpu {path}: {v:.2} ms");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::thousands;
+
+    #[test]
+    fn thousands_groups_digits() {
+        assert_eq!(thousands(0), "0");
+        assert_eq!(thousands(999), "999");
+        assert_eq!(thousands(1000), "1,000");
+        assert_eq!(thousands(199_640), "199,640");
+        assert_eq!(thousands(1_000_000), "1,000,000");
     }
 }

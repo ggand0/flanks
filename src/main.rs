@@ -1,8 +1,13 @@
+// A Windows GUI program, so opening the game does not also open an empty
+// console window. Debug builds keep the console for their log.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod ai;
 mod arrows;
 mod audio;
 mod balance;
 mod banners;
+mod battle_setup;
 mod camera;
 mod combat;
 mod fatigue;
@@ -87,10 +92,10 @@ fn main() {
                     }),
                     ..default()
                 })
-                // Resolve assets/ from the repo regardless of how the
-                // binary is launched (cargo run vs ./target/...).
+                // Resolve assets/ regardless of how the binary is launched
+                // (packaged, cargo run or ./target/...).
                 .set(AssetPlugin {
-                    file_path: concat!(env!("CARGO_MANIFEST_DIR"), "/assets").into(),
+                    file_path: util::game_root().join("assets").to_string_lossy().into_owned(),
                     ..default()
                 })
                 .set(RenderPlugin {
@@ -101,6 +106,7 @@ fn main() {
         .insert_resource(user_settings)
         .add_plugins(game_state::GameShellPlugin)
         .add_plugins(settings::SettingsPlugin)
+        .add_plugins(battle_setup::BattleSetupPlugin)
         .add_plugins((
             terrain::TerrainPlugin,
             water::WaterPlugin,

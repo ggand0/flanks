@@ -11,7 +11,7 @@ use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 
 use crate::game_state::{
-    BTN_NORMAL, BattleConfig, CustomStyled, DIM_TEXT_COLOR, EnemyComp, GameState, PANEL_BG,
+    BTN_ACTIVE, BTN_NORMAL, BattleConfig, CustomStyled, DIM_TEXT_COLOR, EnemyComp, GameState, PANEL_BG,
     TEXT_COLOR, fullscreen_overlay, spawn_text_button,
 };
 use crate::unit_cards::KIND_FILL;
@@ -21,8 +21,6 @@ const GRID_BG: Color = Color::srgba(0.03, 0.04, 0.05, 0.85);
 const CELL_EMPTY: Color = Color::srgba(0.09, 0.10, 0.13, 0.90);
 const CARD_BG: Color = Color::srgba(0.10, 0.11, 0.14, 0.92);
 const CARD_BG_HOVER: Color = Color::srgba(0.22, 0.24, 0.30, 0.95);
-/// The selected enemy-composition chip (same accent as HUD buttons).
-const CHIP_ACTIVE: Color = Color::srgba(0.22, 0.38, 0.62, 0.95);
 
 const CELL_W: f32 = 34.0;
 const CELL_H: f32 = 42.0;
@@ -731,7 +729,7 @@ fn refresh_picker(
             (ModeChip::Style(i), EnemyComp::Style(j)) => *i == j,
             _ => false,
         };
-        bg.0 = if active { CHIP_ACTIVE } else { BTN_NORMAL };
+        bg.0 = if active { BTN_ACTIVE } else { BTN_NORMAL };
     }
 
     for (mut text, tag) in &mut texts {

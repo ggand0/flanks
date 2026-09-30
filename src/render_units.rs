@@ -102,7 +102,7 @@ pub struct InstanceData {
     /// rgb = team color; a = stable per-unit anim seed (NOT opacity).
     pub color: [f32; 4],
     /// x = yaw, y = ground speed m/s, z = attack or cheer
-    /// (CELEBRATE_BASE), w = fx: [0,1) hit flash, [1,2] death.
+    /// (CELEBRATE_BASE), w = fx: [0,1] hit flash, (1,2] death.
     pub anim: [f32; 4],
     /// x = stance band (`stance_tier`, smoothed), y = wall 0..1
     /// (shieldwall shield-front / spearwall leveled spears), z = gait
@@ -964,8 +964,13 @@ fn sync_instance_data(
                     } else {
                         0.0
                     };
-                    // fx: [0,1) hit flash, [1,2] death progress.
-                    let fx = if units.death_t[i] > 0 {
+                    // fx: [0,1] hit flash, (1,2] death progress. A death's
+                    // first tick has progress 0, the living pose, and at 1.0
+                    // it would read as a full flash, so it takes the hit
+                    // flash branch like a living man.
+                    let dying = units.death_t[i] > 0
+                        && units.death_t[i] < crate::sim::damage::DEATH_TICKS;
+                    let fx = if dying {
                         2.0 - units.death_t[i] as f32 / crate::sim::damage::DEATH_TICKS as f32
                     } else if hit_flash {
                         units.flash[i] as f32 * 0.25

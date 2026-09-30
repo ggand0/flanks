@@ -8,7 +8,7 @@ Every soldier on the field is individually simulated, and battles can scale up t
 ## Features
 
 - Two armies of up to 100 units each, 1,000 soldiers per unit
-- Army size selectable in the menu, from 20k to 200k soldiers in total depending on your hardware
+- Army size selectable in the menu, from 10k to 200k soldiers in total depending on your hardware
 - Customize your army before the battle, set the enemy army by hand, pick one of five styles for it or leave it random, then deploy your units inside your zone
 - Unit orders that keep formations intact: lasso or box selection, move and attack orders, battle lines drawn by dragging
 - Formations: shield wall, spear wall, loose order, hold position
@@ -34,7 +34,7 @@ Requires Rust 1.95 or newer. The models and ground textures are stored with [Git
 
 | Action                          | Input                     |
 |---------------------------------|---------------------------|
-| Select units                    | Left click or drag (lasso, or a box in Settings) |
+| Select units                    | Left click or drag (a box, or a lasso in Settings) |
 | Select unit cards               | Click; Ctrl + click adds or removes, Shift + click selects a range |
 | Select all / infantry / missile | Ctrl + A / I / M          |
 | Clear the selection             | Enter                     |
@@ -51,7 +51,7 @@ Requires Rust 1.95 or newer. The models and ground textures are stored with [Git
 | Pan camera                      | WASD or screen edges      |
 | Zoom / rotate camera            | Scroll / middle drag      |
 | Pause                           | Esc                       |
-| Battle HUD / unit panel / debug overlay | F1 / F2 / F3      |
+| Battle HUD / unit panel / stats line and debug overlay | F1 / F2 / F3 |
 | Banners and map lines           | G                         |
 
 The Controls tab in Settings lists every binding. The Map option in the menu switches between the grassland, the classic field and the river map; `FL_MAP=classic` or `FL_MAP=river` picks one at launch. `FL_VOLUME=0` mutes the game. A set of `FL_*` environment variables configures sandbox battles and scripted test scenarios (army size, AI on/off, random seed, and so on).

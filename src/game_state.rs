@@ -14,6 +14,10 @@ use crate::units::Units;
 pub enum Scenario {
     #[default]
     Normal,
+    /// The demo battle (battle_setup.rs `demo_setup`): 200k on the
+    /// grassland, the player's side in a set defence with a timed charge,
+    /// the enemy AI playing as in a normal battle (`FL_DEMO=1`).
+    Demo,
     Surround,
     Rout,
     Dir,
@@ -36,7 +40,8 @@ pub enum Scenario {
 }
 
 /// The env var of every scripted scenario, as the scripts launch them.
-const SCENARIO_ENVS: [&str; 11] = [
+const SCENARIO_ENVS: [&str; 12] = [
+    "FL_DEMO",
     "FL_TEST_SURROUND",
     "FL_TEST_ROUT",
     "FL_TEST_DIR",
@@ -53,6 +58,7 @@ const SCENARIO_ENVS: [&str; 11] = [
 impl Scenario {
     const ALL: &[Scenario] = &[
         Self::Normal,
+        Self::Demo,
         Self::Surround,
         Self::Rout,
         Self::Dir,
@@ -71,6 +77,7 @@ impl Scenario {
     fn label(self) -> &'static str {
         match self {
             Self::Normal => "Normal",
+            Self::Demo => "Demo",
             Self::Surround => "Surround",
             Self::Rout => "Rout",
             Self::Dir => "Dir Defense",
@@ -93,6 +100,7 @@ impl Scenario {
     fn env_key(self) -> Option<&'static str> {
         match self {
             Self::Normal => None,
+            Self::Demo => Some("FL_DEMO"),
             Self::Surround => Some("FL_TEST_SURROUND"),
             Self::Rout => Some("FL_TEST_ROUT"),
             Self::Dir => Some("FL_TEST_DIR"),
@@ -107,7 +115,7 @@ impl Scenario {
         }
     }
 
-    fn from_env() -> Self {
+    pub(crate) fn from_env() -> Self {
         Self::ALL
             .iter()
             .copied()
@@ -151,7 +159,7 @@ impl Default for BattleConfig {
     fn default() -> Self {
         let units_per_team = crate::util::env_or("FL_UNITS", 100_000);
         let reg_size = crate::util::env_or("FL_REG_SIZE", 1000_usize).max(50);
-        Self {
+        let mut config = Self {
             player_regs: crate::regiments::frac_comp((units_per_team / reg_size).max(1)),
             enemy: EnemyComp::Random,
             units_per_team,
@@ -159,7 +167,11 @@ impl Default for BattleConfig {
             ai_enabled: !std::env::var("FL_AI").is_ok_and(|v| v == "0"),
             map: MapKind::from_env(),
             scenario: Scenario::from_env(),
+        };
+        if let Some(setup) = crate::battle_setup::for_battle(config.scenario) {
+            setup.apply_config(&mut config);
         }
+        config
     }
 }
 
@@ -187,10 +199,12 @@ pub fn deploying(d: Res<Deployment>) -> bool {
 }
 
 /// Any scripted scenario or test battery owns the battle: automatic
-/// order sources (ai.rs) stand down. Deliberately NOT cached — menu
-/// scenario buttons change the env between battles (sync_scenario_env).
+/// order sources (ai.rs) stand down. The Demo's script orders only the
+/// player's side, so the AI still plays the enemy there. Deliberately NOT
+/// cached: menu scenario buttons change the env between battles
+/// (sync_scenario_env).
 pub fn scripts_active() -> bool {
-    Scenario::from_env() != Scenario::Normal
+    !matches!(Scenario::from_env(), Scenario::Normal | Scenario::Demo)
         || std::env::var("FL_TEST_FRONT").is_ok()
         || std::env::var("FL_TEST_ORDERS").is_ok()
         || std::env::var("FL_TEST_FORM").is_ok()
@@ -240,12 +254,17 @@ fn test_battles_closed(open: Query<(), With<TestBattlesRoot>>) -> bool {
     open.is_empty()
 }
 
-#[derive(Component)]
-enum OptionButton {
-    ArmySize,
-    Ai,
-    Map,
+/// One button of a segmented menu row, with its index into that row's
+/// values (`ARMY_SIZES`, `MapKind::ALL`, `AI_VALUES`).
+#[derive(Component, Clone, Copy)]
+enum Segment {
+    Army(usize),
+    Map(usize),
+    Ai(usize),
 }
+
+/// The AI row: index 0 turns the enemy AI on.
+const AI_VALUES: [&str; 2] = ["On", "Off"];
 
 #[derive(Component)]
 struct DebugButton(Scenario);
@@ -307,13 +326,14 @@ impl Plugin for GameShellPlugin {
                     // its backdrop blocks picking, and the gate keeps
                     // the keyboard shortcuts (Enter/Space/ESC) from
                     // acting behind it.
-                    (menu_buttons, menu_option_buttons)
+                    (menu_buttons, menu_segments, segment_style)
                         .run_if(
                             in_state(GameState::Menu)
                                 .and_then(crate::settings::settings_closed)
                                 .and_then(test_battles_closed),
                         ),
-                    (debug_scenario_buttons, close_test_battles).run_if(in_state(GameState::Menu)),
+                    (debug_scenario_buttons.before(crate::terrain::MapRebuild), close_test_battles)
+                        .run_if(in_state(GameState::Menu)),
                     (toggle_pause, pause_buttons).run_if(
                         in_state(GameState::Battle)
                             .and_then(crate::settings::settings_closed),
@@ -338,6 +358,8 @@ pub const PANEL_BG: Color = Color::srgba(0.05, 0.06, 0.08, 0.92);
 pub const BTN_NORMAL: Color = Color::srgba(0.15, 0.16, 0.20, 0.92);
 pub const BTN_HOVER: Color = Color::srgba(0.25, 0.27, 0.32, 0.95);
 pub const BTN_PRESSED: Color = Color::srgba(0.10, 0.11, 0.14, 0.95);
+/// The current value of a segmented row or chip group.
+pub const BTN_ACTIVE: Color = Color::srgba(0.22, 0.38, 0.62, 0.95);
 
 pub fn fullscreen_overlay() -> Node {
     Node {
@@ -379,21 +401,35 @@ pub fn spawn_text_button(p: &mut ChildSpawnerCommands, label: &str, marker: impl
 // ── Menu ──
 
 const ARMY_SIZES: &[(usize, &str)] = &[
+    (5_000, "10k"),
     (10_000, "20k"),
     (25_000, "50k"),
     (50_000, "100k"),
     (100_000, "200k"),
 ];
 
-fn army_size_label(per_team: usize) -> &'static str {
-    ARMY_SIZES
-        .iter()
-        .find(|(n, _)| *n == per_team)
-        .map(|(_, s)| *s)
-        .unwrap_or("200k")
+/// Set the army size per team. The regiment size and the slot budget
+/// follow it, so both compositions reset (stale counts could overflow
+/// the new slot total); picking the current size keeps them.
+fn set_army_size(config: &mut BattleConfig, per_team: usize) {
+    if config.units_per_team == per_team {
+        return;
+    }
+    config.units_per_team = per_team;
+    // Smaller armies field smaller units, so a 10k battle still has 25
+    // units a side to maneuver.
+    config.reg_size = if per_team <= 5_000 {
+        200
+    } else if per_team <= 10_000 {
+        500
+    } else {
+        1000
+    };
+    config.player_regs = crate::regiments::frac_comp(config.n_slots());
+    config.enemy = EnemyComp::Random;
 }
 
-fn spawn_menu(mut commands: Commands, config: Res<BattleConfig>) {
+fn spawn_menu(mut commands: Commands) {
     commands
         .spawn((
             fullscreen_overlay(),
@@ -436,19 +472,14 @@ fn spawn_menu(mut commands: Commands, config: Res<BattleConfig>) {
                 ..default()
             })
             .with_children(|opts| {
-                spawn_option_row(
+                spawn_segment_row(
                     opts,
                     "Army",
-                    army_size_label(config.units_per_team),
-                    OptionButton::ArmySize,
+                    ARMY_SIZES.iter().map(|(_, label)| *label),
+                    Segment::Army,
                 );
-                spawn_option_row(
-                    opts,
-                    "AI",
-                    if config.ai_enabled { "On" } else { "Off" },
-                    OptionButton::Ai,
-                );
-                spawn_option_row(opts, "Map", config.map.label(), OptionButton::Map);
+                spawn_segment_row(opts, "Map", MapKind::ALL.iter().map(|m| m.label()), Segment::Map);
+                spawn_segment_row(opts, "AI", AI_VALUES.into_iter(), Segment::Ai);
             });
 
             spawn_text_button(p, "Start Battle", MenuButton::StartBattle);
@@ -491,56 +522,87 @@ fn spawn_menu(mut commands: Commands, config: Res<BattleConfig>) {
         });
 }
 
-fn spawn_option_row(p: &mut ChildSpawnerCommands, label: &str, value: &str, btn: OptionButton) {
-    p.spawn(Node {
-        flex_direction: FlexDirection::Row,
-        align_items: AlignItems::Center,
-        margin: UiRect::vertical(Val::Px(4.0)),
-        ..default()
-    })
-    .with_children(|row| {
-        row.spawn((
-            Text::new(format!("{label}:")),
-            TextFont {
-                font_size: FontSize::Px(15.0),
-                ..default()
-            },
-            TextColor(DIM_TEXT_COLOR),
-            Node {
-                width: Val::Px(80.0),
-                ..default()
-            },
-        ));
-        row.spawn((
-            Button,
-            Node {
-                padding: UiRect::axes(Val::Px(16.0), Val::Px(6.0)),
-                min_width: Val::Px(100.0),
-                justify_content: JustifyContent::Center,
-                align_items: AlignItems::Center,
-                ..default()
-            },
-            BackgroundColor(BTN_NORMAL),
-            btn,
-        ))
-        .with_children(|b| {
-            b.spawn((
-                Text::new(value.to_string()),
-                TextFont {
-                    font_size: FontSize::Px(15.0),
-                    ..default()
-                },
-                TextColor(TEXT_COLOR),
-            ));
+/// A menu option shown as a row of buttons, one per value, the current
+/// one lit (`segment_style`).
+fn spawn_segment_row<'a>(
+    p: &mut ChildSpawnerCommands,
+    label: &str,
+    values: impl Iterator<Item = &'a str>,
+    segment: fn(usize) -> Segment,
+) {
+    p.spawn(option_row_node()).with_children(|row| {
+        spawn_option_label(row, label);
+        row.spawn(Node {
+            column_gap: Val::Px(2.0),
+            ..default()
+        })
+        .with_children(|segments| {
+            for (i, value) in values.enumerate() {
+                segments
+                    .spawn((
+                        Button,
+                        Node {
+                            padding: UiRect::axes(Val::Px(12.0), Val::Px(6.0)),
+                            justify_content: JustifyContent::Center,
+                            align_items: AlignItems::Center,
+                            ..default()
+                        },
+                        BackgroundColor(BTN_NORMAL),
+                        CustomStyled,
+                        segment(i),
+                    ))
+                    .with_children(|b| {
+                        spawn_option_text(b, value);
+                    });
+            }
         });
     });
 }
 
+fn option_row_node() -> Node {
+    Node {
+        flex_direction: FlexDirection::Row,
+        align_items: AlignItems::Center,
+        margin: UiRect::vertical(Val::Px(4.0)),
+        ..default()
+    }
+}
+
+fn spawn_option_label(row: &mut ChildSpawnerCommands, label: &str) {
+    row.spawn((
+        Text::new(format!("{label}:")),
+        TextFont {
+            font_size: FontSize::Px(15.0),
+            ..default()
+        },
+        TextColor(DIM_TEXT_COLOR),
+        Node {
+            width: Val::Px(80.0),
+            ..default()
+        },
+    ));
+}
+
+fn spawn_option_text(button: &mut ChildSpawnerCommands, value: &str) {
+    button.spawn((
+        Text::new(value.to_string()),
+        TextFont {
+            font_size: FontSize::Px(15.0),
+            ..default()
+        },
+        TextColor(TEXT_COLOR),
+    ));
+}
+
 /// Where Start Battle goes: normal battles pass through the Select
 /// Units screen; scripted scenarios and FL_DEPLOY=0 skip deployment and
-/// the picker both and drop straight into the fight.
+/// the picker both and drop straight into the fight. An `FL_SETUP` file
+/// brings its own armies, so it skips the picker and keeps deployment.
 fn start_target() -> GameState {
-    if scripts_active() || crate::util::env_or("FL_DEPLOY", 1_u32) == 0 {
+    if scripts_active()
+        || crate::util::env_or("FL_DEPLOY", 1_u32) == 0
+        || crate::battle_setup::for_battle(Scenario::Normal).is_some()
+    {
         GameState::Battle
     } else {
         GameState::UnitSelect
@@ -568,18 +630,22 @@ fn menu_buttons(
     mut exit: MessageWriter<AppExit>,
     mut auto: Local<bool>,
 ) {
-    if !*auto && scripts_active() {
+    // Launch-time starts, looked at on the menu's first frame only: a test
+    // battle from the menu leaves its scenario's env var set, and a later
+    // visit to the menu must not start it again.
+    if !*auto {
         *auto = true;
-        next.set(GameState::Battle);
-        return;
-    }
-    // FL_AUTOSTART=1: start a normal battle without a key press (with
-    // FL_DEPLOY=0 it skips the picker and deployment too), for measured
-    // runs of the real game with the AI on.
-    if !*auto && std::env::var("FL_AUTOSTART").is_ok() {
-        *auto = true;
-        start_normal_battle(&mut config, &mut next);
-        return;
+        if scripts_active() || Scenario::from_env() == Scenario::Demo {
+            next.set(GameState::Battle);
+            return;
+        }
+        // FL_AUTOSTART=1: start a normal battle without a key press (with
+        // FL_DEPLOY=0 it skips the picker and deployment too), for
+        // measured runs of the real game with the AI on.
+        if std::env::var("FL_AUTOSTART").is_ok() {
+            start_normal_battle(&mut config, &mut next);
+            return;
+        }
     }
     if keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::Space) {
         start_normal_battle(&mut config, &mut next);
@@ -600,46 +666,49 @@ fn menu_buttons(
     }
 }
 
-fn menu_option_buttons(
-    query: Query<(&Interaction, &OptionButton, &Children), Changed<Interaction>>,
-    mut texts: Query<&mut Text>,
+/// A segment pressed: its row takes that value. A new map rebuilds the
+/// terrain behind the menu.
+fn menu_segments(
+    query: Query<(&Interaction, &Segment), Changed<Interaction>>,
     mut config: ResMut<BattleConfig>,
     mut maps: MessageWriter<MapChanged>,
 ) {
-    for (interaction, opt, children) in &query {
+    for (interaction, segment) in &query {
         if *interaction != Interaction::Pressed {
             continue;
         }
-        let new_label = match opt {
-            OptionButton::ArmySize => {
-                let idx = ARMY_SIZES
-                    .iter()
-                    .position(|(n, _)| *n == config.units_per_team)
-                    .map(|i| (i + 1) % ARMY_SIZES.len())
-                    .unwrap_or(0);
-                config.units_per_team = ARMY_SIZES[idx].0;
-                config.reg_size = if config.units_per_team <= 10_000 { 500 } else { 1000 };
-                // The regiment budget changed: reset both compositions
-                // (stale counts could overflow the new slot total).
-                config.player_regs = crate::regiments::frac_comp(config.n_slots());
-                config.enemy = EnemyComp::Random;
-                ARMY_SIZES[idx].1
+        match *segment {
+            Segment::Army(i) => set_army_size(&mut config, ARMY_SIZES[i].0),
+            Segment::Map(i) => {
+                let map = MapKind::ALL[i];
+                if config.map != map {
+                    config.map = map;
+                    maps.write(MapChanged(map));
+                }
             }
-            OptionButton::Ai => {
-                config.ai_enabled = !config.ai_enabled;
-                if config.ai_enabled { "On" } else { "Off" }
-            }
-            OptionButton::Map => {
-                config.map = config.map.next();
-                maps.write(MapChanged(config.map));
-                config.map.label()
-            }
-        };
-        for child in children.iter() {
-            if let Ok(mut text) = texts.get_mut(child) {
-                text.0 = new_label.to_string();
-            }
+            Segment::Ai(i) => config.ai_enabled = i == 0,
         }
+    }
+}
+
+/// Segment colours: the current value lit, the others with the usual
+/// hover and press shades.
+fn segment_style(
+    mut query: Query<(&Interaction, &Segment, &mut BackgroundColor)>,
+    config: Res<BattleConfig>,
+) {
+    for (interaction, segment, mut bg) in &mut query {
+        let current = match *segment {
+            Segment::Army(i) => ARMY_SIZES[i].0 == config.units_per_team,
+            Segment::Map(i) => MapKind::ALL[i] == config.map,
+            Segment::Ai(i) => (i == 0) == config.ai_enabled,
+        };
+        bg.0 = match interaction {
+            _ if current => BTN_ACTIVE,
+            Interaction::Pressed => BTN_PRESSED,
+            Interaction::Hovered => BTN_HOVER,
+            Interaction::None => BTN_NORMAL,
+        };
     }
 }
 
@@ -755,14 +824,21 @@ fn close_test_battles(
     }
 }
 
+/// A test battle button. The Demo brings its own map and armies; a new
+/// map rebuilds before the battle spawns (this runs before `MapRebuild`).
 fn debug_scenario_buttons(
     query: Query<(&Interaction, &DebugButton), Changed<Interaction>>,
     mut config: ResMut<BattleConfig>,
     mut next: ResMut<NextState<GameState>>,
+    mut maps: MessageWriter<MapChanged>,
 ) {
     for (interaction, btn) in &query {
         if *interaction == Interaction::Pressed {
             config.scenario = btn.0;
+            if let Some(setup) = crate::battle_setup::for_battle(btn.0) {
+                setup.apply_config(&mut config);
+                maps.write(MapChanged(config.map));
+            }
             next.set(GameState::Battle);
         }
     }
@@ -795,6 +871,7 @@ pub fn setup_battle(
     mut dir_stats: ResMut<DirTestStats>,
     mut virt_time: ResMut<Time<Virtual>>,
     mut deploy: ResMut<Deployment>,
+    mut script: ResMut<crate::battle_setup::SetupScript>,
     config: Res<BattleConfig>,
     (mut arrows, mut arrow_spawns, mut stuck): (
         ResMut<crate::arrows::Arrows>,
@@ -816,9 +893,16 @@ pub fn setup_battle(
     virt_time.unpause();
     sync_scenario_env(config.scenario);
     crate::regiments::do_spawn_battle(&mut units, &terrain, &mut groups, &config);
+    *script = default();
+    if let Some(setup) = crate::battle_setup::for_battle(config.scenario) {
+        match setup.place(&mut groups, &mut units, &terrain) {
+            Some(placed) => *script = crate::battle_setup::SetupScript::new(setup, &placed),
+            None => warn!("setup: the armies differ from the setup's; units stay where they spawned"),
+        }
+    }
     // Scripted scenarios and test batteries start fighting immediately;
-    // a normal battle opens in deployment. FL_DEPLOY=0 skips it.
-    deploy.active = config.scenario == Scenario::Normal
+    // a normal battle and the Demo open in deployment. FL_DEPLOY=0 skips it.
+    deploy.active = matches!(config.scenario, Scenario::Normal | Scenario::Demo)
         && !scripts_active()
         && crate::util::env_or("FL_DEPLOY", 1_u32) != 0;
     if deploy.active {
@@ -884,12 +968,15 @@ fn spawn_deploy_ui(commands: &mut Commands) {
 }
 
 /// Begin Battle button or Enter: release the sim and drop the deploy UI.
+/// The setup it releases is written to `last_setup.yaml` for `FL_SETUP`.
 fn begin_battle(
     mut commands: Commands,
     mut deploy: ResMut<Deployment>,
     keys: Res<ButtonInput<KeyCode>>,
     buttons: Query<&Interaction, (Changed<Interaction>, With<BeginBattleButton>)>,
     roots: Query<Entity, With<DeployRoot>>,
+    config: Res<BattleConfig>,
+    groups: Res<Groups>,
 ) {
     let clicked = buttons.iter().any(|i| *i == Interaction::Pressed);
     if !clicked && !keys.just_pressed(KeyCode::Enter) {
@@ -899,6 +986,7 @@ fn begin_battle(
     for e in &roots {
         commands.entity(e).despawn();
     }
+    crate::battle_setup::save_last(&crate::battle_setup::BattleSetup::capture(&config, &groups));
     info!("deployment done: battle begins");
 }
 
@@ -1085,5 +1173,49 @@ fn button_hover_style(
             Interaction::Hovered => BackgroundColor(BTN_HOVER),
             Interaction::None => BackgroundColor(BTN_NORMAL),
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every menu size splits into whole units, 10 to 100 a side, and the
+    /// player's starting composition fills exactly those slots.
+    #[test]
+    fn army_sizes_split_into_whole_units() {
+        for &(per_team, label) in ARMY_SIZES {
+            let mut config = BattleConfig { units_per_team: 0, ..default() };
+            set_army_size(&mut config, per_team);
+            assert_eq!(per_team % config.reg_size, 0, "{label}: {per_team} by {}", config.reg_size);
+            let n = config.n_slots();
+            assert!((10..=100).contains(&n), "{label}: {n} units a side");
+            assert_eq!(config.player_regs.iter().sum::<usize>(), n, "{label}: composition");
+        }
+    }
+
+    #[test]
+    fn unit_size_follows_army_size() {
+        let expect = [(5_000, 200), (10_000, 500), (25_000, 1000), (50_000, 1000), (100_000, 1000)];
+        assert_eq!(expect.len(), ARMY_SIZES.len());
+        for (per_team, reg_size) in expect {
+            let mut config = BattleConfig { units_per_team: 0, ..default() };
+            set_army_size(&mut config, per_team);
+            assert_eq!(config.reg_size, reg_size, "{per_team} a side");
+        }
+    }
+
+    #[test]
+    fn picking_the_current_size_keeps_the_picks() {
+        let mut config = BattleConfig { units_per_team: 0, ..default() };
+        set_army_size(&mut config, 5_000);
+        config.player_regs = [25, 0, 0, 0];
+        config.enemy = EnemyComp::Style(1);
+        set_army_size(&mut config, 5_000);
+        assert_eq!(config.player_regs, [25, 0, 0, 0]);
+        assert!(matches!(config.enemy, EnemyComp::Style(1)));
+        set_army_size(&mut config, 10_000);
+        assert_eq!(config.player_regs.iter().sum::<usize>(), 20);
+        assert!(matches!(config.enemy, EnemyComp::Random));
     }
 }

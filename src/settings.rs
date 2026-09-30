@@ -86,14 +86,50 @@ pub struct InterfaceSettings {
     /// F2: the unit panel (bottom right) for the hovered or selected
     /// regiment.
     pub unit_panel: bool,
-    /// F3: the debug overlay (fps and sim readout, top left). It also
-    /// unlocks the debug tools: the morale breakdown in the unit panel
-    /// and the X crater tool. The periodic log runs either way.
-    pub debug_overlay: bool,
+    /// F3 cycles it: nothing, the one-line stats readout, or the full
+    /// debug overlay, all top left. The periodic log runs either way.
+    pub overlay: Overlay,
     /// Soldiers flash white when hit.
     pub hit_flash: bool,
     /// The front line drawn along the fighting. G hides it too.
     pub front_line: bool,
+}
+
+impl InterfaceSettings {
+    /// The full debug overlay is up. It also unlocks the debug tools: the
+    /// morale breakdown in the unit panel and the X crater tool.
+    pub fn debug_overlay(&self) -> bool {
+        self.overlay == Overlay::Full
+    }
+}
+
+/// What F3 shows at the top left of the battle.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub enum Overlay {
+    #[default]
+    Off,
+    /// One line: fps, soldiers alive, sim tick.
+    Stats,
+    /// Every readout, and the debug tools.
+    Full,
+}
+
+impl Overlay {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Off => Self::Stats,
+            Self::Stats => Self::Full,
+            Self::Full => Self::Off,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::Stats => "Stats",
+            Self::Full => "Full",
+        }
+    }
 }
 
 impl Default for Settings {
@@ -101,14 +137,14 @@ impl Default for Settings {
         Self {
             audio: AudioSettings { master: 1.0, battle: 1.0, ui: 1.0 },
             camera: CameraSettings { pan_speed: 1.0, edge_pan: true },
-            controls: ControlsSettings { box_select: false },
+            controls: ControlsSettings { box_select: true },
             video: VideoSettings { vsync: false, fullscreen: false, shadows: true },
             interface: InterfaceSettings {
                 hud: true,
                 unit_panel: true,
-                debug_overlay: false,
+                overlay: Overlay::Off,
                 hit_flash: true,
-                front_line: true,
+                front_line: false,
             },
         }
     }
@@ -382,7 +418,7 @@ impl Toggle {
             Self::Shadows => s.video.shadows,
             Self::Hud => s.interface.hud,
             Self::UnitPanel => s.interface.unit_panel,
-            Self::DebugOverlay => s.interface.debug_overlay,
+            Self::DebugOverlay => s.interface.overlay != Overlay::Off,
             Self::HitFlash => s.interface.hit_flash,
             Self::FrontLine => s.interface.front_line,
         }
@@ -397,7 +433,7 @@ impl Toggle {
             Self::Shadows => s.video.shadows = !s.video.shadows,
             Self::Hud => s.interface.hud = !s.interface.hud,
             Self::UnitPanel => s.interface.unit_panel = !s.interface.unit_panel,
-            Self::DebugOverlay => s.interface.debug_overlay = !s.interface.debug_overlay,
+            Self::DebugOverlay => s.interface.overlay = s.interface.overlay.next(),
             Self::HitFlash => s.interface.hit_flash = !s.interface.hit_flash,
             Self::FrontLine => s.interface.front_line = !s.interface.front_line,
         }
@@ -412,6 +448,7 @@ impl Toggle {
             Self::BoxSelect => {
                 if on { "Box" } else { "Lasso" }
             }
+            Self::DebugOverlay => s.interface.overlay.label(),
             _ => {
                 if on { "On" } else { "Off" }
             }
@@ -579,9 +616,9 @@ const CONTROLS: [(&str, &[(&str, &str)]); 4] = [
             ("Esc", "Pause"),
             ("F1", "Battle HUD"),
             ("F2", "Unit panel"),
-            ("F3", "Debug overlay"),
+            ("F3", "Stats line, debug overlay"),
             ("G", "Banners and map lines"),
-            ("X, with F3 on", "Dig a crater"),
+            ("X, in the full F3 overlay", "Dig a crater"),
         ],
     ),
 ];
@@ -755,7 +792,7 @@ fn spawn_modal(commands: &mut Commands, s: &Settings, active: Tab) {
                     section_header(body, "Screen");
                     toggle_row(body, "Battle HUD (F1)", Toggle::Hud, s);
                     toggle_row(body, "Unit panel (F2)", Toggle::UnitPanel, s);
-                    toggle_row(body, "Debug overlay (F3)", Toggle::DebugOverlay, s);
+                    toggle_row(body, "Overlay (F3)", Toggle::DebugOverlay, s);
 
                     section_header(body, "Battlefield");
                     toggle_row(body, "Hit flash", Toggle::HitFlash, s);
@@ -920,7 +957,7 @@ fn interface_keys(keys: Res<ButtonInput<KeyCode>>, mut settings: ResMut<Settings
         settings.interface.unit_panel = !settings.interface.unit_panel;
     }
     if keys.just_pressed(KeyCode::F3) {
-        settings.interface.debug_overlay = !settings.interface.debug_overlay;
+        settings.interface.overlay = settings.interface.overlay.next();
     }
 }
 
