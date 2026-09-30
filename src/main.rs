@@ -23,6 +23,7 @@ mod picker;
 mod regiments;
 mod render_units;
 mod render_units_gpu;
+mod render_units_phase;
 mod render_units_shadow;
 mod selection;
 mod selection_rings;
