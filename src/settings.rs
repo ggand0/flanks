@@ -137,7 +137,7 @@ impl Default for Settings {
         Self {
             audio: AudioSettings { master: 1.0, battle: 1.0, ui: 1.0 },
             camera: CameraSettings { pan_speed: 1.0, edge_pan: true },
-            controls: ControlsSettings { box_select: false },
+            controls: ControlsSettings { box_select: true },
             video: VideoSettings { vsync: false, fullscreen: false, shadows: true },
             interface: InterfaceSettings {
                 hud: true,

@@ -34,7 +34,7 @@ Requires Rust 1.95 or newer. The models and ground textures are stored with [Git
 
 | Action                          | Input                     |
 |---------------------------------|---------------------------|
-| Select units                    | Left click or drag (lasso, or a box in Settings) |
+| Select units                    | Left click or drag (a box, or a lasso in Settings) |
 | Select unit cards               | Click; Ctrl + click adds or removes, Shift + click selects a range |
 | Select all / infantry / missile | Ctrl + A / I / M          |
 | Clear the selection             | Enter                     |
