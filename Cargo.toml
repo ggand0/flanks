@@ -44,6 +44,13 @@ opt-level = 1
 [profile.dev.package."*"]
 opt-level = 3
 
+# Only shipped versions build with this profile (daily work uses opt-dev),
+# so it takes the slowest build for the fastest binary: full link-time
+# optimization across crates and one codegen unit.
+[profile.release]
+codegen-units = 1
+lto = "fat"
+
 # Faster runtime than dev, faster builds than release.
 [profile.opt-dev]
 inherits = "release"
