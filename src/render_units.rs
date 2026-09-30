@@ -1141,6 +1141,7 @@ fn queue_custom(
                         atlas,
                         receive,
                         pose_pass,
+                        indexed: pull_mesh.indexed(),
                     },
                 ),
                 None => pipelines
@@ -1442,6 +1443,8 @@ pub(crate) struct PullPipelineKey {
     /// The pose pass posed the soldiers: the index list holds pose slots
     /// (render_units_gpu.rs).
     pose_pass: bool,
+    /// The camera draws the bucket indexed (`PullMeshGpu::indexed`).
+    indexed: bool,
 }
 
 impl PullPipelineKey {
@@ -1462,6 +1465,7 @@ impl PullPipelineKey {
             atlas: false,
             receive: false,
             pose_pass,
+            indexed: false,
         }
     }
 }
@@ -1533,6 +1537,9 @@ impl SpecializedRenderPipeline for CustomPipeline {
         }
         if key.pose_pass {
             defs.push("UNIT_POSE_READ".into());
+        }
+        if key.indexed {
+            defs.push("PULL_INDEXED".into());
         }
         atlas_defs(&mut descriptor, key.atlas);
         receive_defs(&mut descriptor, key.receive);
@@ -1638,7 +1645,13 @@ impl<P: PhaseItem> RenderCommand<P> for DrawMeshInstanced {
                 return RenderCommandResult::Skip;
             };
             pass.set_bind_group(3, &pulled.bind_group, &[]);
-            pass.draw_indirect(&alloc.args, pulled.bucket as u64 * 16);
+            match &pulled.index {
+                Some(index) => {
+                    pass.set_index_buffer(index.slice(..), IndexFormat::Uint32);
+                    pass.draw_indexed_indirect(&alloc.indexed_args, pulled.bucket as u64 * 20);
+                }
+                None => pass.draw_indirect(&alloc.args, pulled.bucket as u64 * 16),
+            }
             return RenderCommandResult::Success;
         }
 

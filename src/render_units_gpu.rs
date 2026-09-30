@@ -578,11 +578,21 @@ struct PullVertex {
 /// finds a corner by `vertex_index % len`, no index buffer. Any `Mesh`
 /// with position, normal, the part/pivot UV and vertex color qualifies,
 /// so an imported model set plugs in unchanged.
+///
+/// A mesh whose triangles share most of their corners also keeps its own
+/// vertices and index list. Its camera draw is then indexed, one instance
+/// per soldier, and the GPU shades a shared corner once instead of once per
+/// triangle. The flat-shaded far levels share almost none.
 #[derive(Component)]
 pub struct PullMesh {
     corners: Vec<PullVertex>,
+    shared: Option<(Vec<PullVertex>, Vec<u32>)>,
     bucket: usize,
 }
+
+/// Corners per vertex from which a level draws indexed: the textured L0
+/// models have 2.2 to 2.5, the derived and authored far levels about 1.1.
+const INDEXED_REUSE: f32 = 1.5;
 
 fn pack_unorm8(v: [f32; 4]) -> u32 {
     v.iter()
@@ -614,7 +624,7 @@ impl PullMesh {
         let Some(V::Float32x2(atlas_uv)) = mesh.attribute(Mesh::ATTRIBUTE_UV_1) else {
             return None;
         };
-        let corners = mesh.indices()?.iter().map(|i| PullVertex {
+        let vertex = |i: usize| PullVertex {
             position: pos[i],
             part: uv[i][0],
             normal: nrm[i],
@@ -622,9 +632,14 @@ impl PullMesh {
             color: pack_unorm8(col[i]),
             atlas_uv: pack_unorm16(atlas_uv[i]),
             pad: [0; 2],
-        });
+        };
+        let indices = mesh.indices()?;
+        let corners: Vec<PullVertex> = indices.iter().map(vertex).collect();
+        let shared = (corners.len() as f32 >= INDEXED_REUSE * pos.len() as f32)
+            .then(|| ((0..pos.len()).map(vertex).collect(), indices.iter().map(|i| i as u32).collect()));
         Some(Self {
-            corners: corners.collect(),
+            corners,
+            shared,
             bucket,
         })
     }
@@ -634,9 +649,19 @@ impl PullMesh {
 #[derive(Component)]
 pub struct PullMeshGpu {
     vertices: Buffer,
+    /// The mesh's own vertices (storage) and index list, when its camera
+    /// draw is indexed.
+    shared: Option<(Buffer, Buffer)>,
     /// Corners per soldier (the level's index count).
     pub count: u32,
     pub bucket: usize,
+}
+
+impl PullMeshGpu {
+    /// The camera draws this bucket indexed, one instance per soldier.
+    pub fn indexed(&self) -> bool {
+        self.shared.is_some()
+    }
 }
 
 /// Uploads each pulled bucket's mesh once. The render entity persists,
@@ -652,12 +677,27 @@ fn extract_pull_meshes(
         if uploaded.contains(e) {
             continue;
         }
+        let shared = mesh.shared.as_ref().map(|(vertices, indices)| {
+            (
+                render_device.create_buffer_with_data(&BufferInitDescriptor {
+                    label: Some("unit pull mesh vertices"),
+                    contents: bytemuck::cast_slice(vertices),
+                    usage: BufferUsages::STORAGE,
+                }),
+                render_device.create_buffer_with_data(&BufferInitDescriptor {
+                    label: Some("unit pull mesh indices"),
+                    contents: bytemuck::cast_slice(indices),
+                    usage: BufferUsages::INDEX,
+                }),
+            )
+        });
         commands.entity(e).insert(PullMeshGpu {
             vertices: render_device.create_buffer_with_data(&BufferInitDescriptor {
                 label: Some("unit pull mesh"),
                 contents: bytemuck::cast_slice(&mesh.corners),
                 usage: BufferUsages::STORAGE,
             }),
+            shared,
             count: mesh.corners.len() as u32,
             bucket: mesh.bucket,
         });
@@ -669,6 +709,8 @@ fn extract_pull_meshes(
 #[derive(Component)]
 pub struct PulledBucketGpu {
     pub bind_group: BindGroup,
+    /// The index list of an indexed camera draw (`PullMeshGpu::indexed`).
+    pub index: Option<Buffer>,
     /// The same group for drawing into each sun shadow cascade: it binds
     /// that cascade's set of the bucket table, so the bucket's draw reads
     /// the cascade's caster list for its kind.
@@ -781,6 +823,7 @@ fn init_gpu_unit_pipelines(
                 binding_types::storage_buffer_sized(false, None),
                 binding_types::storage_buffer_sized(false, None),
                 binding_types::storage_buffer_sized(false, None),
+                binding_types::storage_buffer_sized(false, None),
             ),
         ),
     );
@@ -870,6 +913,9 @@ pub struct UnitAlloc {
     pub ring_base: u32,
     counts: Buffer,
     pub args: Buffer,
+    /// Per bucket, the arguments of its indexed camera draw: five words,
+    /// index count, soldiers, then zeros.
+    pub indexed_args: Buffer,
     regiments: Buffer,
     regiments_cap: usize,
     pub bucket_info: Buffer,
@@ -960,6 +1006,12 @@ impl UnitAlloc {
                 "unit draw args",
                 (DRAW_ARGS + NUM_KINDS) * 16,
                 BufferUsages::INDIRECT | BufferUsages::COPY_DST,
+            ),
+            indexed_args: storage_buffer(
+                device,
+                "unit indexed draw args",
+                NUM_BUCKETS * 20,
+                BufferUsages::INDIRECT,
             ),
             regiments: storage_buffer(
                 device,
@@ -1174,6 +1226,7 @@ fn prepare_gpu_units(
                 alloc.args.as_entire_binding(),
                 readback.buffer.as_entire_binding(),
                 alloc.pose_src.as_entire_binding(),
+                alloc.indexed_args.as_entire_binding(),
             )),
         ));
     }
@@ -1293,14 +1346,20 @@ fn prepare_pull_bind_groups(
         let (view, sampler, atlas_settled) = custom_pipeline.atlas_for(atlas, &images);
         let layout = pipeline_cache.get_bind_group_layout(&custom_pipeline.pull_layout);
         // Set 0 of the bucket table is the camera's, set 1 + c cascade c's.
+        // Only the camera's draw can be indexed: the casters stay on the
+        // expanded corners.
         let group = |set: u64| {
+            let corners = match (&mesh.shared, set) {
+                (Some((vertices, _)), 0) => vertices,
+                _ => &mesh.vertices,
+            };
             device.create_bind_group(
                 "unit pull bind group",
                 &layout,
                 &BindGroupEntries::with_indices((
                     (0, alloc.records.as_entire_binding()),
                     (1, alloc.index_list.as_entire_binding()),
-                    (2, mesh.vertices.as_entire_binding()),
+                    (2, corners.as_entire_binding()),
                     (
                         3,
                         BufferBinding {
@@ -1320,6 +1379,7 @@ fn prepare_pull_bind_groups(
         };
         commands.entity(entity).insert(PulledBucketGpu {
             bind_group: group(0),
+            index: mesh.shared.as_ref().map(|(_, indices)| indices.clone()),
             shadow: (1..=MAX_CASCADES as u64).map(group).collect(),
             generation: buffers.generation,
             atlas_settled,

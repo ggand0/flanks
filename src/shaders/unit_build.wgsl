@@ -159,6 +159,9 @@ struct DrawArgs {
 @group(0) @binding(8) var<storage, read_write> readback: array<u32, 52>;
 // Per pose slot, the record it poses, in one region per kind.
 @group(0) @binding(9) var<storage, read_write> pose_src: array<u32>;
+// Per bucket, five words: the arguments of its camera draw when it is
+// indexed, one instance per soldier.
+@group(0) @binding(10) var<storage, read_write> indexed_args: array<u32, 80>;
 
 const CULL_RADIUS: f32 = 2.5;
 const LOD_JITTER: f32 = 0.2;
@@ -537,6 +540,11 @@ fn finalize(@builtin(local_invocation_index) b: u32) {
     let count = atomicLoad(&counts[b]);
     let fallen = atomicLoad(&counts[16u + b]);
     args[b] = DrawArgs(count * params.buckets[b].y, 1u, 0u, 0u);
+    indexed_args[b * 5u] = params.buckets[b].y;
+    indexed_args[b * 5u + 1u] = count;
+    indexed_args[b * 5u + 2u] = 0u;
+    indexed_args[b * 5u + 3u] = 0u;
+    indexed_args[b * 5u + 4u] = 0u;
     readback[b] = count;
     readback[16u + b] = fallen;
     if b < 4u {

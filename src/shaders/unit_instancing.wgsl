@@ -118,9 +118,16 @@ struct PullVertex {
 @group(3) @binding(3) var<storage, read> pull_buckets: array<vec4<u32>>;
 
 @vertex
-fn vertex_pull(@builtin(vertex_index) index: u32) -> VertexOutput {
+fn vertex_pull(@builtin(vertex_index) index: u32, @builtin(instance_index) instance: u32) -> VertexOutput {
+#ifdef PULL_INDEXED
+    // One instance per soldier over the mesh's own index list: a corner
+    // its triangles share is shaded once.
+    let soldier = instance;
+    let corner = index;
+#else
     let soldier = index / #{PULL_VERTS}u;
     let corner = index - soldier * #{PULL_VERTS}u;
+#endif
     let bucket = pull_buckets[#{PULL_BUCKET}u];
     let entry = pull_index[bucket.x + soldier];
     let v = pull_vertices[corner];
