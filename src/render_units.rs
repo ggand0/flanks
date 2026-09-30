@@ -421,6 +421,7 @@ pub struct UnitRenderPlugin;
 
 impl Plugin for UnitRenderPlugin {
     fn build(&self, app: &mut App) {
+        bevy::shader::load_shader_library!(app, "shaders/unit_pose.wgsl");
         embedded_asset!(app, "shaders/unit_instancing.wgsl");
         // Registers the SyncToRenderWorld requirement so instance entities
         // get a render-world twin (ExtractComponentPlugin used to do this).
@@ -1098,7 +1099,8 @@ fn queue_custom(
     view_key_cache: Res<ViewKeyCache>,
 ) {
     let draw_custom = transparent_3d_draw_functions.read().id::<DrawCustom>();
-    let lod_debug = gpu_input.is_some_and(|g| g.lod_debug);
+    let lod_debug = gpu_input.as_ref().is_some_and(|g| g.lod_debug);
+    let pose_pass = gpu_input.as_ref().is_some_and(|g| g.pose_pass);
 
     for view in &views {
         let Some(transparent_phase) = transparent_render_phases.get_mut(&view.retained_view_entity)
@@ -1138,6 +1140,7 @@ fn queue_custom(
                         lod_debug,
                         atlas,
                         receive,
+                        pose_pass,
                     },
                 ),
                 None => pipelines
@@ -1233,7 +1236,7 @@ pub(crate) struct CustomPipeline {
     mesh_pipeline: MeshPipeline,
     /// Group 3 of a pulled bucket: the instance records, the index list,
     /// the bucket's mesh corners, the bucket table, then the atlas, its
-    /// sampler, the rig and the sun.
+    /// sampler, the rig, the sun and the kind's pose buffer.
     pub(crate) pull_layout: BindGroupLayoutDescriptor,
     /// Group 3 of an instanced bucket: the atlas, its sampler, the rig and
     /// the sun, at the same bindings as in `pull_layout`.
@@ -1318,6 +1321,7 @@ pub(crate) fn init_custom_pipeline(
                     (6, rig()),
                     (7, clips()),
                     (8, sun()),
+                    (9, binding_types::storage_buffer_read_only_sized(false, None)),
                 ),
             ),
         ),
@@ -1435,6 +1439,9 @@ pub(crate) struct PullPipelineKey {
     /// The bucket's soldiers can stand inside a sun shadow cascade, so
     /// the fragment samples the shadow (`ShadowReceiveLevels`).
     receive: bool,
+    /// The pose pass posed the soldiers: the index list holds pose slots
+    /// (render_units_gpu.rs).
+    pose_pass: bool,
 }
 
 impl PullPipelineKey {
@@ -1444,6 +1451,7 @@ impl PullPipelineKey {
         mesh: MeshPipelineKey,
         layout: MeshVertexBufferLayoutRef,
         pull_mesh: &PullMeshGpu,
+        pose_pass: bool,
     ) -> Self {
         Self {
             mesh,
@@ -1453,6 +1461,7 @@ impl PullPipelineKey {
             lod_debug: false,
             atlas: false,
             receive: false,
+            pose_pass,
         }
     }
 }
@@ -1521,6 +1530,9 @@ impl SpecializedRenderPipeline for CustomPipeline {
         defs.push(bevy::shader::ShaderDefVal::UInt("PULL_BUCKET".into(), key.bucket));
         if key.lod_debug {
             defs.push("LOD_DEBUG".into());
+        }
+        if key.pose_pass {
+            defs.push("UNIT_POSE_READ".into());
         }
         atlas_defs(&mut descriptor, key.atlas);
         receive_defs(&mut descriptor, key.receive);
