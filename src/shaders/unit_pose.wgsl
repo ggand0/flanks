@@ -69,11 +69,11 @@ struct Bow {
 @group(3) @binding(7) var<storage, read> clips: array<vec4<f32>>;
 
 // Standing brace pose (split legs, crouch, raised guard): read as
-// weird in play-testing, benched but kept — set to 1.0 to re-enable.
+// weird in play-testing, benched but kept. Set to 1.0 to re-enable.
 // Standing units near an enemy hold the plain forward point instead.
 const BRACE_ON: f32 = 0.0;
 // Rear-rank taunt: never looked right in play-testing; benched
-// pending a rework — set to 1.0 to re-enable.
+// pending a rework. Set to 1.0 to re-enable.
 const TAUNT_ON: f32 = 0.0;
 
 const TAU: f32 = 6.2831853;
@@ -771,7 +771,7 @@ fn pose_begin(pos_scale: vec4<f32>, color: vec4<f32>, anim: vec4<f32>, anim2: ve
     let sprint = smoothstep(0.7, 1.0, band);
     let fx = inst.anim.w;
     let seed = inst.color.a;
-    // Brace: standing, enemy near/engaged, not attacking — a planted
+    // Brace: standing, enemy near/engaged, not attacking: a planted
     // fight stance (split legs, crouch, blade at ready guard). Only
     // ~half the line braces (per-unit pick); the rest keep the plain
     // standing point, so a waiting line mixes both poses.
@@ -868,8 +868,8 @@ fn put_common() {
         stagger = vec2<f32>(cos(sang), sin(sang));
     }
     // Death: topple around the feet and sink slightly. Fall direction
-    // varies per unit (seed): forward, backward, or to either side —
-    // corpses keep their seed, so the pose persists on the ground.
+    // varies per unit (seed): forward, backward, or to either side.
+    // Corpses keep their seed, so the pose persists on the ground.
     let death = clamp(pre.fx - 1.0, 0.0, 1.0);
     var topple = vec3<f32>(1.0, 0.0, 0.0);
     if death > 0.0 {
@@ -1082,7 +1082,7 @@ fn put_simple() {
 
     // Bow arm: stave carried vertical at the side. The draw tilts
     // arm and bow up toward the loft angle (the whole part pitches,
-    // so the stave cants back over the shoulder — an archer aiming
+    // so the stave cants back over the shoulder, an archer aiming
     // high); the loose settles it, recover eases back to carry.
     // The draw hand is plain PART_ARM running the stab style: its
     // pull-back-then-snap IS the string draw and release.
@@ -1091,7 +1091,7 @@ fn put_simple() {
         + celebrate * (1.5 + 0.3 * sin(wobble));
 
     // Shield arm: carried at the side; the wall signal swings it
-    // around the body to FACE THE FRONT and lifts it into a guard —
+    // around the body to FACE THE FRONT and lifts it into a guard:
     // a shieldwall is a wall of team color from the enemy's side.
     // (Spear bucket: same fronting reads as the spearwall's off-hand
     // cover behind the leveled spears.) On the move it swings against
@@ -1125,10 +1125,10 @@ fn put_simple() {
     // Ordinary moves carry the blade lowered at the side; battle
     // stance levels it at the enemy (slightly above horizontal),
     // and even a watch-range advance (`ready`) brings it most of
-    // the way up — the braced walk.
+    // the way up (the braced walk).
     let carry = mix(-0.55, 0.25, max(pre.stance, pre.ready * 0.75)) * moving * (1.0 - raise);
     // Taunt: STANDING units of a CONFIDENT fighting regiment pump
-    // the blade skyward for ~1.5 s every ~7 s, staggered per unit —
+    // the blade skyward for ~1.5 s every ~7 s, staggered per unit:
     // the rear ranks jeer while the front works. Wavering regiments
     // (morale low) stop jeering and just hold the brace.
     let tc = fract(pre.time / 7.3 + pre.seed * 5.13);
@@ -1150,7 +1150,7 @@ fn put_simple() {
         // The classic swing: raise up/back, fast chop.
         arm = 1.9 * raise - 2.5 * chop;
     } else {
-        // Slash: horizontal sweep around the body axis — wind back,
+        // Slash: horizontal sweep around the body axis. Wind back,
         // cut across.
         let yawoff = -1.1 * raise + 2.3 * chop;
         slash = vec2<f32>(cos(yawoff), sin(yawoff));
@@ -1162,8 +1162,8 @@ fn put_simple() {
 
     pose_put(P_SHIELD, vec4<f32>(cos(sway), sin(sway), front));
     // Arrow projectile (arrows.rs buckets): rigid mesh, flight pitch
-    // rides anim2.z (a dead channel for these instances — march is
-    // always 0 here); yaw is the shared rotation.
+    // rides anim2.z (a channel these instances do not otherwise use,
+    // since an arrow never marches). Yaw is the shared rotation.
     pose_put(P_MISC, vec4<f32>(lift, cos(pre.pitch), sin(pre.pitch), pre.scale));
     pose_put(P_ARMS, vec4<f32>(cos(arm), sin(arm), cos(spear), sin(spear)));
     pose_put(P_ARMS2, vec4<f32>(cos(bow_arm), sin(bow_arm), slash));
