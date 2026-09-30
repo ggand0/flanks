@@ -741,7 +741,7 @@ fn draw_fight_points(
     terrain: Res<Terrain>,
     mut gizmos: Gizmos,
 ) {
-    if !settings.interface.debug_overlay {
+    if !settings.interface.debug_overlay() {
         return;
     }
     const FIGHT: Color = Color::srgb(0.95, 0.35, 0.85);

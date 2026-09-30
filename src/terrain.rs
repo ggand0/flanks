@@ -1048,7 +1048,7 @@ fn crater_tool(
     mut cooldown: Local<f32>,
 ) {
     *cooldown -= time.delta_secs();
-    if !settings.interface.debug_overlay || !keys.pressed(KeyCode::KeyX) || *cooldown > 0.0 {
+    if !settings.interface.debug_overlay() || !keys.pressed(KeyCode::KeyX) || *cooldown > 0.0 {
         return;
     }
     let Ok(window) = window.single() else { return };

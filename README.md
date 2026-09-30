@@ -51,7 +51,7 @@ Requires Rust 1.95 or newer. The models and ground textures are stored with [Git
 | Pan camera                      | WASD or screen edges      |
 | Zoom / rotate camera            | Scroll / middle drag      |
 | Pause                           | Esc                       |
-| Battle HUD / unit panel / debug overlay | F1 / F2 / F3      |
+| Battle HUD / unit panel / stats line and debug overlay | F1 / F2 / F3 |
 | Banners and map lines           | G                         |
 
 The Controls tab in Settings lists every binding. The Map option in the menu switches between the grassland, the classic field and the river map; `FL_MAP=classic` or `FL_MAP=river` picks one at launch. `FL_VOLUME=0` mutes the game. A set of `FL_*` environment variables configures sandbox battles and scripted test scenarios (army size, AI on/off, random seed, and so on).
