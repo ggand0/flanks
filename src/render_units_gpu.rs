@@ -255,62 +255,199 @@ pub struct GpuFrameInput {
     pub shadow_levels: [[u32; NUM_KINDS]; MAX_CASCADES],
 }
 
-/// Pack the live soldier columns into the snapshot. Runs after every
-/// writer of the columns (the fixed loop, the deployment drag) and only
-/// when `Units` changed, so frames without a tick pack nothing. Parallel
-/// on the compute pool. Not reachable from the tick job, so a plain scope
-/// is correct here.
+/// The columns a snapshot record is packed from: the live ones, or the
+/// tick job's shared copies of them.
+pub(crate) struct PackColumns<'a> {
+    pub pos: &'a [Vec3],
+    pub pos_prev: &'a [Vec3],
+    pub yaw: &'a [f32],
+    pub yaw_prev: &'a [f32],
+    pub kind: &'a [u8],
+    pub swing: &'a [u8],
+    pub swing_t: &'a [u8],
+    pub flash: &'a [u8],
+    pub group: &'a [u32],
+    pub death_t: &'a [u8],
+    pub color: &'a [[f32; 4]],
+}
+
+impl<'a> PackColumns<'a> {
+    fn of(units: &'a Units) -> Self {
+        Self {
+            pos: &units.pos,
+            pos_prev: &units.pos_prev,
+            yaw: &units.yaw,
+            yaw_prev: &units.yaw_prev,
+            kind: &units.kind,
+            swing: &units.swing,
+            swing_t: &units.swing_t,
+            flash: &units.flash,
+            group: &units.group,
+            death_t: &units.death_t,
+            color: &units.color,
+        }
+    }
+}
+
+/// The snapshot the tick job packs, first thing, from the columns it was
+/// kicked with (sim/mod.rs `run_tick_job`). Those are the columns the frame
+/// would pack after Update: nothing writes a column the record reads
+/// between the kick and then, only deployment moves soldiers, and it
+/// freezes the sim. So the job packs on the sim's pool while the frame
+/// runs its Update, instead of the frame packing 11 MB at 200k after it.
+#[derive(Default)]
+pub struct SnapshotSlot {
+    packed: std::sync::Mutex<PackedSnapshot>,
+    ready: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct PackedSnapshot {
+    /// `Units::generation` and the tick of the job that packed `records`.
+    key: Option<(u64, u32)>,
+    records: Vec<GpuSoldier>,
+    kind_counts: [u32; NUM_KINDS],
+}
+
+impl SnapshotSlot {
+    /// Pack the records on the sim's pool and hand them over under `key`.
+    pub(crate) fn pack(&self, key: (u64, u32), columns: &PackColumns, flash: bool) {
+        let mut records = std::mem::take(&mut self.packed.lock().unwrap().records);
+        let n = columns.pos.len();
+        records.resize(n, GpuSoldier::zeroed());
+        let chunk_counts: Vec<[u32; NUM_KINDS]> = crate::util::sim_scope(|scope| {
+            for (ci, out) in records.chunks_mut(SYNC_CHUNK).enumerate() {
+                scope.spawn(async move { pack_chunk(columns, ci * SYNC_CHUNK, out, flash) });
+            }
+        });
+        let mut packed = self.packed.lock().unwrap();
+        packed.records = records;
+        packed.kind_counts = sum_kind_counts(chunk_counts);
+        packed.key = Some(key);
+        self.ready.notify_all();
+    }
+}
+
+/// The tick job's snapshot, main world side: the slot the job packs into,
+/// and the key and `Units` change tick of the kick that asked for it. GPU
+/// path only.
+#[derive(Resource, Default)]
+pub struct SnapshotHandoff {
+    slot: std::sync::Arc<SnapshotSlot>,
+    due: Option<((u64, u32), bevy::ecs::change_detection::Tick)>,
+}
+
+impl SnapshotHandoff {
+    /// A job is kicked under `key` with the columns as of change tick
+    /// `columns`: it packs into the returned slot.
+    pub(crate) fn expect(
+        &mut self,
+        key: (u64, u32),
+        columns: bevy::ecs::change_detection::Tick,
+    ) -> std::sync::Arc<SnapshotSlot> {
+        self.due = Some((key, columns));
+        self.slot.clone()
+    }
+}
+
+/// The longest the frame waits for the job's snapshot before packing its
+/// own. The job packs before anything else, within about 1 ms of the kick,
+/// and the frame asks after its Update, so it is normally there already.
+/// It can be later while Bevy compiles render pipelines on the same pool,
+/// in the first second of a battle.
+const SNAPSHOT_WAIT: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// The tick job packs the render snapshot. Read once: `FL_JOB_PACK=0`
+/// packs it on the frame, for A/B runs.
+pub(crate) fn job_packs_snapshot() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::util::env_or("FL_JOB_PACK", 1_u32) != 0)
+}
+
+/// The snapshot of the live soldier columns, whenever `Units` changed:
+/// taken from the tick job when one was kicked this frame with the columns
+/// as they are now, else packed here, in parallel on the compute pool. Runs
+/// after every writer of the columns (the fixed loop, the deployment drag),
+/// so frames without a tick pack nothing.
 fn pack_soldier_snapshot(
     units: Res<Units>,
     settings: Res<crate::settings::Settings>,
     mut snap: ResMut<SoldierSnapshot>,
+    handoff: Option<ResMut<SnapshotHandoff>>,
 ) {
+    let due = handoff.and_then(|mut h| Some((h.due.take()?, h.slot.clone())));
     if !units.is_changed() {
         return;
     }
+    let t0 = std::time::Instant::now();
+    if let Some(((key, columns), slot)) = due
+        && units.last_changed() == columns
+    {
+        let mut packed = slot.packed.lock().unwrap();
+        while packed.key != Some(key) {
+            let (guard, wait) = slot.ready.wait_timeout(packed, SNAPSHOT_WAIT).unwrap();
+            packed = guard;
+            if wait.timed_out() {
+                debug!("the tick job's snapshot is late: packed on the frame instead");
+                break;
+            }
+        }
+        if packed.key == Some(key) {
+            std::mem::swap(&mut packed.records, &mut snap.records);
+            snap.n = snap.records.len() as u32;
+            snap.kind_counts = packed.kind_counts;
+            snap.fresh = true;
+            snap.pack_ms = t0.elapsed().as_secs_f32() * 1000.0;
+            return;
+        }
+    }
     // The Hit flash setting: off packs every flash as zero.
     let flash = settings.interface.hit_flash;
-    let t0 = std::time::Instant::now();
     let n = units.len();
     snap.records.resize(n, GpuSoldier::zeroed());
-    let units = &*units;
+    let columns = PackColumns::of(&units);
+    let columns = &columns;
     let records = &mut snap.records;
     let chunk_counts: Vec<[u32; NUM_KINDS]> = bevy::tasks::ComputeTaskPool::get().scope(|scope| {
         for (ci, out) in records.chunks_mut(SYNC_CHUNK).enumerate() {
-            scope.spawn(async move { pack_chunk(units, ci * SYNC_CHUNK, out, flash) });
+            scope.spawn(async move { pack_chunk(columns, ci * SYNC_CHUNK, out, flash) });
         }
     });
+    snap.n = n as u32;
+    snap.kind_counts = sum_kind_counts(chunk_counts);
+    snap.fresh = true;
+    snap.pack_ms = t0.elapsed().as_secs_f32() * 1000.0;
+}
+
+fn sum_kind_counts(chunk_counts: Vec<[u32; NUM_KINDS]>) -> [u32; NUM_KINDS] {
     let mut kind_counts = [0u32; NUM_KINDS];
     for counts in chunk_counts {
         for (total, c) in kind_counts.iter_mut().zip(counts) {
             *total += c;
         }
     }
-    snap.n = n as u32;
-    snap.kind_counts = kind_counts;
-    snap.fresh = true;
-    snap.pack_ms = t0.elapsed().as_secs_f32() * 1000.0;
+    kind_counts
 }
 
-fn pack_chunk(units: &Units, start: usize, out: &mut [GpuSoldier], flash: bool) -> [u32; NUM_KINDS] {
+fn pack_chunk(c: &PackColumns, start: usize, out: &mut [GpuSoldier], flash: bool) -> [u32; NUM_KINDS] {
     let mut kind_counts = [0u32; NUM_KINDS];
     for (j, rec) in out.iter_mut().enumerate() {
         let i = start + j;
-        let kind = units.kind[i] as u32;
+        let kind = c.kind[i] as u32;
         kind_counts[kind as usize] += 1;
-        let group = units.group[i];
+        let group = c.group[i];
         debug_assert!(group < 1 << 24, "regiment index must fit 24 bits");
         *rec = GpuSoldier {
-            pos: units.pos[i].to_array(),
-            prev: units.pos_prev[i].to_array(),
-            yaw: units.yaw[i],
-            yaw_prev: units.yaw_prev[i],
+            pos: c.pos[i].to_array(),
+            prev: c.pos_prev[i].to_array(),
+            yaw: c.yaw[i],
+            yaw_prev: c.yaw_prev[i],
             a: kind
-                | (units.swing[i] as u32) << 8
-                | (units.swing_t[i] as u32) << 16
-                | if flash { (units.flash[i] as u32) << 24 } else { 0 },
-            b: (group & 0x00ff_ffff) | (units.death_t[i] as u32) << 24,
-            color: units.color[i],
+                | (c.swing[i] as u32) << 8
+                | (c.swing_t[i] as u32) << 16
+                | if flash { (c.flash[i] as u32) << 24 } else { 0 },
+            b: (group & 0x00ff_ffff) | (c.death_t[i] as u32) << 24,
+            color: c.color[i],
         };
     }
     kind_counts
@@ -1800,6 +1937,9 @@ impl Plugin for GpuUnitRenderPlugin {
             check,
             pose_pass,
         });
+        if requested && supported {
+            app.init_resource::<SnapshotHandoff>();
+        }
     }
 }
 

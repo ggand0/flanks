@@ -58,6 +58,15 @@ pub struct TickJob {
     pub(crate) ammo_in: Arc<Vec<u8>>,
     pub(crate) out_form_in: Arc<Vec<bool>>,
     pub(crate) sight_in: Arc<Vec<u8>>,
+    // Read only to pack the render snapshot.
+    pub(crate) pos_prev_in: Arc<Vec<Vec3>>,
+    pub(crate) color_in: Arc<Vec<[f32; 4]>>,
+    /// Where the job packs the render snapshot of the columns it was
+    /// kicked with, first thing (render_units_gpu.rs `SnapshotSlot`). None
+    /// on the CPU render path and for an inline tick.
+    pub(crate) pack: Option<Arc<crate::render_units_gpu::SnapshotSlot>>,
+    /// The Hit flash setting the snapshot packs with.
+    pub(crate) hit_flash: bool,
     // Outputs: the columns after the tick. Each kernel task copies its
     // chunk in from the shared column, then runs the stages on it.
     pub(crate) pos_out: Vec<Vec3>,
@@ -156,6 +165,8 @@ impl TickJob {
         self.ammo_in = Default::default();
         self.out_form_in = Default::default();
         self.sight_in = Default::default();
+        self.pos_prev_in = Default::default();
+        self.color_in = Default::default();
     }
 }
 
@@ -214,6 +225,7 @@ pub(crate) fn prepare_tick(
     tick: u32,
 ) {
     job.generation = units.generation;
+    job.pack = None;
     job.dt = dt;
     job.combat_scale = combat_scale;
     job.terrain = Some(terrain_arc.clone());
@@ -267,6 +279,8 @@ fn share_columns(job: &mut TickJob, units: &Units) {
     job.ammo_in = units.ammo.share();
     job.out_form_in = units.out_form.share();
     job.sight_in = units.sight.share();
+    job.pos_prev_in = units.pos_prev.share();
+    job.color_in = units.color.share();
     let n = units.pos.len();
     fn fit<T: Clone + Default>(v: &mut Vec<T>, n: usize) {
         if v.len() != n {
