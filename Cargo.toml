@@ -53,5 +53,6 @@ assets = ["assets"]
 [package.metadata.bundle]
 name = "FLANKS"
 identifier = "com.ggando.flanks"
+icon = ["assets/flanks_icon.icns"]
 short_description = "Real-time massed medieval battles, every soldier simulated"
 resources = ["assets"]
