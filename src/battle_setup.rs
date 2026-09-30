@@ -187,19 +187,19 @@ const DEMO_UNIT: usize = 1000;
 /// Flemish at Courtrai (1302), whose second line was there to plug breaks
 /// in the first:
 ///
-/// - Line 1: 4 Men-at-Arms, 32 Spearmen, 4 Men-at-Arms, touching and on
-///   hold, so the front has no gap for the enemy to push through and
-///   never chases forward to open one.
-/// - Line 2: 31 Knights 20 m behind, each centred on a join of line 1, to
-///   meet whatever gets through.
-/// - Line 3: 17 Men-at-Arms in reserve behind the centre.
-/// - Flanks: 4 Men-at-Arms each side beside line 2, facing outward.
-/// - Archers: 2 per wing beside line 1's ends, 10 m ahead of it, in
-///   skirmish mode (they fall back when the enemy closes).
+/// - Line 1: 44 touching units across the deployment zone, on hold so the
+///   front has no gap to push through and never chases forward to open
+///   one. From each end: 6 Knights, 4 Men-at-Arms, then Spearmen to the
+///   centre (24 in all).
+/// - Archers: 2 per wing, 10 m behind the two outermost Knights, which
+///   take the enemy's first blows for them.
+/// - Line 2: 19 Knights 20 m behind line 1, each centred on one of its
+///   central joins. Its ends are left open for the reserve.
+/// - Line 3, the reserve: 4 Spearmen, 17 Men-at-Arms, 4 Spearmen.
+/// - Flanks: 4 Men-at-Arms each side beside line 2's ends, facing outward.
 ///
 /// Normal spacing throughout. The files per unit are chosen so line 1
-/// and the archers fill the deployment zone's width, and the three lines
-/// fit its depth.
+/// fills the zone's width, and the three lines fit its depth.
 fn demo_setup() -> BattleSetup {
     use crate::formation::BASE_SPACING as P;
     use crate::regiments::{EDGE_MARGIN, SIDE_MARGIN, army_gap};
@@ -209,17 +209,15 @@ fn demo_setup() -> BattleSetup {
     let half = crate::terrain::HALF_EXTENTS;
     let x_max = half.x - SIDE_MARGIN;
     let z_front = -army_gap() * 0.5;
-    // Depth of a unit's block, front rank to back rank.
-    let depth = |files: u32| (DEMO_UNIT.div_ceil(files as usize) - 1) as f32 * P;
 
-    // Line 1's 40 units and the 4 archers across the zone's width. Units
-    // `files * P` apart touch with no gap.
+    // Line 1's 44 units across the zone's width. Units `files * P` apart
+    // touch with no gap.
     let files = (2.0 * x_max / (44.0 * P)).floor() as u32;
     let w = files as f32 * P;
-    let d = depth(files);
+    let d = (DEMO_UNIT.div_ceil(files as usize) - 1) as f32 * P;
 
     let mut units = Vec::with_capacity(100);
-    let mut push = |kind: u8, x: f32, z: f32, facing: f32, files: u32, hold: bool| {
+    let mut push = |kind: u8, x: f32, z: f32, facing: f32, hold: bool| {
         units.push(Placement {
             team: PLAYER_TEAM,
             kind,
@@ -231,45 +229,45 @@ fn demo_setup() -> BattleSetup {
             spacing: FormSpacing::Normal,
             hold,
             fire_at_will: true,
-            skirmish: kind == KIND_ARCHER,
+            skirmish: false,
         });
     };
 
-    // Line 1: centres at (i - 19.5) w, so its joins fall on whole
+    // Line 1: centres at (i - 21.5) w, so its joins fall on whole
     // multiples of w.
     let z1 = z_front - 12.0 - d * 0.5;
-    for i in 0..40 {
-        let kind = if (4..36).contains(&i) { KIND_SPEAR } else { KIND_LIGHT };
-        push(kind, (i as f32 - 19.5) * w, z1, 0.0, files, true);
+    for i in 0..44 {
+        let kind = match i.min(43 - i) {
+            0..=5 => KIND_HEAVY,
+            6..=9 => KIND_LIGHT,
+            _ => KIND_SPEAR,
+        };
+        push(kind, (i as f32 - 21.5) * w, z1, 0.0, true);
     }
-    // Line 2: on the joins from -15 w to 15 w.
+    // Archers behind the two outermost units at each end.
+    let za = z1 - d - 10.0;
+    for i in [0, 1, 42, 43] {
+        push(KIND_ARCHER, (i as f32 - 21.5) * w, za, 0.0, false);
+    }
+    // Line 2: on the joins from -9 w to 9 w.
     let z2 = z1 - d - 20.0;
-    for j in -15..=15 {
-        push(KIND_HEAVY, j as f32 * w, z2, 0.0, files, false);
+    for j in -9..=9 {
+        push(KIND_HEAVY, j as f32 * w, z2, 0.0, false);
     }
     // Line 3, whose back rank is the deepest in the zone.
     let z3 = z2 - d - 20.0;
     debug_assert!(z3 - d * 0.5 >= -half.y + EDGE_MARGIN, "the demo lines overrun the zone's depth");
-    for k in -8..=8 {
-        push(KIND_LIGHT, k as f32 * w, z3, 0.0, files, false);
+    for k in -12..=12_i32 {
+        let kind = if k.abs() >= 9 { KIND_SPEAR } else { KIND_LIGHT };
+        push(kind, k as f32 * w, z3, 0.0, false);
     }
-    // Flanks: a column of 4 beside each end of line 2 (15.5 w out), facing
+    // Flanks: a column of 4 beside each end of line 2 (9.5 w out), facing
     // outward, so the block's depth runs along x.
-    let x_flank = 15.5 * w + 10.0 + d * 0.5;
+    let x_flank = 9.5 * w + 10.0 + d * 0.5;
     for side in [-1.0_f32, 1.0] {
         for k in 0..4 {
             let z = z2 + d * 0.5 - (k as f32 + 0.5) * w;
-            push(KIND_LIGHT, side * x_flank, z, side * FRAC_PI_2, files, false);
-        }
-    }
-    // Archers: two across the strip between line 1's end (20 w out) and
-    // the zone's side.
-    let a_files = ((x_max - 20.0 * w) / (2.0 * P)).floor() as u32;
-    let aw = a_files as f32 * P;
-    let za = z_front - 2.0 - depth(a_files) * 0.5;
-    for side in [-1.0_f32, 1.0] {
-        for k in 0..2 {
-            push(KIND_ARCHER, side * (20.0 * w + (k as f32 + 0.5) * aw), za, 0.0, a_files, false);
+            push(KIND_LIGHT, side * x_flank, z, side * FRAC_PI_2, false);
         }
     }
 
