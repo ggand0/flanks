@@ -27,8 +27,17 @@ pub struct BattleSetup {
     /// Soldiers per unit.
     pub reg_size: usize,
     pub ai_enabled: bool,
+    /// The player's deployment zone reaches the map's sides instead of
+    /// stopping at the side margins.
+    #[serde(default)]
+    pub open_sides: bool,
     pub units: Vec<Placement>,
 }
+
+/// Metres between the map's side and the deployment zone of a setup with
+/// open sides: the soldiers at the end of a line stand just inside the
+/// map, with no corridor past them.
+pub const OPEN_SIDE_MARGIN: f32 = 2.0;
 
 /// One unit as it stood when the battle began.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -57,6 +66,7 @@ impl BattleSetup {
             units_per_team: config.units_per_team,
             reg_size: config.reg_size,
             ai_enabled: config.ai_enabled,
+            open_sides: from_env().is_some_and(|s| s.open_sides),
             units: groups
                 .list
                 .iter()
@@ -185,45 +195,51 @@ const DEMO_UNIT: usize = 1000;
 /// The demo battle: 200k on the grassland with the AI on, the enemy as the
 /// spawner deploys it, and the player's 100 units in a defence after the
 /// Flemish at Courtrai (1302), whose second line was there to plug breaks
-/// in the first:
+/// in the first. Every unit has the spawner's block shape (49 files, 21
+/// ranks at 1000 men), so no line is deeper than the enemy's:
 ///
-/// - Line 1: 44 touching units across the deployment zone, on hold so the
-///   front has no gap to push through and never chases forward to open
-///   one. From each end: 6 Knights, 4 Men-at-Arms, then Spearmen to the
-///   centre (24 in all).
-/// - Archers: 2 per wing, 10 m behind the two outermost Knights, which
-///   take the enemy's first blows for them.
-/// - Line 2: 19 Knights 20 m behind line 1, each centred on one of its
-///   central joins. Its ends are left open for the reserve.
-/// - Line 3, the reserve: 4 Spearmen, 17 Men-at-Arms, 4 Spearmen.
-/// - Flanks: 4 Men-at-Arms each side beside line 2's ends, facing outward.
+/// - Line 1: 14 touching units on hold, the front rank on the deployment
+///   zone's front edge and the end files at the map's sides (the demo
+///   opens the zone's sides), so the front has no gap to push through, no
+///   corridor round its ends to the archers, and never chases forward to
+///   open one. From each end: 2 Knights, 2 Men-at-Arms, 3 Spearmen.
+/// - Archers: 2 per wing, 5 m behind the two end Knights, which take the
+///   enemy's first blows for them. Their front rank stands within bow
+///   range of the enemy's starting line, and they loft over line 1.
+/// - Line 2: 9 Knights 10 m behind line 1, each centred on one of its
+///   central joins, clear of the archers.
+/// - Reserve: the other 73 units in six centred rows, Spearmen first, then
+///   Men-at-Arms, then Knights.
 ///
-/// Normal spacing throughout. The files per unit are chosen so line 1
-/// fills the zone's width, and the three lines fit its depth.
+/// Normal spacing throughout.
 fn demo_setup() -> BattleSetup {
     use crate::formation::BASE_SPACING as P;
-    use crate::regiments::{EDGE_MARGIN, SIDE_MARGIN, army_gap};
+    use crate::regiments::{EDGE_MARGIN, army_gap};
     use crate::unit_types::{KIND_ARCHER, KIND_HEAVY, KIND_LIGHT, KIND_SPEAR};
-    use std::f32::consts::FRAC_PI_2;
+
+    /// Units across line 1.
+    const ACROSS: usize = 14;
+    /// Metres between one row's back rank and the next row's front rank.
+    const GAP: f32 = 10.0;
 
     let half = crate::terrain::HALF_EXTENTS;
-    let x_max = half.x - SIDE_MARGIN;
+    let x_max = half.x - OPEN_SIDE_MARGIN;
     let z_front = -army_gap() * 0.5;
 
-    // Line 1's 44 units across the zone's width. Units `files * P` apart
-    // touch with no gap.
-    let files = (2.0 * x_max / (44.0 * P)).floor() as u32;
+    // Units `files * P` apart touch with no gap; line 1 fills the map's
+    // width.
+    let files = (2.0 * x_max / (ACROSS as f32 * P)).floor() as u32;
     let w = files as f32 * P;
     let d = (DEMO_UNIT.div_ceil(files as usize) - 1) as f32 * P;
 
     let mut units = Vec::with_capacity(100);
-    let mut push = |kind: u8, x: f32, z: f32, facing: f32, hold: bool| {
+    let mut push = |kind: u8, x: f32, z: f32, hold: bool| {
         units.push(Placement {
             team: PLAYER_TEAM,
             kind,
             x,
             z,
-            facing,
+            facing: 0.0,
             files,
             shape: FormShape::Rect,
             spacing: FormSpacing::Normal,
@@ -232,50 +248,51 @@ fn demo_setup() -> BattleSetup {
             skirmish: false,
         });
     };
+    // Unit i of a row of n, centred on x = 0.
+    let x_of = |i: usize, n: usize| (i as f32 - (n - 1) as f32 * 0.5) * w;
 
-    // Line 1: centres at (i - 21.5) w, so its joins fall on whole
-    // multiples of w.
-    let z1 = z_front - 12.0 - d * 0.5;
-    for i in 0..44 {
-        let kind = match i.min(43 - i) {
-            0..=5 => KIND_HEAVY,
-            6..=9 => KIND_LIGHT,
+    // Line 1: its front rank 1 m inside the zone's front edge. With an
+    // even count its joins fall on whole multiples of w.
+    let z1 = z_front - 1.0 - d * 0.5;
+    for i in 0..ACROSS {
+        let kind = match i.min(ACROSS - 1 - i) {
+            0..=1 => KIND_HEAVY,
+            2..=3 => KIND_LIGHT,
             _ => KIND_SPEAR,
         };
-        push(kind, (i as f32 - 21.5) * w, z1, 0.0, true);
+        push(kind, x_of(i, ACROSS), z1, true);
     }
-    // Archers behind the two outermost units at each end.
-    let za = z1 - d - 10.0;
-    for i in [0, 1, 42, 43] {
-        push(KIND_ARCHER, (i as f32 - 21.5) * w, za, 0.0, false);
+    // Archers behind the two units at each end.
+    let za = z1 - d - 5.0;
+    for i in [0, 1, ACROSS - 2, ACROSS - 1] {
+        push(KIND_ARCHER, x_of(i, ACROSS), za, false);
     }
-    // Line 2: on the joins from -9 w to 9 w.
-    let z2 = z1 - d - 20.0;
-    for j in -9..=9 {
-        push(KIND_HEAVY, j as f32 * w, z2, 0.0, false);
+    // Line 2: on the joins from -4 w to 4 w, short of the archers.
+    let z2 = z1 - d - GAP;
+    for j in -4..=4 {
+        push(KIND_HEAVY, j as f32 * w, z2, false);
     }
-    // Line 3, whose back rank is the deepest in the zone.
-    let z3 = z2 - d - 20.0;
-    debug_assert!(z3 - d * 0.5 >= -half.y + EDGE_MARGIN, "the demo lines overrun the zone's depth");
-    for k in -12..=12_i32 {
-        let kind = if k.abs() >= 9 { KIND_SPEAR } else { KIND_LIGHT };
-        push(kind, k as f32 * w, z3, 0.0, false);
-    }
-    // Flanks: a column of 4 beside each end of line 2 (9.5 w out), facing
-    // outward, so the block's depth runs along x.
-    let x_flank = 9.5 * w + 10.0 + d * 0.5;
-    for side in [-1.0_f32, 1.0] {
-        for k in 0..4 {
-            let z = z2 + d * 0.5 - (k as f32 + 0.5) * w;
-            push(KIND_LIGHT, side * x_flank, z, side * FRAC_PI_2, false);
+    // Reserve rows behind line 2, filled in kind order.
+    let reserve = std::iter::repeat_n(KIND_SPEAR, 26)
+        .chain(std::iter::repeat_n(KIND_LIGHT, 29))
+        .chain(std::iter::repeat_n(KIND_HEAVY, 18));
+    let mut reserve = reserve.collect::<Vec<_>>().into_iter();
+    let mut z = z2 - d - GAP;
+    for n in [13, 12, 12, 12, 12, 12] {
+        for i in 0..n {
+            push(reserve.next().expect("73 reserve units"), x_of(i, n), z, false);
         }
+        z -= d + GAP;
     }
+    debug_assert!(reserve.next().is_none());
+    debug_assert!(z + GAP + d * 0.5 >= -half.y + EDGE_MARGIN, "the demo rows overrun the zone's depth");
 
     BattleSetup {
         map: MapKind::Grassland,
         units_per_team: 100 * DEMO_UNIT,
         reg_size: DEMO_UNIT,
         ai_enabled: true,
+        open_sides: true,
         units,
     }
 }
@@ -381,7 +398,8 @@ mod tests {
     }
 
     /// The demo army: 100 units of the planned kinds, every block inside the
-    /// player's deployment zone, and no two blocks overlapping.
+    /// player's deployment zone with its sides opened to the map's, and no
+    /// two blocks overlapping.
     #[test]
     fn demo_setup_fits_the_deployment_zone() {
         use crate::unit_types::{KIND_ARCHER, KIND_HEAVY, KIND_LIGHT, KIND_SPEAR};
@@ -410,7 +428,10 @@ mod tests {
                 (c - half, c + half)
             })
             .collect();
-        let zone = crate::orders::deploy_zone_for(&build_terrain(MapKind::Grassland), crate::regiments::army_gap());
+        assert!(setup.open_sides);
+        let mut zone = crate::orders::deploy_zone_for(&build_terrain(MapKind::Grassland), crate::regiments::army_gap());
+        zone.0.x = -crate::terrain::HALF_EXTENTS.x + OPEN_SIDE_MARGIN;
+        zone.1.x = crate::terrain::HALF_EXTENTS.x - OPEN_SIDE_MARGIN;
         for (i, (lo, hi)) in boxes.iter().enumerate() {
             assert!(lo.cmpge(zone.0).all() && hi.cmple(zone.1).all(), "unit {i} leaves the zone: {lo} {hi}");
         }
