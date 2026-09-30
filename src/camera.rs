@@ -15,6 +15,9 @@ const PAN_FAST: f32 = 3.0;
 /// Pan speed factor while left Alt is held, for slow recording moves.
 /// Holding both multiplies the two.
 const PAN_SLOW: f32 = 0.25;
+/// Seconds the pan takes to ease down to `PAN_SLOW` when left Alt goes
+/// down, and back up to full speed when it comes up.
+const PAN_SLOW_RAMP: f32 = 1.5;
 /// Zoom smoothing time constant (seconds to ~2/3 of the way).
 const ZOOM_SMOOTH: f32 = 0.12;
 
@@ -80,10 +83,22 @@ fn control_camera(
     time: Res<Time<Real>>,
     settings: Res<crate::settings::Settings>,
     mut query: Query<&mut RtsCamera>,
+    mut slow_ramp: Local<f32>,
 ) {
     let Ok(mut cam) = query.single_mut() else {
         return;
     };
+
+    // Left Alt eases the pan speed down and back up along a smoothstep
+    // (flat at both ends), so a recorded camera move never jerks. The
+    // ramp runs whether or not the camera pans.
+    let step = time.delta_secs() / PAN_SLOW_RAMP;
+    *slow_ramp = if keys.pressed(KeyCode::AltLeft) {
+        (*slow_ramp + step).min(1.0)
+    } else {
+        (*slow_ramp - step).max(0.0)
+    };
+    let slow = *slow_ramp * *slow_ramp * (3.0 - 2.0 * *slow_ramp);
 
     // Pan in the camera's yaw frame, speed scales with zoom. Ctrl is a
     // command modifier (Ctrl+A select all etc.): no panning under it.
@@ -127,9 +142,7 @@ fn control_camera(
         if keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight) {
             factor *= PAN_FAST;
         }
-        if keys.pressed(KeyCode::AltLeft) {
-            factor *= PAN_SLOW;
-        }
+        factor *= 1.0 + (PAN_SLOW - 1.0) * slow;
         let speed = cam.distance * 0.9 * factor * time.delta_secs();
         let (sin_yaw, cos_yaw) = cam.yaw.sin_cos();
         let forward = Vec3::new(-sin_yaw, 0.0, -cos_yaw);
