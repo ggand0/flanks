@@ -22,7 +22,7 @@ use bevy::ecs::hierarchy::ChildSpawnerCommands;
 use bevy::input::mouse::{AccumulatedMouseScroll, MouseScrollUnit};
 use bevy::prelude::*;
 use bevy::ui::FocusPolicy;
-use bevy::window::{MonitorSelection, PresentMode, PrimaryWindow, WindowMode};
+use bevy::window::{MonitorSelection, PresentMode, PrimaryWindow, VideoModeSelection, WindowMode};
 use serde::{Deserialize, Serialize};
 
 use crate::game_state::{BTN_NORMAL, DIM_TEXT_COLOR, GameState, TEXT_COLOR};
@@ -70,8 +70,10 @@ pub struct ControlsSettings {
 pub struct VideoSettings {
     /// Default off: the FPS overlay should show real headroom.
     pub vsync: bool,
-    /// Borderless fullscreen on the current monitor.
-    pub fullscreen: bool,
+    /// Files saved before exclusive fullscreen carry the bool
+    /// `fullscreen` instead, true for borderless.
+    #[serde(alias = "fullscreen", deserialize_with = "window_kind_or_bool")]
+    pub window: WindowKind,
     /// The sun's shadow maps. Off buys frames on a slow machine: the
     /// shadow pass and two extra views per frame (devlog 0147).
     pub shadows: bool,
@@ -136,13 +138,58 @@ impl Overlay {
     }
 }
 
+/// How the game window takes the screen.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub enum WindowKind {
+    #[default]
+    Windowed,
+    /// A borderless window covering the current monitor.
+    Borderless,
+    /// Exclusive fullscreen on the primary monitor at its current
+    /// resolution and refresh rate.
+    Fullscreen,
+}
+
+impl WindowKind {
+    fn next(self) -> Self {
+        match self {
+            Self::Windowed => Self::Borderless,
+            Self::Borderless => Self::Fullscreen,
+            Self::Fullscreen => Self::Windowed,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Windowed => "Windowed",
+            Self::Borderless => "Borderless",
+            Self::Fullscreen => "Fullscreen",
+        }
+    }
+}
+
+/// `window` as saved now, or the older bool `fullscreen`.
+fn window_kind_or_bool<'de, D: serde::Deserializer<'de>>(d: D) -> Result<WindowKind, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Saved {
+        Kind(WindowKind),
+        Fullscreen(bool),
+    }
+    Ok(match Saved::deserialize(d)? {
+        Saved::Kind(kind) => kind,
+        Saved::Fullscreen(true) => WindowKind::Borderless,
+        Saved::Fullscreen(false) => WindowKind::Windowed,
+    })
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
             audio: AudioSettings { master: 1.0, battle: 1.0, ui: 1.0 },
             camera: CameraSettings { pan_speed: 1.0, edge_pan: true },
             controls: ControlsSettings { box_select: true },
-            video: VideoSettings { vsync: false, fullscreen: false, shadows: true },
+            video: VideoSettings { vsync: false, window: WindowKind::Windowed, shadows: true },
             interface: InterfaceSettings {
                 hud: true,
                 unit_panel: true,
@@ -256,7 +303,7 @@ enum Toggle {
     EdgePan,
     BoxSelect,
     VSync,
-    Fullscreen,
+    Window,
     Shadows,
     Hud,
     UnitPanel,
@@ -420,7 +467,7 @@ impl Toggle {
             Self::EdgePan => s.camera.edge_pan,
             Self::BoxSelect => s.controls.box_select,
             Self::VSync => s.video.vsync,
-            Self::Fullscreen => s.video.fullscreen,
+            Self::Window => s.video.window != WindowKind::Windowed,
             Self::Shadows => s.video.shadows,
             Self::Hud => s.interface.hud,
             Self::UnitPanel => s.interface.unit_panel,
@@ -436,7 +483,7 @@ impl Toggle {
             Self::EdgePan => s.camera.edge_pan = !s.camera.edge_pan,
             Self::BoxSelect => s.controls.box_select = !s.controls.box_select,
             Self::VSync => s.video.vsync = !s.video.vsync,
-            Self::Fullscreen => s.video.fullscreen = !s.video.fullscreen,
+            Self::Window => s.video.window = s.video.window.next(),
             Self::Shadows => s.video.shadows = !s.video.shadows,
             Self::Hud => s.interface.hud = !s.interface.hud,
             Self::UnitPanel => s.interface.unit_panel = !s.interface.unit_panel,
@@ -450,9 +497,7 @@ impl Toggle {
     fn label(self, s: &Settings) -> &'static str {
         let on = self.get(s);
         match self {
-            Self::Fullscreen => {
-                if on { "Borderless" } else { "Windowed" }
-            }
+            Self::Window => s.video.window.label(),
             Self::BoxSelect => {
                 if on { "Box" } else { "Lasso" }
             }
@@ -793,7 +838,7 @@ fn spawn_modal(commands: &mut Commands, s: &Settings, active: Tab) {
                     toggle_row(body, "Edge pan", Toggle::EdgePan, s);
 
                     section_header(body, "Video");
-                    toggle_row(body, "Window", Toggle::Fullscreen, s);
+                    toggle_row(body, "Window", Toggle::Window, s);
                     toggle_row(body, "VSync", Toggle::VSync, s);
                     toggle_row(body, "Shadows", Toggle::Shadows, s);
                 });
@@ -1151,11 +1196,25 @@ fn apply_shadows(settings: Res<Settings>, mut lights: Query<&mut DirectionalLigh
 }
 
 pub fn window_mode(s: &Settings) -> WindowMode {
-    if s.video.fullscreen {
-        WindowMode::BorderlessFullscreen(MonitorSelection::Current)
-    } else {
-        WindowMode::Windowed
+    let borderless = WindowMode::BorderlessFullscreen(MonitorSelection::Current);
+    match s.video.window {
+        WindowKind::Windowed => WindowMode::Windowed,
+        WindowKind::Borderless => borderless,
+        // Wayland has no exclusive mode: winit ignores the request and
+        // the window would stay windowed.
+        WindowKind::Fullscreen if wayland() => borderless,
+        // The primary monitor, not the current one: bevy_winit knows no
+        // current monitor while it creates the window, and exclusive mode
+        // panics without a monitor.
+        WindowKind::Fullscreen => {
+            WindowMode::Fullscreen(MonitorSelection::Primary, VideoModeSelection::Current)
+        }
     }
+}
+
+/// winit runs on Wayland whenever the session offers it.
+fn wayland() -> bool {
+    cfg!(target_os = "linux") && std::env::var_os("WAYLAND_DISPLAY").is_some()
 }
 
 pub fn present_mode(s: &Settings) -> PresentMode {
@@ -1188,5 +1247,41 @@ fn save_debounced(
             *pending = None;
             settings.save();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn window(yaml: &str) -> WindowKind {
+        serde_yaml_ng::from_str::<VideoSettings>(yaml).unwrap().window
+    }
+
+    #[test]
+    fn window_reads_the_old_fullscreen_bool() {
+        assert_eq!(window("fullscreen: true"), WindowKind::Borderless);
+        assert_eq!(window("fullscreen: false"), WindowKind::Windowed);
+        assert_eq!(window("vsync: false"), WindowKind::Windowed);
+    }
+
+    #[test]
+    fn window_round_trips() {
+        for kind in [WindowKind::Windowed, WindowKind::Borderless, WindowKind::Fullscreen] {
+            let mut s = Settings::default();
+            s.video.window = kind;
+            let yaml = serde_yaml_ng::to_string(&s).unwrap();
+            let back: Settings = serde_yaml_ng::from_str(&yaml).unwrap();
+            assert_eq!(back.video.window, kind, "{yaml}");
+        }
+    }
+
+    #[test]
+    fn old_file_keeps_its_other_settings() {
+        let old = "video:\n  vsync: true\n  fullscreen: true\n  shadows: false\n";
+        let s: Settings = serde_yaml_ng::from_str(old).unwrap();
+        assert!(s.video.vsync);
+        assert!(!s.video.shadows);
+        assert_eq!(s.video.window, WindowKind::Borderless);
     }
 }
