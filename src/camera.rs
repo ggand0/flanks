@@ -1,6 +1,7 @@
 //! RTS camera: WASD + screen-edge pan, smoothed scroll zoom,
 //! middle-drag rotate. Keyboard pan takes priority over edge pan (a
-//! cursor parked at the bottom edge must not cancel W).
+//! cursor parked at the bottom edge must not cancel W). Shift pans
+//! faster and left Alt slower.
 
 use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll, MouseScrollUnit};
 use bevy::prelude::*;
@@ -9,6 +10,11 @@ use bevy::window::PrimaryWindow;
 
 /// Cursor within this many pixels of a window edge pans the camera.
 const EDGE_PAN_PX: f32 = 12.0;
+/// Pan speed factor while Shift is held.
+const PAN_FAST: f32 = 3.0;
+/// Pan speed factor while left Alt is held, for slow recording moves.
+/// Holding both multiplies the two.
+const PAN_SLOW: f32 = 0.25;
 /// Zoom smoothing time constant (seconds to ~2/3 of the way).
 const ZOOM_SMOOTH: f32 = 0.12;
 
@@ -117,7 +123,14 @@ fn control_camera(
     }
     if pan != Vec2::ZERO {
         let pan = pan.clamp_length_max(1.0);
-        let speed = cam.distance * 0.9 * settings.camera.pan_speed * time.delta_secs();
+        let mut factor = settings.camera.pan_speed;
+        if keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight) {
+            factor *= PAN_FAST;
+        }
+        if keys.pressed(KeyCode::AltLeft) {
+            factor *= PAN_SLOW;
+        }
+        let speed = cam.distance * 0.9 * factor * time.delta_secs();
         let (sin_yaw, cos_yaw) = cam.yaw.sin_cos();
         let forward = Vec3::new(-sin_yaw, 0.0, -cos_yaw);
         let right = Vec3::new(cos_yaw, 0.0, -sin_yaw);

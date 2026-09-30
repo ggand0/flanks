@@ -588,6 +588,7 @@ const CONTROLS: [(&str, &[(&str, &str)]); 4] = [
         &[
             ("W A S D", "Pan"),
             ("Screen edge", "Pan"),
+            ("Shift, left Alt + pan", "Pan faster, slower"),
             ("Mouse wheel", "Zoom"),
             ("Middle drag", "Rotate"),
         ],

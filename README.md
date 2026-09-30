@@ -49,6 +49,7 @@ Requires Rust 1.95 or newer. The models and ground textures are stored with [Git
 | Control groups                  | Ctrl + 1..9 store, 1..9 recall |
 | Begin the battle after deploying | Enter                    |
 | Pan camera                      | WASD or screen edges      |
+| Pan faster / slower             | Shift / left Alt + pan    |
 | Zoom / rotate camera            | Scroll / middle drag      |
 | Pause                           | Esc                       |
 | Battle HUD / unit panel / stats line and debug overlay / hover rings | F1 / F2 / F3 / F4 |
