@@ -247,6 +247,9 @@ const DEMO_ORDERS_AFTER: f32 = 20.0;
 /// its front: the enemy's front rank is then about 25 m off, the last
 /// seconds before contact.
 const DEMO_COUNTER_WITHIN: f32 = 40.0;
+/// The same for the Knight line out in front of the centre, which meets
+/// the enemy first and waits until it is closer.
+const DEMO_LINE_COUNTER_WITHIN: f32 = 30.0;
 
 /// The demo battle: 200k on the grassland with the AI on, the enemy as the
 /// spawner deploys it, and the player's 100 units in a defence after the
@@ -261,10 +264,11 @@ const DEMO_COUNTER_WITHIN: f32 = 40.0;
 ///   no corridor round its ends. From each end: 2 shallow Knights (an
 ///   archer column), 2 Knights, 8 Spearmen; in the centre 2 shallow
 ///   Spearmen (the centre archer column). Each counter-charges the
-///   nearest enemy in the last seconds before contact.
+///   nearest enemy in the last seconds before contact; the centre
+///   Spearmen go with the Knight line in front of them.
 /// - A Knight line as wide as the centre column, just in front of it and
 ///   out past the zone's edge, so the centre's Spearmen hold. It
-///   counter-charges with line 1.
+///   counter-charges a little later than line 1, as the enemy is closer.
 /// - Archers: 2 behind each of the three archer columns, 5 m back, which
 ///   take the enemy's first blows for them. Their front rank stands within
 ///   bow range of the enemy's starting line, and they loft over line 1.
@@ -273,9 +277,9 @@ const DEMO_COUNTER_WITHIN: f32 = 40.0;
 /// - Line 2: 33 units 10 m behind line 1: 11 Knights on each outer side,
 ///   11 Men-at-Arms in the centre. They charge the nearest enemy 20 s after
 ///   the battle begins.
-/// - Reserve: a row of 3 Men-at-Arms, 12 Spearmen, 3 Men-at-Arms and a row
-///   of 16 Men-at-Arms. As line 2 charges they march up to 30 m behind
-///   line 1's back rank.
+/// - Line 3, the reserve: 34 units across the map, 11 Men-at-Arms at each
+///   end and 12 Spearmen in the centre. As line 2 charges it marches up
+///   to 10 m behind line 1's back rank, where line 2 stood.
 ///
 /// Normal spacing throughout.
 fn demo_setup() -> BattleSetup {
@@ -292,9 +296,8 @@ fn demo_setup() -> BattleSetup {
     const LINE2: usize = 33;
     /// Metres between one row's back rank and the next row's front rank.
     const GAP: f32 = 10.0;
-    /// Metres from line 1's back rank to the reserve's front rank once it
-    /// has moved up.
-    const RESERVE_BEHIND: f32 = 30.0;
+    /// Line 3's units.
+    const LINE3: usize = 34;
 
     let half = crate::terrain::HALF_EXTENTS;
     let x_max = half.x - OPEN_SIDE_MARGIN;
@@ -328,6 +331,18 @@ fn demo_setup() -> BattleSetup {
         });
     };
     let counter = Some(Scripted { when: When::EnemyWithin(DEMO_COUNTER_WITHIN), then: Then::Charge });
+    // The Knight line in front of the centre column: as wide as it, and
+    // thin, its back rank one pitch ahead of line 1's front rank. The
+    // centre column's own cue reaches that much further, so it charges
+    // with the line instead of waiting behind it for an enemy that never
+    // gets close.
+    let line_files = (2.0 * cw / P).floor() as u32;
+    let line_ahead = P + depth(line_files);
+    let line_counter = Some(Scripted { when: When::EnemyWithin(DEMO_LINE_COUNTER_WITHIN), then: Then::Charge });
+    let centre_counter = Some(Scripted {
+        when: When::EnemyWithin(DEMO_LINE_COUNTER_WITHIN + line_ahead),
+        then: Then::Charge,
+    });
 
     // Line 1, from the centre out on each side: a centre-column unit, the
     // deep units, two wing-column units. The front rank is 1 m inside the
@@ -336,19 +351,17 @@ fn demo_setup() -> BattleSetup {
     let wing_x = |k: usize| cw + DEEP_PER_SIDE as f32 * w + (k as f32 + 0.5) * cw;
     let columns = [0.5 * cw, wing_x(0), wing_x(1)];
     for side in [-1.0_f32, 1.0] {
-        let centre_kind = [KIND_SPEAR, KIND_HEAVY, KIND_HEAVY];
-        for (&x, kind) in columns.iter().zip(centre_kind) {
-            push(kind, side * x, front - cd * 0.5, col_files, true, counter);
+        let kinds = [KIND_SPEAR, KIND_HEAVY, KIND_HEAVY];
+        let cues = [centre_counter, counter, counter];
+        for ((&x, kind), cue) in columns.iter().zip(kinds).zip(cues) {
+            push(kind, side * x, front - cd * 0.5, col_files, true, cue);
         }
         for i in 0..DEEP_PER_SIDE {
             let kind = if i >= DEEP_PER_SIDE - 2 { KIND_HEAVY } else { KIND_SPEAR };
             push(kind, side * deep_x(i), front - d * 0.5, DEEP_FILES, true, counter);
         }
     }
-    // The Knight line in front of the centre column: as wide as it, and
-    // thin, its back rank one pitch ahead of line 1's front rank.
-    let line_files = (2.0 * cw / P).floor() as u32;
-    push(KIND_HEAVY, 0.0, front + P + depth(line_files) * 0.5, line_files, true, counter);
+    push(KIND_HEAVY, 0.0, front + line_ahead - depth(line_files) * 0.5, line_files, true, line_counter);
     // Archers behind the three archer columns.
     for side in [-1.0_f32, 1.0] {
         for &x in &columns {
@@ -363,19 +376,15 @@ fn demo_setup() -> BattleSetup {
         let kind = if j.min(LINE2 - 1 - j) < 11 { KIND_HEAVY } else { KIND_LIGHT };
         push(kind, x_of(j, LINE2), z2, DEEP_FILES, false, charge);
     }
-    // The reserve rows, which move up together as line 2 charges.
+    // Line 3, which moves up into line 2's place as line 2 charges.
     let z3 = z2 - d - GAP;
-    let z4 = z3 - d - GAP;
-    let advance = (front - d - RESERVE_BEHIND) - (z3 + d * 0.5);
+    let advance = z2 - z3;
     let move_up = Some(Scripted { when: When::After(DEMO_ORDERS_AFTER), then: Then::Advance(advance) });
-    for i in 0..18 {
-        let kind = if i.min(17 - i) < 3 { KIND_LIGHT } else { KIND_SPEAR };
-        push(kind, x_of(i, 18), z3, DEEP_FILES, false, move_up);
+    for i in 0..LINE3 {
+        let kind = if i.min(LINE3 - 1 - i) < 11 { KIND_LIGHT } else { KIND_SPEAR };
+        push(kind, x_of(i, LINE3), z3, DEEP_FILES, false, move_up);
     }
-    for i in 0..16 {
-        push(KIND_LIGHT, x_of(i, 16), z4, DEEP_FILES, false, move_up);
-    }
-    debug_assert!(z4 - d * 0.5 >= -half.y + EDGE_MARGIN, "the demo rows overrun the zone's depth");
+    debug_assert!(z3 - d * 0.5 >= -half.y + EDGE_MARGIN, "the demo lines overrun the zone's depth");
 
     BattleSetup {
         map: MapKind::Grassland,
@@ -595,7 +604,12 @@ mod tests {
         };
         assert_eq!(cued(When::After(DEMO_ORDERS_AFTER), |t| t == Then::Charge), 33, "line 2 charges");
         assert_eq!(cued(When::After(DEMO_ORDERS_AFTER), |t| matches!(t, Then::Advance(_))), 34, "the reserve moves up");
-        assert_eq!(cued(When::EnemyWithin(DEMO_COUNTER_WITHIN), |t| t == Then::Charge), 27, "line 1 counter-charges");
+        assert_eq!(cued(When::EnemyWithin(DEMO_COUNTER_WITHIN), |t| t == Then::Charge), 24, "line 1 counter-charges");
+        assert_eq!(cued(When::EnemyWithin(DEMO_LINE_COUNTER_WITHIN), |t| t == Then::Charge), 1, "the Knight line");
+        let centre = setup.units.iter().filter(|u| {
+            u.script.is_some_and(|s| matches!(s.when, When::EnemyWithin(r) if r > DEMO_LINE_COUNTER_WITHIN + 10.0))
+        });
+        assert_eq!(centre.count(), 2, "the centre Spearmen charge with the Knight line");
         let mut kinds = [0; NUM_KINDS];
         for p in &setup.units {
             kinds[p.kind as usize] += 1;
