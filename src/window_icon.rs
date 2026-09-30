@@ -44,7 +44,7 @@ fn set_window_icon(
         let winit_window = windows.get_window(entity)?;
         match icon() {
             Some(icon) => winit_window.set_window_icon(Some(icon)),
-            None => warn!("window icon: could not decode assets/flanks_icon_256.png"),
+            None => warn!("window icon: could not decode assets/flanks_icon_rounded_256.png"),
         }
         Some(())
     });
@@ -54,10 +54,11 @@ fn set_window_icon(
     }
 }
 
-/// The 256 px icon, built into the binary so it needs no asset path.
+/// The 256 px app icon (rounded, with a margin), built into the binary so
+/// it needs no asset path.
 fn icon() -> Option<winit::window::Icon> {
     let image = Image::from_buffer(
-        include_bytes!("../assets/flanks_icon_256.png"),
+        include_bytes!("../assets/flanks_icon_rounded_256.png"),
         ImageType::Extension("png"),
         CompressedImageFormats::NONE,
         true,
