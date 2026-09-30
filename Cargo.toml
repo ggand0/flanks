@@ -57,6 +57,7 @@ codegen-units = 16
 # appimagetool will not build an AppImage without an icon.
 [package.metadata.appimage]
 icon = "assets/flanks_icon_rounded_256.png"
+desktop_entry = "resources/linux/flanks.desktop"
 assets = ["assets"]
 
 [package.metadata.bundle]
