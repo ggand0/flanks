@@ -2,7 +2,7 @@
 //! read a window's own icon (KDE, Xfce) show while the game runs. GNOME
 //! ignores it: its dock takes a running app's icon only from the installed
 //! desktop entry whose StartupWMClass matches the window's app name
-//! (`flanks`, see cargo-appimage.desktop). macOS takes the app bundle's.
+//! (`flanks`, see resources/linux/flanks.desktop). macOS takes the app bundle's.
 
 use bevy::asset::RenderAssetUsages;
 use bevy::ecs::system::NonSendMarker;
@@ -19,39 +19,30 @@ impl Plugin for WindowIconPlugin {
     }
 }
 
-/// Frames to wait for the winit window before showing the game window
-/// without its icon.
-const WAIT_FRAMES: u32 = 30;
-
 /// Set the icon once the primary window's winit window exists, a frame or
-/// so after startup, then show the window, which starts hidden so the dock
-/// sees the icon when it appears. `NonSendMarker` keeps the system on the
-/// main thread, where winit requires window calls.
+/// so after startup. `NonSendMarker` keeps the system on the main thread,
+/// where winit requires window calls.
 fn set_window_icon(
-    mut window: Query<(Entity, &mut Window), With<PrimaryWindow>>,
-    mut frames: Local<u32>,
+    window: Query<Entity, With<PrimaryWindow>>,
     mut done: Local<bool>,
     _main_thread: NonSendMarker,
 ) {
     if *done {
         return;
     }
-    let Ok((entity, mut window)) = window.single_mut() else {
+    let Ok(entity) = window.single() else {
         return;
     };
-    *frames += 1;
-    let set = WINIT_WINDOWS.with_borrow(|windows| {
-        let winit_window = windows.get_window(entity)?;
+    WINIT_WINDOWS.with_borrow(|windows| {
+        let Some(winit_window) = windows.get_window(entity) else {
+            return;
+        };
         match icon() {
             Some(icon) => winit_window.set_window_icon(Some(icon)),
             None => warn!("window icon: could not decode assets/flanks_icon_rounded_256.png"),
         }
-        Some(())
-    });
-    if set.is_some() || *frames >= WAIT_FRAMES {
-        window.visible = true;
         *done = true;
-    }
+    });
 }
 
 /// The 256 px app icon (rounded, with a margin), built into the binary so

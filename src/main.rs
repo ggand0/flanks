@@ -88,9 +88,6 @@ fn main() {
                         // The app name (X11 WM_CLASS, Wayland app id) a
                         // desktop entry matches with StartupWMClass.
                         name: Some("flanks".into()),
-                        // Shown once it has its icon (window_icon.rs): the
-                        // dock takes the icon a window has when it appears.
-                        visible: false,
                         // Default vsync off: the FPS overlay should
                         // show real headroom.
                         present_mode: settings::present_mode(&user_settings),
