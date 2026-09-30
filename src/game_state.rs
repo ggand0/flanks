@@ -1133,3 +1133,47 @@ fn button_hover_style(
         };
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every menu size splits into whole units, 10 to 100 a side, and the
+    /// player's starting composition fills exactly those slots.
+    #[test]
+    fn army_sizes_split_into_whole_units() {
+        for &(per_team, label) in ARMY_SIZES {
+            let mut config = BattleConfig { units_per_team: 0, ..default() };
+            set_army_size(&mut config, per_team);
+            assert_eq!(per_team % config.reg_size, 0, "{label}: {per_team} by {}", config.reg_size);
+            let n = config.n_slots();
+            assert!((10..=100).contains(&n), "{label}: {n} units a side");
+            assert_eq!(config.player_regs.iter().sum::<usize>(), n, "{label}: composition");
+        }
+    }
+
+    #[test]
+    fn unit_size_follows_army_size() {
+        let expect = [(5_000, 200), (10_000, 500), (25_000, 1000), (50_000, 1000), (100_000, 1000)];
+        assert_eq!(expect.len(), ARMY_SIZES.len());
+        for (per_team, reg_size) in expect {
+            let mut config = BattleConfig { units_per_team: 0, ..default() };
+            set_army_size(&mut config, per_team);
+            assert_eq!(config.reg_size, reg_size, "{per_team} a side");
+        }
+    }
+
+    #[test]
+    fn picking_the_current_size_keeps_the_picks() {
+        let mut config = BattleConfig { units_per_team: 0, ..default() };
+        set_army_size(&mut config, 5_000);
+        config.player_regs = [25, 0, 0, 0];
+        config.enemy = EnemyComp::Style(1);
+        set_army_size(&mut config, 5_000);
+        assert_eq!(config.player_regs, [25, 0, 0, 0]);
+        assert!(matches!(config.enemy, EnemyComp::Style(1)));
+        set_army_size(&mut config, 10_000);
+        assert_eq!(config.player_regs.iter().sum::<usize>(), 20);
+        assert!(matches!(config.enemy, EnemyComp::Random));
+    }
+}

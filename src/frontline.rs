@@ -59,7 +59,7 @@ pub struct InfluenceField {
 }
 
 impl InfluenceField {
-    fn new(min: Vec2, max: Vec2) -> Self {
+    pub(crate) fn new(min: Vec2, max: Vec2) -> Self {
         let w = ((max.x - min.x) / FIELD_CELL).ceil() as usize + 1;
         let h = ((max.y - min.y) / FIELD_CELL).ceil() as usize + 1;
         Self {

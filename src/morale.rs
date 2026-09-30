@@ -581,3 +581,69 @@ pub fn update_morale(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::orders::GroupData;
+    use std::time::Duration;
+
+    const DT: f32 = 0.05;
+    const EVERY: usize = 20;
+
+    /// Morale of two units of one kind, the second five times the size of
+    /// the first, on opposite teams and far apart so neither sees the
+    /// other (each is its own army's captain). Every `EVERY` ticks each
+    /// loses `deaths[i]` men and kills `kills[i]`. After every tick the
+    /// casualty and exchange terms and the morale level must match: morale
+    /// works in proportions of the unit, so army size and unit size must
+    /// not change how a unit takes the same share of losses.
+    fn assert_same_morale(deaths: [u32; 2], kills: [u32; 2], ticks: usize) -> MoraleFactors {
+        let mut world = World::new();
+        let mut groups = Groups::default();
+        for (team, size) in [200, 1000].into_iter().enumerate() {
+            let at = Vec2::new(team as f32 * 1500.0, 0.0);
+            groups.list.push(GroupData::new(team as u8, crate::unit_types::KIND_HEAVY, at, size));
+        }
+        world.insert_resource(groups);
+        world.insert_resource(InfluenceField::new(Vec2::splat(-100.0), Vec2::new(1600.0, 100.0)));
+        world.insert_resource(MoraleReadout::default());
+        world.insert_resource(Time::<()>::default());
+        let mut system = IntoSystem::into_system(update_morale);
+        system.initialize(&mut world);
+
+        for t in 0..ticks {
+            world.resource_mut::<Time>().advance_by(Duration::from_secs_f32(DT));
+            if t % EVERY == 0 {
+                for (i, g) in world.resource_mut::<Groups>().list.iter_mut().enumerate() {
+                    g.count -= deaths[i] as usize;
+                    g.recent_deaths = deaths[i];
+                    g.recent_kills = kills[i];
+                }
+            }
+            system.run((), &mut world).unwrap();
+            let f = &world.resource::<MoraleReadout>().0;
+            let g = &world.resource::<Groups>().list;
+            assert_eq!(f[0].casualties, f[1].casualties, "casualties at tick {t}");
+            assert!((f[0].exchange - f[1].exchange).abs() < 1e-4, "exchange at tick {t}: {} vs {}", f[0].exchange, f[1].exchange);
+            assert!((g[0].morale - g[1].morale).abs() < 1e-3, "morale at tick {t}: {} vs {}", g[0].morale, g[1].morale);
+        }
+        world.resource::<MoraleReadout>().0[0]
+    }
+
+    #[test]
+    fn losing_morale_scales_with_unit_size() {
+        // 30% lost over the run: past the 10% and 25% casualty steps.
+        let f = assert_same_morale([1, 5], [0, 0], 60 * EVERY);
+        assert_eq!(f.casualties, -4.0);
+        // Below saturation, where counting absolute deaths would show.
+        assert!(f.exchange < -0.5 && f.exchange > EXCHANGE_LOSING + 0.5, "exchange {}", f.exchange);
+    }
+
+    #[test]
+    fn winning_morale_scales_with_unit_size() {
+        let f = assert_same_morale([1, 5], [2, 10], 30 * EVERY);
+        assert_eq!(f.casualties, -2.0);
+        assert!(f.exchange > 0.5 && f.exchange < EXCHANGE_WINNING - 0.5, "exchange {}", f.exchange);
+    }
+}
