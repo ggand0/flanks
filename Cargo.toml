@@ -41,3 +41,17 @@ inherits = "release"
 opt-level = 3
 lto = false
 codegen-units = 16
+
+# Packaging with cargo-appimage and cargo-bundle. Both carry the assets
+# folder, which the game looks for at run time (`util::game_root`); an
+# AppImage keeps it at its root, a macOS app bundle in Contents/Resources.
+# appimagetool will not build an AppImage without an icon.
+[package.metadata.appimage]
+icon = "assets/icon_256.png"
+assets = ["assets"]
+
+[package.metadata.bundle]
+name = "FLANKS"
+identifier = "com.ggando.flanks"
+short_description = "Real-time massed medieval battles, every soldier simulated"
+resources = ["assets"]
