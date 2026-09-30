@@ -46,6 +46,7 @@ impl Plugin for RtsCameraPlugin {
 fn spawn_camera(mut commands: Commands) {
     commands.spawn((
         Camera3d::default(),
+        msaa(),
         // Required: the unit renderer issues direct (non-indirect) draws.
         NoIndirectDrawing,
         RtsCamera {
@@ -62,6 +63,17 @@ fn spawn_camera(mut commands: Commands) {
             target_distance: crate::util::env_or("FL_CAM_DIST", 280.0),
         },
     ));
+}
+
+/// Samples per pixel of the 3D view: Bevy's default 4, or `FL_MSAA=1`
+/// (off), 2 or 8 for A/B runs.
+fn msaa() -> Msaa {
+    match crate::util::env_or("FL_MSAA", 4_u32) {
+        1 => Msaa::Off,
+        2 => Msaa::Sample2,
+        8 => Msaa::Sample8,
+        _ => Msaa::Sample4,
+    }
 }
 
 #[allow(clippy::too_many_arguments)] // bevy system params

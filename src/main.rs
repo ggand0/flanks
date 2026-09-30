@@ -23,6 +23,7 @@ mod picker;
 mod regiments;
 mod render_units;
 mod render_units_gpu;
+mod render_units_phase;
 mod render_units_shadow;
 mod selection;
 mod selection_rings;
@@ -61,6 +62,21 @@ fn wgpu_settings() -> WgpuSettings {
     settings
 }
 
+/// `FL_WINDOW=2560x1360` opens the window with that client size in
+/// physical pixels whatever the display's scale, so runs on differently
+/// scaled displays draw the same frame. The interface then draws at scale 1.
+/// Without it Bevy opens 1280x720 logical, times the display's scale.
+fn window_resolution() -> bevy::window::WindowResolution {
+    let size = std::env::var("FL_WINDOW").ok().and_then(|v| {
+        let (w, h) = v.split_once('x')?;
+        Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
+    });
+    match size {
+        Some((w, h)) => bevy::window::WindowResolution::new(w, h).with_scale_factor_override(1.0),
+        None => default(),
+    }
+}
+
 fn main() {
     // Load before the App so the window opens with the saved video
     // settings instead of switching modes one frame in.
@@ -92,6 +108,7 @@ fn main() {
                         // show real headroom.
                         present_mode: settings::present_mode(&user_settings),
                         mode: settings::window_mode(&user_settings),
+                        resolution: window_resolution(),
                         ..default()
                     }),
                     ..default()

@@ -8,6 +8,11 @@
 //! his kind-by-level index list. The list counts become indirect draw
 //! arguments and each bucket draws with one pulled, non-instanced draw.
 //!
+//! A third pass (`shaders/unit_pose_pass.wgsl`) then poses every drawn
+//! soldier once, so each corner of his mesh only reads his pose and places
+//! itself, instead of working the gait, the joints and the bow out again
+//! for every corner. `FL_POSE_PASS=0` poses per corner, for A/B runs.
+//!
 //! This is the default path. `FL_GPU_SYNC=0` keeps the CPU path in
 //! render_units.rs, which stays complete as the A/B and the fallback.
 
@@ -22,6 +27,7 @@ use bevy::render::{
     gpu_readback::{Readback, ReadbackComplete},
     render_asset::RenderAssets,
     render_resource::*,
+    globals::{GlobalsBuffer, GlobalsUniform},
     renderer::{RenderAdapter, RenderContext, RenderDevice, RenderQueue},
     storage::{GpuShaderBuffer, ShaderBuffer},
     sync_world::RenderEntity,
@@ -32,8 +38,9 @@ use bytemuck::{Pod, Zeroable};
 use crate::render_units::{
     BAND_FIGHTING, BOW_FALL_S, BOW_RISE_S, BOW_WALK_MS, CELEBRATE_BASE, CORPSE_CAP, CULL_RADIUS,
     Corpses, CustomPipeline, ExtractedAtlas, FOLLOW_BASE, FOLLOW_S, FOLLOW_SPAN, HOLD_S,
-    InstanceBucket, InstanceData, LodBands, LodConfig, NUM_BUCKETS, NUM_LODS, RANGED_BASE,
-    RELEASE_S, RELOAD_S, REWIND_S, RenderCounts, RigBuffer, SYNC_CHUNK, celebrate_progress,
+    ExtractedBucket, InstanceBucket, InstanceData, LodBands, LodConfig, NUM_BUCKETS, NUM_LODS,
+    RANGED_BASE, RELEASE_S, RELOAD_S, REWIND_S, RenderCounts, RigBuffer, SYNC_CHUNK, UnitRig,
+    celebrate_progress,
     shadow_level, stance_tier, wall_signal,
 };
 use crate::render_units_shadow::{CAST_LODS, unit_shadows};
@@ -48,6 +55,9 @@ pub struct GpuSyncConfig {
     /// FL_GPU_CHECK=1: the CPU sweep runs too and its per-bucket counts
     /// are compared with the GPU's on the same frame.
     pub check: bool,
+    /// The pose pass poses each drawn soldier once. `FL_POSE_PASS=0`: each
+    /// corner poses itself.
+    pub pose_pass: bool,
 }
 
 pub fn gpu_sync(cfg: Res<GpuSyncConfig>) -> bool {
@@ -78,9 +88,23 @@ pub const RING_ARG: usize = NUM_BUCKETS + CASTER_LISTS;
 /// selection rings.
 pub const DRAW_ARGS: usize = RING_ARG + 1;
 
+/// The pose pass's dispatch arguments, one per kind, after the draws'.
+const POSE_ARG: usize = DRAW_ARGS;
+
 /// Build counters: per bucket the soldiers and the fallen, the caster
-/// lists, then the ring count.
-const COUNTERS: usize = 2 * NUM_BUCKETS + CASTER_LISTS + 1;
+/// lists, the ring count, then the pose slots taken per kind.
+const COUNTERS: usize = 2 * NUM_BUCKETS + CASTER_LISTS + 1 + NUM_KINDS;
+
+/// Storage buffers the build pass binds (`init_gpu_unit_pipelines`), more
+/// than any other unit pass. A device that allows fewer per stage keeps the
+/// CPU path.
+const STORAGE_BUFFERS: u32 = 10;
+
+/// Pose slots (four floats each) per soldier of a kind without a bow rig,
+/// and of one with it (`POSE_SLOTS` and `POSE_SLOTS_BOW` in
+/// shaders/unit_pose.wgsl).
+const POSE_SLOTS: u32 = 17;
+const POSE_SLOTS_BOW: u32 = 45;
 
 /// Bytes of one set of per-bucket list entries in the bucket table: the
 /// camera's set, then one per cascade. A pulled draw binds one set, at a
@@ -178,9 +202,21 @@ pub struct BuildParams {
     cast_lods: u32,
     /// The first slot of the ring list in the index list.
     ring_base: u32,
+    /// Per kind: the first entry of its region of the pose sources.
+    pose_src_base: UVec4,
+    /// 1 with the pose pass on.
+    pose_pass: u32,
 }
 
-const _: () = assert!(NUM_KINDS == 4, "BuildParams packs per-kind values in vec4s");
+/// The pose pass uniform (`Params` in unit_pose_pass.wgsl).
+#[derive(ShaderType, Clone, Copy, Default)]
+struct PoseParams {
+    src_base: UVec4,
+    stride: UVec4,
+}
+
+const _: () = assert!(NUM_KINDS == 4, "BuildParams and PoseParams pack per-kind values in vec4s");
+const _: () = assert!(COUNTERS == 53, "unit_build.wgsl sizes `counts` for 53");
 const _: () = assert!(NUM_BUCKETS == 16, "unit_build.wgsl sizes its counters for 16 buckets");
 const _: () = assert!(MAX_CASCADES == 4, "unit_build.wgsl sizes its cascades for 4");
 const _: () = assert!(
@@ -547,10 +583,109 @@ struct PullVertex {
 /// finds a corner by `vertex_index % len`, no index buffer. Any `Mesh`
 /// with position, normal, the part/pivot UV and vertex color qualifies,
 /// so an imported model set plugs in unchanged.
+///
+/// A mesh whose triangles share most of their corners also keeps its own
+/// vertices and index list. Its camera draw is then indexed, one instance
+/// per soldier, and the GPU shades a shared corner once instead of once per
+/// triangle. The flat-shaded far levels share almost none.
 #[derive(Component)]
 pub struct PullMesh {
     corners: Vec<PullVertex>,
+    shared: Option<(Vec<PullVertex>, Vec<u32>)>,
     bucket: usize,
+}
+
+/// Corners per vertex from which a level draws indexed: the textured L0
+/// models have 2.2 to 2.5, the derived and authored far levels about 1.1.
+const INDEXED_REUSE: f32 = 1.5;
+
+/// Vertices the GPU is assumed to keep shaded between nearby triangles of
+/// an indexed draw (`tipsify`).
+const VERTEX_CACHE: usize = 16;
+
+/// The same triangles, reordered so each one mostly reuses vertices the
+/// GPU has just shaded: Tipsify (Sander, Nehab and Barczak, 2007) with a
+/// cache of `cache` vertices. It fans around one vertex at a time, then
+/// moves to the neighbour that is still in the cache and has triangles
+/// left. The unit L0 models go from about 2.0 vertices shaded per triangle
+/// in their exported order to 1.23 to 1.37, their count of distinct
+/// vertices per triangle.
+fn tipsify(indices: &[u32], vertices: usize, cache: usize) -> Vec<u32> {
+    // Triangles around each vertex, as ranges into `around`.
+    let mut start = vec![0usize; vertices + 1];
+    for &i in indices {
+        start[i as usize + 1] += 1;
+    }
+    for v in 0..vertices {
+        start[v + 1] += start[v];
+    }
+    let mut around = vec![0usize; indices.len()];
+    let mut next = start.clone();
+    for (k, &i) in indices.iter().enumerate() {
+        around[next[i as usize]] = k / 3;
+        next[i as usize] += 1;
+    }
+    // Triangle corners at each vertex not yet emitted, and when each vertex
+    // last entered the cache.
+    let mut live: Vec<usize> = (0..vertices).map(|v| start[v + 1] - start[v]).collect();
+    let mut entered = vec![0usize; vertices];
+    let mut emitted = vec![false; indices.len() / 3];
+    let mut dead_end: Vec<usize> = Vec::new();
+    let mut out = Vec::with_capacity(indices.len());
+    let mut time = cache + 1;
+    let mut cursor = 0;
+    let mut fan = (vertices > 0).then_some(0);
+    while let Some(f) = fan {
+        let mut candidates = Vec::new();
+        for &t in &around[start[f]..start[f + 1]] {
+            if emitted[t] {
+                continue;
+            }
+            emitted[t] = true;
+            for &i in &indices[3 * t..3 * t + 3] {
+                let v = i as usize;
+                out.push(i);
+                dead_end.push(v);
+                candidates.push(v);
+                live[v] -= 1;
+                if time - entered[v] > cache {
+                    entered[v] = time;
+                    time += 1;
+                }
+            }
+        }
+        // The neighbour that stays in the cache longest while its
+        // remaining triangles are drawn, else the latest vertex with any
+        // left, else the next in order.
+        let mut best = None;
+        let mut best_age = -1;
+        for &v in &candidates {
+            if live[v] == 0 {
+                continue;
+            }
+            let age = time - entered[v];
+            let keep = if age + 2 * live[v] <= cache { age as i64 } else { 0 };
+            if keep > best_age {
+                best_age = keep;
+                best = Some(v);
+            }
+        }
+        fan = best.or_else(|| {
+            while let Some(d) = dead_end.pop() {
+                if live[d] > 0 {
+                    return Some(d);
+                }
+            }
+            while cursor < vertices {
+                if live[cursor] > 0 {
+                    return Some(cursor);
+                }
+                cursor += 1;
+            }
+            None
+        });
+    }
+    out
 }
 
 fn pack_unorm8(v: [f32; 4]) -> u32 {
@@ -583,7 +718,7 @@ impl PullMesh {
         let Some(V::Float32x2(atlas_uv)) = mesh.attribute(Mesh::ATTRIBUTE_UV_1) else {
             return None;
         };
-        let corners = mesh.indices()?.iter().map(|i| PullVertex {
+        let vertex = |i: usize| PullVertex {
             position: pos[i],
             part: uv[i][0],
             normal: nrm[i],
@@ -591,9 +726,16 @@ impl PullMesh {
             color: pack_unorm8(col[i]),
             atlas_uv: pack_unorm16(atlas_uv[i]),
             pad: [0; 2],
+        };
+        let indices = mesh.indices()?;
+        let corners: Vec<PullVertex> = indices.iter().map(vertex).collect();
+        let shared = (corners.len() as f32 >= INDEXED_REUSE * pos.len() as f32).then(|| {
+            let list: Vec<u32> = indices.iter().map(|i| i as u32).collect();
+            ((0..pos.len()).map(vertex).collect(), tipsify(&list, pos.len(), VERTEX_CACHE))
         });
         Some(Self {
-            corners: corners.collect(),
+            corners,
+            shared,
             bucket,
         })
     }
@@ -603,9 +745,19 @@ impl PullMesh {
 #[derive(Component)]
 pub struct PullMeshGpu {
     vertices: Buffer,
+    /// The mesh's own vertices (storage) and index list, when its camera
+    /// draw is indexed.
+    shared: Option<(Buffer, Buffer)>,
     /// Corners per soldier (the level's index count).
     pub count: u32,
     pub bucket: usize,
+}
+
+impl PullMeshGpu {
+    /// The camera draws this bucket indexed, one instance per soldier.
+    pub fn indexed(&self) -> bool {
+        self.shared.is_some()
+    }
 }
 
 /// Uploads each pulled bucket's mesh once. The render entity persists,
@@ -621,12 +773,27 @@ fn extract_pull_meshes(
         if uploaded.contains(e) {
             continue;
         }
+        let shared = mesh.shared.as_ref().map(|(vertices, indices)| {
+            (
+                render_device.create_buffer_with_data(&BufferInitDescriptor {
+                    label: Some("unit pull mesh vertices"),
+                    contents: bytemuck::cast_slice(vertices),
+                    usage: BufferUsages::STORAGE,
+                }),
+                render_device.create_buffer_with_data(&BufferInitDescriptor {
+                    label: Some("unit pull mesh indices"),
+                    contents: bytemuck::cast_slice(indices),
+                    usage: BufferUsages::INDEX,
+                }),
+            )
+        });
         commands.entity(e).insert(PullMeshGpu {
             vertices: render_device.create_buffer_with_data(&BufferInitDescriptor {
                 label: Some("unit pull mesh"),
                 contents: bytemuck::cast_slice(&mesh.corners),
                 usage: BufferUsages::STORAGE,
             }),
+            shared,
             count: mesh.corners.len() as u32,
             bucket: mesh.bucket,
         });
@@ -638,6 +805,8 @@ fn extract_pull_meshes(
 #[derive(Component)]
 pub struct PulledBucketGpu {
     pub bind_group: BindGroup,
+    /// The index list of an indexed camera draw (`PullMeshGpu::indexed`).
+    pub index: Option<Buffer>,
     /// The same group for drawing into each sun shadow cascade: it binds
     /// that cascade's set of the bucket table, so the bucket's draw reads
     /// the cascade's caster list for its kind.
@@ -652,6 +821,8 @@ pub struct PulledBucketGpu {
 #[derive(Resource, Default)]
 pub struct GpuUnitInput {
     enabled: bool,
+    /// The pose pass is on (`GpuSyncConfig::pose_pass`).
+    pub pose_pass: bool,
     records: Vec<GpuSoldier>,
     fresh: bool,
     n: u32,
@@ -673,8 +844,10 @@ pub struct GpuUnitInput {
 /// Swap the snapshot into the render world and copy the small per-frame
 /// inputs. Mutable main world access is what makes the swap possible.
 fn extract_gpu_units(mut main_world: ResMut<MainWorld>, mut input: ResMut<GpuUnitInput>) {
-    let enabled = main_world.resource::<GpuSyncConfig>().enabled;
+    let cfg = *main_world.resource::<GpuSyncConfig>();
+    let enabled = cfg.enabled;
     input.enabled = enabled;
+    input.pose_pass = cfg.pose_pass;
     {
         // Drained in every mode, so the list cannot grow on the CPU path.
         let mut corpses = main_world.resource_mut::<Corpses>();
@@ -708,12 +881,22 @@ fn extract_gpu_units(mut main_world: ResMut<MainWorld>, mut input: ResMut<GpuUni
     }
 }
 
-/// The compute pipelines and their bind group layout.
+/// The compute pipelines and their bind group layouts.
 #[derive(Resource)]
 pub(crate) struct GpuUnitPipelines {
     build: CachedComputePipelineId,
     finalize: CachedComputePipelineId,
     layout: BindGroupLayoutDescriptor,
+    pose: CachedComputePipelineId,
+    /// Group 0 of the pose pass: its uniform, the records, the pose
+    /// sources, the build counters, Bevy's globals.
+    pose_layout: BindGroupLayoutDescriptor,
+    /// Groups 1 and 2 of the pose pass: the pose shader binds its kind's
+    /// rig at group 3, where the draws have it.
+    empty_layout: BindGroupLayoutDescriptor,
+    /// Group 3 of the pose pass, per kind: the rig, the shot tables, the
+    /// kind's pose buffer, the kind.
+    kind_layout: BindGroupLayoutDescriptor,
 }
 
 fn init_gpu_unit_pipelines(
@@ -729,6 +912,8 @@ fn init_gpu_unit_pipelines(
                 binding_types::uniform_buffer::<BuildParams>(false),
                 binding_types::storage_buffer_read_only_sized(false, None),
                 binding_types::storage_buffer_read_only_sized(false, None),
+                binding_types::storage_buffer_sized(false, None),
+                binding_types::storage_buffer_sized(false, None),
                 binding_types::storage_buffer_sized(false, None),
                 binding_types::storage_buffer_sized(false, None),
                 binding_types::storage_buffer_sized(false, None),
@@ -751,10 +936,55 @@ fn init_gpu_unit_pipelines(
     let build = pipeline_cache.queue_compute_pipeline(descriptor("unit build", "build"));
     let finalize =
         pipeline_cache.queue_compute_pipeline(descriptor("unit build finalize", "finalize"));
+
+    let pose_layout = BindGroupLayoutDescriptor::new(
+        "unit pose layout",
+        &BindGroupLayoutEntries::sequential(
+            ShaderStages::COMPUTE,
+            (
+                binding_types::uniform_buffer::<PoseParams>(false),
+                binding_types::storage_buffer_read_only_sized(false, None),
+                binding_types::storage_buffer_read_only_sized(false, None),
+                binding_types::storage_buffer_read_only_sized(false, None),
+                binding_types::uniform_buffer::<GlobalsUniform>(false),
+            ),
+        ),
+    );
+    let empty_layout = BindGroupLayoutDescriptor::new("unit pose empty layout", &[]);
+    let kind_layout = BindGroupLayoutDescriptor::new(
+        "unit pose kind layout",
+        &BindGroupLayoutEntries::with_indices(
+            ShaderStages::COMPUTE,
+            (
+                (6, binding_types::uniform_buffer_sized(false, None)),
+                (7, binding_types::storage_buffer_read_only_sized(false, None)),
+                (9, binding_types::storage_buffer_sized(false, None)),
+                (10, binding_types::uniform_buffer::<UVec4>(false)),
+            ),
+        ),
+    );
+    let pose = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+        label: Some("unit pose".into()),
+        layout: vec![
+            pose_layout.clone(),
+            empty_layout.clone(),
+            empty_layout.clone(),
+            kind_layout.clone(),
+        ],
+        immediate_size: 0,
+        shader: load_embedded_asset!(asset_server.as_ref(), "shaders/unit_pose_pass.wgsl"),
+        shader_defs: vec!["UNIT_POSE_WRITE".into()],
+        entry_point: Some("pose".into()),
+        zero_initialize_workgroup_memory: false,
+    });
     commands.insert_resource(GpuUnitPipelines {
         build,
         finalize,
         layout,
+        pose,
+        pose_layout,
+        empty_layout,
+        kind_layout,
     });
 }
 
@@ -779,9 +1009,22 @@ pub struct UnitAlloc {
     pub ring_base: u32,
     counts: Buffer,
     pub args: Buffer,
+    /// Per bucket, the arguments of its indexed camera draw: five words,
+    /// index count, soldiers, then zeros.
+    pub indexed_args: Buffer,
     regiments: Buffer,
     regiments_cap: usize,
     pub bucket_info: Buffer,
+    /// Per pose slot, the record it poses: a region per kind of
+    /// `kind_cap + CORPSE_CAP` entries, since a soldier or a body takes at
+    /// most one slot a frame (unit_build.wgsl `list_entry`).
+    pose_src: Buffer,
+    pose_src_base: [u32; NUM_KINDS],
+    /// Per kind, each drawn soldier's pose (shaders/unit_pose.wgsl):
+    /// `pose_stride` slots of four floats per pose slot. One buffer per
+    /// kind keeps each binding a kind's size.
+    pub poses: [Buffer; NUM_KINDS],
+    pose_stride: [u32; NUM_KINDS],
 }
 
 fn storage_buffer(device: &RenderDevice, label: &str, bytes: usize, extra: BufferUsages) -> Buffer {
@@ -794,7 +1037,13 @@ fn storage_buffer(device: &RenderDevice, label: &str, bytes: usize, extra: Buffe
 }
 
 impl UnitAlloc {
-    fn new(device: &RenderDevice, live_cap: usize, kind_cap: [usize; NUM_KINDS]) -> Self {
+    /// `pose_stride` is zero for every kind with the pose pass off.
+    fn new(
+        device: &RenderDevice,
+        live_cap: usize,
+        kind_cap: [usize; NUM_KINDS],
+        pose_stride: [u32; NUM_KINDS],
+    ) -> Self {
         let mut bases = [0u32; NUM_BUCKETS];
         let mut total = 0usize;
         for kind in 0..NUM_KINDS {
@@ -813,6 +1062,20 @@ impl UnitAlloc {
         let ring_base = total as u32;
         total += live_cap;
         let regiments_cap = 256;
+        let mut pose_src_base = [0u32; NUM_KINDS];
+        let mut sources = 0usize;
+        for (kind, base) in pose_src_base.iter_mut().enumerate() {
+            *base = sources as u32;
+            sources += kind_cap[kind] + CORPSE_CAP;
+        }
+        let limit = device.limits().max_storage_buffer_binding_size as usize;
+        let poses = std::array::from_fn(|kind| {
+            let bytes = (kind_cap[kind] + CORPSE_CAP) * pose_stride[kind] as usize * 16;
+            if bytes > limit {
+                error!("unit poses of kind {kind}: {bytes} bytes, past the device's {limit} per binding");
+            }
+            storage_buffer(device, "unit poses", bytes, BufferUsages::empty())
+        });
         Self {
             soldiers: storage_buffer(
                 device,
@@ -837,8 +1100,14 @@ impl UnitAlloc {
             args: storage_buffer(
                 device,
                 "unit draw args",
-                DRAW_ARGS * 16,
+                (DRAW_ARGS + NUM_KINDS) * 16,
                 BufferUsages::INDIRECT | BufferUsages::COPY_DST,
+            ),
+            indexed_args: storage_buffer(
+                device,
+                "unit indexed draw args",
+                NUM_BUCKETS * 20,
+                BufferUsages::INDIRECT,
             ),
             regiments: storage_buffer(
                 device,
@@ -853,6 +1122,10 @@ impl UnitAlloc {
                 (1 + MAX_CASCADES) * BUCKET_SET_BYTES as usize,
                 BufferUsages::COPY_DST,
             ),
+            pose_src: storage_buffer(device, "unit pose sources", sources * 4, BufferUsages::empty()),
+            pose_src_base,
+            poses,
+            pose_stride,
         }
     }
 }
@@ -869,6 +1142,19 @@ pub struct GpuUnitBuffers {
     pub generation: u32,
     /// Threads of this frame's build dispatch.
     threads: u32,
+    /// The pose pass runs this frame: the build hands out pose slots.
+    pose_pass: bool,
+    pose_params: UniformBuffer<PoseParams>,
+    /// The pose pass's group 0, and the globals buffer it holds.
+    pose_group: Option<BindGroup>,
+    bound_globals: Option<BufferId>,
+    /// Groups 1 and 2 of the pose pass.
+    empty_group: Option<BindGroup>,
+    /// Per kind, the pose pass's group 3, made for `kind_generation`.
+    kind_groups: Vec<BindGroup>,
+    kind_generation: u32,
+    /// Per kind, `UVec4(kind, 0, 0, 0)` for group 3 binding 10.
+    kind_uniforms: Vec<Buffer>,
 }
 
 /// Upload the snapshot when a new one arrived, the small per-frame inputs
@@ -878,11 +1164,12 @@ fn prepare_gpu_units(
     mut input: ResMut<GpuUnitInput>,
     mut buffers: ResMut<GpuUnitBuffers>,
     meshes: Query<&PullMeshGpu>,
+    rigs: Query<(&ExtractedBucket, &UnitRig, &RigBuffer)>,
     pipelines: Res<GpuUnitPipelines>,
     pipeline_cache: Res<PipelineCache>,
-    device: Res<RenderDevice>,
-    queue: Res<RenderQueue>,
+    (device, queue): (Res<RenderDevice>, Res<RenderQueue>),
     gpu_buffers: Res<RenderAssets<GpuShaderBuffer>>,
+    globals: Res<GlobalsBuffer>,
 ) {
     if !input.enabled {
         return;
@@ -890,8 +1177,22 @@ fn prepare_gpu_units(
     let t0 = std::time::Instant::now();
     let n = input.n as usize;
     let kind_needed = input.kind_counts.map(|c| c as usize);
+    // Pose slots per soldier of each kind: more for a kind with a bow rig.
+    let mut pose_stride = [0; NUM_KINDS];
+    if input.pose_pass {
+        pose_stride = [POSE_SLOTS; NUM_KINDS];
+        for (bucket, rig, _) in &rigs {
+            if rig.rig.bow.params[3] > 0.5 {
+                pose_stride[bucket.0 / NUM_LODS] = POSE_SLOTS_BOW;
+            }
+        }
+    }
     let grow = match &buffers.alloc {
-        Some(a) => a.live_cap < n || a.kind_cap.iter().zip(kind_needed).any(|(cap, need)| *cap < need),
+        Some(a) => {
+            a.live_cap < n
+                || a.kind_cap.iter().zip(kind_needed).any(|(cap, need)| *cap < need)
+                || a.pose_stride != pose_stride
+        }
         None => true,
     };
     if grow {
@@ -899,12 +1200,13 @@ fn prepare_gpu_units(
         let old = buffers.alloc.as_ref().map_or([0; NUM_KINDS], |a| a.kind_cap);
         let kind_cap = std::array::from_fn(|k| old[k].max(kind_needed[k]).max(256));
         info!(
-            "unit gpu buffers: {live_cap} soldiers, index slots per kind {:?}",
+            "unit gpu buffers: {live_cap} soldiers, index slots per kind {:?}, pose slots per soldier {pose_stride:?}",
             kind_cap.map(|c| c + CORPSE_CAP)
         );
-        buffers.alloc = Some(UnitAlloc::new(&device, live_cap, kind_cap));
+        buffers.alloc = Some(UnitAlloc::new(&device, live_cap, kind_cap, pose_stride));
         buffers.generation += 1;
         buffers.bind_group = None;
+        buffers.pose_group = None;
     }
     let buffers = &mut *buffers;
     let alloc = buffers.alloc.as_mut().expect("allocated above");
@@ -964,9 +1266,10 @@ fn prepare_gpu_units(
     let mut info = [[[0u32; 4]; NUM_BUCKETS]; 1 + MAX_CASCADES];
     for mesh in &meshes {
         let b = mesh.bucket;
-        info[0][b] = [alloc.bases[b], mesh.count, 0, 0];
+        let stride = alloc.pose_stride[b / NUM_LODS];
+        info[0][b] = [alloc.bases[b], mesh.count, stride, 0];
         for c in 0..MAX_CASCADES {
-            info[1 + c][b] = [alloc.shadow_bases[c][b / NUM_LODS], mesh.count, 0, 0];
+            info[1 + c][b] = [alloc.shadow_bases[c][b / NUM_LODS], mesh.count, stride, 0];
         }
     }
     queue.write_buffer(&alloc.bucket_info, 0, bytemuck::cast_slice(&info));
@@ -982,9 +1285,17 @@ fn prepare_gpu_units(
             info[0][kind * NUM_LODS + levels[kind] as usize][1]
         }))
     });
+    params.pose_src_base = UVec4::from_array(alloc.pose_src_base);
+    params.pose_pass = input.pose_pass as u32;
     buffers.params.set(params);
     buffers.params.write_buffer(&device, &queue);
     buffers.threads = n as u32 + input.corpse_len.iter().sum::<u32>();
+    buffers.pose_pass = input.pose_pass;
+    buffers.pose_params.set(PoseParams {
+        src_base: UVec4::from_array(alloc.pose_src_base),
+        stride: UVec4::from_array(alloc.pose_stride),
+    });
+    buffers.pose_params.write_buffer(&device, &queue);
 
     // The readback asset arrives a frame or two after startup. No bind
     // group until then, so the pass waits and nothing draws.
@@ -1010,13 +1321,97 @@ fn prepare_gpu_units(
                 alloc.counts.as_entire_binding(),
                 alloc.args.as_entire_binding(),
                 readback.buffer.as_entire_binding(),
+                alloc.pose_src.as_entire_binding(),
+                alloc.indexed_args.as_entire_binding(),
             )),
         ));
+    }
+    if buffers.pose_pass {
+        prepare_pose_groups(buffers, &rigs, &pipelines, &pipeline_cache, &device, &globals);
     }
     crate::render_units::PREPARE_US.fetch_add(
         t0.elapsed().as_micros() as u32,
         std::sync::atomic::Ordering::Relaxed,
     );
+}
+
+/// The pose pass's bind groups: group 0 when the buffers or Bevy's globals
+/// moved, group 3 per kind when the pose buffers moved.
+fn prepare_pose_groups(
+    buffers: &mut GpuUnitBuffers,
+    rigs: &Query<(&ExtractedBucket, &UnitRig, &RigBuffer)>,
+    pipelines: &GpuUnitPipelines,
+    pipeline_cache: &PipelineCache,
+    device: &RenderDevice,
+    globals: &GlobalsBuffer,
+) {
+    let Some(alloc) = &buffers.alloc else {
+        return;
+    };
+    let Some(globals_binding) = globals.buffer.binding() else {
+        return;
+    };
+    let globals_id = globals.buffer.buffer().map(|b| b.id());
+    if buffers.pose_group.is_none() || buffers.bound_globals != globals_id {
+        buffers.bound_globals = globals_id;
+        buffers.pose_group = Some(device.create_bind_group(
+            "unit pose bind group",
+            &pipeline_cache.get_bind_group_layout(&pipelines.pose_layout),
+            &BindGroupEntries::sequential((
+                buffers.pose_params.binding().expect("written above"),
+                alloc.records.as_entire_binding(),
+                alloc.pose_src.as_entire_binding(),
+                alloc.counts.as_entire_binding(),
+                globals_binding,
+            )),
+        ));
+    }
+    if buffers.empty_group.is_none() {
+        buffers.empty_group = Some(device.create_bind_group(
+            "unit pose empty bind group",
+            &pipeline_cache.get_bind_group_layout(&pipelines.empty_layout),
+            &[],
+        ));
+    }
+    if buffers.kind_uniforms.is_empty() {
+        buffers.kind_uniforms = (0..NUM_KINDS as u32)
+            .map(|kind| {
+                device.create_buffer_with_data(&BufferInitDescriptor {
+                    label: Some("unit pose kind"),
+                    contents: bytemuck::bytes_of(&[kind, 0, 0, 0]),
+                    usage: BufferUsages::UNIFORM,
+                })
+            })
+            .collect();
+    }
+    if buffers.kind_groups.len() == NUM_KINDS && buffers.kind_generation == buffers.generation {
+        return;
+    }
+    // Every level of a kind binds the same rig: take the first found.
+    let mut kind_rigs: [Option<&RigBuffer>; NUM_KINDS] = [None; NUM_KINDS];
+    for (bucket, _, rig) in rigs {
+        kind_rigs[bucket.0 / NUM_LODS].get_or_insert(rig);
+    }
+    let layout = pipeline_cache.get_bind_group_layout(&pipelines.kind_layout);
+    let groups: Option<Vec<BindGroup>> = (0..NUM_KINDS)
+        .map(|kind| {
+            let rig = kind_rigs[kind]?;
+            Some(device.create_bind_group(
+                "unit pose kind bind group",
+                &layout,
+                &BindGroupEntries::with_indices((
+                    (6, rig.rig.as_entire_binding()),
+                    (7, rig.clips.as_entire_binding()),
+                    (9, alloc.poses[kind].as_entire_binding()),
+                    (10, buffers.kind_uniforms[kind].as_entire_binding()),
+                )),
+            ))
+        })
+        .collect();
+    if let Some(groups) = groups {
+        buffers.kind_groups = groups;
+        buffers.kind_generation = buffers.generation;
+    }
 }
 
 /// Group 3 of every pulled bucket, rebuilt when the shared buffers moved.
@@ -1047,14 +1442,20 @@ fn prepare_pull_bind_groups(
         let (view, sampler, atlas_settled) = custom_pipeline.atlas_for(atlas, &images);
         let layout = pipeline_cache.get_bind_group_layout(&custom_pipeline.pull_layout);
         // Set 0 of the bucket table is the camera's, set 1 + c cascade c's.
+        // Only the camera's draw can be indexed: the casters stay on the
+        // expanded corners.
         let group = |set: u64| {
+            let corners = match (&mesh.shared, set) {
+                (Some((vertices, _)), 0) => vertices,
+                _ => &mesh.vertices,
+            };
             device.create_bind_group(
                 "unit pull bind group",
                 &layout,
                 &BindGroupEntries::with_indices((
                     (0, alloc.records.as_entire_binding()),
                     (1, alloc.index_list.as_entire_binding()),
-                    (2, mesh.vertices.as_entire_binding()),
+                    (2, corners.as_entire_binding()),
                     (
                         3,
                         BufferBinding {
@@ -1068,11 +1469,13 @@ fn prepare_pull_bind_groups(
                     (6, rig.rig.as_entire_binding()),
                     (7, rig.clips.as_entire_binding()),
                     (8, sun.clone()),
+                    (9, alloc.poses[mesh.bucket / NUM_LODS].as_entire_binding()),
                 )),
             )
         };
         commands.entity(entity).insert(PulledBucketGpu {
             bind_group: group(0),
+            index: mesh.shared.as_ref().map(|(_, indices)| indices.clone()),
             shadow: (1..=MAX_CASCADES as u64).map(group).collect(),
             generation: buffers.generation,
             atlas_settled,
@@ -1081,11 +1484,13 @@ fn prepare_pull_bind_groups(
     }
 }
 
-/// The compute pass, recorded into the frame's encoder before the sun's
+/// The compute passes, recorded into the frame's encoder before the sun's
 /// shadow pass and the main passes of the view: clear the counters, build
-/// every soldier, turn the counts into draw arguments. The shadow cascades
-/// draw from the same lists (render_units_shadow.rs), so the pass must come
-/// first or they draw last frame's.
+/// every soldier, turn the counts into draw arguments, then pose each drawn
+/// soldier once per kind. The shadow cascades draw from the same lists
+/// (render_units_shadow.rs), so the passes must come first or they draw
+/// last frame's. Until every pipeline and bind group is ready nothing runs,
+/// and the draws keep last frame's lists, records and poses together.
 pub(crate) fn run_unit_build_pass(
     buffers: Res<GpuUnitBuffers>,
     pipelines: Res<GpuUnitPipelines>,
@@ -1100,6 +1505,19 @@ pub(crate) fn run_unit_build_pass(
         pipeline_cache.get_compute_pipeline(pipelines.finalize),
     ) else {
         return;
+    };
+    let pose = match buffers.pose_pass {
+        true => match (
+            pipeline_cache.get_compute_pipeline(pipelines.pose),
+            &buffers.pose_group,
+            &buffers.empty_group,
+        ) {
+            (Some(pose), Some(group), Some(empty)) if buffers.kind_groups.len() == NUM_KINDS => {
+                Some((pose, group, empty))
+            }
+            _ => return,
+        },
+        false => None,
     };
     let diagnostics = ctx.diagnostic_recorder();
     let diagnostics = diagnostics.as_deref();
@@ -1119,6 +1537,26 @@ pub(crate) fn run_unit_build_pass(
     pass.set_pipeline(finalize);
     pass.dispatch_workgroups(1, 1, 1);
     span.end(&mut pass);
+    drop(pass);
+
+    let Some((pose, group, empty)) = pose else {
+        return;
+    };
+    let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
+        label: Some("unit pose"),
+        timestamp_writes: None,
+    });
+    // Shows up in the overlay's GPU list as `unit_pose`.
+    let span = diagnostics.pass_span(&mut pass, "unit_pose");
+    pass.set_pipeline(pose);
+    pass.set_bind_group(0, &**group, &[]);
+    pass.set_bind_group(1, &**empty, &[]);
+    pass.set_bind_group(2, &**empty, &[]);
+    for (kind, kind_group) in buffers.kind_groups.iter().enumerate() {
+        pass.set_bind_group(3, &**kind_group, &[]);
+        pass.dispatch_workgroups_indirect(&alloc.args, ((POSE_ARG + kind) * 16) as u64);
+    }
+    span.end(&mut pass);
 }
 
 pub struct GpuUnitRenderPlugin;
@@ -1126,6 +1564,7 @@ pub struct GpuUnitRenderPlugin;
 impl Plugin for GpuUnitRenderPlugin {
     fn build(&self, app: &mut App) {
         embedded_asset!(app, "shaders/unit_build.wgsl");
+        embedded_asset!(app, "shaders/unit_pose_pass.wgsl");
         app.init_resource::<SoldierSnapshot>()
             .init_resource::<GpuFrameInput>()
             .add_systems(Startup, setup_counts_readback.run_if(gpu_sync))
@@ -1164,6 +1603,7 @@ impl Plugin for GpuUnitRenderPlugin {
     fn finish(&self, app: &mut App) {
         let requested = !std::env::var("FL_GPU_SYNC").is_ok_and(|v| v == "0");
         let check = std::env::var("FL_GPU_CHECK").is_ok();
+        let pose_pass = !std::env::var("FL_POSE_PASS").is_ok_and(|v| v == "0");
         let supported = match (
             app.world().get_resource::<RenderAdapter>(),
             app.world().get_resource::<RenderDevice>(),
@@ -1173,12 +1613,14 @@ impl Plugin for GpuUnitRenderPlugin {
                     .get_downlevel_capabilities()
                     .flags
                     .contains(DownlevelFlags::VERTEX_STORAGE)
-                    && device.limits().max_storage_buffers_per_shader_stage >= 8
+                    && device.limits().max_storage_buffers_per_shader_stage >= STORAGE_BUFFERS
             }
             _ => false,
         };
         if requested && !supported {
-            warn!("this device lacks vertex storage buffers: the CPU unit path runs instead");
+            warn!(
+                "this device lacks vertex storage buffers or allows fewer than {STORAGE_BUFFERS} per stage: the CPU unit path runs instead"
+            );
         }
         if requested && supported {
             info!("unit render data built on the GPU (FL_GPU_SYNC=0 for the CPU path)");
@@ -1186,9 +1628,13 @@ impl Plugin for GpuUnitRenderPlugin {
         if check && requested && supported {
             info!("FL_GPU_CHECK: the CPU sweep runs too, counts compared per frame");
         }
+        if requested && supported && !pose_pass {
+            info!("FL_POSE_PASS=0: each corner poses itself");
+        }
         app.insert_resource(GpuSyncConfig {
             enabled: requested && supported,
             check,
+            pose_pass,
         });
     }
 }
@@ -1196,4 +1642,78 @@ impl Plugin for GpuUnitRenderPlugin {
 /// Which bucket entity draws pulled: every unit bucket in GPU mode.
 pub fn pull_mesh_for(mesh: &Mesh, bucket: &InstanceBucket, cfg: &GpuSyncConfig) -> Option<PullMesh> {
     cfg.enabled.then(|| PullMesh::from_mesh(mesh, bucket.0)).flatten()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Vertices shaded per triangle with a first-in first-out cache.
+    fn shaded_per_triangle(indices: &[u32], cache: usize) -> f32 {
+        let mut fifo = std::collections::VecDeque::new();
+        let mut shaded = 0;
+        for &i in indices {
+            if fifo.contains(&i) {
+                continue;
+            }
+            shaded += 1;
+            fifo.push_back(i);
+            if fifo.len() > cache {
+                fifo.pop_front();
+            }
+        }
+        shaded as f32 / (indices.len() / 3) as f32
+    }
+
+    /// A grid of quads, two triangles each, listed column by column so
+    /// neighbouring triangles are far apart in the list.
+    fn grid(n: u32) -> Vec<u32> {
+        let mut out = Vec::new();
+        for x in 0..n {
+            for y in 0..n {
+                let v = |x: u32, y: u32| y * (n + 1) + x;
+                out.extend([v(x, y), v(x + 1, y), v(x, y + 1)]);
+                out.extend([v(x + 1, y), v(x + 1, y + 1), v(x, y + 1)]);
+            }
+        }
+        out
+    }
+
+    fn sorted_triangles(indices: &[u32]) -> Vec<[u32; 3]> {
+        let mut tris: Vec<[u32; 3]> = indices
+            .chunks(3)
+            .map(|t| {
+                let mut t = [t[0], t[1], t[2]];
+                t.sort();
+                t
+            })
+            .collect();
+        tris.sort();
+        tris
+    }
+
+    #[test]
+    fn tipsify_keeps_the_triangles_and_reuses_vertices() {
+        let n = 30;
+        let indices = grid(n);
+        let vertices = ((n + 1) * (n + 1)) as usize;
+        let ordered = tipsify(&indices, vertices, VERTEX_CACHE);
+        assert_eq!(sorted_triangles(&ordered), sorted_triangles(&indices));
+        // Each triangle keeps its winding: its corners in the same cyclic order.
+        let windings = |list: &[u32]| {
+            let mut w: Vec<[u32; 3]> = list
+                .chunks(3)
+                .map(|t| {
+                    let r = (0..3).min_by_key(|&k| t[k]).unwrap();
+                    [t[r], t[(r + 1) % 3], t[(r + 2) % 3]]
+                })
+                .collect();
+            w.sort();
+            w
+        };
+        assert_eq!(windings(&ordered), windings(&indices));
+        let before = shaded_per_triangle(&indices, VERTEX_CACHE);
+        let after = shaded_per_triangle(&ordered, VERTEX_CACHE);
+        assert!(after < 0.8 * before, "{before} to {after}");
+    }
 }
