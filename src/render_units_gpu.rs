@@ -95,6 +95,11 @@ const POSE_ARG: usize = DRAW_ARGS;
 /// lists, the ring count, then the pose slots taken per kind.
 const COUNTERS: usize = 2 * NUM_BUCKETS + CASTER_LISTS + 1 + NUM_KINDS;
 
+/// Storage buffers the build pass binds (`init_gpu_unit_pipelines`), more
+/// than any other unit pass. A device that allows fewer per stage keeps the
+/// CPU path.
+const STORAGE_BUFFERS: u32 = 10;
+
 /// Pose slots (four floats each) per soldier of a kind without a bow rig,
 /// and of one with it (`POSE_SLOTS` and `POSE_SLOTS_BOW` in
 /// shaders/unit_pose.wgsl).
@@ -1608,12 +1613,14 @@ impl Plugin for GpuUnitRenderPlugin {
                     .get_downlevel_capabilities()
                     .flags
                     .contains(DownlevelFlags::VERTEX_STORAGE)
-                    && device.limits().max_storage_buffers_per_shader_stage >= 8
+                    && device.limits().max_storage_buffers_per_shader_stage >= STORAGE_BUFFERS
             }
             _ => false,
         };
         if requested && !supported {
-            warn!("this device lacks vertex storage buffers: the CPU unit path runs instead");
+            warn!(
+                "this device lacks vertex storage buffers or allows fewer than {STORAGE_BUFFERS} per stage: the CPU unit path runs instead"
+            );
         }
         if requested && supported {
             info!("unit render data built on the GPU (FL_GPU_SYNC=0 for the CPU path)");
