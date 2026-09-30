@@ -38,6 +38,7 @@ mod units;
 mod util;
 mod vegetation;
 mod water;
+mod window_icon;
 
 use bevy::prelude::*;
 use bevy::render::RenderPlugin;
@@ -84,6 +85,12 @@ fn main() {
                 .set(WindowPlugin {
                     primary_window: Some(Window {
                         title: "flanks".into(),
+                        // The app name (X11 WM_CLASS, Wayland app id) a
+                        // desktop entry matches with StartupWMClass.
+                        name: Some("flanks".into()),
+                        // Shown once it has its icon (window_icon.rs): the
+                        // dock takes the icon a window has when it appears.
+                        visible: false,
                         // Default vsync off: the FPS overlay should
                         // show real headroom.
                         present_mode: settings::present_mode(&user_settings),
@@ -107,6 +114,7 @@ fn main() {
         .add_plugins(game_state::GameShellPlugin)
         .add_plugins(settings::SettingsPlugin)
         .add_plugins(battle_setup::BattleSetupPlugin)
+        .add_plugins(window_icon::WindowIconPlugin)
         .add_plugins((
             terrain::TerrainPlugin,
             water::WaterPlugin,

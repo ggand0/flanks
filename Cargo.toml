@@ -22,6 +22,15 @@ serde_yaml_ng = "0.10.0"
 # bevy does not re-export wgpu's query set types. The same wgpu bevy 0.19
 # builds on, no features of its own, so this costs no extra build.
 wgpu = { version = "29", default-features = false }
+# The game window's icon (src/window_icon.rs): bevy does not re-export
+# winit's icon type. The same winit bevy 0.19 builds on, no features of its
+# own, so this costs no extra build.
+winit = { version = "0.30", default-features = false }
+
+[build-dependencies]
+# Embeds the icon in the Windows executable (build.rs), with MSVC and with
+# mingw, native or cross.
+embed-resource = "3"
 
 [features]
 # Profiling: `cargo run --profile opt-dev --features tracy`, then attach

@@ -4,3 +4,4 @@ Exec=flanks
 Icon=flanks
 Type=Application
 Categories=Game;StrategyGame;
+StartupWMClass=flanks
