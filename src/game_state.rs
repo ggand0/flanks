@@ -240,12 +240,17 @@ fn test_battles_closed(open: Query<(), With<TestBattlesRoot>>) -> bool {
     open.is_empty()
 }
 
-#[derive(Component)]
-enum OptionButton {
-    ArmySize,
-    Ai,
-    Map,
+/// One button of a segmented menu row, with its index into that row's
+/// values (`ARMY_SIZES`, `MapKind::ALL`, `AI_VALUES`).
+#[derive(Component, Clone, Copy)]
+enum Segment {
+    Army(usize),
+    Map(usize),
+    Ai(usize),
 }
+
+/// The AI row: index 0 turns the enemy AI on.
+const AI_VALUES: [&str; 2] = ["On", "Off"];
 
 #[derive(Component)]
 struct DebugButton(Scenario);
@@ -307,7 +312,7 @@ impl Plugin for GameShellPlugin {
                     // its backdrop blocks picking, and the gate keeps
                     // the keyboard shortcuts (Enter/Space/ESC) from
                     // acting behind it.
-                    (menu_buttons, menu_option_buttons)
+                    (menu_buttons, menu_segments, segment_style)
                         .run_if(
                             in_state(GameState::Menu)
                                 .and_then(crate::settings::settings_closed)
@@ -338,6 +343,8 @@ pub const PANEL_BG: Color = Color::srgba(0.05, 0.06, 0.08, 0.92);
 pub const BTN_NORMAL: Color = Color::srgba(0.15, 0.16, 0.20, 0.92);
 pub const BTN_HOVER: Color = Color::srgba(0.25, 0.27, 0.32, 0.95);
 pub const BTN_PRESSED: Color = Color::srgba(0.10, 0.11, 0.14, 0.95);
+/// The current value of a segmented row or chip group.
+pub const BTN_ACTIVE: Color = Color::srgba(0.22, 0.38, 0.62, 0.95);
 
 pub fn fullscreen_overlay() -> Node {
     Node {
@@ -379,21 +386,35 @@ pub fn spawn_text_button(p: &mut ChildSpawnerCommands, label: &str, marker: impl
 // ── Menu ──
 
 const ARMY_SIZES: &[(usize, &str)] = &[
+    (5_000, "10k"),
     (10_000, "20k"),
     (25_000, "50k"),
     (50_000, "100k"),
     (100_000, "200k"),
 ];
 
-fn army_size_label(per_team: usize) -> &'static str {
-    ARMY_SIZES
-        .iter()
-        .find(|(n, _)| *n == per_team)
-        .map(|(_, s)| *s)
-        .unwrap_or("200k")
+/// Set the army size per team. The regiment size and the slot budget
+/// follow it, so both compositions reset (stale counts could overflow
+/// the new slot total); picking the current size keeps them.
+fn set_army_size(config: &mut BattleConfig, per_team: usize) {
+    if config.units_per_team == per_team {
+        return;
+    }
+    config.units_per_team = per_team;
+    // Smaller armies field smaller units, so a 10k battle still has 25
+    // units a side to maneuver.
+    config.reg_size = if per_team <= 5_000 {
+        200
+    } else if per_team <= 10_000 {
+        500
+    } else {
+        1000
+    };
+    config.player_regs = crate::regiments::frac_comp(config.n_slots());
+    config.enemy = EnemyComp::Random;
 }
 
-fn spawn_menu(mut commands: Commands, config: Res<BattleConfig>) {
+fn spawn_menu(mut commands: Commands) {
     commands
         .spawn((
             fullscreen_overlay(),
@@ -436,19 +457,14 @@ fn spawn_menu(mut commands: Commands, config: Res<BattleConfig>) {
                 ..default()
             })
             .with_children(|opts| {
-                spawn_option_row(
+                spawn_segment_row(
                     opts,
                     "Army",
-                    army_size_label(config.units_per_team),
-                    OptionButton::ArmySize,
+                    ARMY_SIZES.iter().map(|(_, label)| *label),
+                    Segment::Army,
                 );
-                spawn_option_row(
-                    opts,
-                    "AI",
-                    if config.ai_enabled { "On" } else { "Off" },
-                    OptionButton::Ai,
-                );
-                spawn_option_row(opts, "Map", config.map.label(), OptionButton::Map);
+                spawn_segment_row(opts, "Map", MapKind::ALL.iter().map(|m| m.label()), Segment::Map);
+                spawn_segment_row(opts, "AI", AI_VALUES.into_iter(), Segment::Ai);
             });
 
             spawn_text_button(p, "Start Battle", MenuButton::StartBattle);
@@ -491,49 +507,76 @@ fn spawn_menu(mut commands: Commands, config: Res<BattleConfig>) {
         });
 }
 
-fn spawn_option_row(p: &mut ChildSpawnerCommands, label: &str, value: &str, btn: OptionButton) {
-    p.spawn(Node {
+/// A menu option shown as a row of buttons, one per value, the current
+/// one lit (`segment_style`).
+fn spawn_segment_row<'a>(
+    p: &mut ChildSpawnerCommands,
+    label: &str,
+    values: impl Iterator<Item = &'a str>,
+    segment: fn(usize) -> Segment,
+) {
+    p.spawn(option_row_node()).with_children(|row| {
+        spawn_option_label(row, label);
+        row.spawn(Node {
+            column_gap: Val::Px(2.0),
+            ..default()
+        })
+        .with_children(|segments| {
+            for (i, value) in values.enumerate() {
+                segments
+                    .spawn((
+                        Button,
+                        Node {
+                            padding: UiRect::axes(Val::Px(12.0), Val::Px(6.0)),
+                            justify_content: JustifyContent::Center,
+                            align_items: AlignItems::Center,
+                            ..default()
+                        },
+                        BackgroundColor(BTN_NORMAL),
+                        CustomStyled,
+                        segment(i),
+                    ))
+                    .with_children(|b| {
+                        spawn_option_text(b, value);
+                    });
+            }
+        });
+    });
+}
+
+fn option_row_node() -> Node {
+    Node {
         flex_direction: FlexDirection::Row,
         align_items: AlignItems::Center,
         margin: UiRect::vertical(Val::Px(4.0)),
         ..default()
-    })
-    .with_children(|row| {
-        row.spawn((
-            Text::new(format!("{label}:")),
-            TextFont {
-                font_size: FontSize::Px(15.0),
-                ..default()
-            },
-            TextColor(DIM_TEXT_COLOR),
-            Node {
-                width: Val::Px(80.0),
-                ..default()
-            },
-        ));
-        row.spawn((
-            Button,
-            Node {
-                padding: UiRect::axes(Val::Px(16.0), Val::Px(6.0)),
-                min_width: Val::Px(100.0),
-                justify_content: JustifyContent::Center,
-                align_items: AlignItems::Center,
-                ..default()
-            },
-            BackgroundColor(BTN_NORMAL),
-            btn,
-        ))
-        .with_children(|b| {
-            b.spawn((
-                Text::new(value.to_string()),
-                TextFont {
-                    font_size: FontSize::Px(15.0),
-                    ..default()
-                },
-                TextColor(TEXT_COLOR),
-            ));
-        });
-    });
+    }
+}
+
+fn spawn_option_label(row: &mut ChildSpawnerCommands, label: &str) {
+    row.spawn((
+        Text::new(format!("{label}:")),
+        TextFont {
+            font_size: FontSize::Px(15.0),
+            ..default()
+        },
+        TextColor(DIM_TEXT_COLOR),
+        Node {
+            width: Val::Px(80.0),
+            ..default()
+        },
+    ));
+}
+
+fn spawn_option_text(button: &mut ChildSpawnerCommands, value: &str) {
+    button.spawn((
+        Text::new(value.to_string()),
+        TextFont {
+            font_size: FontSize::Px(15.0),
+            ..default()
+        },
+        TextColor(TEXT_COLOR),
+    ));
 }
 
 /// Where Start Battle goes: normal battles pass through the Select
@@ -600,46 +643,49 @@ fn menu_buttons(
     }
 }
 
-fn menu_option_buttons(
-    query: Query<(&Interaction, &OptionButton, &Children), Changed<Interaction>>,
-    mut texts: Query<&mut Text>,
+/// A segment pressed: its row takes that value. A new map rebuilds the
+/// terrain behind the menu.
+fn menu_segments(
+    query: Query<(&Interaction, &Segment), Changed<Interaction>>,
     mut config: ResMut<BattleConfig>,
     mut maps: MessageWriter<MapChanged>,
 ) {
-    for (interaction, opt, children) in &query {
+    for (interaction, segment) in &query {
         if *interaction != Interaction::Pressed {
             continue;
         }
-        let new_label = match opt {
-            OptionButton::ArmySize => {
-                let idx = ARMY_SIZES
-                    .iter()
-                    .position(|(n, _)| *n == config.units_per_team)
-                    .map(|i| (i + 1) % ARMY_SIZES.len())
-                    .unwrap_or(0);
-                config.units_per_team = ARMY_SIZES[idx].0;
-                config.reg_size = if config.units_per_team <= 10_000 { 500 } else { 1000 };
-                // The regiment budget changed: reset both compositions
-                // (stale counts could overflow the new slot total).
-                config.player_regs = crate::regiments::frac_comp(config.n_slots());
-                config.enemy = EnemyComp::Random;
-                ARMY_SIZES[idx].1
+        match *segment {
+            Segment::Army(i) => set_army_size(&mut config, ARMY_SIZES[i].0),
+            Segment::Map(i) => {
+                let map = MapKind::ALL[i];
+                if config.map != map {
+                    config.map = map;
+                    maps.write(MapChanged(map));
+                }
             }
-            OptionButton::Ai => {
-                config.ai_enabled = !config.ai_enabled;
-                if config.ai_enabled { "On" } else { "Off" }
-            }
-            OptionButton::Map => {
-                config.map = config.map.next();
-                maps.write(MapChanged(config.map));
-                config.map.label()
-            }
-        };
-        for child in children.iter() {
-            if let Ok(mut text) = texts.get_mut(child) {
-                text.0 = new_label.to_string();
-            }
+            Segment::Ai(i) => config.ai_enabled = i == 0,
         }
+    }
+}
+
+/// Segment colours: the current value lit, the others with the usual
+/// hover and press shades.
+fn segment_style(
+    mut query: Query<(&Interaction, &Segment, &mut BackgroundColor)>,
+    config: Res<BattleConfig>,
+) {
+    for (interaction, segment, mut bg) in &mut query {
+        let current = match *segment {
+            Segment::Army(i) => ARMY_SIZES[i].0 == config.units_per_team,
+            Segment::Map(i) => MapKind::ALL[i] == config.map,
+            Segment::Ai(i) => (i == 0) == config.ai_enabled,
+        };
+        bg.0 = match interaction {
+            _ if current => BTN_ACTIVE,
+            Interaction::Pressed => BTN_PRESSED,
+            Interaction::Hovered => BTN_HOVER,
+            Interaction::None => BTN_NORMAL,
+        };
     }
 }
 

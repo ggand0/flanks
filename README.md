@@ -8,7 +8,7 @@ Every soldier on the field is individually simulated, and battles can scale up t
 ## Features
 
 - Two armies of up to 100 units each, 1,000 soldiers per unit
-- Army size selectable in the menu, from 20k to 200k soldiers in total depending on your hardware
+- Army size selectable in the menu, from 10k to 200k soldiers in total depending on your hardware
 - Customize your army before the battle, set the enemy army by hand, pick one of five styles for it or leave it random, then deploy your units inside your zone
 - Unit orders that keep formations intact: lasso or box selection, move and attack orders, battle lines drawn by dragging
 - Formations: shield wall, spear wall, loose order, hold position

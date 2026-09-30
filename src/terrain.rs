@@ -57,14 +57,8 @@ impl MapKind {
         }
     }
 
-    pub fn next(self) -> Self {
-        match self {
-            Self::Grassland => Self::Classic,
-            Self::Classic => Self::River,
-            Self::River => Self::Sandbox,
-            Self::Sandbox => Self::Grassland,
-        }
-    }
+    /// Every map, in the menu's order.
+    pub const ALL: [Self; 4] = [Self::Grassland, Self::Classic, Self::River, Self::Sandbox];
 }
 
 /// Sent by the menu when the Map row changes. The terrain regenerates
