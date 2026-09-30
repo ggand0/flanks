@@ -1,3 +1,7 @@
+// A Windows GUI program, so opening the game does not also open an empty
+// console window. Debug builds keep the console for their log.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod ai;
 mod arrows;
 mod audio;
