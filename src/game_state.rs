@@ -630,18 +630,22 @@ fn menu_buttons(
     mut exit: MessageWriter<AppExit>,
     mut auto: Local<bool>,
 ) {
-    if !*auto && (scripts_active() || Scenario::from_env() == Scenario::Demo) {
+    // Launch-time starts, looked at on the menu's first frame only: a test
+    // battle from the menu leaves its scenario's env var set, and a later
+    // visit to the menu must not start it again.
+    if !*auto {
         *auto = true;
-        next.set(GameState::Battle);
-        return;
-    }
-    // FL_AUTOSTART=1: start a normal battle without a key press (with
-    // FL_DEPLOY=0 it skips the picker and deployment too), for measured
-    // runs of the real game with the AI on.
-    if !*auto && std::env::var("FL_AUTOSTART").is_ok() {
-        *auto = true;
-        start_normal_battle(&mut config, &mut next);
-        return;
+        if scripts_active() || Scenario::from_env() == Scenario::Demo {
+            next.set(GameState::Battle);
+            return;
+        }
+        // FL_AUTOSTART=1: start a normal battle without a key press (with
+        // FL_DEPLOY=0 it skips the picker and deployment too), for
+        // measured runs of the real game with the AI on.
+        if std::env::var("FL_AUTOSTART").is_ok() {
+            start_normal_battle(&mut config, &mut next);
+            return;
+        }
     }
     if keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::Space) {
         start_normal_battle(&mut config, &mut next);
