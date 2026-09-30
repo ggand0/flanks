@@ -43,6 +43,7 @@ use crate::render_units_gpu::{
     GpuSyncConfig, GpuUnitBuffers, GpuUnitInput, PullMeshGpu, PulledBucketGpu, cpu_sweep,
     pull_mesh_for,
 };
+use crate::render_units_phase::{Units3d, units_first};
 use crate::units::Units;
 
 /// Bounding-sphere radius for per-instance frustum culling: cube diagonal
@@ -421,6 +422,7 @@ pub struct UnitRenderPlugin;
 
 impl Plugin for UnitRenderPlugin {
     fn build(&self, app: &mut App) {
+        bevy::shader::load_shader_library!(app, "shaders/unit_pose.wgsl");
         embedded_asset!(app, "shaders/unit_instancing.wgsl");
         // Registers the SyncToRenderWorld requirement so instance entities
         // get a render-world twin (ExtractComponentPlugin used to do this).
@@ -429,6 +431,7 @@ impl Plugin for UnitRenderPlugin {
             .init_resource::<LodConfig>()
             .init_resource::<Corpses>()
             .add_plugins(crate::render_units_gpu::GpuUnitRenderPlugin)
+            .add_plugins(crate::render_units_phase::UnitPhasePlugin)
             .add_plugins(crate::render_units_shadow::UnitShadowPlugin)
             .add_systems(Startup, setup_unit_mesh)
             // Must run after the camera moves: culling builds a FRESH
@@ -451,6 +454,7 @@ impl Plugin for UnitRenderPlugin {
                 ),
             )
             .add_render_command::<Transparent3d, DrawCustom>()
+            .add_render_command::<Units3d, DrawCustom>()
             .init_resource::<SpecializedMeshPipelines<CustomPipeline>>()
             .init_resource::<SpecializedRenderPipelines<CustomPipeline>>()
             .add_systems(
@@ -1070,9 +1074,13 @@ fn sync_instance_data(
     counts.sync_ms = t0.elapsed().as_secs_f32() * 1000.0;
 }
 
+/// Queue every unit bucket's draw: into the soldiers' own phase, drawn
+/// before the terrain (render_units_phase.rs), or with `FL_UNITS_FIRST=0`
+/// into Bevy's transparent phase.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)] // bevy system params
 fn queue_custom(
     transparent_3d_draw_functions: Res<DrawFunctions<Transparent3d>>,
+    unit_draw_functions: Res<DrawFunctions<Units3d>>,
     custom_pipeline: Res<CustomPipeline>,
     mut pipelines: ResMut<SpecializedMeshPipelines<CustomPipeline>>,
     mut pull_pipelines: ResMut<SpecializedRenderPipelines<CustomPipeline>>,
@@ -1095,15 +1103,21 @@ fn queue_custom(
     gpu_input: Option<Res<GpuUnitInput>>,
     receive_levels: Res<crate::render_units_shadow::ShadowReceiveLevels>,
     mut transparent_render_phases: ResMut<ViewSortedRenderPhases<Transparent3d>>,
+    mut unit_phases: ResMut<ViewSortedRenderPhases<Units3d>>,
     views: Query<&ExtractedView>,
     view_key_cache: Res<ViewKeyCache>,
 ) {
     let draw_custom = transparent_3d_draw_functions.read().id::<DrawCustom>();
-    let lod_debug = gpu_input.is_some_and(|g| g.lod_debug);
+    let draw_unit = unit_draw_functions.read().id::<DrawCustom>();
+    let lod_debug = gpu_input.as_ref().is_some_and(|g| g.lod_debug);
+    let pose_pass = gpu_input.as_ref().is_some_and(|g| g.pose_pass);
 
     for view in &views {
         let Some(transparent_phase) = transparent_render_phases.get_mut(&view.retained_view_entity)
         else {
+            continue;
+        };
+        let Some(unit_phase) = unit_phases.get_mut(&view.retained_view_entity) else {
             continue;
         };
 
@@ -1139,6 +1153,8 @@ fn queue_custom(
                         lod_debug,
                         atlas,
                         receive,
+                        pose_pass,
+                        indexed: pull_mesh.indexed(),
                     },
                 ),
                 None => pipelines
@@ -1150,6 +1166,23 @@ fn queue_custom(
                     )
                     .unwrap(),
             };
+            if units_first() {
+                // Level-major: every kind's nearest soldiers first. Arrows
+                // (no bucket) last.
+                let order = bucket.map_or(u32::MAX, |b| {
+                    ((b.0 % NUM_LODS) * crate::unit_types::NUM_KINDS + b.0 / NUM_LODS) as u32
+                });
+                unit_phase.add_retained(Units3d {
+                    pipeline,
+                    entity: (entity, *main_entity),
+                    draw_function: draw_unit,
+                    batch_range: 0..1,
+                    extra_index: PhaseItemExtraIndex::None,
+                    indexed: true,
+                    order,
+                });
+                continue;
+            }
             transparent_phase.add_retained(Transparent3d {
                 sorting_info: TransparentSortingInfo3d::Sorted {
                     mesh_center: pbr::get_mesh_instance_world_from_local(
@@ -1234,7 +1267,7 @@ pub(crate) struct CustomPipeline {
     mesh_pipeline: MeshPipeline,
     /// Group 3 of a pulled bucket: the instance records, the index list,
     /// the bucket's mesh corners, the bucket table, then the atlas, its
-    /// sampler, the rig and the sun.
+    /// sampler, the rig, the sun and the kind's pose buffer.
     pub(crate) pull_layout: BindGroupLayoutDescriptor,
     /// Group 3 of an instanced bucket: the atlas, its sampler, the rig and
     /// the sun, at the same bindings as in `pull_layout`.
@@ -1319,6 +1352,7 @@ pub(crate) fn init_custom_pipeline(
                     (6, rig()),
                     (7, clips()),
                     (8, sun()),
+                    (9, binding_types::storage_buffer_read_only_sized(false, None)),
                 ),
             ),
         ),
@@ -1436,6 +1470,11 @@ pub(crate) struct PullPipelineKey {
     /// The bucket's soldiers can stand inside a sun shadow cascade, so
     /// the fragment samples the shadow (`ShadowReceiveLevels`).
     receive: bool,
+    /// The pose pass posed the soldiers: the index list holds pose slots
+    /// (render_units_gpu.rs).
+    pose_pass: bool,
+    /// The camera draws the bucket indexed (`PullMeshGpu::indexed`).
+    indexed: bool,
 }
 
 impl PullPipelineKey {
@@ -1445,6 +1484,7 @@ impl PullPipelineKey {
         mesh: MeshPipelineKey,
         layout: MeshVertexBufferLayoutRef,
         pull_mesh: &PullMeshGpu,
+        pose_pass: bool,
     ) -> Self {
         Self {
             mesh,
@@ -1454,6 +1494,8 @@ impl PullPipelineKey {
             lod_debug: false,
             atlas: false,
             receive: false,
+            pose_pass,
+            indexed: false,
         }
     }
 }
@@ -1522,6 +1564,12 @@ impl SpecializedRenderPipeline for CustomPipeline {
         defs.push(bevy::shader::ShaderDefVal::UInt("PULL_BUCKET".into(), key.bucket));
         if key.lod_debug {
             defs.push("LOD_DEBUG".into());
+        }
+        if key.pose_pass {
+            defs.push("UNIT_POSE_READ".into());
+        }
+        if key.indexed {
+            defs.push("PULL_INDEXED".into());
         }
         atlas_defs(&mut descriptor, key.atlas);
         receive_defs(&mut descriptor, key.receive);
@@ -1627,7 +1675,13 @@ impl<P: PhaseItem> RenderCommand<P> for DrawMeshInstanced {
                 return RenderCommandResult::Skip;
             };
             pass.set_bind_group(3, &pulled.bind_group, &[]);
-            pass.draw_indirect(&alloc.args, pulled.bucket as u64 * 16);
+            match &pulled.index {
+                Some(index) => {
+                    pass.set_index_buffer(index.slice(..), IndexFormat::Uint32);
+                    pass.draw_indexed_indirect(&alloc.indexed_args, pulled.bucket as u64 * 20);
+                }
+                None => pass.draw_indirect(&alloc.args, pulled.bucket as u64 * 16),
+            }
             return RenderCommandResult::Success;
         }
 

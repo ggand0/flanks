@@ -373,7 +373,12 @@ fn queue_unit_shadows(
                     pull_pipelines.specialize(
                         &pipeline_cache,
                         &pipeline,
-                        PullPipelineKey::shadow(mesh_key, mesh.layout.clone(), pull_mesh),
+                        PullPipelineKey::shadow(
+                            mesh_key,
+                            mesh.layout.clone(),
+                            pull_mesh,
+                            gpu_input.pose_pass,
+                        ),
                     ),
                     draw_pulled,
                 ),

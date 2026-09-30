@@ -6,7 +6,9 @@
 // whose shadow can fall in view also goes on the caster list for his kind
 // of each sun shadow cascade that serves the depths it falls at, whether
 // or not the camera sees him (render_units_shadow.rs). A second entry
-// turns the list counts into indirect draw arguments.
+// turns the list counts into indirect draw arguments. With the pose pass on,
+// each drawn soldier also takes a pose slot in his kind's region, and his
+// list entries hold that slot instead of his record (unit_pose_pass.wgsl).
 //
 // Step order and constants follow the CPU pass line for line (the
 // contract table in docs/plans/gpu-render-data-item2.md). Culled soldiers
@@ -126,6 +128,10 @@ struct Params {
     cast_lods: u32,
     // The first slot of the ring list in `index_list`.
     ring_base: u32,
+    // Per kind: the first entry of its region in `pose_src`.
+    pose_src_base: vec4<u32>,
+    // 1 with the pose pass on.
+    pose_pass: u32,
 };
 
 struct DrawArgs {
@@ -143,14 +149,19 @@ struct DrawArgs {
 @group(0) @binding(5) var<storage, read_write> index_list: array<u32>;
 // 0..16 soldiers per bucket (living and fallen), 16..32 the fallen alone,
 // 32..48 the casters per cascade and kind (cascade * 4 + kind), 48 the
-// selection rings.
-@group(0) @binding(6) var<storage, read_write> counts: array<atomic<u32>, 49>;
+// selection rings, 49..53 the pose slots taken per kind.
+@group(0) @binding(6) var<storage, read_write> counts: array<atomic<u32>, 53>;
 // 0..16 the camera's buckets, 16..32 the casters as in `counts`, 32 the
-// selection rings.
-@group(0) @binding(7) var<storage, read_write> args: array<DrawArgs, 33>;
+// selection rings, 33..37 the pose pass's dispatch per kind (x, y, z).
+@group(0) @binding(7) var<storage, read_write> args: array<DrawArgs, 37>;
 // Copied back to the CPU by Bevy's readback plugin: the 32 counts, the
 // frame stamp and the soldier count, two spare, the 16 caster counts.
 @group(0) @binding(8) var<storage, read_write> readback: array<u32, 52>;
+// Per pose slot, the record it poses, in one region per kind.
+@group(0) @binding(9) var<storage, read_write> pose_src: array<u32>;
+// Per bucket, five words: the arguments of its camera draw when it is
+// indexed, one instance per soldier.
+@group(0) @binding(10) var<storage, read_write> indexed_args: array<u32, 80>;
 
 const CULL_RADIUS: f32 = 2.5;
 const LOD_JITTER: f32 = 0.2;
@@ -181,6 +192,9 @@ const RING_HOVER_ENEMY: u32 = 2u;
 // The ring count in `counts`, and the rings' entry in `args`.
 const RING_COUNTER: u32 = 48u;
 const RING_ARG: u32 = 32u;
+// The pose slot counters in `counts`, and the pose dispatches in `args`.
+const POSE_COUNTER: u32 = 49u;
+const POSE_ARG: u32 = 33u;
 
 // Detail level for a squared distance: the farthest threshold passed wins.
 fn level(t: vec4<f32>, d2: f32) -> u32 {
@@ -224,6 +238,19 @@ fn lod_jitter(seed: f32) -> f32 {
 fn append(bucket: u32, entry: u32, lod: u32) {
     let slot = atomicAdd(&counts[bucket], 1u);
     index_list[params.buckets[bucket].x + slot] = entry | (lod << 30u);
+}
+
+// The list entry of drawn record `r` of a soldier of `kind`: the record,
+// or with the pose pass a pose slot of his kind that the pass fills from
+// the record. A soldier or body takes at most one slot a frame, so a
+// kind's region holds its living and its fallen.
+fn list_entry(kind: u32, r: u32) -> u32 {
+    if params.pose_pass == 0u {
+        return r;
+    }
+    let slot = atomicAdd(&counts[POSE_COUNTER + kind], 1u);
+    pose_src[params.pose_src_base[kind] + slot] = r;
+    return slot;
 }
 
 // The cascades a soldier at `p` casts into, one bit each: none when the
@@ -421,13 +448,14 @@ fn build_soldier(i: u32) {
         vec4<f32>(sm.band, sm.wall, sm.gait, stagger),
     );
     smoothing[i] = sm;
+    let entry = list_entry(kind, i);
     if visible {
-        append(kind * NUM_LODS + lod, i, lod);
+        append(kind * NUM_LODS + lod, entry, lod);
         if death_t == 0.0 && (reg.flags & (REG_SELECTED | REG_HOVERED | REG_HOVER_OWN)) != 0u {
             append_ring(i, reg.flags, kind);
         }
     }
-    append_casters(casts, kind, i);
+    append_casters(casts, kind, entry);
 }
 
 // A living soldier of a selected or hovered regiment gets a ring under
@@ -466,14 +494,21 @@ fn build_corpse(j: u32) {
     let d = position - params.cam_pos;
     let d2 = dot(d, d) * jitter * jitter;
     let lod = level(params.bands[kind * 3u + 2u], d2);
-    if !culled(position) {
+    let visible = !culled(position);
+    var casts = 0u;
+    if lod < params.cast_lods {
+        casts = cascade_mask(position);
+    }
+    if !visible && casts == 0u {
+        return;
+    }
+    let entry = list_entry(kind, ridx);
+    if visible {
         let bucket = kind * NUM_LODS + lod;
         atomicAdd(&counts[16u + bucket], 1u);
-        append(bucket, ridx, lod);
+        append(bucket, entry, lod);
     }
-    if lod < params.cast_lods {
-        append_casters(cascade_mask(position), kind, ridx);
-    }
+    append_casters(casts, kind, entry);
 }
 
 @compute @workgroup_size(64)
@@ -505,8 +540,17 @@ fn finalize(@builtin(local_invocation_index) b: u32) {
     let count = atomicLoad(&counts[b]);
     let fallen = atomicLoad(&counts[16u + b]);
     args[b] = DrawArgs(count * params.buckets[b].y, 1u, 0u, 0u);
+    indexed_args[b * 5u] = params.buckets[b].y;
+    indexed_args[b * 5u + 1u] = count;
+    indexed_args[b * 5u + 2u] = 0u;
+    indexed_args[b * 5u + 3u] = 0u;
+    indexed_args[b * 5u + 4u] = 0u;
     readback[b] = count;
     readback[16u + b] = fallen;
+    if b < 4u {
+        let posed = atomicLoad(&counts[POSE_COUNTER + b]);
+        args[POSE_ARG + b] = DrawArgs((posed + 63u) / 64u, 1u, 1u, 0u);
+    }
     if b == 0u {
         readback[32u] = params.frame;
         readback[33u] = params.n;
