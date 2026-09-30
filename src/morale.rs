@@ -588,16 +588,33 @@ mod tests {
     use crate::orders::GroupData;
     use std::time::Duration;
 
+    /// Seconds per test tick.
     const DT: f32 = 0.05;
+    /// Ticks between two rounds of losses: 20 ticks of 0.05 s, so losses
+    /// land once per second.
     const EVERY: usize = 20;
 
-    /// Morale of two units of one kind, the second five times the size of
-    /// the first, on opposite teams and far apart so neither sees the
-    /// other (each is its own army's captain). Every `EVERY` ticks each
-    /// loses `deaths[i]` men and kills `kills[i]`. After every tick the
-    /// casualty and exchange terms and the morale level must match: morale
-    /// works in proportions of the unit, so army size and unit size must
-    /// not change how a unit takes the same share of losses.
+    /// A unit that has lost 30% of its men must be exactly as shaken
+    /// whether it started with 200 or 1000. This plays a fight through the
+    /// real `update_morale` and checks that.
+    ///
+    /// The two units are built here, not passed in: unit A with 200 men
+    /// and unit B with 1000, both heavy infantry, on opposite teams 1.5 km
+    /// apart so neither sees the other and each is its own army's captain
+    /// (same leader bonus).
+    ///
+    /// - `deaths`: men lost per second, `[A, B]`. `[1, 5]` is the same
+    ///   0.5% of each unit.
+    /// - `kills`: enemies killed per second, `[A, B]`. `[0, 0]` is a unit
+    ///   that only dies.
+    /// - `ticks`: length of the fight in 0.05 s ticks; `60 * EVERY` is 60 s.
+    ///
+    /// After every tick it compares B with A: the casualty penalty exactly,
+    /// the exchange term and the morale level within float rounding. The
+    /// first tick where they differ fails the test, so B needs no check at
+    /// the end. Returns A's morale breakdown after the last tick (the terms
+    /// that sum to its morale level, not the level itself) for the
+    /// caller's checks on the final values.
     fn assert_same_morale(deaths: [u32; 2], kills: [u32; 2], ticks: usize) -> MoraleFactors {
         let mut world = World::new();
         let mut groups = Groups::default();
@@ -631,19 +648,32 @@ mod tests {
         world.resource::<MoraleReadout>().0[0]
     }
 
+    /// 60 s of only dying: A loses 1 man a second, B loses 5, and both end
+    /// 30% down with morale equal the whole way.
     #[test]
     fn losing_morale_scales_with_unit_size() {
-        // 30% lost over the run: past the 10% and 25% casualty steps.
         let f = assert_same_morale([1, 5], [0, 0], 60 * EVERY);
+        // The losses reached morale: 30% lost is past the 10% (-2) and 25%
+        // (-4) steps of CASUALTY_STEPS and short of 50% (-8). Without this,
+        // both units could sit at 0 and still compare equal.
         assert_eq!(f.casualties, -4.0);
-        // Below saturation, where counting absolute deaths would show.
+        // The losing penalty runs from 0 down to a cap of EXCHANGE_LOSING
+        // (-8). Capped, both units would read -8 even if morale counted raw
+        // deaths (B's 5 a second against A's 1), and the comparison above
+        // would miss it; so the term must sit between the ends.
         assert!(f.exchange < -0.5 && f.exchange > EXCHANGE_LOSING + 0.5, "exchange {}", f.exchange);
     }
 
+    /// 30 s of dying and killing twice as many: A loses 1 and kills 2 a
+    /// second, B loses 5 and kills 10. Both end 15% down, winning the
+    /// exchange, with morale equal the whole way.
     #[test]
     fn winning_morale_scales_with_unit_size() {
         let f = assert_same_morale([1, 5], [2, 10], 30 * EVERY);
+        // 15% lost: past the 10% step (-2), short of 25%.
         assert_eq!(f.casualties, -2.0);
+        // The winning bonus runs from 0 up to a cap of EXCHANGE_WINNING
+        // (+6); off both ends for the same reason as the losing test.
         assert!(f.exchange > 0.5 && f.exchange < EXCHANGE_WINNING - 0.5, "exchange {}", f.exchange);
     }
 }
