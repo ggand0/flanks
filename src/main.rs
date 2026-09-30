@@ -62,6 +62,29 @@ fn wgpu_settings() -> WgpuSettings {
     settings
 }
 
+/// Bevy's task pools. The sim's parallel passes run on the async compute
+/// pool (util.rs `sim_scope`), which takes half the hardware threads, the
+/// file loading pool takes up to two and the compute pool, where every
+/// system of the frame runs, the rest: 12, 2 and 10 of 24. Together they
+/// hold as many threads as the hardware has. `FL_SIM_ASYNC=0` keeps Bevy's
+/// default sizes (16 compute, 4 async compute, 4 file loading of 24).
+/// `FL_THREADS` sets the total either way.
+fn task_pool_options() -> bevy::app::TaskPoolOptions {
+    let mut options = bevy::app::TaskPoolOptions::default();
+    let threads = crate::util::env_or("FL_THREADS", 0_usize);
+    if threads > 0 {
+        options.min_total_threads = threads;
+        options.max_total_threads = threads;
+    }
+    if crate::util::sim_on_async_pool() {
+        options.io.max_threads = 2;
+        options.io.percent = 0.1;
+        options.async_compute.max_threads = usize::MAX;
+        options.async_compute.percent = 0.5;
+    }
+    options
+}
+
 /// `FL_WINDOW=2560x1360` opens the window with that client size in
 /// physical pixels whatever the display's scale, so runs on differently
 /// scaled displays draw the same frame. The interface then draws at scale 1.
@@ -81,22 +104,11 @@ fn main() {
     // Load before the App so the window opens with the saved video
     // settings instead of switching modes one frame in.
     let user_settings = settings::Settings::load();
-    // FL_THREADS caps the compute task pool (default: all cores). The
-    // parallel sim scopes' wall time is gated by their slowest chunk, so
-    // on a loaded box a full-width pool oversubscribes and any stolen
-    // core spikes the whole tick — leaving headroom for the render
-    // thread and whatever else runs trades a little throughput for
-    // fewer hitches. Sim-correctness is unaffected (pure data-parallel).
-    let threads = crate::util::env_or("FL_THREADS", 0_usize);
     App::new()
         .add_plugins(
             DefaultPlugins
-                .set(if threads > 0 {
-                    TaskPoolPlugin {
-                        task_pool_options: bevy::app::TaskPoolOptions::with_num_threads(threads),
-                    }
-                } else {
-                    TaskPoolPlugin::default()
+                .set(TaskPoolPlugin {
+                    task_pool_options: task_pool_options(),
                 })
                 .set(WindowPlugin {
                     primary_window: Some(Window {
@@ -181,8 +193,19 @@ fn main() {
             focused_mode: bevy::winit::UpdateMode::Continuous,
             unfocused_mode: bevy::winit::UpdateMode::Continuous,
         })
-        .add_systems(Startup, setup_world)
+        .add_systems(Startup, (setup_world, log_task_pools))
         .run();
+}
+
+fn log_task_pools() {
+    use bevy::tasks::{AsyncComputeTaskPool, ComputeTaskPool, IoTaskPool};
+    info!(
+        "task pools: compute {}, async compute {} (the sim{}), file loading {}",
+        ComputeTaskPool::get().thread_num(),
+        AsyncComputeTaskPool::get().thread_num(),
+        if crate::util::sim_on_async_pool() { "" } else { " runs on the compute pool" },
+        IoTaskPool::get().thread_num(),
+    );
 }
 
 /// Sun; terrain chunks come from TerrainPlugin.
