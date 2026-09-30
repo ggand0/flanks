@@ -305,14 +305,17 @@ fn spawn_stats_line(mut commands: Commands) {
 }
 
 /// The stats line's numbers: the full overlay's fps, soldiers alive on
-/// both sides, and the sim tick (its grid, step and field phases). The
+/// both sides, and the sim tick (its grid, step and field phases).
+/// Soldiers add up the units' living counts: those start at full
+/// strength, so the number is right in deployment, before the sim has
+/// filled `CombatStats`. The
 /// font is monospaced, so fps and sim are right-aligned in a fixed width:
 /// a value crossing 10 or 100 no longer resizes the pill every update.
 /// The soldier count loses a digit at most twice a battle.
 fn update_stats_line(
     settings: Res<crate::settings::Settings>,
     diagnostics: Res<DiagnosticsStore>,
-    combat: Res<CombatStats>,
+    groups: Res<Groups>,
     stats: Res<SimStats>,
     mut spans: Query<(&mut TextSpan, &StatsValue)>,
 ) {
@@ -323,7 +326,7 @@ fn update_stats_line(
     for (mut span, value) in &mut spans {
         let text = match value {
             StatsValue::Fps => format!("{fps:>3.0}"),
-            StatsValue::Soldiers => thousands(combat.alive[0] + combat.alive[1]),
+            StatsValue::Soldiers => thousands(groups.list.iter().map(|g| g.count).sum()),
             StatsValue::Sim => format!("{:>4.1}", stats.grid_ms + stats.step_ms + stats.field_ms),
         };
         if span.0 != text {
