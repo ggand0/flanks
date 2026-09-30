@@ -3,8 +3,10 @@
 //! to `last_setup.yaml` in the config folder. `FL_SETUP=<file>` starts
 //! battles from one: the map and armies come from the file, the unit
 //! picker is skipped, and every unit stands as saved while the deployment
-//! waits for Begin Battle. `FL_DEMO=1` does the same with a built-in
-//! setup (`demo_setup`) for the player's side only.
+//! waits for Begin Battle. The Demo scenario (`FL_DEMO=1`) does the same
+//! with a built-in setup (`demo_setup`) for the player's side only. A unit
+//! may carry a timed charge, which `run_setup_script` orders once the
+//! battle has begun.
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -13,7 +15,7 @@ use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::formation::{FormShape, FormSpacing};
-use crate::game_state::{BattleConfig, EnemyComp};
+use crate::game_state::{BattleConfig, Deployment, EnemyComp, GameState, Scenario};
 use crate::orders::{Groups, PLAYER_TEAM};
 use crate::terrain::{MapKind, Terrain};
 use crate::unit_types::NUM_KINDS;
@@ -57,6 +59,10 @@ pub struct Placement {
     pub hold: bool,
     pub fire_at_will: bool,
     pub skirmish: bool,
+    /// Seconds after the battle begins when the unit charges the nearest
+    /// enemy unit; none for a unit that waits for orders.
+    #[serde(default)]
+    pub charge_after: Option<f32>,
 }
 
 impl BattleSetup {
@@ -82,6 +88,7 @@ impl BattleSetup {
                     hold: g.hold,
                     fire_at_will: g.fire_at_will,
                     skirmish: g.skirmish,
+                    charge_after: None,
                 })
                 .collect(),
         }
@@ -119,26 +126,26 @@ impl BattleSetup {
     /// unit of that team and kind. A team the setup does not list stays as
     /// spawned. A unit whose formation already matches (never moved in
     /// deployment) keeps its spawn positions, scatter included, so the
-    /// battle starts exactly as saved. Places nothing and returns false
-    /// when the spawned armies are not the saved ones (the army was
-    /// changed in the menu after loading).
-    pub fn place(&self, groups: &mut Groups, units: &mut Units, terrain: &Terrain) -> bool {
+    /// battle starts exactly as saved. Returns, for each saved unit, the
+    /// spawned unit it went to; places nothing and returns none when the
+    /// spawned armies are not the saved ones (the army was changed in the
+    /// menu after loading).
+    pub fn place(&self, groups: &mut Groups, units: &mut Units, terrain: &Terrain) -> Option<Vec<usize>> {
         let listed = |team: u8| self.lists_team(team);
         if groups.list.iter().filter(|g| listed(g.team)).count() != self.units.len() {
-            return false;
+            return None;
         }
         let mut taken = vec![false; self.units.len()];
         let mut pairs = Vec::with_capacity(self.units.len());
         for (g, gd) in groups.list.iter().enumerate().filter(|(_, gd)| listed(gd.team)) {
-            let Some(s) = (0..self.units.len())
-                .find(|&s| !taken[s] && self.units[s].team == gd.team && self.units[s].kind == gd.kind)
-            else {
-                return false;
-            };
+            let s = (0..self.units.len())
+                .find(|&s| !taken[s] && self.units[s].team == gd.team && self.units[s].kind == gd.kind)?;
             taken[s] = true;
             pairs.push((g, s));
         }
+        let mut placed = vec![0; self.units.len()];
         for (g, s) in pairs {
+            placed[s] = g;
             let p = &self.units[s];
             let gd = &mut groups.list[g];
             gd.hold = p.hold;
@@ -158,22 +165,38 @@ impl BattleSetup {
                 crate::formation::snap_to_slots(units, terrain, g as u32, gd);
             }
         }
-        true
+        Some(placed)
     }
 }
 
-/// The setup `FL_SETUP` names, else the demo setup when `FL_DEMO=1`, read
-/// once. A file that cannot be read or parsed is logged and counts as none.
+/// The setup a battle of `scenario` starts from: a normal battle's is the
+/// `FL_SETUP` file, if any; the Demo scenario's is the demo setup.
+pub fn for_battle(scenario: Scenario) -> Option<&'static BattleSetup> {
+    match scenario {
+        Scenario::Normal => file_setup(),
+        Scenario::Demo => Some(demo()),
+        _ => None,
+    }
+}
+
+/// The setup the launch environment asks for (`FL_SETUP` or `FL_DEMO`):
+/// the map built at launch and the menu's first options come from it.
 pub fn from_env() -> Option<&'static BattleSetup> {
+    for_battle(Scenario::from_env())
+}
+
+fn demo() -> &'static BattleSetup {
+    static DEMO: OnceLock<BattleSetup> = OnceLock::new();
+    DEMO.get_or_init(demo_setup)
+}
+
+/// The setup `FL_SETUP` names, read once. A file that cannot be read or
+/// parsed is logged and counts as none.
+fn file_setup() -> Option<&'static BattleSetup> {
     static SETUP: OnceLock<Option<BattleSetup>> = OnceLock::new();
     SETUP
         .get_or_init(|| {
-            let Ok(path) = std::env::var("FL_SETUP") else {
-                return (crate::util::env_or("FL_DEMO", 0_u32) != 0).then(|| {
-                    info!("FL_DEMO: battles start from the demo setup");
-                    demo_setup()
-                });
-            };
+            let path = std::env::var("FL_SETUP").ok()?;
             let read = std::fs::read_to_string(&path).map_err(|e| e.to_string());
             match read.and_then(|text| serde_yaml_ng::from_str(&text).map_err(|e| e.to_string())) {
                 Ok(setup) => {
@@ -191,25 +214,30 @@ pub fn from_env() -> Option<&'static BattleSetup> {
 
 /// Soldiers per unit in the demo battle.
 const DEMO_UNIT: usize = 1000;
+/// Seconds after the demo battle begins when line 2 charges.
+const DEMO_CHARGE_AFTER: f32 = 20.0;
 
 /// The demo battle: 200k on the grassland with the AI on, the enemy as the
 /// spawner deploys it, and the player's 100 units in a defence after the
 /// Flemish at Courtrai (1302), whose second line was there to plug breaks
-/// in the first. Every unit has the spawner's block shape (49 files, 21
-/// ranks at 1000 men), so no line is deeper than the enemy's:
+/// in the first. Units are 21 files wide and 48 ranks deep, except the
+/// wing columns, which keep the spawner's shallow block so the archers
+/// behind them stay in bow range:
 ///
-/// - Line 1: 14 touching units on hold, the front rank on the deployment
+/// - Line 1: 28 touching units on hold, the front rank on the deployment
 ///   zone's front edge and the end files at the map's sides (the demo
 ///   opens the zone's sides), so the front has no gap to push through, no
-///   corridor round its ends to the archers, and never chases forward to
-///   open one. From each end: 2 Knights, 2 Men-at-Arms, 3 Spearmen.
-/// - Archers: 2 per wing, 5 m behind the two end Knights, which take the
+///   corridor round its ends, and never chases forward to open one. From
+///   each end: 2 shallow Knights (the wing column), 2 Knights, then
+///   Spearmen to the centre.
+/// - Archers: 2 per wing, 5 m behind the wing columns, which take the
 ///   enemy's first blows for them. Their front rank stands within bow
 ///   range of the enemy's starting line, and they loft over line 1.
-/// - Line 2: 9 Knights 10 m behind line 1, each centred on one of its
-///   central joins, clear of the archers.
-/// - Reserve: the other 73 units in six centred rows, Spearmen first, then
-///   Men-at-Arms, then Knights.
+/// - Line 2: 33 units 10 m behind line 1, each centred on one of its
+///   joins: 11 Knights on each outer side, 11 Men-at-Arms in the centre.
+///   They charge the nearest enemy 20 s after the battle begins.
+/// - Reserve: a row of 3 Men-at-Arms, 12 Spearmen, 3 Men-at-Arms, and a
+///   row of 17 Men-at-Arms.
 ///
 /// Normal spacing throughout.
 fn demo_setup() -> BattleSetup {
@@ -217,23 +245,31 @@ fn demo_setup() -> BattleSetup {
     use crate::regiments::{EDGE_MARGIN, army_gap};
     use crate::unit_types::{KIND_ARCHER, KIND_HEAVY, KIND_LIGHT, KIND_SPEAR};
 
-    /// Units across line 1.
-    const ACROSS: usize = 14;
+    /// Files of every deep unit: 48 ranks at 1000 men, 70% of the 67 the
+    /// first demo layout used.
+    const DEEP_FILES: u32 = 21;
+    /// Deep units across line 1, between the wing columns.
+    const DEEP_ACROSS: usize = 24;
+    /// Line 2's units. An odd count centres them on line 1's joins.
+    const LINE2: usize = 33;
     /// Metres between one row's back rank and the next row's front rank.
     const GAP: f32 = 10.0;
 
     let half = crate::terrain::HALF_EXTENTS;
     let x_max = half.x - OPEN_SIDE_MARGIN;
     let z_front = -army_gap() * 0.5;
-
-    // Units `files * P` apart touch with no gap; line 1 fills the map's
-    // width.
-    let files = (2.0 * x_max / (ACROSS as f32 * P)).floor() as u32;
-    let w = files as f32 * P;
-    let d = (DEMO_UNIT.div_ceil(files as usize) - 1) as f32 * P;
+    // Depth of a unit's block, front rank to back rank. Units `files * P`
+    // apart touch with no gap.
+    let depth = |files: u32| (DEMO_UNIT.div_ceil(files as usize) - 1) as f32 * P;
+    let w = DEEP_FILES as f32 * P;
+    let d = depth(DEEP_FILES);
+    // The two wing columns a side take the width the deep units leave.
+    let wing_files = ((2.0 * x_max - DEEP_ACROSS as f32 * w) / (4.0 * P)).floor() as u32;
+    let ww = wing_files as f32 * P;
+    let dw = depth(wing_files);
 
     let mut units = Vec::with_capacity(100);
-    let mut push = |kind: u8, x: f32, z: f32, hold: bool| {
+    let mut push = |kind: u8, x: f32, z: f32, files: u32, hold: bool, charge_after: Option<f32>| {
         units.push(Placement {
             team: PLAYER_TEAM,
             kind,
@@ -246,46 +282,49 @@ fn demo_setup() -> BattleSetup {
             hold,
             fire_at_will: true,
             skirmish: false,
+            charge_after,
         });
     };
-    // Unit i of a row of n, centred on x = 0.
+    // Unit i of a row of n deep units, centred on x = 0. Line 1's deep
+    // units are an even count, so its joins fall on whole multiples of w.
     let x_of = |i: usize, n: usize| (i as f32 - (n - 1) as f32 * 0.5) * w;
+    // The wing columns: k = 0 next to the deep units, 1 at the map's side.
+    let wing_x = |k: usize| DEEP_ACROSS as f32 * 0.5 * w + (k as f32 + 0.5) * ww;
 
-    // Line 1: its front rank 1 m inside the zone's front edge. With an
-    // even count its joins fall on whole multiples of w.
-    let z1 = z_front - 1.0 - d * 0.5;
-    for i in 0..ACROSS {
-        let kind = match i.min(ACROSS - 1 - i) {
-            0..=1 => KIND_HEAVY,
-            2..=3 => KIND_LIGHT,
-            _ => KIND_SPEAR,
-        };
-        push(kind, x_of(i, ACROSS), z1, true);
-    }
-    // Archers behind the two units at each end.
-    let za = z1 - d - 5.0;
-    for i in [0, 1, ACROSS - 2, ACROSS - 1] {
-        push(KIND_ARCHER, x_of(i, ACROSS), za, false);
-    }
-    // Line 2: on the joins from -4 w to 4 w, short of the archers.
-    let z2 = z1 - d - GAP;
-    for j in -4..=4 {
-        push(KIND_HEAVY, j as f32 * w, z2, false);
-    }
-    // Reserve rows behind line 2, filled in kind order.
-    let reserve = std::iter::repeat_n(KIND_SPEAR, 26)
-        .chain(std::iter::repeat_n(KIND_LIGHT, 29))
-        .chain(std::iter::repeat_n(KIND_HEAVY, 18));
-    let mut reserve = reserve.collect::<Vec<_>>().into_iter();
-    let mut z = z2 - d - GAP;
-    for n in [13, 12, 12, 12, 12, 12] {
-        for i in 0..n {
-            push(reserve.next().expect("73 reserve units"), x_of(i, n), z, false);
+    // Line 1, its front rank 1 m inside the zone's front edge.
+    let front = z_front - 1.0;
+    for side in [-1.0_f32, 1.0] {
+        for k in 0..2 {
+            push(KIND_HEAVY, side * wing_x(k), front - dw * 0.5, wing_files, true, None);
         }
-        z -= d + GAP;
     }
-    debug_assert!(reserve.next().is_none());
-    debug_assert!(z + GAP + d * 0.5 >= -half.y + EDGE_MARGIN, "the demo rows overrun the zone's depth");
+    for i in 0..DEEP_ACROSS {
+        let kind = if i.min(DEEP_ACROSS - 1 - i) < 2 { KIND_HEAVY } else { KIND_SPEAR };
+        push(kind, x_of(i, DEEP_ACROSS), front - d * 0.5, DEEP_FILES, true, None);
+    }
+    // Archers behind the wing columns.
+    for side in [-1.0_f32, 1.0] {
+        for k in 0..2 {
+            push(KIND_ARCHER, side * wing_x(k), front - dw * 1.5 - 5.0, wing_files, false, None);
+        }
+    }
+    // Line 2, clear of the archers: it starts deeper than their back rank.
+    let z2 = front - d - GAP - d * 0.5;
+    for j in 0..LINE2 {
+        let kind = if j.min(LINE2 - 1 - j) < 11 { KIND_HEAVY } else { KIND_LIGHT };
+        push(kind, x_of(j, LINE2), z2, DEEP_FILES, false, Some(DEMO_CHARGE_AFTER));
+    }
+    // The reserve rows.
+    let z3 = z2 - d - GAP;
+    for i in 0..18 {
+        let kind = if i.min(17 - i) < 3 { KIND_LIGHT } else { KIND_SPEAR };
+        push(kind, x_of(i, 18), z3, DEEP_FILES, false, None);
+    }
+    let z4 = z3 - d - GAP;
+    for i in 0..17 {
+        push(KIND_LIGHT, x_of(i, 17), z4, DEEP_FILES, false, None);
+    }
+    debug_assert!(z4 - d * 0.5 >= -half.y + EDGE_MARGIN, "the demo rows overrun the zone's depth");
 
     BattleSetup {
         map: MapKind::Grassland,
@@ -294,6 +333,77 @@ fn demo_setup() -> BattleSetup {
         ai_enabled: true,
         open_sides: true,
         units,
+    }
+}
+
+/// Timed charges from the battle's setup: (unit index, seconds after the
+/// battle begins), and the time the battle began on the game clock.
+#[derive(Resource, Default)]
+pub struct SetupScript {
+    charges: Vec<(usize, f32)>,
+    begun: Option<f32>,
+}
+
+impl SetupScript {
+    /// The charges of `setup`'s units, placed as `place` returned.
+    pub fn new(setup: &BattleSetup, placed: &[usize]) -> Self {
+        let charges = setup
+            .units
+            .iter()
+            .zip(placed)
+            .filter_map(|(p, &g)| p.charge_after.map(|t| (g, t)))
+            .collect();
+        Self { charges, begun: None }
+    }
+}
+
+/// Order each timed unit to charge the nearest steady enemy unit once its
+/// time has come. The clock starts when the deployment ends and stops
+/// while the game is paused.
+fn run_setup_script(
+    time: Res<Time>,
+    deploy: Res<Deployment>,
+    mut script: ResMut<SetupScript>,
+    mut groups: ResMut<Groups>,
+) {
+    if deploy.active || script.charges.is_empty() {
+        return;
+    }
+    let now = time.elapsed_secs();
+    let begun = *script.begun.get_or_insert(now);
+    let mut due = Vec::new();
+    script.charges.retain(|&(g, t)| {
+        let ready = now - begun >= t;
+        if ready {
+            due.push(g);
+        }
+        !ready
+    });
+    for g in due {
+        if let Some(target) = nearest_enemy(&groups, g) {
+            crate::orders::attack_regiments(&mut groups, &[g], target);
+        }
+    }
+}
+
+/// The steady enemy unit whose centre is nearest unit `g`'s.
+fn nearest_enemy(groups: &Groups, g: usize) -> Option<u32> {
+    let (team, at) = (groups.list[g].team, groups.list[g].centroid);
+    groups
+        .list
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.team != team && e.count > 0 && !e.state.is_broken())
+        .min_by(|a, b| a.1.centroid.distance_squared(at).total_cmp(&b.1.centroid.distance_squared(at)))
+        .map(|(i, _)| i as u32)
+}
+
+pub struct BattleSetupPlugin;
+
+impl Plugin for BattleSetupPlugin {
+    fn build(&self, app: &mut App) {
+        app.init_resource::<SetupScript>()
+            .add_systems(Update, run_setup_script.run_if(in_state(GameState::Battle)));
     }
 }
 
@@ -365,7 +475,7 @@ mod tests {
         let mut fresh = BattleConfig { enemy: EnemyComp::Random, ..default() };
         loaded.apply_config(&mut fresh);
         let (mut units2, mut groups2) = spawn(&fresh, &terrain);
-        assert!(loaded.place(&mut groups2, &mut units2, &terrain));
+        assert!(loaded.place(&mut groups2, &mut units2, &terrain).is_some());
 
         assert_eq!(units2.len(), units.len());
         for i in 0..units.len() {
@@ -393,7 +503,7 @@ mod tests {
         other.player_regs = crate::regiments::frac_comp(other.n_slots());
         let (mut units2, mut groups2) = spawn(&other, &terrain);
         let before = units2.pos.to_vec();
-        assert!(!saved.place(&mut groups2, &mut units2, &terrain));
+        assert!(saved.place(&mut groups2, &mut units2, &terrain).is_none());
         assert_eq!(units2.pos.to_vec(), before);
     }
 
@@ -405,11 +515,13 @@ mod tests {
         use crate::unit_types::{KIND_ARCHER, KIND_HEAVY, KIND_LIGHT, KIND_SPEAR};
         let setup = demo_setup();
         assert_eq!(setup.units.len(), 100);
+        let charging = setup.units.iter().filter(|u| u.charge_after == Some(DEMO_CHARGE_AFTER)).count();
+        assert_eq!(charging, 33, "line 2 charges");
         let mut kinds = [0; NUM_KINDS];
         for p in &setup.units {
             kinds[p.kind as usize] += 1;
         }
-        assert_eq!((kinds[KIND_HEAVY as usize], kinds[KIND_LIGHT as usize]), (31, 33));
+        assert_eq!((kinds[KIND_HEAVY as usize], kinds[KIND_LIGHT as usize]), (30, 34));
         assert_eq!((kinds[KIND_SPEAR as usize], kinds[KIND_ARCHER as usize]), (32, 4));
 
         // Soldier-centre footprint of each block: files across, ranks deep,
@@ -457,7 +569,7 @@ mod tests {
             (0..units.len()).filter(|&i| units.team[i] != PLAYER_TEAM).map(|i| units.pos[i]).collect()
         };
         let before = enemy(&units);
-        assert!(setup.place(&mut groups, &mut units, &terrain));
+        assert!(setup.place(&mut groups, &mut units, &terrain).is_some());
         assert_eq!(enemy(&units), before);
         // Placement pairs units by kind, not by list order: compare the
         // player's units and the setup's as sorted (kind, anchor) lists.
@@ -468,5 +580,38 @@ mod tests {
         let placed = groups.list.iter().filter(|g| g.team == PLAYER_TEAM).map(|g| (g.kind, g.anchor.x, g.anchor.y));
         let saved = setup.units.iter().map(|p| (p.kind, p.x, p.z));
         assert_eq!(sorted(placed.collect()), sorted(saved.collect()));
+    }
+
+    /// A timed charge waits out the deployment and its time on the game
+    /// clock, then attacks the nearest steady enemy unit.
+    #[test]
+    fn a_timed_charge_attacks_the_nearest_enemy_on_time() {
+        use crate::orders::{GroupData, Order};
+        let mut world = World::new();
+        let mut groups = Groups::default();
+        let unit = |team, x: f32, z: f32| GroupData::new(team, crate::unit_types::KIND_HEAVY, Vec2::new(x, z), 100);
+        groups.list.push(unit(0, 0.0, -50.0));
+        groups.list.push(unit(1, 300.0, 50.0));
+        groups.list.push(unit(1, 20.0, 40.0));
+        world.insert_resource(groups);
+        world.insert_resource(Deployment { active: true });
+        world.insert_resource(SetupScript { charges: vec![(0, 20.0)], begun: None });
+        world.insert_resource(Time::<()>::default());
+        let mut system = IntoSystem::into_system(run_setup_script);
+        system.initialize(&mut world);
+        let mut run = |world: &mut World, secs: f32| {
+            world.resource_mut::<Time>().advance_by(std::time::Duration::from_secs_f32(secs));
+            system.run((), world).unwrap();
+        };
+        let order = |world: &World| world.resource::<Groups>().list[0].order;
+
+        run(&mut world, 30.0);
+        assert!(order(&world).is_none(), "no charge while deploying");
+        world.resource_mut::<Deployment>().active = false;
+        run(&mut world, 1.0);
+        run(&mut world, 19.0);
+        assert!(order(&world).is_none(), "19 s into the battle");
+        run(&mut world, 1.5);
+        assert!(matches!(order(&world), Some(Order::Attack(2))), "the nearer enemy, 20.5 s in");
     }
 }

@@ -102,6 +102,7 @@ fn main() {
         .insert_resource(user_settings)
         .add_plugins(game_state::GameShellPlugin)
         .add_plugins(settings::SettingsPlugin)
+        .add_plugins(battle_setup::BattleSetupPlugin)
         .add_plugins((
             terrain::TerrainPlugin,
             water::WaterPlugin,

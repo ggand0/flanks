@@ -214,7 +214,7 @@ pub fn do_spawn_battle(
         Scenario::Scene => { groups.list.clear(); return; }
         Scenario::Archery => { spawn_archery_test(units, terrain, groups); return; }
         Scenario::Retarget => { spawn_retarget_test(units, terrain, groups); return; }
-        Scenario::Normal => {}
+        Scenario::Normal | Scenario::Demo => {}
     }
 
     let per_team = config.units_per_team;

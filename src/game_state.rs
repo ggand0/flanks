@@ -14,6 +14,10 @@ use crate::units::Units;
 pub enum Scenario {
     #[default]
     Normal,
+    /// The demo battle (battle_setup.rs `demo_setup`): 200k on the
+    /// grassland, the player's side in a set defence with a timed charge,
+    /// the enemy AI playing as in a normal battle (`FL_DEMO=1`).
+    Demo,
     Surround,
     Rout,
     Dir,
@@ -36,7 +40,8 @@ pub enum Scenario {
 }
 
 /// The env var of every scripted scenario, as the scripts launch them.
-const SCENARIO_ENVS: [&str; 11] = [
+const SCENARIO_ENVS: [&str; 12] = [
+    "FL_DEMO",
     "FL_TEST_SURROUND",
     "FL_TEST_ROUT",
     "FL_TEST_DIR",
@@ -53,6 +58,7 @@ const SCENARIO_ENVS: [&str; 11] = [
 impl Scenario {
     const ALL: &[Scenario] = &[
         Self::Normal,
+        Self::Demo,
         Self::Surround,
         Self::Rout,
         Self::Dir,
@@ -71,6 +77,7 @@ impl Scenario {
     fn label(self) -> &'static str {
         match self {
             Self::Normal => "Normal",
+            Self::Demo => "Demo",
             Self::Surround => "Surround",
             Self::Rout => "Rout",
             Self::Dir => "Dir Defense",
@@ -93,6 +100,7 @@ impl Scenario {
     fn env_key(self) -> Option<&'static str> {
         match self {
             Self::Normal => None,
+            Self::Demo => Some("FL_DEMO"),
             Self::Surround => Some("FL_TEST_SURROUND"),
             Self::Rout => Some("FL_TEST_ROUT"),
             Self::Dir => Some("FL_TEST_DIR"),
@@ -107,7 +115,7 @@ impl Scenario {
         }
     }
 
-    fn from_env() -> Self {
+    pub(crate) fn from_env() -> Self {
         Self::ALL
             .iter()
             .copied()
@@ -160,7 +168,7 @@ impl Default for BattleConfig {
             map: MapKind::from_env(),
             scenario: Scenario::from_env(),
         };
-        if let Some(setup) = crate::battle_setup::from_env() {
+        if let Some(setup) = crate::battle_setup::for_battle(config.scenario) {
             setup.apply_config(&mut config);
         }
         config
@@ -191,10 +199,12 @@ pub fn deploying(d: Res<Deployment>) -> bool {
 }
 
 /// Any scripted scenario or test battery owns the battle: automatic
-/// order sources (ai.rs) stand down. Deliberately NOT cached — menu
-/// scenario buttons change the env between battles (sync_scenario_env).
+/// order sources (ai.rs) stand down. The Demo's script orders only the
+/// player's side, so the AI still plays the enemy there. Deliberately NOT
+/// cached — menu scenario buttons change the env between battles
+/// (sync_scenario_env).
 pub fn scripts_active() -> bool {
-    Scenario::from_env() != Scenario::Normal
+    !matches!(Scenario::from_env(), Scenario::Normal | Scenario::Demo)
         || std::env::var("FL_TEST_FRONT").is_ok()
         || std::env::var("FL_TEST_ORDERS").is_ok()
         || std::env::var("FL_TEST_FORM").is_ok()
@@ -322,7 +332,8 @@ impl Plugin for GameShellPlugin {
                                 .and_then(crate::settings::settings_closed)
                                 .and_then(test_battles_closed),
                         ),
-                    (debug_scenario_buttons, close_test_battles).run_if(in_state(GameState::Menu)),
+                    (debug_scenario_buttons.before(crate::terrain::MapRebuild), close_test_battles)
+                        .run_if(in_state(GameState::Menu)),
                     (toggle_pause, pause_buttons).run_if(
                         in_state(GameState::Battle)
                             .and_then(crate::settings::settings_closed),
@@ -590,7 +601,7 @@ fn spawn_option_text(button: &mut ChildSpawnerCommands, value: &str) {
 fn start_target() -> GameState {
     if scripts_active()
         || crate::util::env_or("FL_DEPLOY", 1_u32) == 0
-        || crate::battle_setup::from_env().is_some()
+        || crate::battle_setup::for_battle(Scenario::Normal).is_some()
     {
         GameState::Battle
     } else {
@@ -619,7 +630,7 @@ fn menu_buttons(
     mut exit: MessageWriter<AppExit>,
     mut auto: Local<bool>,
 ) {
-    if !*auto && scripts_active() {
+    if !*auto && (scripts_active() || Scenario::from_env() == Scenario::Demo) {
         *auto = true;
         next.set(GameState::Battle);
         return;
@@ -809,14 +820,21 @@ fn close_test_battles(
     }
 }
 
+/// A test battle button. The Demo brings its own map and armies; a new
+/// map rebuilds before the battle spawns (this runs before `MapRebuild`).
 fn debug_scenario_buttons(
     query: Query<(&Interaction, &DebugButton), Changed<Interaction>>,
     mut config: ResMut<BattleConfig>,
     mut next: ResMut<NextState<GameState>>,
+    mut maps: MessageWriter<MapChanged>,
 ) {
     for (interaction, btn) in &query {
         if *interaction == Interaction::Pressed {
             config.scenario = btn.0;
+            if let Some(setup) = crate::battle_setup::for_battle(btn.0) {
+                setup.apply_config(&mut config);
+                maps.write(MapChanged(config.map));
+            }
             next.set(GameState::Battle);
         }
     }
@@ -849,6 +867,7 @@ pub fn setup_battle(
     mut dir_stats: ResMut<DirTestStats>,
     mut virt_time: ResMut<Time<Virtual>>,
     mut deploy: ResMut<Deployment>,
+    mut script: ResMut<crate::battle_setup::SetupScript>,
     config: Res<BattleConfig>,
     (mut arrows, mut arrow_spawns, mut stuck): (
         ResMut<crate::arrows::Arrows>,
@@ -870,15 +889,16 @@ pub fn setup_battle(
     virt_time.unpause();
     sync_scenario_env(config.scenario);
     crate::regiments::do_spawn_battle(&mut units, &terrain, &mut groups, &config);
-    if config.scenario == Scenario::Normal
-        && let Some(setup) = crate::battle_setup::from_env()
-        && !setup.place(&mut groups, &mut units, &terrain)
-    {
-        warn!("FL_SETUP: the armies differ from the file's; units stay where they spawned");
+    *script = default();
+    if let Some(setup) = crate::battle_setup::for_battle(config.scenario) {
+        match setup.place(&mut groups, &mut units, &terrain) {
+            Some(placed) => *script = crate::battle_setup::SetupScript::new(setup, &placed),
+            None => warn!("setup: the armies differ from the setup's; units stay where they spawned"),
+        }
     }
     // Scripted scenarios and test batteries start fighting immediately;
-    // a normal battle opens in deployment. FL_DEPLOY=0 skips it.
-    deploy.active = config.scenario == Scenario::Normal
+    // a normal battle and the Demo open in deployment. FL_DEPLOY=0 skips it.
+    deploy.active = matches!(config.scenario, Scenario::Normal | Scenario::Demo)
         && !scripts_active()
         && crate::util::env_or("FL_DEPLOY", 1_u32) != 0;
     if deploy.active {
