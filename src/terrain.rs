@@ -21,6 +21,10 @@ pub const CHUNKS_X: usize = 16;
 pub const CHUNKS_Z: usize = 12;
 const VERTS_X: usize = CHUNKS_X * CHUNK_CELLS + 1;
 const VERTS_Z: usize = CHUNKS_Z * CHUNK_CELLS + 1;
+/// Half the battlefield's width (x) and depth (z) in metres. Every map is
+/// this size, centred on the origin (`Terrain::min`, `Terrain::max`).
+pub const HALF_EXTENTS: Vec2 =
+    Vec2::new((VERTS_X - 1) as f32 * CELL * 0.5, (VERTS_Z - 1) as f32 * CELL * 0.5);
 
 /// The battlefields in the menu's Map row. An `FL_SETUP` file's map wins
 /// at launch, then `FL_MAP=classic`, `river` or `sandbox`; anything else
