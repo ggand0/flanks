@@ -201,7 +201,7 @@ pub fn deploying(d: Res<Deployment>) -> bool {
 /// Any scripted scenario or test battery owns the battle: automatic
 /// order sources (ai.rs) stand down. The Demo's script orders only the
 /// player's side, so the AI still plays the enemy there. Deliberately NOT
-/// cached — menu scenario buttons change the env between battles
+/// cached: menu scenario buttons change the env between battles
 /// (sync_scenario_env).
 pub fn scripts_active() -> bool {
     !matches!(Scenario::from_env(), Scenario::Normal | Scenario::Demo)
