@@ -47,7 +47,7 @@ codegen-units = 16
 # AppImage keeps it at its root, a macOS app bundle in Contents/Resources.
 # appimagetool will not build an AppImage without an icon.
 [package.metadata.appimage]
-icon = "assets/icon_256.png"
+icon = "assets/flanks_icon_256.png"
 assets = ["assets"]
 
 [package.metadata.bundle]
