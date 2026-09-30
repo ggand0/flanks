@@ -730,7 +730,7 @@ fn load_trees(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
 ) {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = crate::util::game_root();
     let mut trees = Vec::new();
     for (name, fallback, budgets) in [
         (

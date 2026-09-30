@@ -87,10 +87,10 @@ fn main() {
                     }),
                     ..default()
                 })
-                // Resolve assets/ from the repo regardless of how the
-                // binary is launched (cargo run vs ./target/...).
+                // Resolve assets/ regardless of how the binary is launched
+                // (packaged, cargo run or ./target/...).
                 .set(AssetPlugin {
-                    file_path: concat!(env!("CARGO_MANIFEST_DIR"), "/assets").into(),
+                    file_path: util::game_root().join("assets").to_string_lossy().into_owned(),
                     ..default()
                 })
                 .set(RenderPlugin {
