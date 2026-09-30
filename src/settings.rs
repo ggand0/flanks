@@ -108,7 +108,7 @@ impl Default for Settings {
                 unit_panel: true,
                 debug_overlay: false,
                 hit_flash: true,
-                front_line: true,
+                front_line: false,
             },
         }
     }
