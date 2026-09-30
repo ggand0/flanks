@@ -22,6 +22,15 @@ serde_yaml_ng = "0.10.0"
 # bevy does not re-export wgpu's query set types. The same wgpu bevy 0.19
 # builds on, no features of its own, so this costs no extra build.
 wgpu = { version = "29", default-features = false }
+# The game window's icon (src/window_icon.rs): bevy does not re-export
+# winit's icon type. The same winit bevy 0.19 builds on, no features of its
+# own, so this costs no extra build.
+winit = { version = "0.30", default-features = false }
+
+[build-dependencies]
+# Embeds the icon in the Windows executable (build.rs), with MSVC and with
+# mingw, native or cross.
+embed-resource = "3"
 
 [features]
 # Profiling: `cargo run --profile opt-dev --features tracy`, then attach
@@ -41,3 +50,19 @@ inherits = "release"
 opt-level = 3
 lto = false
 codegen-units = 16
+
+# Packaging with cargo-appimage and cargo-bundle. Both carry the assets
+# folder, which the game looks for at run time (`util::game_root`); an
+# AppImage keeps it at its root, a macOS app bundle in Contents/Resources.
+# appimagetool will not build an AppImage without an icon.
+[package.metadata.appimage]
+icon = "assets/flanks_icon_rounded_256.png"
+desktop_entry = "resources/linux/flanks.desktop"
+assets = ["assets"]
+
+[package.metadata.bundle]
+name = "FLANKS"
+identifier = "com.ggando.flanks"
+icon = ["assets/flanks_icon.icns"]
+short_description = "Real-time massed medieval battles, every soldier simulated"
+resources = ["assets"]
