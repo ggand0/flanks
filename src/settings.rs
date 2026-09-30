@@ -15,7 +15,7 @@
 //! camera, video), Interface (what the battle screen shows) and
 //! Controls (drag select and the list of keys).
 //!
-//! F1 to F3 flip the Interface settings in battle, so a key and its
+//! F1 to F4 flip the Interface settings in battle, so a key and its
 //! Settings row are the same saved state.
 
 use bevy::ecs::hierarchy::ChildSpawnerCommands;
@@ -89,6 +89,10 @@ pub struct InterfaceSettings {
     /// F3 cycles it: nothing, the one-line stats readout, or the full
     /// debug overlay, all top left. The periodic log runs either way.
     pub overlay: Overlay,
+    /// F4: rings under the soldiers of the regiment under the cursor or
+    /// its card, green for the player's, red for the enemy's. Selection
+    /// rings show either way.
+    pub hover_rings: bool,
     /// Soldiers flash white when hit.
     pub hit_flash: bool,
     /// The front line drawn along the fighting. G hides it too.
@@ -143,6 +147,7 @@ impl Default for Settings {
                 hud: true,
                 unit_panel: true,
                 overlay: Overlay::Off,
+                hover_rings: true,
                 hit_flash: true,
                 front_line: false,
             },
@@ -256,6 +261,7 @@ enum Toggle {
     Hud,
     UnitPanel,
     DebugOverlay,
+    HoverRings,
     HitFlash,
     FrontLine,
 }
@@ -419,6 +425,7 @@ impl Toggle {
             Self::Hud => s.interface.hud,
             Self::UnitPanel => s.interface.unit_panel,
             Self::DebugOverlay => s.interface.overlay != Overlay::Off,
+            Self::HoverRings => s.interface.hover_rings,
             Self::HitFlash => s.interface.hit_flash,
             Self::FrontLine => s.interface.front_line,
         }
@@ -434,6 +441,7 @@ impl Toggle {
             Self::Hud => s.interface.hud = !s.interface.hud,
             Self::UnitPanel => s.interface.unit_panel = !s.interface.unit_panel,
             Self::DebugOverlay => s.interface.overlay = s.interface.overlay.next(),
+            Self::HoverRings => s.interface.hover_rings = !s.interface.hover_rings,
             Self::HitFlash => s.interface.hit_flash = !s.interface.hit_flash,
             Self::FrontLine => s.interface.front_line = !s.interface.front_line,
         }
@@ -617,6 +625,7 @@ const CONTROLS: [(&str, &[(&str, &str)]); 4] = [
             ("F1", "Battle HUD"),
             ("F2", "Unit panel"),
             ("F3", "Stats line, debug overlay"),
+            ("F4", "Hover rings"),
             ("G", "Banners and map lines"),
             ("X, in the full F3 overlay", "Dig a crater"),
         ],
@@ -793,6 +802,7 @@ fn spawn_modal(commands: &mut Commands, s: &Settings, active: Tab) {
                     toggle_row(body, "Battle HUD (F1)", Toggle::Hud, s);
                     toggle_row(body, "Unit panel (F2)", Toggle::UnitPanel, s);
                     toggle_row(body, "Overlay (F3)", Toggle::DebugOverlay, s);
+                    toggle_row(body, "Hover rings (F4)", Toggle::HoverRings, s);
 
                     section_header(body, "Battlefield");
                     toggle_row(body, "Hit flash", Toggle::HitFlash, s);
@@ -947,8 +957,8 @@ fn sync_scroll_thumbs(
     }
 }
 
-/// F1 to F3 flip the Interface settings in battle (paused too): the
-/// battle HUD, the unit panel and the debug overlay.
+/// F1 to F4 flip the Interface settings in battle (paused too): the
+/// battle HUD, the unit panel, the debug overlay and the hover rings.
 fn interface_keys(keys: Res<ButtonInput<KeyCode>>, mut settings: ResMut<Settings>) {
     if keys.just_pressed(KeyCode::F1) {
         settings.interface.hud = !settings.interface.hud;
@@ -958,6 +968,9 @@ fn interface_keys(keys: Res<ButtonInput<KeyCode>>, mut settings: ResMut<Settings
     }
     if keys.just_pressed(KeyCode::F3) {
         settings.interface.overlay = settings.interface.overlay.next();
+    }
+    if keys.just_pressed(KeyCode::F4) {
+        settings.interface.hover_rings = !settings.interface.hover_rings;
     }
 }
 

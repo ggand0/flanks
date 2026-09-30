@@ -3,7 +3,8 @@
 //! see-through disc with a point at the front where the soldier faces,
 //! ETW's teardrop. Selected regiments are a muted green, the player's
 //! regiment under the cursor (or its card) a fainter green, the enemy
-//! under the cursor a muted red.
+//! under the cursor a muted red. The two hover styles show only with the
+//! Hover rings setting on (F4).
 //!
 //! GPU path: the build pass (unit_build.wgsl `append_ring`) puts each
 //! visible soldier of a flagged regiment on the ring list in the tail of
@@ -109,15 +110,18 @@ fn update_rings_active(
     selection: Res<crate::orders::Selection>,
     hover: Res<crate::orders::Hover>,
     groups: Res<crate::orders::Groups>,
+    settings: Res<crate::settings::Settings>,
     mut active: ResMut<RingsActive>,
 ) {
+    let hovered =
+        settings.interface.hover_rings && (hover.enemy.is_some() || hover.own.is_some());
     let selected = selection
         .regiments
         .iter()
         .zip(&groups.list)
         .any(|(s, gd)| *s && !gd.state.is_broken());
     let on = *state.get() == crate::game_state::GameState::Battle
-        && (selected || hover.enemy.is_some() || hover.own.is_some());
+        && (selected || hovered);
     if active.0 != on {
         active.0 = on;
     }

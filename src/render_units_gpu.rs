@@ -279,7 +279,7 @@ fn pack_chunk(units: &Units, start: usize, out: &mut [GpuSoldier], flash: bool) 
 fn build_frame_params(
     units: Res<Units>,
     selection: Res<crate::orders::Selection>,
-    hover: Res<crate::orders::Hover>,
+    (hover, settings): (Res<crate::orders::Hover>, Res<crate::settings::Settings>),
     groups: Res<crate::orders::Groups>,
     time: Res<Time>,
     fixed_time: Res<Time<Fixed>>,
@@ -329,11 +329,13 @@ fn build_frame_params(
             {
                 flags |= REG_SELECTED;
             }
-            if hover.enemy == Some(g as u32) {
-                flags |= REG_HOVERED;
-            }
-            if hover.own == Some(g as u32) {
-                flags |= REG_HOVER_OWN;
+            if settings.interface.hover_rings {
+                if hover.enemy == Some(g as u32) {
+                    flags |= REG_HOVERED;
+                }
+                if hover.own == Some(g as u32) {
+                    flags |= REG_HOVER_OWN;
+                }
             }
             RegimentRecord {
                 stance: stance_tier(gd),
