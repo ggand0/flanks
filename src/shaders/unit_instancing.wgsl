@@ -25,8 +25,8 @@ struct Vertex {
     // rgb = team color, a = stable per-unit anim seed (not opacity).
     @location(9) i_color: vec4<f32>,
     // x = yaw, y = ground speed in m/s. z = attack or cheer
-    // (render_units.rs CELEBRATE_BASE), 0 for neither. w = fx: [0,1)
-    // hit-flash intensity, [1,2] = 1 + death progress, 2 on a corpse.
+    // (render_units.rs CELEBRATE_BASE), 0 for neither. w = fx: [0,1]
+    // hit-flash intensity, (1,2] = 1 + death progress, 2 on a corpse.
     @location(10) i_anim: vec4<f32>,
     // x = stance band (0.25 enemy near, 0.5 fighting, 1 charging),
     // y = wall 0..1 (shieldwall/spearwall by bucket), z = gait phase in

@@ -401,9 +401,11 @@ fn build_soldier(i: u32) {
         lunge = params.consts.w + reg.celebrate;
     }
 
-    // fx: [0,1) hit flash, [1,2] death progress.
+    // fx: [0,1] hit flash, (1,2] death progress. A death's first tick has
+    // progress 0, the living pose, and at 1.0 it would read as a full
+    // flash, so it keeps the hit flash like a living man.
     var fx = flash * 0.25;
-    if death_t > 0.0 {
+    if death_t > 0.0 && death_t < params.consts.y {
         fx = 2.0 - death_t / params.consts.y;
     }
 
