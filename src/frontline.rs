@@ -349,6 +349,78 @@ struct RegimentSums {
     target_line_n: u32,
 }
 
+/// Regiments per pool task in `update_groups`: a task per regiment spent
+/// more on spawning than on its thousand men.
+const REGIMENTS_PER_TASK: usize = 16;
+
+/// One regiment's sums over its men, walking its runs in index order. `pc`
+/// and `pb` are its centroid and home bias from the last tick, `f` its
+/// forward vector, `tg` its attack target.
+fn regiment_sums(
+    units: &Units,
+    runs: &[(u32, u32)],
+    (pc, pb, f, tg): (Vec2, Vec2, Vec2, Option<u32>),
+) -> RegimentSums {
+    let mut a = RegimentSums {
+        pos: Vec2::ZERO,
+        count: 0,
+        home: Vec2::ZERO,
+        r2: 0.0,
+        slot_err: 0.0,
+        front_off: f32::MIN,
+        back_off: f32::MAX,
+        line_sum: 0.0,
+        line_n: 0,
+        fight_n: 0,
+        target_fight_n: 0,
+        target_line_sum: 0.0,
+        target_line_n: 0,
+    };
+    for &(s, e) in runs {
+        for i in s as usize..e as usize {
+            let p = Vec2::new(units.pos[i].x, units.pos[i].z);
+            a.front_off = a.front_off.max(units.home[i].dot(f));
+            a.back_off = a.back_off.min(units.home[i].dot(f));
+            a.pos += p;
+            a.count += 1;
+            a.home += units.home[i];
+            a.r2 += (p - pc).length_squared();
+            a.slot_err += (p - pc - units.home[i] + pb).length();
+            // Ground-truth contact: a unit in WIND-UP has an enemy in reach
+            // and is striking. TW rule: one soldier fighting engages the
+            // regiment. (`target` is stale outside a swing cycle and `swing`
+            // spawns in Recover for strike staggering, so neither is usable.)
+            // A bow DRAW is a wind-up too but not melee: counting it made
+            // an archer regiment "engaged" the moment it drew, which
+            // silenced its own fire solution before the first loose.
+            if units.death_t[i] == 0
+                && units.swing[i] & crate::units::SWING_STATE_MASK
+                    == crate::units::SWING_WINDUP
+                && units.swing[i] & crate::units::SWING_RANGED == 0
+            {
+                a.fight_n += 1;
+                let ti = units.target[i] as usize;
+                let at_target = ti < units.len() && Some(units.group[ti]) == tg;
+                if at_target {
+                    a.target_fight_n += 1;
+                }
+                if ti < units.len() {
+                    let d = Vec2::new(units.pos[ti].x - p.x, units.pos[ti].z - p.y);
+                    if d.dot(f) > 0.5 * d.length() {
+                        a.line_sum += p.dot(f);
+                        a.line_n += 1;
+                        if at_target {
+                            a.target_line_sum += p.dot(f);
+                            a.target_line_n += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    a
+}
+
 fn update_groups(
     units: Res<Units>,
     runs: Res<crate::sim::RegimentRuns>,
@@ -377,79 +449,27 @@ fn update_groups(
             _ => None,
         })
         .collect();
-    // The sums over the men, one task per regiment walking its runs in
-    // index order: the same additions in the same order as one scan of
-    // the army, regiment by regiment, so the same bits. Bevy's scope
-    // returns the tasks' results in spawn order.
+    // The sums over the men, a pool task per few regiments, each regiment's
+    // runs walked in index order: the same additions in the same order as
+    // one scan of the army, regiment by regiment, so the same bits. Bevy's
+    // scope returns the tasks' results in spawn order.
     let units = &*units;
     let runs = &*runs;
     let (prev_cents_r, prev_bias_r, fwd_r, target_r) =
         (&prev_cents, &prev_bias, &fwd, &attack_target);
-    let sums: Vec<RegimentSums> = bevy::tasks::ComputeTaskPool::get().scope(|scope| {
-        for g in 0..n {
+    let batches: Vec<Vec<RegimentSums>> = bevy::tasks::ComputeTaskPool::get().scope(|scope| {
+        for first in (0..n).step_by(REGIMENTS_PER_TASK) {
             scope.spawn(async move {
-                let (pc, pb, f, tg) = (prev_cents_r[g], prev_bias_r[g], fwd_r[g], target_r[g]);
-                let mut a = RegimentSums {
-                    pos: Vec2::ZERO,
-                    count: 0,
-                    home: Vec2::ZERO,
-                    r2: 0.0,
-                    slot_err: 0.0,
-                    front_off: f32::MIN,
-                    back_off: f32::MAX,
-                    line_sum: 0.0,
-                    line_n: 0,
-                    fight_n: 0,
-                    target_fight_n: 0,
-                    target_line_sum: 0.0,
-                    target_line_n: 0,
-                };
-                for &(s, e) in runs.of(g) {
-                    for i in s as usize..e as usize {
-                        let p = Vec2::new(units.pos[i].x, units.pos[i].z);
-                        a.front_off = a.front_off.max(units.home[i].dot(f));
-                        a.back_off = a.back_off.min(units.home[i].dot(f));
-                        a.pos += p;
-                        a.count += 1;
-                        a.home += units.home[i];
-                        a.r2 += (p - pc).length_squared();
-                        a.slot_err += (p - pc - units.home[i] + pb).length();
-                        // Ground-truth contact: a unit in WIND-UP has an enemy in reach
-                        // and is striking. TW rule: one soldier fighting engages the
-                        // regiment. (`target` is stale outside a swing cycle and `swing`
-                        // spawns in Recover for strike staggering, so neither is usable.)
-                        // A bow DRAW is a wind-up too but not melee: counting it made
-                        // an archer regiment "engaged" the moment it drew, which
-                        // silenced its own fire solution before the first loose.
-                        if units.death_t[i] == 0
-                            && units.swing[i] & crate::units::SWING_STATE_MASK
-                                == crate::units::SWING_WINDUP
-                            && units.swing[i] & crate::units::SWING_RANGED == 0
-                        {
-                            a.fight_n += 1;
-                            let ti = units.target[i] as usize;
-                            let at_target = ti < units.len() && Some(units.group[ti]) == tg;
-                            if at_target {
-                                a.target_fight_n += 1;
-                            }
-                            if ti < units.len() {
-                                let d = Vec2::new(units.pos[ti].x - p.x, units.pos[ti].z - p.y);
-                                if d.dot(f) > 0.5 * d.length() {
-                                    a.line_sum += p.dot(f);
-                                    a.line_n += 1;
-                                    if at_target {
-                                        a.target_line_sum += p.dot(f);
-                                        a.target_line_n += 1;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                a
+                (first..n.min(first + REGIMENTS_PER_TASK))
+                    .map(|g| {
+                        let regiment = (prev_cents_r[g], prev_bias_r[g], fwd_r[g], target_r[g]);
+                        regiment_sums(units, runs.of(g), regiment)
+                    })
+                    .collect::<Vec<RegimentSums>>()
             });
         }
     });
+    let sums: Vec<RegimentSums> = batches.into_iter().flatten().collect();
     let counts: Vec<usize> = sums.iter().map(|a| a.count).collect();
     let fighting: Vec<bool> = sums.iter().map(|a| a.fight_n > 0).collect();
     let cents: Vec<Vec2> = sums
