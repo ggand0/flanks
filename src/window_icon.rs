@@ -8,40 +8,32 @@ use bevy::asset::RenderAssetUsages;
 use bevy::ecs::system::NonSendMarker;
 use bevy::image::{CompressedImageFormats, ImageSampler, ImageType};
 use bevy::prelude::*;
-use bevy::window::PrimaryWindow;
+use bevy::window::WindowCreated;
 use bevy::winit::WINIT_WINDOWS;
 
 pub struct WindowIconPlugin;
 
 impl Plugin for WindowIconPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Update, set_window_icon);
+        app.add_systems(Update, set_window_icon.run_if(on_message::<WindowCreated>));
     }
 }
 
-/// Set the icon once the primary window's winit window exists, a frame or
-/// so after startup. `NonSendMarker` keeps the system on the main thread,
-/// where winit requires window calls.
-fn set_window_icon(
-    window: Query<Entity, With<PrimaryWindow>>,
-    mut done: Local<bool>,
-    _main_thread: NonSendMarker,
-) {
-    if *done {
-        return;
-    }
-    let Ok(entity) = window.single() else {
-        return;
-    };
+/// Set the icon on each window bevy has just created; bevy sends
+/// `WindowCreated` once the winit window exists, so this runs once at
+/// startup. `NonSendMarker` keeps the system on the main thread, where winit
+/// requires window calls.
+fn set_window_icon(mut created: MessageReader<WindowCreated>, _main_thread: NonSendMarker) {
     WINIT_WINDOWS.with_borrow(|windows| {
-        let Some(winit_window) = windows.get_window(entity) else {
-            return;
-        };
-        match icon() {
-            Some(icon) => winit_window.set_window_icon(Some(icon)),
-            None => warn!("window icon: could not decode assets/flanks_icon_rounded_256.png"),
+        for created in created.read() {
+            let Some(winit_window) = windows.get_window(created.window) else {
+                continue;
+            };
+            match icon() {
+                Some(icon) => winit_window.set_window_icon(Some(icon)),
+                None => warn!("window icon: could not decode assets/flanks_icon_rounded_256.png"),
+            }
         }
-        *done = true;
     });
 }
 
