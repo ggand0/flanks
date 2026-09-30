@@ -446,7 +446,13 @@ impl<P: PhaseItem> RenderCommand<P> for DrawCasterList {
         let kind = pulled.bucket as usize / NUM_LODS;
         let list = NUM_BUCKETS + cascade_index * NUM_KINDS + kind;
         pass.set_bind_group(3, group, &[]);
-        pass.draw_indirect(&alloc.args, list as u64 * 16);
+        match &pulled.index {
+            Some(index) => {
+                pass.set_index_buffer(index.slice(..), IndexFormat::Uint32);
+                pass.draw_indexed_indirect(&alloc.indexed_args, list as u64 * 20);
+            }
+            None => pass.draw_indirect(&alloc.args, list as u64 * 16),
+        }
         RenderCommandResult::Success
     }
 }
