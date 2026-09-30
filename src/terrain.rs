@@ -22,9 +22,10 @@ pub const CHUNKS_Z: usize = 12;
 const VERTS_X: usize = CHUNKS_X * CHUNK_CELLS + 1;
 const VERTS_Z: usize = CHUNKS_Z * CHUNK_CELLS + 1;
 
-/// The battlefields the menu's Map row cycles through. `FL_MAP=classic`
-/// or `FL_MAP=river` picks one at launch; anything else is the grassland.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+/// The battlefields in the menu's Map row. An `FL_SETUP` file's map wins
+/// at launch, then `FL_MAP=classic`, `river` or `sandbox`; anything else
+/// is the grassland.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub enum MapKind {
     /// Broad pasture shoulders around an open lowland: the default.
     #[default]
@@ -40,6 +41,9 @@ pub enum MapKind {
 
 impl MapKind {
     pub fn from_env() -> Self {
+        if let Some(setup) = crate::battle_setup::from_env() {
+            return setup.map;
+        }
         match std::env::var("FL_MAP").as_deref() {
             Ok("river") => Self::River,
             Ok("classic") => Self::Classic,

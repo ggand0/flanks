@@ -2,6 +2,7 @@ mod ai;
 mod arrows;
 mod audio;
 mod balance;
+mod battle_setup;
 mod banners;
 mod camera;
 mod combat;

@@ -151,7 +151,7 @@ impl Default for BattleConfig {
     fn default() -> Self {
         let units_per_team = crate::util::env_or("FL_UNITS", 100_000);
         let reg_size = crate::util::env_or("FL_REG_SIZE", 1000_usize).max(50);
-        Self {
+        let mut config = Self {
             player_regs: crate::regiments::frac_comp((units_per_team / reg_size).max(1)),
             enemy: EnemyComp::Random,
             units_per_team,
@@ -159,7 +159,11 @@ impl Default for BattleConfig {
             ai_enabled: !std::env::var("FL_AI").is_ok_and(|v| v == "0"),
             map: MapKind::from_env(),
             scenario: Scenario::from_env(),
+        };
+        if let Some(setup) = crate::battle_setup::from_env() {
+            setup.apply_config(&mut config);
         }
+        config
     }
 }
 
@@ -581,9 +585,13 @@ fn spawn_option_text(button: &mut ChildSpawnerCommands, value: &str) {
 
 /// Where Start Battle goes: normal battles pass through the Select
 /// Units screen; scripted scenarios and FL_DEPLOY=0 skip deployment and
-/// the picker both and drop straight into the fight.
+/// the picker both and drop straight into the fight. An `FL_SETUP` file
+/// brings its own armies, so it skips the picker and keeps deployment.
 fn start_target() -> GameState {
-    if scripts_active() || crate::util::env_or("FL_DEPLOY", 1_u32) == 0 {
+    if scripts_active()
+        || crate::util::env_or("FL_DEPLOY", 1_u32) == 0
+        || crate::battle_setup::from_env().is_some()
+    {
         GameState::Battle
     } else {
         GameState::UnitSelect
@@ -862,6 +870,12 @@ pub fn setup_battle(
     virt_time.unpause();
     sync_scenario_env(config.scenario);
     crate::regiments::do_spawn_battle(&mut units, &terrain, &mut groups, &config);
+    if config.scenario == Scenario::Normal
+        && let Some(setup) = crate::battle_setup::from_env()
+        && !setup.place(&mut groups, &mut units, &terrain)
+    {
+        warn!("FL_SETUP: the armies differ from the file's; units stay where they spawned");
+    }
     // Scripted scenarios and test batteries start fighting immediately;
     // a normal battle opens in deployment. FL_DEPLOY=0 skips it.
     deploy.active = config.scenario == Scenario::Normal
@@ -930,12 +944,15 @@ fn spawn_deploy_ui(commands: &mut Commands) {
 }
 
 /// Begin Battle button or Enter: release the sim and drop the deploy UI.
+/// The setup it releases is written to `last_setup.yaml` for `FL_SETUP`.
 fn begin_battle(
     mut commands: Commands,
     mut deploy: ResMut<Deployment>,
     keys: Res<ButtonInput<KeyCode>>,
     buttons: Query<&Interaction, (Changed<Interaction>, With<BeginBattleButton>)>,
     roots: Query<Entity, With<DeployRoot>>,
+    config: Res<BattleConfig>,
+    groups: Res<Groups>,
 ) {
     let clicked = buttons.iter().any(|i| *i == Interaction::Pressed);
     if !clicked && !keys.just_pressed(KeyCode::Enter) {
@@ -945,6 +962,7 @@ fn begin_battle(
     for e in &roots {
         commands.entity(e).despawn();
     }
+    crate::battle_setup::save_last(&crate::battle_setup::BattleSetup::capture(&config, &groups));
     info!("deployment done: battle begins");
 }
 
