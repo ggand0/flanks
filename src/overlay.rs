@@ -308,10 +308,10 @@ fn spawn_stats_line(mut commands: Commands) {
 /// both sides, and the sim tick (its grid, step and field phases).
 /// Soldiers add up the units' living counts: those start at full
 /// strength, so the number is right in deployment, before the sim has
-/// filled `CombatStats`. The
-/// font is monospaced, so fps and sim are right-aligned in a fixed width:
-/// a value crossing 10 or 100 no longer resizes the pill every update.
-/// The soldier count loses a digit at most twice a battle.
+/// filled `CombatStats`. The font is monospaced, so fps and sim are
+/// right-aligned in a fixed width: a value crossing 10 or 100 no longer
+/// resizes the pill every update. The soldier count loses a digit at most
+/// twice a battle.
 fn update_stats_line(
     settings: Res<crate::settings::Settings>,
     diagnostics: Res<DiagnosticsStore>,

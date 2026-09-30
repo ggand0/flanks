@@ -618,7 +618,7 @@ const CONTROLS: [(&str, &[(&str, &str)]); 4] = [
             ("F2", "Unit panel"),
             ("F3", "Stats line, debug overlay"),
             ("G", "Banners and map lines"),
-            ("X, with F3 on", "Dig a crater"),
+            ("X, in the full F3 overlay", "Dig a crater"),
         ],
     ),
 ];
