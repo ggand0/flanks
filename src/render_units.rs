@@ -818,6 +818,7 @@ fn sync_instance_data(
     // Broken regiments render desaturated (no extra instance data needed).
     let broken: Vec<bool> = groups.list.iter().map(|g| g.state.is_broken()).collect();
     let broken = &broken[..];
+    let hover_rings = settings.interface.hover_rings;
     // Each regiment's ring style, as the GPU build picks it. The GPU path
     // owns the display in check mode, so only the CPU path collects.
     let ring_style: Vec<Option<u32>> = (0..groups.list.len())
@@ -825,8 +826,8 @@ fn sync_instance_data(
             let selected = selection.regiments.get(g).copied().unwrap_or(false) && !broken[g];
             crate::selection_rings::ring_style(
                 selected,
-                hover.enemy == Some(g as u32),
-                hover.own == Some(g as u32),
+                hover_rings && hover.enemy == Some(g as u32),
+                hover_rings && hover.own == Some(g as u32),
             )
         })
         .collect();
