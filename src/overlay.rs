@@ -641,11 +641,21 @@ fn update_overlay(
         ph.render.clear();
         for diag in diagnostics.iter() {
             let path = diag.path().as_str();
-            if path.starts_with("render/")
-                && path.ends_with("elapsed_gpu")
-                && let Some(v) = diag.smoothed()
-            {
+            if !path.starts_with("render/") {
+                continue;
+            }
+            let Some(v) = diag.smoothed() else {
+                continue;
+            };
+            // Per pass, from pipeline statistics queries on devices that have
+            // them: vertices shaded, triangles set up, fragments shaded.
+            let counted = ["vertex_shader_invocations", "clipper_invocations", "fragment_shader_invocations"]
+                .iter()
+                .any(|c| path.ends_with(c));
+            if path.ends_with("elapsed_gpu") {
                 info!("  gpu {path}: {v:.2} ms");
+            } else if counted && v >= 1e4 {
+                info!("  gpu {path}: {:.2} M", v / 1e6);
             }
         }
     }
