@@ -780,7 +780,7 @@ fn load_trees(
         ),
     ] {
         let shipped = root.join(format!("assets/vegetation/{name}.glb"));
-        let path = if shipped.exists() {
+        let path = if crate::game_files::is_file(&shipped) {
             shipped
         } else {
             root.join("assets_dev/vegetation").join(fallback)
@@ -863,7 +863,8 @@ fn horizontal_reach(levels: &[TreeLevelData; 3]) -> f32 {
 
 /// Decode the whole asset before publishing handles, so a failed import leaves no assets behind.
 fn read_tree(path: &std::path::Path, budgets: [usize; 3]) -> Result<TreeData, String> {
-    let glb = gltf::Gltf::open(path).map_err(|e| e.to_string())?;
+    let bytes = crate::game_files::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let glb = gltf::Gltf::from_slice(&bytes).map_err(|e| e.to_string())?;
     let blob = glb.blob.as_deref().ok_or("missing binary buffer")?;
     for node in glb.nodes() {
         let matrix = Mat4::from_cols_array_2d(&node.transform().matrix());

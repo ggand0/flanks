@@ -175,7 +175,7 @@ fn mesh_length(mesh: &Mesh) -> f32 {
 /// Read the arrow's `L0`: one rigid part, id 7, vertex coloured, metres
 /// along +Z, origin at the shaft's middle. Scaled to `length`.
 fn import_arrow(path: &Path, length: f32) -> Fallible<Mesh> {
-    let bytes = std::fs::read(path).map_err(|e| format!("cannot read it: {e}"))?;
+    let bytes = crate::game_files::read(path).map_err(|e| format!("cannot read it: {e}"))?;
     let gltf = gltf::Gltf::from_slice(&bytes).map_err(|e| format!("not valid glTF: {e}"))?;
     let blob = gltf.blob.as_deref();
     let scene = gltf
@@ -249,17 +249,17 @@ fn model_file(name: &str) -> Option<PathBuf> {
     let var = format!("FL_GLB_{}", name.to_uppercase());
     if let Ok(named) = std::env::var(&var) {
         let named = root.join(named);
-        if named.is_file() {
+        if crate::game_files::is_file(&named) {
             return Some(named);
         }
         warn!("{var}: {} is not a file", named.display());
     }
     let shipped = root.join("assets/units").join(format!("{name}.glb"));
-    if shipped.is_file() {
+    if crate::game_files::is_file(&shipped) {
         return Some(shipped);
     }
     let working = root.join("assets_dev").join(name).join(format!("{name}.glb"));
-    working.is_file().then_some(working)
+    crate::game_files::is_file(&working).then_some(working)
 }
 
 /// One level's geometry, in model space while it is read and in engine
@@ -302,7 +302,7 @@ impl Level {
 /// Read a model and hand back its four levels, engine local space, ready
 /// to hand to `Mesh3d`, with its atlas.
 fn import(kind: usize, path: &Path) -> Fallible<KindMeshes> {
-    let bytes = std::fs::read(path).map_err(|e| format!("cannot read it: {e}"))?;
+    let bytes = crate::game_files::read(path).map_err(|e| format!("cannot read it: {e}"))?;
     let gltf = gltf::Gltf::from_slice(&bytes).map_err(|e| format!("not valid glTF: {e}"))?;
     let blob = gltf.blob.as_deref();
     let atlas = read_atlas(&gltf, blob, path)?;
@@ -766,7 +766,7 @@ impl Shots {
 
 /// Read and check a bow rig's shot file.
 fn read_shoot(path: &Path) -> Fallible<Shots> {
-    let text = std::fs::read_to_string(path)
+    let text = crate::game_files::read_to_string(path)
         .map_err(|e| format!("cannot read its shot tables {}: {e}", path.display()))?;
     let mut file: ShootFile = serde_json::from_str(&text)
         .map_err(|e| format!("{} is not a shot file: {e}", path.display()))?;
@@ -879,7 +879,7 @@ struct Attack {
 
 /// Read and check an attack file against the model's joints.
 fn read_attack(path: &Path, joints: &[Vec3; 4], parts: [usize; 4]) -> Fallible<Attack> {
-    let text = std::fs::read_to_string(path)
+    let text = crate::game_files::read_to_string(path)
         .map_err(|e| format!("cannot read its attack tables {}: {e}", path.display()))?;
     let file: AttackFile = serde_json::from_str(&text)
         .map_err(|e| format!("{} is not an attack file: {e}", path.display()))?;
@@ -1158,9 +1158,9 @@ fn read_atlas(
         }
         gltf::image::Source::Uri { uri, mime_type } => {
             let file = path.parent().unwrap_or(Path::new(".")).join(uri);
-            let bytes = std::fs::read(&file)
+            let bytes = crate::game_files::read(&file)
                 .map_err(|e| format!("cannot read the atlas {}: {e}", file.display()))?;
-            (bytes, mime_type)
+            (bytes.into_owned(), mime_type)
         }
     };
     let sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {

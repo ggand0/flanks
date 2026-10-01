@@ -40,6 +40,11 @@ embed-resource = "3"
 # Profiling: `cargo run --profile opt-dev --features tracy`, then attach
 # the Tracy UI. Enables bevy's per-system spans + our manual sim spans.
 tracy = ["bevy/trace_tracy"]
+# Compile every file under assets/ into the executable, so a shipped build
+# is a single file: `cargo build --release --features embed_assets`. Off for
+# daily builds, which read assets/ from disk and need no rebuild when an
+# asset changes (src/game_files.rs).
+embed_assets = []
 
 # Bevy-recommended dev profile: fast recompiles for our code, optimized deps.
 [profile.dev]

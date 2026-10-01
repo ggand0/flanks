@@ -14,6 +14,7 @@ mod fatigue;
 mod formation;
 mod gait;
 mod frontline;
+mod game_files;
 mod game_state;
 mod mixer;
 mod morale;
@@ -105,6 +106,7 @@ fn main() {
     // settings instead of switching modes one frame in.
     let user_settings = settings::Settings::load();
     App::new()
+        .add_plugins(game_files::GameFilesPlugin)
         .add_plugins(
             DefaultPlugins
                 .set(TaskPoolPlugin {
@@ -126,7 +128,8 @@ fn main() {
                     ..default()
                 })
                 // Resolve assets/ regardless of how the binary is launched
-                // (packaged, cargo run or ./target/...).
+                // (packaged, cargo run or ./target/...). An embed_assets
+                // build serves them from memory instead (GameFilesPlugin).
                 .set(AssetPlugin {
                     file_path: util::game_root().join("assets").to_string_lossy().into_owned(),
                     ..default()
