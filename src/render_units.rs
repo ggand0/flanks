@@ -40,8 +40,8 @@ use bevy::math::primitives::ViewFrustum;
 use bytemuck::{Pod, Zeroable};
 
 use crate::render_units_gpu::{
-    GpuSyncConfig, GpuUnitBuffers, GpuUnitInput, PullMeshGpu, PulledBucketGpu, cpu_sweep,
-    pull_mesh_for,
+    DrawShape, GpuSyncConfig, GpuUnitBuffers, GpuUnitInput, PullMeshGpu, PulledBucketGpu,
+    cpu_sweep, pull_mesh_for,
 };
 use crate::render_units_phase::{Units3d, units_first};
 use crate::units::Units;
@@ -1154,7 +1154,7 @@ fn queue_custom(
                         atlas,
                         receive,
                         pose_pass,
-                        indexed: pull_mesh.indexed(),
+                        shape: pull_mesh.shape,
                     },
                 ),
                 None => pipelines
@@ -1473,8 +1473,8 @@ pub(crate) struct PullPipelineKey {
     /// The pose pass posed the soldiers: the index list holds pose slots
     /// (render_units_gpu.rs).
     pose_pass: bool,
-    /// The camera draws the bucket indexed (`PullMeshGpu::indexed`).
-    indexed: bool,
+    /// Expanded or indexed, and how (render_units_gpu.rs `DrawShape`).
+    shape: DrawShape,
 }
 
 impl PullPipelineKey {
@@ -1495,7 +1495,10 @@ impl PullPipelineKey {
             atlas: false,
             receive: false,
             pose_pass,
-            indexed: false,
+            shape: DrawShape {
+                flat_atlas: false,
+                ..pull_mesh.shape
+            },
         }
     }
 }
@@ -1568,8 +1571,16 @@ impl SpecializedRenderPipeline for CustomPipeline {
         if key.pose_pass {
             defs.push("UNIT_POSE_READ".into());
         }
-        if key.indexed {
+        if key.shape.group > 0 {
             defs.push("PULL_INDEXED".into());
+            defs.push(bevy::shader::ShaderDefVal::UInt("PULL_GROUP".into(), key.shape.group));
+            defs.push(bevy::shader::ShaderDefVal::UInt("PULL_GROUP_VERTS".into(), key.shape.verts));
+        }
+        if key.atlas && key.shape.flat_atlas {
+            descriptor.vertex.shader_defs.push("UNIT_ATLAS_FLAT".into());
+            if let Some(fragment) = descriptor.fragment.as_mut() {
+                fragment.shader_defs.push("UNIT_ATLAS_FLAT".into());
+            }
         }
         atlas_defs(&mut descriptor, key.atlas);
         receive_defs(&mut descriptor, key.receive);
@@ -1667,9 +1678,10 @@ impl<P: PhaseItem> RenderCommand<P> for DrawMeshInstanced {
         let Some((instance_buffer, pulled, atlas)) = bucket else {
             return RenderCommandResult::Skip;
         };
-        // GPU mode: ONE plain draw over every corner of every soldier in
-        // the bucket. The count comes from the indirect buffer the compute
-        // pass wrote, no vertex buffers, no instances.
+        // GPU mode: one draw for every soldier in the bucket, a plain draw
+        // over every corner or an indexed one over groups of soldiers. The
+        // counts come from the indirect buffers the compute pass wrote, no
+        // vertex buffers.
         if let Some(pulled) = pulled {
             let Some(alloc) = &gpu.into_inner().alloc else {
                 return RenderCommandResult::Skip;

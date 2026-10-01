@@ -60,7 +60,14 @@ struct VertexOutput {
     @location(2) shadow_position: vec3<f32>,
 #endif
 #ifdef UNIT_ATLAS
+#ifdef UNIT_ATLAS_FLAT
+    // One atlas point per triangle, from its first vertex: a welded far
+    // level's vertex is shared by triangles that sample different points
+    // (render_units_gpu.rs `weld`).
+    @location(3) @interpolate(flat, first) atlas_uv: vec2<f32>,
+#else
     @location(3) atlas_uv: vec2<f32>,
+#endif
 #endif
 };
 
@@ -86,11 +93,13 @@ struct Sun {
 @group(3) @binding(8) var<uniform> sun: Sun;
 
 #ifdef VERTEX_PULL
-// GPU-built path (render_units_gpu.rs): ONE plain draw of soldiers *
-// PULL_VERTS vertices per bucket, no vertex buffers, no instances. The
-// soldier comes through the bucket's index list, the mesh corner from the
-// expanded level mesh. With the pose pass (UNIT_POSE_READ) the list holds
-// the soldier's pose slot, else his instance record, posed here.
+// GPU-built path (render_units_gpu.rs): one draw per bucket, no vertex
+// buffers. Expanded, a plain draw of soldiers * PULL_VERTS corners. Indexed
+// (PULL_INDEXED), PULL_GROUP soldiers of PULL_GROUP_VERTS vertices per
+// instance over the level's own index list. The soldier comes through the
+// bucket's index list, the corner from the level mesh. With the pose pass
+// (UNIT_POSE_READ) the list holds the soldier's pose slot, else his
+// instance record, posed here.
 struct PullInstance {
     pos_scale: vec4<f32>,
     color: vec4<f32>,
@@ -114,22 +123,34 @@ struct PullVertex {
 @group(3) @binding(1) var<storage, read> pull_index: array<u32>;
 @group(3) @binding(2) var<storage, read> pull_vertices: array<PullVertex>;
 // Per bucket: x = first index slot, y = corners per soldier, z = pose slots
-// per soldier in the kind's pose buffer.
+// per soldier in the kind's pose buffer, w = soldiers per instance.
 @group(3) @binding(3) var<storage, read> pull_buckets: array<vec4<u32>>;
 
 @vertex
 fn vertex_pull(@builtin(vertex_index) index: u32, @builtin(instance_index) instance: u32) -> VertexOutput {
 #ifdef PULL_INDEXED
-    // One instance per soldier over the mesh's own index list: a corner
-    // its triangles share is shaded once.
-    let soldier = instance;
-    let corner = index;
+    // The group's index list holds one copy of the level's list per
+    // soldier, copy k offset by k times the vertex count: a corner the
+    // soldier's triangles share is shaded once.
+    let in_group = index / #{PULL_GROUP_VERTS}u;
+    let soldier = instance * #{PULL_GROUP}u + in_group;
+    let corner = index - in_group * #{PULL_GROUP_VERTS}u;
 #else
     let soldier = index / #{PULL_VERTS}u;
     let corner = index - soldier * #{PULL_VERTS}u;
 #endif
     let bucket = pull_buckets[#{PULL_BUCKET}u];
     let entry = pull_index[bucket.x + soldier];
+#ifdef PULL_INDEXED
+    if entry == 0xffffffffu {
+        // Past the last soldier, in the last group (unit_build.wgsl
+        // `finish_indexed`): every corner of his triangles lands on one
+        // point, so they cover nothing.
+        var empty: VertexOutput;
+        empty.clip_position = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+        return empty;
+    }
+#endif
     let v = pull_vertices[corner];
 #ifdef UNIT_POSE_READ
     pose_from((entry & 0x3fffffffu) * bucket.z);

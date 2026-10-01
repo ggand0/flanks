@@ -53,21 +53,44 @@ pub fn on_sim_worker() -> bool {
     SIM_WORKER.with(|w| w.get())
 }
 
+/// The sim's parallel passes run on Bevy's async compute pool, sized to
+/// half the machine (main.rs `task_pool_options`). Read once:
+/// `FL_SIM_ASYNC=0` runs them on the compute pool with Bevy's default pool
+/// sizes, for A/B runs.
+pub fn sim_on_async_pool() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_or("FL_SIM_ASYNC", 1_u32) != 0)
+}
+
 /// The task pool scope for every sim kernel a tick job can reach (grid
-/// rebuild, integrate). A plain `scope` lets the waiting thread tick the
-/// shared executor, which means it can pick up ANY queued task, bevy
-/// system tasks included. On the tick worker thread that is fatal:
-/// `step_sim` stolen this way parks waiting for the very job its thread
-/// is computing (a startup hang about one launch in two, caught with
-/// gdb). On that thread the scope waits without ticking the shared
-/// executor. Chunk tasks still fan out across every pool worker.
-/// Everywhere else this is exactly `ComputeTaskPool::get().scope`.
+/// rebuild, density field, integrate).
+///
+/// The scope runs on Bevy's async compute pool, never on the compute pool.
+/// Bevy runs every system of the frame as a task on the compute pool, and
+/// any thread waiting inside a pool scope (a parallel query, a system's own
+/// scope) runs other queued tasks of that pool while it waits, up to a few
+/// hundred before it looks at its own work again. Queued there, the hundred
+/// 1 ms pieces of a 200k integrate would run inside the frame's systems,
+/// and a frame that overlaps a tick would take up to 15 ms. The async pool
+/// is an executor with threads of its own, which the frame's tasks never
+/// wait on.
+///
+/// A plain `scope` lets the waiting thread tick the pool's executor, which
+/// means it can pick up any queued task of that pool. On the tick worker
+/// thread the scope waits without ticking it, so that thread runs nothing
+/// but its job: a bevy system run there could block on the very job its
+/// thread computes (a startup hang about one launch in two, caught with gdb).
 pub fn sim_scope<'env, F, T>(f: F) -> Vec<T>
 where
     F: for<'scope> FnOnce(&'scope bevy::tasks::Scope<'scope, 'env, T>),
     T: Send + 'static,
 {
-    bevy::tasks::ComputeTaskPool::get().scope_with_executor(!on_sim_worker(), None, f)
+    let pool: &bevy::tasks::TaskPool = if sim_on_async_pool() {
+        bevy::tasks::AsyncComputeTaskPool::get()
+    } else {
+        bevy::tasks::ComputeTaskPool::get()
+    };
+    pool.scope_with_executor(!on_sim_worker(), None, f)
 }
 
 #[cfg(test)]

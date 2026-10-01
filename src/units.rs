@@ -73,7 +73,7 @@ pub struct Units {
     pub hp: Vec<f32>,
     /// Base render color (team color with per-unit variation baked in).
     /// Alpha carries a stable per-unit anim seed, not opacity.
-    pub color: Vec<[f32; 4]>,
+    pub color: Column<[f32; 4]>,
     /// Combat memo (unit index; `u32::MAX` = none): the melee target
     /// while a swing is in flight, and the sparse-fight closing memo
     /// otherwise (sim/soldier.rs wide acquisition). NEVER cleared, and
