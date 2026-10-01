@@ -70,8 +70,8 @@ pub struct ControlsSettings {
 pub struct VideoSettings {
     /// Default off: the FPS overlay should show real headroom.
     pub vsync: bool,
-    /// Files saved before exclusive fullscreen carry the bool
-    /// `fullscreen` instead, true for borderless.
+    /// Older settings files carry the bool `fullscreen` instead, true
+    /// for borderless.
     #[serde(alias = "fullscreen", deserialize_with = "window_kind_or_bool")]
     pub window: WindowKind,
     /// The sun's shadow maps. Off buys frames on a slow machine: the
@@ -168,7 +168,8 @@ impl WindowKind {
     }
 }
 
-/// `window` as saved now, or the older bool `fullscreen`.
+/// `window` as the game saves it, or the bool `fullscreen` of older
+/// settings files.
 fn window_kind_or_bool<'de, D: serde::Deserializer<'de>>(d: D) -> Result<WindowKind, D::Error> {
     #[derive(Deserialize)]
     #[serde(untagged)]
