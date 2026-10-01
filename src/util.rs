@@ -56,7 +56,7 @@ pub fn on_sim_worker() -> bool {
 /// The sim's parallel passes run on Bevy's async compute pool, sized to
 /// half the machine (main.rs `task_pool_options`). Read once:
 /// `FL_SIM_ASYNC=0` runs them on the compute pool with Bevy's default pool
-/// sizes, as before, for A/B runs.
+/// sizes, for A/B runs.
 pub fn sim_on_async_pool() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| env_or("FL_SIM_ASYNC", 1_u32) != 0)

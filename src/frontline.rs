@@ -349,8 +349,8 @@ struct RegimentSums {
     target_line_n: u32,
 }
 
-/// Regiments per pool task in `update_groups`: a task per regiment spent
-/// more on spawning than on its thousand men.
+/// Regiments per pool task in `update_groups`: a task sums about 16k men
+/// rather than a regiment's thousand.
 const REGIMENTS_PER_TASK: usize = 16;
 
 /// One regiment's sums over its men, walking its runs in index order. `pc`

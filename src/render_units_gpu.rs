@@ -730,9 +730,9 @@ struct PullVertex {
 /// so an imported model set plugs in unchanged.
 ///
 /// Every level also keeps an indexed form (`IndexedMesh`), which the
-/// camera and the sun's cascades draw. `FL_UNIT_WELD=0` keeps the earlier
-/// draw for A/B runs: the far levels expanded, and only a level whose
-/// triangles share most of their corners indexed, one soldier per instance.
+/// camera and the sun's cascades draw. With `FL_UNIT_WELD=0`, for A/B runs,
+/// the far levels draw expanded, and only a level whose triangles share
+/// most of their corners draws indexed, one soldier per instance.
 #[derive(Component)]
 pub struct PullMesh {
     corners: Vec<PullVertex>,
