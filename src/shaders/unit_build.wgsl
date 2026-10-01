@@ -108,7 +108,8 @@ struct Params {
     shot: vec4<f32>,
     // BOW_RISE_S, BOW_FALL_S, CANCEL_TICKS, RANGED_BASE.
     bow: vec4<f32>,
-    // x = first index slot of the bucket, y = mesh corners per soldier.
+    // x = first index slot of the bucket, y = mesh corners per soldier,
+    // w = soldiers per instance of its indexed draw (0: expanded).
     buckets: array<vec4<u32>, 16>,
     // The camera's forward axis, for view depth.
     cam_fwd: vec4<f32>,
@@ -132,6 +133,9 @@ struct Params {
     pose_src_base: vec4<u32>,
     // 1 with the pose pass on.
     pose_pass: u32,
+    // Per cascade and kind: soldiers per instance of the level the caster
+    // list draws with (0: expanded).
+    shadow_groups: array<vec4<u32>, 4>,
 };
 
 struct DrawArgs {
@@ -159,9 +163,14 @@ struct DrawArgs {
 @group(0) @binding(8) var<storage, read_write> readback: array<u32, 52>;
 // Per pose slot, the record it poses, in one region per kind.
 @group(0) @binding(9) var<storage, read_write> pose_src: array<u32>;
-// Per bucket, five words: the arguments of its camera draw when it is
-// indexed, one instance per soldier.
-@group(0) @binding(10) var<storage, read_write> indexed_args: array<u32, 80>;
+// Five words per list, 0..16 the camera's buckets and 16..32 the casters as
+// in `counts`: the arguments of its draw when its level is indexed.
+@group(0) @binding(10) var<storage, read_write> indexed_args: array<u32, 160>;
+
+// An index list slot past the last soldier, up to the end of the last group
+// of an indexed draw: the vertex shader draws nothing for it
+// (unit_instancing.wgsl `vertex_pull`).
+const EMPTY_SLOT: u32 = 0xffffffffu;
 
 const CULL_RADIUS: f32 = 2.5;
 const LOD_JITTER: f32 = 0.2;
@@ -525,26 +534,46 @@ fn build(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 }
 
-// One thread per list: the list count becomes the pulled draw's vertex
-// count. `counts` was cleared before `build` ran.
+// The arguments of list `b`'s indexed draw: `group` soldiers of `corners`
+// indices per instance, as many instances as cover `count` soldiers. The
+// slots from the last soldier to the end of the last group get the empty
+// mark: the build left whatever an earlier frame wrote there. Every list has
+// room for them (render_units_gpu.rs `MAX_GROUP`).
+fn finish_indexed(b: u32, first: u32, count: u32, corners: u32, group: u32) {
+    if group == 0u {
+        return;
+    }
+    let instances = (count + group - 1u) / group;
+    indexed_args[b * 5u] = corners * group;
+    indexed_args[b * 5u + 1u] = instances;
+    indexed_args[b * 5u + 2u] = 0u;
+    indexed_args[b * 5u + 3u] = 0u;
+    indexed_args[b * 5u + 4u] = 0u;
+    for (var k = count; k < instances * group; k++) {
+        index_list[first + k] = EMPTY_SLOT;
+    }
+}
+
+// One thread per list: the list count becomes the arguments of its draw,
+// the corner count of the expanded draw and the groups of the indexed one.
+// `counts` was cleared before `build` ran.
 @compute @workgroup_size(32)
 fn finalize(@builtin(local_invocation_index) b: u32) {
     if b >= 16u {
         // A caster list: cascade * 4 + kind.
         let s = b - 16u;
         let count = atomicLoad(&counts[32u + s]);
-        args[b] = DrawArgs(count * params.shadow_corners[s / 4u][s % 4u], 1u, 0u, 0u);
+        let corners = params.shadow_corners[s / 4u][s % 4u];
+        args[b] = DrawArgs(count * corners, 1u, 0u, 0u);
+        finish_indexed(b, params.shadow_lists[s / 4u][s % 4u], count, corners, params.shadow_groups[s / 4u][s % 4u]);
         readback[36u + s] = count;
         return;
     }
     let count = atomicLoad(&counts[b]);
     let fallen = atomicLoad(&counts[16u + b]);
-    args[b] = DrawArgs(count * params.buckets[b].y, 1u, 0u, 0u);
-    indexed_args[b * 5u] = params.buckets[b].y;
-    indexed_args[b * 5u + 1u] = count;
-    indexed_args[b * 5u + 2u] = 0u;
-    indexed_args[b * 5u + 3u] = 0u;
-    indexed_args[b * 5u + 4u] = 0u;
+    let bucket = params.buckets[b];
+    args[b] = DrawArgs(count * bucket.y, 1u, 0u, 0u);
+    finish_indexed(b, bucket.x, count, bucket.y, bucket.w);
     readback[b] = count;
     readback[16u + b] = fallen;
     if b < 4u {

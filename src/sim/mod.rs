@@ -263,6 +263,22 @@ pub fn refresh_shared_terrain(terrain: Res<Terrain>, mut shared: ResMut<SharedTe
 /// became a job. Every scope in here, the grid rebuild's and the field's
 /// included, goes through `util::sim_scope`.
 fn run_tick_job(job: &mut TickJob) {
+    if let Some(slot) = &job.pack {
+        let columns = crate::render_units_gpu::PackColumns {
+            pos: &job.pos_in,
+            pos_prev: &job.pos_prev_in,
+            yaw: &job.yaw_in,
+            yaw_prev: &job.yaw_prev_in,
+            kind: &job.kind,
+            swing: &job.swing_in,
+            swing_t: &job.swing_t_in,
+            flash: &job.flash_in,
+            group: &job.group,
+            death_t: &job.death_t_in,
+            color: &job.color_in,
+        };
+        slot.pack((job.generation, job.tick), &columns, job.hit_flash);
+    }
     let terrain_arc = job.terrain.clone().expect("terrain snapshot set at prep");
     let terrain: &Terrain = &terrain_arc;
     let dt = job.dt;
@@ -657,6 +673,7 @@ pub fn step_sim(
 /// instead of stretching a frame. Regiment commands are read here, one
 /// tick ahead of the install: orders quantize to the tick, as in a
 /// lockstep sim.
+#[allow(clippy::too_many_arguments)] // bevy system params
 pub fn kick_tick(
     units: Res<Units>,
     mut groups: ResMut<Groups>,
@@ -665,6 +682,10 @@ pub fn kick_tick(
     scale: Res<CombatScale>,
     time: Res<Time>,
     mut pipeline: ResMut<TickPipeline>,
+    (handoff, settings): (
+        Option<ResMut<crate::render_units_gpu::SnapshotHandoff>>,
+        Res<crate::settings::Settings>,
+    ),
 ) {
     if !pipeline_enabled() || units.pos.is_empty() || pipeline.in_flight {
         return;
@@ -684,6 +705,13 @@ pub fn kick_tick(
         pipeline.tick,
     );
     job.field_wanted = true;
+    // The render snapshot of the columns as kicked: the job packs it on
+    // the sim's pool while the frame runs, instead of the frame packing
+    // the same columns after Update (render_units_gpu.rs).
+    if let Some(mut handoff) = handoff.filter(|_| crate::render_units_gpu::job_packs_snapshot()) {
+        job.pack = Some(handoff.expect((units.generation, pipeline.tick), units.last_changed()));
+        job.hit_flash = settings.interface.hit_flash;
+    }
     let worker = pipeline.worker.get_or_insert_with(TickWorker::default);
     worker.to_worker.lock().unwrap().send(job).expect("sim tick worker alive");
     pipeline.in_flight = true;

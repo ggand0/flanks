@@ -42,13 +42,14 @@ pub fn process_deaths(
     mut stats: ResMut<CombatStats>,
     groups: Res<crate::orders::Groups>,
     mut corpses: ResMut<crate::render_units::Corpses>,
-    pipeline: Res<crate::sim::TickPipeline>,
+    (pipeline, runs): (Res<crate::sim::TickPipeline>, Res<crate::sim::RegimentRuns>),
 ) {
     let _span = info_span!("process_deaths").entered();
     let (edge_min, edge_max) = (terrain.min().y + 8.0, terrain.max().y - 8.0);
     let mut craters: Vec<(Vec2, f32)> = Vec::new();
     // Slots the dead leave in formed regiments, filled after the sweep.
     let mut vacated: Vec<(u32, Vec2)> = Vec::new();
+    let mut moves = SweepMoves::default();
     // Kills are counted at the hp<=0 transition (damage apply pass);
     // the sweep removes corpses whose death anim has played out, and
     // despawns routed units that reach their own map edge (fled). The
@@ -131,6 +132,7 @@ pub fn process_deaths(
             units.ammo.swap_remove(i);
             units.out_form.swap_remove(i);
             units.sight.swap_remove(i);
+            moves.swap_remove(i, units.len() + 1);
             // The hole took the last man; a popped tail took nobody.
             if i >= units.len() {
                 break;
@@ -140,12 +142,48 @@ pub fn process_deaths(
     for (c, r) in craters {
         terrain.carve_crater(c, r, r * 0.4);
     }
-    fill_vacated_slots(&mut units, &groups, &vacated);
+    fill_vacated_slots(&mut units, &groups, &vacated, &runs, &moves);
 
     stats.alive = [0, 0];
     for (&t, &d) in units.team.iter().zip(&units.death_t[..]) {
         if d == 0 {
             stats.alive[t as usize] += 1;
+        }
+    }
+}
+
+/// Where the death sweep's swap-removes took each man: positions in the
+/// columns as the tick started (the regiment runs' layout) against
+/// positions after the sweep. A swap-remove brings the last man into the
+/// hole, so only the men removed and the men moved into holes change.
+#[derive(Default)]
+struct SweepMoves {
+    /// Position after the sweep -> position at the tick's start, for every
+    /// position whose man changed.
+    origin: bevy::platform::collections::HashMap<u32, u32>,
+    removed: bevy::platform::collections::HashSet<u32>,
+}
+
+impl SweepMoves {
+    /// The man at `i` is removed and the last of `len` takes his place.
+    fn swap_remove(&mut self, i: usize, len: usize) {
+        let origin_of = |k: u32| self.origin.get(&k).copied().unwrap_or(k);
+        let (i, last) = (i as u32, len as u32 - 1);
+        self.removed.insert(origin_of(i));
+        let moved = origin_of(last);
+        self.origin.remove(&last);
+        if i != last {
+            self.origin.insert(i, moved);
+        }
+    }
+
+    /// Where the man at `start` (the tick's start layout) stands now, if he
+    /// is still in the columns.
+    fn now(&self, start: u32, placed: &bevy::platform::collections::HashMap<u32, u32>) -> Option<u32> {
+        if self.removed.contains(&start) {
+            None
+        } else {
+            Some(placed.get(&start).copied().unwrap_or(start))
         }
     }
 }
@@ -158,20 +196,36 @@ pub fn process_deaths(
 /// Files are read from the slot grid itself, so this works for any
 /// width, depth and spacing; a hole with nobody behind it stays. Front
 /// holes are closed first, each against the slots the earlier ones left.
-fn fill_vacated_slots(units: &mut Units, groups: &crate::orders::Groups, vacated: &[(u32, Vec2)]) {
+fn fill_vacated_slots(
+    units: &mut Units,
+    groups: &crate::orders::Groups,
+    vacated: &[(u32, Vec2)],
+    runs: &crate::sim::RegimentRuns,
+    moves: &SweepMoves,
+) {
     if vacated.is_empty() {
         return;
     }
+    // The living members of each regiment with a hole, in ascending
+    // position: its men at the tick's start (the regiment runs), where the
+    // sweep left them.
+    let placed: bevy::platform::collections::HashMap<u32, u32> =
+        moves.origin.iter().map(|(&now, &start)| (start, now)).collect();
     let mut members: Vec<Vec<usize>> = vec![Vec::new(); groups.list.len()];
-    let mut need = vec![false; groups.list.len()];
     for &(g, _) in vacated {
-        need[g as usize] = true;
-    }
-    for i in 0..units.len() {
-        let g = units.group[i] as usize;
-        if need[g] && units.death_t[i] == 0 {
-            members[g].push(i);
+        let list = &mut members[g as usize];
+        if !list.is_empty() {
+            continue;
         }
+        for &(s, e) in runs.of(g as usize) {
+            list.extend(
+                (s..e)
+                    .filter_map(|i| moves.now(i, &placed))
+                    .map(|i| i as usize)
+                    .filter(|&i| units.death_t[i] == 0),
+            );
+        }
+        list.sort_unstable();
     }
     let depth_of = |k: usize| {
         let gd = &groups.list[vacated[k].0 as usize];

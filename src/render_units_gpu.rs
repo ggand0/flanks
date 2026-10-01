@@ -6,7 +6,8 @@
 //! the CPU: interpolate, cull, pick the detail level, run the pose
 //! smoothers, write the 64 byte instance record and append the soldier to
 //! his kind-by-level index list. The list counts become indirect draw
-//! arguments and each bucket draws with one pulled, non-instanced draw.
+//! arguments and each bucket draws with one pulled draw: indexed over its
+//! level's welded vertices, a group of soldiers per instance (`weld`).
 //!
 //! A third pass (`shaders/unit_pose_pass.wgsl`) then poses every drawn
 //! soldier once, so each corner of his mesh only reads his pose and places
@@ -90,6 +91,9 @@ pub const DRAW_ARGS: usize = RING_ARG + 1;
 
 /// The pose pass's dispatch arguments, one per kind, after the draws'.
 const POSE_ARG: usize = DRAW_ARGS;
+
+/// Indexed draw arguments: the camera's buckets, then the caster lists.
+const INDEXED_ARGS: usize = NUM_BUCKETS + CASTER_LISTS;
 
 /// Build counters: per bucket the soldiers and the fallen, the caster
 /// lists, the ring count, then the pose slots taken per kind.
@@ -182,7 +186,8 @@ pub struct BuildParams {
     shot: Vec4,
     /// BOW_RISE_S, BOW_FALL_S, CANCEL_TICKS, RANGED_BASE.
     bow: Vec4,
-    /// x = first index slot of the bucket, y = mesh corners per soldier.
+    /// x = first index slot of the bucket, y = mesh corners per soldier,
+    /// w = soldiers per instance of its indexed draw (0: expanded).
     buckets: [UVec4; NUM_BUCKETS],
     /// The camera's forward axis, for view depth.
     cam_fwd: Vec4,
@@ -206,6 +211,9 @@ pub struct BuildParams {
     pose_src_base: UVec4,
     /// 1 with the pose pass on.
     pose_pass: u32,
+    /// Per cascade and kind: soldiers per instance of the level he casts
+    /// with (0: expanded).
+    shadow_groups: [UVec4; MAX_CASCADES],
 }
 
 /// The pose pass uniform (`Params` in unit_pose_pass.wgsl).
@@ -247,62 +255,199 @@ pub struct GpuFrameInput {
     pub shadow_levels: [[u32; NUM_KINDS]; MAX_CASCADES],
 }
 
-/// Pack the live soldier columns into the snapshot. Runs after every
-/// writer of the columns (the fixed loop, the deployment drag) and only
-/// when `Units` changed, so frames without a tick pack nothing. Parallel
-/// on the compute pool. Not reachable from the tick job, so a plain scope
-/// is correct here.
+/// The columns a snapshot record is packed from: the live ones, or the
+/// tick job's shared copies of them.
+pub(crate) struct PackColumns<'a> {
+    pub pos: &'a [Vec3],
+    pub pos_prev: &'a [Vec3],
+    pub yaw: &'a [f32],
+    pub yaw_prev: &'a [f32],
+    pub kind: &'a [u8],
+    pub swing: &'a [u8],
+    pub swing_t: &'a [u8],
+    pub flash: &'a [u8],
+    pub group: &'a [u32],
+    pub death_t: &'a [u8],
+    pub color: &'a [[f32; 4]],
+}
+
+impl<'a> PackColumns<'a> {
+    fn of(units: &'a Units) -> Self {
+        Self {
+            pos: &units.pos,
+            pos_prev: &units.pos_prev,
+            yaw: &units.yaw,
+            yaw_prev: &units.yaw_prev,
+            kind: &units.kind,
+            swing: &units.swing,
+            swing_t: &units.swing_t,
+            flash: &units.flash,
+            group: &units.group,
+            death_t: &units.death_t,
+            color: &units.color,
+        }
+    }
+}
+
+/// The snapshot the tick job packs, first thing, from the columns it was
+/// kicked with (sim/mod.rs `run_tick_job`). Those are the columns the frame
+/// would pack after Update: nothing writes a column the record reads
+/// between the kick and then, only deployment moves soldiers, and it
+/// freezes the sim. So the job packs on the sim's pool while the frame
+/// runs its Update, instead of the frame packing 11 MB at 200k after it.
+#[derive(Default)]
+pub struct SnapshotSlot {
+    packed: std::sync::Mutex<PackedSnapshot>,
+    ready: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct PackedSnapshot {
+    /// `Units::generation` and the tick of the job that packed `records`.
+    key: Option<(u64, u32)>,
+    records: Vec<GpuSoldier>,
+    kind_counts: [u32; NUM_KINDS],
+}
+
+impl SnapshotSlot {
+    /// Pack the records on the sim's pool and hand them over under `key`.
+    pub(crate) fn pack(&self, key: (u64, u32), columns: &PackColumns, flash: bool) {
+        let mut records = std::mem::take(&mut self.packed.lock().unwrap().records);
+        let n = columns.pos.len();
+        records.resize(n, GpuSoldier::zeroed());
+        let chunk_counts: Vec<[u32; NUM_KINDS]> = crate::util::sim_scope(|scope| {
+            for (ci, out) in records.chunks_mut(SYNC_CHUNK).enumerate() {
+                scope.spawn(async move { pack_chunk(columns, ci * SYNC_CHUNK, out, flash) });
+            }
+        });
+        let mut packed = self.packed.lock().unwrap();
+        packed.records = records;
+        packed.kind_counts = sum_kind_counts(chunk_counts);
+        packed.key = Some(key);
+        self.ready.notify_all();
+    }
+}
+
+/// The tick job's snapshot, main world side: the slot the job packs into,
+/// and the key and `Units` change tick of the kick that asked for it. GPU
+/// path only.
+#[derive(Resource, Default)]
+pub struct SnapshotHandoff {
+    slot: std::sync::Arc<SnapshotSlot>,
+    due: Option<((u64, u32), bevy::ecs::change_detection::Tick)>,
+}
+
+impl SnapshotHandoff {
+    /// A job is kicked under `key` with the columns as of change tick
+    /// `columns`: it packs into the returned slot.
+    pub(crate) fn expect(
+        &mut self,
+        key: (u64, u32),
+        columns: bevy::ecs::change_detection::Tick,
+    ) -> std::sync::Arc<SnapshotSlot> {
+        self.due = Some((key, columns));
+        self.slot.clone()
+    }
+}
+
+/// The longest the frame waits for the job's snapshot before packing its
+/// own. The job packs before anything else, within about 1 ms of the kick,
+/// and the frame asks after its Update, so it is normally there already.
+/// It can be later while Bevy compiles render pipelines on the same pool,
+/// in the first second of a battle.
+const SNAPSHOT_WAIT: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// The tick job packs the render snapshot. Read once: `FL_JOB_PACK=0`
+/// packs it on the frame, for A/B runs.
+pub(crate) fn job_packs_snapshot() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::util::env_or("FL_JOB_PACK", 1_u32) != 0)
+}
+
+/// The snapshot of the live soldier columns, whenever `Units` changed:
+/// taken from the tick job when one was kicked this frame with the columns
+/// as they are now, else packed here, in parallel on the compute pool. Runs
+/// after every writer of the columns (the fixed loop, the deployment drag),
+/// so frames without a tick pack nothing.
 fn pack_soldier_snapshot(
     units: Res<Units>,
     settings: Res<crate::settings::Settings>,
     mut snap: ResMut<SoldierSnapshot>,
+    handoff: Option<ResMut<SnapshotHandoff>>,
 ) {
+    let due = handoff.and_then(|mut h| Some((h.due.take()?, h.slot.clone())));
     if !units.is_changed() {
         return;
     }
+    let t0 = std::time::Instant::now();
+    if let Some(((key, columns), slot)) = due
+        && units.last_changed() == columns
+    {
+        let mut packed = slot.packed.lock().unwrap();
+        while packed.key != Some(key) {
+            let (guard, wait) = slot.ready.wait_timeout(packed, SNAPSHOT_WAIT).unwrap();
+            packed = guard;
+            if wait.timed_out() {
+                debug!("the tick job's snapshot is late: packed on the frame instead");
+                break;
+            }
+        }
+        if packed.key == Some(key) {
+            std::mem::swap(&mut packed.records, &mut snap.records);
+            snap.n = snap.records.len() as u32;
+            snap.kind_counts = packed.kind_counts;
+            snap.fresh = true;
+            snap.pack_ms = t0.elapsed().as_secs_f32() * 1000.0;
+            return;
+        }
+    }
     // The Hit flash setting: off packs every flash as zero.
     let flash = settings.interface.hit_flash;
-    let t0 = std::time::Instant::now();
     let n = units.len();
     snap.records.resize(n, GpuSoldier::zeroed());
-    let units = &*units;
+    let columns = PackColumns::of(&units);
+    let columns = &columns;
     let records = &mut snap.records;
     let chunk_counts: Vec<[u32; NUM_KINDS]> = bevy::tasks::ComputeTaskPool::get().scope(|scope| {
         for (ci, out) in records.chunks_mut(SYNC_CHUNK).enumerate() {
-            scope.spawn(async move { pack_chunk(units, ci * SYNC_CHUNK, out, flash) });
+            scope.spawn(async move { pack_chunk(columns, ci * SYNC_CHUNK, out, flash) });
         }
     });
+    snap.n = n as u32;
+    snap.kind_counts = sum_kind_counts(chunk_counts);
+    snap.fresh = true;
+    snap.pack_ms = t0.elapsed().as_secs_f32() * 1000.0;
+}
+
+fn sum_kind_counts(chunk_counts: Vec<[u32; NUM_KINDS]>) -> [u32; NUM_KINDS] {
     let mut kind_counts = [0u32; NUM_KINDS];
     for counts in chunk_counts {
         for (total, c) in kind_counts.iter_mut().zip(counts) {
             *total += c;
         }
     }
-    snap.n = n as u32;
-    snap.kind_counts = kind_counts;
-    snap.fresh = true;
-    snap.pack_ms = t0.elapsed().as_secs_f32() * 1000.0;
+    kind_counts
 }
 
-fn pack_chunk(units: &Units, start: usize, out: &mut [GpuSoldier], flash: bool) -> [u32; NUM_KINDS] {
+fn pack_chunk(c: &PackColumns, start: usize, out: &mut [GpuSoldier], flash: bool) -> [u32; NUM_KINDS] {
     let mut kind_counts = [0u32; NUM_KINDS];
     for (j, rec) in out.iter_mut().enumerate() {
         let i = start + j;
-        let kind = units.kind[i] as u32;
+        let kind = c.kind[i] as u32;
         kind_counts[kind as usize] += 1;
-        let group = units.group[i];
+        let group = c.group[i];
         debug_assert!(group < 1 << 24, "regiment index must fit 24 bits");
         *rec = GpuSoldier {
-            pos: units.pos[i].to_array(),
-            prev: units.pos_prev[i].to_array(),
-            yaw: units.yaw[i],
-            yaw_prev: units.yaw_prev[i],
+            pos: c.pos[i].to_array(),
+            prev: c.pos_prev[i].to_array(),
+            yaw: c.yaw[i],
+            yaw_prev: c.yaw_prev[i],
             a: kind
-                | (units.swing[i] as u32) << 8
-                | (units.swing_t[i] as u32) << 16
-                | if flash { (units.flash[i] as u32) << 24 } else { 0 },
-            b: (group & 0x00ff_ffff) | (units.death_t[i] as u32) << 24,
-            color: units.color[i],
+                | (c.swing[i] as u32) << 8
+                | (c.swing_t[i] as u32) << 16
+                | if flash { (c.flash[i] as u32) << 24 } else { 0 },
+            b: (group & 0x00ff_ffff) | (c.death_t[i] as u32) << 24,
+            color: c.color[i],
         };
     }
     kind_counts
@@ -584,33 +729,161 @@ struct PullVertex {
 /// with position, normal, the part/pivot UV and vertex color qualifies,
 /// so an imported model set plugs in unchanged.
 ///
-/// A mesh whose triangles share most of their corners also keeps its own
-/// vertices and index list. Its camera draw is then indexed, one instance
-/// per soldier, and the GPU shades a shared corner once instead of once per
-/// triangle. The flat-shaded far levels share almost none.
+/// Every level also keeps an indexed form (`IndexedMesh`), which the
+/// camera and the sun's cascades draw. With `FL_UNIT_WELD=0`, for A/B runs,
+/// the far levels draw expanded, and only a level whose triangles share
+/// most of their corners draws indexed, one soldier per instance.
 #[derive(Component)]
 pub struct PullMesh {
     corners: Vec<PullVertex>,
-    shared: Option<(Vec<PullVertex>, Vec<u32>)>,
+    indexed: Option<IndexedMesh>,
     bucket: usize,
 }
 
-/// Corners per vertex from which a level draws indexed: the textured L0
-/// models have 2.2 to 2.5, the derived and authored far levels about 1.1.
+/// A level drawn indexed: its vertices, and its index list repeated for
+/// `group` soldiers, copy k offset by k times the vertex count. One instance
+/// draws a group of soldiers (unit_instancing.wgsl `vertex_pull`), so what
+/// the GPU pays per instance is paid once per group, and a corner the
+/// soldier's triangles share is shaded once.
+struct IndexedMesh {
+    vertices: Vec<PullVertex>,
+    indices: Vec<u32>,
+    group: u32,
+    /// The atlas coordinate rides on each triangle's first vertex and is not
+    /// interpolated (`weld`).
+    flat_atlas: bool,
+}
+
+impl IndexedMesh {
+    /// One soldier's index list over `vertices`, repeated for a group.
+    fn grouped(vertices: Vec<PullVertex>, one: &[u32], group: u32, flat_atlas: bool) -> Self {
+        let n = vertices.len() as u32;
+        let indices = (0..group).flat_map(|k| one.iter().map(move |&i| i + k * n)).collect();
+        Self {
+            vertices,
+            indices,
+            group,
+            flat_atlas,
+        }
+    }
+}
+
+/// Corners per vertex from which a level draws indexed under
+/// `FL_UNIT_WELD=0`: the textured L0 models have 2.2 to 2.5 in their files,
+/// the far levels about 1.1.
 const INDEXED_REUSE: f32 = 1.5;
 
 /// Vertices the GPU is assumed to keep shaded between nearby triangles of
 /// an indexed draw (`tipsify`).
 const VERTEX_CACHE: usize = 16;
 
+/// Indices in a level's group list: a level of n indices draws
+/// `GROUP_INDICES / n` soldiers per instance, between 1 and `MAX_GROUP`.
+const GROUP_INDICES: usize = 65536;
+
+/// The most soldiers one instance draws. Each list in `index_list` has
+/// this many spare slots past its capacity, for the empty marks the last
+/// group is padded with (unit_build.wgsl `finalize`).
+const MAX_GROUP: u32 = 64;
+
+/// The welded, grouped draw is on. Read once: `FL_UNIT_WELD=0` turns it off.
+fn welded_levels() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::util::env_or("FL_UNIT_WELD", 1_u32) != 0)
+}
+
+/// The level's corners welded into shared vertices wherever everything the
+/// vertex shader reads from them agrees, ordered for vertex reuse.
+///
+/// The far levels sample one atlas point per triangle, a different one on
+/// each neighbouring face, and that alone keeps their exported vertices
+/// from repeating: welding with the atlas coordinate would share almost
+/// nothing. So a level whose atlas coordinate is the same on all three
+/// corners of every triangle leaves it out of the weld. Each triangle then
+/// starts at a vertex no other triangle starts at, its provoking vertex,
+/// which carries the triangle's atlas point to the fragment unblended
+/// (`@interpolate(flat, first)`). Where every corner of a triangle already
+/// starts another one, its first corner is duplicated. Every value a
+/// fragment sees stays what the expanded corners gave it. The far levels
+/// go from three vertex shader runs per triangle to 1.3 to 1.55 (L1 and
+/// L2) under a 16-entry cache.
+fn weld(corners: &[PullVertex]) -> IndexedMesh {
+    let flat_atlas = corners
+        .chunks(3)
+        .all(|t| t[1].atlas_uv == t[0].atlas_uv && t[2].atlas_uv == t[0].atlas_uv);
+    let key = |v: &PullVertex| -> [u32; 10] {
+        let f = f32::to_bits;
+        [
+            f(v.position[0]),
+            f(v.position[1]),
+            f(v.position[2]),
+            f(v.part),
+            f(v.normal[0]),
+            f(v.normal[1]),
+            f(v.normal[2]),
+            f(v.pivot),
+            v.color,
+            if flat_atlas { 0 } else { v.atlas_uv },
+        ]
+    };
+    let mut slots = bevy::platform::collections::HashMap::<[u32; 10], u32>::default();
+    let mut vertices: Vec<PullVertex> = Vec::new();
+    let list: Vec<u32> = corners
+        .iter()
+        .map(|c| {
+            *slots.entry(key(c)).or_insert_with(|| {
+                vertices.push(*c);
+                vertices.len() as u32 - 1
+            })
+        })
+        .collect();
+    let order = tipsify_triangles(&list, vertices.len(), VERTEX_CACHE);
+    let mut one = Vec::with_capacity(list.len());
+    if flat_atlas {
+        let mut provokes = vec![false; vertices.len()];
+        for t in order {
+            let tri = [list[3 * t], list[3 * t + 1], list[3 * t + 2]];
+            let atlas = corners[3 * t].atlas_uv;
+            let first = match (0..3).find(|&k| !provokes[tri[k] as usize]) {
+                Some(k) => {
+                    one.extend([tri[k], tri[(k + 1) % 3], tri[(k + 2) % 3]]);
+                    tri[k]
+                }
+                None => {
+                    vertices.push(vertices[tri[0] as usize]);
+                    provokes.push(false);
+                    let dup = vertices.len() as u32 - 1;
+                    one.extend([dup, tri[1], tri[2]]);
+                    dup
+                }
+            };
+            provokes[first as usize] = true;
+            vertices[first as usize].atlas_uv = atlas;
+        }
+    } else {
+        one.extend(order.into_iter().flat_map(|t| [list[3 * t], list[3 * t + 1], list[3 * t + 2]]));
+    }
+    let group = (GROUP_INDICES / one.len().max(1)).clamp(1, MAX_GROUP as usize) as u32;
+    IndexedMesh::grouped(vertices, &one, group, flat_atlas)
+}
+
 /// The same triangles, reordered so each one mostly reuses vertices the
-/// GPU has just shaded: Tipsify (Sander, Nehab and Barczak, 2007) with a
-/// cache of `cache` vertices. It fans around one vertex at a time, then
-/// moves to the neighbour that is still in the cache and has triangles
-/// left. The unit L0 models go from about 2.0 vertices shaded per triangle
-/// in their exported order to 1.23 to 1.37, their count of distinct
-/// vertices per triangle.
+/// GPU has just shaded (`tipsify_triangles`), as an index list.
 fn tipsify(indices: &[u32], vertices: usize, cache: usize) -> Vec<u32> {
+    tipsify_triangles(indices, vertices, cache)
+        .into_iter()
+        .flat_map(|t| [indices[3 * t], indices[3 * t + 1], indices[3 * t + 2]])
+        .collect()
+}
+
+/// The triangles of an index list in the order that mostly reuses
+/// vertices the GPU has just shaded: Tipsify (Sander, Nehab and Barczak,
+/// 2007) with a cache of `cache` vertices. It fans around one vertex at a
+/// time, then moves to the neighbour that is still in the cache and has
+/// triangles left. The unit L0 models go from about 2.0 vertices shaded per
+/// triangle in their exported order to 1.23 to 1.37, their count of
+/// distinct vertices per triangle.
+fn tipsify_triangles(indices: &[u32], vertices: usize, cache: usize) -> Vec<usize> {
     // Triangles around each vertex, as ranges into `around`.
     let mut start = vec![0usize; vertices + 1];
     for &i in indices {
@@ -631,7 +904,7 @@ fn tipsify(indices: &[u32], vertices: usize, cache: usize) -> Vec<u32> {
     let mut entered = vec![0usize; vertices];
     let mut emitted = vec![false; indices.len() / 3];
     let mut dead_end: Vec<usize> = Vec::new();
-    let mut out = Vec::with_capacity(indices.len());
+    let mut out = Vec::with_capacity(indices.len() / 3);
     let mut time = cache + 1;
     let mut cursor = 0;
     let mut fan = (vertices > 0).then_some(0);
@@ -642,9 +915,9 @@ fn tipsify(indices: &[u32], vertices: usize, cache: usize) -> Vec<u32> {
                 continue;
             }
             emitted[t] = true;
+            out.push(t);
             for &i in &indices[3 * t..3 * t + 3] {
                 let v = i as usize;
-                out.push(i);
                 dead_end.push(v);
                 candidates.push(v);
                 live[v] -= 1;
@@ -729,13 +1002,26 @@ impl PullMesh {
         };
         let indices = mesh.indices()?;
         let corners: Vec<PullVertex> = indices.iter().map(vertex).collect();
-        let shared = (corners.len() as f32 >= INDEXED_REUSE * pos.len() as f32).then(|| {
-            let list: Vec<u32> = indices.iter().map(|i| i as u32).collect();
-            ((0..pos.len()).map(vertex).collect(), tipsify(&list, pos.len(), VERTEX_CACHE))
-        });
+        let indexed = if welded_levels() {
+            let m = weld(&corners);
+            info!(
+                "unit bucket {bucket}: {} triangles on {} welded vertices, {} soldiers per instance{}",
+                corners.len() / 3,
+                m.vertices.len(),
+                m.group,
+                if m.flat_atlas { ", atlas point per triangle" } else { "" }
+            );
+            Some(m)
+        } else {
+            (corners.len() as f32 >= INDEXED_REUSE * pos.len() as f32).then(|| {
+                let list: Vec<u32> = indices.iter().map(|i| i as u32).collect();
+                let one = tipsify(&list, pos.len(), VERTEX_CACHE);
+                IndexedMesh::grouped((0..pos.len()).map(vertex).collect(), &one, 1, false)
+            })
+        };
         Some(Self {
             corners,
-            shared,
+            indexed,
             bucket,
         })
     }
@@ -745,19 +1031,23 @@ impl PullMesh {
 #[derive(Component)]
 pub struct PullMeshGpu {
     vertices: Buffer,
-    /// The mesh's own vertices (storage) and index list, when its camera
-    /// draw is indexed.
-    shared: Option<(Buffer, Buffer)>,
+    /// The indexed form: its vertices (storage) and its group list.
+    indexed: Option<(Buffer, Buffer)>,
     /// Corners per soldier (the level's index count).
     pub count: u32,
     pub bucket: usize,
+    pub shape: DrawShape,
 }
 
-impl PullMeshGpu {
-    /// The camera draws this bucket indexed, one instance per soldier.
-    pub fn indexed(&self) -> bool {
-        self.shared.is_some()
-    }
+/// How a bucket's level draws. `group` 0: expanded corners, one plain draw
+/// over every soldier's corners. Otherwise indexed, `group` soldiers of
+/// `verts` vertices each per instance.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct DrawShape {
+    pub group: u32,
+    pub verts: u32,
+    /// The atlas coordinate is flat, from each triangle's first vertex.
+    pub flat_atlas: bool,
 }
 
 /// Uploads each pulled bucket's mesh once. The render entity persists,
@@ -773,19 +1063,24 @@ fn extract_pull_meshes(
         if uploaded.contains(e) {
             continue;
         }
-        let shared = mesh.shared.as_ref().map(|(vertices, indices)| {
+        let indexed = mesh.indexed.as_ref().map(|m| {
             (
                 render_device.create_buffer_with_data(&BufferInitDescriptor {
                     label: Some("unit pull mesh vertices"),
-                    contents: bytemuck::cast_slice(vertices),
+                    contents: bytemuck::cast_slice(&m.vertices),
                     usage: BufferUsages::STORAGE,
                 }),
                 render_device.create_buffer_with_data(&BufferInitDescriptor {
-                    label: Some("unit pull mesh indices"),
-                    contents: bytemuck::cast_slice(indices),
+                    label: Some("unit pull mesh group indices"),
+                    contents: bytemuck::cast_slice(&m.indices),
                     usage: BufferUsages::INDEX,
                 }),
             )
+        });
+        let shape = mesh.indexed.as_ref().map_or(DrawShape::default(), |m| DrawShape {
+            group: m.group,
+            verts: m.vertices.len() as u32,
+            flat_atlas: m.flat_atlas,
         });
         commands.entity(e).insert(PullMeshGpu {
             vertices: render_device.create_buffer_with_data(&BufferInitDescriptor {
@@ -793,9 +1088,10 @@ fn extract_pull_meshes(
                 contents: bytemuck::cast_slice(&mesh.corners),
                 usage: BufferUsages::STORAGE,
             }),
-            shared,
+            indexed,
             count: mesh.corners.len() as u32,
             bucket: mesh.bucket,
+            shape,
         });
     }
 }
@@ -999,7 +1295,8 @@ pub struct UnitAlloc {
     smooth: Buffer,
     /// Per bucket, `kind_cap[kind] + CORPSE_CAP` slots: a soldier of a
     /// kind can only land in one of that kind's levels. Then as many per
-    /// cascade and kind for the casters.
+    /// cascade and kind for the casters. Every list has `MAX_GROUP` spare
+    /// slots after it for the padding of its last group.
     pub index_list: Buffer,
     kind_cap: [usize; NUM_KINDS],
     bases: [u32; NUM_BUCKETS],
@@ -1009,8 +1306,8 @@ pub struct UnitAlloc {
     pub ring_base: u32,
     counts: Buffer,
     pub args: Buffer,
-    /// Per bucket, the arguments of its indexed camera draw: five words,
-    /// index count, soldiers, then zeros.
+    /// The arguments of the indexed draws, five words each: per bucket for
+    /// the camera, then per caster list (`DRAW_ARGS` order, rings excluded).
     pub indexed_args: Buffer,
     regiments: Buffer,
     regiments_cap: usize,
@@ -1049,14 +1346,14 @@ impl UnitAlloc {
         for kind in 0..NUM_KINDS {
             for lod in 0..NUM_LODS {
                 bases[kind * NUM_LODS + lod] = total as u32;
-                total += kind_cap[kind] + CORPSE_CAP;
+                total += kind_cap[kind] + CORPSE_CAP + MAX_GROUP as usize;
             }
         }
         let mut shadow_bases = [[0u32; NUM_KINDS]; MAX_CASCADES];
         for cascade in &mut shadow_bases {
             for (kind, base) in cascade.iter_mut().enumerate() {
                 *base = total as u32;
-                total += kind_cap[kind] + CORPSE_CAP;
+                total += kind_cap[kind] + CORPSE_CAP + MAX_GROUP as usize;
             }
         }
         let ring_base = total as u32;
@@ -1106,7 +1403,7 @@ impl UnitAlloc {
             indexed_args: storage_buffer(
                 device,
                 "unit indexed draw args",
-                NUM_BUCKETS * 20,
+                INDEXED_ARGS * 20,
                 BufferUsages::INDIRECT,
             ),
             regiments: storage_buffer(
@@ -1267,9 +1564,10 @@ fn prepare_gpu_units(
     for mesh in &meshes {
         let b = mesh.bucket;
         let stride = alloc.pose_stride[b / NUM_LODS];
-        info[0][b] = [alloc.bases[b], mesh.count, stride, 0];
+        let group = mesh.shape.group;
+        info[0][b] = [alloc.bases[b], mesh.count, stride, group];
         for c in 0..MAX_CASCADES {
-            info[1 + c][b] = [alloc.shadow_bases[c][b / NUM_LODS], mesh.count, stride, 0];
+            info[1 + c][b] = [alloc.shadow_bases[c][b / NUM_LODS], mesh.count, stride, group];
         }
     }
     queue.write_buffer(&alloc.bucket_info, 0, bytemuck::cast_slice(&info));
@@ -1280,11 +1578,15 @@ fn prepare_gpu_units(
     params.buckets = info[0].map(UVec4::from_array);
     params.shadow_lists = alloc.shadow_bases.map(UVec4::from_array);
     params.ring_base = alloc.ring_base;
-    params.shadow_corners = input.shadow_levels.map(|levels| {
-        UVec4::from_array(std::array::from_fn(|kind| {
-            info[0][kind * NUM_LODS + levels[kind] as usize][1]
-        }))
-    });
+    let cast_with = |field: usize| {
+        input.shadow_levels.map(|levels| {
+            UVec4::from_array(std::array::from_fn(|kind| {
+                info[0][kind * NUM_LODS + levels[kind] as usize][field]
+            }))
+        })
+    };
+    params.shadow_corners = cast_with(1);
+    params.shadow_groups = cast_with(3);
     params.pose_src_base = UVec4::from_array(alloc.pose_src_base);
     params.pose_pass = input.pose_pass as u32;
     buffers.params.set(params);
@@ -1442,12 +1744,11 @@ fn prepare_pull_bind_groups(
         let (view, sampler, atlas_settled) = custom_pipeline.atlas_for(atlas, &images);
         let layout = pipeline_cache.get_bind_group_layout(&custom_pipeline.pull_layout);
         // Set 0 of the bucket table is the camera's, set 1 + c cascade c's.
-        // Only the camera's draw can be indexed: the casters stay on the
-        // expanded corners.
+        // An indexed level draws indexed into every one of them.
         let group = |set: u64| {
-            let corners = match (&mesh.shared, set) {
-                (Some((vertices, _)), 0) => vertices,
-                _ => &mesh.vertices,
+            let corners = match &mesh.indexed {
+                Some((vertices, _)) => vertices,
+                None => &mesh.vertices,
             };
             device.create_bind_group(
                 "unit pull bind group",
@@ -1475,7 +1776,7 @@ fn prepare_pull_bind_groups(
         };
         commands.entity(entity).insert(PulledBucketGpu {
             bind_group: group(0),
-            index: mesh.shared.as_ref().map(|(_, indices)| indices.clone()),
+            index: mesh.indexed.as_ref().map(|(_, indices)| indices.clone()),
             shadow: (1..=MAX_CASCADES as u64).map(group).collect(),
             generation: buffers.generation,
             atlas_settled,
@@ -1636,6 +1937,9 @@ impl Plugin for GpuUnitRenderPlugin {
             check,
             pose_pass,
         });
+        if requested && supported {
+            app.init_resource::<SnapshotHandoff>();
+        }
     }
 }
 
@@ -1715,5 +2019,86 @@ mod tests {
         let before = shaded_per_triangle(&indices, VERTEX_CACHE);
         let after = shaded_per_triangle(&ordered, VERTEX_CACHE);
         assert!(after < 0.8 * before, "{before} to {after}");
+    }
+
+    /// Each triangle as its corners' positions from its lowest one on, so
+    /// the winding counts, and the atlas point it samples.
+    fn faces(tris: impl Iterator<Item = ([[u32; 3]; 3], u32)>) -> Vec<([[u32; 3]; 3], u32)> {
+        let mut out: Vec<_> = tris
+            .map(|(p, atlas)| {
+                let r = (0..3).min_by_key(|&k| p[k]).unwrap();
+                ([p[r], p[(r + 1) % 3], p[(r + 2) % 3]], atlas)
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// A far level samples one atlas point per triangle. Welded, it keeps
+    /// every triangle with its winding, each triangle starts at a vertex no
+    /// other triangle starts at and that vertex carries its atlas point, and
+    /// the group list repeats the soldier's list at vertex-count offsets.
+    #[test]
+    fn weld_shares_corners_and_keeps_each_atlas_point() {
+        let n = 12;
+        let list = grid(n);
+        let corners: Vec<PullVertex> = list
+            .iter()
+            .enumerate()
+            .map(|(k, &v)| PullVertex {
+                position: [(v % (n + 1)) as f32, 0.0, (v / (n + 1)) as f32],
+                part: 2.0,
+                normal: [0.0, 1.0, 0.0],
+                pivot: 0.5,
+                color: u32::MAX,
+                atlas_uv: (k / 3) as u32 * 7 + 1,
+                pad: [0; 2],
+            })
+            .collect();
+        let m = weld(&corners);
+        assert!(m.flat_atlas);
+        let per = corners.len();
+        assert_eq!(m.indices.len(), per * m.group as usize);
+        assert!(m.group > 1);
+        let verts = m.vertices.len() as u32;
+        assert!(verts < per as u32 / 2, "{verts} vertices for {per} corners");
+        assert!(m.indices[per..2 * per].iter().zip(&m.indices[..per]).all(|(b, a)| *b == a + verts));
+        let one = &m.indices[..per];
+        let pos = |i: u32| m.vertices[i as usize].position.map(f32::to_bits);
+        let welded = faces(one.chunks(3).map(|t| ([pos(t[0]), pos(t[1]), pos(t[2])], m.vertices[t[0] as usize].atlas_uv)));
+        let original = faces(
+            corners
+                .chunks(3)
+                .map(|t| ([t[0], t[1], t[2]].map(|c| c.position.map(f32::to_bits)), t[0].atlas_uv)),
+        );
+        assert_eq!(welded, original);
+        let mut firsts: Vec<u32> = one.chunks(3).map(|t| t[0]).collect();
+        firsts.sort();
+        firsts.dedup();
+        assert_eq!(firsts.len(), per / 3);
+    }
+
+    /// A level whose atlas coordinate varies across a triangle keeps it
+    /// interpolated and welds only corners that agree in everything.
+    #[test]
+    fn weld_keeps_an_interpolated_atlas() {
+        let corner = |x: f32, atlas: u32| PullVertex {
+            position: [x, 0.0, 0.0],
+            part: 0.0,
+            normal: [0.0, 1.0, 0.0],
+            pivot: 0.0,
+            color: 0,
+            atlas_uv: atlas,
+            pad: [0; 2],
+        };
+        let corners = [
+            corner(0.0, 1), corner(1.0, 2), corner(2.0, 3),
+            corner(2.0, 3), corner(1.0, 2), corner(3.0, 4),
+            corner(3.0, 9), corner(1.0, 2), corner(0.0, 1),
+        ];
+        let m = weld(&corners);
+        assert!(!m.flat_atlas);
+        // Corner (3, 9) differs from (3, 4) in its atlas coordinate only.
+        assert_eq!(m.vertices.len(), 5);
     }
 }
