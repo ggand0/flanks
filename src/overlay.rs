@@ -528,6 +528,7 @@ fn update_overlay(
     combat: Res<CombatStats>,
     render_counts: Res<RenderCounts>,
     outcome: Res<crate::ai::BattleOutcome>,
+    settings: Res<crate::settings::Settings>,
     mut query: Query<&mut Text, With<OverlayText>>,
     time: Res<Time>,
     mut log_timer: Local<f32>,
@@ -536,41 +537,46 @@ fn update_overlay(
 ) {
     let (frame_ms, fps) = frame_rate(&diagnostics);
 
-    let banner = match outcome.0 {
-        Some(0) => "\n=== VICTORY: the enemy army is broken ===",
-        Some(1) => "\n=== DEFEAT: your army is broken ===",
-        Some(2) => "\n=== MUTUAL DESTRUCTION ===",
-        _ => "",
-    };
-    for mut text in &mut query {
-        text.0 = format!(
-            "{fps:>5.0} fps  {frame_ms:.2} ms\n{} units, drawn {} [{}] lod {:?} + {} fallen (frustum culled)\nsim tick: grid {:.2} ms, step {:.2} ms, field {:.2} ms, audit {:.2} ms | sync {:.2} ms\n{} groups ({} engaged, {} broken), {} selected\nblue {} ({} lost, {} fled)  orange {} ({} lost, {} fled){banner}",
-            units.len(),
-            render_counts.drawn,
-            render_counts
-                .bucket_drawn
-                .iter()
-                .map(|n| n.to_string())
-                .collect::<Vec<_>>()
-                .join("/"),
-            render_counts.lod_drawn,
-            render_counts.corpses_drawn,
-            stats.grid_ms,
-            stats.step_ms,
-            stats.field_ms,
-            stats.audit_ms,
-            render_counts.sync_ms,
-            groups.list.len(),
-            groups.list.iter().filter(|g| g.engaged).count(),
-            groups.list.iter().filter(|g| g.state.is_broken()).count(),
-            selection.count_units,
-            combat.alive[0],
-            combat.kills[0],
-            combat.fled[0],
-            combat.alive[1],
-            combat.kills[1],
-            combat.fled[1],
-        );
+    // Only while the readouts show (`show_overlay`): a write marks the
+    // text changed, and Bevy then measures, lays out and shapes it again
+    // that frame, hidden or not, on the main thread's critical path.
+    if settings.interface.overlay == crate::settings::Overlay::Full {
+        let banner = match outcome.0 {
+            Some(0) => "\n=== VICTORY: the enemy army is broken ===",
+            Some(1) => "\n=== DEFEAT: your army is broken ===",
+            Some(2) => "\n=== MUTUAL DESTRUCTION ===",
+            _ => "",
+        };
+        for mut text in &mut query {
+            text.0 = format!(
+                "{fps:>5.0} fps  {frame_ms:.2} ms\n{} units, drawn {} [{}] lod {:?} + {} fallen (frustum culled)\nsim tick: grid {:.2} ms, step {:.2} ms, field {:.2} ms, audit {:.2} ms | sync {:.2} ms\n{} groups ({} engaged, {} broken), {} selected\nblue {} ({} lost, {} fled)  orange {} ({} lost, {} fled){banner}",
+                units.len(),
+                render_counts.drawn,
+                render_counts
+                    .bucket_drawn
+                    .iter()
+                    .map(|n| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join("/"),
+                render_counts.lod_drawn,
+                render_counts.corpses_drawn,
+                stats.grid_ms,
+                stats.step_ms,
+                stats.field_ms,
+                stats.audit_ms,
+                render_counts.sync_ms,
+                groups.list.len(),
+                groups.list.iter().filter(|g| g.engaged).count(),
+                groups.list.iter().filter(|g| g.state.is_broken()).count(),
+                selection.count_units,
+                combat.alive[0],
+                combat.kills[0],
+                combat.fled[0],
+                combat.alive[1],
+                combat.kills[1],
+                combat.fled[1],
+            );
+        }
     }
 
     // Periodic log so FPS is verifiable from a headless-ish run. GPU pass
