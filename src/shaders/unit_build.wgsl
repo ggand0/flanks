@@ -620,9 +620,9 @@ fn finish_indexed(b: u32, first: u32, count: u32, corners: u32, group: u32) {
 }
 
 // One thread per list: the list count becomes the arguments of its draw,
-// the corner count of the expanded draw and the groups of the indexed one,
-// and a camera bucket's depth bin counts the first slot of each bin.
-// `counts` was cleared before `build` ran.
+// the corner count of the expanded draw and the groups of the indexed one.
+// A camera bucket's thread also turns its depth bin counts into the first
+// slot of each bin. `counts` was cleared before `build` ran.
 @compute @workgroup_size(32)
 fn finalize(@builtin(local_invocation_index) b: u32) {
     if b >= 16u {
