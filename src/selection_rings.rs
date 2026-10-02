@@ -29,8 +29,8 @@ use bevy::{
     ecs::system::{SystemParamItem, lifetimeless::*},
     mesh::MeshVertexBufferLayoutRef,
     pbr::{
-        MeshPipeline, MeshPipelineKey, RenderMeshInstances, SetMeshViewBindGroup,
-        SetMeshViewBindingArrayBindGroup, ViewKeyCache,
+        MeshPipeline, MeshPipelineKey, MeshPipelineSystems, RenderMeshInstances,
+        SetMeshViewBindGroup, SetMeshViewBindingArrayBindGroup, ViewKeyCache,
     },
     prelude::*,
     render::{
@@ -514,7 +514,12 @@ impl Plugin for SelectionRingsPlugin {
             .init_resource::<RingInput>()
             .init_resource::<SpecializedRenderPipelines<RingPipeline>>()
             .add_render_command::<Transparent3d, DrawRings>()
-            .add_systems(RenderStartup, (init_ring_pipeline, init_ring_gpu))
+            // The ring pipeline copies Bevy's mesh pipeline, which exists
+            // only once its own startup systems ran.
+            .add_systems(
+                RenderStartup,
+                (init_ring_pipeline.after(MeshPipelineSystems), init_ring_gpu),
+            )
             .add_systems(ExtractSchedule, extract_rings)
             .add_systems(
                 Render,
