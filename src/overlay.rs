@@ -348,10 +348,11 @@ fn thousands(n: usize) -> String {
     out
 }
 
-/// Mean frame time in ms over the diagnostic's history (about two
-/// seconds), and the rate that mean implies. The smoothed values chase
-/// the latest frame: frames that carry a sim tick are longer than the
-/// ones between them, so a smoothed readout flickered between two rates.
+/// Mean frame time in ms over the diagnostic's history (Bevy's default,
+/// the last 120 frames: under a second at 144 fps), and the rate that mean
+/// implies, frames over elapsed time. The smoothed values chase the latest
+/// frame: frames that carry a sim tick are longer than the ones between
+/// them, so a smoothed readout flickered between two rates.
 fn frame_rate(diagnostics: &DiagnosticsStore) -> (f64, f64) {
     let frame_ms = diagnostics
         .get(&FrameTimeDiagnosticsPlugin::FRAME_TIME)
