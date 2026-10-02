@@ -140,6 +140,9 @@ struct Params {
     // soldier in bin 0, the camera's lists in the order the build found
     // them).
     order: f32,
+    // Per kind, the first detail level from which every level's mesh is
+    // all body, one part (4: none).
+    body_lods: vec4<u32>,
 };
 
 struct DrawArgs {
@@ -296,13 +299,19 @@ fn queue_draw(t: u32, bucket: u32, entry: u32, lod: u32, dist2: f32) {
 // The list entry of drawn record `r` of a soldier of `kind`: the record,
 // or with the pose pass a pose slot of his kind that the pass fills from
 // the record. A soldier or body takes at most one slot a frame, so a
-// kind's region holds its living and its fallen.
-fn list_entry(kind: u32, r: u32) -> u32 {
+// kind's region holds its living and its fallen. One the camera draws at
+// a body-only level and who casts no shadow is posed for his body alone
+// (the top bit, unit_pose_pass.wgsl).
+fn list_entry(kind: u32, r: u32, lod: u32, casts: u32) -> u32 {
     if params.pose_pass == 0u {
         return r;
     }
     let slot = atomicAdd(&counts[POSE_COUNTER + kind], 1u);
-    pose_src[params.pose_src_base[kind] + slot] = r;
+    var body = 0u;
+    if lod >= params.body_lods[kind] && casts == 0u {
+        body = 0x80000000u;
+    }
+    pose_src[params.pose_src_base[kind] + slot] = r | body;
     return slot;
 }
 
@@ -501,7 +510,11 @@ fn build_soldier(i: u32) {
         vec4<f32>(sm.band, sm.wall, sm.gait, stagger),
     );
     smoothing[i] = sm;
-    let entry = list_entry(kind, i);
+    var drawn_lod = NUM_LODS;
+    if visible {
+        drawn_lod = lod;
+    }
+    let entry = list_entry(kind, i, drawn_lod, casts);
     if visible {
         queue_draw(i, kind * NUM_LODS + lod, entry, lod, dot(d, d));
         if death_t == 0.0 && (reg.flags & (REG_SELECTED | REG_HOVERED | REG_HOVER_OWN)) != 0u {
@@ -555,7 +568,11 @@ fn build_corpse(j: u32, t: u32) {
     if !visible && casts == 0u {
         return;
     }
-    let entry = list_entry(kind, ridx);
+    var drawn_lod = NUM_LODS;
+    if visible {
+        drawn_lod = lod;
+    }
+    let entry = list_entry(kind, ridx, drawn_lod, casts);
     if visible {
         let bucket = kind * NUM_LODS + lod;
         atomicAdd(&counts[16u + bucket], 1u);

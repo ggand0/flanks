@@ -41,6 +41,9 @@ fn pose(@builtin(global_invocation_id) gid: vec3<u32>) {
     if slot >= counts[POSE_COUNTER + k] {
         return;
     }
-    let r = records[pose_src[params.src_base[k] + slot]];
-    pose_write(slot * params.stride[k], r.pos_scale, r.color, r.anim, r.anim2, globals.time);
+    // The top bit: the soldier is drawn at a body-only level
+    // (unit_build.wgsl `list_entry`).
+    let src = pose_src[params.src_base[k] + slot];
+    let r = records[src & 0x7fffffffu];
+    pose_write(slot * params.stride[k], r.pos_scale, r.color, r.anim, r.anim2, globals.time, (src >> 31u) != 0u);
 }

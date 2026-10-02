@@ -1209,9 +1209,16 @@ fn pose_write(
     anim: vec4<f32>,
     anim2: vec4<f32>,
     time: f32,
+    body_only: bool,
 ) {
     pose_base = base;
     pose_begin(pos_scale, color, anim, anim2, time);
+    // A soldier drawn at a level whose mesh is all body (unit_build.wgsl
+    // `list_entry`) reads only the slots `pose_begin` writes: no limbs, no
+    // weapon rig, no bow.
+    if body_only {
+        return;
+    }
     put_simple();
     // The fallen keep the legs they fell with (`place`).
     if pre.leg > 0.0 {

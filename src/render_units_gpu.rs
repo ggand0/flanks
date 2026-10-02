@@ -225,6 +225,10 @@ pub struct BuildParams {
     /// Depth bins per unit of log2 of the squared camera distance, 0 to
     /// keep every soldier in one bin.
     order: f32,
+    /// Per kind, the first detail level from which every level's mesh is
+    /// all body (`PullMeshGpu::body_only`), 4 for none: a soldier drawn there
+    /// who casts no shadow is posed for his body alone.
+    body_lods: UVec4,
 }
 
 /// The pose pass uniform (`Params` in unit_pose_pass.wgsl).
@@ -806,6 +810,14 @@ const MAX_GROUP: u32 = 64;
 /// The near levels draw their soldiers near to far, in depth bins
 /// (unit_build.wgsl `ORDERED_LODS`). Read once: `FL_UNIT_ORDER=0` keeps
 /// them in the order the build found them, for A/B runs.
+/// Soldiers drawn at a body-only level are posed for their body alone
+/// (unit_build.wgsl `list_entry`). Read once: `FL_POSE_BODY=0` poses
+/// everyone in full, for A/B runs.
+fn body_poses() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::util::env_or("FL_POSE_BODY", 1_u32) != 0)
+}
+
 fn depth_order() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| crate::util::env_or("FL_UNIT_ORDER", 1_u32) != 0)
@@ -1062,6 +1074,9 @@ pub struct PullMeshGpu {
     pub count: u32,
     pub bucket: usize,
     pub shape: DrawShape,
+    /// Every corner is on the body, part 0 (the unit models' L3): the
+    /// vertex shader reads only the pose slots `pose_begin` writes.
+    pub body_only: bool,
 }
 
 /// How a bucket's level draws. `group` 0: expanded corners, one plain draw
@@ -1117,6 +1132,7 @@ fn extract_pull_meshes(
             count: mesh.corners.len() as u32,
             bucket: mesh.bucket,
             shape,
+            body_only: mesh.corners.iter().all(|c| c.part < 0.5),
         });
     }
 }
@@ -1629,6 +1645,20 @@ fn prepare_gpu_units(
     params.shadow_groups = cast_with(3);
     params.pose_src_base = UVec4::from_array(alloc.pose_src_base);
     params.pose_pass = input.pose_pass as u32;
+    // The first level of each kind from which every level is body only.
+    let mut body = [NUM_LODS as u32; NUM_KINDS];
+    if body_poses() {
+        let mut levels = [[false; NUM_LODS]; NUM_KINDS];
+        for mesh in &meshes {
+            levels[mesh.bucket / NUM_LODS][mesh.bucket % NUM_LODS] = mesh.body_only;
+        }
+        for (kind, first) in body.iter_mut().enumerate() {
+            while *first > 0 && levels[kind][*first as usize - 1] {
+                *first -= 1;
+            }
+        }
+    }
+    params.body_lods = UVec4::from_array(body);
     buffers.params.set(params);
     buffers.params.write_buffer(&device, &queue);
     buffers.threads = n as u32 + input.corpse_len.iter().sum::<u32>();
