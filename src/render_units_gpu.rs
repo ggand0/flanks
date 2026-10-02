@@ -95,14 +95,22 @@ const POSE_ARG: usize = DRAW_ARGS;
 /// Indexed draw arguments: the camera's buckets, then the caster lists.
 const INDEXED_ARGS: usize = NUM_BUCKETS + CASTER_LISTS;
 
+/// Depth bins of each camera bucket's list (unit_build.wgsl `queue_draw`).
+const DEPTH_BINS: usize = 128;
+
+/// The squared camera distances the bins cover, as a power of two: 1 m to
+/// 4096 m, past which every soldier shares the last bin.
+const DEPTH_BIN_SPAN: f32 = 24.0;
+
 /// Build counters: per bucket the soldiers and the fallen, the caster
-/// lists, the ring count, then the pose slots taken per kind.
-const COUNTERS: usize = 2 * NUM_BUCKETS + CASTER_LISTS + 1 + NUM_KINDS;
+/// lists, the ring count, the pose slots taken per kind, then per bucket
+/// its depth bins.
+const COUNTERS: usize = 2 * NUM_BUCKETS + CASTER_LISTS + 1 + NUM_KINDS + NUM_BUCKETS * DEPTH_BINS;
 
 /// Storage buffers the build pass binds (`init_gpu_unit_pipelines`), more
 /// than any other unit pass. A device that allows fewer per stage keeps the
 /// CPU path.
-const STORAGE_BUFFERS: u32 = 10;
+const STORAGE_BUFFERS: u32 = 11;
 
 /// Pose slots (four floats each) per soldier of a kind without a bow rig,
 /// and of one with it (`POSE_SLOTS` and `POSE_SLOTS_BOW` in
@@ -214,6 +222,9 @@ pub struct BuildParams {
     /// Per cascade and kind: soldiers per instance of the level he casts
     /// with (0: expanded).
     shadow_groups: [UVec4; MAX_CASCADES],
+    /// Depth bins per unit of log2 of the squared camera distance, 0 to
+    /// keep every soldier in one bin.
+    order: f32,
 }
 
 /// The pose pass uniform (`Params` in unit_pose_pass.wgsl).
@@ -224,7 +235,8 @@ struct PoseParams {
 }
 
 const _: () = assert!(NUM_KINDS == 4, "BuildParams and PoseParams pack per-kind values in vec4s");
-const _: () = assert!(COUNTERS == 53, "unit_build.wgsl sizes `counts` for 53");
+const _: () = assert!(COUNTERS == 2101, "unit_build.wgsl sizes `counts` for 2101");
+const _: () = assert!(DEPTH_BINS == 128, "unit_build.wgsl has 128 depth bins per bucket");
 const _: () = assert!(NUM_BUCKETS == 16, "unit_build.wgsl sizes its counters for 16 buckets");
 const _: () = assert!(MAX_CASCADES == 4, "unit_build.wgsl sizes its cascades for 4");
 const _: () = assert!(
@@ -566,6 +578,9 @@ fn build_frame_params(
         RANGED_BASE,
     );
     p.frame = frame_count.0;
+    if depth_order() {
+        p.order = DEPTH_BINS as f32 / DEPTH_BIN_SPAN;
+    }
     // The sun's cascades for this camera, as the shadow pass draws them
     // this frame. A soldier casts into a cascade when the ground his shadow
     // can fall on is in view at depths the cascade serves, with the level
@@ -787,6 +802,14 @@ const GROUP_INDICES: usize = 65536;
 /// this many spare slots past its capacity, for the empty marks the last
 /// group is padded with (unit_build.wgsl `finalize`).
 const MAX_GROUP: u32 = 64;
+
+/// The near levels draw their soldiers near to far, in depth bins
+/// (unit_build.wgsl `ORDERED_LODS`). Read once: `FL_UNIT_ORDER=0` keeps
+/// them in the order the build found them, for A/B runs.
+fn depth_order() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::util::env_or("FL_UNIT_ORDER", 1_u32) != 0)
+}
 
 /// The welded, grouped draw is on. Read once: `FL_UNIT_WELD=0` turns it off.
 fn welded_levels() -> bool {
@@ -1184,6 +1207,8 @@ fn extract_gpu_units(mut main_world: ResMut<MainWorld>, mut input: ResMut<GpuUni
 pub(crate) struct GpuUnitPipelines {
     build: CachedComputePipelineId,
     finalize: CachedComputePipelineId,
+    /// Places each camera list entry by its depth bin, after `finalize`.
+    scatter: CachedComputePipelineId,
     layout: BindGroupLayoutDescriptor,
     pose: CachedComputePipelineId,
     /// Group 0 of the pose pass: its uniform, the records, the pose
@@ -1218,6 +1243,7 @@ fn init_gpu_unit_pipelines(
                 binding_types::storage_buffer_sized(false, None),
                 binding_types::storage_buffer_sized(false, None),
                 binding_types::storage_buffer_sized(false, None),
+                binding_types::storage_buffer_sized(false, None),
             ),
         ),
     );
@@ -1234,6 +1260,8 @@ fn init_gpu_unit_pipelines(
     let build = pipeline_cache.queue_compute_pipeline(descriptor("unit build", "build"));
     let finalize =
         pipeline_cache.queue_compute_pipeline(descriptor("unit build finalize", "finalize"));
+    let scatter =
+        pipeline_cache.queue_compute_pipeline(descriptor("unit build scatter", "scatter"));
 
     let pose_layout = BindGroupLayoutDescriptor::new(
         "unit pose layout",
@@ -1278,6 +1306,7 @@ fn init_gpu_unit_pipelines(
     commands.insert_resource(GpuUnitPipelines {
         build,
         finalize,
+        scatter,
         layout,
         pose,
         pose_layout,
@@ -1307,6 +1336,9 @@ pub struct UnitAlloc {
     /// of a selected or hovered regiment each (selection_rings.rs).
     pub ring_base: u32,
     counts: Buffer,
+    /// Per build thread (the living, then the fallen), where its entry
+    /// goes on the camera's lists (unit_build.wgsl `Draw`, 12 bytes).
+    draws: Buffer,
     pub args: Buffer,
     /// The arguments of the indexed draws, five words each: per bucket for
     /// the camera, then per caster list (`DRAW_ARGS` order, rings excluded).
@@ -1396,6 +1428,12 @@ impl UnitAlloc {
             shadow_bases,
             ring_base,
             counts: storage_buffer(device, "unit bucket counts", COUNTERS * 4, BufferUsages::COPY_DST),
+            draws: storage_buffer(
+                device,
+                "unit draw places",
+                (live_cap + NUM_KINDS * CORPSE_CAP) * 12,
+                BufferUsages::empty(),
+            ),
             args: storage_buffer(
                 device,
                 "unit draw args",
@@ -1627,6 +1665,7 @@ fn prepare_gpu_units(
                 readback.buffer.as_entire_binding(),
                 alloc.pose_src.as_entire_binding(),
                 alloc.indexed_args.as_entire_binding(),
+                alloc.draws.as_entire_binding(),
             )),
         ));
     }
@@ -1789,11 +1828,12 @@ fn prepare_pull_bind_groups(
 
 /// The compute passes, recorded into the frame's encoder before the sun's
 /// shadow pass and the main passes of the view: clear the counters, build
-/// every soldier, turn the counts into draw arguments, then pose each drawn
-/// soldier once per kind. The shadow cascades draw from the same lists
-/// (render_units_shadow.rs), so the passes must come first or they draw
-/// last frame's. Until every pipeline and bind group is ready nothing runs,
-/// and the draws keep last frame's lists, records and poses together.
+/// every soldier, turn the counts into draw arguments, place each drawn
+/// soldier on his bucket's list, near to far on the near levels, then pose
+/// each drawn soldier once per kind. The shadow cascades draw from the same
+/// lists (render_units_shadow.rs), so the passes must come first or they
+/// draw last frame's. Until every pipeline and bind group is ready nothing
+/// runs, and the draws keep last frame's lists, records and poses together.
 pub(crate) fn run_unit_build_pass(
     buffers: Res<GpuUnitBuffers>,
     pipelines: Res<GpuUnitPipelines>,
@@ -1803,9 +1843,10 @@ pub(crate) fn run_unit_build_pass(
     let (Some(alloc), Some(bind_group)) = (&buffers.alloc, &buffers.bind_group) else {
         return;
     };
-    let (Some(build), Some(finalize)) = (
+    let (Some(build), Some(finalize), Some(scatter)) = (
         pipeline_cache.get_compute_pipeline(pipelines.build),
         pipeline_cache.get_compute_pipeline(pipelines.finalize),
+        pipeline_cache.get_compute_pipeline(pipelines.scatter),
     ) else {
         return;
     };
@@ -1839,6 +1880,10 @@ pub(crate) fn run_unit_build_pass(
     }
     pass.set_pipeline(finalize);
     pass.dispatch_workgroups(1, 1, 1);
+    if buffers.threads > 0 {
+        pass.set_pipeline(scatter);
+        pass.dispatch_workgroups(buffers.threads.div_ceil(64), 1, 1);
+    }
     span.end(&mut pass);
     drop(pass);
 

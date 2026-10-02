@@ -136,6 +136,10 @@ struct Params {
     // Per cascade and kind: soldiers per instance of the level the caster
     // list draws with (0: expanded).
     shadow_groups: array<vec4<u32>, 4>,
+    // Depth bins per unit of log2 of the squared camera distance (0: every
+    // soldier in bin 0, the camera's lists in the order the build found
+    // them).
+    order: f32,
 };
 
 struct DrawArgs {
@@ -153,8 +157,10 @@ struct DrawArgs {
 @group(0) @binding(5) var<storage, read_write> index_list: array<u32>;
 // 0..16 soldiers per bucket (living and fallen), 16..32 the fallen alone,
 // 32..48 the casters per cascade and kind (cascade * 4 + kind), 48 the
-// selection rings, 49..53 the pose slots taken per kind.
-@group(0) @binding(6) var<storage, read_write> counts: array<atomic<u32>, 53>;
+// selection rings, 49..53 the pose slots taken per kind, then per bucket
+// and depth bin (`BIN_COUNTER`) the soldiers in it, which `finalize` turns
+// into the bin's first slot in the bucket's list.
+@group(0) @binding(6) var<storage, read_write> counts: array<atomic<u32>, 2101>;
 // 0..16 the camera's buckets, 16..32 the casters as in `counts`, 32 the
 // selection rings, 33..37 the pose pass's dispatch per kind (x, y, z).
 @group(0) @binding(7) var<storage, read_write> args: array<DrawArgs, 37>;
@@ -166,6 +172,21 @@ struct DrawArgs {
 // Five words per list, 0..16 the camera's buckets and 16..32 the casters as
 // in `counts`: the arguments of its draw when its level is indexed.
 @group(0) @binding(10) var<storage, read_write> indexed_args: array<u32, 160>;
+
+// Where a build thread's soldier or body goes on the camera's lists, for
+// `scatter` to place once `finalize` knows where every bin starts.
+struct Draw {
+    // bucket * DEPTH_BINS + depth bin, NO_DRAW when the camera does not
+    // draw him.
+    cell: u32,
+    // His slot in the bin.
+    slot: u32,
+    // His list entry, the level in the top two bits.
+    entry: u32,
+};
+
+// One per build thread: the living, then the fallen.
+@group(0) @binding(11) var<storage, read_write> draws: array<Draw>;
 
 // An index list slot past the last soldier, up to the end of the last group
 // of an indexed draw: the vertex shader draws nothing for it
@@ -204,6 +225,18 @@ const RING_ARG: u32 = 32u;
 // The pose slot counters in `counts`, and the pose dispatches in `args`.
 const POSE_COUNTER: u32 = 49u;
 const POSE_ARG: u32 = 33u;
+// Depth bins per bucket, and where their counters start in `counts`.
+const DEPTH_BINS: u32 = 128u;
+const BIN_COUNTER: u32 = 53u;
+// Levels drawn near to far: below this one. The near levels' soldiers are
+// large on screen, so the depth test spares the shading of most of those
+// behind them. A far soldier is a few pixels, and his neighbours in his
+// regiment, next to him in the build's order, write the same framebuffer
+// tiles: sorted by depth, a level's consecutive soldiers lie along a band
+// across the screen instead, and the far levels draw slower.
+const ORDERED_LODS: u32 = 2u;
+// A thread that put nothing on the camera's lists this frame.
+const NO_DRAW: u32 = 0xffffffffu;
 
 // Detail level for a squared distance: the farthest threshold passed wins.
 fn level(t: vec4<f32>, d2: f32) -> u32 {
@@ -244,9 +277,20 @@ fn lod_jitter(seed: f32) -> f32 {
     return 1.0 - 0.5 * LOD_JITTER + LOD_JITTER * seed;
 }
 
-fn append(bucket: u32, entry: u32, lod: u32) {
-    let slot = atomicAdd(&counts[bucket], 1u);
-    index_list[params.buckets[bucket].x + slot] = entry | (lod << 30u);
+// Count build thread `t`'s soldier or body, `dist2` squared metres from the
+// camera, into his bucket and its depth bin, and keep where he goes:
+// `scatter` writes his entry once `finalize` knows where each bin starts.
+// The bins run near to far on the levels below ORDERED_LODS; a farther
+// level keeps one bin.
+fn queue_draw(t: u32, bucket: u32, entry: u32, lod: u32, dist2: f32) {
+    atomicAdd(&counts[bucket], 1u);
+    var bin = 0u;
+    if lod < ORDERED_LODS {
+        bin = u32(clamp(log2(max(dist2, 1.0)) * params.order, 0.0, f32(DEPTH_BINS - 1u)));
+    }
+    let cell = bucket * DEPTH_BINS + bin;
+    let slot = atomicAdd(&counts[BIN_COUNTER + cell], 1u);
+    draws[t] = Draw(cell, slot, entry | (lod << 30u));
 }
 
 // The list entry of drawn record `r` of a soldier of `kind`: the record,
@@ -459,7 +503,7 @@ fn build_soldier(i: u32) {
     smoothing[i] = sm;
     let entry = list_entry(kind, i);
     if visible {
-        append(kind * NUM_LODS + lod, entry, lod);
+        queue_draw(i, kind * NUM_LODS + lod, entry, lod, dot(d, d));
         if death_t == 0.0 && (reg.flags & (REG_SELECTED | REG_HOVERED | REG_HOVER_OWN)) != 0u {
             append_ring(i, reg.flags, kind);
         }
@@ -484,8 +528,8 @@ fn append_ring(i: u32, flags: u32, kind: u32) {
 
 // The fallen: a frozen record in the corpse region of `records`. A cull,
 // a level pick from the plain thresholds (no hysteresis, bodies do not
-// move) and an index append, then the caster lists as for the living.
-fn build_corpse(j: u32) {
+// move), then the camera's list and the caster lists as for the living.
+fn build_corpse(j: u32, t: u32) {
     var kind = 0u;
     var start = 0u;
     for (var k = 0u; k < 4u; k++) {
@@ -515,7 +559,7 @@ fn build_corpse(j: u32) {
     if visible {
         let bucket = kind * NUM_LODS + lod;
         atomicAdd(&counts[16u + bucket], 1u);
-        append(bucket, entry, lod);
+        queue_draw(t, bucket, entry, lod, dot(d, d));
     }
     append_casters(casts, kind, entry);
 }
@@ -523,15 +567,36 @@ fn build_corpse(j: u32) {
 @compute @workgroup_size(64)
 fn build(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
-    if i < params.n {
-        build_soldier(i);
+    if i >= build_threads() {
         return;
     }
-    let j = i - params.n;
-    let total = params.corpse_len.x + params.corpse_len.y + params.corpse_len.z + params.corpse_len.w;
-    if j < total {
-        build_corpse(j);
+    draws[i].cell = NO_DRAW;
+    if i < params.n {
+        build_soldier(i);
+    } else {
+        build_corpse(i - params.n, i);
     }
+}
+
+// The living, then the fallen of every kind.
+fn build_threads() -> u32 {
+    return params.n + params.corpse_len.x + params.corpse_len.y + params.corpse_len.z + params.corpse_len.w;
+}
+
+// After `finalize`: each soldier or body on the camera's lists goes to his
+// bin's first slot plus his slot in the bin.
+@compute @workgroup_size(64)
+fn scatter(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let t = gid.x;
+    if t >= build_threads() {
+        return;
+    }
+    let d = draws[t];
+    if d.cell == NO_DRAW {
+        return;
+    }
+    let first = atomicLoad(&counts[BIN_COUNTER + d.cell]);
+    index_list[params.buckets[d.cell / DEPTH_BINS].x + first + d.slot] = d.entry;
 }
 
 // The arguments of list `b`'s indexed draw: `group` soldiers of `corners`
@@ -556,7 +621,8 @@ fn finish_indexed(b: u32, first: u32, count: u32, corners: u32, group: u32) {
 
 // One thread per list: the list count becomes the arguments of its draw,
 // the corner count of the expanded draw and the groups of the indexed one.
-// `counts` was cleared before `build` ran.
+// A camera bucket's thread also turns its depth bin counts into the first
+// slot of each bin. `counts` was cleared before `build` ran.
 @compute @workgroup_size(32)
 fn finalize(@builtin(local_invocation_index) b: u32) {
     if b >= 16u {
@@ -571,6 +637,12 @@ fn finalize(@builtin(local_invocation_index) b: u32) {
     }
     let count = atomicLoad(&counts[b]);
     let fallen = atomicLoad(&counts[16u + b]);
+    var first = 0u;
+    for (var k = b * DEPTH_BINS; k < (b + 1u) * DEPTH_BINS; k++) {
+        let in_bin = atomicLoad(&counts[BIN_COUNTER + k]);
+        atomicStore(&counts[BIN_COUNTER + k], first);
+        first += in_bin;
+    }
     let bucket = params.buckets[b];
     args[b] = DrawArgs(count * bucket.y, 1u, 0u, 0u);
     finish_indexed(b, bucket.x, count, bucket.y, bucket.w);

@@ -161,12 +161,6 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
         pasture, pasture_normal, select(vec3<f32>(0.5), vec3<f32>(0.158131, 0.119077, 0.049214), natural_ground != 0u),
         p.xz, dx.xz, dy.xz, 2.51, detail,
     );
-    let soil_sample = sample_ground(
-        earth, earth_normal, vec3<f32>(0.194145, 0.120636, 0.057649),
-        p.xz + 83.0, dx.xz, dy.xz, 3.5, detail,
-    );
-    let soil_color = soil_sample.color;
-    let soil_nr = soil_sample.normal_roughness;
     var rock_color = vec3<f32>(0.284067, 0.232351, 0.136810);
     var rock_nr = vec4<f32>(0.5, 0.5, 1.0, 0.95);
     if natural_ground == 0u && in.color.b > 0.05 {
@@ -193,6 +187,19 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     var field = textureSample(coverage, coverage_sampler, coverage_uv);
     if natural_ground != 0u {
         field = meadow_transition(field, coverage_uv, p.xz, max(length(dx.xz), length(dy.xz)));
+    }
+    // On the authored ground every mix below takes the earth layer at
+    // weight field.a or in.color.g. Where both are 0, most of the field,
+    // nothing reads it, so its six samples are skipped there.
+    var soil_color = vec3<f32>(0.194145, 0.120636, 0.057649);
+    var soil_nr = vec4<f32>(0.5, 0.5, 1.0, 0.95);
+    if natural_ground == 0u || max(field.a, in.color.g) > 0.0 {
+        let soil_sample = sample_ground(
+            earth, earth_normal, vec3<f32>(0.194145, 0.120636, 0.057649),
+            p.xz + 83.0, dx.xz, dy.xz, 3.5, detail,
+        );
+        soil_color = soil_sample.color;
+        soil_nr = soil_sample.normal_roughness;
     }
     var soil: f32;
     var rock = 0.0;
