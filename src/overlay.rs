@@ -166,10 +166,12 @@ pub struct OverlayPlugin;
 
 impl Plugin for OverlayPlugin {
     fn build(&self, app: &mut App) {
-        app.add_plugins((
-            FrameTimeDiagnosticsPlugin::default(),
-            RenderDiagnosticsPlugin,
-        ))
+        // Bevy's RenderPlugin adds the render diagnostics itself when built
+        // with Tracy (`--features tracy`); adding them twice panics.
+        if !app.is_plugin_added::<RenderDiagnosticsPlugin>() {
+            app.add_plugins(RenderDiagnosticsPlugin);
+        }
+        app.add_plugins(FrameTimeDiagnosticsPlugin::default())
             .add_systems(Startup, (spawn_overlay, spawn_stats_line, spawn_inspect_panel))
             .add_systems(
                 OnEnter(crate::game_state::GameState::Battle),
