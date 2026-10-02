@@ -126,8 +126,12 @@ fn update_sun_uniform(
             };
             let bands = LodBands::new(&lod_cfg, px_per_unit);
             let reach = config.bounds.last().copied().unwrap_or(0.0);
+            // FL_RECEIVE_LODS=n: only the levels below n, for A/B runs of
+            // what the far soldiers' shadow lookup costs.
+            static BELOW: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+            let below = *BELOW.get_or_init(|| crate::util::env_or("FL_RECEIVE_LODS", NUM_LODS));
             for (lod, on) in levels.iter_mut().enumerate() {
-                *on = bands.level_start(lod) < reach;
+                *on = bands.level_start(lod) < reach && lod < below;
             }
             u.params = Vec4::new(
                 1.0,
