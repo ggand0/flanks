@@ -16,6 +16,7 @@ mod gait;
 mod frontline;
 mod game_files;
 mod game_state;
+mod gpu_frame_timer;
 mod mixer;
 mod morale;
 mod orders;
@@ -168,6 +169,7 @@ fn main() {
             selection_rings::SelectionRingsPlugin,
             camera::RtsCameraPlugin,
             overlay::OverlayPlugin,
+            gpu_frame_timer::GpuFrameTimerPlugin,
             unit_cards::UnitCardsPlugin,
             balance::BalancePlugin,
             picker::PickerPlugin,
