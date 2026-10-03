@@ -36,7 +36,7 @@ pub const CLEAR_CAP: f32 = 64.0;
 const EDGE: f32 = 4.0;
 /// The cost of giving up all the room a passage offers: walking at a
 /// wall that could have been kept a half width away costs like walking
-/// three times as far (see `NavGrid::weight`).
+/// three times as far (see `NavGrid::costs`).
 const ROOM: f32 = 2.0;
 /// A smoothed segment may cost this much more than the grid path it
 /// replaces (the sampled cost and the stepped cost differ slightly).
@@ -85,7 +85,7 @@ impl Clone for NavGrid {
 }
 
 /// The cost per metre of every cell in each step class for regiments of
-/// one width (`NavGrid::weight` gives the rule). Built once per width
+/// one width (`NavGrid::costs` gives the rule). Built once per width
 /// and shared by every plan for a regiment that wide.
 pub struct Costs {
     span: Span,
