@@ -243,7 +243,7 @@ pub fn do_spawn_battle(
     let block_d = rows as f32 * SPACING;
 
     // Regiments per rank: prefer filling the field's width, but never spawn
-    // ranks past its edge (the sim clamps positions to the terrain bounds
+    // ranks past its edge (at the terrain's edge the sim clamps positions
     // and stacked rows would squash onto the boundary line). If the army
     // needs more ranks than fit, widen the ranks and shrink the x pitch.
     let (field_min, field_max) = army_field(terrain);
