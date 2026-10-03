@@ -197,7 +197,7 @@ impl Terrain {
     }
 
     /// Impassable ground (nearest-vertex mask lookup). Steep ground
-    /// only — the river is wadeable and never in the mask. On the river
+    /// only: the river is wadeable and never in the mask. On the river
     /// map the bridge deck rectangle is exempt so the deck stays walkable
     /// even if a mask rule ever covers the channel again.
     #[inline]
