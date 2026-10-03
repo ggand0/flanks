@@ -215,6 +215,7 @@ pub fn scripts_active() -> bool {
         || std::env::var("FL_TEST_FRONT").is_ok()
         || std::env::var("FL_TEST_ORDERS").is_ok()
         || std::env::var("FL_TEST_FORM").is_ok()
+        || std::env::var("FL_TEST_PATH").is_ok()
 }
 
 #[derive(SystemSet, Clone, Copy, PartialEq, Eq, Hash, Debug)]

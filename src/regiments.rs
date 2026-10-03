@@ -161,7 +161,7 @@ fn time_seed() -> u32 {
 /// Spawn one regiment block (units + GroupData). `dir` faces the enemy
 /// (+1 toward -Z spawns rows so the block front is enemy-side).
 #[allow(clippy::too_many_arguments)] // spawn-time plumbing, all scalars
-fn spawn_regiment(
+pub(crate) fn spawn_regiment(
     units: &mut Units,
     terrain: &Terrain,
     list: &mut Vec<GroupData>,
@@ -202,6 +202,10 @@ pub fn do_spawn_battle(
     config: &crate::game_state::BattleConfig,
 ) {
     use crate::game_state::Scenario;
+    if crate::path_test::scene().is_some() {
+        crate::path_test::spawn(units, terrain, groups);
+        return;
+    }
     match config.scenario {
         Scenario::Surround => {
             crate::units::spawn_surround_test(units, terrain, groups);

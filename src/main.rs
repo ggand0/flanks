@@ -22,6 +22,7 @@ mod nav;
 mod obstacle_map;
 mod orders;
 mod overlay;
+mod path_test;
 mod picker;
 mod regiments;
 mod render_units;
@@ -146,6 +147,7 @@ fn main() {
         .add_plugins(settings::SettingsPlugin)
         .add_plugins(battle_setup::BattleSetupPlugin)
         .add_plugins(window_icon::WindowIconPlugin)
+        .add_plugins(path_test::PathTestPlugin)
         .add_plugins((
             terrain::TerrainPlugin,
             water::WaterPlugin,
