@@ -9,24 +9,28 @@
 //! - Otherwise a plan is requested. Requests ride in the tick job, a
 //!   fixed number per tick, and are planned on the pool after the
 //!   soldiers' kernel; the job's install hands the plans back at the next
-//!   tick. The schedule is counted in ticks, never in wall time, so a run
-//!   repeats bit for bit. While a regiment waits for its plan (normally
-//!   one tick) it walks straight, as before.
+//!   tick. A tick that must first build the cost table for a new
+//!   regiment width builds only that, and its plans go out with the next
+//!   job. The schedule is counted in ticks, never in wall time, so a run
+//!   repeats bit for bit. While a regiment waits for its plan (one or two
+//!   ticks, longer when many order at once) it walks straight, as before.
 //! - The regiment's frame (the point `resolve_orders` hands its men) is
 //!   the route's current waypoint; the last waypoint is the live goal. It
 //!   moves on to the next waypoint once the way there is clear and dry for
 //!   the block's whole width, or once its centre reaches the current one.
 //! - Each man keeps walking to his own slot around the frame while his
-//!   straight way there is open. When it is not, he follows the route:
-//!   the farthest route point ahead of his place on it that he can walk
-//!   to straight, never past his regiment's frame; failing any, he steps
-//!   round what stands in front of him. He knows his slot, his
+//!   straight way there is open. When it is not, he follows the route
+//!   from his own place on it, never past his regiment's frame: the
+//!   farthest point along it he can walk to straight; failing any, he
+//!   steps round what stands in front of him. He knows his slot, his
 //!   regiment's route and the ground ahead of him, nothing else.
 //! - A regiment that has arrived keeps its route while it holds at the
 //!   route's end, so a man still behind an obstacle finds his way to his
-//!   slot after the order is done. The next order replaces it.
-//! - An attack order plans again when its target has moved more than the
-//!   regiment's half width from where the plan was made to. A goal that
+//!   slot after the order is done, and its slots are re-sorted by where
+//!   its men stand. The next order replaces the route.
+//! - An attack order plans again when its target has gone behind
+//!   something, or has moved more than the regiment's half width from
+//!   where the plan was made to. A goal that
 //!   cannot be reached becomes a move to the nearest reachable ground
 //!   with room for the regiment, and the log states it.
 //!
