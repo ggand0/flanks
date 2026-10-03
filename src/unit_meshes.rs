@@ -11,7 +11,8 @@
 //! wind-up and chops on the strike.
 //!
 //! Local convention: origin at mid-body, +Z is forward (yaw 0), feet at
-//! y = -half_height (matching `TYPES[kind]`). The soldier's left hand is
+//! y = -half_height. The builders write a kind at `BUILT_HALF` and
+//! `build_kind_lods` scales it to `TYPES[kind]`. The soldier's left hand is
 //! on +X and holds the shield. The builders below are written as seen
 //! from the front, shield on -X, and `build_kind_lods` mirrors every
 //! level into place.
@@ -90,6 +91,10 @@ pub struct Rig {
     pub leg: f32,
     /// 1 for a jointed arm.
     pub chain: f32,
+    /// The soldier's centre above his soles: half his height.
+    pub half: f32,
+    /// Keeps the attack tables on the shader's 16-byte boundary.
+    pub pad: [f32; 3],
     /// A jointed arm's attack, sampled evenly over the wind-up and over
     /// the follow-through: shoulder, elbow and wrist turns from the rest
     /// pose, and how far the weapon is levelled. Entry 0 of the wind-up
@@ -144,6 +149,7 @@ impl Rig {
         self.rear *= s;
         self.slide *= s;
         self.leg *= s;
+        self.half *= s;
         self
     }
 }
@@ -172,7 +178,16 @@ pub fn code_rig(kind: usize) -> Rig {
         crate::unit_types::KIND_SPEAR => rig(0.14, [0.12, 0.10], up, 0.478, PART_SPEAR_ARM, HOLD_SPEAR),
         _ => rig(0.14, [0.12, 0.15], forward, 0.0, PART_ARM, HOLD_DRAW),
     };
-    r.scaled(crate::unit_types::unit_scale())
+    r.scaled(built_scale(kind))
+}
+
+/// Half heights the code-built kinds are written at: the knight 1.10 m
+/// tall, the others 1.00 m.
+const BUILT_HALF: [f32; crate::unit_types::NUM_KINDS] = [0.55, 0.50, 0.50, 0.50];
+
+/// What takes a code-built kind to the height its type has.
+fn built_scale(kind: usize) -> f32 {
+    crate::unit_types::half_height(kind) / BUILT_HALF[kind]
 }
 
 /// Part palette: rgb = material color, a = team-color blend amount.
@@ -459,8 +474,7 @@ pub(crate) fn build(m: MeshBuf) -> Mesh {
 
 /// Heavy knight: broad steel-and-tabard chest over narrow hips, pauldrons,
 /// full helm with nose guard, tall team-colored kite shield, arming sword.
-/// 17 cuboids, 204 tris at L0 (then 120 / 72 / 24). Height 1.1 m
-/// (half_height 0.55).
+/// 17 cuboids, 204 tris at L0 (then 120 / 72 / 24). Built 1.1 m tall.
 pub fn build_knight(lod: usize) -> Mesh {
     let mut m = MeshBuf::for_level(lod);
     let hip_pivot = -0.18;
@@ -613,7 +627,7 @@ pub fn build_knight(lod: usize) -> Mesh {
 
 /// Light man-at-arms: slim tunic, bare face under a steel kettle hat,
 /// wooden buckler, shorter sword. 15 cuboids, 180 tris at L0 (then
-/// 120 / 72 / 24). Height 1.0 m (half_height 0.50).
+/// 120 / 72 / 24). Built 1.0 m tall.
 pub fn build_man_at_arms(lod: usize) -> Mesh {
     let mut m = MeshBuf::for_level(lod);
     let hip_pivot = -0.16;
@@ -751,7 +765,7 @@ pub fn build_man_at_arms(lod: usize) -> Mesh {
 /// wide-brim steel kettle hat over a mail coif, round team shield, and a
 /// tall spear carried VERTICAL (the shader levels it at the enemy and
 /// thrusts it on the stab). 17 cuboids, 204 tris at L0 (then 132 / 72 /
-/// 24). Height 1.0 m (half_height 0.50).
+/// 24). Built 1.0 m tall.
 pub fn build_spearman(lod: usize) -> Mesh {
     let mut m = MeshBuf::for_level(lod);
     let hip_pivot = -0.16;
@@ -965,7 +979,7 @@ pub fn build_spearman(lod: usize) -> Mesh {
 /// (green with a whisper of team dye), long sleeves, leather belt,
 /// brown hose, low shoes, back quiver with the fletching fan, leather
 /// bracer on the bow arm. 42 cuboids, ~500 tris at L0 (then 168 / 72 /
-/// 24). Height ~1.0 m (half_height 0.50; the arrow fan overtops it like
+/// 24). Built about 1.0 m tall (the arrow fan overtops it like
 /// the spearman's point). The far levels keep the three tells as long
 /// as each is more than a speck: bow and string to L1, stave and fan to
 /// L2, the hood color to L3.
@@ -1421,9 +1435,8 @@ fn mirror_x(mesh: &mut Mesh) {
     }
 }
 
-/// These meshes are written at the kind's own half height, so the
-/// display scale (unit_types::unit_scale) has to be applied to them.
-/// An imported mesh is built to the scaled half height already.
+/// These meshes are written at `BUILT_HALF`, so they are scaled to the
+/// kind's half height here. An imported mesh is built to it already.
 fn apply_scale(mesh: &mut Mesh, scale: f32) {
     use bevy::mesh::VertexAttributeValues as V;
     if let Some(V::Float32x3(pos)) = mesh.attribute_mut(Mesh::ATTRIBUTE_POSITION) {
@@ -1449,7 +1462,7 @@ pub fn build_kind_lods(kind: usize) -> [Mesh; NUM_LODS] {
         crate::unit_types::KIND_SPEAR => build_spearman,
         _ => build_archer,
     };
-    let scale = crate::unit_types::unit_scale();
+    let scale = built_scale(kind);
     std::array::from_fn(|lod| {
         let mut mesh = builder(lod);
         mirror_x(&mut mesh);

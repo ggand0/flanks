@@ -1009,15 +1009,17 @@ fn swing(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
                                 (h(0x5DC1) + h(0x6B8D) - 1.0) * sigma,
                             );
                         aim += shot.vel * (aim.distance(p) / 30.0);
-                        // Launch ABOVE the body-hit band (arrows.rs tops out
-                        // at ground + 1.15): a shaft leaving at head height
-                        // is inside its own shooter's hit cylinder at
-                        // flight-time zero and kills him.
-                        let from =
-                            Vec3::new(p.x, pos_prev[i].y + 0.75, p.y);
+                        // Launch above the body-hit band (arrows.rs): a
+                        // shaft leaving at head height is inside its own
+                        // shooter's hit cylinder at flight-time zero and
+                        // kills him.
+                        let over = crate::unit_types::half_height(my_kind)
+                            + crate::arrows::LAUNCH_OVER_HEAD;
+                        let from = Vec3::new(p.x, pos_prev[i].y + over, p.y);
                         let to = Vec3::new(
                             aim.x,
-                            terrain.height_at(aim.x, aim.y) + 0.7,
+                            terrain.height_at(aim.x, aim.y)
+                                + crate::arrows::AIM_HEIGHT * crate::unit_types::tallest(),
                             aim.y,
                         );
                         out.arrows.push(crate::arrows::ArrowSpawn {

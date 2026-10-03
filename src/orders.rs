@@ -909,7 +909,7 @@ fn draw_order_preview(
                         lift(world(off), 0.25),
                         Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2),
                     ),
-                    0.42,
+                    crate::selection_rings::RADIUS,
                     slot_col,
                 );
             }

@@ -28,6 +28,8 @@ struct Rig {
     leg: f32,
     // 1 for a jointed arm: upper arm, forearm (9) and hand (10).
     chain: f32,
+    // His centre above his soles: half his height.
+    half: f32,
     // A jointed arm's attack, even samples over the wind-up and over the
     // follow-through: shoulder, elbow and wrist turns from the rest pose,
     // and how far the weapon is levelled. windup[0] is the guard.
@@ -887,11 +889,12 @@ fn put_common() {
         }
     }
     // Cheer hop: celebrating units bounce. Brace, the braced walk and the
-    // wall carry a slight crouch.
+    // wall carry a slight crouch. Each is a share of the soldier's height.
+    let height = 2.0 * rig.half;
     let hop = 0.06 * pre.celebrate * max(sin(pre.wobble), 0.0);
     let bob = -pre.dip;
-    let offset = bob - 0.15 * death - 0.07 * pre.brace - 0.03 * pre.ready * pre.moving
-        - 0.05 * pre.wall - 0.10 * pre.stagger + hop;
+    let offset = bob + height * (hop - 0.15 * death - 0.07 * pre.brace
+        - 0.03 * pre.ready * pre.moving - 0.05 * pre.wall - 0.10 * pre.stagger);
     pose_put(P_POS, vec4<f32>(pre.pos, offset));
     pose_put(P_YAW, vec4<f32>(cos(pre.yaw), sin(pre.yaw), lean, turn));
     pose_put(P_TURN, vec4<f32>(cos(turn), sin(turn), shift, pre.leg));
@@ -1103,7 +1106,7 @@ fn put_simple() {
     if wall > 0.001 {
         let ang = -1.05 * wall;
         front = vec2<f32>(cos(ang), sin(ang));
-        lift = 0.10 * wall;
+        lift = 0.20 * rig.half * wall;
     }
 
     // Spear arm without a rig: arm and shaft turn as one about the
@@ -1406,7 +1409,7 @@ fn place(rest: vec3<f32>, rest_normal: vec3<f32>, part_id: f32, pivot_height: f3
     if part < 1.5 || (part > 3.5 && part < 6.5) || (part > 7.5 && part < 19.5) {
         let turn = pose_at(P_TURN);
         let torso = part < 0.5 || abs(part - 19.0) < 0.5;
-        let w = select(1.0, smoothstep(0.0, 0.25, corner.position.y), torso);
+        let w = select(1.0, smoothstep(0.0, 0.5 * rig.half, corner.position.y), torso);
         var c = turn.x;
         var s = turn.y;
         if torso {
@@ -1419,7 +1422,8 @@ fn place(rest: vec3<f32>, rest_normal: vec3<f32>, part_id: f32, pivot_height: f3
         local.x += turn.z * w;
     }
 
-    let lean = yaw.z * clamp(local.y + 0.5, 0.0, 1.5);
+    // The lean shears the body forward from the soles up.
+    let lean = yaw.z * clamp(local.y + rig.half, 0.0, 3.0 * rig.half);
     local.z += lean * 0.3;
 
     // Stagger: the whole body pitches backward from the feet. The sine is
@@ -1427,8 +1431,8 @@ fn place(rest: vec3<f32>, rest_normal: vec3<f32>, part_id: f32, pivot_height: f3
     if hip.w != 0.0 {
         let sca = hip.z;
         let ssa = hip.w;
-        let sfy = local.y + 0.5;
-        local = vec3<f32>(local.x, sfy * sca - local.z * ssa - 0.5, sfy * ssa + local.z * sca);
+        let sfy = local.y + rig.half;
+        local = vec3<f32>(local.x, sfy * sca - local.z * ssa - rig.half, sfy * ssa + local.z * sca);
         normal =
             vec3<f32>(normal.x, normal.y * sca - normal.z * ssa, normal.y * ssa + normal.z * sca);
     }
@@ -1438,13 +1442,13 @@ fn place(rest: vec3<f32>, rest_normal: vec3<f32>, part_id: f32, pivot_height: f3
     if topple.z > 0.5 {
         let ca = topple.x;
         let sa = topple.y;
-        let fy = local.y + 0.5;
+        let fy = local.y + rig.half;
         if topple.z < 1.5 {
-            local = vec3<f32>(local.x, fy * ca - local.z * sa - 0.5, fy * sa + local.z * ca);
+            local = vec3<f32>(local.x, fy * ca - local.z * sa - rig.half, fy * sa + local.z * ca);
             normal =
                 vec3<f32>(normal.x, normal.y * ca - normal.z * sa, normal.y * sa + normal.z * ca);
         } else {
-            local = vec3<f32>(local.x * ca + fy * sa, fy * ca - local.x * sa - 0.5, local.z);
+            local = vec3<f32>(local.x * ca + fy * sa, fy * ca - local.x * sa - rig.half, local.z);
             normal =
                 vec3<f32>(normal.x * ca + normal.y * sa, normal.y * ca - normal.x * sa, normal.z);
         }

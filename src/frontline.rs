@@ -809,7 +809,9 @@ fn draw_front_gizmos(
     if !viz.0 || !settings.interface.front_line {
         return;
     }
-    let lift = |p: Vec2| Vec3::new(p.x, terrain.height_at(p.x, p.y) + 1.5, p.y);
+    // Over the soldiers' heads.
+    let over = crate::unit_types::tallest() + 0.4;
+    let lift = |p: Vec2| Vec3::new(p.x, terrain.height_at(p.x, p.y) + over, p.y);
     for (a, b) in &field.segments {
         gizmos.line(lift(*a), lift(*b), Color::srgb(1.0, 0.95, 0.35));
     }
