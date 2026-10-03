@@ -10,8 +10,8 @@ use crate::terrain::Terrain;
 use crate::unit_types::{KIND_ARCHER, KIND_HEAVY, KIND_LIGHT, KIND_SPEAR, NUM_KINDS};
 use crate::units::{Units, hash01, push_unit};
 
-/// Unit spacing inside a regiment block.
-const SPACING: f32 = 1.4;
+/// Unit spacing inside a regiment block in the test scenarios' layouts.
+const SPACING: f32 = crate::formation::BASE_SPACING;
 /// Gap between regiment blocks.
 const REG_GAP: f32 = 10.0;
 /// Margins the army layout keeps from the terrain edges. Shared with the
@@ -181,8 +181,9 @@ fn spawn_regiment(
         let seed = crate::units::spawn_seed((team as u32) << 30 | g << 16 | k as u32);
         let jx = hash01(seed.wrapping_mul(3) + 1) - 0.5;
         let jz = hash01(seed.wrapping_mul(3) + 2) - 0.5;
-        let x = anchor.x + (col as f32 - (cols - 1) as f32 / 2.0) * SPACING + jx * 0.5;
-        let z = anchor.y + dir * ((row as f32 - (rows - 1) as f32 / 2.0) * SPACING) + jz * 0.5;
+        let gap = crate::formation::gap(kind);
+        let x = anchor.x + (col as f32 - (cols - 1) as f32 / 2.0) * gap + jx * 0.5;
+        let z = anchor.y + dir * ((row as f32 - (rows - 1) as f32 / 2.0) * gap) + jz * 0.5;
         push_unit(units, terrain, seed, team, kind, g, x, z, anchor);
     }
     // Rigid rank-and-file by default: exact slots into `home` (the spawn
@@ -236,11 +237,13 @@ pub fn do_spawn_battle(
     let size = config.reg_size;
     let n_regs = (per_team / size).max(1);
 
-    // Block geometry: wider than deep (~2.2:1).
+    // Block geometry: wider than deep (~2.2:1), on the ground the kind
+    // with the widest gap needs.
     let cols = ((size as f32 * 2.2).sqrt().ceil() as usize).max(1);
     let rows = size.div_ceil(cols);
-    let block_w = cols as f32 * SPACING;
-    let block_d = rows as f32 * SPACING;
+    let gap = crate::formation::widest_gap();
+    let block_w = cols as f32 * gap;
+    let block_d = rows as f32 * gap;
 
     // Regiments per rank: prefer filling the field's width, but never spawn
     // ranks past its edge (at the terrain's edge the sim clamps positions
@@ -984,7 +987,7 @@ fn melee_diag_log(
         return;
     };
     let fwd = crate::formation::facing_dir(gd.facing);
-    let pitch = gd.spacing.pitch().y;
+    let pitch = gd.spacing.pitch(gd.kind).y;
     let mut members: Vec<(usize, f32)> = Vec::new();
     let mut max_fwd = f32::MIN;
     for i in 0..units.len() {

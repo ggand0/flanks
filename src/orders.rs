@@ -595,7 +595,7 @@ fn line_layout(
     for (g, _) in segs {
         let gd = &groups.list[g];
         let share = len * gd.count as f32 / total as f32;
-        let pitch = gd.spacing.pitch();
+        let pitch = gd.spacing.pitch(gd.kind);
         let files = (((share - LINE_REG_GAP) / pitch.x).floor() as u32)
             .clamp(1, gd.count as u32);
         let ranks = (gd.count as u32).div_ceil(files);
@@ -899,7 +899,7 @@ fn draw_order_preview(
         let gd = &groups.list[p.g];
         let fwd = facing_dir(p.facing);
         let right = Vec2::new(fwd.y, -fwd.x);
-        let pitch = gd.spacing.pitch();
+        let pitch = gd.spacing.pitch(gd.kind);
         let world = |off: Vec2| p.anchor + right * off.x + fwd * off.y;
 
         if total <= PREVIEW_CIRCLE_CAP {
