@@ -1057,7 +1057,8 @@ const ROOM_PROBE: f32 = 6.0;
 /// own regiment (10th percentile, median, 90th), the median distance to
 /// the nearest enemy, the share of men with an enemy within 3 m, and the
 /// box the men's centres cover along the regiment's facing with its
-/// ground per man. One line for each regiment while few are alive, and
+/// ground per man, and the shares of men out of formation and moving
+/// faster than 0.4 m/s. One line for each regiment while few are alive, and
 /// always a line over all regiments by state: fighting (engaged), moving
 /// (under an order) and standing.
 fn room_log(
@@ -1080,6 +1081,8 @@ fn room_log(
         enemy: Vec<f32>,
         near_enemy: u32,
         men: u32,
+        out_form: u32,
+        walking: u32,
         lo: Vec2,
         hi: Vec2,
     }
@@ -1091,6 +1094,8 @@ fn room_log(
             enemy: Vec::new(),
             near_enemy: 0,
             men: 0,
+            out_form: 0,
+            walking: 0,
             lo: Vec2::MAX,
             hi: Vec2::MIN,
         })
@@ -1117,6 +1122,8 @@ fn room_log(
         });
         let room = &mut rooms[g];
         room.men += 1;
+        room.out_form += units.out_form[i] as u32;
+        room.walking += (units.vel[i].length_squared() > 0.16) as u32;
         if comrade < ROOM_PROBE * ROOM_PROBE {
             room.comrade.push(comrade.sqrt());
         }
@@ -1164,7 +1171,7 @@ fn room_log(
                 )
             };
             info!(
-                "[room] t={t:.0}s reg {g} {} {} n={}: comrade {:.2}/{:.2}/{:.2} m (p10/median/p90), enemy {enemy}, box {:.1} x {:.1} m, {ground:.2} m2 a man",
+                "[room] t={t:.0}s reg {g} {} {} n={}: comrade {:.2}/{:.2}/{:.2} m (p10/median/p90), enemy {enemy}, box {:.1} x {:.1} m, {ground:.2} m2 a man, {}% out of formation, {}% walking",
                 crate::unit_types::kind_name(gd.kind),
                 STATES[state],
                 room.men,
@@ -1173,6 +1180,8 @@ fn room_log(
                 at(&room.comrade, 0.9),
                 size.x,
                 size.y,
+                room.out_form * 100 / room.men,
+                room.walking * 100 / room.men,
             );
         }
     }
