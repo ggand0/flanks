@@ -271,7 +271,8 @@ fn log_progress(
     }
     let scene = scene().unwrap_or_default();
     if scene == "many" {
-        if test.many_routed_tick.is_none() {
+        // From the tick after the orders, once the route pass has seen them.
+        if test.many_routed_tick.is_none() && tick > ORDER_TICK {
             let regs = MANY_REGS.min(groups.list.len() - 1);
             let waiting = (0..regs).filter(|&g| routes.pending(g)).count();
             if waiting == 0 {
