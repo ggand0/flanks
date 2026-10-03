@@ -139,7 +139,7 @@ fn update_ring_terrain(
     if !(first || ring_terrain.stale && active.0) {
         return;
     }
-    let (vx, vz) = crate::terrain::grid_verts();
+    let (vx, vz) = terrain.grid_verts();
     ring_terrain.heights = Arc::new(terrain.heights().to_vec());
     ring_terrain.origin = terrain.origin;
     ring_terrain.verts = UVec2::new(vx as u32, vz as u32);
@@ -527,3 +527,38 @@ impl Plugin for SelectionRingsPlugin {
 }
 
 const _: () = assert!(NUM_KINDS == 4, "RingParams packs per-kind half heights in a vec4");
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::terrain::{MapKind, build_terrain};
+
+    #[test]
+    fn rings_refresh_grid_size_after_switching_maps_with_no_selection() {
+        let mut app = App::new();
+        app.init_resource::<RingTerrain>()
+            .init_resource::<RingsActive>()
+            .insert_resource(build_terrain(MapKind::Grassland))
+            .add_systems(Update, update_ring_terrain);
+        app.update();
+        assert_eq!(
+            app.world().resource::<RingTerrain>().verts,
+            UVec2::new(513, 385)
+        );
+        for kind in [MapKind::BigGrassland, MapKind::Grassland] {
+            app.world_mut().resource_mut::<RingsActive>().0 = false;
+            app.insert_resource(build_terrain(kind));
+            app.update();
+            assert!(app.world().resource::<RingTerrain>().stale);
+            app.world_mut().resource_mut::<RingsActive>().0 = true;
+            app.update();
+            let ring = app.world().resource::<RingTerrain>();
+            let terrain = app.world().resource::<crate::terrain::Terrain>();
+            let (x, z) = terrain.grid_verts();
+            assert_eq!(ring.verts, UVec2::new(x as u32, z as u32));
+            assert_eq!(ring.origin, terrain.origin);
+            assert_eq!(ring.heights.as_slice(), terrain.heights());
+            assert!(!ring.stale);
+        }
+    }
+}

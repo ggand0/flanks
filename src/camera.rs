@@ -21,6 +21,20 @@ const PAN_SLOW_RAMP: f32 = 1.5;
 /// Zoom smoothing time constant (seconds to ~2/3 of the way).
 const ZOOM_SMOOTH: f32 = 0.12;
 
+fn max_distance(kind: crate::terrain::MapKind) -> f32 {
+    match kind {
+        crate::terrain::MapKind::BigGrassland => 2800.0,
+        _ => 900.0,
+    }
+}
+
+fn far_plane(kind: crate::terrain::MapKind) -> f32 {
+    match kind {
+        crate::terrain::MapKind::BigGrassland => 6000.0,
+        _ => PerspectiveProjection::default().far,
+    }
+}
+
 #[derive(Component)]
 pub struct RtsCamera {
     pub focus: Vec3,
@@ -94,6 +108,7 @@ fn control_camera(
     window: Query<&Window, With<PrimaryWindow>>,
     time: Res<Time<Real>>,
     settings: Res<crate::settings::Settings>,
+    terrain: Res<crate::terrain::Terrain>,
     mut query: Query<&mut RtsCamera>,
     mut slow_ramp: Local<f32>,
 ) {
@@ -170,7 +185,7 @@ fn control_camera(
     };
     if scroll_lines != 0.0 {
         cam.target_distance =
-            (cam.target_distance * 0.9f32.powf(scroll_lines)).clamp(15.0, 900.0);
+            (cam.target_distance * 0.9f32.powf(scroll_lines)).clamp(15.0, max_distance(terrain.kind));
     }
     // Smooth zoom: distance chases the scroll target.
     let blend = (time.delta_secs() / ZOOM_SMOOTH).min(1.0);
@@ -183,13 +198,21 @@ fn control_camera(
 }
 
 pub fn apply_camera_transform(
-    mut query: Query<(&mut RtsCamera, &mut Transform)>,
+    mut query: Query<(&mut RtsCamera, &mut Transform, &mut Projection)>,
     terrain: Res<crate::terrain::Terrain>,
     time: Res<Time>,
 ) {
-    let Ok((mut cam, mut transform)) = query.single_mut() else {
+    let Ok((mut cam, mut transform, mut projection)) = query.single_mut() else {
         return;
     };
+    let limit = max_distance(terrain.kind);
+    if terrain.is_changed() {
+        cam.distance = cam.distance.min(limit);
+        cam.target_distance = cam.target_distance.min(limit);
+        if let Projection::Perspective(p) = &mut *projection {
+            p.far = far_plane(terrain.kind);
+        }
+    }
     // FL_CAM_LOCK: pin the camera to the FL_CAM_* spawn values every
     // frame — screenshot debugging needs a stable frame even with a
     // cursor parked at a screen edge (edge pan) or a stray scroll.
@@ -200,20 +223,20 @@ pub fn apply_camera_transform(
         cam.pitch = crate::util::env_or("FL_CAM_PITCH", 0.9);
         cam.distance = crate::util::env_or("FL_CAM_DIST", 280.0);
         // FL_CAM_SWEEP=s: every s seconds the locked camera jumps between
-        // the close-up (40 m) and the whole field (900 m), the worst case
+        // the close-up and the map's widest view, the worst case
         // of a sudden zoom, so frame time under camera changes can be
         // measured from a log instead of by hand.
         let sweep = crate::util::env_or("FL_CAM_SWEEP", 0.0_f32);
         if sweep > 0.0 && (time.elapsed_secs() / sweep) as u32 % 2 == 1 {
-            cam.distance = 900.0;
+            cam.distance = limit;
         }
         // A negative period gives a continuous zoom and orbit for checking
         // material transitions in motion, without injecting desktop input.
         if sweep < 0.0 {
             let phase = time.elapsed_secs() / -sweep * std::f32::consts::TAU;
             // The sweep starts at FL_CAM_DIST, so small plants can be seen up close.
-            let close_distance = crate::util::env_or("FL_CAM_DIST", 40.0_f32).clamp(1.0, 900.0);
-            cam.distance = close_distance + (900.0 - close_distance) * (0.5 - 0.5 * phase.cos());
+            let close_distance = crate::util::env_or("FL_CAM_DIST", 40.0_f32).clamp(1.0, limit);
+            cam.distance = close_distance + (limit - close_distance) * (0.5 - 0.5 * phase.cos());
             cam.yaw += phase.sin() * 0.35;
         }
         cam.target_distance = cam.distance;
@@ -226,4 +249,48 @@ pub fn apply_camera_transform(
     let rot = Quat::from_euler(EulerRot::YXZ, cam.yaw, -cam.pitch, 0.0);
     let offset = rot * Vec3::new(0.0, 0.0, cam.distance);
     *transform = Transform::from_translation(cam.focus + offset).looking_at(cam.focus, Vec3::Y);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::terrain::{MapKind, build_terrain};
+
+    #[test]
+    fn map_switches_update_camera_range_and_keep_focus_on_the_field() {
+        let mut app = App::new();
+        app.init_resource::<Time>()
+            .insert_resource(build_terrain(MapKind::BigGrassland))
+            .add_systems(Update, apply_camera_transform);
+        let camera = app
+            .world_mut()
+            .spawn((
+                RtsCamera {
+                    focus: Vec3::new(2000.0, 0.0, 2000.0),
+                    yaw: 0.0,
+                    pitch: 1.45,
+                    distance: 2800.0,
+                    target_distance: 2800.0,
+                },
+                Transform::default(),
+                Projection::default(),
+            ))
+            .id();
+        for (kind, limit, far, corner) in [
+            (MapKind::BigGrassland, 2800.0, 6000.0, Vec2::splat(1024.0)),
+            (MapKind::Grassland, 900.0, 1000.0, Vec2::new(512.0, 384.0)),
+        ] {
+            app.insert_resource(build_terrain(kind));
+            app.update();
+            let camera = app.world().entity(camera);
+            let cam = camera.get::<RtsCamera>().unwrap();
+            assert_eq!(cam.distance, limit);
+            assert_eq!(cam.target_distance, limit);
+            assert_eq!(cam.focus.xz(), corner);
+            let Projection::Perspective(p) = camera.get::<Projection>().unwrap() else {
+                panic!("expected perspective camera");
+            };
+            assert_eq!(p.far, far);
+        }
+    }
 }

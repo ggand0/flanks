@@ -17,24 +17,17 @@ use crate::units::hash01;
 
 pub const CELL: f32 = 2.0;
 pub const CHUNK_CELLS: usize = 32;
-pub const CHUNKS_X: usize = 16;
-pub const CHUNKS_Z: usize = 12;
-const VERTS_X: usize = CHUNKS_X * CHUNK_CELLS + 1;
-const VERTS_Z: usize = CHUNKS_Z * CHUNK_CELLS + 1;
-
-/// Half the battlefield's width (x) and depth (z) in metres. Every map is
-/// this size, centred on the origin (`Terrain::min`, `Terrain::max`).
-pub const HALF_EXTENTS: Vec2 =
-    Vec2::new((VERTS_X - 1) as f32 * CELL * 0.5, (VERTS_Z - 1) as f32 * CELL * 0.5);
 
 /// The battlefields in the menu's Map row. At launch a setup's map wins
 /// (an `FL_SETUP` file, or the Demo's with `FL_DEMO=1`), then
-/// `FL_MAP=classic`, `river` or `sandbox`; anything else is the grassland.
+/// `FL_MAP=big_grassland`, `classic`, `river` or `sandbox`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub enum MapKind {
     /// Broad pasture shoulders around an open lowland: the default.
     #[default]
     Grassland,
+    /// A 2048 m square pasture with an open centre and low outer hills.
+    BigGrassland,
     /// The 0.1.0 heightfield: rolling noise with ridged peaks, no river.
     Classic,
     /// Experimental: the same noise with terraces, a river and a bridge.
@@ -50,6 +43,7 @@ impl MapKind {
             return setup.map;
         }
         match std::env::var("FL_MAP").as_deref() {
+            Ok("big_grassland") => Self::BigGrassland,
             Ok("river") => Self::River,
             Ok("classic") => Self::Classic,
             Ok("sandbox") => Self::Sandbox,
@@ -60,6 +54,7 @@ impl MapKind {
     pub fn label(self) -> &'static str {
         match self {
             Self::Grassland => "Grassland",
+            Self::BigGrassland => "Big Grassland",
             Self::Classic => "Classic",
             Self::River => "River",
             Self::Sandbox => "Sandbox",
@@ -67,7 +62,31 @@ impl MapKind {
     }
 
     /// Every map, in the menu's order.
-    pub const ALL: [Self; 4] = [Self::Grassland, Self::Classic, Self::River, Self::Sandbox];
+    pub const ALL: [Self; 5] = [
+        Self::Grassland,
+        Self::BigGrassland,
+        Self::Classic,
+        Self::River,
+        Self::Sandbox,
+    ];
+
+    const fn chunk_counts(self) -> (usize, usize) {
+        match self {
+            Self::BigGrassland => (32, 32),
+            _ => (16, 12),
+        }
+    }
+
+    const fn grid_verts(self) -> (usize, usize) {
+        let (x, z) = self.chunk_counts();
+        (x * CHUNK_CELLS + 1, z * CHUNK_CELLS + 1)
+    }
+
+    /// Half the playable width and depth in metres, centred on the origin.
+    pub const fn half_extents(self) -> Vec2 {
+        let (x, z) = self.grid_verts();
+        Vec2::new((x - 1) as f32 * CELL * 0.5, (z - 1) as f32 * CELL * 0.5)
+    }
 }
 
 /// Sent by the menu when the Map row changes. The terrain regenerates
@@ -83,11 +102,13 @@ pub struct MapRebuild;
 pub struct Terrain {
     /// Vertex heights, row-major [z][x].
     heights: Vec<f32>,
+    verts_x: usize,
+    verts_z: usize,
     /// Impassable vertices (terrace risers, gorge walls, crater lips),
     /// same grid as `heights`. All-false on the classic map.
     blocked: Vec<bool>,
     pub kind: MapKind,
-    /// True on the two maps without a river (grassland and classic):
+    /// True on maps without a river:
     /// skips the river carve, terraces, ground variety, and every
     /// river-dependent system (water, bridge, wade).
     pub classic: bool,
@@ -96,12 +117,19 @@ pub struct Terrain {
     dirty: Vec<bool>,
 }
 
-/// Vertex counts of the height field along x and z.
-pub const fn grid_verts() -> (usize, usize) {
-    (VERTS_X, VERTS_Z)
-}
-
 impl Terrain {
+    /// Vertex counts of this height field along x and z.
+    pub fn grid_verts(&self) -> (usize, usize) {
+        (self.verts_x, self.verts_z)
+    }
+
+    fn chunk_counts(&self) -> (usize, usize) {
+        (
+            (self.verts_x - 1) / CHUNK_CELLS,
+            (self.verts_z - 1) / CHUNK_CELLS,
+        )
+    }
+
     /// The vertex heights, row-major [z][x] (`grid_verts` wide and deep):
     /// what the selection rings sample on the GPU.
     pub fn heights(&self) -> &[f32] {
@@ -113,12 +141,13 @@ impl Terrain {
     }
 
     pub fn max(&self) -> Vec2 {
-        self.origin + Vec2::new((VERTS_X - 1) as f32 * CELL, (VERTS_Z - 1) as f32 * CELL)
+        self.origin
+            + Vec2::new((self.verts_x - 1) as f32 * CELL, (self.verts_z - 1) as f32 * CELL)
     }
 
     #[inline]
     fn h(&self, x: usize, z: usize) -> f32 {
-        self.heights[z * VERTS_X + x]
+        self.heights[z * self.verts_x + x]
     }
 
     /// Bilinear height sample, clamped to the field. The bridge deck
@@ -129,8 +158,8 @@ impl Terrain {
             return river_water_level(z) + BRIDGE_DECK_LIFT;
         }
         let g = (Vec2::new(x, z) - self.origin) / CELL;
-        let gx = g.x.clamp(0.0, (VERTS_X - 2) as f32);
-        let gz = g.y.clamp(0.0, (VERTS_Z - 2) as f32);
+        let gx = g.x.clamp(0.0, (self.verts_x - 2) as f32);
+        let gz = g.y.clamp(0.0, (self.verts_z - 2) as f32);
         let x0 = gx as usize;
         let z0 = gz as usize;
         let fx = gx - x0 as f32;
@@ -165,9 +194,9 @@ impl Terrain {
             return false;
         }
         let g = (Vec2::new(x, z) - self.origin) / CELL;
-        let gx = (g.x.round() as usize).min(VERTS_X - 1);
-        let gz = (g.y.round() as usize).min(VERTS_Z - 1);
-        self.blocked[gz * VERTS_X + gx]
+        let gx = (g.x.round() as usize).min(self.verts_x - 1);
+        let gz = (g.y.round() as usize).min(self.verts_z - 1);
+        self.blocked[gz * self.verts_x + gx]
     }
 
     /// Wading slow multiplier: WADE_SLOW inside the channel, 1.0 on
@@ -193,8 +222,8 @@ impl Terrain {
         let gmax = ((center + rim_r - self.origin) / CELL).ceil();
         let x0 = (gmin.x.max(0.0)) as usize;
         let z0 = (gmin.y.max(0.0)) as usize;
-        let x1 = (gmax.x as usize).min(VERTS_X - 1);
-        let z1 = (gmax.y as usize).min(VERTS_Z - 1);
+        let x1 = (gmax.x as usize).min(self.verts_x - 1);
+        let z1 = (gmax.y as usize).min(self.verts_z - 1);
         for z in z0..=z1 {
             for x in x0..=x1 {
                 let p = self.origin + Vec2::new(x as f32, z as f32) * CELL;
@@ -208,7 +237,7 @@ impl Terrain {
                 } else {
                     continue;
                 };
-                self.heights[z * VERTS_X + x] += dh;
+                self.heights[z * self.verts_x + x] += dh;
             }
         }
         // Refresh the blocked mask over the touched area (one vertex of
@@ -217,23 +246,25 @@ impl Terrain {
         if !self.classic {
             let bx0 = x0.saturating_sub(1);
             let bz0 = z0.saturating_sub(1);
-            let bx1 = (x1 + 1).min(VERTS_X - 1);
-            let bz1 = (z1 + 1).min(VERTS_Z - 1);
+            let bx1 = (x1 + 1).min(self.verts_x - 1);
+            let bz1 = (z1 + 1).min(self.verts_z - 1);
             for z in bz0..=bz1 {
                 for x in bx0..=bx1 {
-                    self.blocked[z * VERTS_X + x] = vertex_blocked(&self.heights, x, z);
+                    self.blocked[z * self.verts_x + x] =
+                        vertex_blocked(&self.heights, self.grid_verts(), x, z);
                 }
             }
         }
         // Normals read one neighbor beyond each vertex. Include both copies
         // of boundary vertices whose stencil touches the deformed region.
+        let (chunks_x, chunks_z) = self.chunk_counts();
         let cx0 = x0.saturating_sub(2) / CHUNK_CELLS;
         let cz0 = z0.saturating_sub(2) / CHUNK_CELLS;
-        let cx1 = ((x1 + 1) / CHUNK_CELLS).min(CHUNKS_X - 1);
-        let cz1 = ((z1 + 1) / CHUNK_CELLS).min(CHUNKS_Z - 1);
+        let cx1 = ((x1 + 1) / CHUNK_CELLS).min(chunks_x - 1);
+        let cz1 = ((z1 + 1) / CHUNK_CELLS).min(chunks_z - 1);
         for cz in cz0..=cz1 {
             for cx in cx0..=cx1 {
-                self.dirty[cz * CHUNKS_X + cx] = true;
+                self.dirty[cz * chunks_x + cx] = true;
             }
         }
     }
@@ -243,7 +274,14 @@ impl Terrain {
         let mut t = 0.0f32;
         let mut prev_t = 0.0f32;
         let dir = ray.direction.as_vec3();
-        for _ in 0..1500 {
+        // The overview can see across the large field from beyond its edge.
+        // Keep the same step and bisection accuracy at that longer distance.
+        let steps = if self.kind == MapKind::BigGrassland {
+            4000
+        } else {
+            1500
+        };
+        for _ in 0..steps {
             let p = ray.origin + dir * t;
             if p.y < self.height_at(p.x, p.z) {
                 // Bisect between prev_t and t.
@@ -261,9 +299,6 @@ impl Terrain {
             }
             prev_t = t;
             t += 1.5;
-            if t > 2500.0 {
-                break;
-            }
         }
         None
     }
@@ -272,20 +307,20 @@ impl Terrain {
 /// Mask rule per vertex: a face steeper than SLOPE_BLOCK against any
 /// 4-neighbor (terrace risers, gorge walls, crater lips). The river
 /// itself is wadeable and never blocks.
-fn vertex_blocked(heights: &[f32], x: usize, z: usize) -> bool {
-    let h = heights[z * VERTS_X + x];
+fn vertex_blocked(heights: &[f32], (verts_x, verts_z): (usize, usize), x: usize, z: usize) -> bool {
+    let h = heights[z * verts_x + x];
     let mut max_d = 0.0f32;
     if x > 0 {
-        max_d = max_d.max((h - heights[z * VERTS_X + x - 1]).abs());
+        max_d = max_d.max((h - heights[z * verts_x + x - 1]).abs());
     }
-    if x + 1 < VERTS_X {
-        max_d = max_d.max((h - heights[z * VERTS_X + x + 1]).abs());
+    if x + 1 < verts_x {
+        max_d = max_d.max((h - heights[z * verts_x + x + 1]).abs());
     }
     if z > 0 {
-        max_d = max_d.max((h - heights[(z - 1) * VERTS_X + x]).abs());
+        max_d = max_d.max((h - heights[(z - 1) * verts_x + x]).abs());
     }
-    if z + 1 < VERTS_Z {
-        max_d = max_d.max((h - heights[(z + 1) * VERTS_X + x]).abs());
+    if z + 1 < verts_z {
+        max_d = max_d.max((h - heights[(z + 1) * verts_x + x]).abs());
     }
     max_d / CELL >= SLOPE_BLOCK
 }
@@ -508,6 +543,22 @@ fn classic_height(p: Vec2) -> f32 {
         + detail
 }
 
+/// Gentle rolls through the open 1700 m square, with hills outside it.
+/// Cosines along z give both deployment sides the same central relief.
+fn big_grassland_height(p: Vec2) -> f32 {
+    let rolls = 1.5 * (p.x / 340.0).cos() * (p.y / 420.0).cos()
+        + 0.7 * (p.x / 210.0).sin() * (p.y / 300.0).cos();
+    let west = 23.0 * smoothstep(850.0, 950.0, -p.x)
+        * (-((p.x + 950.0) / 145.0).powi(2) - ((p.y + 350.0) / 460.0).powi(2)).exp();
+    let east = 14.0 * smoothstep(850.0, 970.0, p.x)
+        * (-((p.x - 970.0) / 165.0).powi(2) - ((p.y - 200.0) / 520.0).powi(2)).exp();
+    let north = 6.0 * smoothstep(850.0, 1000.0, -p.y)
+        * (-((p.x + 350.0) / 650.0).powi(2)).exp();
+    let south = 4.0 * smoothstep(850.0, 1000.0, p.y)
+        * (-((p.x - 300.0) / 700.0).powi(2)).exp();
+    5.0 + rolls + west + east + north + south
+}
+
 fn generate_terrain(mut commands: Commands) {
     commands.insert_resource(build_terrain(MapKind::from_env()));
 }
@@ -516,17 +567,23 @@ fn generate_terrain(mut commands: Commands) {
 /// own analytic landforms; classic and river share the noise formula,
 /// and river alone carves the channel, terraces and impassable walls.
 pub(crate) fn build_terrain(kind: MapKind) -> Terrain {
+    let (verts_x, verts_z) = kind.grid_verts();
+    let (chunks_x, chunks_z) = kind.chunk_counts();
     let classic = kind != MapKind::River;
     let origin = Vec2::new(
-        -(VERTS_X as f32 - 1.0) * CELL * 0.5,
-        -(VERTS_Z as f32 - 1.0) * CELL * 0.5,
+        -(verts_x as f32 - 1.0) * CELL * 0.5,
+        -(verts_z as f32 - 1.0) * CELL * 0.5,
     );
-    let mut heights = vec![0.0f32; VERTS_X * VERTS_Z];
-    for z in 0..VERTS_Z {
-        for x in 0..VERTS_X {
+    let mut heights = vec![0.0f32; verts_x * verts_z];
+    for z in 0..verts_z {
+        for x in 0..verts_x {
             let p = origin + Vec2::new(x as f32, z as f32) * CELL;
+            if kind == MapKind::BigGrassland {
+                heights[z * verts_x + x] = big_grassland_height(p);
+                continue;
+            }
             if matches!(kind, MapKind::Grassland | MapKind::Sandbox) {
-                heights[z * VERTS_X + x] = classic_height(p);
+                heights[z * verts_x + x] = classic_height(p);
                 continue;
             }
             // Experimental river base: rolling landforms and ridged peaks.
@@ -571,25 +628,34 @@ pub(crate) fn build_terrain(kind: MapKind) -> Terrain {
                     h = prof + (h - prof) * s;
                 }
             }
-            heights[z * VERTS_X + x] = h;
+            heights[z * verts_x + x] = h;
         }
     }
-    let mut blocked = vec![false; VERTS_X * VERTS_Z];
+    let mut blocked = vec![false; verts_x * verts_z];
     if !classic {
-        for z in 0..VERTS_Z {
-            for x in 0..VERTS_X {
-                blocked[z * VERTS_X + x] = vertex_blocked(&heights, x, z);
+        for z in 0..verts_z {
+            for x in 0..verts_x {
+                blocked[z * verts_x + x] = vertex_blocked(&heights, (verts_x, verts_z), x, z);
             }
         }
     }
-    info!("terrain: {} map", kind.label());
+    info!(
+        "terrain: {} map, {:.0} x {:.0} m, {verts_x} x {verts_z} vertices, {} chunks, {} triangles",
+        kind.label(),
+        (verts_x - 1) as f32 * CELL,
+        (verts_z - 1) as f32 * CELL,
+        chunks_x * chunks_z,
+        (verts_x - 1) * (verts_z - 1) * 2,
+    );
     Terrain {
         heights,
+        verts_x,
+        verts_z,
         blocked,
         kind,
         classic,
         origin,
-        dirty: vec![false; CHUNKS_X * CHUNKS_Z],
+        dirty: vec![false; chunks_x * chunks_z],
     }
 }
 
@@ -628,7 +694,10 @@ fn ground_base() -> StandardMaterial {
 fn ground_layers(assets: &AssetServer, images: &mut Assets<Image>, terrain: &Terrain) -> GroundLayers {
     // Only the grassland has a painted layout; the other maps derive
     // their coverage from their own relief and put stone on steep faces.
-    let authored = matches!(terrain.kind, MapKind::Grassland | MapKind::Sandbox);
+    let authored = matches!(
+        terrain.kind,
+        MapKind::Grassland | MapKind::BigGrassland | MapKind::Sandbox
+    );
     GroundLayers {
         pasture: ground_texture(
             assets,
@@ -666,24 +735,23 @@ fn ground_layers(assets: &AssetServer, images: &mut Assets<Image>, terrain: &Ter
             Vec4::new(
                 terrain.origin.x,
                 terrain.origin.y,
-                (VERTS_X - 1) as f32 * CELL,
-                (VERTS_Z - 1) as f32 * CELL,
+                (terrain.verts_x - 1) as f32 * CELL,
+                (terrain.verts_z - 1) as f32 * CELL,
             )
         } else {
             Vec4::new(
                 terrain.origin.x - CELL * 0.5,
                 terrain.origin.y - CELL * 0.5,
-                VERTS_X as f32 * CELL,
-                VERTS_Z as f32 * CELL,
+                terrain.verts_x as f32 * CELL,
+                terrain.verts_z as f32 * CELL,
             )
         },
         natural_ground: u32::from(authored),
     }
 }
 
-/// The menu changed the map: regenerate the heightfield in place, give
-/// every chunk a material with the new map's layers and mark every
-/// chunk, so `remesh_dirty` rebuilds the whole field later in this frame.
+/// Replace the field and its chunk entities together so switching map sizes
+/// leaves neither missing ground nor chunks from the previous field.
 #[allow(clippy::too_many_arguments)]
 fn rebuild_map(
     mut changes: MessageReader<MapChanged>,
@@ -692,6 +760,7 @@ fn rebuild_map(
     mut materials: ResMut<Assets<GroundMaterial>>,
     assets: Res<AssetServer>,
     mut images: ResMut<Assets<Image>>,
+    mut meshes: ResMut<Assets<Mesh>>,
     mut commands: Commands,
     chunk_entities: Query<Entity, With<GroundChunk>>,
 ) {
@@ -703,27 +772,17 @@ fn rebuild_map(
     }
     let t0 = Instant::now();
     *terrain = build_terrain(kind);
-    terrain.dirty.fill(true);
     chunks.original_heights.clone_from(&terrain.heights);
-    // A fresh material on every chunk: a component change, which the
-    // renderer tracks, where editing the asset in place did not reach them.
     let material = materials.add(GroundMaterial {
         base: ground_base(),
         extension: ground_layers(&assets, &mut images, &terrain),
     });
     for e in &chunk_entities {
-        let mut entity = commands.entity(e);
-        if kind == MapKind::Classic {
-            entity.remove::<MeshMaterial3d<GroundMaterial>>();
-            if let Some(band) = &chunks.band_material {
-                entity.insert(MeshMaterial3d(band.clone()));
-            }
-        } else {
-            entity.remove::<MeshMaterial3d<StandardMaterial>>();
-            entity.insert(MeshMaterial3d(material.clone()));
-        }
+        commands.entity(e).despawn();
     }
+    chunks.meshes.clear();
     chunks.material = Some(material);
+    spawn_chunk_meshes(&mut commands, &terrain, &mut meshes, &mut chunks);
     debug!(
         "map rebuilt as {} in {:.2} ms",
         kind.label(),
@@ -746,14 +805,14 @@ fn spawn_chunks(
         base: ground_base(),
         extension: ground_layers(&assets, &mut images, &terrain),
     });
-    chunks.material = Some(material.clone());
+    chunks.material = Some(material);
     let band_material = standard.add(StandardMaterial {
         base_color: Color::WHITE,
         perceptual_roughness: 1.0,
         reflectance: 0.05,
         ..default()
     });
-    chunks.band_material = Some(band_material.clone());
+    chunks.band_material = Some(band_material);
     // Otherwise a switch in the menu drops the ground for the frames the
     // new map's textures take to load.
     chunks.warm = GROUND_TEXTURES
@@ -762,17 +821,31 @@ fn spawn_chunks(
         .map(|path| ground_texture(&assets, path))
         .collect();
     chunks.original_heights.clone_from(&terrain.heights);
-    for cz in 0..CHUNKS_Z {
-        for cx in 0..CHUNKS_X {
-            let mesh = build_chunk_mesh(&terrain, &chunks.original_heights, cx, cz);
+    spawn_chunk_meshes(&mut commands, &terrain, &mut meshes, &mut chunks);
+}
+
+fn spawn_chunk_meshes(
+    commands: &mut Commands,
+    terrain: &Terrain,
+    meshes: &mut Assets<Mesh>,
+    chunks: &mut TerrainChunks,
+) {
+    let (chunks_x, chunks_z) = terrain.chunk_counts();
+    for cz in 0..chunks_z {
+        for cx in 0..chunks_x {
+            let mesh = build_chunk_mesh(terrain, &chunks.original_heights, cx, cz);
             let aabb = mesh.compute_aabb();
             let handle = meshes.add(mesh);
             chunks.meshes.push(handle.clone());
             let mut e = commands.spawn((Mesh3d(handle), GroundChunk));
             if terrain.kind == MapKind::Classic {
-                e.insert(MeshMaterial3d(band_material.clone()));
+                e.insert(MeshMaterial3d(
+                    chunks.band_material.as_ref().expect("band material").clone(),
+                ));
             } else {
-                e.insert(MeshMaterial3d(material.clone()));
+                e.insert(MeshMaterial3d(
+                    chunks.material.as_ref().expect("ground material").clone(),
+                ));
             }
             if let Some(aabb) = aabb {
                 e.insert(aabb);
@@ -784,9 +857,9 @@ fn spawn_chunks(
 /// Central differences use the global grid, including across chunk boundaries.
 fn ground_normal(terrain: &Terrain, x: usize, z: usize) -> Vec3 {
     let xm = x.saturating_sub(1);
-    let xp = (x + 1).min(VERTS_X - 1);
+    let xp = (x + 1).min(terrain.verts_x - 1);
     let zm = z.saturating_sub(1);
-    let zp = (z + 1).min(VERTS_Z - 1);
+    let zp = (z + 1).min(terrain.verts_z - 1);
     let dx = (terrain.h(xp, z) - terrain.h(xm, z)) / ((xp - xm) as f32 * CELL);
     let dz = (terrain.h(x, zp) - terrain.h(x, zm)) / ((zp - zm) as f32 * CELL);
     Vec3::new(-dx, 1.0, -dz).normalize()
@@ -817,9 +890,9 @@ fn cover_noise(p: Vec2) -> f32 {
 /// One clamped field spans the battlefield. Warped coordinates break lattice
 /// alignment; relative relief keeps hollows greener than nearby shoulders.
 fn ground_coverage(terrain: &Terrain) -> Image {
-    let mut pixels = Vec::with_capacity(VERTS_X * VERTS_Z * 4);
-    for z in 0..VERTS_Z {
-        for x in 0..VERTS_X {
+    let mut pixels = Vec::with_capacity(terrain.verts_x * terrain.verts_z * 4);
+    for z in 0..terrain.verts_z {
+        for x in 0..terrain.verts_x {
             let p = terrain.origin + Vec2::new(x as f32, z as f32) * CELL;
             let warp = Vec2::new(
                 cover_noise(p / 170.0 + Vec2::new(17.2, 81.7)),
@@ -830,9 +903,9 @@ fn ground_coverage(terrain: &Terrain) -> Image {
             let patches = cover_noise(q / 31.0 + Vec2::splat(37.8));
             let flecks = cover_noise(q / 7.0 + Vec2::splat(91.1));
             let neighbors = terrain.h(x.saturating_sub(48), z)
-                + terrain.h((x + 48).min(VERTS_X - 1), z)
+                + terrain.h((x + 48).min(terrain.verts_x - 1), z)
                 + terrain.h(x, z.saturating_sub(48))
-                + terrain.h(x, (z + 48).min(VERTS_Z - 1));
+                + terrain.h(x, (z + 48).min(terrain.verts_z - 1));
             let relief = terrain.h(x, z) - neighbors * 0.25;
             let dry = (0.52 + broad * 0.28 + patches * 0.08 + relief * 0.07).clamp(0.0, 1.0);
             let soil = smoothstep(0.52, 0.82, dry + patches * 0.16) * 0.5;
@@ -844,8 +917,8 @@ fn ground_coverage(terrain: &Terrain) -> Image {
     }
     let mut image = Image::new(
         Extent3d {
-            width: VERTS_X as u32,
-            height: VERTS_Z as u32,
+            width: terrain.verts_x as u32,
+            height: terrain.verts_z as u32,
             depth_or_array_layers: 1,
         },
         TextureDimension::D2,
@@ -862,7 +935,7 @@ fn ground_weights(terrain: &Terrain, original: &[f32], x: usize, z: usize, n: Ve
     let p = terrain.origin + Vec2::new(x as f32, z as f32) * CELL;
     let h = terrain.h(x, z);
     let slope = n.xz().length() / n.y.max(0.001);
-    let disturbed = smoothstep(0.03, 0.65, (h - original[z * VERTS_X + x]).abs());
+    let disturbed = smoothstep(0.03, 0.65, (h - original[z * terrain.verts_x + x]).abs());
     let mut soil = disturbed;
     let stone = smoothstep(0.45, 0.95, slope) * (1.0 - disturbed * 0.8);
     let mut damp = 0.0;
@@ -1019,9 +1092,10 @@ fn remesh_dirty(
     }
     let t0 = Instant::now();
     let mut rebuilt = 0;
-    for cz in 0..CHUNKS_Z {
-        for cx in 0..CHUNKS_X {
-            let ci = cz * CHUNKS_X + cx;
+    let (chunks_x, chunks_z) = terrain.chunk_counts();
+    for cz in 0..chunks_z {
+        for cx in 0..chunks_x {
+            let ci = cz * chunks_x + cx;
             if !terrain.dirty[ci] {
                 continue;
             }
@@ -1109,6 +1183,11 @@ mod tests {
     use super::*;
     use bevy::mesh::VertexAttributeValues;
 
+    const CHUNKS_X: usize = 16;
+    const CHUNKS_Z: usize = 12;
+    const VERTS_X: usize = CHUNKS_X * CHUNK_CELLS + 1;
+    const VERTS_Z: usize = CHUNKS_Z * CHUNK_CELLS + 1;
+
     #[test]
     fn classic_landforms_keep_gentle_slopes_without_sharp_cell_ridges() {
         let mut min_height = f32::INFINITY;
@@ -1154,6 +1233,8 @@ mod tests {
         }
         Terrain {
             heights,
+            verts_x: VERTS_X,
+            verts_z: VERTS_Z,
             blocked: vec![false; VERTS_X * VERTS_Z],
             kind: MapKind::Grassland,
             classic: true,
@@ -1229,5 +1310,159 @@ mod tests {
             before.height_at(66.0, 66.0) - 2.0
         );
         assert!(terrain.blocked.iter().all(|blocked| !blocked));
+    }
+
+    #[test]
+    fn map_sizes_keep_the_existing_fields_and_add_the_large_square() {
+        for kind in MapKind::ALL {
+            let terrain = build_terrain(kind);
+            let (size, vertices, chunks) = if kind == MapKind::BigGrassland {
+                (Vec2::splat(2048.0), (1025, 1025), 1024)
+            } else {
+                (Vec2::new(1024.0, 768.0), (513, 385), 192)
+            };
+            assert_eq!(terrain.max() - terrain.min(), size);
+            assert_eq!(terrain.min(), -kind.half_extents());
+            assert_eq!(terrain.grid_verts(), vertices);
+            assert_eq!(terrain.heights.len(), vertices.0 * vertices.1);
+            assert_eq!(terrain.blocked.len(), terrain.heights.len());
+            assert_eq!(terrain.dirty.len(), chunks);
+            for (x, z) in [
+                (1, 1),
+                (vertices.0 - 2, 1),
+                (1, vertices.1 - 2),
+                (vertices.0 - 2, vertices.1 - 2),
+            ] {
+                let p = terrain.origin + Vec2::new(x as f32, z as f32) * CELL;
+                assert_eq!(terrain.height_at(p.x, p.y), terrain.h(x, z));
+                assert_eq!(
+                    terrain.blocked_at(p.x, p.y),
+                    terrain.blocked[z * vertices.0 + x]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn big_grassland_keeps_the_open_ground_gentle_and_pickable_from_the_overview() {
+        let terrain = build_terrain(MapKind::BigGrassland);
+        let mut low = f32::INFINITY;
+        let mut high = f32::NEG_INFINITY;
+        let mut slope = 0.0_f32;
+        for z in (-850..=850).step_by(2) {
+            for x in (-850..=850).step_by(2) {
+                let (x, z) = (x as f32, z as f32);
+                let h = terrain.height_at(x, z);
+                low = low.min(h);
+                high = high.max(h);
+                slope = slope.max(terrain.slope_at(x, z));
+                assert!(!terrain.blocked_at(x, z));
+            }
+        }
+        println!("Big Grassland open ground: {low:.3}..{high:.3} m, maximum grade {slope:.5}");
+        assert!((3.0..=6.0).contains(&(high - low)));
+        assert!(slope < 0.03);
+        for target in [
+            Vec2::ZERO,
+            Vec2::new(-950.0, -350.0),
+            Vec2::new(1000.0, 1000.0),
+        ] {
+            let ground = Vec3::new(target.x, terrain.height_at(target.x, target.y), target.y);
+            for pitch in [0.25_f32, 1.45] {
+                let offset = Vec3::new(0.0, pitch.sin(), pitch.cos()) * 2800.0;
+                let ray = Ray3d::new(ground + offset, Dir3::new(-offset).unwrap());
+                let hit = terrain.raycast(ray).expect("overview must reach the field");
+                assert!(hit.distance(ground) < 0.01, "{hit:?} instead of {ground:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn large_field_craters_update_the_far_chunks_and_their_seams() {
+        let mut terrain = build_terrain(MapKind::BigGrassland);
+        let original = terrain.heights.clone();
+        let center = Vec2::splat(898.0);
+        let old_height = terrain.height_at(center.x, center.y);
+        terrain.carve_crater(center, 5.0, 2.0);
+        assert_eq!(terrain.height_at(center.x, center.y), old_height - 2.0);
+        assert_eq!(terrain.dirty.iter().filter(|&&dirty| dirty).count(), 4);
+        for z in 29..=30 {
+            for x in 29..=30 {
+                assert!(terrain.dirty[z * 32 + x]);
+            }
+        }
+        let left = build_chunk_mesh(&terrain, &original, 29, 30);
+        let right = build_chunk_mesh(&terrain, &original, 30, 30);
+        for attribute in [Mesh::ATTRIBUTE_POSITION, Mesh::ATTRIBUTE_NORMAL] {
+            let a = vec3_attribute(&left, attribute);
+            let b = vec3_attribute(&right, attribute);
+            for z in 0..33 {
+                assert_eq!(a[z * 33 + 32], b[z * 33]);
+            }
+        }
+    }
+
+    #[test]
+    fn switching_map_sizes_replaces_every_chunk_and_keeps_craters_working() {
+        use bevy::asset::{AssetApp, AssetPlugin};
+
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, AssetPlugin::default()))
+            .init_asset::<Mesh>()
+            .init_asset::<Image>()
+            .init_asset::<GroundMaterial>()
+            .init_asset::<StandardMaterial>()
+            .init_resource::<TerrainChunks>()
+            .insert_resource(build_terrain(MapKind::Grassland))
+            .add_message::<MapChanged>()
+            .add_systems(Startup, spawn_chunks)
+            .add_systems(Update, (rebuild_map, remesh_dirty).chain());
+        app.update();
+        for kind in [
+            MapKind::BigGrassland,
+            MapKind::Classic,
+            MapKind::BigGrassland,
+            MapKind::River,
+            MapKind::Sandbox,
+            MapKind::Grassland,
+        ] {
+            app.world_mut().write_message(MapChanged(kind));
+            app.update();
+            let count = if kind == MapKind::BigGrassland {
+                1024
+            } else {
+                192
+            };
+            let world = app.world_mut();
+            assert_eq!(
+                world
+                    .query_filtered::<Entity, With<GroundChunk>>()
+                    .iter(world)
+                    .count(),
+                count
+            );
+            let chunks = world.resource::<TerrainChunks>();
+            let terrain = world.resource::<Terrain>();
+            assert_eq!(chunks.meshes.len(), count);
+            assert_eq!(chunks.original_heights, terrain.heights);
+            let last = world
+                .resource::<Assets<Mesh>>()
+                .get(chunks.meshes.last().unwrap())
+                .unwrap();
+            let positions = vec3_attribute(last, Mesh::ATTRIBUTE_POSITION);
+            let max = terrain.max();
+            assert!(positions.iter().any(|p| p[0] == max.x && p[2] == max.y));
+            world
+                .resource_mut::<Terrain>()
+                .carve_crater(Vec2::ZERO, 5.0, 2.0);
+            app.update();
+            assert!(
+                app.world()
+                    .resource::<Terrain>()
+                    .dirty
+                    .iter()
+                    .all(|&dirty| !dirty)
+            );
+        }
     }
 }

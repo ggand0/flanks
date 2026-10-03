@@ -299,7 +299,7 @@ fn demo_setup() -> BattleSetup {
     /// Line 3's units.
     const LINE3: usize = 34;
 
-    let half = crate::terrain::HALF_EXTENTS;
+    let half = MapKind::Grassland.half_extents();
     let x_max = half.x - OPEN_SIDE_MARGIN;
     let front = -army_gap() * 0.5 - 1.0;
     // Depth of a unit's block, front rank to back rank. Units `files * P`
@@ -635,8 +635,8 @@ mod tests {
             .collect();
         assert!(setup.open_sides);
         let mut zone = crate::orders::deploy_zone_for(&build_terrain(MapKind::Grassland), crate::regiments::army_gap());
-        zone.0.x = -crate::terrain::HALF_EXTENTS.x + OPEN_SIDE_MARGIN;
-        zone.1.x = crate::terrain::HALF_EXTENTS.x - OPEN_SIDE_MARGIN;
+        zone.0.x = -MapKind::Grassland.half_extents().x + OPEN_SIDE_MARGIN;
+        zone.1.x = MapKind::Grassland.half_extents().x - OPEN_SIDE_MARGIN;
         // Only the Knight line in front of the centre may stand out past the
         // zone's front edge, and only a little.
         let mut past_front = 0;

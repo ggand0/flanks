@@ -27,6 +27,21 @@ pub fn army_gap() -> f32 {
     crate::util::env_or("FL_ARMY_GAP", 60.0)
 }
 
+/// The corners of the field the army layout fills: the terrain's bounds,
+/// or with FL_ARMY_FIELD=WxD (metres) a field of that size centred on the
+/// map and clipped to it. FL_ARMY_FIELD=1024x768 packs a big map's armies
+/// as on Grassland, for benchmarks.
+fn army_field(terrain: &Terrain) -> (Vec2, Vec2) {
+    let size = std::env::var("FL_ARMY_FIELD").ok().and_then(|v| {
+        let (w, d) = v.split_once('x')?;
+        Some(Vec2::new(w.trim().parse().ok()?, d.trim().parse().ok()?))
+    });
+    match size {
+        Some(size) => (terrain.min().max(-size / 2.0), terrain.max().min(size / 2.0)),
+        None => (terrain.min(), terrain.max()),
+    }
+}
+
 pub struct RegimentsPlugin;
 
 impl Plugin for RegimentsPlugin {
@@ -227,13 +242,14 @@ pub fn do_spawn_battle(
     let block_w = cols as f32 * SPACING;
     let block_d = rows as f32 * SPACING;
 
-    // Regiments per rank: prefer filling the map width, but never spawn
-    // ranks past the terrain edge (the sim clamps positions to the bounds
+    // Regiments per rank: prefer filling the field's width, but never spawn
+    // ranks past its edge (at the terrain's edge the sim clamps positions
     // and stacked rows would squash onto the boundary line). If the army
     // needs more ranks than fit, widen the ranks and shrink the x pitch.
-    let usable_w = (terrain.max().x - terrain.min().x) - 2.0 * SIDE_MARGIN;
+    let (field_min, field_max) = army_field(terrain);
+    let usable_w = (field_max.x - field_min.x) - 2.0 * SIDE_MARGIN;
     let army_gap = army_gap();
-    let usable_d = terrain.max().y - EDGE_MARGIN - army_gap / 2.0;
+    let usable_d = field_max.y - EDGE_MARGIN - army_gap / 2.0;
     let max_ranks = (((usable_d - block_d) / (block_d + REG_GAP)).floor() as usize + 1).max(1);
     let per_rank = ((usable_w / (block_w + REG_GAP)).floor() as usize)
         .max(n_regs.div_ceil(max_ranks))
