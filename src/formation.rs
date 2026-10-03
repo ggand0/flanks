@@ -89,7 +89,7 @@ pub enum FormSpacing {
 
 impl FormSpacing {
     /// (lateral, depth) slot pitch of a kind in meters. Wall matches the
-    /// tightened separation rest distance (sim/soldier.rs WALL_SEP_RADIUS) —
+    /// tightened separation rest distance (sim/soldier.rs WALL_SEP_RADIUS):
     /// slots the physics refuses to hold are lies.
     pub fn pitch(self, kind: u8) -> Vec2 {
         match self {
