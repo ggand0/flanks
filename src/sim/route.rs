@@ -230,7 +230,7 @@ pub fn update_routes(
     mut routes: ResMut<Routes>,
     mut groups: ResMut<Groups>,
     terrain: Res<Terrain>,
-    units: Res<crate::units::Units>,
+    mut units: ResMut<crate::units::Units>,
     pipeline: Res<crate::sim::TickPipeline>,
 ) {
     if !enabled() {
@@ -291,9 +291,11 @@ pub fn update_routes(
                     _ => None,
                 };
                 // Coming round obstacles has mixed up the ranks: the men
-                // take the nearest places in them.
-                if kept.is_some() {
-                    groups.list[g].reform = true;
+                // take the nearest places in them. Done here, between the
+                // install and the next job, so the next job reads the new
+                // slots whether the tick is pipelined or inline.
+                if kept.is_some() && groups.list[g].count > 0 && !groups.list[g].state.is_broken() {
+                    crate::formation::assign_slots(&mut units, g as u32, &mut groups.list[g]);
                 }
                 routes.per[g].state = kept.map_or(State::None, State::Ready);
                 continue;

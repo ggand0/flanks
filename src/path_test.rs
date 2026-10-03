@@ -58,6 +58,8 @@ struct Subject {
     done_s: Option<f32>,
     peak_stuck: usize,
     reported: bool,
+    /// Where its centre stood at the verdict, to see that it then stays.
+    settled_at: Option<Vec2>,
 }
 
 #[derive(Resource, Default)]
@@ -87,6 +89,9 @@ impl Plugin for PathTestPlugin {
         }
         app.init_resource::<PathTest>()
             .init_resource::<FrameWatch>()
+            // The orders go out between the install and the next job,
+            // where the pipelined tick's kick and the inline tick's next
+            // prep both read them.
             .add_systems(
                 FixedUpdate,
                 (give_orders, log_progress)
@@ -162,6 +167,7 @@ fn river_starts() -> (Vec2, Vec2) {
 fn give_orders(
     pipeline: Res<crate::sim::TickPipeline>,
     mut groups: ResMut<Groups>,
+    mut units: ResMut<Units>,
     mut test: ResMut<PathTest>,
 ) {
     if test.ordered || pipeline.tick < ORDER_TICK || groups.list.is_empty() {
@@ -195,6 +201,12 @@ fn give_orders(
     }
     for &(g, case, goal) in &orders {
         crate::orders::order_regiments(&mut groups, &[g], goal);
+        // The new facing's slots, written now rather than at the next
+        // tick's reform pass, so both kinds of tick read them in the same
+        // job.
+        if groups.list[g].reform {
+            crate::formation::assign_slots(&mut units, g as u32, &mut groups.list[g]);
+        }
         let start = groups.list[g].centroid;
         test.subjects.push(Subject {
             g,
@@ -206,6 +218,7 @@ fn give_orders(
             done_s: None,
             peak_stuck: 0,
             reported: false,
+            settled_at: None,
         });
     }
     info!("[path-test] tick {}: {} regiments ordered", pipeline.tick, orders.len());
@@ -341,9 +354,25 @@ fn log_progress(
                 .collect();
             info!("[path-test] {} reg {} t={secs:.0}s: men out: {}", s.case, s.g, list.join(", "));
         }
+        // After the verdict, every ten seconds: how far the centre has moved
+        // since (a regiment that arrived stays where it stopped).
+        if let Some(at) = s.settled_at
+            && tick.is_multiple_of(300)
+        {
+            info!(
+                "[path-test] {} reg {} t={secs:.0}s: holding at ({:.0}, {:.0}), {:.1} m from where it stood at the verdict, arrived {:.1}%",
+                s.case,
+                s.g,
+                gd.centroid.x,
+                gd.centroid.y,
+                gd.centroid.distance(at),
+                share * 100.0
+            );
+        }
         let timed_out = secs >= TIMEOUT_S.max(3.0 * s.route_len.unwrap_or(0.0) / regiment_pace(&units, s.g).max(0.1));
         if !s.reported && (s.done_s.is_some() || timed_out) {
             s.reported = true;
+            s.settled_at = Some(gd.centroid);
             let pace = regiment_pace(&units, s.g);
             let len = s.route_len.unwrap_or(s.straight);
             let bound = 2.0 * len / pace.max(0.1);
