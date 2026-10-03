@@ -28,6 +28,8 @@ Every soldier on the field is individually simulated, and battles can scale up t
 cargo run --profile opt-dev
 ```
 
+`opt-dev` is recommended for development and playing. `--release` is for published builds. To embed the assets in the binary, add `--features embed_assets`.
+
 Requires Rust 1.95 or newer. The models and ground textures are stored with [Git LFS](https://git-lfs.com/): install it before cloning, or run `git lfs pull` in an existing clone.
 
 ## Controls
