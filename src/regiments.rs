@@ -48,7 +48,7 @@ impl Plugin for RegimentsPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(
             Update,
-            (rout_test_log, dir_test_log, arena_log, charge_test_log, pile_test_log, melee_diag_log, join_test_log, routpass_test_log, archery_log),
+            (rout_test_log, dir_test_log, arena_log, charge_test_log, pile_test_log, melee_diag_log, join_test_log, routpass_test_log, archery_log, room_log),
         );
     }
 }
@@ -1045,6 +1045,157 @@ fn melee_diag_log(
         ));
     }
     info!("[melee-diag] t={t:.0}s regiment {g}:{s}");
+}
+
+/// Regiments alive up to which the room log prints a line for each.
+const ROOM_LINES: usize = 8;
+/// How far the room log looks for a man's nearest comrade and enemy.
+const ROOM_PROBE: f32 = 6.0;
+
+/// FL_LOG_ROOM=1: every 5 s, the room the men of each regiment have.
+/// Per regiment: each man's distance to the nearest living comrade of his
+/// own regiment (10th percentile, median, 90th), the median distance to
+/// the nearest enemy, the share of men with an enemy within 3 m, and the
+/// box the men's centres cover along the regiment's facing with its
+/// ground per man. One line for each regiment while few are alive, and
+/// always a line over all regiments by state: fighting (engaged), moving
+/// (under an order) and standing.
+fn room_log(
+    units: Res<Units>,
+    groups: Res<Groups>,
+    grid: Res<crate::spatial::SpatialGrid>,
+    time: Res<Time>,
+    mut next: Local<f32>,
+) {
+    if std::env::var("FL_LOG_ROOM").is_err() {
+        return;
+    }
+    let t = time.elapsed_secs();
+    if t < *next {
+        return;
+    }
+    *next = t + 5.0;
+    struct Room {
+        comrade: Vec<f32>,
+        enemy: Vec<f32>,
+        near_enemy: u32,
+        men: u32,
+        lo: Vec2,
+        hi: Vec2,
+    }
+    let mut rooms: Vec<Room> = groups
+        .list
+        .iter()
+        .map(|_| Room {
+            comrade: Vec::new(),
+            enemy: Vec::new(),
+            near_enemy: 0,
+            men: 0,
+            lo: Vec2::MAX,
+            hi: Vec2::MIN,
+        })
+        .collect();
+    for i in 0..units.len() {
+        if units.death_t[i] != 0 {
+            continue;
+        }
+        let g = units.group[i] as usize;
+        let gd = &groups.list[g];
+        let p = Vec2::new(units.pos[i].x, units.pos[i].z);
+        let team_bit = (units.team[i] as u32) * crate::spatial::META_TEAM;
+        let (mut comrade, mut enemy) = (f32::MAX, f32::MAX);
+        grid.for_each_candidate(p, ROOM_PROBE, |o| {
+            if o.idx as usize == i || (o.meta & crate::spatial::META_DYING) != 0 {
+                return;
+            }
+            let d2 = p.distance_squared(o.xz());
+            if (o.meta & crate::spatial::META_TEAM) != team_bit {
+                enemy = enemy.min(d2);
+            } else if crate::spatial::meta_group(o.meta) == g {
+                comrade = comrade.min(d2);
+            }
+        });
+        let room = &mut rooms[g];
+        room.men += 1;
+        if comrade < ROOM_PROBE * ROOM_PROBE {
+            room.comrade.push(comrade.sqrt());
+        }
+        if enemy < ROOM_PROBE * ROOM_PROBE {
+            room.enemy.push(enemy.sqrt());
+            room.near_enemy += (enemy < 9.0) as u32;
+        }
+        let fwd = crate::formation::facing_dir(gd.facing);
+        let along = Vec2::new(p.dot(Vec2::new(fwd.y, -fwd.x)), p.dot(fwd));
+        room.lo = room.lo.min(along);
+        room.hi = room.hi.max(along);
+    }
+    // The value at share `q` of a sorted list.
+    let at = |v: &[f32], q: f32| v[((v.len() - 1) as f32 * q).round() as usize];
+    const STATES: [&str; 3] = ["fighting", "moving", "standing"];
+    let mut by_state: [(Vec<f32>, Vec<f32>); 3] = Default::default();
+    let alive = rooms.iter().filter(|r| r.men > 0).count();
+    for (g, room) in rooms.iter_mut().enumerate() {
+        if room.men < 2 || room.comrade.is_empty() {
+            continue;
+        }
+        let gd = &groups.list[g];
+        let state = if gd.engaged {
+            0
+        } else if gd.order.is_some() {
+            1
+        } else {
+            2
+        };
+        room.comrade.sort_unstable_by(f32::total_cmp);
+        room.enemy.sort_unstable_by(f32::total_cmp);
+        let median = at(&room.comrade, 0.5);
+        let size = room.hi - room.lo;
+        let ground = size.x * size.y / room.men as f32;
+        by_state[state].0.push(median);
+        by_state[state].1.push(ground);
+        if alive <= ROOM_LINES {
+            let enemy = if room.enemy.is_empty() {
+                "none in sight".to_string()
+            } else {
+                format!(
+                    "{:.2} m, {}% within 3 m of one",
+                    at(&room.enemy, 0.5),
+                    room.near_enemy * 100 / room.men
+                )
+            };
+            info!(
+                "[room] t={t:.0}s reg {g} {} {} n={}: comrade {:.2}/{:.2}/{:.2} m (p10/median/p90), enemy {enemy}, box {:.1} x {:.1} m, {ground:.2} m2 a man",
+                crate::unit_types::kind_name(gd.kind),
+                STATES[state],
+                room.men,
+                at(&room.comrade, 0.1),
+                median,
+                at(&room.comrade, 0.9),
+                size.x,
+                size.y,
+            );
+        }
+    }
+    let mut line = String::new();
+    for (state, (medians, grounds)) in by_state.iter_mut().enumerate() {
+        if medians.is_empty() {
+            continue;
+        }
+        medians.sort_unstable_by(f32::total_cmp);
+        grounds.sort_unstable_by(f32::total_cmp);
+        line.push_str(&format!(
+            " | {} {}: comrade {:.2} m ({:.2} to {:.2}), {:.2} m2 a man",
+            STATES[state],
+            medians.len(),
+            at(medians, 0.5),
+            medians[0],
+            medians[medians.len() - 1],
+            at(grounds, 0.5),
+        ));
+    }
+    if !line.is_empty() {
+        info!("[room] t={t:.0}s regiments by state, the median of their medians (lowest to highest){line}");
+    }
 }
 
 /// FL_ARENA=1: hand-testing range for directional damage. Two mirrored
