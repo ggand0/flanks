@@ -18,6 +18,7 @@ mod game_files;
 mod game_state;
 mod mixer;
 mod morale;
+mod nav;
 mod obstacle_map;
 mod orders;
 mod overlay;
