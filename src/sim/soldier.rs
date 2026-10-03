@@ -69,13 +69,40 @@ const STEP_FACE_SPEED: f32 = 1.05;
 const ADVANCE_PACE: f32 = 1.06;
 const COMBAT_JOG_PACE: f32 = 2.87;
 const JOG_BEYOND: f32 = 3.0;
-/// Each man stops short of the enemy he goes to at his own distance,
-/// 1.2 m plus up to this much: ranks are men, not a machine.
+/// With the room to fight off, each man stops short of the enemy he goes
+/// to at his own distance, CLOSE_STOP plus up to this much: ranks are
+/// men, not a machine.
 const SEEK_STOP_SPREAD: f32 = 0.4;
 /// A man blocked by a comrade on the way to his enemy sidesteps toward
 /// an open lane in some one-second windows (M2TW's isSideStepping),
 /// and waits in the others.
 const SIDESTEP_WINDOW: u32 = 30;
+/// A man fights at his weapon's length. A blade lands with its far end,
+/// so he stands where that end meets his enemy: he closes to this share
+/// of his reach, and steps back to it from an enemy who has come inside
+/// it when the ground behind him is open.
+const FIGHT_SHARE: f32 = 0.9;
+/// He lets an enemy this far inside his fighting distance before he
+/// steps back, and then steps all the way out to it: a real step, as on
+/// the way back to his mark.
+const BACK_SLACK: f32 = 0.3;
+/// The closing distance of every kind with the room to fight off.
+const CLOSE_STOP: f32 = 1.2;
+/// A cut needs a clear arc: the ground in front of a man that his blade
+/// sweeps, a sector centred on his facing that reaches this far from his
+/// own centre and this wide to either side (its cosine). A comrade whose
+/// centre stands in it blocks the cut. A spear thrust needs only its
+/// lane, SPEAR_LINE_HALF_W to either side of the line to the enemy.
+const ARC_REACH: f32 = 1.2;
+const ARC_HALF_COS: f32 = 0.342;
+
+/// FL_FIGHT_ROOM=0 turns the room to fight off: every kind closes to
+/// CLOSE_STOP, nobody steps back, and a blow needs no clear arc. For A/B
+/// play in one binary.
+fn fight_room() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::util::env_or("FL_FIGHT_ROOM", 1_u32) != 0)
+}
 
 /// Share of those windows in which a blocked man sidesteps
 /// (FL_SIDESTEP, 0 to 1). A play-testing knob.
@@ -115,14 +142,17 @@ const JOIN_SEE_R: f32 = 6.0;
 const LOOK_TICKS: u32 = 8;
 /// `sight` bits: a comrade blocks his way, his left, his right; a
 /// comrade ahead; a comrade between him and his mark; a comrade close
-/// by running to the fight; one further out (far look).
-const SIGHT_WAY: u8 = 1;
-const SIGHT_LEFT: u8 = 1 << 1;
-const SIGHT_RIGHT: u8 = 1 << 2;
-const SIGHT_AHEAD: u8 = 1 << 3;
-const SIGHT_MARK: u8 = 1 << 4;
-const SIGHT_GO: u8 = 1 << 5;
-const SIGHT_GO_FAR: u8 = 1 << 6;
+/// by running to the fight; one further out (far look); a comrade in
+/// the arc of his cut or the lane of his thrust; a man close behind him.
+const SIGHT_WAY: u16 = 1;
+const SIGHT_LEFT: u16 = 1 << 1;
+const SIGHT_RIGHT: u16 = 1 << 2;
+const SIGHT_AHEAD: u16 = 1 << 3;
+const SIGHT_MARK: u16 = 1 << 4;
+const SIGHT_GO: u16 = 1 << 5;
+const SIGHT_GO_FAR: u16 = 1 << 6;
+const SIGHT_ARC: u16 = 1 << 7;
+const SIGHT_BACK: u16 = 1 << 8;
 /// Even with nobody going in sight, a man joins once his regiment has
 /// been in melee longer than his own patience, spread between these
 /// (seconds; FL_JOIN_PATIENCE sets the upper end): the fight's noise and
@@ -246,7 +276,7 @@ pub(crate) struct Soldier<'a> {
     pub death_t: &'a mut u8,
     pub ammo: &'a mut u8,
     pub out_form: &'a mut bool,
-    pub sight: &'a mut u8,
+    pub sight: &'a mut u16,
 }
 
 /// The rows of one chunk of soldiers, in index order.
@@ -263,7 +293,7 @@ pub(crate) struct Rows<'a> {
     pub death_t: &'a mut [u8],
     pub ammo: &'a mut [u8],
     pub out_form: &'a mut [bool],
-    pub sight: &'a mut [u8],
+    pub sight: &'a mut [u16],
 }
 
 /// What a chunk emits beside its rows: landed swings and loosed arrows.
@@ -308,6 +338,8 @@ struct Step {
     right_blocked: bool,
     comrade_ahead: bool,
     slot_blocked: bool,
+    arc_blocked: bool,
+    back_blocked: bool,
     // The swing and the steering.
     face_target: Option<Vec2>,
     corr_len2: f32,
@@ -413,6 +445,8 @@ fn begin(f: &Field, s: &mut Soldier) -> Step {
         right_blocked: false,
         comrade_ahead: false,
         slot_blocked: false,
+        arc_blocked: false,
+        back_blocked: false,
         face_target: None,
         corr_len2: 0.0,
         jam: 0.0,
@@ -653,14 +687,16 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
 /// What he remembers and what he sees of his comrades: the enemy he
 /// remembers if still in sight, the way he is going, and every eighth tick
 /// a look at the men around him (a comrade in his way, to his left or
-/// right, ahead, between him and his mark, or running to the fight),
-/// remembered in the sight bits until the next look.
+/// right, ahead, between him and his mark, or running to the fight; with
+/// an enemy in reach, a comrade in the arc of his cut and a man close
+/// behind him), remembered in the sight bits until the next look.
 #[inline]
 fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
     let Field { grid, pos_prev, team, group, orders, engaged, focus, tick, .. } = *f;
     let i = s.i;
     let p = st.p;
     let gi = st.gi;
+    let my_kind = st.my_kind;
     let dying = st.dying;
     let routed = st.routed;
     let in_melee = st.in_melee;
@@ -704,8 +740,17 @@ fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
     } else {
         Vec2::ZERO
     };
+    // With an enemy in reach his way is to that enemy, and he looks at the
+    // room he has to fight him.
+    let fighter = fight_room() && best_idx != u32::MAX && !dying && !routed;
+    let to_enemy = if fighter { pos_prev[best_idx as usize].xz() - p } else { Vec2::ZERO };
+    let fight_dir = to_enemy.normalize_or_zero();
     // Open lanes to either side of his way.
-    let side_dir = Vec2::new(-memo_dir.y, memo_dir.x);
+    let side_dir = if fighter {
+        Vec2::new(-fight_dir.y, fight_dir.x)
+    } else {
+        Vec2::new(-memo_dir.y, memo_dir.x)
+    };
     // His look at the comrades around him on his way (to his enemy, to the
     // fight, or back to his mark), in his own rhythm: a separate pass over
     // the neighbors of the separation scan, run only by men who are going
@@ -715,7 +760,7 @@ fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
     let watch_go = in_melee && !committed && !memo_valid;
     let slot_on = slot_dir != Vec2::ZERO;
     if (i as u32).wrapping_add(tick).is_multiple_of(LOOK_TICKS) {
-        let mut seen = 0u8;
+        let mut seen = 0u16;
         if look_lanes || watch_go || slot_on {
             let (mut way, mut left, mut right, mut ahead_any, mut mark, mut go) =
                 (false, false, false, false, false, false);
@@ -749,12 +794,48 @@ fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
                 right |= beside & (lateral < -reach);
                 mark |= comrade & slot_on & near & ((-d).dot(slot_dir) > reach);
             });
-            seen = (way as u8 * SIGHT_WAY)
-                | (left as u8 * SIGHT_LEFT)
-                | (right as u8 * SIGHT_RIGHT)
-                | (ahead_any as u8 * SIGHT_AHEAD)
-                | (mark as u8 * SIGHT_MARK)
-                | (go as u8 * SIGHT_GO);
+            seen = (way as u16 * SIGHT_WAY)
+                | (left as u16 * SIGHT_LEFT)
+                | (right as u16 * SIGHT_RIGHT)
+                | (ahead_any as u16 * SIGHT_AHEAD)
+                | (mark as u16 * SIGHT_MARK)
+                | (go as u16 * SIGHT_GO);
+        }
+        if fighter {
+            // The room he has to fight the enemy in reach: a comrade in the
+            // arc his cut sweeps (a sector on his facing) or in the lane of
+            // his thrust (along the line to the enemy), a comrade close to
+            // either side of his way to the enemy, and any man close behind
+            // him.
+            let enemy_d = to_enemy.length();
+            let fwd = Vec2::new(s.yaw.sin(), s.yaw.cos());
+            let thrust = TYPES[my_kind].weapon == crate::unit_types::Weapon::Spear;
+            let (mut arc, mut left, mut right, mut back) = (false, false, false, false);
+            grid.for_each_candidate(p, scan_r, |o| {
+                let other = o.idx as usize != i;
+                let comrade = other & ((o.meta & crate::spatial::META_TEAM) == my_team_bit);
+                let standing = (o.meta & crate::spatial::META_DYING) == 0;
+                let to = o.xz() - p;
+                let d2 = to.length_squared();
+                let len = d2.sqrt();
+                let quarter = 0.707 * len;
+                let near = d2 < SEP_RADIUS * SEP_RADIUS;
+                let along = to.dot(fight_dir);
+                let lateral = to.dot(side_dir);
+                let in_arc = if thrust {
+                    (along > 0.0) & (along < enemy_d) & (lateral.abs() < SPEAR_LINE_HALF_W)
+                } else {
+                    (d2 < ARC_REACH * ARC_REACH) & (to.dot(fwd) > ARC_HALF_COS * len)
+                };
+                arc |= comrade & standing & in_arc;
+                left |= comrade & near & (lateral > quarter);
+                right |= comrade & near & (lateral < -quarter);
+                back |= other & near & (along < -quarter);
+            });
+            seen |= (arc as u16 * SIGHT_ARC)
+                | (left as u16 * SIGHT_LEFT)
+                | (right as u16 * SIGHT_RIGHT)
+                | (back as u16 * SIGHT_BACK);
         }
         *s.sight = (*s.sight & SIGHT_GO_FAR) | seen;
     }
@@ -763,6 +844,8 @@ fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
     let right_blocked = *s.sight & SIGHT_RIGHT != 0;
     let comrade_ahead = *s.sight & SIGHT_AHEAD != 0;
     let slot_blocked = *s.sight & SIGHT_MARK != 0;
+    st.arc_blocked = *s.sight & SIGHT_ARC != 0;
+    st.back_blocked = *s.sight & SIGHT_BACK != 0;
     st.memo_valid = memo_valid;
     st.memo_dir = memo_dir;
     st.side_dir = side_dir;
@@ -1132,7 +1215,10 @@ fn swing(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
                         fwd.dot(to_t) >= 0.0
                     }
                 };
-                if chosen != u32::MAX && !routed && aware {
+                if chosen != u32::MAX && !routed && aware && st.arc_blocked {
+                    // He does not cut or thrust through a comrade: he waits
+                    // for room, and sidesteps to find it (`close_in`).
+                } else if chosen != u32::MAX && !routed && aware {
                     *s.target = chosen;
                     // Arriving at speed = a charging blow: momentum converts
                     // to damage + a bigger lunge (render reads the flag).
@@ -1230,14 +1316,37 @@ fn yield_to_crowd(st: &mut Step) {
     st.desired = desired;
 }
 
-/// Closing the last metre on the enemy in reach, going to the enemy he
+/// A waiting man's sidestep: in some one-second windows he steps toward
+/// whichever side is open, at the shuffle's pace, and in the others he
+/// stands.
+#[inline]
+fn sidestep(i: usize, tick: u32, left_blocked: bool, right_blocked: bool, side_dir: Vec2) -> Vec2 {
+    let window = (tick.wrapping_add((i as u32).wrapping_mul(7)) / SIDESTEP_WINDOW)
+        .wrapping_mul(0x2545_F491);
+    let roll = crate::units::hash01(window ^ (i as u32).wrapping_mul(0x9E37));
+    let chance = sidestep_chance();
+    let side = match (left_blocked, right_blocked) {
+        _ if roll >= chance => Vec2::ZERO,
+        (false, true) => side_dir,
+        (true, false) => -side_dir,
+        (false, false) if roll < 0.5 * chance => side_dir,
+        (false, false) => -side_dir,
+        (true, true) => Vec2::ZERO,
+    };
+    side * STEP_PACE
+}
+
+/// His footwork around the enemy in reach: closing to his weapon's
+/// length, stepping back to it from an enemy who has come inside it, and
+/// waiting for a clear arc. With nobody in reach, going to the enemy he
 /// remembers through open ground (waiting behind a comrade, sidestepping
 /// now and then), or, with nobody to close on, joining his regiment's
 /// fight at the jog.
 #[inline]
 fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
-    let Field { pos_prev, speed, team, group, engaged, hold, moving, focus, tick, .. } = *f;
+    let Field { pos_prev, speed, team, group, broken, wall, engaged, hold, moving, focus, tick, .. } = *f;
     let i = s.i;
+    let params = &TYPES[st.my_kind];
     let p = st.p;
     let gi = st.gi;
     let dying = st.dying;
@@ -1300,15 +1409,27 @@ fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
         // Held regiments fight at arm's length only.
         let look = if engaged[gi] { seek_radius() } else { WIDE_ACQUIRE_R };
         let max_close = if hold[gi] { 2.2 } else { look + 1.0 };
-        // Going to a seen enemy, each man stops at his own distance; closing
-        // the last meter to a man already in reach stays as it was.
-        let stop = if memo_close {
-            1.2 + SEEK_STOP_SPREAD
-                * crate::units::hash01((i as u32).wrapping_mul(0x3C1B) ^ 0x51F7)
-        } else {
-            1.2
+        // He closes on an enemy in reach to his weapon's length. Going to
+        // a seen enemy, each man stops at his own distance, between that
+        // and just inside his reach.
+        let own = crate::units::hash01((i as u32).wrapping_mul(0x3C1B) ^ 0x51F7);
+        let fight = FIGHT_SHARE * params.reach;
+        let stop = match (fight_room(), memo_close) {
+            (true, true) => fight + 0.8 * (params.reach - fight) * own,
+            (true, false) => fight,
+            (false, true) => CLOSE_STOP + SEEK_STOP_SPREAD * own,
+            (false, false) => CLOSE_STOP,
         };
-        if dist > stop && dist < max_close {
+        let ready = *s.swing & crate::units::SWING_STATE_MASK == crate::units::SWING_READY;
+        if !memo_close && best_idx != u32::MAX && ready && st.arc_blocked {
+            // A comrade stands in the arc of his cut. He does not lean in
+            // on the man: he waits, and in some windows he sidesteps toward
+            // open ground, as a man blocked on his way does. A wall fights
+            // from its slots.
+            if wall[gi] == 0 {
+                desired += sidestep(i, tick, left_blocked, right_blocked, side_dir);
+            }
+        } else if dist > stop && dist < max_close {
             let mut urge = ((dist - stop) / 0.8).clamp(0.0, 1.0);
             // The surge toward a REMEMBERED enemy (no one in reach yet) is
             // steering, not combat execution: it yields to the jam like all
@@ -1325,21 +1446,7 @@ fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
                     urge = 0.0;
                     // Waiting; in some windows he sidesteps toward whichever
                     // side is open.
-                    let window = (tick.wrapping_add((i as u32).wrapping_mul(7))
-                        / SIDESTEP_WINDOW)
-                        .wrapping_mul(0x2545_F491);
-                    let roll = crate::units::hash01(window ^ (i as u32).wrapping_mul(0x9E37));
-                    let chance = sidestep_chance();
-                    if roll < chance {
-                        let side = match (left_blocked, right_blocked) {
-                            (false, true) => side_dir,
-                            (true, false) => -side_dir,
-                            (false, false) if roll < 0.5 * chance => side_dir,
-                            (false, false) => -side_dir,
-                            (true, true) => Vec2::ZERO,
-                        };
-                        desired += side * STEP_PACE;
-                    }
+                    desired += sidestep(i, tick, left_blocked, right_blocked, side_dir);
                 }
             }
             let pace = if !memo_close {
@@ -1351,6 +1458,25 @@ fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
             };
             desired += to_enemy * (pace * urge / dist);
             d_surge = to_enemy * (pace * urge / dist);
+        } else if fight_room()
+            && !memo_close
+            && committed
+            && wall[gi] == 0
+            && !st.back_blocked
+            && *s.swing & crate::units::SWING_STATE_MASK != crate::units::SWING_WINDUP
+            && !broken[group[close_to as usize] as usize]
+            && dist > 1e-3
+        {
+            // The enemy has come inside his weapon's length: out of
+            // formation, with open ground behind him and no blow under way,
+            // he steps back to it. He lets the man well inside first, and a
+            // step once begun goes all the way out. A man in formation holds
+            // his place, and nobody backs off a broken enemy.
+            let stepping = s.vel.xz().dot(to_enemy) < -0.5 * STEP_PACE * dist;
+            let inside = if stepping { fight } else { fight - BACK_SLACK };
+            if dist < inside {
+                desired -= to_enemy * (STEP_PACE / dist);
+            }
         }
     }
     // Joining: no enemy to close on, so he heads for the enemy unit his
@@ -1372,20 +1498,7 @@ fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
                 let pace = if comrade_ahead { ADVANCE_PACE } else { COMBAT_JOG_PACE };
                 dir * pace * (1.0 - jam)
             } else {
-                let window = (tick.wrapping_add((i as u32).wrapping_mul(7))
-                    / SIDESTEP_WINDOW)
-                    .wrapping_mul(0x2545_F491);
-                let roll = crate::units::hash01(window ^ (i as u32).wrapping_mul(0x9E37));
-                let chance = sidestep_chance();
-                let side = match (left_blocked, right_blocked) {
-                    _ if roll >= chance => Vec2::ZERO,
-                    (false, true) => side_dir,
-                    (true, false) => -side_dir,
-                    (false, false) if roll < 0.5 * chance => side_dir,
-                    (false, false) => -side_dir,
-                    (true, true) => Vec2::ZERO,
-                };
-                side * STEP_PACE
+                sidestep(i, tick, left_blocked, right_blocked, side_dir)
             };
         }
     }

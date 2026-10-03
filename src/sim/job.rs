@@ -57,7 +57,7 @@ pub struct TickJob {
     pub(crate) death_t_in: Arc<Vec<u8>>,
     pub(crate) ammo_in: Arc<Vec<u8>>,
     pub(crate) out_form_in: Arc<Vec<bool>>,
-    pub(crate) sight_in: Arc<Vec<u8>>,
+    pub(crate) sight_in: Arc<Vec<u16>>,
     // Read only to pack the render snapshot.
     pub(crate) pos_prev_in: Arc<Vec<Vec3>>,
     pub(crate) color_in: Arc<Vec<[f32; 4]>>,
@@ -80,7 +80,7 @@ pub struct TickJob {
     pub(crate) death_t: Vec<u8>,
     pub(crate) ammo: Vec<u8>,
     pub(crate) out_form: Vec<bool>,
-    pub(crate) sight: Vec<u8>,
+    pub(crate) sight: Vec<u16>,
     // Per-regiment command snapshot, taken at prep.
     pub(crate) orders: Vec<Option<Vec2>>,
     pub(crate) anchors: Vec<Vec2>,
