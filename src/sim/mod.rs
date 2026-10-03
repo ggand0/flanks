@@ -24,6 +24,7 @@ use crate::units::Units;
 pub mod damage;
 mod diag;
 pub mod job;
+pub mod route;
 pub mod soldier;
 
 use damage::{DamageBuffers, DirTestStats};
@@ -95,15 +96,17 @@ impl Plugin for SimPlugin {
             .init_resource::<TickPipeline>()
             .init_resource::<SharedTerrain>()
             .init_resource::<RegimentRuns>()
+            .init_resource::<route::Routes>()
             .add_systems(
                 FixedUpdate,
                 (
                     (refresh_shared_terrain, take_tick, step_sim).chain(),
-                    kick_tick.after(crate::orders::clear_arrived_orders),
+                    route::update_routes.after(crate::orders::clear_arrived_orders),
+                    kick_tick.after(route::update_routes),
                 )
                     .in_set(crate::game_state::SimSet),
             )
-            .add_systems(Update, toggle_debug_viz);
+            .add_systems(Update, (toggle_debug_viz, route::draw_routes));
     }
 }
 
@@ -350,6 +353,10 @@ fn run_tick_job(job: &mut TickJob) {
         grid_ms,
         step_ms,
         field_ms,
+        plan_requests,
+        plans,
+        routes,
+        nav,
         ..
     } = job;
 
@@ -447,6 +454,7 @@ fn run_tick_job(job: &mut TickJob) {
         tick,
         bounds_min,
         bounds_max,
+        paths: route::KernelRoutes { routes: &routes[..], nav: nav.as_deref() },
     };
     let f = &field;
     // The shared read-modify-write columns, for the copy-in per chunk.
@@ -547,6 +555,15 @@ fn run_tick_job(job: &mut TickJob) {
         at_edge.extend(e);
     }
     *step_ms = t2.elapsed().as_secs_f32() * 1000.0;
+    // The routes asked for at the kick, planned now that the soldiers are
+    // done; the install hands them back.
+    match nav.as_deref() {
+        Some(nav) => {
+            let _span = info_span!("plan_routes").entered();
+            route::plan_all(nav, plan_requests, plans);
+        }
+        None => plans.clear(),
+    }
 }
 
 #[allow(clippy::too_many_arguments)] // bevy system params
@@ -567,6 +584,7 @@ pub fn step_sim(
     mut pipeline: ResMut<TickPipeline>,
     mut dir_stats: ResMut<DirTestStats>,
     mut sounds: Option<ResMut<crate::audio::SoundEvents>>,
+    mut routes: ResMut<route::Routes>,
 ) {
     let finished = pipeline.taken.take();
     if units.pos.is_empty() {
@@ -586,6 +604,7 @@ pub fn step_sim(
                 &units,
                 &mut groups,
                 &tracks,
+                &mut routes,
                 terrain_arc,
                 time.delta_secs(),
                 scale.0,
@@ -630,6 +649,7 @@ pub fn step_sim(
     pipeline.sweep_candidates.sort_unstable();
     pipeline.sweep_candidates.dedup();
     std::mem::swap(&mut *grid, &mut job.grid);
+    routes.hand_back(&mut job.plans);
     std::mem::swap(&mut damage.0, &mut job.events);
     std::mem::swap(&mut arrow_spawns.0, &mut job.arrow_spawns);
     stats.grid_ms = job.grid_ms;
@@ -686,6 +706,7 @@ pub fn kick_tick(
         Option<ResMut<crate::render_units_gpu::SnapshotHandoff>>,
         Res<crate::settings::Settings>,
     ),
+    mut routes: ResMut<route::Routes>,
 ) {
     if !pipeline_enabled() || units.pos.is_empty() || pipeline.in_flight {
         return;
@@ -699,6 +720,7 @@ pub fn kick_tick(
         &units,
         &mut groups,
         &tracks,
+        &mut routes,
         terrain_arc,
         time.delta_secs(),
         scale.0,

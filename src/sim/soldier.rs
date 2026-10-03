@@ -298,6 +298,8 @@ pub(crate) struct Field<'a> {
     pub tick: u32,
     pub bounds_min: Vec2,
     pub bounds_max: Vec2,
+    /// Per regiment: its route, and the grid (sim/route.rs).
+    pub paths: crate::sim::route::KernelRoutes<'a>,
 }
 
 /// One soldier's own row: the columns his tick writes.
@@ -519,7 +521,7 @@ fn begin(f: &Field, s: &mut Soldier) -> Step {
 /// jitter and a step that finishes once begun.
 #[inline]
 fn drive(f: &Field, s: &mut Soldier, st: &mut Step) {
-    let Field { terrain, speed, team, home, orders, anchors, .. } = *f;
+    let Field { terrain, speed, team, home, orders, anchors, paths, .. } = *f;
     let i = s.i;
     let p = st.p;
     let gi = st.gi;
@@ -550,7 +552,15 @@ fn drive(f: &Field, s: &mut Soldier, st: &mut Step) {
             / (1.0 + 3.0 * slope * slope);
     } else if !dying {
         let holding = orders[gi].is_none();
-        let goal = orders[gi].unwrap_or(anchors[gi]) + home[i];
+        let mut goal = orders[gi].unwrap_or(anchors[gi]) + home[i];
+        // On a route, a man whose straight way to his slot is blocked
+        // follows the route instead (sim/route.rs); short of the last leg
+        // he keeps his pace.
+        let mut through = false;
+        if let (Some(route), Some(nav)) = (paths.routes.get(gi).and_then(Option::as_ref), paths.nav) {
+            let frame = orders[gi].unwrap_or(anchors[gi]);
+            (goal, through) = crate::sim::route::man_target(nav, terrain, route, frame, p, goal, i);
+        }
         let to_goal = goal - p;
         let dist = to_goal.length();
         // Hold deadzone: parked units don't jitter around their slot point.
@@ -576,7 +586,7 @@ fn drive(f: &Field, s: &mut Soldier, st: &mut Step) {
                 * slope_mult
                 * terrain.wade_mult(p.x, p.y)
                 * gain
-                * (dist / arrive).min(1.0);
+                * if through { 1.0 } else { (dist / arrive).min(1.0) };
             if holding {
                 desired_speed = desired_speed
                     .max(STEP_PACE * slope_mult * terrain.wade_mult(p.x, p.y));

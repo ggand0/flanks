@@ -368,11 +368,6 @@ impl NavGrid {
         self.cell_at(p).map_or(0.0, |i| self.clear[i])
     }
 
-    #[inline]
-    pub fn walkable_at(&self, p: Vec2) -> bool {
-        self.cell_at(p).is_some_and(|i| self.walk[i])
-    }
-
     /// A man can walk the straight line from `a` to `b` without stepping
     /// on unwalkable ground. Marches along the line by the clearance: in
     /// open ground a few lookups cover the whole way, next to a wall it
@@ -439,9 +434,29 @@ impl NavGrid {
         self.band_clear(a, b, w) && self.dry_line(a, b)
     }
 
-    /// Water a man wades through at `p`.
-    pub fn wet_at(&self, p: Vec2) -> bool {
-        self.cell_at(p).is_some_and(|i| self.wet[i])
+    /// The unwalkable cells next to walkable ground within `radius` of
+    /// `center`: the outline of the blocked ground, for the debug view.
+    pub fn edge_cells(&self, center: Vec2, radius: f32) -> Vec<Vec2> {
+        let lo = ((center - radius - self.origin) / CELL).floor().max(Vec2::ZERO);
+        let hi = ((center + radius - self.origin) / CELL).ceil();
+        let (x1, z1) = ((hi.x as usize).min(self.nx - 1), (hi.y as usize).min(self.nz - 1));
+        let mut out = Vec::new();
+        for z in lo.y as usize..=z1 {
+            for x in lo.x as usize..=x1 {
+                let i = z * self.nx + x;
+                if self.walk[i] {
+                    continue;
+                }
+                let near_open = (x > 0 && self.walk[i - 1])
+                    || (x + 1 < self.nx && self.walk[i + 1])
+                    || (z > 0 && self.walk[i - self.nx])
+                    || (z + 1 < self.nz && self.walk[i + self.nx]);
+                if near_open {
+                    out.push(self.pos(i));
+                }
+            }
+        }
+        out
     }
 
     /// The walkable cell nearest `p` within `max_r` metres, by distance.
@@ -507,78 +522,122 @@ impl NavGrid {
     ///   walk into it and wait, so a route keeps to the middle of a passage
     ///   that is wide enough, and hugs nothing it does not have to.
     fn costs(&self, span: Span) -> std::sync::Arc<Costs> {
-        let mut tables = self.costs.lock().unwrap();
-        if let Some(t) = tables.iter().find(|t| t.span.k_axis == span.k_axis) {
-            return t.clone();
+        if let Some(t) = self.cached_costs(span) {
+            return t;
         }
+        let passes: Vec<_> = (0..4u8).map(|class| self.class_pass(class, span)).collect();
+        self.store_costs(span, &passes)
+    }
+
+    fn cached_costs(&self, span: Span) -> Option<std::sync::Arc<Costs>> {
+        let tables = self.costs.lock().unwrap();
+        tables.iter().find(|t| t.span.k_axis == span.k_axis).cloned()
+    }
+
+    /// Build the cost tables the plans for `requests` need and do not have
+    /// yet, each step class on its own task. Run before the plans, so no
+    /// plan waits on another's table.
+    pub fn prepare_costs(&self, requests: &[PlanRequest]) {
+        let mut spans: Vec<Span> = Vec::new();
+        for r in requests {
+            let span = Span::of(r.half_w.clamp(CELL, CLEAR_CAP - CELL));
+            if !spans.iter().any(|s| s.k_axis == span.k_axis) && self.cached_costs(span).is_none() {
+                spans.push(span);
+            }
+        }
+        for span in spans {
+            let t0 = Instant::now();
+            let passes = crate::util::sim_scope(|scope| {
+                for class in 0..4u8 {
+                    scope.spawn(async move { self.class_pass(class, span) });
+                }
+            });
+            self.store_costs(span, &passes);
+            debug!(
+                "[path] cost table for a {:.1} m half width built in {:.2} ms",
+                span.half_w,
+                t0.elapsed().as_secs_f32() * 1000.0
+            );
+        }
+    }
+
+    /// One step class's lines: per cell, the open share of the line across
+    /// it and the largest clearance of the open cells on that line.
+    fn class_pass(&self, class: u8, span: Span) -> (Vec<f32>, Vec<f32>) {
         let n = self.walk.len();
         let open = |j: usize| self.region[j] == self.main_region;
-        let mut share = vec![[1.0f32; 4]; n];
-        let mut widest = vec![[0.0f32; 4]; n];
+        let mut share = vec![1.0f32; n];
+        let mut widest = vec![0.0f32; n];
         let mut line = Vec::new();
         let mut pref = Vec::new();
         let mut deque = std::collections::VecDeque::new();
-        for class in 0..4u8 {
-            let (lx, lz) = line_dir(class);
-            let k = if class < 2 { span.k_axis } else { span.k_diag } as i64;
-            let all = (2 * k + 1) as f32;
-            for start in self.line_starts(lx, lz) {
-                line.clear();
-                let (mut x, mut z) = ((start % self.nx) as i64, (start / self.nx) as i64);
-                while x >= 0 && z >= 0 && x < self.nx as i64 && z < self.nz as i64 {
-                    line.push(z as usize * self.nx + x as usize);
-                    x += lx;
-                    z += lz;
-                }
-                let len = line.len() as i64;
-                pref.clear();
-                pref.push(0u32);
-                for &j in &line {
-                    pref.push(pref.last().unwrap() + open(j) as u32);
-                }
-                // Sliding maximum of the open cells' clearance over
-                // [t - k, t + k].
-                deque.clear();
-                for r in 0..len + k {
-                    if r < len {
-                        let v = |t: i64| {
-                            let j = line[t as usize];
-                            if open(j) { self.clear[j] } else { 0.0 }
-                        };
-                        while deque.back().is_some_and(|&b| v(b) <= v(r)) {
-                            deque.pop_back();
-                        }
-                        deque.push_back(r);
+        let (lx, lz) = line_dir(class);
+        let k = if class < 2 { span.k_axis } else { span.k_diag } as i64;
+        let all = (2 * k + 1) as f32;
+        for start in self.line_starts(lx, lz) {
+            line.clear();
+            let (mut x, mut z) = ((start % self.nx) as i64, (start / self.nx) as i64);
+            while x >= 0 && z >= 0 && x < self.nx as i64 && z < self.nz as i64 {
+                line.push(z as usize * self.nx + x as usize);
+                x += lx;
+                z += lz;
+            }
+            let len = line.len() as i64;
+            pref.clear();
+            pref.push(0u32);
+            for &j in &line {
+                pref.push(pref.last().unwrap() + open(j) as u32);
+            }
+            // Sliding maximum of the open cells' clearance over [t - k, t + k].
+            let v = |t: i64| {
+                let j = line[t as usize];
+                if open(j) { self.clear[j] } else { 0.0 }
+            };
+            deque.clear();
+            for r in 0..len + k {
+                if r < len {
+                    while deque.back().is_some_and(|&b| v(b) <= v(r)) {
+                        deque.pop_back();
                     }
-                    let t = r - k;
-                    if t < 0 {
-                        continue;
-                    }
-                    while deque.front().is_some_and(|&f| f < t - k) {
-                        deque.pop_front();
-                    }
-                    let j = line[t as usize];
-                    let (lo, hi) = ((t - k).max(0) as usize, (t + k).min(len - 1) as usize);
-                    share[j][class as usize] = (pref[hi + 1] - pref[lo]) as f32 / all;
-                    let f = line[*deque.front().unwrap() as usize];
-                    widest[j][class as usize] = if open(f) { self.clear[f] } else { 0.0 };
+                    deque.push_back(r);
                 }
+                let t = r - k;
+                if t < 0 {
+                    continue;
+                }
+                while deque.front().is_some_and(|&f| f < t - k) {
+                    deque.pop_front();
+                }
+                let j = line[t as usize];
+                let (lo, hi) = ((t - k).max(0) as usize, (t + k).min(len - 1) as usize);
+                share[j] = (pref[hi + 1] - pref[lo]) as f32 / all;
+                widest[j] = v(*deque.front().unwrap());
             }
         }
+        (share, widest)
+    }
+
+    /// Combine the four classes' passes into the table and keep it.
+    fn store_costs(&self, span: Span, passes: &[(Vec<f32>, Vec<f32>)]) -> std::sync::Arc<Costs> {
+        let n = self.walk.len();
         let mut w = vec![[f32::INFINITY; 4]; n];
-        for i in 0..n {
+        for (i, wi) in w.iter_mut().enumerate() {
             if !self.walk[i] {
                 continue;
             }
             for class in 0..4usize {
                 let slants: [usize; 2] = if class < 2 { [2, 3] } else { [0, 1] };
-                let sh = share[i][class].min(share[i][slants[0]]).min(share[i][slants[1]]);
+                let sh = passes[class].0[i].min(passes[slants[0]].0[i]).min(passes[slants[1]].0[i]);
                 let squeeze = (1.0 / sh.max(1e-3)).max(1.0);
-                let lost = ((widest[i][class].min(span.half_w) - self.clear[i]) / span.half_w).max(0.0);
-                w[i][class] = self.cost[i] * squeeze * (1.0 + ROOM * lost);
+                let lost = ((passes[class].1[i].min(span.half_w) - self.clear[i]) / span.half_w).max(0.0);
+                wi[class] = self.cost[i] * squeeze * (1.0 + ROOM * lost);
             }
         }
         let table = std::sync::Arc::new(Costs { span, w });
+        let mut tables = self.costs.lock().unwrap();
+        if let Some(t) = tables.iter().find(|t| t.span.k_axis == span.k_axis) {
+            return t.clone();
+        }
         tables.push(table.clone());
         table
     }

@@ -139,6 +139,12 @@ pub struct TickJob {
     pub(crate) grid_ms: f32,
     pub(crate) step_ms: f32,
     pub(crate) field_ms: f32,
+    // Routes (sim/route.rs): the plans asked for at prep, planned after
+    // the kernel, and each regiment's route with the grid its men read.
+    pub(crate) plan_requests: Vec<crate::nav::PlanRequest>,
+    pub(crate) plans: Vec<crate::nav::Plan>,
+    pub(crate) routes: Vec<Option<crate::sim::route::RouteView>>,
+    pub(crate) nav: Option<Arc<crate::nav::NavGrid>>,
 }
 
 impl TickJob {
@@ -219,6 +225,7 @@ pub(crate) fn prepare_tick(
     units: &Units,
     groups: &mut Groups,
     tracks: &crate::arrows::RegTracks,
+    routes: &mut crate::sim::route::Routes,
     terrain_arc: &std::sync::Arc<Terrain>,
     dt: f32,
     combat_scale: f32,
@@ -233,7 +240,8 @@ pub(crate) fn prepare_tick(
 
     share_columns(job, units);
     let fire = archer_fire_solutions(groups, tracks, terrain);
-    job.orders = resolve_orders(groups, &fire.standoff);
+    job.orders = resolve_orders(groups, &fire.standoff, routes);
+    routes.fill_job(&mut job.plan_requests, &mut job.routes, &mut job.nav, groups.list.len());
     snapshot_regiments(job, groups, terrain);
 
     let n_chunks = units.pos.len().div_ceil(CHUNK);
@@ -450,8 +458,13 @@ fn archer_fire_solutions(
 }
 
 /// Each regiment's order resolved to this tick's destination, or none
-/// for a regiment that holds where it is.
-fn resolve_orders(groups: &Groups, standoff: &[bool]) -> Vec<Option<Vec2>> {
+/// for a regiment that holds where it is. A regiment on a route heads
+/// for its current waypoint (sim/route.rs).
+fn resolve_orders(
+    groups: &Groups,
+    standoff: &[bool],
+    routes: &crate::sim::route::Routes,
+) -> Vec<Option<Vec2>> {
     // Orders resolved to this tick's destination (attack orders chase
     // their target regiment's current centroid). A regiment holding a
     // contact frame stops chasing: dragging the slot grid onward
@@ -472,7 +485,7 @@ fn resolve_orders(groups: &Groups, standoff: &[bool]) -> Vec<Option<Vec2>> {
             if gd.contact {
                 return None;
             }
-            groups.goal(g)
+            groups.goal(g).map(|goal| routes.frame(g, goal))
         })
         .collect();
     orders
