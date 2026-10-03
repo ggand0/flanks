@@ -270,9 +270,22 @@ pub fn update_routes(
     };
     let tick = pipeline.tick;
 
-    // The plans the last install handed back.
+    // The plans the last install handed back; the deferred go out again
+    // first, in their order.
+    let mut again = Vec::new();
     for plan in std::mem::take(&mut routes.incoming) {
-        adopt(routes, &mut groups, plan);
+        if plan.deferred {
+            again.push(plan.req);
+        } else {
+            adopt(routes, &mut groups, plan);
+        }
+    }
+    for req in again.into_iter().rev() {
+        let still = matches!(routes.per.get(req.g as usize).map(|r| &r.state),
+            Some(State::Pending { serial, .. }) if *serial == req.serial);
+        if still && !routes.queue.iter().any(|q| q.g == req.g) {
+            routes.queue.push_front(req);
+        }
     }
 
     for g in 0..n {
@@ -441,7 +454,24 @@ pub(crate) fn plan_all(nav: &NavGrid, requests: &[PlanRequest], out: &mut Vec<Pl
         return;
     }
     let t0 = std::time::Instant::now();
-    nav.prepare_costs(requests);
+    // A tick that has to build a cost table does only that; its plans go
+    // out with the next job, so no tick pays for both.
+    if nav.prepare_costs(requests) {
+        out.extend(requests.iter().map(|req| Plan {
+            req: *req,
+            points: Vec::new(),
+            reached: false,
+            deferred: true,
+            cells: 0,
+            ms: 0.0,
+        }));
+        info!(
+            "[path] cost table built in the tick job: {:.2} ms; {} plans wait for the next",
+            t0.elapsed().as_secs_f32() * 1000.0,
+            requests.len()
+        );
+        return;
+    }
     let plans = crate::util::sim_scope(|scope| {
         for req in requests {
             scope.spawn(async move { SCRATCH.with(|s| nav.plan(req, &mut s.borrow_mut())) });

@@ -115,6 +115,9 @@ pub struct Plan {
     /// The goal itself is reachable; else the route ends at the nearest
     /// reachable ground with room for the regiment.
     pub reached: bool,
+    /// Not planned: the tick built the cost table it needs instead, and
+    /// the request goes out again with the next job.
+    pub deferred: bool,
     pub cells: u32,
     pub ms: f32,
 }
@@ -526,7 +529,7 @@ impl NavGrid {
             return t;
         }
         let passes: Vec<_> = (0..4u8).map(|class| self.class_pass(class, span)).collect();
-        self.store_costs(span, &passes)
+        self.store_costs(span, &passes, false)
     }
 
     fn cached_costs(&self, span: Span) -> Option<std::sync::Arc<Costs>> {
@@ -535,9 +538,8 @@ impl NavGrid {
     }
 
     /// Build the cost tables the plans for `requests` need and do not have
-    /// yet, each step class on its own task. Run before the plans, so no
-    /// plan waits on another's table.
-    pub fn prepare_costs(&self, requests: &[PlanRequest]) {
+    /// yet, on the pool. Returns whether any had to be built.
+    pub fn prepare_costs(&self, requests: &[PlanRequest]) -> bool {
         let mut spans: Vec<Span> = Vec::new();
         for r in requests {
             let span = Span::of(r.half_w.clamp(CELL, CLEAR_CAP - CELL));
@@ -545,6 +547,7 @@ impl NavGrid {
                 spans.push(span);
             }
         }
+        let built = !spans.is_empty();
         for span in spans {
             let t0 = Instant::now();
             let passes = crate::util::sim_scope(|scope| {
@@ -552,13 +555,14 @@ impl NavGrid {
                     scope.spawn(async move { self.class_pass(class, span) });
                 }
             });
-            self.store_costs(span, &passes);
+            self.store_costs(span, &passes, true);
             debug!(
                 "[path] cost table for a {:.1} m half width built in {:.2} ms",
                 span.half_w,
                 t0.elapsed().as_secs_f32() * 1000.0
             );
         }
+        built
     }
 
     /// One step class's lines: per cell, the open share of the line across
@@ -617,21 +621,36 @@ impl NavGrid {
         (share, widest)
     }
 
-    /// Combine the four classes' passes into the table and keep it.
-    fn store_costs(&self, span: Span, passes: &[(Vec<f32>, Vec<f32>)]) -> std::sync::Arc<Costs> {
+    /// Combine the four classes' passes into the table and keep it, in
+    /// parallel strips on the pool when `pooled` (from the sim worker).
+    fn store_costs(&self, span: Span, passes: &[(Vec<f32>, Vec<f32>)], pooled: bool) -> std::sync::Arc<Costs> {
         let n = self.walk.len();
         let mut w = vec![[f32::INFINITY; 4]; n];
-        for (i, wi) in w.iter_mut().enumerate() {
-            if !self.walk[i] {
-                continue;
+        let fill = |start: usize, strip: &mut [[f32; 4]]| {
+            for (j, wi) in strip.iter_mut().enumerate() {
+                let i = start + j;
+                if !self.walk[i] {
+                    continue;
+                }
+                for class in 0..4usize {
+                    let slants: [usize; 2] = if class < 2 { [2, 3] } else { [0, 1] };
+                    let sh = passes[class].0[i].min(passes[slants[0]].0[i]).min(passes[slants[1]].0[i]);
+                    let squeeze = (1.0 / sh.max(1e-3)).max(1.0);
+                    let lost = ((passes[class].1[i].min(span.half_w) - self.clear[i]) / span.half_w).max(0.0);
+                    wi[class] = self.cost[i] * squeeze * (1.0 + ROOM * lost);
+                }
             }
-            for class in 0..4usize {
-                let slants: [usize; 2] = if class < 2 { [2, 3] } else { [0, 1] };
-                let sh = passes[class].0[i].min(passes[slants[0]].0[i]).min(passes[slants[1]].0[i]);
-                let squeeze = (1.0 / sh.max(1e-3)).max(1.0);
-                let lost = ((passes[class].1[i].min(span.half_w) - self.clear[i]) / span.half_w).max(0.0);
-                wi[class] = self.cost[i] * squeeze * (1.0 + ROOM * lost);
-            }
+        };
+        if pooled {
+            const STRIP: usize = 16384;
+            let fill = &fill;
+            crate::util::sim_scope(|scope| {
+                for (k, strip) in w.chunks_mut(STRIP).enumerate() {
+                    scope.spawn(async move { fill(k * STRIP, strip) });
+                }
+            });
+        } else {
+            fill(0, &mut w);
         }
         let table = std::sync::Arc::new(Costs { span, w });
         let mut tables = self.costs.lock().unwrap();
@@ -667,7 +686,7 @@ impl NavGrid {
         let t0 = Instant::now();
         let need = req.half_w.clamp(CELL, CLEAR_CAP - CELL);
         let costs = self.costs(Span::of(need));
-        let mut out = Plan { req: *req, points: Vec::new(), reached: false, cells: 0, ms: 0.0 };
+        let mut out = Plan { req: *req, points: Vec::new(), reached: false, deferred: false, cells: 0, ms: 0.0 };
         let Some(start) = self.nearest_walkable(req.start, CLEAR_CAP) else {
             out.ms = t0.elapsed().as_secs_f32() * 1000.0;
             return out;
