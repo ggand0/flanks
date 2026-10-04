@@ -19,17 +19,18 @@ const QUERY_RADIUS: f32 = 2.0;
 /// Cap on summed separation push to avoid explosive forces deep in a crowd.
 const SEP_PUSH_MAX: f32 = 2.5;
 /// Below this distance overlap is resolved positionally. A soldier is
-/// 0.75 to 1.1 m across with his arms, shield and weapon, and a wall's
-/// files stand 1.05 m apart, the most this can be. FL_BODY=<metres> sets
-/// it; with the room to fight off it is 0.9 m, the distance set when a
-/// soldier was 0.6 m wide.
+/// 0.75 to 1.1 m across with his arms, shield and weapon. Never more than
+/// a pair's own rest distance, so the men of a wall keep their 1.05 m
+/// files. FL_BODY=<metres> sets it, up to the separation distance; with
+/// the room to fight off it is 0.9 m, the distance set when a soldier was
+/// 0.6 m wide.
 const BODY_DISTANCE: f32 = 1.0;
 const BODY_DISTANCE_OLD: f32 = 0.9;
 fn body_distance() -> f32 {
     static D: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
     *D.get_or_init(|| {
         if fight_room() {
-            crate::util::env_or("FL_BODY", BODY_DISTANCE).clamp(0.5, WALL_SEP_RADIUS)
+            crate::util::env_or("FL_BODY", BODY_DISTANCE).clamp(0.5, SEP_RADIUS)
         } else {
             BODY_DISTANCE_OLD
         }
@@ -670,12 +671,13 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
             let mw = 2.0 * o_mass / (my_mass + o_mass);
             let len = d2.sqrt();
             let w = 1.0 - len / sep_r;
-            if len < body {
+            let hard = body.min(sep_r);
+            if len < hard {
                 // Overlap is resolved POSITIONALLY only. A hard force boost
                 // here as well made packed crowds oscillate at the
                 // acceleration cap, two solvers fighting over the same
                 // overlap, every frame.
-                corr += d * ((body - len) * CORR_GAIN * mw / len);
+                corr += d * ((hard - len) * CORR_GAIN * mw / len);
             }
             push += d * (w * mw / len);
             // Jam density: COMPRESSED pairs only — a neighbor resting AT his
