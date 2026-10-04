@@ -1248,13 +1248,12 @@ fn shake_log(
     }
     sh.tick = pipe.tick;
     let n = units.len();
-    if sh.last.len() != n {
-        // The death sweep renumbered the men: their last steps are void.
-        sh.last.clear();
-        sh.last.resize(n, Vec2::ZERO);
-        sh.turns.resize(n, 0);
-        sh.step.resize(n, 0.0);
-    }
+    // The death sweep moves the last men into the places of the removed:
+    // those few carry another man's count for one window, the rest keep
+    // theirs.
+    sh.last.resize(n, Vec2::ZERO);
+    sh.turns.resize(n, 0);
+    sh.step.resize(n, 0.0);
     for i in 0..n {
         let d = units.pos[i] - units.pos_prev[i];
         let d = Vec2::new(d.x, d.z);
