@@ -41,6 +41,33 @@ fn body_distance() -> f32 {
 /// itself into overlap: packed interior units genuinely stop shoving.
 const CROWD_SLOW: f32 = 1.2;
 const CROWD_STOP: f32 = 2.5;
+
+/// A man stops shoving when his shoulder room runs out. His drive fades
+/// as the men around him close in and is gone when six of them stand at
+/// the shove limit: halfway between the separation distance and the body
+/// distance, 1.2 m, so nobody drives into the overlap correction and a
+/// rank in good order is not slowed. The fade starts halfway from there
+/// to the separation distance. He can still be pressed closer by others.
+/// FL_SHOVE=<metres> sets the limit and FL_SHOVE=0 keeps the crowd's two
+/// figures above for the drive, as with the room to fight off. Returns
+/// the crowd figures where the fade starts and ends.
+fn shove_limit() -> Option<(f32, f32)> {
+    static L: std::sync::OnceLock<Option<(f32, f32)>> = std::sync::OnceLock::new();
+    *L.get_or_init(|| {
+        if !fight_room() {
+            return None;
+        }
+        let midway = 0.5 * (SEP_RADIUS + body_distance());
+        let limit = crate::util::env_or("FL_SHOVE", midway);
+        if limit <= 0.0 {
+            return None;
+        }
+        let limit = limit.clamp(body_distance(), 0.95 * SEP_RADIUS);
+        // The crowd figure of a man with six neighbours at distance `d`.
+        let crowd_at = |d: f32| 6.0 * (1.0 - d / SEP_RADIUS);
+        Some((crowd_at(0.5 * (limit + SEP_RADIUS)), crowd_at(limit)))
+    })
+}
 const STEER_GAIN: f32 = 3.0;
 const MAX_ACCEL: f32 = 50.0;
 /// Facing turn smoothing (fraction/s of the remaining angle) — the
@@ -375,6 +402,8 @@ struct Step {
     face_target: Option<Vec2>,
     corr_len2: f32,
     jam: f32,
+    /// How far his own drive is faded by the crowd, 0 to 1.
+    brake: f32,
     new_v: Vec2,
 }
 
@@ -481,6 +510,7 @@ fn begin(f: &Field, s: &mut Soldier) -> Step {
         face_target: None,
         corr_len2: 0.0,
         jam: 0.0,
+        brake: 0.0,
         new_v: Vec2::ZERO,
     }
 }
@@ -1340,11 +1370,17 @@ fn yield_to_crowd(st: &mut Step) {
     // keep compressing itself; `jam` (0 = free, 1 = packed) also damps the
     // response below.
     let jam = ((crowd - CROWD_SLOW) / (CROWD_STOP - CROWD_SLOW)).clamp(0.0, 1.0);
-    desired *= 1.0 - jam;
+    // His own drive fades sooner, at the shove limit.
+    let brake = match shove_limit() {
+        Some((slow, stop)) => ((crowd - slow) / (stop - slow)).clamp(0.0, 1.0),
+        None => jam,
+    };
+    desired *= 1.0 - brake;
     st.corr = corr;
     st.corr_len2 = corr_len2;
     st.push = push;
     st.jam = jam;
+    st.brake = brake;
     st.desired = desired;
 }
 
@@ -1389,7 +1425,7 @@ fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
     let join_fp = st.join_fp;
     let best_idx = st.best_idx;
     let crowd = st.crowd;
-    let jam = st.jam;
+    let brake = st.brake;
     let way_blocked = st.way_blocked;
     let left_blocked = st.left_blocked;
     let right_blocked = st.right_blocked;
@@ -1464,12 +1500,10 @@ fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
         } else if dist > stop && dist < max_close {
             let mut urge = ((dist - stop) / 0.8).clamp(0.0, 1.0);
             // The surge toward a REMEMBERED enemy (no one in reach yet) is
-            // steering, not combat execution: it yields to the jam like all
-            // steering, so the press brakes on genuine body-pack. Ungated
-            // this factor is always 1 (the memo gate above already required
-            // crowd < CROWD_SLOW, i.e. jam == 0).
+            // steering, not combat execution: it yields to the crowd like all
+            // steering, so the press brakes on genuine body-pack.
             if memo_close {
-                urge *= 1.0 - jam;
+                urge *= 1.0 - brake;
                 // He steps toward a remembered enemy only through open
                 // ground. With a comrade in the way he stands and waits for
                 // room instead of leaning on the man's back (M2TW's crowded
@@ -1528,7 +1562,7 @@ fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
             let dir = to_fp / dist;
             desired = if !way_blocked {
                 let pace = if comrade_ahead { ADVANCE_PACE } else { COMBAT_JOG_PACE };
-                dir * pace * (1.0 - jam)
+                dir * pace * (1.0 - brake)
             } else {
                 sidestep(i, tick, left_blocked, right_blocked, side_dir)
             };
