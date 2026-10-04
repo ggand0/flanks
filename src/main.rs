@@ -3,6 +3,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod ai;
+mod arc_overlay;
 mod arrows;
 mod audio;
 mod balance;
@@ -166,6 +167,7 @@ fn main() {
             combat::CombatPlugin,
             render_units::UnitRenderPlugin,
             selection_rings::SelectionRingsPlugin,
+            arc_overlay::ArcOverlayPlugin,
             camera::RtsCameraPlugin,
             overlay::OverlayPlugin,
             unit_cards::UnitCardsPlugin,

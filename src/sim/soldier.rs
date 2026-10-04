@@ -93,8 +93,25 @@ const CLOSE_STOP: f32 = 1.2;
 /// own centre and this wide to either side (its cosine). A comrade whose
 /// centre stands in it blocks the cut. A spear thrust needs only its
 /// lane, SPEAR_LINE_HALF_W to either side of the line to the enemy.
-const ARC_REACH: f32 = 1.2;
-const ARC_HALF_COS: f32 = 0.342;
+pub(crate) const ARC_REACH: f32 = 1.2;
+pub(crate) const ARC_HALF_COS: f32 = 0.342;
+
+/// Whether a man standing `to` away from him is in the arc of his cut,
+/// `fwd` his facing.
+#[inline]
+pub(crate) fn in_cut_arc(to: Vec2, fwd: Vec2) -> bool {
+    let d2 = to.length_squared();
+    (d2 < ARC_REACH * ARC_REACH) & (to.dot(fwd) > ARC_HALF_COS * d2.sqrt())
+}
+
+/// Whether a man standing `to` away from him is in the lane of his
+/// thrust at an enemy `enemy_d` away along `fight_dir`.
+#[inline]
+pub(crate) fn in_thrust_lane(to: Vec2, fight_dir: Vec2, enemy_d: f32) -> bool {
+    let along = to.dot(fight_dir);
+    let lateral = to.dot(Vec2::new(-fight_dir.y, fight_dir.x));
+    (along > 0.0) & (along < enemy_d) & (lateral.abs() < SPEAR_LINE_HALF_W)
+}
 
 /// FL_FIGHT_ROOM=0 turns the room to fight off: every kind closes to
 /// CLOSE_STOP, nobody steps back, and a blow needs no clear arc. For A/B
@@ -212,7 +229,7 @@ const WALL_SEP_RADIUS: f32 = 1.05;
 /// reaches the spearman and swings with his full charge bonus: gaps
 /// are real, coverage at 1.05 m wall pitch is ~2/3 of the frontage.
 const SPEAR_POINT_MIN: f32 = 0.9;
-const SPEAR_LINE_HALF_W: f32 = 0.35;
+pub(crate) const SPEAR_LINE_HALF_W: f32 = 0.35;
 
 /// Global damage multiplier. FL_COMBAT_SCALE overrides (fast test battles).
 /// What every soldier reads and none writes: the job's shared inputs.
@@ -823,9 +840,9 @@ fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
                 let along = to.dot(fight_dir);
                 let lateral = to.dot(side_dir);
                 let in_arc = if thrust {
-                    (along > 0.0) & (along < enemy_d) & (lateral.abs() < SPEAR_LINE_HALF_W)
+                    in_thrust_lane(to, fight_dir, enemy_d)
                 } else {
-                    (d2 < ARC_REACH * ARC_REACH) & (to.dot(fwd) > ARC_HALF_COS * len)
+                    in_cut_arc(to, fwd)
                 };
                 arc |= comrade & standing & in_arc;
                 left |= comrade & near & (lateral > quarter);
