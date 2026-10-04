@@ -113,10 +113,12 @@ const COUNTERS: usize = 2 * NUM_BUCKETS + CASTER_LISTS + 1 + NUM_KINDS + NUM_BUC
 const STORAGE_BUFFERS: u32 = 11;
 
 /// Pose slots (four floats each) per soldier of a kind without a bow rig,
-/// and of one with it (`POSE_SLOTS` and `POSE_SLOTS_BOW` in
-/// shaders/unit_pose.wgsl).
+/// of one with it, and of one posed by a skeleton: the six common slots
+/// and two per joint (`POSE_SLOTS`, `POSE_SLOTS_BOW` and `POSE_SLOTS_SKEL`
+/// in shaders/unit_pose.wgsl).
 const POSE_SLOTS: u32 = 17;
 const POSE_SLOTS_BOW: u32 = 45;
+const POSE_SLOTS_SKEL: u32 = 6 + 2 * crate::unit_meshes::SKEL_JOINTS as u32;
 
 /// Bytes of one set of per-bucket list entries in the bucket table: the
 /// camera's set, then one per cascade. A pulled draw binds one set, at a
@@ -735,10 +737,12 @@ struct PullVertex {
     pivot: f32,
     /// Vertex colour, unorm8 rgba.
     color: u32,
-    /// Atlas coordinates, unorm16 each, then padding to the WGSL struct's
-    /// 48 bytes.
+    /// Atlas coordinates, unorm16 each.
     atlas_uv: u32,
-    pad: [u32; 2],
+    /// A skinned level's joint pair, `a + 256 * b`, and the weight of b
+    /// (unit_glb.rs `ATTRIBUTE_SKIN`). Zero on a level without a skin.
+    skin: u32,
+    weight: f32,
 }
 
 /// A bucket's level mesh with its index list expanded: the vertex shader
@@ -836,7 +840,7 @@ fn weld(corners: &[PullVertex]) -> IndexedMesh {
     let flat_atlas = corners
         .chunks(3)
         .all(|t| t[1].atlas_uv == t[0].atlas_uv && t[2].atlas_uv == t[0].atlas_uv);
-    let key = |v: &PullVertex| -> [u32; 10] {
+    let key = |v: &PullVertex| -> [u32; 12] {
         let f = f32::to_bits;
         [
             f(v.position[0]),
@@ -849,9 +853,11 @@ fn weld(corners: &[PullVertex]) -> IndexedMesh {
             f(v.pivot),
             v.color,
             if flat_atlas { 0 } else { v.atlas_uv },
+            v.skin,
+            f(v.weight),
         ]
     };
-    let mut slots = bevy::platform::collections::HashMap::<[u32; 10], u32>::default();
+    let mut slots = bevy::platform::collections::HashMap::<[u32; 12], u32>::default();
     let mut vertices: Vec<PullVertex> = Vec::new();
     let list: Vec<u32> = corners
         .iter()
@@ -1016,6 +1022,10 @@ impl PullMesh {
         let Some(V::Float32x2(atlas_uv)) = mesh.attribute(Mesh::ATTRIBUTE_UV_1) else {
             return None;
         };
+        let skin = match mesh.attribute(crate::unit_glb::ATTRIBUTE_SKIN) {
+            Some(V::Float32x2(skin)) => Some(skin),
+            _ => None,
+        };
         let vertex = |i: usize| PullVertex {
             position: pos[i],
             part: uv[i][0],
@@ -1023,7 +1033,8 @@ impl PullMesh {
             pivot: uv[i][1],
             color: pack_unorm8(col[i]),
             atlas_uv: pack_unorm16(atlas_uv[i]),
-            pad: [0; 2],
+            skin: skin.map_or(0, |s| s[i][0] as u32),
+            weight: skin.map_or(0.0, |s| s[i][1]),
         };
         let indices = mesh.indices()?;
         let corners: Vec<PullVertex> = indices.iter().map(vertex).collect();
@@ -1521,6 +1532,9 @@ fn prepare_gpu_units(
         for (bucket, rig, _) in &rigs {
             if rig.rig.bow.params[3] > 0.5 {
                 pose_stride[bucket.0 / NUM_LODS] = POSE_SLOTS_BOW;
+            }
+            if rig.rig.skel.params[0] > 0 {
+                pose_stride[bucket.0 / NUM_LODS] = POSE_SLOTS_SKEL;
             }
         }
     }
@@ -2099,7 +2113,8 @@ mod tests {
                 pivot: 0.5,
                 color: u32::MAX,
                 atlas_uv: (k / 3) as u32 * 7 + 1,
-                pad: [0; 2],
+                skin: 0,
+                weight: 0.0,
             })
             .collect();
         let m = weld(&corners);
@@ -2136,7 +2151,8 @@ mod tests {
             pivot: 0.0,
             color: 0,
             atlas_uv: atlas,
-            pad: [0; 2],
+            skin: 0,
+            weight: 0.0,
         };
         let corners = [
             corner(0.0, 1), corner(1.0, 2), corner(2.0, 3),

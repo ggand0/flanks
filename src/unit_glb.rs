@@ -31,6 +31,12 @@
 //! `<kind>.shoot.json`. Without them the parts join the arm, bow arm or
 //! body they belong to, and the archer shoots as a rigid figure.
 //!
+//! A model with a glTF skin and the clips of `SKEL_CLIPS` next to it
+//! (`<kind>.<clip>.json`, the one clip format of docs/plans/022) is posed
+//! by its skeleton when `FL_CLIPS=1`: every vertex follows a joint pair
+//! (`ATTRIBUTE_SKIN`), and the pose pass plays the clips (unit_pose.wgsl
+//! `put_skeleton`). Without the flag the same file draws by its parts.
+//!
 //! `FL_UNIT_MESH=code` keeps the code-built meshes and `FL_GLB_FAR=code`
 //! fills only the missing levels from them. `FL_GLB_<KIND>=path` loads
 //! another file for one kind, for example `FL_GLB_KNIGHT=path/to/knight.glb`.
@@ -46,7 +52,7 @@ use bevy::prelude::*;
 use bevy::render::render_resource::TextureFormat;
 
 use crate::render_units::NUM_LODS;
-use crate::unit_meshes::{MeshBuf, Rig, blend};
+use crate::unit_meshes::{MeshBuf, Rig, SKEL_CLIP_SLOTS, SKEL_JOINTS, Skel, blend};
 use crate::unit_types::NUM_KINDS;
 
 type Fallible<T> = Result<T, String>;
@@ -273,6 +279,10 @@ struct Level {
     col: Vec<[f32; 4]>,
     /// Atlas coordinates, zero on an untextured model.
     tex: Vec<[f32; 2]>,
+    /// Per vertex of a skinned model, the two joints it follows and the
+    /// weight of the second (`JOINTS_0`, `WEIGHTS_0`). Empty when a
+    /// primitive of the level has no skin.
+    skin: Vec<(u16, u16, f32)>,
     idx: Vec<u32>,
 }
 
@@ -320,12 +330,15 @@ fn import(kind: usize, path: &Path) -> Fallible<KindMeshes> {
         .default_scene()
         .or_else(|| gltf.document.scenes().next())
         .ok_or("the file has no scene")?;
+    // Every node's origin in model space, by node index, for the skeleton.
+    let mut origins: Vec<Vec3> = vec![Vec3::ZERO; gltf.document.nodes().len()];
     let mut stack: Vec<(gltf::Node, Mat4)> = scene.nodes().map(|n| (n, Mat4::IDENTITY)).collect();
     while let Some((node, parent)) = stack.pop() {
         let xf = parent * Mat4::from_cols_array_2d(&node.transform().matrix());
         for child in node.children() {
             stack.push((child, xf));
         }
+        origins[node.index()] = xf.w_axis.truncate();
         let Some(name) = node.name() else { continue };
         if let Some(part) = name
             .strip_prefix("pivot_")
@@ -370,10 +383,32 @@ fn import(kind: usize, path: &Path) -> Fallible<KindMeshes> {
     }
     let local = |p: Vec3| [scale * p.y - half_height, scale * p.z];
     let local3 = |p: Vec3| Vec3::new(scale * p.x, scale * p.y - half_height, scale * p.z);
-    let (rig, clips) = match bow_rig(&mut levels, &empties, local3, scale, path, name) {
+    let (mut rig, mut clips) = match bow_rig(&mut levels, &empties, local3, scale, path, name) {
         Some(bow) => bow,
         None => (arm_rig(&mut levels, &empties, local, scale, path, name), Vec::new()),
     };
+    // A skeleton takes the clip buffer, which a bow rig's shots fill.
+    let skinned = clips_on() && clips.is_empty() && gltf.document.skins().next().is_some();
+    if skinned {
+        match read_skeleton(&gltf, &origins, &mut levels, local3, scale, path) {
+            Ok((skel, rows)) => {
+                info!(
+                    "{name}: skeleton of {} joints, clips {:?} ({} rows)",
+                    skel.params[0],
+                    SKEL_CLIPS,
+                    rows.len()
+                );
+                rig.skel = skel;
+                clips = rows;
+            }
+            Err(e) => warn!("{name}: FL_CLIPS is set but its skeleton is not usable, it draws by its parts: {e}"),
+        }
+    }
+    if rig.skel.params[0] == 0 {
+        for level in levels.iter_mut().flatten() {
+            level.skin.clear();
+        }
+    }
 
     let imported: Vec<usize> = (0..NUM_LODS).filter(|l| levels[*l].is_some()).collect();
     let tris: Vec<usize> = levels.iter().map(|l| l.as_ref().map_or(0, Level::tris)).collect();
@@ -525,6 +560,141 @@ fn arm_rig(
         hold,
         ..Rig::default()
     }
+}
+
+/// `FL_CLIPS=1`: a model with a skeleton and its clips is posed by them.
+pub fn clips_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::util::env_or("FL_CLIPS", 0_u32) != 0)
+}
+
+/// The clips a skinned kind plays, by slot (unit_pose.wgsl `CLIP_STAND`
+/// and on). Each is `<kind>.<name>.json` next to the model.
+const SKEL_CLIPS: [&str; 2] = ["stand", "ready"];
+const _: () = assert!(SKEL_CLIPS.len() <= SKEL_CLIP_SLOTS);
+
+/// The joints the player's gait, arm sway and attack write, in the order
+/// of `Skel::roles`.
+const SKEL_ROLES: [[&str; 4]; 5] = [
+    ["pelvis", "chest", "head", "weapon"],
+    ["upperarm_r", "forearm_r", "hand_r", "coat_r"],
+    ["upperarm_l", "forearm_l", "hand_l", "coat_l"],
+    ["thigh_r", "shin_r", "foot_r", ""],
+    ["thigh_l", "shin_l", "foot_l", ""],
+];
+
+/// A clip in the one format (docs/plans/022): per sample the root's
+/// offset from rest, then one quaternion per joint relative to its parent.
+#[derive(serde::Deserialize)]
+struct ClipFile {
+    format: String,
+    version: u32,
+    joints: Vec<String>,
+    fps: f32,
+    #[serde(rename = "loop")]
+    looped: bool,
+    samples: Vec<Vec<f32>>,
+}
+
+/// The model's skeleton and its clips as rows of the clip buffer, and
+/// every level's joint pairs put in parent then child order. Fails when
+/// the skin, a level's weights or a clip file do not fit the player.
+fn read_skeleton(
+    gltf: &gltf::Gltf,
+    origins: &[Vec3],
+    levels: &mut [Option<Level>; NUM_LODS],
+    local3: impl Fn(Vec3) -> Vec3,
+    scale: f32,
+    model: &Path,
+) -> Fallible<(Skel, Vec<[f32; 4]>)> {
+    let skin = gltf.document.skins().next().ok_or("no skin")?;
+    let nodes: Vec<gltf::Node> = skin.joints().collect();
+    let count = nodes.len();
+    if count == 0 || count > SKEL_JOINTS {
+        return Err(format!("{count} joints, the player poses up to {SKEL_JOINTS}"));
+    }
+    let names: Vec<String> = nodes.iter().map(|n| n.name().unwrap_or("").to_string()).collect();
+    let mut parent = vec![-1_i32; count];
+    for (i, node) in nodes.iter().enumerate() {
+        for child in node.children() {
+            if let Some(c) = nodes.iter().position(|n| n.index() == child.index()) {
+                parent[c] = i as i32;
+            }
+        }
+    }
+    if parent.iter().enumerate().any(|(i, p)| *p >= i as i32) || parent.iter().filter(|p| **p < 0).count() != 1 {
+        return Err("the joints are not one tree with parents first".into());
+    }
+    let mut skel = Skel::default();
+    skel.params[0] = count as u32;
+    for (i, node) in nodes.iter().enumerate() {
+        let at = local3(origins[node.index()]);
+        skel.joints[i] = [at.x, at.y, at.z, parent[i] as f32];
+    }
+    for (row, roles) in SKEL_ROLES.iter().enumerate() {
+        for (k, role) in roles.iter().enumerate() {
+            if role.is_empty() {
+                continue;
+            }
+            let j = names.iter().position(|n| n == role).ok_or(format!("no joint named {role}"))?;
+            skel.roles[row][k] = j as u32;
+        }
+    }
+    // A vertex follows a joint and one of its children, the child second.
+    for (lod, level) in levels.iter_mut().enumerate() {
+        let Some(level) = level else { continue };
+        if level.skin.is_empty() {
+            return Err(format!("L{lod} has no JOINTS_0 and WEIGHTS_0"));
+        }
+        for v in &mut level.skin {
+            let (a, b, w) = *v;
+            if a as usize >= count || b as usize >= count {
+                return Err(format!("L{lod}: a vertex names joint {} of {count}", a.max(b)));
+            }
+            *v = if w < 1e-4 {
+                (a, a, 0.0)
+            } else if parent[b as usize] == a as i32 {
+                (a, b, w)
+            } else if parent[a as usize] == b as i32 {
+                (b, a, 1.0 - w)
+            } else {
+                return Err(format!(
+                    "L{lod}: a vertex follows {} and {}, which are not parent and child",
+                    names[a as usize], names[b as usize]
+                ));
+            };
+        }
+    }
+    let mut rows: Vec<[f32; 4]> = Vec::new();
+    for (slot, clip) in SKEL_CLIPS.iter().enumerate() {
+        let path = model.with_extension(format!("{clip}.json"));
+        let text = crate::game_files::read_to_string(&path)
+            .map_err(|e| format!("cannot read its clip {}: {e}", path.display()))?;
+        let file: ClipFile =
+            serde_json::from_str(&text).map_err(|e| format!("{} is not a clip: {e}", path.display()))?;
+        if file.format != "flanks-clip" || file.version != 1 {
+            return Err(format!("{} is not a flanks-clip of version 1", path.display()));
+        }
+        if file.joints != names {
+            return Err(format!("{}: its joints are not the model's, in the model's order", path.display()));
+        }
+        if file.samples.is_empty() || !file.fps.is_finite() || file.fps <= 0.0 {
+            return Err(format!("{} has no samples or no rate", path.display()));
+        }
+        skel.clips[slot] = [rows.len() as u32, file.samples.len() as u32, 0, file.looped as u32];
+        skel.rates[slot][0] = file.fps;
+        for sample in &file.samples {
+            if sample.len() != 3 + 4 * count || sample.iter().any(|v| !v.is_finite()) {
+                return Err(format!("{}: a sample is not 3 + 4 x {count} numbers", path.display()));
+            }
+            rows.push([scale * sample[0], scale * sample[1], scale * sample[2], 0.0]);
+            for q in sample[3..].chunks_exact(4) {
+                let q = Quat::from_xyzw(q[0], q[1], q[2], q[3]).normalize();
+                rows.push(q.to_array());
+            }
+        }
+    }
+    Ok((skel, rows))
 }
 
 /// The weapon's direction from the grip to its point, and how far it
@@ -1000,6 +1170,7 @@ fn read_primitive(
         None => None,
     };
     let indices = reader.read_indices().ok_or("the mesh has no index buffer")?;
+    let skin = reader.read_joints(0).zip(reader.read_weights(0));
 
     let base = level.pos.len() as u32;
     // A node scale would squash the normals; the inverse transpose is
@@ -1020,10 +1191,26 @@ fn read_primitive(
         Some(tex) => level.tex.extend(tex.into_f32()),
         None => level.tex.resize(n, [0.0; 2]),
     }
+    // The two heaviest joints of each vertex. A level keeps its skin only
+    // while every primitive read into it has one.
+    match skin {
+        Some((joints, weights)) if level.skin.len() == base as usize => {
+            for (j, w) in joints.into_u16().zip(weights.into_f32()) {
+                let mut order = [0, 1, 2, 3];
+                order.sort_by(|a, b| w[*b].total_cmp(&w[*a]));
+                let (first, second) = (order[0], order[1]);
+                let sum = w[first] + w[second];
+                let share = if sum > 0.0 { w[second] / sum } else { 0.0 };
+                level.skin.push((j[first], j[second], share));
+            }
+        }
+        _ => level.skin.clear(),
+    }
     if level.nrm.len() != n
         || level.col.len() != n
         || level.part.len() != n
         || level.tex.len() != n
+        || (!level.skin.is_empty() && level.skin.len() != n)
     {
         return Err("the attributes have different vertex counts".into());
     }
@@ -1106,7 +1293,31 @@ fn to_local(level: &mut Level, scale: f32, half_height: f32) {
     }
 }
 
+/// Per vertex of a skinned level: x = its two joints as `a + 256 * b`,
+/// y = the weight of joint b. b is a or a child of a, and the vertex
+/// turns about b's origin (unit_pose.wgsl `place`).
+pub const ATTRIBUTE_SKIN: bevy::mesh::MeshVertexAttribute = bevy::mesh::MeshVertexAttribute::new(
+    "UnitSkin",
+    0x464c_534b,
+    bevy::render::render_resource::VertexFormat::Float32x2,
+);
+
 fn level_mesh(level: &Level) -> Mesh {
+    let mesh = level_mesh_unskinned(level);
+    if level.skin.is_empty() {
+        return mesh;
+    }
+    mesh.with_inserted_attribute(
+        ATTRIBUTE_SKIN,
+        level
+            .skin
+            .iter()
+            .map(|(a, b, w)| [(*a as u32 + 256 * *b as u32) as f32, *w])
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn level_mesh_unskinned(level: &Level) -> Mesh {
     Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::RENDER_WORLD)
         .with_inserted_attribute(
             Mesh::ATTRIBUTE_POSITION,

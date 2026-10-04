@@ -34,6 +34,28 @@ struct Rig {
     windup: array<vec4<f32>, 33>,
     recover: array<vec4<f32>, 33>,
     bow: Bow,
+    skel: Skel,
+};
+
+// A skinned kind's skeleton (unit_meshes.rs `Skel`). Every joint's rest
+// rotation is identity, so a pose is one rotation per joint from rest.
+struct Skel {
+    // x = how many joints, 0 without a skeleton.
+    params: vec4<u32>,
+    // xyz = the joint's rest origin, local space; w = its parent's index,
+    // -1 for the root. Parents come first.
+    joints: array<vec4<f32>, 20>,
+    // Per clip: x = its first vec4 in `clips`, y = its samples, w = 1 when
+    // it loops. A sample is the root's offset from rest, then one
+    // quaternion per joint relative to its parent.
+    clips: array<vec4<u32>, 8>,
+    // Per clip: x = samples per second.
+    rates: array<vec4<f32>, 8>,
+    // The joints the gait, the arm sway and the attack write: (pelvis,
+    // chest, head, weapon), then (upper arm, forearm, hand, coat) of the
+    // weapon side and of the shield side, then (thigh, shin, foot) of
+    // each.
+    roles: array<vec4<u32>, 5>,
 };
 
 // An archer's jointed arms and strung bow (unit_meshes.rs `Bow`), local
@@ -60,7 +82,8 @@ struct Bow {
     clips: array<vec4<u32>, 2>,
 };
 @group(3) @binding(6) var<uniform> rig: Rig;
-// The shot tables of this bucket's kind (unit_glb.rs `Shots::buffer`).
+// The tables of this bucket's kind: an archer's shots (unit_glb.rs
+// `Shots::buffer`), or a skinned kind's clips (`read_skeleton`).
 // A pose is 8 vec4s: six joint turns as xyzw quaternions (the drawing
 // arm's shoulder, elbow and wrist, then the bow arm's), (bow yaw, limb
 // bend, arrow shown, body yaw), (torso pitch, bow pitch). A free-arrow
@@ -577,10 +600,17 @@ const P_RIG: u32 = 13u;
 // Two slots per bow rig part (`bow_part`): the rotation, then the offset
 // and the scale.
 const P_BOW: u32 = 17u;
-// Slots per soldier: without a bow rig, and with one (render_units_gpu.rs
-// POSE_SLOTS).
+// A skinned kind: two slots per joint from here, after the common slots.
+// The joint's rotation in local space, then its posed origin.
+const P_SKEL: u32 = 6u;
+// Slots per soldier: without a bow rig, with one, and with a skeleton
+// (render_units_gpu.rs POSE_SLOTS).
 const POSE_SLOTS: u32 = 17u;
 const POSE_SLOTS_BOW: u32 = 45u;
+const POSE_SLOTS_SKEL: u32 = 46u;
+// A skinned kind's clips, by slot (unit_glb.rs `SKEL_CLIPS`).
+const CLIP_STAND: u32 = 0u;
+const CLIP_READY: u32 = 1u;
 // Parts of the bow rig.
 const BOW_PARTS: u32 = 14u;
 
@@ -1200,6 +1230,120 @@ fn chain_slot(part: f32) -> u32 {
 }
 
 #ifdef UNIT_POSE_WRITE
+// Joint j's rotation in sample i of a skeleton clip, and the root's offset.
+fn skel_turn(clip: u32, i: u32, j: u32) -> vec4<f32> {
+    return clips[rig.skel.clips[clip].x + i * (rig.skel.params.x + 1u) + 1u + j];
+}
+
+fn skel_root(clip: u32, i: u32) -> vec3<f32> {
+    return clips[rig.skel.clips[clip].x + i * (rig.skel.params.x + 1u)].xyz;
+}
+
+// Rotation a toward b by t, the shorter way.
+fn qblend(a: vec4<f32>, b: vec4<f32>, t: f32) -> vec4<f32> {
+    return normalize(mix(a, select(b, -b, dot(a, b) < 0.0), t));
+}
+
+// The sword arm's blow and cheer as `put_rig_arm` plays them from the
+// rest pose, without the march's sway and carry: shoulder, elbow and
+// wrist pitches (+ taking +Z toward +Y), and the slash's yaw.
+fn sword_arm() -> vec4<f32> {
+    let reach = length(rig.elbow - rig.shoulder) + length(rig.grip - rig.elbow);
+    let rest = yz_angle(rig.tip);
+    var goal = rig.grip;
+    var aim = rest;
+    var turn = 0.0;
+    var yaw = 0.0;
+    if pre.celebrate > 0.001 {
+        turn = pre.celebrate * (1.75 + 0.35 * sin(pre.wobble));
+    } else if pre.style < 0.5 {
+        goal = rig.grip + yz_dir(rest) * reach * (-0.4 * pre.raise * (1.0 - pre.chop) + 0.7 * pre.chop);
+        aim = rest + 0.15 * pre.raise - 0.1 * pre.chop;
+    } else if pre.style < 1.5 {
+        turn = 1.9 * pre.raise - 2.5 * pre.chop;
+    } else {
+        yaw = -1.1 * pre.raise + 2.3 * pre.chop;
+        turn = 0.5 * pre.raise - 0.3 * pre.chop;
+    }
+    let pose = arm_pose(goal, aim);
+    return vec4<f32>(pose.x + turn, pose.y, pose.z, yaw);
+}
+
+// A skinned soldier: one rotation per joint, relative to its parent, then
+// the hierarchy walked once into each joint's rotation and posed origin.
+// He stands in the standing clip, and in the ready clip while an enemy is
+// near and he is still. On the move his legs take the gait and his arms
+// its sway. A blow and the cheer play the sword arm's motion from the
+// rest pose, and the body leaves the guard to face the blow. The fallen
+// lie in the standing pose.
+fn put_skeleton() {
+    let n = rig.skel.params.x;
+    let alive = pre.leg > 0.0;
+    let moving = select(0.0, pre.moving, alive);
+    var act = pre.celebrate;
+    if pre.following {
+        act = max(act, 1.0 - smoothstep(0.75, 1.0, pre.follow));
+    } else if pre.windup > 0.0 {
+        act = max(act, smoothstep(0.0, 0.2, pre.windup));
+    }
+    act = select(0.0, act, alive && rig.arm > 0.5 && rig.hold < 1.5);
+    let level = max(max(pre.stance, pre.ready * 0.75), max(pre.sprint, pre.wall)) * (1.0 - pre.celebrate);
+    let guard = select(0.0, level * (1.0 - moving) * (1.0 - act), alive);
+
+    var turn: array<vec4<f32>, 20>;
+    for (var j = 0u; j < n; j++) {
+        turn[j] = qblend(skel_turn(CLIP_STAND, 0u, j), skel_turn(CLIP_READY, 0u, j), guard);
+    }
+    let root = mix(skel_root(CLIP_STAND, 0u), skel_root(CLIP_READY, 0u), guard);
+    let core = rig.skel.roles[0];
+    let arm_r = rig.skel.roles[1];
+    let arm_l = rig.skel.roles[2];
+
+    if moving > 0.0 {
+        // The gait: thigh, knee and foot pitches, the weapon side's leg
+        // half a cycle after the shield side's (`put_leg`). The coat
+        // swings with the thigh.
+        for (var side = 0u; side < 2u; side++) {
+            let pose = leg_pose(fract(pre.gait + select(0.5, 0.0, side == 1u)), pre.g);
+            let shin = pose.x - pose.y;
+            let leg = rig.skel.roles[3u + side];
+            let coat = rig.skel.roles[1u + side].w;
+            turn[leg.x] = qblend(turn[leg.x], qx(-pose.x), moving);
+            turn[leg.y] = qblend(turn[leg.y], qx(pose.y), moving);
+            turn[leg.z] = qblend(turn[leg.z], qx(shin - pose.z), moving);
+            turn[coat] = qblend(turn[coat], qx(-pose.x), moving);
+        }
+        // The shoulders turn against the legs, and the arms counter them.
+        turn[core.y] = qmul(turn[core.y], qy(0.10 * pre.g.run * pre.g.stride * pre.limb * moving));
+        let sway = (0.18 - 0.06 * pre.g.run) * moving * pre.limb * (1.0 - pre.raise);
+        turn[arm_r.x] = qmul(qx(-sway), turn[arm_r.x]);
+        turn[arm_l.x] = qmul(qx(0.06 * moving * pre.limb * (1.0 - pre.wall)), turn[arm_l.x]);
+    }
+    if act > 0.0 {
+        let blow = sword_arm();
+        turn[arm_r.x] = qblend(turn[arm_r.x], qmul(qx(-blow.x), qy(blow.w)), act);
+        turn[arm_r.y] = qblend(turn[arm_r.y], qx(-blow.y), act);
+        turn[arm_r.z] = qblend(turn[arm_r.z], QI, act);
+        turn[core.w] = qblend(turn[core.w], qx(-blow.z), act);
+    }
+
+    var rot: array<vec4<f32>, 20>;
+    var org: array<vec3<f32>, 20>;
+    for (var j = 0u; j < n; j++) {
+        let rest = rig.skel.joints[j];
+        let p = i32(rest.w);
+        if p < 0 {
+            rot[j] = normalize(turn[j]);
+            org[j] = rest.xyz + root;
+        } else {
+            rot[j] = normalize(qmul(rot[p], turn[j]));
+            org[j] = org[p] + qrot(rot[p], rest.xyz - rig.skel.joints[p].xyz);
+        }
+        pose_put(P_SKEL + 2u * j, rot[j]);
+        pose_put(P_SKEL + 2u * j + 1u, vec4<f32>(org[j], 0.0));
+    }
+}
+
 // The whole pose of the soldier with this instance record, into the slots
 // from `base` on.
 fn pose_write(
@@ -1212,6 +1356,10 @@ fn pose_write(
 ) {
     pose_base = base;
     pose_begin(pos_scale, color, anim, anim2, time);
+    if rig.skel.params.x > 0u {
+        put_skeleton();
+        return;
+    }
     put_simple();
     // The fallen keep the legs they fell with (`place`).
     if pre.leg > 0.0 {
@@ -1253,17 +1401,44 @@ fn pitch_normal_cs(n: vec3<f32>, c: f32, s: f32) -> vec3<f32> {
 
 // Where a corner of the mesh lands in the world, posed: its rest position
 // and normal in the soldier's local space, its body part and the part's
-// pivot height.
-fn place(rest: vec3<f32>, rest_normal: vec3<f32>, part_id: f32, pivot_height: f32) -> Placed {
+// pivot height. On a skinned kind, `skin` is its joint pair, a + 256 * b,
+// and `weight` the share of b.
+fn place(
+    rest: vec3<f32>,
+    rest_normal: vec3<f32>,
+    part_id: f32,
+    pivot_height: f32,
+    skin: u32,
+    weight: f32,
+) -> Placed {
     let corner = Corner(rest, rest_normal, part_id, pivot_height);
     let part = corner.part;
     let pivot = corner.pivot;
     var local = corner.position;
     var normal = corner.normal;
     let bow_rig = rig.bow.params.w > 0.5;
+#ifdef UNIT_POSE_READ
+    let skinned = rig.skel.params.x > 0u;
+#else
+    let skinned = false;
+#endif
 
     // --- Part animation (rotations around the part pivot) ---
-    if bow_rig && (abs(part - 1.0) < 0.5 || abs(part - 6.0) < 0.5 || (part > 7.5 && part < 19.5)) {
+    if skinned {
+#ifdef UNIT_POSE_READ
+        // The corner turns about joint b's origin by the blend of its two
+        // joints' rotations: rigid on a at weight 0, on b at 1.
+        let a = skin & 0xffu;
+        let b = (skin >> 8u) & 0xffu;
+        var q = pose_at(P_SKEL + 2u * a);
+        if b != a {
+            let qb = pose_at(P_SKEL + 2u * b);
+            q = normalize(mix(q, select(qb, -qb, dot(q, qb) < 0.0), weight));
+        }
+        local = pose_at(P_SKEL + 2u * b + 1u).xyz + qrot(q, local - rig.skel.joints[b].xyz);
+        normal = qrot(q, normal);
+#endif
+    } else if bow_rig && (abs(part - 1.0) < 0.5 || abs(part - 6.0) < 0.5 || (part > 7.5 && part < 19.5)) {
 #ifdef UNIT_POSE_READ
         var k = u32(part + 0.5) - 6u;
         if part < 1.5 {
@@ -1402,8 +1577,9 @@ fn place(rest: vec3<f32>, rest_normal: vec3<f32>, part_id: f32, pivot_height: f3
 
     // The shoulders turn against the legs and the upper body shifts over
     // the planted foot, easing in up the torso so the hips stay square.
+    // A skinned kind takes the turn in its chest joint.
     let yaw = pose_at(P_YAW);
-    if part < 1.5 || (part > 3.5 && part < 6.5) || (part > 7.5 && part < 19.5) {
+    if !skinned && (part < 1.5 || (part > 3.5 && part < 6.5) || (part > 7.5 && part < 19.5)) {
         let turn = pose_at(P_TURN);
         let torso = part < 0.5 || abs(part - 19.0) < 0.5;
         let w = select(1.0, smoothstep(0.0, 0.25, corner.position.y), torso);
