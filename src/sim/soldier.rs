@@ -103,33 +103,21 @@ const FIGHT_SHARE: f32 = 0.9;
 const BACK_SLACK: f32 = 0.3;
 /// The closing distance of every kind with the room to fight off.
 const CLOSE_STOP: f32 = 1.2;
-/// A cut needs a clear arc: the ground in front of a man that his blade
-/// sweeps, a sector centred on his facing that reaches this far from his
-/// own centre and this wide to either side (its cosine). A comrade whose
-/// centre stands in it blocks the cut. A spear thrust needs only its
-/// lane, SPEAR_LINE_HALF_W to either side of the line to the enemy.
-pub(crate) const ARC_REACH: f32 = 1.2;
-pub(crate) const ARC_HALF_COS: f32 = 0.342;
-
-/// Whether a man standing `to` away from him is in the arc of his cut,
-/// `fwd` his facing.
+/// A blow needs a clear lane: a man does not strike through a comrade
+/// who stands between him and his enemy, within SPEAR_LINE_HALF_W of the
+/// line from one to the other. The stab and the overhead chop both travel
+/// in the vertical plane through that line, so neither needs room to the
+/// side. `to` is where the other man stands from him, `fight_dir` the
+/// direction to his enemy and `enemy_d` the distance.
 #[inline]
-pub(crate) fn in_cut_arc(to: Vec2, fwd: Vec2) -> bool {
-    let d2 = to.length_squared();
-    (d2 < ARC_REACH * ARC_REACH) & (to.dot(fwd) > ARC_HALF_COS * d2.sqrt())
-}
-
-/// Whether a man standing `to` away from him is in the lane of his
-/// thrust at an enemy `enemy_d` away along `fight_dir`.
-#[inline]
-pub(crate) fn in_thrust_lane(to: Vec2, fight_dir: Vec2, enemy_d: f32) -> bool {
+pub(crate) fn in_lane(to: Vec2, fight_dir: Vec2, enemy_d: f32) -> bool {
     let along = to.dot(fight_dir);
     let lateral = to.dot(Vec2::new(-fight_dir.y, fight_dir.x));
     (along > 0.0) & (along < enemy_d) & (lateral.abs() < SPEAR_LINE_HALF_W)
 }
 
 /// FL_FIGHT_ROOM=0 turns the room to fight off: every kind closes to
-/// CLOSE_STOP, nobody steps back, and a blow needs no clear arc. For A/B
+/// CLOSE_STOP, nobody steps back, and a blow needs no clear lane. For A/B
 /// play in one binary.
 fn fight_room() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -175,7 +163,7 @@ const LOOK_TICKS: u32 = 8;
 /// `sight` bits: a comrade blocks his way, his left, his right; a
 /// comrade ahead; a comrade between him and his mark; a comrade close
 /// by running to the fight; one further out (far look); a comrade in
-/// the arc of his cut or the lane of his thrust; a man close behind him.
+/// the lane of his blow; a man close behind him.
 const SIGHT_WAY: u16 = 1;
 const SIGHT_LEFT: u16 = 1 << 1;
 const SIGHT_RIGHT: u16 = 1 << 2;
@@ -183,7 +171,7 @@ const SIGHT_AHEAD: u16 = 1 << 3;
 const SIGHT_MARK: u16 = 1 << 4;
 const SIGHT_GO: u16 = 1 << 5;
 const SIGHT_GO_FAR: u16 = 1 << 6;
-const SIGHT_ARC: u16 = 1 << 7;
+const SIGHT_LANE: u16 = 1 << 7;
 const SIGHT_BACK: u16 = 1 << 8;
 /// Even with nobody going in sight, a man joins once his regiment has
 /// been in melee longer than his own patience, spread between these
@@ -370,7 +358,7 @@ struct Step {
     right_blocked: bool,
     comrade_ahead: bool,
     slot_blocked: bool,
-    arc_blocked: bool,
+    lane_blocked: bool,
     back_blocked: bool,
     // The swing and the steering.
     face_target: Option<Vec2>,
@@ -477,7 +465,7 @@ fn begin(f: &Field, s: &mut Soldier) -> Step {
         right_blocked: false,
         comrade_ahead: false,
         slot_blocked: false,
-        arc_blocked: false,
+        lane_blocked: false,
         back_blocked: false,
         face_target: None,
         corr_len2: 0.0,
@@ -722,7 +710,7 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
 /// remembers if still in sight, the way he is going, and every eighth tick
 /// a look at the men around him (a comrade in his way, to his left or
 /// right, ahead, between him and his mark, or running to the fight; with
-/// an enemy in reach, a comrade in the arc of his cut and a man close
+/// an enemy in reach, a comrade in the lane of his blow and a man close
 /// behind him), remembered in the sight bits until the next look.
 #[inline]
 fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
@@ -730,7 +718,6 @@ fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
     let i = s.i;
     let p = st.p;
     let gi = st.gi;
-    let my_kind = st.my_kind;
     let dying = st.dying;
     let routed = st.routed;
     let in_melee = st.in_melee;
@@ -837,14 +824,10 @@ fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
         }
         if fighter {
             // The room he has to fight the enemy in reach: a comrade in the
-            // arc his cut sweeps (a sector on his facing) or in the lane of
-            // his thrust (along the line to the enemy), a comrade close to
-            // either side of his way to the enemy, and any man close behind
-            // him.
+            // lane of his blow, a comrade close to either side of his way to
+            // the enemy, and any man close behind him.
             let enemy_d = to_enemy.length();
-            let fwd = Vec2::new(s.yaw.sin(), s.yaw.cos());
-            let thrust = TYPES[my_kind].weapon == crate::unit_types::Weapon::Spear;
-            let (mut arc, mut left, mut right, mut back) = (false, false, false, false);
+            let (mut lane, mut left, mut right, mut back) = (false, false, false, false);
             grid.for_each_candidate(p, scan_r, |o| {
                 let other = o.idx as usize != i;
                 let comrade = other & ((o.meta & crate::spatial::META_TEAM) == my_team_bit);
@@ -856,17 +839,12 @@ fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
                 let near = d2 < SEP_RADIUS * SEP_RADIUS;
                 let along = to.dot(fight_dir);
                 let lateral = to.dot(side_dir);
-                let in_arc = if thrust {
-                    in_thrust_lane(to, fight_dir, enemy_d)
-                } else {
-                    in_cut_arc(to, fwd)
-                };
-                arc |= comrade & standing & in_arc;
+                lane |= comrade & standing & in_lane(to, fight_dir, enemy_d);
                 left |= comrade & near & (lateral > quarter);
                 right |= comrade & near & (lateral < -quarter);
                 back |= other & near & (along < -quarter);
             });
-            seen |= (arc as u16 * SIGHT_ARC)
+            seen |= (lane as u16 * SIGHT_LANE)
                 | (left as u16 * SIGHT_LEFT)
                 | (right as u16 * SIGHT_RIGHT)
                 | (back as u16 * SIGHT_BACK);
@@ -878,7 +856,7 @@ fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
     let right_blocked = *s.sight & SIGHT_RIGHT != 0;
     let comrade_ahead = *s.sight & SIGHT_AHEAD != 0;
     let slot_blocked = *s.sight & SIGHT_MARK != 0;
-    st.arc_blocked = *s.sight & SIGHT_ARC != 0;
+    st.lane_blocked = *s.sight & SIGHT_LANE != 0;
     st.back_blocked = *s.sight & SIGHT_BACK != 0;
     st.memo_valid = memo_valid;
     st.memo_dir = memo_dir;
@@ -1249,9 +1227,9 @@ fn swing(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
                         fwd.dot(to_t) >= 0.0
                     }
                 };
-                if chosen != u32::MAX && !routed && aware && st.arc_blocked {
-                    // He does not cut or thrust through a comrade: he waits
-                    // for room, and sidesteps to find it (`close_in`).
+                if chosen != u32::MAX && !routed && aware && st.lane_blocked {
+                    // He does not strike through a comrade: he waits for
+                    // room, and sidesteps to find it (`close_in`).
                 } else if chosen != u32::MAX && !routed && aware {
                     *s.target = chosen;
                     // Arriving at speed = a charging blow: momentum converts
@@ -1372,7 +1350,7 @@ fn sidestep(i: usize, tick: u32, left_blocked: bool, right_blocked: bool, side_d
 
 /// His footwork around the enemy in reach: closing to his weapon's
 /// length, stepping back to it from an enemy who has come inside it, and
-/// waiting for a clear arc. With nobody in reach, going to the enemy he
+/// waiting for a clear lane. With nobody in reach, going to the enemy he
 /// remembers through open ground (waiting behind a comrade, sidestepping
 /// now and then), or, with nobody to close on, joining his regiment's
 /// fight at the jog.
@@ -1455,8 +1433,8 @@ fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
             (false, false) => CLOSE_STOP,
         };
         let ready = *s.swing & crate::units::SWING_STATE_MASK == crate::units::SWING_READY;
-        if !memo_close && best_idx != u32::MAX && ready && st.arc_blocked {
-            // A comrade stands in the arc of his cut. He does not lean in
+        if !memo_close && best_idx != u32::MAX && ready && st.lane_blocked {
+            // A comrade stands in the lane of his blow. He does not lean in
             // on the man: he waits, and in some windows he sidesteps toward
             // open ground, as a man blocked on his way does. A wall fights
             // from its slots.
