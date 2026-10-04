@@ -42,6 +42,21 @@ fn body_distance() -> f32 {
 /// itself into overlap: packed interior units genuinely stop shoving.
 const CROWD_SLOW: f32 = 1.2;
 const CROWD_STOP: f32 = 2.5;
+/// The two values at the body distance in use. CROWD_STOP is six
+/// neighbours pressed to 0.91 of the 0.9 m body, and the press it stands
+/// for moves with the body distance: a drive still on where bodies
+/// overlap walks a packed man in, the overlap correction sets him back
+/// out, and he twitches every tick. The fade starts no later than where
+/// six neighbours touch him.
+fn crowd_brake() -> (f32, f32) {
+    static B: std::sync::OnceLock<(f32, f32)> = std::sync::OnceLock::new();
+    *B.get_or_init(|| {
+        let body = body_distance();
+        let stop = 6.0 - (6.0 - CROWD_STOP) * body / BODY_DISTANCE_OLD;
+        let touch = 6.0 * (1.0 - body / SEP_RADIUS);
+        (CROWD_SLOW.min(touch), stop)
+    })
+}
 const STEER_GAIN: f32 = 3.0;
 const MAX_ACCEL: f32 = 50.0;
 /// Facing turn smoothing (fraction/s of the remaining angle) — the
@@ -1319,7 +1334,8 @@ fn yield_to_crowd(st: &mut Step) {
     // Yield in dense crowds: goal drive fades out entirely so the mass can't
     // keep compressing itself; `jam` (0 = free, 1 = packed) also damps the
     // response below.
-    let jam = ((crowd - CROWD_SLOW) / (CROWD_STOP - CROWD_SLOW)).clamp(0.0, 1.0);
+    let (slow, stop) = crowd_brake();
+    let jam = ((crowd - slow) / (stop - slow)).clamp(0.0, 1.0);
     desired *= 1.0 - jam;
     st.corr = corr;
     st.corr_len2 = corr_len2;
@@ -1396,7 +1412,7 @@ fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
         (*s.target, false)
     } else if best_idx != u32::MAX {
         (best_idx, false)
-    } else if crowd < CROWD_SLOW && (!in_melee || committed) {
+    } else if crowd < crowd_brake().0 && (!in_melee || committed) {
         (*s.target, true)
     } else {
         (u32::MAX, false)
@@ -1447,7 +1463,7 @@ fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
             // steering, not combat execution: it yields to the jam like all
             // steering, so the press brakes on genuine body-pack. Ungated
             // this factor is always 1 (the memo gate above already required
-            // crowd < CROWD_SLOW, i.e. jam == 0).
+            // a crowd under the brake's start, i.e. jam == 0).
             if memo_close {
                 urge *= 1.0 - jam;
                 // He steps toward a remembered enemy only through open
