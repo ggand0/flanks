@@ -114,11 +114,27 @@ pub(crate) fn in_thrust_lane(to: Vec2, fight_dir: Vec2, enemy_d: f32) -> bool {
 }
 
 /// FL_FIGHT_ROOM=0 turns the room to fight off: every kind closes to
-/// CLOSE_STOP, nobody steps back, and a blow needs no clear arc. For A/B
-/// play in one binary.
+/// CLOSE_STOP, nobody steps back, a blow needs no clear arc, and a
+/// marching man waits behind nobody. For A/B play in one binary.
 fn fight_room() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| crate::util::env_or("FL_FIGHT_ROOM", 1_u32) != 0)
+}
+
+/// A man in formation on his way to his slot under an attack order does
+/// not walk into a comrade who stands in his way: he waits behind him.
+/// A man of another unit holds him up from SEP_RADIUS away, as on the way
+/// to an enemy, when that unit is fighting or the man is waiting himself;
+/// men of an idle unit he walks between, as a Move order does. A man of
+/// his own unit holds him up once he has come this close: their slots keep
+/// the ranks apart, and the whole unit steps off together. Once held up
+/// he waits until that man is SEP_RADIUS away or walks on, so a waiting
+/// rank that has eased apart does not close up again.
+/// FL_WAIT_BEHIND=0 turns the rule off on its own.
+const RANK_CLOSE: f32 = SEP_RADIUS - BACK_SLACK;
+fn wait_behind() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| fight_room() && crate::util::env_or("FL_WAIT_BEHIND", 1_u32) != 0)
 }
 
 /// Share of those windows in which a blocked man sidesteps
@@ -239,6 +255,8 @@ pub(crate) struct Field<'a> {
     pub terrain: &'a Terrain,
     /// Positions at the tick's start.
     pub pos_prev: &'a [Vec3],
+    /// What every man had last seen at the tick's start (SIGHT_* bits).
+    pub sight_prev: &'a [u16],
     pub speed: &'a [f32],
     pub team: &'a [u8],
     pub kind: &'a [u8],
@@ -709,7 +727,7 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
 /// behind him), remembered in the sight bits until the next look.
 #[inline]
 fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
-    let Field { grid, pos_prev, team, group, orders, engaged, focus, tick, .. } = *f;
+    let Field { grid, pos_prev, sight_prev, team, group, orders, engaged, moving, focus, tick, .. } = *f;
     let i = s.i;
     let p = st.p;
     let gi = st.gi;
@@ -757,6 +775,16 @@ fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
     } else {
         Vec2::ZERO
     };
+    // In formation and on his way to his slot under an attack order: his
+    // way is to the slot, and he looks for a comrade standing in it.
+    let march_dir = if wait_behind() && orders[gi].is_some() && !moving[gi] && !committed
+        && !routed && !dying
+    {
+        desired.normalize_or_zero()
+    } else {
+        Vec2::ZERO
+    };
+    let marching = march_dir != Vec2::ZERO;
     // With an enemy in reach his way is to that enemy, and he looks at the
     // room he has to fight him.
     let fighter = fight_room() && best_idx != u32::MAX && !dying && !routed;
@@ -817,6 +845,30 @@ fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
                 | (ahead_any as u16 * SIGHT_AHEAD)
                 | (mark as u16 * SIGHT_MARK)
                 | (go as u16 * SIGHT_GO);
+        }
+        if marching {
+            // A comrade ahead on his way to his slot who is not walking the
+            // same way (`wait_behind`).
+            let own_close = if *s.sight & SIGHT_MARK != 0 { SEP_RADIUS } else { RANK_CLOSE };
+            let mut held = false;
+            grid.for_each_candidate_vel(p, scan_r, |o, ov| {
+                let comrade = (o.idx as usize != i)
+                    & ((o.meta & crate::spatial::META_TEAM) == my_team_bit)
+                    & ((o.meta & crate::spatial::META_DYING) == 0);
+                let to = o.xz() - p;
+                let d2 = to.length_squared();
+                let ahead = to.dot(march_dir) > 0.707 * d2.sqrt();
+                let staying = ov.dot(march_dir) <= 0.5;
+                let unit = crate::spatial::meta_group(o.meta);
+                let close = if unit == gi {
+                    d2 < own_close * own_close
+                } else {
+                    (d2 < SEP_RADIUS * SEP_RADIUS)
+                        && (engaged[unit] || sight_prev[o.idx as usize] & SIGHT_MARK != 0)
+                };
+                held |= comrade & ahead & staying & close;
+            });
+            seen |= held as u16 * SIGHT_MARK;
         }
         if fighter {
             // The room he has to fight the enemy in reach: a comrade in the
@@ -901,6 +953,8 @@ fn hold_the_frame(f: &Field, st: &mut Step) {
     // ground: shoved off his mark with a comrade between him and it, a man
     // stands where he is until the way clears (the comrade dies, steps up or
     // moves back to his own mark) instead of pressing into the man's back.
+    // A man marching to his slot under an attack order waits the same way
+    // (`wait_behind`).
     if slot_blocked {
         desired = Vec2::ZERO;
     }
