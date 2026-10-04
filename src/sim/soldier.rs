@@ -351,6 +351,10 @@ struct Step {
     // The scan.
     push: Vec2,
     corr: Vec2,
+    /// Which way the overlap correction points, before its deadband and
+    /// cap, and the ground velocity of the bodies he overlaps.
+    overlap_dir: Vec2,
+    overlap_vel: Vec2,
     crowd: f32,
     best_idx: u32,
     sticky: bool,
@@ -460,6 +464,8 @@ fn begin(f: &Field, s: &mut Soldier) -> Step {
         desired: Vec2::ZERO,
         push: Vec2::ZERO,
         corr: Vec2::ZERO,
+        overlap_dir: Vec2::ZERO,
+        overlap_vel: Vec2::ZERO,
         crowd: 0.0,
         best_idx: u32::MAX,
         sticky: false,
@@ -584,6 +590,8 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
     // lane occupancy.
     let mut push = Vec2::ZERO;
     let mut corr = Vec2::ZERO;
+    let mut overlap_vel = Vec2::ZERO;
+    let mut overlap = 0.0f32;
     let mut crowd = 0.0f32;
     let my_team_bit = (team[i] as u32) * crate::spatial::META_TEAM;
     let my_wall = wall[gi] != 0;
@@ -612,7 +620,7 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
     } else {
         QUERY_RADIUS.max(params.reach)
     };
-    grid.for_each_candidate(p, scan_r, |o| {
+    grid.for_each_candidate_vel(p, scan_r, |o, o_vel| {
         if o.idx as usize == i {
             return;
         }
@@ -680,7 +688,10 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
                 // here as well made packed crowds oscillate at the
                 // acceleration cap, two solvers fighting over the same
                 // overlap, every frame.
-                corr += d * ((hard - len) * CORR_GAIN * mw / len);
+                let back = (hard - len) * CORR_GAIN * mw;
+                corr += d * (back / len);
+                overlap_vel += o_vel * back;
+                overlap += back;
             }
             push += d * (w * mw / len);
             // Jam density: COMPRESSED pairs only — a neighbor resting AT his
@@ -711,6 +722,9 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
     }
     st.push = push;
     st.corr = corr;
+    if overlap > 0.0 {
+        st.overlap_vel = overlap_vel / overlap;
+    }
     st.crowd = crowd;
     st.best_idx = best_idx;
     st.sticky = sticky;
@@ -1319,6 +1333,9 @@ fn yield_to_crowd(st: &mut Step) {
     let mut push = st.push;
     let mut desired = st.desired;
     let mut corr_len2 = corr.length_squared();
+    if corr_len2 > 1e-12 {
+        st.overlap_dir = corr / corr_len2.sqrt();
+    }
     if corr_len2 < 1e-4 {
         // Sub-centimeter corrections are settle noise, not overlap: applying
         // them is pure micro-twitch.
@@ -1535,8 +1552,8 @@ fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
 
 /// From drive to velocity: the wall and charge paces, fatigue, the
 /// stagger, the crowd's damping, a standing man's grip on the ground, the
-/// acceleration and speed caps, and the overlap correction's kill of the
-/// velocity still driving into it.
+/// acceleration and speed caps, and the limit on the speed that drives
+/// into an overlap.
 #[inline]
 fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
     let Field { speed, wall, charging, fat_speed, fat_nocharge, dt, .. } = *f;
@@ -1592,9 +1609,24 @@ fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
     if v2 > vmax * vmax {
         new_v *= vmax / v2.sqrt();
     }
-    // After a positional correction, kill the velocity component still
-    // driving into the overlap or it re-penetrates next tick.
-    if corr_len2 > 1e-12 {
+    if fight_room() {
+        // His legs do not take him further into bodies he overlaps. Toward
+        // them, measured against their own movement, he keeps only the
+        // speed the overlap correction takes back this tick: he holds his
+        // ground while the bodies are set apart. Losing all of it only on
+        // the ticks the correction passes its deadband has him set back,
+        // then walking in again, back and forth every tick.
+        let dir = st.overlap_dir;
+        if dir != Vec2::ZERO {
+            let hold = corr.length() / dt;
+            let into = (new_v - st.overlap_vel).dot(-dir);
+            if into > hold {
+                new_v += dir * (into - hold);
+            }
+        }
+    } else if corr_len2 > 1e-12 {
+        // After a positional correction, kill the velocity component still
+        // driving into the overlap or it re-penetrates next tick.
         let cn = corr.normalize_or_zero();
         let into = new_v.dot(-cn);
         if into > 0.0 {
