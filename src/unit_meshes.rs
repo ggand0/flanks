@@ -123,7 +123,10 @@ pub struct Skel {
     /// w = 1 when it loops. A sample is one vec4 for the root's offset
     /// from rest, then one quaternion per joint relative to its parent.
     pub clips: [[u32; 4]; SKEL_CLIP_SLOTS],
-    /// Per clip: x = samples per second.
+    /// Per clip: x = samples per second, y = its length in seconds (the
+    /// last sample's time), z = when its blow lands in seconds, -1
+    /// without one, w = how far one play carries the soldier, engine
+    /// metres.
     pub rates: [[f32; 4]; SKEL_CLIP_SLOTS],
     /// The joints the gait, the arm sway and the attack write: (pelvis,
     /// chest, head, weapon), then (upper arm, forearm, hand, coat) of the

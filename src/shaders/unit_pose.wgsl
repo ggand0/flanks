@@ -49,7 +49,9 @@ struct Skel {
     // it loops. A sample is the root's offset from rest, then one
     // quaternion per joint relative to its parent.
     clips: array<vec4<u32>, 8>,
-    // Per clip: x = samples per second.
+    // Per clip: x = samples per second, y = its length in seconds, z =
+    // when its blow lands in seconds, -1 without one, w = how far one play
+    // carries the soldier.
     rates: array<vec4<f32>, 8>,
     // The joints the gait, the arm sway and the attack write: (pelvis,
     // chest, head, weapon), then (upper arm, forearm, hand, coat) of the
@@ -611,6 +613,11 @@ const POSE_SLOTS_SKEL: u32 = 46u;
 // A skinned kind's clips, by slot (unit_glb.rs `SKEL_CLIPS`).
 const CLIP_STAND: u32 = 0u;
 const CLIP_READY: u32 = 1u;
+const CLIP_SHUFFLE_LEFT: u32 = 2u;
+const CLIP_SHUFFLE_RIGHT: u32 = 3u;
+const CLIP_SHUFFLE_FORWARD: u32 = 4u;
+const CLIP_SHUFFLE_BACKWARD: u32 = 5u;
+const CLIP_CUT: u32 = 6u;
 // Parts of the bow rig.
 const BOW_PARTS: u32 = 14u;
 
@@ -1237,6 +1244,43 @@ fn skel_turn(clip: u32, i: u32, j: u32) -> vec4<f32> {
 
 fn skel_root(clip: u32, i: u32) -> vec3<f32> {
     return clips[rig.skel.clips[clip].x + i * (rig.skel.params.x + 1u)].xyz;
+}
+
+// Whether a skeleton clip slot holds a clip.
+fn skel_has(clip: u32) -> bool {
+    return rig.skel.clips[clip].y > 0u;
+}
+
+// Where a skeleton clip is at time t (seconds): the clip, the sample
+// before, and how far toward the next. A looping clip wraps, another
+// holds its ends.
+struct SkelAt {
+    clip: u32,
+    i: u32,
+    f: f32,
+};
+
+fn skel_at(clip: u32, t: f32) -> SkelAt {
+    let count = rig.skel.clips[clip].y;
+    let len = rig.skel.rates[clip].y;
+    var x = clamp(t, 0.0, len);
+    if rig.skel.clips[clip].w > 0u && len > 0.0 {
+        x = t - len * floor(t / len);
+    }
+    let s = x * rig.skel.rates[clip].x;
+    let i = min(u32(s), max(count, 2u) - 2u);
+    return SkelAt(clip, i, select(0.0, clamp(s - f32(i), 0.0, 1.0), count > 1u));
+}
+
+// Joint j's rotation, and the root's offset, at a place in a clip.
+fn skel_turn_at(s: SkelAt, j: u32) -> vec4<f32> {
+    let next = min(s.i + 1u, rig.skel.clips[s.clip].y - 1u);
+    return qblend(skel_turn(s.clip, s.i, j), skel_turn(s.clip, next, j), s.f);
+}
+
+fn skel_root_at(s: SkelAt) -> vec3<f32> {
+    let next = min(s.i + 1u, rig.skel.clips[s.clip].y - 1u);
+    return mix(skel_root(s.clip, s.i), skel_root(s.clip, next), s.f);
 }
 
 // Rotation a toward b by t, the shorter way.

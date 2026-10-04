@@ -569,8 +569,12 @@ pub fn clips_on() -> bool {
 }
 
 /// The clips a skinned kind plays, by slot (unit_pose.wgsl `CLIP_STAND`
-/// and on). Each is `<kind>.<name>.json` next to the model.
-const SKEL_CLIPS: [&str; 2] = ["stand", "ready"];
+/// and on). Each is `<kind>.<name>.json` next to the model. The first
+/// `SKEL_CLIPS_NEEDED` must be there; a missing later one leaves its slot
+/// empty and the player does without it.
+const SKEL_CLIPS: [&str; 7] =
+    ["stand", "ready", "shuffle_left", "shuffle_right", "shuffle_forward", "shuffle_backward", "cut"];
+const SKEL_CLIPS_NEEDED: usize = 2;
 const _: () = assert!(SKEL_CLIPS.len() <= SKEL_CLIP_SLOTS);
 
 /// The joints the player's gait, arm sway and attack write, in the order
@@ -593,7 +597,18 @@ struct ClipFile {
     fps: f32,
     #[serde(rename = "loop")]
     looped: bool,
+    /// How far one play of the clip carries the soldier, model metres.
+    #[serde(default)]
+    travel: [f32; 3],
+    #[serde(default)]
+    events: ClipEvents,
     samples: Vec<Vec<f32>>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct ClipEvents {
+    /// When the blow lands, seconds from the clip's start.
+    contact: Option<f32>,
 }
 
 /// The model's skeleton and its clips as rows of the clip buffer, and
@@ -668,8 +683,14 @@ fn read_skeleton(
     let mut rows: Vec<[f32; 4]> = Vec::new();
     for (slot, clip) in SKEL_CLIPS.iter().enumerate() {
         let path = model.with_extension(format!("{clip}.json"));
-        let text = crate::game_files::read_to_string(&path)
-            .map_err(|e| format!("cannot read its clip {}: {e}", path.display()))?;
+        let text = match crate::game_files::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if slot >= SKEL_CLIPS_NEEDED => {
+                warn!("{}: no clip {clip}, the player does without it: {e}", model.display());
+                continue;
+            }
+            Err(e) => return Err(format!("cannot read its clip {}: {e}", path.display())),
+        };
         let file: ClipFile =
             serde_json::from_str(&text).map_err(|e| format!("{} is not a clip: {e}", path.display()))?;
         if file.format != "flanks-clip" || file.version != 1 {
@@ -682,7 +703,13 @@ fn read_skeleton(
             return Err(format!("{} has no samples or no rate", path.display()));
         }
         skel.clips[slot] = [rows.len() as u32, file.samples.len() as u32, 0, file.looped as u32];
-        skel.rates[slot][0] = file.fps;
+        let length = (file.samples.len() - 1) as f32 / file.fps;
+        let contact = file.events.contact.unwrap_or(-1.0);
+        if contact > length {
+            return Err(format!("{}: contact at {contact} s is after its end at {length} s", path.display()));
+        }
+        let travel = scale * Vec3::from_array(file.travel).length();
+        skel.rates[slot] = [file.fps, length, contact, travel];
         for sample in &file.samples {
             if sample.len() != 3 + 4 * count || sample.iter().any(|v| !v.is_finite()) {
                 return Err(format!("{}: a sample is not 3 + 4 x {count} numbers", path.display()));
