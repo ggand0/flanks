@@ -26,7 +26,7 @@ const SEP_PUSH_MAX: f32 = 2.5;
 /// 0.6 m wide.
 const BODY_DISTANCE: f32 = 1.0;
 const BODY_DISTANCE_OLD: f32 = 0.9;
-fn body_distance() -> f32 {
+pub(crate) fn body_distance() -> f32 {
     static D: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
     *D.get_or_init(|| {
         if fight_room() {
@@ -48,7 +48,7 @@ const CROWD_STOP: f32 = 2.5;
 /// overlap walks a packed man in, the overlap correction sets him back
 /// out, and he twitches every tick. The fade starts no later than where
 /// six neighbours touch him.
-fn crowd_brake() -> (f32, f32) {
+pub(crate) fn crowd_brake() -> (f32, f32) {
     static B: std::sync::OnceLock<(f32, f32)> = std::sync::OnceLock::new();
     *B.get_or_init(|| {
         let body = body_distance();
