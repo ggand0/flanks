@@ -66,6 +66,9 @@ struct Smooth {
     shot: f32,
     // How far his bow is up toward the drawn ready pose, 0 to 1.
     bow: f32,
+    // Smoothed ground velocity, m/s (x, z): `walk` is its length.
+    drift_x: f32,
+    drift_z: f32,
 };
 
 // Per-regiment pose signals for this frame (render_units_gpu.rs
@@ -362,11 +365,15 @@ fn build_soldier(i: u32) {
     }
     var sm = smoothing[i];
 
-    // Walk signal: smoothed ACTUAL per-tick displacement, updated before
-    // the cull so units re-entering the frustum have a live value.
+    // Walk signal: the ACTUAL per-tick displacement smoothed as a vector,
+    // then its length, updated before the cull so units re-entering the
+    // frustum have a live value. A man jostled back and forth in a press
+    // gets nowhere and does not read as walking.
     let step = pos - prev;
-    let disp = length(step.xz) * params.inv_dt;
-    sm.walk += (disp - sm.walk) * params.k_walk;
+    let drift = mix(vec2<f32>(sm.drift_x, sm.drift_z), step.xz * params.inv_dt, params.k_walk);
+    sm.drift_x = drift.x;
+    sm.drift_z = drift.y;
+    sm.walk = length(drift);
 
     // The attack on anim z, 0 when he is not attacking, as in
     // render_units.rs `attack_signal`.

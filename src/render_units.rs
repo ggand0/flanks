@@ -683,6 +683,8 @@ struct Smooth {
     shot: f32,
     /// How far his bow is up toward the drawn ready pose, 0 to 1.
     bow: f32,
+    /// Smoothed ground velocity, m/s (x, z): `walk` is its length.
+    drift: Vec2,
 }
 
 /// One soldier's attack on anim z (CELEBRATE_BASE), 0 when he is not
@@ -902,17 +904,21 @@ fn sync_instance_data(
                 let start = ci * SYNC_CHUNK;
                 let end = (start + SYNC_CHUNK).min(units.len());
                 for i in start..end {
-                    // Walk signal: smoothed ACTUAL per-tick displacement.
-                    // Velocity misses positional-correction shoves (which
-                    // also kill vel), raw displacement strobes on bursty
-                    // corr chains. Updated before the cull so units
-                    // re-entering the frustum have a live value.
+                    // Walk signal: the ACTUAL per-tick displacement
+                    // smoothed as a vector, then its length. Velocity misses
+                    // positional-correction shoves (which also kill vel), raw
+                    // displacement strobes on bursty corr chains, and the
+                    // smoothed size of the displacement reads a man jostled
+                    // back and forth in a press as walking. Updated before
+                    // the cull so units re-entering the frustum have a live
+                    // value.
                     let step = units.pos[i] - units.pos_prev[i];
-                    let disp = Vec2::new(step.x, step.z).length() * inv_dt;
+                    let disp = Vec2::new(step.x, step.z) * inv_dt;
                     let gi = units.group[i] as usize;
                     let kind = units.kind[i] as usize;
                     let sm = &mut smooth_chunk[i - start];
-                    sm.walk += (disp - sm.walk) * ema_k;
+                    sm.drift += (disp - sm.drift) * ema_k;
+                    sm.walk = sm.drift.length();
                     let sw = units.swing[i];
                     let dying = units.death_t[i] > 0;
                     let attack =
