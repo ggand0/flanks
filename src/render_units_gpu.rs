@@ -40,7 +40,7 @@ use crate::render_units::{
     BAND_FIGHTING, BOW_FALL_S, BOW_RISE_S, BOW_WALK_MS, CELEBRATE_BASE, CORPSE_CAP, CULL_RADIUS,
     Corpses, CustomPipeline, ExtractedAtlas, FOLLOW_BASE, FOLLOW_S, FOLLOW_SPAN, HOLD_S,
     ExtractedBucket, InstanceBucket, InstanceData, LodBands, LodConfig, NUM_BUCKETS, NUM_LODS,
-    RANGED_BASE, RELEASE_S, RELOAD_S, REWIND_S, RenderCounts, RigBuffer, SYNC_CHUNK, UnitRig,
+    RANGED_BASE, RELEASE_S, RELOAD_S, REWIND_S, RenderCounts, RigBuffer, STEP_SETTLE_S, SYNC_CHUNK, UnitRig,
     celebrate_progress,
     shadow_level, stance_tier, wall_signal,
 };
@@ -125,6 +125,9 @@ const POSE_SLOTS_SKEL: u32 = 6 + 2 * crate::unit_meshes::SKEL_JOINTS as u32;
 /// multiple of the storage offset alignment every device allows.
 const BUCKET_SET_BYTES: u64 = 256;
 
+/// Bytes of one soldier's smoothing state (`Smooth` in unit_build.wgsl).
+const SMOOTH_BYTES: usize = 52;
+
 /// Per-tick snapshot of one soldier, 56 bytes, every field exact. All
 /// scalars, so the WGSL struct (`Soldier` in unit_build.wgsl) has the same
 /// stride. `prev` rides along on purpose: the death sweep swap-removes
@@ -188,6 +191,17 @@ pub struct BuildParams {
     /// [kind * 3 + set]: set 0 fine, 1 coarse, 2 plain.
     bands: [Vec4; 12],
     windup: Vec4,
+    /// Per kind: its cut's wind-up ticks (0 without a cut), and the
+    /// seconds the cut takes to come back.
+    cut_windup: Vec4,
+    cut_return: Vec4,
+    /// Per kind, the step clips left, right, forward and backward: the
+    /// ground one play covers in metres (0 without the clip), and its
+    /// length in seconds.
+    step_travel: [Vec4; NUM_KINDS],
+    step_len: [Vec4; NUM_KINDS],
+    /// soldier.rs STEP_FACE_SPEED, render_units.rs STEP_SETTLE_S.
+    steps: Vec4,
     /// draw_ticks, death_ticks, hit_stagger_ticks, celebrate_base
     consts: Vec4,
     /// FOLLOW_S, FOLLOW_BASE, FOLLOW_SPAN, REWIND_S (render_units.rs).
@@ -474,7 +488,11 @@ fn pack_chunk(c: &PackColumns, start: usize, out: &mut [GpuSoldier], flash: bool
 fn build_frame_params(
     units: Res<Units>,
     selection: Res<crate::orders::Selection>,
-    (hover, settings): (Res<crate::orders::Hover>, Res<crate::settings::Settings>),
+    (hover, settings, rigs): (
+        Res<crate::orders::Hover>,
+        Res<crate::settings::Settings>,
+        Query<(&InstanceBucket, &UnitRig)>,
+    ),
     groups: Res<crate::orders::Groups>,
     time: Res<Time>,
     fixed_time: Res<Time<Fixed>>,
@@ -563,6 +581,25 @@ fn build_frame_params(
     p.windup = Vec4::from_array(std::array::from_fn(|k| {
         crate::unit_types::TYPES[k].windup_ticks as f32
     }));
+    p.cut_windup = Vec4::from_array(std::array::from_fn(|k| {
+        crate::unit_types::TYPES[k].cut_windup_ticks as f32
+    }));
+    p.cut_return = Vec4::from_array(std::array::from_fn(|k| {
+        crate::unit_types::TYPES[k].cut_return_s()
+    }));
+    for (bucket, rig) in &rigs {
+        let (kind, skel) = (bucket.0 / NUM_LODS, &rig.rig.skel);
+        if kind >= NUM_KINDS || skel.params[0] == 0 {
+            continue;
+        }
+        for (k, slot) in (crate::unit_glb::SKEL_CLIP_STEPS..).take(4).enumerate() {
+            if skel.clips[slot][1] > 1 {
+                p.step_travel[kind][k] = skel.rates[slot][3];
+                p.step_len[kind][k] = skel.rates[slot][1];
+            }
+        }
+    }
+    p.steps = Vec4::new(crate::sim::soldier::STEP_FACE_SPEED, STEP_SETTLE_S, 0.0, 0.0);
     p.consts = Vec4::new(
         crate::unit_types::missile::DRAW_TICKS as f32,
         crate::sim::damage::DEATH_TICKS as f32,
@@ -1432,7 +1469,7 @@ impl UnitAlloc {
                 (live_cap + NUM_KINDS * CORPSE_CAP) * size_of::<crate::render_units::InstanceData>(),
                 BufferUsages::COPY_DST,
             ),
-            smooth: storage_buffer(device, "unit smoothing", live_cap * 40, BufferUsages::empty()),
+            smooth: storage_buffer(device, "unit smoothing", live_cap * SMOOTH_BYTES, BufferUsages::empty()),
             index_list: storage_buffer(device, "unit index list", total * 4, BufferUsages::empty()),
             kind_cap,
             bases,

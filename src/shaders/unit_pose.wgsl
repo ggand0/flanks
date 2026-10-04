@@ -704,6 +704,13 @@ struct Pre {
     clip: u32,
     clip_x: f32,
     style: f32,
+    // A skinned kind's blow that plays its cut clip.
+    cut: bool,
+    // A skinned kind's steps: the clip slot, the place in its play 0 to 1,
+    // and his weight in it rather than in his stance or gait.
+    step_clip: u32,
+    step_x: f32,
+    step_w: f32,
     following: bool,
     windup: f32,
     follow: f32,
@@ -735,7 +742,19 @@ fn pose_begin(pos_scale: vec4<f32>, color: vec4<f32>, anim: vec4<f32>, anim2: ve
     let inst = Inst(pos_scale, color, anim, anim2);
     let yaw = inst.anim.x;
     let speed = inst.anim.y;
-    let moving = walk_gate(speed);
+    // A skinned kind's steps ride the fourth position float
+    // (unit_build.wgsl `steps`). While he steps, his gait gives way.
+    var step_clip = 0u;
+    var step_x = 0.0;
+    var step_w = 0.0;
+    if rig.skel.params.x > 0u {
+        let q = u32(max(inst.pos_scale.w, 0.0) + 0.5);
+        step_clip = CLIP_SHUFFLE_LEFT + (q & 3u);
+        step_x = f32((q >> 2u) & 1023u) / 1023.0;
+        step_w = f32(q >> 12u) / 1023.0;
+    }
+    let walking = 1.0 - step_w;
+    let moving = walk_gate(speed) * walking;
     // A bow shot from 16: clip * 2 + progress, clip 0 the raise, 1 the
     // release, 2 the reload (render_units.rs RANGED_BASE). A kind with a
     // bow rig plays it from its tables. Without one the draw arms read it
@@ -776,6 +795,14 @@ fn pose_begin(pos_scale: vec4<f32>, color: vec4<f32>, anim: vec4<f32>, anim2: ve
     let following = within > 1.395 && !cheering;
     let windup = select(select(within, 0.0, following), 0.0, cheering);
     let follow = clamp((within - 1.4) / 0.59, 0.0, 1.0);
+    // A skinned kind with a cut clip plays it for the classic swing (the
+    // sim's slow cut; a charging blow is a stab).
+    let cut = rig.skel.params.x > 0u
+        && rig.skel.clips[CLIP_CUT].y > 0u
+        && rig.skel.rates[CLIP_CUT].z > 0.0
+        && !charge
+        && !cheering
+        && abs(style - 1.0) < 0.5;
     // The lunge the code-posed arms and the body lean follow: quadratic
     // over the wind-up and harder on a charge, where it raises from the
     // levelled run-in point instead of dipping the blade first. After the
@@ -828,9 +855,9 @@ fn pose_begin(pos_scale: vec4<f32>, color: vec4<f32>, anim: vec4<f32>, anim2: ve
     let g = gait_at(speed, leg);
     // The step wave the arms counter, and the idle wobble, which is the
     // one oscillator that is not locomotion.
-    let limb = cos(TAU * gait);
+    let limb = cos(TAU * gait) * walking;
     let wobble = time * 9.0 + seed * TAU;
-    let dip = gait_dip(fract(2.0 * gait), g);
+    let dip = gait_dip(fract(2.0 * gait), g) * walking;
 
     pre = Pre(
         inst.pos_scale.xyz,
@@ -846,6 +873,10 @@ fn pose_begin(pos_scale: vec4<f32>, color: vec4<f32>, anim: vec4<f32>, anim2: ve
         clip,
         clip_x,
         style,
+        cut,
+        step_clip,
+        step_x,
+        step_w,
         following,
         windup,
         follow,
@@ -886,13 +917,15 @@ fn put_common() {
     // the planted foot, both at full weight here: the torso eases them in
     // up its height (`place`).
     let turn = 0.10 * g.run * g.stride * pre.limb;
-    let shift = 0.02 * pre.leg * g.run * g.stride * cos(TAU * (pre.gait - 0.5 * g.duty));
+    let shift = 0.02 * pre.leg * g.run * g.stride * cos(TAU * (pre.gait - 0.5 * g.duty))
+        * (1.0 - pre.step_w);
     // The body rides the hip drop from the gait. A runner leans as far
-    // forward as a charger.
+    // forward as a charger. A blow leans into it, except a cut, whose clip
+    // moves the whole body itself.
+    let blow = select(0.30 * pre.lunge + 0.25 * pre.chop, 0.0, pre.cut);
     let lean = 0.10 * pre.moving
         + 0.24 * max(g.run * pre.moving, pre.sprint * (0.25 + 0.75 * pre.moving))
-        + 0.30 * pre.lunge
-        + 0.25 * pre.chop;
+        + blow;
     // Stagger (anim2.w = remaining stun, 1 at the blow -> 0 recovered):
     // rocked back off a charging blow or a spear point. The whole body
     // pitches backward from the feet with a short reel, hardest at the
@@ -1316,20 +1349,25 @@ fn sword_arm() -> vec4<f32> {
 // A skinned soldier: one rotation per joint, relative to its parent, then
 // the hierarchy walked once into each joint's rotation and posed origin.
 // He stands in the standing clip, and in the ready clip while an enemy is
-// near and he is still. On the move his legs take the gait and his arms
-// its sway. A blow and the cheer play the sword arm's motion from the
-// rest pose, and the body leaves the guard to face the blow. The fallen
-// lie in the standing pose.
+// near and he is still. Near the enemy and slow he steps in the step
+// clips (unit_build.wgsl `steps`). Faster, his legs take the gait and his
+// arms its sway. A cut plays its clip, which starts and ends in the ready
+// pose: the blade lands on the strike tick, and on the move his legs keep
+// the gait. Another blow and the cheer play the sword arm's motion from
+// the rest pose, and the body leaves the guard to face the blow. The
+// fallen lie in the standing pose.
 fn put_skeleton() {
     let n = rig.skel.params.x;
     let alive = pre.leg > 0.0;
     let moving = select(0.0, pre.moving, alive);
-    var act = pre.celebrate;
+    var strike = 0.0;
     if pre.following {
-        act = max(act, 1.0 - smoothstep(0.75, 1.0, pre.follow));
+        strike = 1.0 - smoothstep(0.75, 1.0, pre.follow);
     } else if pre.windup > 0.0 {
-        act = max(act, smoothstep(0.0, 0.2, pre.windup));
+        strike = smoothstep(0.0, 0.2, pre.windup);
     }
+    let cut = select(0.0, strike, alive && pre.cut);
+    var act = select(max(pre.celebrate, strike), pre.celebrate, pre.cut);
     act = select(0.0, act, alive && rig.arm > 0.5 && rig.hold < 1.5);
     let level = max(max(pre.stance, pre.ready * 0.75), max(pre.sprint, pre.wall)) * (1.0 - pre.celebrate);
     let guard = select(0.0, level * (1.0 - moving) * (1.0 - act), alive);
@@ -1338,11 +1376,21 @@ fn put_skeleton() {
     for (var j = 0u; j < n; j++) {
         turn[j] = qblend(skel_turn(CLIP_STAND, 0u, j), skel_turn(CLIP_READY, 0u, j), guard);
     }
-    let root = mix(skel_root(CLIP_STAND, 0u), skel_root(CLIP_READY, 0u), guard);
+    var root = mix(skel_root(CLIP_STAND, 0u), skel_root(CLIP_READY, 0u), guard);
     let core = rig.skel.roles[0];
     let arm_r = rig.skel.roles[1];
     let arm_l = rig.skel.roles[2];
 
+    let step_w = select(0.0, pre.step_w, alive);
+    if step_w > 0.0 {
+        // His steps, the whole body: each play starts and ends in the
+        // ready pose.
+        let at = skel_at(pre.step_clip, pre.step_x * rig.skel.rates[pre.step_clip].y);
+        for (var j = 0u; j < n; j++) {
+            turn[j] = qblend(turn[j], skel_turn_at(at, j), step_w);
+        }
+        root = mix(root, skel_root_at(at), step_w);
+    }
     if moving > 0.0 {
         // The gait: thigh, knee and foot pitches, the weapon side's leg
         // half a cycle after the shield side's (`put_leg`). The coat
@@ -1362,6 +1410,26 @@ fn put_skeleton() {
         let sway = (0.18 - 0.06 * pre.g.run) * moving * pre.limb * (1.0 - pre.raise);
         turn[arm_r.x] = qmul(qx(-sway), turn[arm_r.x]);
         turn[arm_l.x] = qmul(qx(0.06 * moving * pre.limb * (1.0 - pre.wall)), turn[arm_l.x]);
+    }
+    if cut > 0.0 {
+        // Clip time from the wind-up to the blow at its contact, then
+        // from the blow to its end over the follow-through.
+        let rates = rig.skel.rates[CLIP_CUT];
+        var t = pre.windup * rates.z;
+        if pre.following {
+            t = rates.z + pre.follow * (rates.y - rates.z);
+        }
+        let at = skel_at(CLIP_CUT, t);
+        // On the move the pelvis, legs and coat keep the gait.
+        let low = cut * (1.0 - moving);
+        let leg_r = rig.skel.roles[3];
+        let leg_l = rig.skel.roles[4];
+        for (var j = 0u; j < n; j++) {
+            let lower = j == core.x || j == arm_r.w || j == arm_l.w
+                || any(vec3<u32>(j) == leg_r.xyz) || any(vec3<u32>(j) == leg_l.xyz);
+            turn[j] = qblend(turn[j], skel_turn_at(at, j), select(cut, low, lower));
+        }
+        root = mix(root, skel_root_at(at), low);
     }
     if act > 0.0 {
         let blow = sword_arm();

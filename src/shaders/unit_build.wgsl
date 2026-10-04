@@ -66,6 +66,13 @@ struct Smooth {
     shot: f32,
     // How far his bow is up toward the drawn ready pose, 0 to 1.
     bow: f32,
+    // A skinned soldier's steps, which the CPU path does not play
+    // (`steps`): where he is in the step clip, in plays, its slot from
+    // the left step, and how far he is in it rather than in his stance or
+    // his gait, 0 to 1.
+    step: f32,
+    step_clip: u32,
+    step_w: f32,
 };
 
 // Per-regiment pose signals for this frame (render_units_gpu.rs
@@ -100,6 +107,17 @@ struct Params {
     // switch distances for L0/L1, L1/L2, L2/L3 (inf = switch disabled).
     bands: array<vec4<f32>, 12>,
     windup: vec4<f32>,
+    // Per kind: its cut's wind-up ticks (0 without a cut), and the
+    // seconds the cut takes to come back.
+    cut_windup: vec4<f32>,
+    cut_return: vec4<f32>,
+    // Per kind, the step clips left, right, forward and backward: the
+    // ground one play covers in metres (0 without the clip), and its
+    // length in seconds.
+    step_travel: array<vec4<f32>, 4>,
+    step_len: array<vec4<f32>, 4>,
+    // soldier.rs STEP_FACE_SPEED, render_units.rs STEP_SETTLE_S.
+    steps: vec4<f32>,
     // draw_ticks, death_ticks, hit_stagger_ticks, celebrate_base
     consts: vec4<f32>,
     // FOLLOW_S, FOLLOW_BASE, FOLLOW_SPAN, REWIND_S (render_units.rs).
@@ -345,6 +363,71 @@ fn append_casters(mask: u32, kind: u32, entry: u32) {
     }
 }
 
+// Whether a swing byte's blow is this kind's slow cut, as
+// unit_types.rs `UnitTypeParams::is_cut`.
+fn is_cut(kind: u32, swing: u32) -> bool {
+    return params.cut_windup[kind] > 0.0
+        && (swing & SWING_RANGED) == 0u
+        && (swing & SWING_STYLE_MASK) == (1u << SWING_STYLE_SHIFT);
+}
+
+// A skinned soldier's steps. Near the enemy and slower than he turns to
+// walk, he steps in the clip nearest his motion relative to his facing,
+// one play per the ground it covers, so his feet keep to the ground.
+// A play starts and ends in the ready pose, so he changes clip only
+// there. When he stops or speeds up into his gait, the foot in the air
+// lands at the clip's own pace and he settles into his stance. Returns
+// the record's fourth position float: the clip slot, plus 4 times the
+// place in the play and 4096 times his weight in it, both in 1023rds.
+fn steps(sm: ptr<function, Smooth>, kind: u32, vel: vec2<f32>, yaw: f32, alive: bool) -> f32 {
+    let travel = params.step_travel[kind];
+    let fwd = vec2<f32>(sin(yaw), cos(yaw));
+    let local = vec2<f32>(dot(vel, vec2<f32>(fwd.y, -fwd.x)), dot(vel, fwd));
+    var pick = select(1u, 0u, local.x > 0.0);
+    if abs(local.y) > abs(local.x) {
+        pick = select(3u, 2u, local.y > 0.0);
+    }
+    let speed = length(vel);
+    let want = alive && (*sm).band > 0.15 && (*sm).walk < params.steps.x && speed > 0.06
+        && travel[pick] > 0.0;
+    if (*sm).step_w <= 0.0 {
+        (*sm).step = 0.0;
+        (*sm).step_clip = pick;
+    }
+    let ease = params.dt / params.steps.y;
+    var x = (*sm).step;
+    if want {
+        x += speed * params.dt / max(travel[(*sm).step_clip], 0.01);
+        (*sm).step_w = min((*sm).step_w + ease, 1.0);
+    } else {
+        // A step is half a play: one foot moves. The foot in the air
+        // lands, then he settles.
+        let half = x * 2.0;
+        if half - floor(half) > 0.0 {
+            x = min(x + params.dt / max(params.step_len[kind][(*sm).step_clip], 0.01), (floor(half) + 1.0) * 0.5);
+        } else {
+            (*sm).step_w = max((*sm).step_w - ease, 0.0);
+        }
+    }
+    if x >= 1.0 {
+        x -= floor(x);
+        if want {
+            (*sm).step_clip = pick;
+        }
+    }
+    (*sm).step = x;
+    return f32((*sm).step_clip) + 4.0 * round(x * 1023.0) + 4096.0 * round((*sm).step_w * 1023.0);
+}
+
+// Seconds a blow of this swing byte takes to come back once it lands, as
+// render_units.rs `follow_s`.
+fn follow_s(kind: u32, swing: u32) -> f32 {
+    if is_cut(kind, swing) {
+        return params.cut_return[kind];
+    }
+    return params.attack.x;
+}
+
 fn build_soldier(i: u32) {
     let s = soldiers[i];
     let pos = vec3<f32>(s.px, s.py, s.pz);
@@ -370,7 +453,6 @@ fn build_soldier(i: u32) {
 
     // The attack on anim z, 0 when he is not attacking, as in
     // render_units.rs `attack_signal`.
-    let follow_s = params.attack.x;
     let shot_s = params.shot.x + params.shot.y + params.shot.z;
     let winding = (swing & SWING_STATE_MASK) == SWING_WINDUP && death_t == 0.0;
     sm.shot = max(sm.shot - params.dt, 0.0);
@@ -378,6 +460,8 @@ fn build_soldier(i: u32) {
         var w = params.windup[kind];
         if (swing & SWING_RANGED) != 0u {
             w = params.consts.x;
+        } else if is_cut(kind, swing) {
+            w = params.cut_windup[kind];
         }
         sm.atk = clamp((w - swing_t + params.alpha) / (w + 1.0), 0.0, 1.0);
         sm.swing = swing;
@@ -389,7 +473,7 @@ fn build_soldier(i: u32) {
         if (sm.swing & SWING_RANGED) != 0u {
             sm.shot = shot_s;
         } else {
-            sm.follow = follow_s;
+            sm.follow = follow_s(kind, sm.swing);
         }
         sm.atk = 0.0;
     } else {
@@ -424,7 +508,7 @@ fn build_soldier(i: u32) {
     } else if ranged && (sm.atk > 0.0 || sm.bow > 0.0) {
         attack = params.bow.w + sm.atk;
     } else if sm.follow > 0.0 {
-        attack = digit * 2.0 + params.attack.y + params.attack.z * (1.0 - sm.follow / follow_s);
+        attack = digit * 2.0 + params.attack.y + params.attack.z * (1.0 - sm.follow / follow_s(kind, sm.swing));
     } else if sm.atk > 0.0 {
         attack = digit * 2.0 + sm.atk;
     }
@@ -438,6 +522,12 @@ fn build_soldier(i: u32) {
     // The step is capped as in gait.rs `advance`.
     let g = sm.gait + min(gait_rate(sm.walk) * params.dt, 0.25);
     sm.gait = g - floor(g);
+    // The record's fourth position float: an archer's bow, a skinned
+    // kind's steps.
+    var fourth = sm.bow;
+    if any(params.step_travel[kind] > vec4<f32>(0.0)) {
+        fourth = steps(&sm, kind, step.xz * params.inv_dt, s.yaw, death_t == 0.0);
+    }
 
     let position = mix(prev, pos, params.alpha);
     let jitter = lod_jitter(s.seed);
@@ -495,7 +585,7 @@ fn build_soldier(i: u32) {
     }
 
     records[i] = Record(
-        vec4<f32>(position, sm.bow),
+        vec4<f32>(position, fourth),
         vec4<f32>(rgb, s.seed),
         vec4<f32>(yaw, sm.walk, lunge, fx),
         vec4<f32>(sm.band, sm.wall, sm.gait, stagger),

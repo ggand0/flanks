@@ -575,6 +575,9 @@ pub fn clips_on() -> bool {
 const SKEL_CLIPS: [&str; 7] =
     ["stand", "ready", "shuffle_left", "shuffle_right", "shuffle_forward", "shuffle_backward", "cut"];
 const SKEL_CLIPS_NEEDED: usize = 2;
+/// The slot of the first step clip: left, right, forward and backward
+/// follow in that order (unit_pose.wgsl CLIP_SHUFFLE_LEFT).
+pub(crate) const SKEL_CLIP_STEPS: usize = 2;
 const _: () = assert!(SKEL_CLIPS.len() <= SKEL_CLIP_SLOTS);
 
 /// The joints the player's gait, arm sway and attack write, in the order

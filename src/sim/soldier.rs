@@ -61,8 +61,9 @@ const STEP_PACE: f32 = 0.8;
 const STEP_STOP: f32 = 0.35;
 /// Below this ground speed a standing formation's soldier keeps his
 /// facing while he moves: he steps sideways or back, he does not turn
-/// to walk (M2TW's shuffle keeps facing).
-const STEP_FACE_SPEED: f32 = 1.05;
+/// to walk (M2TW's shuffle keeps facing). The renderer plays a skinned
+/// kind's step clips below it.
+pub(crate) const STEP_FACE_SPEED: f32 = 1.05;
 /// Going to an enemy he can see: M2TW's ready-stance `advance`
 /// (1.06 m/s) for the last few meters or with a comrade close ahead,
 /// its `combat_jog` (2.87 m/s) from further out over open ground.
@@ -1066,9 +1067,13 @@ fn swing(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
                 if *s.swing_t == 0 {
                     // Strike lands; validity (still alive, still in reach,
                     // still an enemy) is checked in the apply pass — a dodged
-                    // or dead target is a whiff.
-                    let jit =
+                    // or dead target is a whiff. A cut lands harder.
+                    let cut = params.is_cut(*s.swing);
+                    let mut jit =
                         0.85 + 0.3 * crate::units::hash01(tick_seed ^ (i as u32));
+                    if cut {
+                        jit *= params.cut_weight();
+                    }
                     out.events.push(DamageEvent {
                         victim: *s.target,
                         attacker: i as u32,
@@ -1077,12 +1082,16 @@ fn swing(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
                         impale: false,
                     });
                     *s.swing = crate::units::SWING_RECOVER;
-                    let cjit = 0.75
-                        + 0.5
+                    let cjit = (1.0 - crate::unit_types::COOLDOWN_JITTER)
+                        + 2.0
+                            * crate::unit_types::COOLDOWN_JITTER
                             * crate::units::hash01(
                                 tick_seed ^ (i as u32).wrapping_mul(0x9E37),
                             );
                     *s.swing_t = (params.cooldown_ticks as f32 * cjit) as u8;
+                    if cut {
+                        *s.swing_t = (*s.swing_t).max(params.cut_return_ticks);
+                    }
                 } else {
                     *s.swing_t -= 1;
                 }
@@ -1136,11 +1145,16 @@ fn swing(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
                     // to damage + a bigger lunge (render reads the flag).
                     let v2 = s.vel.xz().length_squared();
                     let cs = speed[i] * CHARGE_SPEED_FRAC;
-                    // Attack style for this swing (render variety only): 0 =
-                    // stab, 1 = the classic swing. (2 = slash exists in the
-                    // shader but benched.) Spears only ever thrust.
+                    // Attack style for this swing: 0 = stab, 1 = the classic
+                    // swing, or the slow cut of a kind that has one (2 =
+                    // slash exists in the shader but benched). Spears only
+                    // ever thrust, and a charging man with a cut stabs: a
+                    // slow cut at a run carries him into the man before it
+                    // lands.
+                    let charge = v2 > cs * cs;
                     let style = if my_kind
                         == crate::unit_types::KIND_SPEAR as usize
+                        || (charge && params.cut_windup_ticks > 0)
                     {
                         0
                     } else {
@@ -1149,14 +1163,14 @@ fn swing(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
                         ) * 2.0) as u8
                     };
                     let style = style << crate::units::SWING_STYLE_SHIFT;
-                    *s.swing = if v2 > cs * cs {
+                    *s.swing = if charge {
                         crate::units::SWING_WINDUP
                             | crate::units::SWING_CHARGE
                             | style
                     } else {
                         crate::units::SWING_WINDUP | style
                     };
-                    *s.swing_t = params.windup_ticks;
+                    *s.swing_t = params.windup_for(*s.swing);
                 } else if my_kind == crate::unit_types::KIND_ARCHER as usize
                     && !routed
                     && *s.ammo > 0

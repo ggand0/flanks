@@ -601,8 +601,15 @@ pub(crate) const BOW_FALL_S: f32 = 0.5;
 /// Above this ground speed, m/s, an archer carries his bow.
 pub(crate) const BOW_WALK_MS: f32 = 0.6;
 
-/// A blow lands, then the arm comes back over this many seconds.
+/// A blow lands, then the arm comes back over this many seconds; a cut
+/// over its own return (`UnitTypeParams::cut_return_s`).
 pub(crate) const FOLLOW_S: f32 = 0.6;
+
+/// Seconds a blow of this swing byte takes to come back once it lands.
+fn follow_s(kind: usize, swing: u8) -> f32 {
+    let t = &crate::unit_types::TYPES[kind];
+    if t.is_cut(swing) { t.cut_return_s() } else { FOLLOW_S }
+}
 
 /// The follow-through on anim z: digit * 2 + FOLLOW_BASE + FOLLOW_SPAN *
 /// progress, above any wind-up.
@@ -612,6 +619,11 @@ pub(crate) const FOLLOW_SPAN: f32 = 0.59;
 /// Seconds a wind-up cut short takes to go back the way it came, from a
 /// full wind-up.
 pub(crate) const REWIND_S: f32 = 0.25;
+
+/// Seconds a skinned soldier takes to go into his step clips, and to
+/// settle back into his stance once his last step has landed
+/// (unit_build.wgsl, the GPU path's pose pass only).
+pub(crate) const STEP_SETTLE_S: f32 = 0.25;
 
 /// The stance band of a regiment fighting with confidence. A soldier who
 /// swings is fighting whatever his regiment does, so his band rises at
@@ -658,7 +670,8 @@ pub(crate) fn wall_signal(g: &crate::orders::GroupData) -> f32 {
 /// Per-soldier render state carried between frames, index-aligned with
 /// `Units`. The death sweep swap-removes soldiers, and the one it moves
 /// into a freed slot takes over that slot's state. Same fields in the
-/// same order as `Smooth` in unit_build.wgsl, the GPU path's copy.
+/// same order as `Smooth` in unit_build.wgsl, the GPU path's copy, which
+/// adds the steps of a skinned kind (posed in its pose pass only).
 #[derive(Clone, Copy, Default)]
 struct Smooth {
     /// Smoothed ground speed, m/s.
@@ -687,7 +700,7 @@ struct Smooth {
 /// One soldier's attack on anim z (CELEBRATE_BASE), 0 when he is not
 /// attacking, and his attack state carried on. The sim goes from wind-up
 /// to recovery on the tick the blow lands or the arrow leaves, so what
-/// follows is the renderer's: a blow's follow-through for FOLLOW_S, a
+/// follows is the renderer's: a blow's follow-through for `follow_s`, a
 /// shot's release, reload and hold (SHOT_S). A melee wind-up that ends any
 /// other way, by a stagger or death, goes back the way it came, and so
 /// does a draw whose target went away. Same steps as `build_soldier` in
@@ -701,7 +714,7 @@ fn attack_signal(sm: &mut Smooth, sw: u8, swing_t: u8, kind: usize, dying: bool,
         let w = if sw & SWING_RANGED != 0 {
             crate::unit_types::missile::DRAW_TICKS as f32
         } else {
-            crate::unit_types::TYPES[kind].windup_ticks as f32
+            crate::unit_types::TYPES[kind].windup_for(sw) as f32
         };
         // Between ticks the wind-up runs on with the fixed clock, and it
         // reaches 1 on the tick the blow lands. Clamped: the draw-start
@@ -717,7 +730,7 @@ fn attack_signal(sm: &mut Smooth, sw: u8, swing_t: u8, kind: usize, dying: bool,
         if sm.swing & SWING_RANGED != 0 {
             sm.shot = SHOT_S;
         } else {
-            sm.follow = FOLLOW_S;
+            sm.follow = follow_s(kind, sm.swing);
         }
         sm.atk = 0.0;
     } else {
@@ -744,7 +757,7 @@ fn attack_signal(sm: &mut Smooth, sw: u8, swing_t: u8, kind: usize, dying: bool,
     } else if ranged && (sm.atk > 0.0 || sm.bow > 0.0) {
         RANGED_BASE + sm.atk
     } else if sm.follow > 0.0 {
-        digit * 2.0 + FOLLOW_BASE + FOLLOW_SPAN * (1.0 - sm.follow / FOLLOW_S)
+        digit * 2.0 + FOLLOW_BASE + FOLLOW_SPAN * (1.0 - sm.follow / follow_s(kind, sm.swing))
     } else if sm.atk > 0.0 {
         digit * 2.0 + sm.atk
     } else {
