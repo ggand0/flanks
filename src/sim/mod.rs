@@ -415,7 +415,6 @@ fn run_tick_job(job: &mut TickJob) {
         grid,
         terrain,
         pos_prev,
-        sight_prev: &sight_in[..],
         speed,
         team,
         kind,
