@@ -139,6 +139,25 @@ fn fight_room() -> bool {
     *ON.get_or_init(|| crate::util::env_or("FL_FIGHT_ROOM", 1_u32) != 0)
 }
 
+/// A man who has run into a body does not walk into it again at once. He
+/// shoves in for PRESS_TICKS at the start of a beat of his own, is set back
+/// out, and stands until his next beat: a bump about once a second, each
+/// man on his own time, where a man left free to walk in steps in and is
+/// set back every tick. His beat is PRESS_BEAT_MIN to PRESS_BEAT_MAX ticks
+/// long, and he lets a PRESS_SKIP share of his beats pass.
+const PRESS_TICKS: u32 = 3;
+const PRESS_BEAT_MIN: u32 = 20;
+const PRESS_BEAT_MAX: u32 = 45;
+const PRESS_SKIP: f32 = 0.3;
+#[inline]
+fn presses(i: usize, tick: u32) -> bool {
+    let own = crate::units::hash01((i as u32).wrapping_mul(0x9E37) ^ 0x7F4A_7C15);
+    let beat = PRESS_BEAT_MIN + (own * (PRESS_BEAT_MAX - PRESS_BEAT_MIN) as f32) as u32;
+    let t = tick.wrapping_add((i as u32).wrapping_mul(13));
+    let roll = crate::units::hash01((t / beat).wrapping_mul(0x2545_F491) ^ (i as u32).wrapping_mul(0x51ED));
+    t % beat < PRESS_TICKS && roll >= PRESS_SKIP
+}
+
 /// Share of those windows in which a blocked man sidesteps
 /// (FL_SIDESTEP, 0 to 1). A play-testing knob.
 fn sidestep_chance() -> f32 {
@@ -1552,11 +1571,11 @@ fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
 
 /// From drive to velocity: the wall and charge paces, fatigue, the
 /// stagger, the crowd's damping, a standing man's grip on the ground, the
-/// acceleration and speed caps, and the limit on the speed that drives
+/// acceleration and speed caps, and the loss of the speed that drives
 /// into an overlap.
 #[inline]
 fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
-    let Field { speed, wall, charging, fat_speed, fat_nocharge, dt, .. } = *f;
+    let Field { speed, wall, charging, fat_speed, fat_nocharge, moving, tick, dt, .. } = *f;
     let i = s.i;
     let gi = st.gi;
     let dying = st.dying;
@@ -1609,24 +1628,23 @@ fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
     if v2 > vmax * vmax {
         new_v *= vmax / v2.sqrt();
     }
-    if fight_room() {
-        // His legs do not take him further into bodies he overlaps. Toward
-        // them, measured against their own movement, he keeps only the
-        // speed the overlap correction takes back this tick: he holds his
-        // ground while the bodies are set apart. Losing all of it only on
-        // the ticks the correction passes its deadband has him set back,
-        // then walking in again, back and forth every tick.
+    if fight_room() && !moving[gi] && !presses(i, tick) {
+        // Between his beats nothing carries a man into the bodies he
+        // overlaps: toward them, measured against their own movement, he
+        // has no speed, on every tick the overlap lasts. He is set back out
+        // and stands. A man sent somewhere by a Move order is left out, so
+        // a unit can still be forced through another.
         let dir = st.overlap_dir;
         if dir != Vec2::ZERO {
-            let hold = corr.length() / dt;
             let into = (new_v - st.overlap_vel).dot(-dir);
-            if into > hold {
-                new_v += dir * (into - hold);
+            if into > 0.0 {
+                new_v += dir * into;
             }
         }
     } else if corr_len2 > 1e-12 {
-        // After a positional correction, kill the velocity component still
-        // driving into the overlap or it re-penetrates next tick.
+        // On his beat he shoves in as a man does. After a positional
+        // correction, kill the velocity component still driving into the
+        // overlap or it re-penetrates next tick.
         let cn = corr.normalize_or_zero();
         let into = new_v.dot(-cn);
         if into > 0.0 {
