@@ -229,9 +229,10 @@ pub const TYPES: [UnitTypeParams; NUM_KINDS] = [
         cooldown_ticks: 48,
         // The cut clip lands its blow 1.20 s in and is back 1.40 s later
         // (assets/units/knight.cut.json, contact and length). In play it
-        // runs 2.4 times that fast, 0.5 s to the blow and 0.6 s back.
-        cut_windup_ticks: 15,
-        cut_return_ticks: 18,
+        // runs twice that fast, 0.6 s to the blow and 0.7 s back: faster
+        // reads as a clip sped up.
+        cut_windup_ticks: 18,
+        cut_return_ticks: 21,
         speed: 6.0,
         // Masses sit on the vanilla EDU scale (militia 0.8 / spears 1.0 /
         // sergeants 1.2 / dismounted knights 1.5) so future cavalry mounts
