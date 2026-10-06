@@ -161,6 +161,20 @@ fn sidestep_chance() -> f32 {
 /// neighbor. Stepping and running men, and charge knockback, are
 /// unaffected; true overlap is still corrected.
 const STAND_GRIP: f32 = 6.0;
+/// The body a man runs into is a soft wall. His legs carry him this far
+/// into it (his own give, 0.7 to 1.3 of it), losing their closing speed on
+/// the way, and nothing of his speed is handed to the man he hits: the
+/// press and that man's feet take it. A stop on one tick is the twitch (he
+/// is set back and walks in again) or, with his speed handed on, a lurch
+/// that runs through the rows.
+const GIVE: f32 = 0.08;
+/// A standing man's stance (his lean, arms and shield) takes the first
+/// STANCE metres of a net squeeze before he gives ground to it.
+const STANCE: f32 = 0.10;
+#[inline]
+fn give(i: usize) -> f32 {
+    GIVE * (0.7 + 0.6 * crate::units::hash01((i as u32).wrapping_mul(0x51ED).wrapping_add(77)))
+}
 
 /// A man of a regiment in melee who sees no enemy joins the fight when
 /// he sees the comrade beside him run toward it: in each half-second
@@ -363,13 +377,12 @@ struct Step {
     push: Vec2,
     corr: Vec2,
     /// Which way the overlap correction points, before its deadband and
-    /// cap, the ground velocity of the bodies he overlaps, and his share
-    /// by weight of a closing speed on them (half against his own kind,
-    /// less for a heavy man against a light one), each weighted by how far
-    /// a body sets him back.
+    /// cap, how deep the net overlap is along it in metres, and the ground
+    /// velocity of the bodies he overlaps, weighted by how far each sets
+    /// him back.
     overlap_dir: Vec2,
+    overlap_depth: f32,
     overlap_vel: Vec2,
-    overlap_share: f32,
     crowd: f32,
     best_idx: u32,
     sticky: bool,
@@ -480,8 +493,8 @@ fn begin(f: &Field, s: &mut Soldier) -> Step {
         push: Vec2::ZERO,
         corr: Vec2::ZERO,
         overlap_dir: Vec2::ZERO,
+        overlap_depth: 0.0,
         overlap_vel: Vec2::ZERO,
-        overlap_share: 0.0,
         crowd: 0.0,
         best_idx: u32::MAX,
         sticky: false,
@@ -607,7 +620,6 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
     let mut push = Vec2::ZERO;
     let mut corr = Vec2::ZERO;
     let mut overlap_vel = Vec2::ZERO;
-    let mut overlap_share = 0.0f32;
     let mut overlap = 0.0f32;
     let mut crowd = 0.0f32;
     let my_team_bit = (team[i] as u32) * crate::spatial::META_TEAM;
@@ -709,7 +721,6 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
                 let back = (hard - len) * gain * mw;
                 corr += d * (back / len);
                 overlap_vel += o_vel * back;
-                overlap_share += o_mass / (my_mass + o_mass) * back;
                 overlap += back;
             }
             push += d * (w * mw / len);
@@ -743,7 +754,6 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
     st.corr = corr;
     if overlap > 0.0 {
         st.overlap_vel = overlap_vel / overlap;
-        st.overlap_share = overlap_share / overlap;
     }
     st.crowd = crowd;
     st.best_idx = best_idx;
@@ -1355,6 +1365,7 @@ fn yield_to_crowd(st: &mut Step) {
     let mut corr_len2 = corr.length_squared();
     if corr_len2 > 1e-12 {
         st.overlap_dir = corr / corr_len2.sqrt();
+        st.overlap_depth = corr_len2.sqrt() / corr_gain();
     }
     if !fight_room() && corr_len2 < 1e-4 {
         // With the room to fight off, the contact rule holds a man only on
@@ -1573,9 +1584,9 @@ fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
 }
 
 /// From drive to velocity: the wall and charge paces, fatigue, the
-/// stagger, the crowd's damping, a standing man's grip on the ground, the
-/// acceleration and speed caps, and the sharing of the speed that drives
-/// into an overlap.
+/// stagger, the crowd's damping, a standing man's grip on the ground and
+/// his stance against a squeeze, the acceleration and speed caps, and the
+/// give of his legs at a body he runs into.
 #[inline]
 fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
     let Field { speed, wall, charging, fat_speed, fat_nocharge, dt, .. } = *f;
@@ -1611,10 +1622,18 @@ fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
     let mut push_a = push * (SEP_STRENGTH * (1.0 - jam));
     // A standing man plants his feet: small pushes do not move him, real
     // shoves do (less the grip). Without it any squeeze turned straight into
-    // sliding, and a fight's jostle rippled back through packed ranks.
+    // sliding, and a fight's jostle rippled back through packed ranks. With
+    // the room to fight on his stance takes the first STANCE of a net
+    // squeeze the same way: he gives ground only to what is beyond it.
     if desired.length_squared() < 1e-6 {
         let pl = push_a.length();
         push_a *= if pl > STAND_GRIP { (pl - STAND_GRIP) / pl } else { 0.0 };
+        if fight_room()
+            && st.overlap_depth > 0.0
+            && *s.swing & crate::units::SWING_STAGGERED == 0
+        {
+            st.corr *= ((st.overlap_depth - STANCE) / st.overlap_depth).max(0.0);
+        }
     }
     let mut accel = (desired - v) * STEER_GAIN + push_a;
     let a2 = accel.length_squared();
@@ -1632,20 +1651,25 @@ fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
         new_v *= vmax / v2.sqrt();
     }
     if fight_room() {
-        // A contact shares the speed. Toward the bodies he overlaps,
-        // measured against their own movement, a man loses his share by
-        // weight of the closing speed on every tick the overlap lasts, and
-        // each of them takes the rest from its own side: the two end the
-        // tick at one speed along the line between them, as bodies that
-        // meet and do not bounce. Nobody stops dead, the man run into is
-        // carried, and a push passes on through the ranks. Each side taking
-        // all of it would swap the two speeds: the runner would stop in one
-        // tick and the man he hit would take the runner's whole speed.
+        // The soft wall. Toward the bodies he overlaps, a man's legs lose
+        // their closing speed on them over his give: all of it is left at
+        // the touch, none at the give, and they never carry him past it in
+        // one tick. The closing speed is measured against the bodies' own
+        // movement, and never more of it is taken than his own speed into
+        // them, so a column on the march is not held up and the man he hits
+        // is handed nothing: he is moved by the setting apart alone, as
+        // pressure. The spring and the setting apart then push the runner
+        // back out along the line to the body he hit.
         let dir = st.overlap_dir;
         if dir != Vec2::ZERO {
+            let own = new_v.dot(-dir);
             let into = (new_v - st.overlap_vel).dot(-dir);
-            if into > 0.0 {
-                new_v += dir * (into * st.overlap_share);
+            let closing = into.min(own);
+            if closing > 0.0 {
+                let give = give(i);
+                let left = (give - st.overlap_depth).max(0.0);
+                let allowed = (closing * left / give).min(left / dt);
+                new_v += dir * (closing - allowed);
             }
         }
     } else if corr_len2 > 1e-12 {
