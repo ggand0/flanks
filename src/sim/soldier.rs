@@ -75,12 +75,23 @@ const KEEP_FACING_R: f32 = 6.0;
 /// turns ~180° in about a second: pi rad/s. Small angles never hit
 /// the cap, so marching wheels and duel tracking feel unchanged.
 const TURN_SPEED_MAX: f32 = std::f32::consts::PI;
-/// Positional overlap resolution: fraction of pair overlap corrected per
-/// tick per unit, and the per-tick cap on total correction distance.
-/// UNDER-relaxed on purpose: resolving overlap over ~3-4 ticks reads as
-/// bodies settling; resolving it in 1-2 reads as twitching.
-const CORR_GAIN: f32 = 0.3;
+/// Positional overlap resolution: the share of a pair's overlap each man
+/// is moved back per tick, and the per-tick cap on total correction
+/// distance. A packed man overlaps up to six bodies and their corrections
+/// add up, so the share stays under one sixth: over it, six bodies throw
+/// him past the middle of them and he comes back on the next tick, every
+/// tick. 90% of an overlap is gone in 7 ticks. With the room to fight off
+/// (main's sim) it is 0.3.
+const CORR_GAIN: f32 = 0.15;
+const CORR_GAIN_OLD: f32 = 0.3;
 const CORR_MAX: f32 = 0.1;
+fn corr_gain() -> f32 {
+    if fight_room() {
+        CORR_GAIN
+    } else {
+        CORR_GAIN_OLD
+    }
+}
 /// Units slow down proportionally inside this distance to the target.
 const ARRIVE_RADIUS: f32 = 35.0;
 /// A holding soldier who leaves his mark by more than the hold deadzone
@@ -137,25 +148,6 @@ pub(crate) fn in_lane(to: Vec2, fight_dir: Vec2, enemy_d: f32) -> bool {
 fn fight_room() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| crate::util::env_or("FL_FIGHT_ROOM", 1_u32) != 0)
-}
-
-/// A man who has run into a body does not walk into it again at once. He
-/// shoves in for PRESS_TICKS at the start of a beat of his own, is set back
-/// out, and stands until his next beat: a bump about once a second, each
-/// man on his own time, where a man left free to walk in steps in and is
-/// set back every tick. His beat is PRESS_BEAT_MIN to PRESS_BEAT_MAX ticks
-/// long, and he lets a PRESS_SKIP share of his beats pass.
-const PRESS_TICKS: u32 = 3;
-const PRESS_BEAT_MIN: u32 = 20;
-const PRESS_BEAT_MAX: u32 = 45;
-const PRESS_SKIP: f32 = 0.3;
-#[inline]
-fn presses(i: usize, tick: u32) -> bool {
-    let own = crate::units::hash01((i as u32).wrapping_mul(0x9E37) ^ 0x7F4A_7C15);
-    let beat = PRESS_BEAT_MIN + (own * (PRESS_BEAT_MAX - PRESS_BEAT_MIN) as f32) as u32;
-    let t = tick.wrapping_add((i as u32).wrapping_mul(13));
-    let roll = crate::units::hash01((t / beat).wrapping_mul(0x2545_F491) ^ (i as u32).wrapping_mul(0x51ED));
-    t % beat < PRESS_TICKS && roll >= PRESS_SKIP
 }
 
 /// Share of those windows in which a blocked man sidesteps
@@ -371,9 +363,13 @@ struct Step {
     push: Vec2,
     corr: Vec2,
     /// Which way the overlap correction points, before its deadband and
-    /// cap, and the ground velocity of the bodies he overlaps.
+    /// cap, the ground velocity of the bodies he overlaps, and his share
+    /// by weight of a closing speed on them (half against his own kind,
+    /// less for a heavy man against a light one), each weighted by how far
+    /// a body sets him back.
     overlap_dir: Vec2,
     overlap_vel: Vec2,
+    overlap_share: f32,
     crowd: f32,
     best_idx: u32,
     sticky: bool,
@@ -485,6 +481,7 @@ fn begin(f: &Field, s: &mut Soldier) -> Step {
         corr: Vec2::ZERO,
         overlap_dir: Vec2::ZERO,
         overlap_vel: Vec2::ZERO,
+        overlap_share: 0.0,
         crowd: 0.0,
         best_idx: u32::MAX,
         sticky: false,
@@ -610,12 +607,14 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
     let mut push = Vec2::ZERO;
     let mut corr = Vec2::ZERO;
     let mut overlap_vel = Vec2::ZERO;
+    let mut overlap_share = 0.0f32;
     let mut overlap = 0.0f32;
     let mut crowd = 0.0f32;
     let my_team_bit = (team[i] as u32) * crate::spatial::META_TEAM;
     let my_wall = wall[gi] != 0;
     let my_mass = params.mass;
     let body = body_distance();
+    let gain = corr_gain();
     let reach2 = params.reach * params.reach;
     let prev_target = *s.target;
     let mut best_d2 = f32::MAX;
@@ -707,9 +706,10 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
                 // here as well made packed crowds oscillate at the
                 // acceleration cap, two solvers fighting over the same
                 // overlap, every frame.
-                let back = (hard - len) * CORR_GAIN * mw;
+                let back = (hard - len) * gain * mw;
                 corr += d * (back / len);
                 overlap_vel += o_vel * back;
+                overlap_share += o_mass / (my_mass + o_mass) * back;
                 overlap += back;
             }
             push += d * (w * mw / len);
@@ -743,6 +743,7 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
     st.corr = corr;
     if overlap > 0.0 {
         st.overlap_vel = overlap_vel / overlap;
+        st.overlap_share = overlap_share / overlap;
     }
     st.crowd = crowd;
     st.best_idx = best_idx;
@@ -1355,9 +1356,11 @@ fn yield_to_crowd(st: &mut Step) {
     if corr_len2 > 1e-12 {
         st.overlap_dir = corr / corr_len2.sqrt();
     }
-    if corr_len2 < 1e-4 {
-        // Sub-centimeter corrections are settle noise, not overlap: applying
-        // them is pure micro-twitch.
+    if !fight_room() && corr_len2 < 1e-4 {
+        // With the room to fight off, the contact rule holds a man only on
+        // the ticks a correction is applied, and sub-centimetre ones are
+        // left out as settle noise. With it on every correction is applied:
+        // a threshold turns a steady lean into jumps of a centimetre.
         corr = Vec2::ZERO;
         corr_len2 = 0.0;
     } else if corr_len2 > CORR_MAX * CORR_MAX {
@@ -1571,11 +1574,11 @@ fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
 
 /// From drive to velocity: the wall and charge paces, fatigue, the
 /// stagger, the crowd's damping, a standing man's grip on the ground, the
-/// acceleration and speed caps, and the loss of the speed that drives
+/// acceleration and speed caps, and the sharing of the speed that drives
 /// into an overlap.
 #[inline]
 fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
-    let Field { speed, wall, charging, fat_speed, fat_nocharge, moving, tick, dt, .. } = *f;
+    let Field { speed, wall, charging, fat_speed, fat_nocharge, dt, .. } = *f;
     let i = s.i;
     let gi = st.gi;
     let dying = st.dying;
@@ -1628,23 +1631,26 @@ fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
     if v2 > vmax * vmax {
         new_v *= vmax / v2.sqrt();
     }
-    if fight_room() && !moving[gi] && !presses(i, tick) {
-        // Between his beats nothing carries a man into the bodies he
-        // overlaps: toward them, measured against their own movement, he
-        // has no speed, on every tick the overlap lasts. He is set back out
-        // and stands. A man sent somewhere by a Move order is left out, so
-        // a unit can still be forced through another.
+    if fight_room() {
+        // A contact shares the speed. Toward the bodies he overlaps,
+        // measured against their own movement, a man loses his share by
+        // weight of the closing speed on every tick the overlap lasts, and
+        // each of them takes the rest from its own side: the two end the
+        // tick at one speed along the line between them, as bodies that
+        // meet and do not bounce. Nobody stops dead, the man run into is
+        // carried, and a push passes on through the ranks. Each side taking
+        // all of it would swap the two speeds: the runner would stop in one
+        // tick and the man he hit would take the runner's whole speed.
         let dir = st.overlap_dir;
         if dir != Vec2::ZERO {
             let into = (new_v - st.overlap_vel).dot(-dir);
             if into > 0.0 {
-                new_v += dir * into;
+                new_v += dir * (into * st.overlap_share);
             }
         }
     } else if corr_len2 > 1e-12 {
-        // On his beat he shoves in as a man does. After a positional
-        // correction, kill the velocity component still driving into the
-        // overlap or it re-penetrates next tick.
+        // After a positional correction, kill the velocity component still
+        // driving into the overlap or it re-penetrates next tick.
         let cn = corr.normalize_or_zero();
         let into = new_v.dot(-cn);
         if into > 0.0 {
