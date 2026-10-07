@@ -53,17 +53,30 @@ const CROWD_STOP: f32 = 2.5;
 /// once whenever a gap opened at its front.
 const BRAKE_FAR: f32 = 1.3;
 const BRAKE_NEAR: f32 = 0.9;
+/// FL_BRAKE=body plays the band set from the body distance instead (six
+/// at the touch to six at 0.91 of the body), for comparison.
 pub(crate) fn crowd_brake() -> (f32, f32) {
     static B: std::sync::OnceLock<(f32, f32)> = std::sync::OnceLock::new();
     *B.get_or_init(|| {
-        if fight_room() {
+        if !fight_room() {
+            (CROWD_SLOW, CROWD_STOP)
+        } else if std::env::var("FL_BRAKE").is_ok_and(|v| v == "body") {
+            let body = body_distance();
+            let stop = 6.0 - (6.0 - CROWD_STOP) * body / BODY_DISTANCE_OLD;
+            let touch = 6.0 * (1.0 - body / SEP_RADIUS);
+            (CROWD_SLOW.min(touch), stop)
+        } else {
             let scale = crate::unit_types::unit_scale();
             let at = |d: f32| 6.0 * (1.0 - (d * scale).min(SEP_RADIUS) / SEP_RADIUS);
             (at(BRAKE_FAR), at(BRAKE_NEAR))
-        } else {
-            (CROWD_SLOW, CROWD_STOP)
         }
     })
+}
+/// FL_CONTACT=share plays the contact that shares the closing speed by
+/// weight between the two men instead of the soft wall, for comparison.
+fn share_contact() -> bool {
+    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *S.get_or_init(|| std::env::var("FL_CONTACT").is_ok_and(|v| v == "share"))
 }
 const STEER_GAIN: f32 = 3.0;
 const MAX_ACCEL: f32 = 50.0;
@@ -402,6 +415,8 @@ struct Step {
     overlap_dir: Vec2,
     overlap_depth: f32,
     overlap_vel: Vec2,
+    /// His share by weight of a closing speed on them (FL_CONTACT=share).
+    overlap_share: f32,
     crowd: f32,
     best_idx: u32,
     sticky: bool,
@@ -514,6 +529,7 @@ fn begin(f: &Field, s: &mut Soldier) -> Step {
         overlap_dir: Vec2::ZERO,
         overlap_depth: 0.0,
         overlap_vel: Vec2::ZERO,
+        overlap_share: 0.0,
         crowd: 0.0,
         best_idx: u32::MAX,
         sticky: false,
@@ -639,6 +655,7 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
     let mut push = Vec2::ZERO;
     let mut corr = Vec2::ZERO;
     let mut overlap_vel = Vec2::ZERO;
+    let mut overlap_share = 0.0f32;
     let mut overlap = 0.0f32;
     let mut crowd = 0.0f32;
     let my_team_bit = (team[i] as u32) * crate::spatial::META_TEAM;
@@ -740,6 +757,7 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
                 let back = (hard - len) * gain * mw;
                 corr += d * (back / len);
                 overlap_vel += o_vel * back;
+                overlap_share += o_mass / (my_mass + o_mass) * back;
                 overlap += back;
             }
             push += d * (w * mw / len);
@@ -773,6 +791,7 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
     st.corr = corr;
     if overlap > 0.0 {
         st.overlap_vel = overlap_vel / overlap;
+        st.overlap_share = overlap_share / overlap;
     }
     st.crowd = crowd;
     st.best_idx = best_idx;
@@ -1688,7 +1707,12 @@ fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
         // pressure. The spring and the setting apart then push the runner
         // back out along the line to the body he hit.
         let dir = st.overlap_dir;
-        if dir != Vec2::ZERO {
+        if dir != Vec2::ZERO && share_contact() {
+            let into = (new_v - st.overlap_vel).dot(-dir);
+            if into > 0.0 {
+                new_v += dir * (into * st.overlap_share);
+            }
+        } else if dir != Vec2::ZERO {
             let own = new_v.dot(-dir);
             let into = (new_v - st.overlap_vel).dot(-dir);
             let closing = into.min(own);
