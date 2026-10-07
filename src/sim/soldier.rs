@@ -40,25 +40,44 @@ pub(crate) fn body_distance() -> f32 {
 /// density values. Scalar density can't cancel out the way opposing push
 /// vectors do, so this is what stops a goal-seeking crowd from compressing
 /// itself into overlap: packed interior units genuinely stop shoving.
+/// These two are main's values (six neighbours at 1.12 m and six at
+/// 0.82 m), kept with the room to fight off.
 const CROWD_SLOW: f32 = 1.2;
 const CROWD_STOP: f32 = 2.5;
-/// The two values at the body distance in use. CROWD_STOP is six
-/// neighbours pressed to 0.91 of the 0.9 m body, and the press it stands
-/// for moves with the body distance: a drive still on where bodies
-/// overlap walks a packed man in, the overlap correction sets him back
-/// out, and he twitches every tick. The fade starts no later than where
-/// six neighbours touch him.
+/// With the room to fight on, the fade is set by the men's real size, not
+/// by the body distance: a man's drive eases from six neighbours at arm's
+/// length, BRAKE_FAR of the 1.70 m man, to nothing when six are pressed
+/// against him at BRAKE_NEAR, his width with arms and shield. Both scale
+/// with the unit scale. A band set from the body distance was 11 cm of
+/// squeeze at a 1.2 m body, and the drive of a whole lane came back at
+/// once whenever a gap opened at its front.
+const BRAKE_FAR: f32 = 1.3;
+const BRAKE_NEAR: f32 = 0.9;
 pub(crate) fn crowd_brake() -> (f32, f32) {
     static B: std::sync::OnceLock<(f32, f32)> = std::sync::OnceLock::new();
     *B.get_or_init(|| {
-        let body = body_distance();
-        let stop = 6.0 - (6.0 - CROWD_STOP) * body / BODY_DISTANCE_OLD;
-        let touch = 6.0 * (1.0 - body / SEP_RADIUS);
-        (CROWD_SLOW.min(touch), stop)
+        if fight_room() {
+            let scale = crate::unit_types::unit_scale();
+            let at = |d: f32| 6.0 * (1.0 - (d * scale).min(SEP_RADIUS) / SEP_RADIUS);
+            (at(BRAKE_FAR), at(BRAKE_NEAR))
+        } else {
+            (CROWD_SLOW, CROWD_STOP)
+        }
     })
 }
 const STEER_GAIN: f32 = 3.0;
 const MAX_ACCEL: f32 = 50.0;
+/// What a man's legs can do: the steering toward his wish is capped at
+/// this acceleration, about what a man in armour with a shield manages
+/// from a stand (FL_LEG_ACCEL, m/s^2). Without it the gain gave 28 m/s^2,
+/// three g, at every start and stop, and a lane behind an opening gap
+/// surged and stopped as one body. The spring's push and the contact are
+/// not legs and keep MAX_ACCEL.
+const LEG_ACCEL: f32 = 4.0;
+fn leg_accel() -> f32 {
+    static A: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *A.get_or_init(|| crate::util::env_or("FL_LEG_ACCEL", LEG_ACCEL).max(0.1))
+}
 /// Facing turn smoothing (fraction/s of the remaining angle) — the
 /// settle behavior for SMALL corrections.
 const YAW_RATE: f32 = 10.0;
@@ -1635,7 +1654,15 @@ fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
             st.corr *= ((st.overlap_depth - STANCE) / st.overlap_depth).max(0.0);
         }
     }
-    let mut accel = (desired - v) * STEER_GAIN + push_a;
+    let mut legs = (desired - v) * STEER_GAIN;
+    if fight_room() {
+        let l2 = legs.length_squared();
+        let cap = leg_accel();
+        if l2 > cap * cap {
+            legs *= cap / l2.sqrt();
+        }
+    }
+    let mut accel = legs + push_a;
     let a2 = accel.length_squared();
     if a2 > MAX_ACCEL * MAX_ACCEL {
         accel *= MAX_ACCEL / a2.sqrt();
