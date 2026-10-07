@@ -854,7 +854,7 @@ fn spawn_routpass_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups
 /// FL_TEST_PUSH=1: a lane behind a gap. Three deep orange regiments of
 /// FL_PUSH_LINE_SIZE men (384, 23 ranks) hold in a line in the middle of
 /// the field with FL_PUSH_GAP metres of air between them (3), facing a blue mass of
-/// FL_PUSH_ACROSS by FL_PUSH_DEEP regiments (3 by 4, as wide as the line, so it cannot go round it) of FL_PUSH_SIZE men
+/// FL_PUSH_ACROSS by FL_PUSH_DEEP regiments (4 by 3) of FL_PUSH_SIZE men
 /// (128) that stands 30 m in front of them under a Move order to a point
 /// 60 m behind them: the mass clogs against the line and presses past it
 /// through the gaps while the fight at the rim kills. Every regiment is
@@ -866,8 +866,8 @@ fn spawn_push_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
     let size: usize = crate::util::env_or("FL_PUSH_SIZE", 128).max(1);
     let line_size: usize = crate::util::env_or("FL_PUSH_LINE_SIZE", 3 * size).max(1);
     let gap: f32 = crate::util::env_or("FL_PUSH_GAP", 3.0);
-    let across: usize = crate::util::env_or("FL_PUSH_ACROSS", 3).max(1);
-    let deep: usize = crate::util::env_or("FL_PUSH_DEEP", 4).max(1);
+    let across: usize = crate::util::env_or("FL_PUSH_ACROSS", 4).max(1);
+    let deep: usize = crate::util::env_or("FL_PUSH_DEEP", 3).max(1);
     let cols = ((size as f32 * 2.2).sqrt().ceil() as usize).max(1);
     let width = cols as f32 * SPACING;
     let depth = size.div_ceil(cols) as f32 * SPACING;
