@@ -89,6 +89,9 @@ pub struct GroupData {
     /// Hold position (defend mode): never auto-engage, never chase — at
     /// ease (false, default) idle regiments engage enemies that come near.
     pub hold: bool,
+    /// A scripted regiment that never breaks, whatever its morale: the
+    /// line a test scene presses against.
+    pub steadfast: bool,
     /// Request: rewrite this regiment's slots before the next sim tick.
     pub reform: bool,
     /// Living strength when slots were last written (close-ranks trigger).
@@ -230,6 +233,7 @@ impl GroupData {
             facing: if team == 0 { 0.0 } else { std::f32::consts::PI },
             files: 0,
             hold: false,
+            steadfast: false,
             reform: false,
             count_at_reform: count,
             disorder: 0.0,
