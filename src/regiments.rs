@@ -1288,6 +1288,11 @@ fn room_log(
     if !line.is_empty() {
         info!("[room] t={t:.0}s regiments by state, the median of their medians (lowest to highest){line}");
     }
+    let back = crate::sim::soldier::STEP_BACK_TICKS.swap(0, std::sync::atomic::Ordering::Relaxed);
+    info!(
+        "[room] t={t:.0}s stepping back from an enemy inside the fighting distance: {back} man-ticks in 5 s, {:.1} men a tick",
+        back as f32 / 150.0
+    );
 }
 
 /// What `shake_log` keeps from tick to tick: each man's last step, and over

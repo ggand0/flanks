@@ -151,6 +151,10 @@ const FIGHT_SHARE: f32 = 0.9;
 /// steps back, and then steps all the way out to it: a real step, as on
 /// the way back to his mark.
 const BACK_SLACK: f32 = 0.3;
+/// Man-ticks of that step back since the room log last read them
+/// (FL_LOG_ROOM).
+pub(crate) static STEP_BACK_TICKS: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
 /// The closing distance of every kind with the room to fight off.
 const CLOSE_STOP: f32 = 1.2;
 
@@ -1551,6 +1555,7 @@ fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
             let inside = if stepping { fight } else { fight - BACK_SLACK };
             if dist < inside {
                 desired -= to_enemy * (STEP_PACE / dist);
+                STEP_BACK_TICKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
     }
