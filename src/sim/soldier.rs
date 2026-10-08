@@ -72,11 +72,14 @@ pub(crate) fn crowd_brake() -> (f32, f32) {
         }
     })
 }
-/// FL_CONTACT=share plays the contact that shares the closing speed by
-/// weight between the two men instead of the soft wall, for comparison.
+/// The contact between a man and the body he runs into. By default the
+/// two share the closing speed by weight (half each between equal men),
+/// so a shove travels through a press and a deep mass pushes a line.
+/// FL_CONTACT=wall plays the soft wall instead: the runner's legs lose
+/// the closing speed over his give and the man hit is handed none of it.
 fn share_contact() -> bool {
     static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *S.get_or_init(|| std::env::var("FL_CONTACT").is_ok_and(|v| v == "share"))
+    *S.get_or_init(|| !std::env::var("FL_CONTACT").is_ok_and(|v| v == "wall"))
 }
 const STEER_GAIN: f32 = 3.0;
 const MAX_ACCEL: f32 = 50.0;
@@ -193,12 +196,11 @@ fn sidestep_chance() -> f32 {
 /// neighbor. Stepping and running men, and charge knockback, are
 /// unaffected; true overlap is still corrected.
 const STAND_GRIP: f32 = 6.0;
-/// The body a man runs into is a soft wall. His legs carry him this far
-/// into it (his own give, 0.7 to 1.3 of it), losing their closing speed on
-/// the way, and nothing of his speed is handed to the man he hits: the
-/// press and that man's feet take it. A stop on one tick is the twitch (he
-/// is set back and walks in again) or, with his speed handed on, a lurch
-/// that runs through the rows.
+/// The soft wall (FL_CONTACT=wall): a man's legs carry him this far into
+/// the body he runs into (his own give, 0.7 to 1.3 of it), losing their
+/// closing speed on the way, and nothing of his speed is handed to the
+/// man he hits: the press and that man's feet take it. A stop on one tick
+/// is the twitch (he is set back and walks in again).
 const GIVE: f32 = 0.08;
 /// A standing man's stance (his lean, arms and shield) takes the first
 /// STANCE metres of a net squeeze before he gives ground to it.
@@ -415,7 +417,7 @@ struct Step {
     overlap_dir: Vec2,
     overlap_depth: f32,
     overlap_vel: Vec2,
-    /// His share by weight of a closing speed on them (FL_CONTACT=share).
+    /// His share by weight of a closing speed on them (the shared speed).
     overlap_share: f32,
     crowd: f32,
     best_idx: u32,
@@ -1697,15 +1699,17 @@ fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
         new_v *= vmax / v2.sqrt();
     }
     if fight_room() {
-        // The soft wall. Toward the bodies he overlaps, a man's legs lose
-        // their closing speed on them over his give: all of it is left at
-        // the touch, none at the give, and they never carry him past it in
-        // one tick. The closing speed is measured against the bodies' own
-        // movement, and never more of it is taken than his own speed into
-        // them, so a column on the march is not held up and the man he hits
-        // is handed nothing: he is moved by the setting apart alone, as
-        // pressure. The spring and the setting apart then push the runner
-        // back out along the line to the body he hit.
+        // The contact. Shared speed: a man gives up his share by weight of
+        // the closing speed on the bodies he overlaps, measured against
+        // their own movement, and each of the two does the same, so a
+        // runner and the man he hits move on together and a shove travels
+        // through a press. Soft wall (FL_CONTACT=wall): toward the bodies
+        // he overlaps a man's legs lose their closing speed over his give,
+        // all of it left at the touch, none at the give, never carrying him
+        // past it in one tick, and never more than his own speed into them,
+        // so a column on the march is not held up; the man he hits is
+        // handed nothing and is moved by the setting apart alone, as
+        // pressure.
         let dir = st.overlap_dir;
         if dir != Vec2::ZERO && share_contact() {
             let into = (new_v - st.overlap_vel).dot(-dir);
