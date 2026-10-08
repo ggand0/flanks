@@ -16,7 +16,6 @@ mod gait;
 mod frontline;
 mod game_files;
 mod game_state;
-mod lane_overlay;
 mod mixer;
 mod morale;
 mod orders;
@@ -167,7 +166,6 @@ fn main() {
             combat::CombatPlugin,
             render_units::UnitRenderPlugin,
             selection_rings::SelectionRingsPlugin,
-            lane_overlay::LaneOverlayPlugin,
             camera::RtsCameraPlugin,
             overlay::OverlayPlugin,
             unit_cards::UnitCardsPlugin,
