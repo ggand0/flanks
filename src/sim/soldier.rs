@@ -24,7 +24,7 @@ const SEP_PUSH_MAX: f32 = 2.5;
 /// files. FL_BODY=<metres> sets it, up to the separation distance; with
 /// the room to fight off it is 0.9 m, the distance set when a soldier was
 /// 0.6 m wide.
-const BODY_DISTANCE: f32 = 1.0;
+const BODY_DISTANCE: f32 = 1.2;
 const BODY_DISTANCE_OLD: f32 = 0.9;
 pub(crate) fn body_distance() -> f32 {
     static D: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
