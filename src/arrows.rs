@@ -29,6 +29,11 @@ const LITTER_CAP_DEFAULT: usize = 50_000;
 /// soldier's axis to strike him. A man is about 0.5 m across the torso
 /// and 0.8 m with his arms.
 const HIT_RADIUS: f32 = 0.35;
+/// FL_WOUND=<share> overrides `missile::WOUND_SHARE` for calibration.
+fn wound_share() -> f32 {
+    static W: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *W.get_or_init(|| crate::util::env_or("FL_WOUND", missile::WOUND_SHARE).clamp(0.0, 1.0))
+}
 /// Collision tests only run below the tallest body plus this.
 const STRIKE_MARGIN: f32 = 0.3;
 /// How far over his own head an archer's arrow leaves the bow
@@ -365,6 +370,8 @@ fn update_arrows(
         /// convention: where the blow comes FROM).
         from_dir: Vec2,
         jit: f32,
+        /// False for a shaft that glanced off: heard, nothing else.
+        wound: bool,
     }
     let mut hits: Vec<Hit> = Vec::new();
     let strike_band = crate::unit_types::tallest() + STRIKE_MARGIN;
@@ -420,12 +427,16 @@ fn update_arrows(
             // one tick.
             if units.death_t[u] == 0 && units.hp[u] > 0.0 {
                 let seed = (*tick).wrapping_mul(0x9E37_79B1) ^ (i as u32).wrapping_mul(0x85EB);
+                // The shaft that crosses a man strikes him; whether it
+                // wounds him is the one roll here. The rest glance off
+                // armour, helmet or the shield's rim.
                 hits.push(Hit {
                     victim: u,
                     team: arrows.team[i],
                     group: arrows.group[i],
                     from_dir: -v.xz().normalize_or_zero(),
                     jit: 0.85 + 0.3 * hash01(seed),
+                    wound: hash01(seed ^ 0x6A09_E667) < wound_share(),
                 });
                 stats.hits += 1;
                 stats.landed += 1;
@@ -483,8 +494,10 @@ fn update_arrows(
         // The missile curve is steeper than melee's (missile::FACTOR_MULT):
         // armour classes must separate hard under arrows.
         let dmg = missile::BASE_DMG * missile::FACTOR_MULT.powf(factor) * h.jit * combat_scale;
-        units.hp[v] -= dmg;
-        units.flash[v] = 4;
+        if h.wound {
+            units.hp[v] -= dmg;
+            units.flash[v] = 4;
+        }
         if let Some(se) = sounds.as_deref_mut() {
             // A shaft cannot be parried: shield or armour takes it.
             se.push_arrow_hit(crate::audio::ArrowHit {
@@ -499,6 +512,9 @@ fn update_arrows(
                 ),
                 killed: units.hp[v] <= 0.0,
             });
+        }
+        if !h.wound {
+            continue;
         }
         if units.hp[v] <= 0.0 {
             units.death_t[v] = crate::sim::damage::DEATH_TICKS;

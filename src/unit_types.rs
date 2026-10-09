@@ -67,6 +67,14 @@ pub mod missile {
     pub const FACTOR_MULT: f32 = 1.28;
     /// Damage of a landed arrow at missile factor 0.
     pub const BASE_DMG: f32 = 20.0;
+    /// The share of the arrows that strike a man which wound him; the
+    /// rest glance off armour, helmet or the shield's rim and do
+    /// nothing, as M2TW's lethality has it. Set so the kills per arrow
+    /// at the men's true height match the ones the curve above was
+    /// calibrated to with the 1.1 m bodies, whose window a shaft could
+    /// hit was half as tall: 146 dead against 279 at 36 s of the
+    /// archery scene. FL_WOUND overrides it.
+    pub const WOUND_SHARE: f32 = 0.52;
 }
 
 /// Damage swing per combat factor point (M2TW uses ~1.2 on kill CHANCE;
