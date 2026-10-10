@@ -57,7 +57,7 @@ pub struct TickJob {
     pub(crate) death_t_in: Arc<Vec<u8>>,
     pub(crate) ammo_in: Arc<Vec<u8>>,
     pub(crate) out_form_in: Arc<Vec<bool>>,
-    pub(crate) sight_in: Arc<Vec<u8>>,
+    pub(crate) sight_in: Arc<Vec<u16>>,
     // Read only to pack the render snapshot.
     pub(crate) pos_prev_in: Arc<Vec<Vec3>>,
     pub(crate) color_in: Arc<Vec<[f32; 4]>>,
@@ -80,7 +80,7 @@ pub struct TickJob {
     pub(crate) death_t: Vec<u8>,
     pub(crate) ammo: Vec<u8>,
     pub(crate) out_form: Vec<bool>,
-    pub(crate) sight: Vec<u8>,
+    pub(crate) sight: Vec<u16>,
     // Per-regiment command snapshot, taken at prep.
     pub(crate) orders: Vec<Option<Vec2>>,
     pub(crate) anchors: Vec<Vec2>,
@@ -423,7 +423,9 @@ fn archer_fire_solutions(
     // Friendly blocks per team for the loft-over-friendlies check: every
     // live formed regiment as a disc with a clearance ceiling. A
     // shooter's own regiment is in here too — that is what makes rear
-    // ranks loft over their own front rank.
+    // ranks loft over their own front rank. The ceiling is 1.3 m over the
+    // heads at the disc's centre.
+    let ceiling = crate::unit_types::tallest() + 1.3;
     let blocks: [Vec<(Vec2, f32, f32)>; 2] = [0u8, 1u8].map(|tm| {
         groups
             .list
@@ -433,7 +435,7 @@ fn archer_fire_solutions(
                 (
                     g.centroid,
                     g.radius.max(3.0),
-                    terrain.height_at(g.centroid.x, g.centroid.y) + 2.4,
+                    terrain.height_at(g.centroid.x, g.centroid.y) + ceiling,
                 )
             })
             .collect()

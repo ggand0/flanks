@@ -128,9 +128,12 @@ pub(crate) struct ExtractedBucket(pub usize);
 /// couple of blocks for soldiers a few pixels tall.
 pub const NUM_LODS: usize = 4;
 
-/// Starting level thresholds: the minimum on-screen soldier height in
-/// pixels for L0, L1 and L2. Anything smaller draws the last level.
-const LOD_PX_DEFAULT: [f32; NUM_LODS - 1] = [28.0, 12.0, 3.0];
+/// Starting level thresholds for L0, L1 and L2: the minimum on-screen
+/// pixels one metre of a soldier's height covers. Anything smaller draws
+/// the last level. Per metre, so the switch distances do not move with
+/// the soldier's height: a taller man kept at a fixed pixel height would
+/// hold each finer mesh further out and cost the frame rate.
+const LOD_PX_PER_M: [f32; NUM_LODS - 1] = [28.0, 12.0, 3.0];
 /// Per-soldier threshold spread (+-10% of distance, from the stable anim
 /// seed): a regiment changes level as a scattered band, never as a line
 /// sweeping across the ranks.
@@ -158,23 +161,25 @@ pub struct LodConfig {
 
 impl Default for LodConfig {
     /// FL_LOD=0 draws everything at L0 (the pre-LOD renderer, for A/B
-    /// checks). FL_LOD_PX=a,b,c overrides the thresholds for feel passes.
+    /// checks). FL_LOD_PX=a,b,c overrides the thresholds, as soldier
+    /// heights in pixels, for feel passes.
     fn default() -> Self {
-        let mut px = LOD_PX_DEFAULT;
+        let mut px: [[f32; NUM_LODS - 1]; crate::unit_types::NUM_KINDS] =
+            std::array::from_fn(|kind| {
+                let height = 2.0 * crate::unit_types::half_height(kind);
+                LOD_PX_PER_M.map(|per_m| per_m * height)
+            });
         if let Ok(v) = std::env::var("FL_LOD_PX") {
             let parsed: Vec<f32> = v.split(',').filter_map(|t| t.trim().parse().ok()).collect();
             match <[f32; NUM_LODS - 1]>::try_from(parsed) {
-                Ok(p) => px = p,
+                Ok(p) => px = [p; crate::unit_types::NUM_KINDS],
                 Err(_) => warn!("FL_LOD_PX wants {} comma-separated numbers", NUM_LODS - 1),
             }
         }
         if std::env::var("FL_LOD").is_ok_and(|v| v == "0") {
-            px = [0.0; NUM_LODS - 1];
+            px = [[0.0; NUM_LODS - 1]; crate::unit_types::NUM_KINDS];
         }
-        Self {
-            px: [px; crate::unit_types::NUM_KINDS],
-            debug: std::env::var("FL_LOD_DEBUG").is_ok(),
-        }
+        Self { px, debug: std::env::var("FL_LOD_DEBUG").is_ok() }
     }
 }
 
@@ -501,6 +506,7 @@ fn setup_unit_mesh(
         // the figure's height when it has no legs.
         rig.leg = crate::gait::measure(&lods[0])
             .unwrap_or(crate::unit_types::half_height(kind));
+        rig.half = crate::unit_types::half_height(kind);
         let rig = UnitRig { rig, clips: std::sync::Arc::new(model.clips) };
         let atlas = model.atlas.map(|image| images.add(image));
         let tris: Vec<usize> =
@@ -677,6 +683,8 @@ struct Smooth {
     shot: f32,
     /// How far his bow is up toward the drawn ready pose, 0 to 1.
     bow: f32,
+    /// Smoothed ground velocity, m/s (x, z): `walk` is its length.
+    drift: Vec2,
 }
 
 /// One soldier's attack on anim z (CELEBRATE_BASE), 0 when he is not
@@ -896,17 +904,21 @@ fn sync_instance_data(
                 let start = ci * SYNC_CHUNK;
                 let end = (start + SYNC_CHUNK).min(units.len());
                 for i in start..end {
-                    // Walk signal: smoothed ACTUAL per-tick displacement.
-                    // Velocity misses positional-correction shoves (which
-                    // also kill vel), raw displacement strobes on bursty
-                    // corr chains. Updated before the cull so units
-                    // re-entering the frustum have a live value.
+                    // Walk signal: the ACTUAL per-tick displacement
+                    // smoothed as a vector, then its length. Velocity misses
+                    // positional-correction shoves (which also kill vel), raw
+                    // displacement strobes on bursty corr chains, and the
+                    // smoothed size of the displacement reads a man jostled
+                    // back and forth in a press as walking. Updated before
+                    // the cull so units re-entering the frustum have a live
+                    // value.
                     let step = units.pos[i] - units.pos_prev[i];
-                    let disp = Vec2::new(step.x, step.z).length() * inv_dt;
+                    let disp = Vec2::new(step.x, step.z) * inv_dt;
                     let gi = units.group[i] as usize;
                     let kind = units.kind[i] as usize;
                     let sm = &mut smooth_chunk[i - start];
-                    sm.walk += (disp - sm.walk) * ema_k;
+                    sm.drift += (disp - sm.drift) * ema_k;
+                    sm.walk = sm.drift.length();
                     let sw = units.swing[i];
                     let dying = units.death_t[i] > 0;
                     let attack =

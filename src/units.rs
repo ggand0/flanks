@@ -106,7 +106,7 @@ pub struct Units {
     /// What he last saw of the comrades around him and of comrades
     /// running to the fight (sim/soldier.rs SIGHT_* bits). A man looks
     /// around every few ticks, not every tick, and acts on what he saw.
-    pub sight: Column<u8>,
+    pub sight: Column<u16>,
     /// Bumped every time a battle rebuilds this world. A sim tick job
     /// computed from an older world carries indices that mean nothing
     /// here: sim/mod.rs drops it instead of installing it.

@@ -115,7 +115,8 @@ pub struct UnitTypeParams {
     /// Fatigue accumulation multiplier — the M2TW `stat_heat` analog:
     /// heavy armour tires its wearer faster. Recovery is unscaled.
     pub fatigue_rate: f32,
-    /// Mesh half height; units sit on the terrain at this Y.
+    /// Half the soldier's height, feet to helmet top; units sit on the
+    /// terrain at this Y. Every kind is 1.70 m.
     pub half_height: f32,
 }
 
@@ -141,10 +142,10 @@ pub fn kind_class(kind: u8) -> &'static str {
     }
 }
 
-/// FL_UNIT_SCALE=f scales every soldier's height. At 1.0 they are 1.0 to
-/// 1.1 m tall, at 1.64 a knight is 1.8 m. Soldiers stand on the terrain
-/// at their half height, so this moves the sim and breaks the behaviour
-/// baselines when set.
+/// FL_UNIT_SCALE=f scales every soldier's height from the true 1.70 m.
+/// Soldiers stand on the terrain at their half height and arrows test
+/// against it, so this moves the sim and breaks the behaviour baselines
+/// when set.
 pub fn unit_scale() -> f32 {
     static S: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
     *S.get_or_init(|| crate::util::env_or("FL_UNIT_SCALE", 1.0_f32).clamp(0.5, 2.5))
@@ -154,6 +155,11 @@ pub fn unit_scale() -> f32 {
 /// terrain at this and their meshes are built to it.
 pub fn half_height(kind: usize) -> f32 {
     TYPES[kind].half_height * unit_scale()
+}
+
+/// Height of the tallest kind, feet to helmet top.
+pub fn tallest() -> f32 {
+    (0..NUM_KINDS).map(half_height).fold(0.0, f32::max) * 2.0
 }
 
 /// Indexed by kind. Baseline feel: the median frontal matchup (light vs
@@ -195,7 +201,7 @@ pub const TYPES: [UnitTypeParams; NUM_KINDS] = [
         base_morale: 11.0,
         discipline: 0.6,
         fatigue_rate: 1.3,
-        half_height: 0.55,
+        half_height: 0.85,
     },
     // KIND_LIGHT — men-at-arms: fast, fragile, quicker swings, spear reach.
     UnitTypeParams {
@@ -216,7 +222,7 @@ pub const TYPES: [UnitTypeParams; NUM_KINDS] = [
         base_morale: 5.0,
         discipline: 1.0,
         fatigue_rate: 1.0,
-        half_height: 0.50,
+        half_height: 0.85,
     },
     // KIND_SPEAR — spear infantry: chainmail line troops behind big
     // shields. Longest reach (first strike on contact), steadier than
@@ -241,7 +247,7 @@ pub const TYPES: [UnitTypeParams; NUM_KINDS] = [
         base_morale: 5.0,
         discipline: 0.85,
         fatigue_rate: 1.1,
-        half_height: 0.50,
+        half_height: 0.85,
     },
     // KIND_ARCHER — levy bowmen: the ranged kind (missile stats live in
     // `missile`); this row is their WEAK melee fallback. Flesh-tier
@@ -266,6 +272,6 @@ pub const TYPES: [UnitTypeParams; NUM_KINDS] = [
         base_morale: 3.0,
         discipline: 1.15,
         fatigue_rate: 0.9,
-        half_height: 0.50,
+        half_height: 0.85,
     },
 ];

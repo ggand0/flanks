@@ -10,8 +10,8 @@ use crate::terrain::Terrain;
 use crate::unit_types::{KIND_ARCHER, KIND_HEAVY, KIND_LIGHT, KIND_SPEAR, NUM_KINDS};
 use crate::units::{Units, hash01, push_unit};
 
-/// Unit spacing inside a regiment block.
-const SPACING: f32 = 1.4;
+/// Unit spacing inside a regiment block in the test scenarios' layouts.
+const SPACING: f32 = crate::formation::BASE_SPACING;
 /// Gap between regiment blocks.
 const REG_GAP: f32 = 10.0;
 /// Margins the army layout keeps from the terrain edges. Shared with the
@@ -48,7 +48,7 @@ impl Plugin for RegimentsPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(
             Update,
-            (rout_test_log, dir_test_log, arena_log, charge_test_log, pile_test_log, melee_diag_log, join_test_log, routpass_test_log, archery_log),
+            (rout_test_log, dir_test_log, arena_log, charge_test_log, pile_test_log, melee_diag_log, join_test_log, routpass_test_log, push_test_log, archery_log, room_log, shake_log),
         );
     }
 }
@@ -181,8 +181,9 @@ fn spawn_regiment(
         let seed = crate::units::spawn_seed((team as u32) << 30 | g << 16 | k as u32);
         let jx = hash01(seed.wrapping_mul(3) + 1) - 0.5;
         let jz = hash01(seed.wrapping_mul(3) + 2) - 0.5;
-        let x = anchor.x + (col as f32 - (cols - 1) as f32 / 2.0) * SPACING + jx * 0.5;
-        let z = anchor.y + dir * ((row as f32 - (rows - 1) as f32 / 2.0) * SPACING) + jz * 0.5;
+        let gap = crate::formation::gap(kind);
+        let x = anchor.x + (col as f32 - (cols - 1) as f32 / 2.0) * gap + jx * 0.5;
+        let z = anchor.y + dir * ((row as f32 - (rows - 1) as f32 / 2.0) * gap) + jz * 0.5;
         push_unit(units, terrain, seed, team, kind, g, x, z, anchor);
     }
     // Rigid rank-and-file by default: exact slots into `home` (the spawn
@@ -224,6 +225,7 @@ pub fn do_spawn_battle(
         }
         Scenario::Join => { spawn_join_test(units, terrain, groups); return; }
         Scenario::Routpass => { spawn_routpass_test(units, terrain, groups); return; }
+        Scenario::Push => { spawn_push_test(units, terrain, groups); return; }
         // The scene: no armies. The victory check stays quiet on an empty
         // regiment list and the camera is free in the Battle state.
         Scenario::Scene => { groups.list.clear(); return; }
@@ -236,11 +238,13 @@ pub fn do_spawn_battle(
     let size = config.reg_size;
     let n_regs = (per_team / size).max(1);
 
-    // Block geometry: wider than deep (~2.2:1).
+    // Block geometry: wider than deep (~2.2:1), on the ground the kind
+    // with the widest gap needs.
     let cols = ((size as f32 * 2.2).sqrt().ceil() as usize).max(1);
     let rows = size.div_ceil(cols);
-    let block_w = cols as f32 * SPACING;
-    let block_d = rows as f32 * SPACING;
+    let gap = crate::formation::widest_gap();
+    let block_w = cols as f32 * gap;
+    let block_d = rows as f32 * gap;
 
     // Regiments per rank: prefer filling the field's width, but never spawn
     // ranks past its edge (at the terrain's edge the sim clamps positions
@@ -847,6 +851,88 @@ fn spawn_routpass_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups
     info!("[routpass-test] passer Move-ordered straight through A's held line");
 }
 
+/// FL_TEST_PUSH=1: a lane behind a gap. Three deep orange regiments of
+/// FL_PUSH_LINE_SIZE men (384, 23 ranks) hold in a line in the middle of
+/// the field with FL_PUSH_GAP metres of air between them (3), facing a blue mass of
+/// FL_PUSH_ACROSS by FL_PUSH_DEEP regiments (4 by 3) of FL_PUSH_SIZE men
+/// (128) that stands 30 m in front of them under a Move order to a point
+/// 60 m behind them: the mass clogs against the line and presses past it
+/// through the gaps while the fight at the rim kills. Every regiment is
+/// as wide as a mass regiment, and the line never breaks, so the scene
+/// lasts; FL_COMBAT_SCALE slows the killing further. Acceptance: the mass
+/// packs against the line, gaps open where men fall, and the lane behind
+/// a gap flows through instead of surging and stopping as one body.
+fn spawn_push_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
+    let size: usize = crate::util::env_or("FL_PUSH_SIZE", 128).max(1);
+    let line_size: usize = crate::util::env_or("FL_PUSH_LINE_SIZE", 3 * size).max(1);
+    let gap: f32 = crate::util::env_or("FL_PUSH_GAP", 3.0);
+    let across: usize = crate::util::env_or("FL_PUSH_ACROSS", 4).max(1);
+    let deep: usize = crate::util::env_or("FL_PUSH_DEEP", 3).max(1);
+    let cols = ((size as f32 * 2.2).sqrt().ceil() as usize).max(1);
+    let width = cols as f32 * SPACING;
+    let depth = size.div_ceil(cols) as f32 * SPACING;
+    let mut list = Vec::new();
+    // The gap is air between the outer men of two regiments: the edge
+    // files stand (cols - 1) pitches apart, and a man is a body distance
+    // across.
+    let line_pitch = (cols - 1) as f32 * SPACING + crate::sim::soldier::body_distance() + gap;
+    for k in 0..3 {
+        let x = (k as f32 - 1.0) * line_pitch;
+        spawn_regiment(units, terrain, &mut list, 1, KIND_LIGHT, Vec2::new(x, 0.0), line_size, 1.0);
+        let g = list.len() - 1;
+        list[g].files = cols as u32;
+        // Spawned at the wide default layout; set every man on his slot
+        // in the deep one, since the mass is on the line in seconds.
+        for i in crate::formation::assign_slots(units, g as u32, &mut list[g]) {
+            let i = i as usize;
+            let at = list[g].anchor + units.home[i];
+            let y = terrain.height_at(at.x, at.y) + crate::unit_types::half_height(KIND_LIGHT as usize);
+            units.pos[i] = Vec3::new(at.x, y, at.y);
+            units.pos_prev[i] = units.pos[i];
+        }
+        list[g].hold = true;
+        list[g].steadfast = true;
+    }
+    for row in 0..deep {
+        for col in 0..across {
+            let x = (col as f32 - (across as f32 - 1.0) / 2.0) * (width + 4.0);
+            let z = 30.0 + depth / 2.0 + row as f32 * (depth + 4.0);
+            spawn_regiment(units, terrain, &mut list, 0, KIND_LIGHT, Vec2::new(x, z), size, -1.0);
+            let g = list.len() - 1;
+            list[g].order = Some(crate::orders::Order::Move(Vec2::new(x, -60.0)));
+            list[g].auto_order = true;
+        }
+    }
+    groups.list = list;
+    info!("[push-test] {} blue regiments of {size} sent past 3 orange regiments of {line_size} holding {gap} m apart", across * deep);
+}
+
+/// FL_TEST_PUSH bookkeeping every 4 s: the line's men and centre, the
+/// mass's men, and how many of them are past the line.
+fn push_test_log(
+    units: Res<Units>,
+    groups: Res<crate::orders::Groups>,
+    time: Res<Time>,
+    mut next: Local<f32>,
+) {
+    if std::env::var("FL_TEST_PUSH").is_err() || groups.list.len() < 4 {
+        return;
+    }
+    let t = time.elapsed_secs();
+    if t < *next {
+        return;
+    }
+    *next = t + 4.0;
+    let line: Vec<_> = groups.list.iter().take(3).collect();
+    let line_men: usize = line.iter().map(|g| g.count).sum();
+    let line_z = line.iter().map(|g| g.centroid.y).sum::<f32>() / 3.0;
+    let mass_men: usize = groups.list.iter().skip(3).map(|g| g.count).sum();
+    let past = (0..units.len())
+        .filter(|&i| units.team[i] == 0 && units.death_t[i] == 0 && units.pos[i].z < line_z - 6.0)
+        .count();
+    info!("[push-test] t={t:.0}s line {line_men} men at z {line_z:.1}, mass {mass_men} men, {past} of them past the line");
+}
+
 /// FL_TEST_ROUTPASS bookkeeping every 2 s: A's shape while the passer
 /// walks through it, and the overlap floor.
 fn routpass_test_log(
@@ -984,7 +1070,7 @@ fn melee_diag_log(
         return;
     };
     let fwd = crate::formation::facing_dir(gd.facing);
-    let pitch = gd.spacing.pitch().y;
+    let pitch = gd.spacing.pitch(gd.kind).y;
     let mut members: Vec<(usize, f32)> = Vec::new();
     let mut max_fwd = f32::MIN;
     for i in 0..units.len() {
@@ -1042,6 +1128,305 @@ fn melee_diag_log(
         ));
     }
     info!("[melee-diag] t={t:.0}s regiment {g}:{s}");
+}
+
+/// Regiments alive up to which the room log prints a line for each.
+const ROOM_LINES: usize = 8;
+/// How far the room log looks for a man's nearest comrade and enemy.
+const ROOM_PROBE: f32 = 6.0;
+
+/// FL_LOG_ROOM=1: every 5 s, the room the men of each regiment have.
+/// Per regiment: each man's distance to the nearest living comrade of his
+/// own regiment (10th percentile, median, 90th), the median distance to
+/// the nearest enemy, the share of men with an enemy within 3 m, and the
+/// box the men's centres cover along the regiment's facing with its
+/// ground per man, and the shares of men out of formation and moving
+/// faster than 0.4 m/s. One line for each regiment while few are alive, and
+/// always a line over all regiments by state: fighting (engaged), moving
+/// (under an order) and standing.
+fn room_log(
+    units: Res<Units>,
+    groups: Res<Groups>,
+    grid: Res<crate::spatial::SpatialGrid>,
+    time: Res<Time>,
+    mut next: Local<f32>,
+) {
+    if std::env::var("FL_LOG_ROOM").is_err() {
+        return;
+    }
+    let t = time.elapsed_secs();
+    if t < *next {
+        return;
+    }
+    *next = t + 5.0;
+    struct Room {
+        comrade: Vec<f32>,
+        enemy: Vec<f32>,
+        near_enemy: u32,
+        men: u32,
+        out_form: u32,
+        walking: u32,
+        lo: Vec2,
+        hi: Vec2,
+    }
+    let mut rooms: Vec<Room> = groups
+        .list
+        .iter()
+        .map(|_| Room {
+            comrade: Vec::new(),
+            enemy: Vec::new(),
+            near_enemy: 0,
+            men: 0,
+            out_form: 0,
+            walking: 0,
+            lo: Vec2::MAX,
+            hi: Vec2::MIN,
+        })
+        .collect();
+    for i in 0..units.len() {
+        if units.death_t[i] != 0 {
+            continue;
+        }
+        let g = units.group[i] as usize;
+        let gd = &groups.list[g];
+        let p = Vec2::new(units.pos[i].x, units.pos[i].z);
+        let team_bit = (units.team[i] as u32) * crate::spatial::META_TEAM;
+        let (mut comrade, mut enemy) = (f32::MAX, f32::MAX);
+        grid.for_each_candidate(p, ROOM_PROBE, |o| {
+            if o.idx as usize == i || (o.meta & crate::spatial::META_DYING) != 0 {
+                return;
+            }
+            let d2 = p.distance_squared(o.xz());
+            if (o.meta & crate::spatial::META_TEAM) != team_bit {
+                enemy = enemy.min(d2);
+            } else if crate::spatial::meta_group(o.meta) == g {
+                comrade = comrade.min(d2);
+            }
+        });
+        let room = &mut rooms[g];
+        room.men += 1;
+        room.out_form += units.out_form[i] as u32;
+        room.walking += (units.vel[i].length_squared() > 0.16) as u32;
+        if comrade < ROOM_PROBE * ROOM_PROBE {
+            room.comrade.push(comrade.sqrt());
+        }
+        if enemy < ROOM_PROBE * ROOM_PROBE {
+            room.enemy.push(enemy.sqrt());
+            room.near_enemy += (enemy < 9.0) as u32;
+        }
+        let fwd = crate::formation::facing_dir(gd.facing);
+        let along = Vec2::new(p.dot(Vec2::new(fwd.y, -fwd.x)), p.dot(fwd));
+        room.lo = room.lo.min(along);
+        room.hi = room.hi.max(along);
+    }
+    // The value at share `q` of a sorted list.
+    let at = |v: &[f32], q: f32| v[((v.len() - 1) as f32 * q).round() as usize];
+    const STATES: [&str; 3] = ["fighting", "moving", "standing"];
+    let mut by_state: [(Vec<f32>, Vec<f32>); 3] = Default::default();
+    let alive = rooms.iter().filter(|r| r.men > 0).count();
+    for (g, room) in rooms.iter_mut().enumerate() {
+        if room.men < 2 || room.comrade.is_empty() {
+            continue;
+        }
+        let gd = &groups.list[g];
+        let state = if gd.engaged {
+            0
+        } else if gd.order.is_some() {
+            1
+        } else {
+            2
+        };
+        room.comrade.sort_unstable_by(f32::total_cmp);
+        room.enemy.sort_unstable_by(f32::total_cmp);
+        let median = at(&room.comrade, 0.5);
+        let size = room.hi - room.lo;
+        let ground = size.x * size.y / room.men as f32;
+        by_state[state].0.push(median);
+        by_state[state].1.push(ground);
+        if alive <= ROOM_LINES {
+            let enemy = if room.enemy.is_empty() {
+                "none in sight".to_string()
+            } else {
+                format!(
+                    "{:.2} m, {}% within 3 m of one",
+                    at(&room.enemy, 0.5),
+                    room.near_enemy * 100 / room.men
+                )
+            };
+            info!(
+                "[room] t={t:.0}s reg {g} {} {} n={}: comrade {:.2}/{:.2}/{:.2} m (p10/median/p90), enemy {enemy}, box {:.1} x {:.1} m, {ground:.2} m2 a man, {}% out of formation, {}% walking",
+                crate::unit_types::kind_name(gd.kind),
+                STATES[state],
+                room.men,
+                at(&room.comrade, 0.1),
+                median,
+                at(&room.comrade, 0.9),
+                size.x,
+                size.y,
+                room.out_form * 100 / room.men,
+                room.walking * 100 / room.men,
+            );
+        }
+    }
+    let mut line = String::new();
+    for (state, (medians, grounds)) in by_state.iter_mut().enumerate() {
+        if medians.is_empty() {
+            continue;
+        }
+        medians.sort_unstable_by(f32::total_cmp);
+        grounds.sort_unstable_by(f32::total_cmp);
+        line.push_str(&format!(
+            " | {} {}: comrade {:.2} m ({:.2} to {:.2}), {:.2} m2 a man",
+            STATES[state],
+            medians.len(),
+            at(medians, 0.5),
+            medians[0],
+            medians[medians.len() - 1],
+            at(grounds, 0.5),
+        ));
+    }
+    if !line.is_empty() {
+        info!("[room] t={t:.0}s regiments by state, the median of their medians (lowest to highest){line}");
+    }
+    let back = crate::sim::soldier::STEP_BACK_TICKS.swap(0, std::sync::atomic::Ordering::Relaxed);
+    info!(
+        "[room] t={t:.0}s stepping back from an enemy inside the fighting distance: {back} man-ticks in 5 s, {:.1} men a tick",
+        back as f32 / 150.0
+    );
+}
+
+/// What `shake_log` keeps from tick to tick: each man's last step, and over
+/// the report's window his turns and the length of the steps he turned on.
+#[derive(Default)]
+struct Shake {
+    tick: u32,
+    next: f32,
+    last: Vec<Vec2>,
+    turns: Vec<u8>,
+    step: Vec<f32>,
+}
+
+/// A step shorter than this is no step, in metres.
+const SHAKE_STEP: f32 = 0.003;
+/// Seconds per report, and the turns within it that make a man a shaker
+/// and a hard one.
+const SHAKE_WINDOW: f32 = 2.0;
+const SHAKE_TURNS: u8 = 10;
+const SHAKE_HARD: u8 = 30;
+/// How many of the hardest shakers a report lists.
+const SHAKE_LINES: usize = 6;
+
+/// FL_LOG_SHAKE=1: the men who shake in place. A man turns when his step
+/// of one tick points against his step of the tick before, both longer
+/// than SHAKE_STEP. Every SHAKE_WINDOW: how many living men turned on at
+/// least SHAKE_TURNS ticks of it (and on at least SHAKE_HARD), their mean
+/// step, and what they share: their regiment's state, out of formation, an
+/// enemy within 3 m, a crowd under the brake's start, and how many bodies
+/// touch them. The hardest are listed with their place on the field.
+fn shake_log(
+    units: Res<Units>,
+    groups: Res<Groups>,
+    grid: Res<crate::spatial::SpatialGrid>,
+    pipe: Res<crate::sim::TickPipeline>,
+    time: Res<Time>,
+    mut sh: Local<Shake>,
+) {
+    if std::env::var("FL_LOG_SHAKE").is_err() || pipe.tick == sh.tick {
+        return;
+    }
+    sh.tick = pipe.tick;
+    let n = units.len();
+    // The death sweep moves the last men into the places of the removed:
+    // those few carry another man's count for one window, the rest keep
+    // theirs.
+    sh.last.resize(n, Vec2::ZERO);
+    sh.turns.resize(n, 0);
+    sh.step.resize(n, 0.0);
+    for i in 0..n {
+        let d = units.pos[i] - units.pos_prev[i];
+        let d = Vec2::new(d.x, d.z);
+        let was = sh.last[i];
+        if d.length_squared() > SHAKE_STEP * SHAKE_STEP
+            && was.length_squared() > SHAKE_STEP * SHAKE_STEP
+            && d.dot(was) < 0.0
+        {
+            sh.turns[i] = sh.turns[i].saturating_add(1);
+            sh.step[i] += d.length();
+        }
+        sh.last[i] = d;
+    }
+    let t = time.elapsed_secs();
+    if t < sh.next {
+        return;
+    }
+    sh.next = t + SHAKE_WINDOW;
+    let (slow, _) = crate::sim::soldier::crowd_brake();
+    let body = crate::sim::soldier::body_distance();
+    let sep = crate::sim::soldier::SEP_RADIUS;
+    let (mut alive, mut hard, mut turns_sum, mut step_sum) = (0u32, 0u32, 0u32, 0.0f32);
+    let (mut by_state, mut by_touch) = ([0u32; 3], [0u32; 3]);
+    let (mut out_form, mut near_enemy, mut thin) = (0u32, 0u32, 0u32);
+    let mut shakers: Vec<(u8, usize, f32, u32)> = Vec::new();
+    for i in 0..n {
+        if units.death_t[i] != 0 {
+            continue;
+        }
+        alive += 1;
+        let turns = sh.turns[i];
+        if turns < SHAKE_TURNS {
+            continue;
+        }
+        let p = Vec2::new(units.pos[i].x, units.pos[i].z);
+        let team_bit = (units.team[i] as u32) * crate::spatial::META_TEAM;
+        let (mut crowd, mut touching, mut enemy) = (0.0f32, 0u32, f32::MAX);
+        grid.for_each_candidate(p, 3.0, |o| {
+            if o.idx as usize == i || (o.meta & crate::spatial::META_DYING) != 0 {
+                return;
+            }
+            let d = p.distance(o.xz());
+            if d < sep {
+                crowd += 1.0 - d / sep;
+            }
+            touching += (d < body) as u32;
+            if (o.meta & crate::spatial::META_TEAM) != team_bit {
+                enemy = enemy.min(d);
+            }
+        });
+        let gd = &groups.list[units.group[i] as usize];
+        by_state[if gd.engaged { 0 } else if gd.order.is_some() { 1 } else { 2 }] += 1;
+        by_touch[match touching { 0 => 0, 1 | 2 => 1, _ => 2 }] += 1;
+        hard += (turns >= SHAKE_HARD) as u32;
+        turns_sum += turns as u32;
+        step_sum += sh.step[i];
+        out_form += units.out_form[i] as u32;
+        near_enemy += (enemy < 3.0) as u32;
+        thin += (crowd < slow) as u32;
+        shakers.push((turns, i, crowd, touching));
+    }
+    shakers.sort_unstable_by_key(|s| std::cmp::Reverse(s.0));
+    let mut listed = String::new();
+    for &(turns, i, crowd, touching) in shakers.iter().take(SHAKE_LINES) {
+        listed.push_str(&format!(
+            " | reg {} at ({:.0}, {:.0}): {turns} turns, crowd {crowd:.2}, touching {touching}{}",
+            units.group[i],
+            units.pos[i].x,
+            units.pos[i].z,
+            if units.out_form[i] { ", out of formation" } else { "" },
+        ));
+    }
+    info!(
+        "[shake] t={t:.0}s {} of {alive} men shake ({hard} hard), mean step {:.1} cm | regiment fighting {} moving {} standing {} | out of formation {out_form} | enemy within 3 m {near_enemy} | crowd under the brake's start {thin} | touching none {} one or two {} more {}{listed}",
+        shakers.len(),
+        step_sum * 100.0 / turns_sum.max(1) as f32,
+        by_state[0],
+        by_state[1],
+        by_state[2],
+        by_touch[0],
+        by_touch[1],
+        by_touch[2],
+    );
+    sh.turns.fill(0);
+    sh.step.fill(0.0);
 }
 
 /// FL_ARENA=1: hand-testing range for directional damage. Two mirrored

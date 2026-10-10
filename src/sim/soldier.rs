@@ -18,17 +18,59 @@ const SEP_STRENGTH: f32 = 60.0;
 const QUERY_RADIUS: f32 = 2.0;
 /// Cap on summed separation push to avoid explosive forces deep in a crowd.
 const SEP_PUSH_MAX: f32 = 2.5;
-/// Below this distance overlap is resolved positionally (bodies are
-/// ~0.6 m wide).
-const HARD_RADIUS: f32 = 0.9;
-/// Crowd-density yield: goal drive fades to zero between these two local
-/// density values. Scalar density can't cancel out the way opposing push
-/// vectors do, so this is what stops a goal-seeking crowd from compressing
-/// itself into overlap: packed interior units genuinely stop shoving.
+/// Below this distance overlap is resolved positionally. A soldier is
+/// 0.75 to 1.1 m across with his arms, shield and weapon. Never more than
+/// a pair's own rest distance, so the men of a wall keep their 1.05 m
+/// files. FL_BODY=<metres> sets it, up to the separation distance.
+const BODY_DISTANCE: f32 = 1.2;
+pub(crate) fn body_distance() -> f32 {
+    static D: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *D.get_or_init(|| crate::util::env_or("FL_BODY", BODY_DISTANCE).clamp(0.5, SEP_RADIUS))
+}
+/// Crowd-density yield: a man's drive fades to nothing as the crowd around
+/// him (his neighbours' closeness summed, one each at a touch) rises
+/// between the two values of `crowd_brake`. Scalar density can't cancel
+/// out the way opposing push vectors do, so this is what stops a
+/// goal-seeking crowd from compressing itself into overlap: packed
+/// interior units genuinely stop shoving. CROWD_SLOW, six neighbours at
+/// 1.12 m, is the crowd above which a pressing man with nobody in reach
+/// stops looking for a far enemy (`acquire`).
 const CROWD_SLOW: f32 = 1.2;
-const CROWD_STOP: f32 = 2.5;
+/// The fade is set by the men's real size, not by the body distance: a
+/// man's drive eases from six neighbours at arm's length, BRAKE_FAR of
+/// the 1.70 m man, to nothing when six are pressed against him at
+/// BRAKE_NEAR, his width with arms and shield. Both scale with the unit
+/// scale. A band set from the body distance would be 11 cm of squeeze at
+/// a 1.2 m body, and the drive of a whole lane would come back at once
+/// whenever a gap opened at its front.
+const BRAKE_FAR: f32 = 1.3;
+const BRAKE_NEAR: f32 = 0.9;
+pub(crate) fn crowd_brake() -> (f32, f32) {
+    static B: std::sync::OnceLock<(f32, f32)> = std::sync::OnceLock::new();
+    *B.get_or_init(|| {
+        let scale = crate::unit_types::unit_scale();
+        let at = |d: f32| 6.0 * (1.0 - (d * scale).min(SEP_RADIUS) / SEP_RADIUS);
+        (at(BRAKE_FAR), at(BRAKE_NEAR))
+    })
+}
+/// The contact between a man and the body he runs into. By default the
+/// two share the closing speed by weight (half each between equal men),
+/// so a shove travels through a press and a deep mass pushes a line.
+/// FL_CONTACT=wall plays the soft wall instead: the runner's legs lose
+/// the closing speed over his give and the man hit is handed none of it.
+fn share_contact() -> bool {
+    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *S.get_or_init(|| !std::env::var("FL_CONTACT").is_ok_and(|v| v == "wall"))
+}
 const STEER_GAIN: f32 = 3.0;
 const MAX_ACCEL: f32 = 50.0;
+/// What a man's legs can do: the steering toward his wish is capped at
+/// this acceleration (m/s^2), about what a man in armour with a shield
+/// manages from a stand. The gain alone would give 28 m/s^2, three g, at
+/// every start and stop, and a lane behind an opening gap would surge
+/// and stop as one body. The spring's push and the contact are not legs
+/// and keep MAX_ACCEL.
+const LEG_ACCEL: f32 = 4.0;
 /// Facing turn smoothing (fraction/s of the remaining angle) — the
 /// settle behavior for SMALL corrections.
 const YAW_RATE: f32 = 10.0;
@@ -45,11 +87,13 @@ const KEEP_FACING_R: f32 = 6.0;
 /// turns ~180° in about a second: pi rad/s. Small angles never hit
 /// the cap, so marching wheels and duel tracking feel unchanged.
 const TURN_SPEED_MAX: f32 = std::f32::consts::PI;
-/// Positional overlap resolution: fraction of pair overlap corrected per
-/// tick per unit, and the per-tick cap on total correction distance.
-/// UNDER-relaxed on purpose: resolving overlap over ~3-4 ticks reads as
-/// bodies settling; resolving it in 1-2 reads as twitching.
-const CORR_GAIN: f32 = 0.3;
+/// Positional overlap resolution: the share of a pair's overlap each man
+/// is moved back per tick, and the per-tick cap on total correction
+/// distance. A packed man overlaps up to six bodies and their corrections
+/// add up, so the share stays under one sixth: over it, six bodies throw
+/// him past the middle of them and he comes back on the next tick, every
+/// tick. 90% of an overlap is gone in 7 ticks.
+const CORR_GAIN: f32 = 0.15;
 const CORR_MAX: f32 = 0.1;
 /// Units slow down proportionally inside this distance to the target.
 const ARRIVE_RADIUS: f32 = 35.0;
@@ -69,14 +113,23 @@ const STEP_FACE_SPEED: f32 = 1.05;
 const ADVANCE_PACE: f32 = 1.06;
 const COMBAT_JOG_PACE: f32 = 2.87;
 const JOG_BEYOND: f32 = 3.0;
-/// Each man stops short of the enemy he goes to at his own distance,
-/// 1.2 m plus up to this much: ranks are men, not a machine.
-const SEEK_STOP_SPREAD: f32 = 0.4;
 /// A man blocked by a comrade on the way to his enemy sidesteps toward
 /// an open lane in some one-second windows (M2TW's isSideStepping),
 /// and waits in the others.
 const SIDESTEP_WINDOW: u32 = 30;
-
+/// A man fights at his weapon's length. A blade lands with its far end,
+/// so he stands where that end meets his enemy: he closes to this share
+/// of his reach, and steps back to it from an enemy who has come inside
+/// it when the ground behind him is open.
+const FIGHT_SHARE: f32 = 0.9;
+/// He lets an enemy this far inside his fighting distance before he
+/// steps back, and then steps all the way out to it: a real step, as on
+/// the way back to his mark.
+const BACK_SLACK: f32 = 0.3;
+/// Man-ticks of that step back since the room log last read them
+/// (FL_LOG_ROOM).
+pub(crate) static STEP_BACK_TICKS: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
 /// Share of those windows in which a blocked man sidesteps
 /// (FL_SIDESTEP, 0 to 1). A play-testing knob.
 fn sidestep_chance() -> f32 {
@@ -88,6 +141,19 @@ fn sidestep_chance() -> f32 {
 /// neighbor. Stepping and running men, and charge knockback, are
 /// unaffected; true overlap is still corrected.
 const STAND_GRIP: f32 = 6.0;
+/// The soft wall (FL_CONTACT=wall): a man's legs carry him this far into
+/// the body he runs into (his own give, 0.7 to 1.3 of it), losing their
+/// closing speed on the way, and nothing of his speed is handed to the
+/// man he hits: the press and that man's feet take it. A stop on one tick
+/// is the twitch (he is set back and walks in again).
+const GIVE: f32 = 0.08;
+/// A standing man's stance (his lean, arms and shield) takes the first
+/// STANCE metres of a net squeeze before he gives ground to it.
+const STANCE: f32 = 0.10;
+#[inline]
+fn give(i: usize) -> f32 {
+    GIVE * (0.7 + 0.6 * crate::units::hash01((i as u32).wrapping_mul(0x51ED).wrapping_add(77)))
+}
 
 /// A man of a regiment in melee who sees no enemy joins the fight when
 /// he sees the comrade beside him run toward it: in each half-second
@@ -115,14 +181,16 @@ const JOIN_SEE_R: f32 = 6.0;
 const LOOK_TICKS: u32 = 8;
 /// `sight` bits: a comrade blocks his way, his left, his right; a
 /// comrade ahead; a comrade between him and his mark; a comrade close
-/// by running to the fight; one further out (far look).
-const SIGHT_WAY: u8 = 1;
-const SIGHT_LEFT: u8 = 1 << 1;
-const SIGHT_RIGHT: u8 = 1 << 2;
-const SIGHT_AHEAD: u8 = 1 << 3;
-const SIGHT_MARK: u8 = 1 << 4;
-const SIGHT_GO: u8 = 1 << 5;
-const SIGHT_GO_FAR: u8 = 1 << 6;
+/// by running to the fight; one further out (far look); a man close
+/// behind him.
+const SIGHT_WAY: u16 = 1;
+const SIGHT_LEFT: u16 = 1 << 1;
+const SIGHT_RIGHT: u16 = 1 << 2;
+const SIGHT_AHEAD: u16 = 1 << 3;
+const SIGHT_MARK: u16 = 1 << 4;
+const SIGHT_GO: u16 = 1 << 5;
+const SIGHT_GO_FAR: u16 = 1 << 6;
+const SIGHT_BACK: u16 = 1 << 7;
 /// Even with nobody going in sight, a man joins once his regiment has
 /// been in melee longer than his own patience, spread between these
 /// (seconds; FL_JOIN_PATIENCE sets the upper end): the fight's noise and
@@ -182,7 +250,7 @@ const WALL_SEP_RADIUS: f32 = 1.05;
 /// reaches the spearman and swings with his full charge bonus: gaps
 /// are real, coverage at 1.05 m wall pitch is ~2/3 of the frontage.
 const SPEAR_POINT_MIN: f32 = 0.9;
-const SPEAR_LINE_HALF_W: f32 = 0.35;
+pub(crate) const SPEAR_LINE_HALF_W: f32 = 0.35;
 
 /// Global damage multiplier. FL_COMBAT_SCALE overrides (fast test battles).
 /// What every soldier reads and none writes: the job's shared inputs.
@@ -246,7 +314,7 @@ pub(crate) struct Soldier<'a> {
     pub death_t: &'a mut u8,
     pub ammo: &'a mut u8,
     pub out_form: &'a mut bool,
-    pub sight: &'a mut u8,
+    pub sight: &'a mut u16,
 }
 
 /// The rows of one chunk of soldiers, in index order.
@@ -263,7 +331,7 @@ pub(crate) struct Rows<'a> {
     pub death_t: &'a mut [u8],
     pub ammo: &'a mut [u8],
     pub out_form: &'a mut [bool],
-    pub sight: &'a mut [u8],
+    pub sight: &'a mut [u16],
 }
 
 /// What a chunk emits beside its rows: landed swings and loosed arrows.
@@ -286,6 +354,15 @@ struct Step {
     // The scan.
     push: Vec2,
     corr: Vec2,
+    /// Which way the overlap correction points, before its deadband and
+    /// cap, how deep the net overlap is along it in metres, and the ground
+    /// velocity of the bodies he overlaps, weighted by how far each sets
+    /// him back.
+    overlap_dir: Vec2,
+    overlap_depth: f32,
+    overlap_vel: Vec2,
+    /// His share by weight of a closing speed on them (the shared speed).
+    overlap_share: f32,
     crowd: f32,
     best_idx: u32,
     sticky: bool,
@@ -308,9 +385,9 @@ struct Step {
     right_blocked: bool,
     comrade_ahead: bool,
     slot_blocked: bool,
+    back_blocked: bool,
     // The swing and the steering.
     face_target: Option<Vec2>,
-    corr_len2: f32,
     jam: f32,
     new_v: Vec2,
 }
@@ -393,6 +470,10 @@ fn begin(f: &Field, s: &mut Soldier) -> Step {
         desired: Vec2::ZERO,
         push: Vec2::ZERO,
         corr: Vec2::ZERO,
+        overlap_dir: Vec2::ZERO,
+        overlap_depth: 0.0,
+        overlap_vel: Vec2::ZERO,
+        overlap_share: 0.0,
         crowd: 0.0,
         best_idx: u32::MAX,
         sticky: false,
@@ -413,8 +494,8 @@ fn begin(f: &Field, s: &mut Soldier) -> Step {
         right_blocked: false,
         comrade_ahead: false,
         slot_blocked: false,
+        back_blocked: false,
         face_target: None,
-        corr_len2: 0.0,
         jam: 0.0,
         new_v: Vec2::ZERO,
     }
@@ -515,10 +596,15 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
     // lane occupancy.
     let mut push = Vec2::ZERO;
     let mut corr = Vec2::ZERO;
+    let mut overlap_vel = Vec2::ZERO;
+    let mut overlap_share = 0.0f32;
+    let mut overlap = 0.0f32;
     let mut crowd = 0.0f32;
     let my_team_bit = (team[i] as u32) * crate::spatial::META_TEAM;
     let my_wall = wall[gi] != 0;
     let my_mass = params.mass;
+    let body = body_distance();
+    let gain = CORR_GAIN;
     let reach2 = params.reach * params.reach;
     let prev_target = *s.target;
     let mut best_d2 = f32::MAX;
@@ -542,7 +628,7 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
     } else {
         QUERY_RADIUS.max(params.reach)
     };
-    grid.for_each_candidate(p, scan_r, |o| {
+    grid.for_each_candidate_vel(p, scan_r, |o, o_vel| {
         if o.idx as usize == i {
             return;
         }
@@ -604,12 +690,17 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
             let mw = 2.0 * o_mass / (my_mass + o_mass);
             let len = d2.sqrt();
             let w = 1.0 - len / sep_r;
-            if len < HARD_RADIUS {
+            let hard = body.min(sep_r);
+            if len < hard {
                 // Overlap is resolved POSITIONALLY only. A hard force boost
                 // here as well made packed crowds oscillate at the
                 // acceleration cap, two solvers fighting over the same
                 // overlap, every frame.
-                corr += d * ((HARD_RADIUS - len) * CORR_GAIN * mw / len);
+                let back = (hard - len) * gain * mw;
+                corr += d * (back / len);
+                overlap_vel += o_vel * back;
+                overlap_share += o_mass / (my_mass + o_mass) * back;
+                overlap += back;
             }
             push += d * (w * mw / len);
             // Jam density: COMPRESSED pairs only — a neighbor resting AT his
@@ -640,6 +731,10 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
     }
     st.push = push;
     st.corr = corr;
+    if overlap > 0.0 {
+        st.overlap_vel = overlap_vel / overlap;
+        st.overlap_share = overlap_share / overlap;
+    }
     st.crowd = crowd;
     st.best_idx = best_idx;
     st.sticky = sticky;
@@ -653,8 +748,10 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
 /// What he remembers and what he sees of his comrades: the enemy he
 /// remembers if still in sight, the way he is going, and every eighth tick
 /// a look at the men around him (a comrade in his way, to his left or
-/// right, ahead, between him and his mark, or running to the fight),
-/// remembered in the sight bits until the next look.
+/// right, ahead, between him and his mark, or running to the fight; with
+/// an enemy in reach, a comrade to either side of his way to him and a
+/// man close behind him), remembered in the sight bits until the next
+/// look.
 #[inline]
 fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
     let Field { grid, pos_prev, team, group, orders, engaged, focus, tick, .. } = *f;
@@ -704,8 +801,17 @@ fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
     } else {
         Vec2::ZERO
     };
+    // With an enemy in reach his way is to that enemy, and he looks at the
+    // room he has to fight him.
+    let fighter = best_idx != u32::MAX && !dying && !routed;
+    let to_enemy = if fighter { pos_prev[best_idx as usize].xz() - p } else { Vec2::ZERO };
+    let fight_dir = to_enemy.normalize_or_zero();
     // Open lanes to either side of his way.
-    let side_dir = Vec2::new(-memo_dir.y, memo_dir.x);
+    let side_dir = if fighter {
+        Vec2::new(-fight_dir.y, fight_dir.x)
+    } else {
+        Vec2::new(-memo_dir.y, memo_dir.x)
+    };
     // His look at the comrades around him on his way (to his enemy, to the
     // fight, or back to his mark), in his own rhythm: a separate pass over
     // the neighbors of the separation scan, run only by men who are going
@@ -715,7 +821,7 @@ fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
     let watch_go = in_melee && !committed && !memo_valid;
     let slot_on = slot_dir != Vec2::ZERO;
     if (i as u32).wrapping_add(tick).is_multiple_of(LOOK_TICKS) {
-        let mut seen = 0u8;
+        let mut seen = 0u16;
         if look_lanes || watch_go || slot_on {
             let (mut way, mut left, mut right, mut ahead_any, mut mark, mut go) =
                 (false, false, false, false, false, false);
@@ -749,12 +855,35 @@ fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
                 right |= beside & (lateral < -reach);
                 mark |= comrade & slot_on & near & ((-d).dot(slot_dir) > reach);
             });
-            seen = (way as u8 * SIGHT_WAY)
-                | (left as u8 * SIGHT_LEFT)
-                | (right as u8 * SIGHT_RIGHT)
-                | (ahead_any as u8 * SIGHT_AHEAD)
-                | (mark as u8 * SIGHT_MARK)
-                | (go as u8 * SIGHT_GO);
+            seen = (way as u16 * SIGHT_WAY)
+                | (left as u16 * SIGHT_LEFT)
+                | (right as u16 * SIGHT_RIGHT)
+                | (ahead_any as u16 * SIGHT_AHEAD)
+                | (mark as u16 * SIGHT_MARK)
+                | (go as u16 * SIGHT_GO);
+        }
+        if fighter {
+            // The room he has to fight the enemy in reach: a comrade close
+            // to either side of his way to the enemy, and any man close
+            // behind him.
+            let (mut left, mut right, mut back) = (false, false, false);
+            grid.for_each_candidate(p, scan_r, |o| {
+                let other = o.idx as usize != i;
+                let comrade = other & ((o.meta & crate::spatial::META_TEAM) == my_team_bit);
+                let to = o.xz() - p;
+                let d2 = to.length_squared();
+                let len = d2.sqrt();
+                let quarter = 0.707 * len;
+                let near = d2 < SEP_RADIUS * SEP_RADIUS;
+                let along = to.dot(fight_dir);
+                let lateral = to.dot(side_dir);
+                left |= comrade & near & (lateral > quarter);
+                right |= comrade & near & (lateral < -quarter);
+                back |= other & near & (along < -quarter);
+            });
+            seen |= (left as u16 * SIGHT_LEFT)
+                | (right as u16 * SIGHT_RIGHT)
+                | (back as u16 * SIGHT_BACK);
         }
         *s.sight = (*s.sight & SIGHT_GO_FAR) | seen;
     }
@@ -763,6 +892,7 @@ fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
     let right_blocked = *s.sight & SIGHT_RIGHT != 0;
     let comrade_ahead = *s.sight & SIGHT_AHEAD != 0;
     let slot_blocked = *s.sight & SIGHT_MARK != 0;
+    st.back_blocked = *s.sight & SIGHT_BACK != 0;
     st.memo_valid = memo_valid;
     st.memo_dir = memo_dir;
     st.side_dir = side_dir;
@@ -1009,15 +1139,17 @@ fn swing(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
                                 (h(0x5DC1) + h(0x6B8D) - 1.0) * sigma,
                             );
                         aim += shot.vel * (aim.distance(p) / 30.0);
-                        // Launch ABOVE the body-hit band (arrows.rs tops out
-                        // at ground + 1.15): a shaft leaving at head height
-                        // is inside its own shooter's hit cylinder at
-                        // flight-time zero and kills him.
-                        let from =
-                            Vec3::new(p.x, pos_prev[i].y + 0.75, p.y);
+                        // Launch above the body-hit band (arrows.rs): a
+                        // shaft leaving at head height is inside its own
+                        // shooter's hit cylinder at flight-time zero and
+                        // kills him.
+                        let over = crate::unit_types::half_height(my_kind)
+                            + crate::arrows::LAUNCH_OVER_HEAD;
+                        let from = Vec3::new(p.x, pos_prev[i].y + over, p.y);
                         let to = Vec3::new(
                             aim.x,
-                            terrain.height_at(aim.x, aim.y) + 0.7,
+                            terrain.height_at(aim.x, aim.y)
+                                + crate::arrows::AIM_HEIGHT * crate::unit_types::tallest(),
                             aim.y,
                         );
                         out.arrows.push(crate::arrows::ArrowSpawn {
@@ -1203,13 +1335,14 @@ fn yield_to_crowd(st: &mut Step) {
     let mut corr = st.corr;
     let mut push = st.push;
     let mut desired = st.desired;
-    let mut corr_len2 = corr.length_squared();
-    if corr_len2 < 1e-4 {
-        // Sub-centimeter corrections are settle noise, not overlap: applying
-        // them is pure micro-twitch.
-        corr = Vec2::ZERO;
-        corr_len2 = 0.0;
-    } else if corr_len2 > CORR_MAX * CORR_MAX {
+    let corr_len2 = corr.length_squared();
+    if corr_len2 > 1e-12 {
+        st.overlap_dir = corr / corr_len2.sqrt();
+        st.overlap_depth = corr_len2.sqrt() / CORR_GAIN;
+    }
+    // Every correction is applied, the sub-centimetre ones too: a threshold
+    // turns a steady lean into jumps of a centimetre.
+    if corr_len2 > CORR_MAX * CORR_MAX {
         corr *= CORR_MAX / corr_len2.sqrt();
     }
     let push_len = push.length();
@@ -1219,23 +1352,46 @@ fn yield_to_crowd(st: &mut Step) {
     // Yield in dense crowds: goal drive fades out entirely so the mass can't
     // keep compressing itself; `jam` (0 = free, 1 = packed) also damps the
     // response below.
-    let jam = ((crowd - CROWD_SLOW) / (CROWD_STOP - CROWD_SLOW)).clamp(0.0, 1.0);
+    let (slow, stop) = crowd_brake();
+    let jam = ((crowd - slow) / (stop - slow)).clamp(0.0, 1.0);
     desired *= 1.0 - jam;
     st.corr = corr;
-    st.corr_len2 = corr_len2;
     st.push = push;
     st.jam = jam;
     st.desired = desired;
 }
 
-/// Closing the last metre on the enemy in reach, going to the enemy he
+/// A waiting man's sidestep: in some one-second windows he steps toward
+/// whichever side is open, at the shuffle's pace, and in the others he
+/// stands.
+#[inline]
+fn sidestep(i: usize, tick: u32, left_blocked: bool, right_blocked: bool, side_dir: Vec2) -> Vec2 {
+    let window = (tick.wrapping_add((i as u32).wrapping_mul(7)) / SIDESTEP_WINDOW)
+        .wrapping_mul(0x2545_F491);
+    let roll = crate::units::hash01(window ^ (i as u32).wrapping_mul(0x9E37));
+    let chance = sidestep_chance();
+    let side = match (left_blocked, right_blocked) {
+        _ if roll >= chance => Vec2::ZERO,
+        (false, true) => side_dir,
+        (true, false) => -side_dir,
+        (false, false) if roll < 0.5 * chance => side_dir,
+        (false, false) => -side_dir,
+        (true, true) => Vec2::ZERO,
+    };
+    side * STEP_PACE
+}
+
+/// His footwork around the enemy in reach: closing to his weapon's
+/// length and stepping back to it from an enemy who has come inside it.
+/// With nobody in reach, going to the enemy he
 /// remembers through open ground (waiting behind a comrade, sidestepping
 /// now and then), or, with nobody to close on, joining his regiment's
 /// fight at the jog.
 #[inline]
 fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
-    let Field { pos_prev, speed, team, group, engaged, hold, moving, focus, tick, .. } = *f;
+    let Field { pos_prev, speed, team, group, broken, wall, engaged, hold, moving, focus, tick, .. } = *f;
     let i = s.i;
+    let params = &TYPES[st.my_kind];
     let p = st.p;
     let gi = st.gi;
     let dying = st.dying;
@@ -1273,7 +1429,7 @@ fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
         (*s.target, false)
     } else if best_idx != u32::MAX {
         (best_idx, false)
-    } else if crowd < CROWD_SLOW && (!in_melee || committed) {
+    } else if crowd < crowd_brake().0 && (!in_melee || committed) {
         (*s.target, true)
     } else {
         (u32::MAX, false)
@@ -1298,21 +1454,19 @@ fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
         // Held regiments fight at arm's length only.
         let look = if engaged[gi] { seek_radius() } else { WIDE_ACQUIRE_R };
         let max_close = if hold[gi] { 2.2 } else { look + 1.0 };
-        // Going to a seen enemy, each man stops at his own distance; closing
-        // the last meter to a man already in reach stays as it was.
-        let stop = if memo_close {
-            1.2 + SEEK_STOP_SPREAD
-                * crate::units::hash01((i as u32).wrapping_mul(0x3C1B) ^ 0x51F7)
-        } else {
-            1.2
-        };
+        // He closes on an enemy in reach to his weapon's length. Going to
+        // a seen enemy, each man stops at his own distance, between that
+        // and just inside his reach.
+        let own = crate::units::hash01((i as u32).wrapping_mul(0x3C1B) ^ 0x51F7);
+        let fight = FIGHT_SHARE * params.reach;
+        let stop = if memo_close { fight + 0.8 * (params.reach - fight) * own } else { fight };
         if dist > stop && dist < max_close {
             let mut urge = ((dist - stop) / 0.8).clamp(0.0, 1.0);
             // The surge toward a REMEMBERED enemy (no one in reach yet) is
             // steering, not combat execution: it yields to the jam like all
             // steering, so the press brakes on genuine body-pack. Ungated
             // this factor is always 1 (the memo gate above already required
-            // crowd < CROWD_SLOW, i.e. jam == 0).
+            // a crowd under the brake's start, i.e. jam == 0).
             if memo_close {
                 urge *= 1.0 - jam;
                 // He steps toward a remembered enemy only through open
@@ -1323,21 +1477,7 @@ fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
                     urge = 0.0;
                     // Waiting; in some windows he sidesteps toward whichever
                     // side is open.
-                    let window = (tick.wrapping_add((i as u32).wrapping_mul(7))
-                        / SIDESTEP_WINDOW)
-                        .wrapping_mul(0x2545_F491);
-                    let roll = crate::units::hash01(window ^ (i as u32).wrapping_mul(0x9E37));
-                    let chance = sidestep_chance();
-                    if roll < chance {
-                        let side = match (left_blocked, right_blocked) {
-                            (false, true) => side_dir,
-                            (true, false) => -side_dir,
-                            (false, false) if roll < 0.5 * chance => side_dir,
-                            (false, false) => -side_dir,
-                            (true, true) => Vec2::ZERO,
-                        };
-                        desired += side * STEP_PACE;
-                    }
+                    desired += sidestep(i, tick, left_blocked, right_blocked, side_dir);
                 }
             }
             let pace = if !memo_close {
@@ -1349,6 +1489,25 @@ fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
             };
             desired += to_enemy * (pace * urge / dist);
             d_surge = to_enemy * (pace * urge / dist);
+        } else if !memo_close
+            && committed
+            && wall[gi] == 0
+            && !st.back_blocked
+            && *s.swing & crate::units::SWING_STATE_MASK != crate::units::SWING_WINDUP
+            && !broken[group[close_to as usize] as usize]
+            && dist > 1e-3
+        {
+            // The enemy has come inside his weapon's length: out of
+            // formation, with open ground behind him and no blow under way,
+            // he steps back to it. He lets the man well inside first, and a
+            // step once begun goes all the way out. A man in formation holds
+            // his place, and nobody backs off a broken enemy.
+            let stepping = s.vel.xz().dot(to_enemy) < -0.5 * STEP_PACE * dist;
+            let inside = if stepping { fight } else { fight - BACK_SLACK };
+            if dist < inside {
+                desired -= to_enemy * (STEP_PACE / dist);
+                STEP_BACK_TICKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
         }
     }
     // Joining: no enemy to close on, so he heads for the enemy unit his
@@ -1370,20 +1529,7 @@ fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
                 let pace = if comrade_ahead { ADVANCE_PACE } else { COMBAT_JOG_PACE };
                 dir * pace * (1.0 - jam)
             } else {
-                let window = (tick.wrapping_add((i as u32).wrapping_mul(7))
-                    / SIDESTEP_WINDOW)
-                    .wrapping_mul(0x2545_F491);
-                let roll = crate::units::hash01(window ^ (i as u32).wrapping_mul(0x9E37));
-                let chance = sidestep_chance();
-                let side = match (left_blocked, right_blocked) {
-                    _ if roll >= chance => Vec2::ZERO,
-                    (false, true) => side_dir,
-                    (true, false) => -side_dir,
-                    (false, false) if roll < 0.5 * chance => side_dir,
-                    (false, false) => -side_dir,
-                    (true, true) => Vec2::ZERO,
-                };
-                side * STEP_PACE
+                sidestep(i, tick, left_blocked, right_blocked, side_dir)
             };
         }
     }
@@ -1391,9 +1537,9 @@ fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
 }
 
 /// From drive to velocity: the wall and charge paces, fatigue, the
-/// stagger, the crowd's damping, a standing man's grip on the ground, the
-/// acceleration and speed caps, and the overlap correction's kill of the
-/// velocity still driving into it.
+/// stagger, the crowd's damping, a standing man's grip on the ground and
+/// his stance against a squeeze, the acceleration and speed caps, and the
+/// give of his legs at a body he runs into.
 #[inline]
 fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
     let Field { speed, wall, charging, fat_speed, fat_nocharge, dt, .. } = *f;
@@ -1403,8 +1549,6 @@ fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
     let routed = st.routed;
     let push = st.push;
     let jam = st.jam;
-    let corr = st.corr;
-    let corr_len2 = st.corr_len2;
     let mut desired = st.desired;
     // Formation pace: walls advance deliberately (running breaks a wall), the
     // charge phase runs the last stretch home. Broken/dying already excluded
@@ -1429,12 +1573,22 @@ fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
     let mut push_a = push * (SEP_STRENGTH * (1.0 - jam));
     // A standing man plants his feet: small pushes do not move him, real
     // shoves do (less the grip). Without it any squeeze turned straight into
-    // sliding, and a fight's jostle rippled back through packed ranks.
+    // sliding, and a fight's jostle rippled back through packed ranks. His
+    // stance takes the first STANCE of a net squeeze the same way: he gives
+    // ground only to what is beyond it.
     if desired.length_squared() < 1e-6 {
         let pl = push_a.length();
         push_a *= if pl > STAND_GRIP { (pl - STAND_GRIP) / pl } else { 0.0 };
+        if st.overlap_depth > 0.0 && *s.swing & crate::units::SWING_STAGGERED == 0 {
+            st.corr *= ((st.overlap_depth - STANCE) / st.overlap_depth).max(0.0);
+        }
     }
-    let mut accel = (desired - v) * STEER_GAIN + push_a;
+    let mut legs = (desired - v) * STEER_GAIN;
+    let l2 = legs.length_squared();
+    if l2 > LEG_ACCEL * LEG_ACCEL {
+        legs *= LEG_ACCEL / l2.sqrt();
+    }
+    let mut accel = legs + push_a;
     let a2 = accel.length_squared();
     if a2 > MAX_ACCEL * MAX_ACCEL {
         accel *= MAX_ACCEL / a2.sqrt();
@@ -1449,13 +1603,31 @@ fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
     if v2 > vmax * vmax {
         new_v *= vmax / v2.sqrt();
     }
-    // After a positional correction, kill the velocity component still
-    // driving into the overlap or it re-penetrates next tick.
-    if corr_len2 > 1e-12 {
-        let cn = corr.normalize_or_zero();
-        let into = new_v.dot(-cn);
+    // The contact. Shared speed: a man gives up his share by weight of the
+    // closing speed on the bodies he overlaps, measured against their own
+    // movement, and each of the two does the same, so a runner and the man
+    // he hits move on together and a shove travels through a press. Soft
+    // wall (FL_CONTACT=wall): toward the bodies he overlaps a man's legs
+    // lose their closing speed over his give, all of it left at the touch,
+    // none at the give, never carrying him past it in one tick, and never
+    // more than his own speed into them, so a column on the march is not
+    // held up; the man he hits is handed nothing and is moved by the
+    // setting apart alone, as pressure.
+    let dir = st.overlap_dir;
+    if dir != Vec2::ZERO && share_contact() {
+        let into = (new_v - st.overlap_vel).dot(-dir);
         if into > 0.0 {
-            new_v += cn * into;
+            new_v += dir * (into * st.overlap_share);
+        }
+    } else if dir != Vec2::ZERO {
+        let own = new_v.dot(-dir);
+        let into = (new_v - st.overlap_vel).dot(-dir);
+        let closing = into.min(own);
+        if closing > 0.0 {
+            let give = give(i);
+            let left = (give - st.overlap_depth).max(0.0);
+            let allowed = (closing * left / give).min(left / dt);
+            new_v += dir * (closing - allowed);
         }
     }
     st.new_v = new_v;

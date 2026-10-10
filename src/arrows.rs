@@ -26,10 +26,17 @@ pub const ARROW_CAP: usize = 65_536;
 /// oldest overwritten). FL_ARROW_LITTER overrides; 0 disables.
 const LITTER_CAP_DEFAULT: usize = 50_000;
 /// Body-hit lateral radius (m): the shaft passes within this of a
-/// soldier's axis to strike him. On the body scale (cube ~0.6 m wide).
+/// soldier's axis to strike him. A man is about 0.5 m across the torso
+/// and 0.8 m with his arms.
 const HIT_RADIUS: f32 = 0.35;
-/// Collision tests only run below ground + this (tallest body ~1.1 m).
-const STRIKE_BAND: f32 = 1.4;
+/// Collision tests only run below the tallest body plus this.
+const STRIKE_MARGIN: f32 = 0.3;
+/// How far over his own head an archer's arrow leaves the bow
+/// (sim/soldier.rs). Above the body-hit band's top margin below, or a
+/// shaft is inside its own shooter at flight-time zero and kills him.
+pub const LAUNCH_OVER_HEAD: f32 = 0.25;
+/// The point an archer aims at on a man, as a share of the man's height.
+pub const AIM_HEIGHT: f32 = 0.7;
 
 /// One loosed arrow, queued by step_sim's integrate chunks (per-chunk
 /// buffers, no write races) and drained here the same tick.
@@ -256,6 +263,7 @@ pub fn solve_launch(
         // are exempt (the arrow has to come down on the target). The
         // arc must clear a head standing on any such rise.
         let from_ground = terrain.height_at(from.x, from.z);
+        let head = crate::unit_types::tallest() + 0.2;
         let step = (d / 24.0).max(4.0);
         let mut s = 2.0_f32;
         while s < d - 4.0 {
@@ -263,7 +271,7 @@ pub fn solve_launch(
             let g_s = terrain.height_at(p.x, p.y);
             if g_s > from_ground + 0.35 {
                 let y = from.y + s * tan - g * s * s * (1.0 + tan * tan) / (2.0 * vv);
-                if y < g_s + 1.30 {
+                if y < g_s + head {
                     lofted = true;
                     break;
                 }
@@ -359,6 +367,7 @@ fn update_arrows(
         jit: f32,
     }
     let mut hits: Vec<Hit> = Vec::new();
+    let strike_band = crate::unit_types::tallest() + STRIKE_MARGIN;
     let mut i = 0;
     while i < arrows.len() {
         let prev = arrows.pos[i];
@@ -371,7 +380,7 @@ fn update_arrows(
         arrows.vel[i] = v;
 
         let ground = terrain.height_at(p.x, p.z);
-        if p.y.min(prev.y) > ground + STRIKE_BAND {
+        if p.y.min(prev.y) > ground + strike_band {
             i += 1;
             continue;
         }
@@ -397,8 +406,8 @@ fn update_arrows(
             let arrow_y = prev.y + (p.y - prev.y) * t;
             let hh = crate::unit_types::half_height(units.kind[u] as usize);
             let uy = units.pos[u].y;
-            // Top margin stays BELOW the launch height (sim/soldier.rs
-            // looses at +0.75 over mid-body) or shooters hit themselves.
+            // The top margin stays below the launch height
+            // (LAUNCH_OVER_HEAD) or shooters hit themselves.
             if arrow_y < uy - hh || arrow_y > uy + hh + 0.05 {
                 return;
             }
