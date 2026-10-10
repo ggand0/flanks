@@ -509,7 +509,7 @@ fn setup_unit_mesh(
         rig.half = crate::unit_types::half_height(kind);
         // A skeleton is posed in the pose pass only.
         if rig.skel.params[0] > 0 && !(gpu.enabled && gpu.pose_pass) {
-            warn!("kind {kind}: FL_CLIPS needs the GPU path with its pose pass, so it draws by its parts");
+            warn!("kind {kind}: its skeleton needs the GPU path with its pose pass, so it draws by its parts");
             rig.skel = Default::default();
         }
         let rig = UnitRig { rig, clips: std::sync::Arc::new(model.clips) };

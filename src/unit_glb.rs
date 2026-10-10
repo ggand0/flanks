@@ -33,9 +33,9 @@
 //!
 //! A model with a glTF skin and the clips of `SKEL_CLIPS` next to it
 //! (`<kind>.<clip>.json`, the one clip format of docs/plans/022) is posed
-//! by its skeleton when `FL_CLIPS=1`: every vertex follows a joint pair
+//! by its skeleton unless `FL_CLIPS=0`: every vertex follows a joint pair
 //! (`ATTRIBUTE_SKIN`), and the pose pass plays the clips (unit_pose.wgsl
-//! `put_skeleton`). Without the flag the same file draws by its parts.
+//! `put_skeleton`). With `FL_CLIPS=0` the same file draws by its parts.
 //!
 //! `FL_UNIT_MESH=code` keeps the code-built meshes and `FL_GLB_FAR=code`
 //! fills only the missing levels from them. `FL_GLB_<KIND>=path` loads
@@ -401,7 +401,7 @@ fn import(kind: usize, path: &Path) -> Fallible<KindMeshes> {
                 rig.skel = skel;
                 clips = rows;
             }
-            Err(e) => warn!("{name}: FL_CLIPS is set but its skeleton is not usable, it draws by its parts: {e}"),
+            Err(e) => warn!("{name}: its skeleton is not usable, it draws by its parts: {e}"),
         }
     }
     if rig.skel.params[0] == 0 {
@@ -562,10 +562,11 @@ fn arm_rig(
     }
 }
 
-/// `FL_CLIPS=1`: a model with a skeleton and its clips is posed by them.
+/// A model with a skeleton and its clips is posed by them; `FL_CLIPS=0`
+/// draws it by its parts.
 pub fn clips_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| crate::util::env_or("FL_CLIPS", 0_u32) != 0)
+    *ON.get_or_init(|| crate::util::env_or("FL_CLIPS", 1_u32) != 0)
 }
 
 /// The clips a skinned kind plays, by slot (unit_pose.wgsl `CLIP_STAND`
