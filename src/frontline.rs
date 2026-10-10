@@ -615,10 +615,11 @@ fn update_groups(
             }
             group.melee_ticks = group.melee_ticks.saturating_add(1);
         } else {
-            // The melee is over: its men come back into formation
-            // (sim/soldier.rs clears out_form). A regiment with no attack
-            // order re-forms where it stands, M2TW's discrete reforming
-            // state; an attacker's order lays its slots again.
+            // The melee is over: its men come back into formation as each
+            // loses sight of the enemy (sim/soldier.rs decide_to_join). A
+            // regiment with no attack order re-forms where it stands,
+            // M2TW's discrete reforming state; an attacker's order lays its
+            // slots again.
             if group.melee_ticks > 0
                 && group.shape == crate::formation::FormShape::Rect
                 && !group.state.is_broken()
