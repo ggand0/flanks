@@ -239,7 +239,7 @@ fn fill_vacated_slots(
         let gd = &groups.list[g as usize];
         let f = crate::formation::facing_dir(gd.facing);
         let r = Vec2::new(f.y, -f.x);
-        let half_file = 0.5 * gd.spacing.pitch().x;
+        let half_file = 0.5 * gd.spacing.pitch(gd.kind).x;
         file.clear();
         for &i in &members[g as usize] {
             if units.swing[i] & crate::units::SWING_STATE_MASK != crate::units::SWING_READY {

@@ -89,6 +89,9 @@ pub struct GroupData {
     /// Hold position (defend mode): never auto-engage, never chase — at
     /// ease (false, default) idle regiments engage enemies that come near.
     pub hold: bool,
+    /// A scripted regiment that never breaks, whatever its morale: the
+    /// line a test scene presses against.
+    pub steadfast: bool,
     /// Request: rewrite this regiment's slots before the next sim tick.
     pub reform: bool,
     /// Living strength when slots were last written (close-ranks trigger).
@@ -230,6 +233,7 @@ impl GroupData {
             facing: if team == 0 { 0.0 } else { std::f32::consts::PI },
             files: 0,
             hold: false,
+            steadfast: false,
             reform: false,
             count_at_reform: count,
             disorder: 0.0,
@@ -595,7 +599,7 @@ fn line_layout(
     for (g, _) in segs {
         let gd = &groups.list[g];
         let share = len * gd.count as f32 / total as f32;
-        let pitch = gd.spacing.pitch();
+        let pitch = gd.spacing.pitch(gd.kind);
         let files = (((share - LINE_REG_GAP) / pitch.x).floor() as u32)
             .clamp(1, gd.count as u32);
         let ranks = (gd.count as u32).div_ceil(files);
@@ -899,7 +903,7 @@ fn draw_order_preview(
         let gd = &groups.list[p.g];
         let fwd = facing_dir(p.facing);
         let right = Vec2::new(fwd.y, -fwd.x);
-        let pitch = gd.spacing.pitch();
+        let pitch = gd.spacing.pitch(gd.kind);
         let world = |off: Vec2| p.anchor + right * off.x + fwd * off.y;
 
         if total <= PREVIEW_CIRCLE_CAP {
@@ -909,7 +913,7 @@ fn draw_order_preview(
                         lift(world(off), 0.25),
                         Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2),
                     ),
-                    0.42,
+                    crate::selection_rings::RADIUS,
                     slot_col,
                 );
             }

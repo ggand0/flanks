@@ -19,9 +19,44 @@ use bevy::prelude::*;
 use crate::orders::{GroupData, Groups};
 use crate::units::{Units, hash01};
 
-/// Base slot pitch inside a regiment block (matches the historical spawn
-/// spacing; per-mode multipliers below).
+/// Slot pitch inside a regiment block in normal order, every kind's
+/// default (per-mode multipliers below).
 pub const BASE_SPACING: f32 = 1.4;
+
+/// A kind's slot pitch in normal order: how far apart its men stand.
+/// FL_GAP=k,m,s,a sets it per kind in metres (knights, men-at-arms,
+/// spearmen, bowmen). Never under the separation rest distance
+/// (sim/soldier.rs SEP_RADIUS): the physics pushes closer slots apart.
+pub fn gap(kind: u8) -> f32 {
+    static GAPS: std::sync::OnceLock<[f32; crate::unit_types::NUM_KINDS]> =
+        std::sync::OnceLock::new();
+    GAPS.get_or_init(|| {
+        let mut gaps = [BASE_SPACING; crate::unit_types::NUM_KINDS];
+        if let Ok(v) = std::env::var("FL_GAP") {
+            let parsed: Vec<f32> = v.split(',').filter_map(|t| t.trim().parse().ok()).collect();
+            match <[f32; crate::unit_types::NUM_KINDS]>::try_from(parsed) {
+                Ok(given) => {
+                    let floor = crate::sim::soldier::SEP_RADIUS;
+                    if given.iter().any(|g| *g < floor) {
+                        warn!("FL_GAP: a gap under {floor} m cannot be held, raised to it");
+                    }
+                    gaps = given.map(|g| g.clamp(floor, 6.0));
+                }
+                Err(_) => warn!(
+                    "FL_GAP wants {} comma-separated numbers",
+                    crate::unit_types::NUM_KINDS
+                ),
+            }
+        }
+        gaps
+    })[kind as usize]
+}
+
+/// The widest normal-order pitch of any kind: army layouts size every
+/// block's ground with it.
+pub fn widest_gap() -> f32 {
+    (0..crate::unit_types::NUM_KINDS as u8).map(gap).fold(0.0, f32::max)
+}
 /// Files-to-ranks bias of the default block (~2.2:1, wider than deep).
 const DEFAULT_ASPECT: f32 = 2.2;
 /// Close ranks when this fraction of the last-formed strength has fallen
@@ -53,13 +88,13 @@ pub enum FormSpacing {
 }
 
 impl FormSpacing {
-    /// (lateral, depth) slot pitch in meters. Wall matches the tightened
-    /// separation rest distance (sim/soldier.rs WALL_SEP_RADIUS) — slots the
-    /// physics refuses to hold are lies.
-    pub fn pitch(self) -> Vec2 {
+    /// (lateral, depth) slot pitch of a kind in meters. Wall matches the
+    /// tightened separation rest distance (sim/soldier.rs WALL_SEP_RADIUS):
+    /// slots the physics refuses to hold are lies.
+    pub fn pitch(self, kind: u8) -> Vec2 {
         match self {
-            FormSpacing::Normal => Vec2::splat(BASE_SPACING),
-            FormSpacing::Loose => Vec2::splat(BASE_SPACING * 1.9),
+            FormSpacing::Normal => Vec2::splat(gap(kind)),
+            FormSpacing::Loose => Vec2::splat(gap(kind) * 1.9),
             FormSpacing::Wall => Vec2::new(1.05, 1.15),
         }
     }
@@ -148,7 +183,7 @@ pub fn assign_slots(units: &mut Units, g: u32, gd: &mut GroupData) -> Vec<u32> {
         }
         FormShape::Rect => {
             let files = (gd.files.max(1) as usize).min(n);
-            let pitch = gd.spacing.pitch();
+            let pitch = gd.spacing.pitch(gd.kind);
             let slots = slot_offsets(n, files, pitch);
             // Front-to-back, then left-to-right within each rank: the
             // greedy crossing-minimizer, matching the slots' row-major
@@ -178,7 +213,7 @@ pub fn block_half_extents(gd: &GroupData, files: u32, facing: f32) -> Vec2 {
     }
     let files = (files.max(1) as usize).min(gd.count.max(1));
     let ranks = gd.count.max(1).div_ceil(files);
-    let pitch = gd.spacing.pitch();
+    let pitch = gd.spacing.pitch(gd.kind);
     let half_w = (files - 1) as f32 * 0.5 * pitch.x + 1.0;
     let half_d = (ranks - 1) as f32 * 0.5 * pitch.y + 1.0;
     let fwd = facing_dir(facing);

@@ -537,7 +537,7 @@ pub fn update_morale(
 
         match g.state {
             RegState::Steady => {
-                if eff <= ROUT_AT {
+                if eff <= ROUT_AT && !g.steadfast {
                     let held = g.break_ticks as f32 * dt;
                     if held >= BREAK_HOLD_S {
                         g.state = RegState::Routing { since: *tick };

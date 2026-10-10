@@ -126,7 +126,7 @@ const POSE_SLOTS_SKEL: u32 = 6 + 2 * crate::unit_meshes::SKEL_JOINTS as u32;
 const BUCKET_SET_BYTES: u64 = 256;
 
 /// Bytes of one soldier's smoothing state (`Smooth` in unit_build.wgsl).
-const SMOOTH_BYTES: usize = 52;
+const SMOOTH_BYTES: usize = 60;
 
 /// Per-tick snapshot of one soldier, 56 bytes, every field exact. All
 /// scalars, so the WGSL struct (`Soldier` in unit_build.wgsl) has the same

@@ -52,10 +52,12 @@ use crate::render_units::{ExtractedBucket, InstanceData};
 use crate::render_units_gpu::{GpuSyncConfig, GpuUnitBuffers, RING_ARG};
 use crate::unit_types::NUM_KINDS;
 
-/// Ring radius in metres: the move preview's slot circles
+/// Ring radius in metres, shared with the move preview's slot circles
 /// (orders.rs `draw_order_preview`), so a slot of the preview and the
-/// soldier who takes it read the same.
-const RADIUS: f32 = 0.42;
+/// soldier who takes it read the same. About a man's width with shield
+/// and weapon, and just under half a wall's file pitch (1.05 m), so the
+/// rings of a wall do not overlap.
+pub const RADIUS: f32 = 0.5;
 /// The teardrop point on the front of the ring, where the soldier faces.
 const FACING_POINT: bool = true;
 

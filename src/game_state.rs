@@ -31,6 +31,9 @@ pub enum Scenario {
     PileTwo,
     Join,
     Routpass,
+    /// A lane behind a gap: three regiments hold in a line, a mass of
+    /// twelve is sent past them (regiments.rs `spawn_push_test`).
+    Push,
     Archery,
     /// A new attack target mid-fight (regiments.rs `spawn_retarget_test`).
     Retarget,
@@ -40,7 +43,7 @@ pub enum Scenario {
 }
 
 /// The env var of every scripted scenario, as the scripts launch them.
-const SCENARIO_ENVS: [&str; 12] = [
+const SCENARIO_ENVS: [&str; 13] = [
     "FL_DEMO",
     "FL_TEST_SURROUND",
     "FL_TEST_ROUT",
@@ -50,6 +53,7 @@ const SCENARIO_ENVS: [&str; 12] = [
     "FL_TEST_PILE",
     "FL_TEST_JOIN",
     "FL_TEST_ROUTPASS",
+    "FL_TEST_PUSH",
     "FL_TEST_ARCHERY",
     "FL_TEST_RETARGET",
     "FL_SCENE",
@@ -69,6 +73,7 @@ impl Scenario {
         Self::PileTwo,
         Self::Join,
         Self::Routpass,
+        Self::Push,
         Self::Archery,
         Self::Retarget,
         Self::Scene,
@@ -88,6 +93,7 @@ impl Scenario {
             Self::PileTwo => "Two on One",
             Self::Join => "Join Fight",
             Self::Routpass => "Rout Pass",
+            Self::Push => "Push Past",
             Self::Archery => "Archery",
             Self::Retarget => "Retarget",
             Self::Scene => "Scene",
@@ -109,6 +115,7 @@ impl Scenario {
             Self::Pile | Self::PileWide | Self::PileTwo => Some("FL_TEST_PILE"),
             Self::Join => Some("FL_TEST_JOIN"),
             Self::Routpass => Some("FL_TEST_ROUTPASS"),
+            Self::Push => Some("FL_TEST_PUSH"),
             Self::Archery => Some("FL_TEST_ARCHERY"),
             Self::Retarget => Some("FL_TEST_RETARGET"),
             Self::Scene => Some("FL_SCENE"),
