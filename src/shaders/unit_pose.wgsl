@@ -842,12 +842,13 @@ fn pose_begin(pos_scale: vec4<f32>, color: vec4<f32>, anim: vec4<f32>, anim2: ve
     let cut = skel && has_cut && !charge && !cheering && abs(swing_style - 1.0) < 0.5;
     let style = select(swing_style, 1.0, has_cut && swing_style > 1.5);
     // The stab clip plays the ordinary stab (style 0) the same way, and
-    // the charge blow clip the charging blow.
-    let has_stab = rig.skel.clips[CLIP_STAB].y > 0u && rig.skel.rates[CLIP_STAB].z > 0.0;
-    let stab = skel && has_stab && !charge && !cheering && swing_style < 0.5;
+    // the charge blow clip the charging blow. A kind without a charge blow
+    // clip stabs on the charge too: a spear only ever thrusts.
     let has_charge_attack =
         rig.skel.clips[CLIP_CHARGE_ATTACK].y > 0u && rig.skel.rates[CLIP_CHARGE_ATTACK].z > 0.0;
     let charge_attack = skel && has_charge_attack && charge;
+    let has_stab = rig.skel.clips[CLIP_STAB].y > 0u && rig.skel.rates[CLIP_STAB].z > 0.0;
+    let stab = skel && has_stab && !charge_attack && !cheering && swing_style < 0.5;
     // The lunge the code-posed arms and the body lean follow: quadratic
     // over the wind-up and harder on a charge, where it raises from the
     // levelled run-in point instead of dipping the blade first. After the

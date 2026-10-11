@@ -24,8 +24,9 @@
 //! regiment grey. On a textured model they come from the atlas.
 //!
 //! A weapon arm split into upper arm, forearm and hand is posed by
-//! attack tables that ship next to the model, `<kind>.stab.json`, which
-//! the build scripts in tools/blender write. Without them the arm bends
+//! attack tables that ship next to the model, `<kind>.arm_stab.json`,
+//! which the build scripts in tools/blender write. (`<kind>.stab.json` is
+//! a skeleton's stab clip.) Without them the arm bends
 //! at the elbow as one piece. An archer with jointed arms, a strung bow,
 //! a held arrow and a separate head and torso shoots from the tables in
 //! `<kind>.shoot.json`. Without them the parts join the arm, bow arm or
@@ -1065,7 +1066,7 @@ fn read_shoot(path: &Path) -> Fallible<Shots> {
 
 /// The attack tables of a model with a jointed arm, next to it.
 fn attack_path(model: &Path) -> PathBuf {
-    model.with_extension("stab.json")
+    model.with_extension("arm_stab.json")
 }
 
 /// A jointed arm's attack as the build scripts write it

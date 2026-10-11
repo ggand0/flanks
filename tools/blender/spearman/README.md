@@ -71,7 +71,9 @@ own parts:
 `TEXCOORD_1` stores the integer part ID and that part's pivot height, with the
 Blender V flip handled before export. `joint_elbow` and `joint_wrist` are also
 exported for inspection. The engine reads the stab from `spear_stab.json`,
-installed next to the model as `spearman.stab.json`.
+installed next to the model as `spearman.arm_stab.json`; the far levels of
+the skinned spearman still play it. `spearman.stab.json` is the skeleton's
+stab clip.
 
 The motion covers the stationary weapon-arm stab. Shieldwall shoulder
 motion, sword attacks, locomotion and full-body stepping are separate tasks.
