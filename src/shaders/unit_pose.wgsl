@@ -50,11 +50,11 @@ struct Skel {
     // Per clip: x = its first vec4 in `clips`, y = its samples, w = 1 when
     // it loops. A sample is the root's offset from rest, then one
     // quaternion per joint relative to its parent.
-    clips: array<vec4<u32>, 8>,
+    clips: array<vec4<u32>, 12>,
     // Per clip: x = samples per second, y = its length in seconds, z =
     // when its blow lands in seconds, -1 without one, w = how far one play
     // carries the soldier.
-    rates: array<vec4<f32>, 8>,
+    rates: array<vec4<f32>, 12>,
     // The joints the gait, the arm sway and the attack write: (pelvis,
     // chest, head, weapon), then (upper arm, forearm, hand, coat) of the
     // weapon side and of the shield side, then (thigh, shin, foot) of
@@ -647,6 +647,7 @@ const CLIP_SHUFFLE_RIGHT: u32 = 3u;
 const CLIP_SHUFFLE_FORWARD: u32 = 4u;
 const CLIP_SHUFFLE_BACKWARD: u32 = 5u;
 const CLIP_CUT: u32 = 6u;
+const CLIP_STAB: u32 = 7u;
 // Parts of the bow rig.
 const BOW_PARTS: u32 = 14u;
 
@@ -733,8 +734,9 @@ struct Pre {
     clip: u32,
     clip_x: f32,
     style: f32,
-    // A skinned kind's blow that plays its cut clip.
+    // A skinned kind's blow that plays its cut clip, or its stab clip.
     cut: bool,
+    stab: bool,
     // A skinned kind's steps: the clip slot, the place in its play 0 to 1,
     // and his weight in it rather than in his stance or gait.
     step_clip: u32,
@@ -835,6 +837,10 @@ fn pose_begin(pos_scale: vec4<f32>, color: vec4<f32>, anim: vec4<f32>, anim2: ve
     let has_cut = rig.skel.clips[CLIP_CUT].y > 0u && rig.skel.rates[CLIP_CUT].z > 0.0;
     let cut = skel && has_cut && !charge && !cheering && abs(swing_style - 1.0) < 0.5;
     let style = select(swing_style, 1.0, has_cut && swing_style > 1.5);
+    // The stab clip plays the ordinary stab (style 0) the same way; the
+    // charging blow stays the code's.
+    let has_stab = rig.skel.clips[CLIP_STAB].y > 0u && rig.skel.rates[CLIP_STAB].z > 0.0;
+    let stab = skel && has_stab && !charge && !cheering && swing_style < 0.5;
     // The lunge the code-posed arms and the body lean follow: quadratic
     // over the wind-up and harder on a charge, where it raises from the
     // levelled run-in point instead of dipping the blade first. After the
@@ -906,6 +912,7 @@ fn pose_begin(pos_scale: vec4<f32>, color: vec4<f32>, anim: vec4<f32>, anim2: ve
         clip_x,
         style,
         cut,
+        stab,
         step_clip,
         step_x,
         step_w,
@@ -952,9 +959,9 @@ fn put_common() {
     let shift = 0.02 * pre.leg * g.run * g.stride * cos(TAU * (pre.gait - 0.5 * g.duty))
         * (1.0 - pre.step_w);
     // The body rides the hip drop from the gait. A runner leans as far
-    // forward as a charger. A blow leans into it, except a cut, whose clip
-    // moves the whole body itself.
-    let blow = select(0.30 * pre.lunge + 0.25 * pre.chop, 0.0, pre.cut);
+    // forward as a charger. A blow leans into it, except one from a clip
+    // (the cut, the stab), which moves the whole body itself.
+    let blow = select(0.30 * pre.lunge + 0.25 * pre.chop, 0.0, pre.cut || pre.stab);
     let lean = 0.10 * pre.moving
         + 0.24 * max(g.run * pre.moving, pre.sprint * (0.25 + 0.75 * pre.moving))
         + blow;
@@ -1399,8 +1406,11 @@ fn put_skeleton() {
     } else if pre.windup > 0.0 {
         strike = smoothstep(0.0, 0.2, pre.windup);
     }
-    let cut = select(0.0, strike, alive && pre.cut);
-    var act = select(max(pre.celebrate, strike), pre.celebrate, pre.cut);
+    // A blow from a clip: the cut or the stab, played the same way.
+    let clip_blow = pre.cut || pre.stab;
+    let blow_clip = select(CLIP_CUT, CLIP_STAB, pre.stab);
+    let cut = select(0.0, strike, alive && clip_blow);
+    var act = select(max(pre.celebrate, strike), pre.celebrate, clip_blow);
     act = select(0.0, act, alive && rig.arm > 0.5 && rig.hold < 1.5);
     let level = max(max(pre.stance, pre.ready * 0.75), max(pre.sprint, pre.wall)) * (1.0 - pre.celebrate);
     // The guard holds through a blow: the stab thrusts and the overhead
@@ -1450,12 +1460,12 @@ fn put_skeleton() {
     if cut > 0.0 {
         // Clip time from the wind-up to the blow at its contact, then
         // from the blow to its end over the follow-through.
-        let rates = rig.skel.rates[CLIP_CUT];
+        let rates = rig.skel.rates[blow_clip];
         var t = pre.windup * rates.z;
         if pre.following {
             t = rates.z + pre.follow * (rates.y - rates.z);
         }
-        let at = skel_at(CLIP_CUT, t);
+        let at = skel_at(blow_clip, t);
         // On the move the pelvis, legs and coat keep the gait.
         let low = cut * (1.0 - moving);
         let leg_r = rig.skel.roles[3];

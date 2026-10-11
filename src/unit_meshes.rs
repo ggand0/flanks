@@ -110,7 +110,7 @@ pub const SKEL_JOINTS: usize = 20;
 const _: () = assert!(SKEL_JOINTS == 20, "unit_pose.wgsl sizes its joint arrays and POSE_SLOTS_SKEL for 20");
 /// The clips a skinned kind plays, in the order of `Skel::clips`
 /// (unit_glb.rs `SKEL_CLIPS`).
-pub const SKEL_CLIP_SLOTS: usize = 8;
+pub const SKEL_CLIP_SLOTS: usize = 12;
 
 /// A skinned kind's skeleton (unit_glb.rs `read_skeleton`): its joints and
 /// where its clips are in the clip buffer. Every joint's rest rotation is
