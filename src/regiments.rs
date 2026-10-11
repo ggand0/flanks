@@ -1304,7 +1304,20 @@ struct Shake {
     last: Vec<Vec2>,
     turns: Vec<u8>,
     step: Vec<f32>,
+    /// For the wander count: each man's place when its window began, the
+    /// ground he has covered since, and the shake windows reported so far.
+    wstart: Vec<Vec2>,
+    path: Vec<f32>,
+    windows: u32,
 }
+
+/// A man wanders when he covers WANDER_PATH metres over WANDER_WINDOWS
+/// shake windows and ends within WANDER_NET metres of where he began: the
+/// man who goes to an enemy and back to his slot, over and over (devlog
+/// 0212), whom the turn count misses because he turns about once a second.
+const WANDER_WINDOWS: u32 = 2;
+const WANDER_PATH: f32 = 4.0;
+const WANDER_NET: f32 = 1.5;
 
 /// A step shorter than this is no step, in metres.
 const SHAKE_STEP: f32 = 0.003;
@@ -1342,9 +1355,12 @@ fn shake_log(
     sh.last.resize(n, Vec2::ZERO);
     sh.turns.resize(n, 0);
     sh.step.resize(n, 0.0);
+    sh.wstart.resize(n, Vec2::ZERO);
+    sh.path.resize(n, 0.0);
     for i in 0..n {
         let d = units.pos[i] - units.pos_prev[i];
         let d = Vec2::new(d.x, d.z);
+        sh.path[i] += d.length();
         let was = sh.last[i];
         if d.length_squared() > SHAKE_STEP * SHAKE_STEP
             && was.length_squared() > SHAKE_STEP * SHAKE_STEP
@@ -1425,6 +1441,57 @@ fn shake_log(
         by_touch[1],
         by_touch[2],
     );
+    sh.windows += 1;
+    if sh.windows.is_multiple_of(WANDER_WINDOWS) {
+        let (mut wander, mut w_out, mut w_thin, mut w_shake) = (0u32, 0u32, 0u32, 0u32);
+        let mut w_state = [0u32; 3];
+        let mut wanderers: Vec<(f32, f32, usize, f32)> = Vec::new();
+        for i in 0..n {
+            let p = Vec2::new(units.pos[i].x, units.pos[i].z);
+            let path = sh.path[i];
+            let net = p.distance(sh.wstart[i]);
+            sh.wstart[i] = p;
+            sh.path[i] = 0.0;
+            if units.death_t[i] != 0 || path < WANDER_PATH || net > WANDER_NET {
+                continue;
+            }
+            let mut crowd = 0.0f32;
+            grid.for_each_candidate(p, 3.0, |o| {
+                if o.idx as usize == i || (o.meta & crate::spatial::META_DYING) != 0 {
+                    return;
+                }
+                let d = p.distance(o.xz());
+                if d < sep {
+                    crowd += 1.0 - d / sep;
+                }
+            });
+            let gd = &groups.list[units.group[i] as usize];
+            w_state[if gd.engaged { 0 } else if gd.order.is_some() { 1 } else { 2 }] += 1;
+            wander += 1;
+            w_out += units.out_form[i] as u32;
+            w_thin += (crowd < slow) as u32;
+            w_shake += (sh.turns[i] >= SHAKE_TURNS) as u32;
+            wanderers.push((path, net, i, crowd));
+        }
+        wanderers.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+        let mut listed = String::new();
+        for &(path, net, i, crowd) in wanderers.iter().take(SHAKE_LINES) {
+            listed.push_str(&format!(
+                " | reg {} at ({:.0}, {:.0}): {path:.1} m walked, {net:.1} m from his start, crowd {crowd:.2}{}",
+                units.group[i],
+                units.pos[i].x,
+                units.pos[i].z,
+                if units.out_form[i] { ", out of formation" } else { "" },
+            ));
+        }
+        info!(
+            "[wander] t={t:.0}s {wander} of {alive} men walked over {WANDER_PATH} m in {} s and ended within {WANDER_NET} m of their start | shakers among them {w_shake} | regiment fighting {} moving {} standing {} | out of formation {w_out} | crowd under the brake's start {w_thin}{listed}",
+            WANDER_WINDOWS as f32 * SHAKE_WINDOW,
+            w_state[0],
+            w_state[1],
+            w_state[2],
+        );
+    }
     sh.turns.fill(0);
     sh.step.fill(0.0);
 }

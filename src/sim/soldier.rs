@@ -373,10 +373,12 @@ struct Step {
     my_team_bit: u32,
     // His regiment's melee and his part in it.
     in_melee: bool,
+    may_leave: bool,
     committed: bool,
     join_fp: Option<Vec2>,
     // What he remembers and sees.
     memo_valid: bool,
+    memo_d2: f32,
     memo_dir: Vec2,
     side_dir: Vec2,
     watch_go: bool,
@@ -431,7 +433,7 @@ pub(crate) fn tick_chunk(f: &Field, rows: Rows, out: &mut ChunkOut) {
 /// in his regiment's melee.
 #[inline]
 fn begin(f: &Field, s: &mut Soldier) -> Step {
-    let Field { pos_prev, kind, group, broken, fight_point, .. } = *f;
+    let Field { pos_prev, kind, group, broken, fight_point, hold, moving, .. } = *f;
     let i = s.i;
     let p = pos_prev[i].xz();
     let my_kind = kind[i] as usize;
@@ -445,21 +447,28 @@ fn begin(f: &Field, s: &mut Soldier) -> Step {
     }
     let gi = group[i] as usize;
     let routed = broken[gi];
-    // In melee: his regiment has a fight. He is either still in formation or
-    // out of it (out_form: he left his slot to fight, a state that sticks
-    // until the melee ends; M2TW's isInFormation). Fighting takes him out of
-    // formation.
+    // In melee: his regiment has a fight. Out of formation (out_form): he
+    // left his slot to fight, his own state, not his regiment's (M2TW's
+    // isInFormation). It sticks while he sees an enemy or his regiment has
+    // a fight to head for (decide_to_join); a Move order, a hold order, a
+    // rout and death bring him back. Fighting takes him out of formation.
+    // Keyed on the regiment's melee instead, a man whose regiment had no
+    // fight on its clock, with an enemy standing off his flank, went to
+    // him and was pulled back to his slot, over and over (devlog 0212).
     let in_melee = fight_point[gi].is_some() && !routed && !dying;
-    if !in_melee {
+    let may_leave = !routed && !dying && !hold[gi] && !moving[gi];
+    if !may_leave {
         *s.out_form = false;
-        *s.sight &= !(SIGHT_GO | SIGHT_GO_FAR);
     } else if *s.swing & crate::units::SWING_STATE_MASK
         != crate::units::SWING_READY
         && *s.swing & crate::units::SWING_RANGED == 0
     {
         *s.out_form = true;
     }
-    let committed = in_melee && *s.out_form;
+    if !in_melee {
+        *s.sight &= !(SIGHT_GO | SIGHT_GO_FAR);
+    }
+    let committed = *s.out_form;
     let join_fp = if in_melee { fight_point[gi] } else { None };
     Step {
         p,
@@ -483,9 +492,11 @@ fn begin(f: &Field, s: &mut Soldier) -> Step {
         scan_r: 0.0,
         my_team_bit: 0,
         in_melee,
+        may_leave,
         committed,
         join_fp,
         memo_valid: false,
+        memo_d2: f32::MAX,
         memo_dir: Vec2::ZERO,
         side_dir: Vec2::ZERO,
         watch_go: false,
@@ -776,12 +787,14 @@ fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
     // of another regiment is remembered only within his threat distance:
     // one who is not on him he lets go, and follows his orders.
     let memo = prev_target as usize;
+    let mut memo_d2 = f32::MAX;
     let memo_valid = ((best_idx == u32::MAX && !dying && !routed)
         || (in_melee && !committed))
         && memo < pos_prev.len()
         && team[memo] != team[i]
         && {
             let d2 = pos_prev[memo].xz().distance_squared(p);
+            memo_d2 = d2;
             d2 < (seek_radius() + 1.0) * (seek_radius() + 1.0)
                 && focus[gi].is_none_or(|t| {
                     group[memo] == t || d2 < threat_radius() * threat_radius()
@@ -894,6 +907,7 @@ fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
     let slot_blocked = *s.sight & SIGHT_MARK != 0;
     st.back_blocked = *s.sight & SIGHT_BACK != 0;
     st.memo_valid = memo_valid;
+    st.memo_d2 = memo_d2;
     st.memo_dir = memo_dir;
     st.side_dir = side_dir;
     st.watch_go = watch_go;
@@ -1032,43 +1046,68 @@ fn acquire(f: &Field, s: &mut Soldier, st: &mut Step) {
 
 /// Leaving formation to fight, in his own time: a chance per half-second
 /// window while he sees an enemy or a comrade going, and patience as the
-/// backstop. Once out he never dresses on his slot until the melee ends.
+/// backstop. Once out he never dresses on his slot while he sees an enemy
+/// or his regiment's melee runs.
 #[inline]
 fn decide_to_join(f: &Field, s: &mut Soldier, st: &mut Step) {
-    let Field { melee_ticks, tick, .. } = *f;
+    let Field { melee_ticks, engaged, tick, .. } = *f;
     let i = s.i;
     let in_melee = st.in_melee;
+    let may_leave = st.may_leave;
     let gi = st.gi;
     let memo_valid = st.memo_valid;
+    let memo_d2 = st.memo_d2;
+    let best_idx = st.best_idx;
     let mut desired = st.desired;
     let committed = st.committed;
+    let mut committed = committed;
+    // Out of formation with his regiment's melee over, or never begun: he
+    // comes back to his slot once he sees no enemy, nobody in reach and no
+    // remembered enemy within his closing range (close_in). While his
+    // regiment's melee runs he stays out until it ends, heading for the
+    // fight when he sees nobody.
+    if committed && !in_melee {
+        let look = if engaged[gi] { seek_radius() } else { WIDE_ACQUIRE_R };
+        let sees = best_idx != u32::MAX
+            || (memo_valid && memo_d2 < (look + 1.0) * (look + 1.0));
+        if !sees {
+            committed = false;
+            *s.out_form = false;
+        }
+    }
     // Leaving formation to fight, in his own time: he reacts to an enemy in
     // sight or a comrade seen running to the fight (a chance per half-second
     // window), or his patience with the fight's noise runs out. Near men go
-    // first and the line rolls up outward.
-    let mut committed = committed;
-    if in_melee && !committed {
+    // first and the line rolls up outward. With no melee on his regiment's
+    // clock (a lone enemy at the flank, a thin contact) he goes only for an
+    // enemy within the short look (WIDE_ACQUIRE_R): the men nearest him
+    // leave the ranks for him, the rest stay in formation.
+    if may_leave && !committed {
         let patience = (JOIN_PATIENCE_MIN
             + (join_patience_max() - JOIN_PATIENCE_MIN)
                 * crate::units::hash01((i as u32).wrapping_mul(0x3C6E) ^ 0xF372))
             * 30.0;
         let saw_comrade_go = *s.sight & (SIGHT_GO | SIGHT_GO_FAR) != 0;
-        let react = (memo_valid || saw_comrade_go) && {
+        let sees = if in_melee {
+            memo_valid || saw_comrade_go
+        } else {
+            memo_valid && memo_d2 < WIDE_ACQUIRE_R * WIDE_ACQUIRE_R
+        };
+        let react = sees && {
             let window = (tick.wrapping_add((i as u32).wrapping_mul(11)) / JOIN_WINDOW)
                 .wrapping_mul(0x9E37_79B1);
             crate::units::hash01(window ^ (i as u32).wrapping_mul(0x6A09))
                 < join_react_chance()
         };
-        if react || melee_ticks[gi] as f32 > patience {
+        if react || (in_melee && melee_ticks[gi] as f32 > patience) {
             committed = true;
             *s.out_form = true;
         }
     }
-    // Out of formation he never dresses on his slot until the melee ends and
-    // the regiment re-forms: he fights, goes for an enemy he sees, heads for
-    // the fight, or stands where he is when blocked. Inferring this from his
-    // speed made a man who slowed down run back to his slot and come out
-    // again, over and over.
+    // Out of formation he never dresses on his slot: he fights, goes for an
+    // enemy he sees, heads for the fight, or stands where he is when
+    // blocked. Inferring this from his speed made a man who slowed down run
+    // back to his slot and come out again, over and over.
     if committed {
         desired = Vec2::ZERO;
     }
@@ -1396,7 +1435,6 @@ fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
     let gi = st.gi;
     let dying = st.dying;
     let routed = st.routed;
-    let in_melee = st.in_melee;
     let committed = st.committed;
     let memo_valid = st.memo_valid;
     let join_fp = st.join_fp;
@@ -1421,7 +1459,10 @@ fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
     // in a dense press the memo would let second ranks drive through the jam
     // and compress the crowd into overlap. The memo may be stale after
     // death sweeps reindex, so it is validated as "some enemy within closing
-    // range" — a legitimate closing target regardless of identity.
+    // range" — a legitimate closing target regardless of identity. Only a
+    // man out of formation goes to a remembered enemy: a formed man seeing
+    // one leaves formation first (decide_to_join), so the slot never pulls
+    // against the chase.
     let (close_to, memo_close) = if *s.swing & crate::units::SWING_STATE_MASK
         != crate::units::SWING_READY
         && (*s.target as usize) < pos_prev.len()
@@ -1429,7 +1470,7 @@ fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
         (*s.target, false)
     } else if best_idx != u32::MAX {
         (best_idx, false)
-    } else if crowd < crowd_brake().0 && (!in_melee || committed) {
+    } else if crowd < crowd_brake().0 && committed {
         (*s.target, true)
     } else {
         (u32::MAX, false)
