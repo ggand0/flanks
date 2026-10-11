@@ -822,19 +822,19 @@ fn pose_begin(pos_scale: vec4<f32>, color: vec4<f32>, anim: vec4<f32>, anim2: ve
     let cheering = zpos > 11.5;
     let digit = floor(zpos * 0.5 + 0.001);
     let charge = digit > 2.5 && !cheering;
-    let style = digit - select(0.0, 3.0, charge);
+    let swing_style = digit - select(0.0, 3.0, charge);
     let within = zpos - digit * 2.0;
     let following = within > 1.395 && !cheering;
     let windup = select(select(within, 0.0, following), 0.0, cheering);
     let follow = clamp((within - 1.4) / 0.59, 0.0, 1.0);
-    // A skinned kind with a cut clip plays it for the classic swing (the
-    // sim's slow cut; a charging blow is a stab).
-    let cut = skel
-        && rig.skel.clips[CLIP_CUT].y > 0u
-        && rig.skel.rates[CLIP_CUT].z > 0.0
-        && !charge
-        && !cheering
-        && abs(style - 1.0) < 0.5;
+    // A kind with a cut clip draws three styles (soldier.rs): 1 is the
+    // slow cut, which his skeleton plays from the clip at the near levels
+    // and his parts play as the overhead swing further out, and 2 is the
+    // overhead swing at the stab's pace, which is the code's style 1. A
+    // charging blow is a stab.
+    let has_cut = rig.skel.clips[CLIP_CUT].y > 0u && rig.skel.rates[CLIP_CUT].z > 0.0;
+    let cut = skel && has_cut && !charge && !cheering && abs(swing_style - 1.0) < 0.5;
+    let style = select(swing_style, 1.0, has_cut && swing_style > 1.5);
     // The lunge the code-posed arms and the body lean follow: quadratic
     // over the wind-up and harder on a charge, where it raises from the
     // levelled run-in point instead of dipping the blade first. After the

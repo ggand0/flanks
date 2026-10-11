@@ -580,7 +580,8 @@ pub(crate) const SYNC_CHUNK: usize = 16_384;
 ///   z <= 0: no attack, no cheer;
 ///   z > 0, < CELEBRATE_BASE: attack = digit * 2 + progress, where the
 ///     digit is the swing style (0 stab, 1 classic swing, 2 slash,
-///     which the sim does not pick), plus 3 on a charging blow. Progress is the wind-up,
+///     which the sim does not pick; a kind with a cut draws 1 as the cut
+///     and 2 as the classic swing), plus 3 on a charging blow. Progress is the wind-up,
 ///     0..1 linear in time, or from FOLLOW_BASE the follow-through;
 ///   z >= CELEBRATE_BASE: victory cheer, fraction = progress 0..1;
 ///   z >= RANGED_BASE: a bow shot, RANGED_BASE + clip * 2 + progress,

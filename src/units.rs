@@ -119,9 +119,10 @@ pub const SWING_WINDUP: u8 = 1;
 pub const SWING_RECOVER: u8 = 2;
 pub const SWING_STATE_MASK: u8 = 3;
 /// Attack style for the CURRENT swing (bits 3-4, set at wind-up start,
-/// wiped with the state): 0 = stab, 1 = classic swing, 2 = slash
+/// wiped with the state): 0 = stab, 1 = classic overhead swing, 2 = slash
 /// (benched). Only the look, except for a kind with a cut, whose style 1
-/// is the slow cut (`UnitTypeParams::is_cut`).
+/// is the slow cut (`UnitTypeParams::is_cut`) and whose style 2 is the
+/// overhead swing at the stab's pace.
 pub const SWING_STYLE_SHIFT: u8 = 3;
 pub const SWING_STYLE_MASK: u8 = 0b11 << SWING_STYLE_SHIFT;
 /// Set when the swing was started at charging speed: bonus damage and a
