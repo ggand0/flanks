@@ -106,8 +106,8 @@ pub struct Rig {
 }
 
 /// The most joints a skeleton can have.
-pub const SKEL_JOINTS: usize = 20;
-const _: () = assert!(SKEL_JOINTS == 20, "unit_pose.wgsl sizes its joint arrays and POSE_SLOTS_SKEL for 20");
+pub const SKEL_JOINTS: usize = 22;
+const _: () = assert!(SKEL_JOINTS == 22, "unit_pose.wgsl sizes its joint arrays and POSE_SLOTS_SKEL for 22");
 /// The clips a skinned kind plays, in the order of `Skel::clips`
 /// (unit_glb.rs `SKEL_CLIPS`).
 pub const SKEL_CLIP_SLOTS: usize = 12;

@@ -46,7 +46,7 @@ struct Skel {
     params: vec4<u32>,
     // xyz = the joint's rest origin, local space; w = its parent's index,
     // -1 for the root. Parents come first.
-    joints: array<vec4<f32>, 20>,
+    joints: array<vec4<f32>, 22>,
     // Per clip: x = its first vec4 in `clips`, y = its samples, w = 1 when
     // it loops. A sample is the root's offset from rest, then one
     // quaternion per joint relative to its parent.
@@ -635,7 +635,7 @@ const P_SKEL: u32 = 17u;
 // (render_units_gpu.rs POSE_SLOTS).
 const POSE_SLOTS: u32 = 17u;
 const POSE_SLOTS_BOW: u32 = 45u;
-const POSE_SLOTS_SKEL: u32 = 37u;
+const POSE_SLOTS_SKEL: u32 = 39u;
 // The levels a skinned kind poses by its skeleton (render_units_gpu.rs
 // SKEL_LODS): L0 and L1. Further out he poses by his parts.
 const SKEL_LODS: u32 = 2u;
@@ -1384,7 +1384,7 @@ fn skel_lower(j: u32) -> bool {
 // toward the clip's turn in the world, so his upper body faces as the
 // clip has it whatever his hips do: over hips that keep the gait it does
 // not take on the clip's hip turn.
-fn skel_over(turn: ptr<function, array<vec4<f32>, 20>>, at: SkelAt, up: f32, low: f32) {
+fn skel_over(turn: ptr<function, array<vec4<f32>, 22>>, at: SkelAt, up: f32, low: f32) {
     let n = rig.skel.params.x;
     let was = *turn;
     for (var j = 0u; j < n; j++) {
@@ -1462,7 +1462,7 @@ fn put_skeleton() {
     // arm. Only the cheer, in `level`, drops it.
     let guard = select(0.0, level * (1.0 - moving), alive);
 
-    var turn: array<vec4<f32>, 20>;
+    var turn: array<vec4<f32>, 22>;
     for (var j = 0u; j < n; j++) {
         turn[j] = qblend(skel_turn(CLIP_STAND, 0u, j), skel_turn(CLIP_READY, 0u, j), guard);
     }
@@ -1539,8 +1539,8 @@ fn put_skeleton() {
         turn[core.w] = qblend(turn[core.w], qx(-blow.z), act);
     }
 
-    var rot: array<vec4<f32>, 20>;
-    var org: array<vec3<f32>, 20>;
+    var rot: array<vec4<f32>, 22>;
+    var org: array<vec3<f32>, 22>;
     for (var j = 0u; j < n; j++) {
         let rest = rig.skel.joints[j];
         let p = i32(rest.w);
