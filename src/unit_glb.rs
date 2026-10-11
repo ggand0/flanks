@@ -575,8 +575,18 @@ pub fn clips_on() -> bool {
 /// and on). Each is `<kind>.<name>.json` next to the model. The first
 /// `SKEL_CLIPS_NEEDED` must be there; a missing later one leaves its slot
 /// empty and the player does without it.
-const SKEL_CLIPS: [&str; 8] =
-    ["stand", "ready", "shuffle_left", "shuffle_right", "shuffle_forward", "shuffle_backward", "cut", "stab"];
+const SKEL_CLIPS: [&str; 10] = [
+    "stand",
+    "ready",
+    "shuffle_left",
+    "shuffle_right",
+    "shuffle_forward",
+    "shuffle_backward",
+    "cut",
+    "stab",
+    "charge",
+    "charge_attack",
+];
 const SKEL_CLIPS_NEEDED: usize = 2;
 /// The slot of the first step clip: left, right, forward and backward
 /// follow in that order (unit_pose.wgsl CLIP_SHUFFLE_LEFT).

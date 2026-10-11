@@ -648,6 +648,8 @@ const CLIP_SHUFFLE_FORWARD: u32 = 4u;
 const CLIP_SHUFFLE_BACKWARD: u32 = 5u;
 const CLIP_CUT: u32 = 6u;
 const CLIP_STAB: u32 = 7u;
+const CLIP_CHARGE: u32 = 8u;
+const CLIP_CHARGE_ATTACK: u32 = 9u;
 // Parts of the bow rig.
 const BOW_PARTS: u32 = 14u;
 
@@ -734,9 +736,11 @@ struct Pre {
     clip: u32,
     clip_x: f32,
     style: f32,
-    // A skinned kind's blow that plays its cut clip, or its stab clip.
+    // A skinned kind's blow that plays its cut clip, its stab clip or its
+    // charging blow's clip.
     cut: bool,
     stab: bool,
+    charge_attack: bool,
     // A skinned kind's steps: the clip slot, the place in its play 0 to 1,
     // and his weight in it rather than in his stance or gait.
     step_clip: u32,
@@ -837,10 +841,13 @@ fn pose_begin(pos_scale: vec4<f32>, color: vec4<f32>, anim: vec4<f32>, anim2: ve
     let has_cut = rig.skel.clips[CLIP_CUT].y > 0u && rig.skel.rates[CLIP_CUT].z > 0.0;
     let cut = skel && has_cut && !charge && !cheering && abs(swing_style - 1.0) < 0.5;
     let style = select(swing_style, 1.0, has_cut && swing_style > 1.5);
-    // The stab clip plays the ordinary stab (style 0) the same way; the
-    // charging blow stays the code's.
+    // The stab clip plays the ordinary stab (style 0) the same way, and
+    // the charge blow clip the charging blow.
     let has_stab = rig.skel.clips[CLIP_STAB].y > 0u && rig.skel.rates[CLIP_STAB].z > 0.0;
     let stab = skel && has_stab && !charge && !cheering && swing_style < 0.5;
+    let has_charge_attack =
+        rig.skel.clips[CLIP_CHARGE_ATTACK].y > 0u && rig.skel.rates[CLIP_CHARGE_ATTACK].z > 0.0;
+    let charge_attack = skel && has_charge_attack && charge;
     // The lunge the code-posed arms and the body lean follow: quadratic
     // over the wind-up and harder on a charge, where it raises from the
     // levelled run-in point instead of dipping the blade first. After the
@@ -913,6 +920,7 @@ fn pose_begin(pos_scale: vec4<f32>, color: vec4<f32>, anim: vec4<f32>, anim2: ve
         style,
         cut,
         stab,
+        charge_attack,
         step_clip,
         step_x,
         step_w,
@@ -960,8 +968,9 @@ fn put_common() {
         * (1.0 - pre.step_w);
     // The body rides the hip drop from the gait. A runner leans as far
     // forward as a charger. A blow leans into it, except one from a clip
-    // (the cut, the stab), which moves the whole body itself.
-    let blow = select(0.30 * pre.lunge + 0.25 * pre.chop, 0.0, pre.cut || pre.stab);
+    // (the cut, the stab, the charging blow), which moves the whole body
+    // itself.
+    let blow = select(0.30 * pre.lunge + 0.25 * pre.chop, 0.0, pre.cut || pre.stab || pre.charge_attack);
     let lean = 0.10 * pre.moving
         + 0.24 * max(g.run * pre.moving, pre.sprint * (0.25 + 0.75 * pre.moving))
         + blow;
@@ -1361,6 +1370,38 @@ fn qblend(a: vec4<f32>, b: vec4<f32>, t: f32) -> vec4<f32> {
     return normalize(mix(a, select(b, -b, dot(a, b) < 0.0), t));
 }
 
+// Whether joint j is of the lower body: the pelvis, a leg or the coat.
+fn skel_lower(j: u32) -> bool {
+    let core = rig.skel.roles[0];
+    let arm_r = rig.skel.roles[1];
+    let arm_l = rig.skel.roles[2];
+    return j == core.x || j == arm_r.w || j == arm_l.w
+        || any(vec3<u32>(j) == rig.skel.roles[3].xyz) || any(vec3<u32>(j) == rig.skel.roles[4].xyz);
+}
+
+// Lay a place in a clip over the pose: the lower body by `low`, the rest
+// by `up`. A joint whose parent is of the lower body (the chest) blends
+// toward the clip's turn in the world, so his upper body faces as the
+// clip has it whatever his hips do: over hips that keep the gait it does
+// not take on the clip's hip turn.
+fn skel_over(turn: ptr<function, array<vec4<f32>, 20>>, at: SkelAt, up: f32, low: f32) {
+    let n = rig.skel.params.x;
+    let was = *turn;
+    for (var j = 0u; j < n; j++) {
+        let clip = skel_turn_at(at, j);
+        let p = i32(rig.skel.joints[j].w);
+        if skel_lower(j) {
+            (*turn)[j] = qblend(was[j], clip, low);
+        } else if p >= 0 && skel_lower(u32(p)) {
+            let world = qblend(qmul(was[p], was[j]), qmul(skel_turn_at(at, u32(p)), clip), up);
+            let hips = (*turn)[p];
+            (*turn)[j] = normalize(qmul(vec4<f32>(-hips.xyz, hips.w), world));
+        } else {
+            (*turn)[j] = qblend(was[j], clip, up);
+        }
+    }
+}
+
 // The sword arm's blow and cheer as `put_rig_arm` plays them from the
 // rest pose, without the march's sway and carry: shoulder, elbow and
 // wrist pitches (+ taking +Z toward +Y), and the slash's yaw.
@@ -1391,11 +1432,13 @@ fn sword_arm() -> vec4<f32> {
 // He stands in the standing clip, and in the ready clip while an enemy is
 // near and he is still. Near the enemy and slow he steps in the step
 // clips (unit_build.wgsl `steps`). Faster, his legs take the gait and his
-// arms its sway. A cut plays its clip, which starts and ends in the ready
+// arms its sway; running at the enemy, his upper body holds the charge
+// pose over the gait. A cut plays its clip, which starts and ends in the ready
 // pose: the blade lands on the strike tick, and on the move his legs keep
-// the gait. Another blow plays the sword arm's motion over the guard's
-// arm, the body holding its guard; the cheer plays it from the standing
-// pose. The fallen lie in the standing pose.
+// the gait. So do the stab and the charging blow. Another blow plays the
+// sword arm's motion over the guard's arm, the body holding its guard;
+// the cheer plays it from the standing pose. The fallen lie in the
+// standing pose.
 fn put_skeleton() {
     let n = rig.skel.params.x;
     let alive = pre.leg > 0.0;
@@ -1406,9 +1449,10 @@ fn put_skeleton() {
     } else if pre.windup > 0.0 {
         strike = smoothstep(0.0, 0.2, pre.windup);
     }
-    // A blow from a clip: the cut or the stab, played the same way.
-    let clip_blow = pre.cut || pre.stab;
-    let blow_clip = select(CLIP_CUT, CLIP_STAB, pre.stab);
+    // A blow from a clip: the cut, the stab or the charging blow, played
+    // the same way.
+    let clip_blow = pre.cut || pre.stab || pre.charge_attack;
+    let blow_clip = select(select(CLIP_CUT, CLIP_STAB, pre.stab), CLIP_CHARGE_ATTACK, pre.charge_attack);
     let cut = select(0.0, strike, alive && clip_blow);
     var act = select(max(pre.celebrate, strike), pre.celebrate, clip_blow);
     act = select(0.0, act, alive && rig.arm > 0.5 && rig.hold < 1.5);
@@ -1437,6 +1481,19 @@ fn put_skeleton() {
         }
         root = mix(root, skel_root_at(at), step_w);
     }
+    // Running at the enemy, his upper body holds the charge pose: on the
+    // charge, and after it while he runs in, since his regiment's charge
+    // ends when its first man strikes. A wavering or broken regiment's
+    // runner does not. Its hips and legs are the standing pose's, so his
+    // own keep the gait.
+    let hold = select(
+        0.0,
+        pre.confident * pre.g.run * moving * (1.0 - pre.celebrate),
+        alive && skel_has(CLIP_CHARGE),
+    );
+    if hold > 0.0 {
+        skel_over(&turn, SkelAt(CLIP_CHARGE, 0u, 0.0), hold, 0.0);
+    }
     if moving > 0.0 {
         // The gait: thigh, knee and foot pitches, the weapon side's leg
         // half a cycle after the shield side's (`put_leg`). The coat
@@ -1451,11 +1508,12 @@ fn put_skeleton() {
             turn[leg.z] = qblend(turn[leg.z], qx(shin - pose.z), moving);
             turn[coat] = qblend(turn[coat], qx(-pose.x), moving);
         }
-        // The shoulders turn against the legs, and the arms counter them.
+        // The shoulders turn against the legs, and the arms counter them,
+        // except arms held in the charge pose.
         turn[core.y] = qmul(turn[core.y], qy(0.10 * pre.g.run * pre.g.stride * pre.limb * moving));
-        let sway = (0.18 - 0.06 * pre.g.run) * moving * pre.limb * (1.0 - pre.raise);
+        let sway = (0.18 - 0.06 * pre.g.run) * moving * pre.limb * (1.0 - pre.raise) * (1.0 - hold);
         turn[arm_r.x] = qmul(qx(-sway), turn[arm_r.x]);
-        turn[arm_l.x] = qmul(qx(0.06 * moving * pre.limb * (1.0 - pre.wall)), turn[arm_l.x]);
+        turn[arm_l.x] = qmul(qx(0.06 * moving * pre.limb * (1.0 - pre.wall) * (1.0 - hold)), turn[arm_l.x]);
     }
     if cut > 0.0 {
         // Clip time from the wind-up to the blow at its contact, then
@@ -1466,15 +1524,11 @@ fn put_skeleton() {
             t = rates.z + pre.follow * (rates.y - rates.z);
         }
         let at = skel_at(blow_clip, t);
-        // On the move the pelvis, legs and coat keep the gait.
+        // On the move the pelvis, legs and coat keep the gait: a charger
+        // runs on into his blow, and the clip's legs take over as he
+        // stops.
         let low = cut * (1.0 - moving);
-        let leg_r = rig.skel.roles[3];
-        let leg_l = rig.skel.roles[4];
-        for (var j = 0u; j < n; j++) {
-            let lower = j == core.x || j == arm_r.w || j == arm_l.w
-                || any(vec3<u32>(j) == leg_r.xyz) || any(vec3<u32>(j) == leg_l.xyz);
-            turn[j] = qblend(turn[j], skel_turn_at(at, j), select(cut, low, lower));
-        }
+        skel_over(&turn, at, cut, low);
         root = mix(root, skel_root_at(at), low);
     }
     if act > 0.0 {
