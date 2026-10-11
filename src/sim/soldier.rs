@@ -1279,11 +1279,13 @@ fn swing(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
                     let cs = speed[i] * CHARGE_SPEED_FRAC;
                     // Attack style for this swing: 0 = stab, 1 = the classic
                     // overhead swing (2 = slash exists in the shader but
-                    // benched). A kind with a cut draws three ways: 1 is its
-                    // slow cut and 2 the overhead swing at the stab's pace.
-                    // Spears only ever thrust, and a charging man with a cut
-                    // stabs: a slow cut at a run carries him into the man
-                    // before it lands.
+                    // benched). A kind with a cut draws 1 as its slow cut;
+                    // its 2 is the overhead swing at the stab's pace, drawn
+                    // once the overhead is a clip of its own (the code's
+                    // swing over the guard turns the blade sideways). Spears
+                    // only ever thrust, and a charging man with a cut stabs:
+                    // a slow cut at a run carries him into the man before it
+                    // lands.
                     let charge = v2 > cs * cs;
                     let style = if my_kind
                         == crate::unit_types::KIND_SPEAR as usize
@@ -1291,10 +1293,9 @@ fn swing(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
                     {
                         0
                     } else {
-                        let ways = if params.cut_windup_ticks > 0 { 3.0 } else { 2.0 };
                         (crate::units::hash01(
                             tick_seed ^ (i as u32).wrapping_mul(0x51ED),
-                        ) * ways) as u8
+                        ) * 2.0) as u8
                     };
                     let style = style << crate::units::SWING_STYLE_SHIFT;
                     *s.swing = if charge {
