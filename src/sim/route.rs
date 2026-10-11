@@ -217,7 +217,7 @@ pub fn half_width(gd: &GroupData, dir: Vec2) -> f32 {
     }
     let files = (gd.files.max(1) as usize).min(gd.count.max(1));
     let ranks = gd.count.max(1).div_ceil(files);
-    let pitch = gd.spacing.pitch();
+    let pitch = gd.spacing.pitch(gd.kind);
     let half_w = (files - 1) as f32 * 0.5 * pitch.x + 1.0;
     let half_d = (ranks - 1) as f32 * 0.5 * pitch.y + 1.0;
     let fwd = crate::formation::facing_dir(gd.facing);
