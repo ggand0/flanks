@@ -521,7 +521,7 @@ mod tests {
     /// A normal 10k battle on the grassland, freshly spawned.
     fn spawn(config: &BattleConfig, terrain: &Terrain) -> (Units, Groups) {
         let (mut units, mut groups) = (Units::default(), Groups::default());
-        crate::regiments::do_spawn_battle(&mut units, terrain, &mut groups, config);
+        crate::regiments::do_spawn_battle(&mut units, terrain, &mut groups, config, None);
         (units, groups)
     }
 

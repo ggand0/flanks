@@ -448,6 +448,38 @@ impl NavGrid {
         self.band_clear(a, b, w) && self.dry_line(a, b)
     }
 
+    /// A block of half extents `he` (axis-aligned, m) centred at `c`
+    /// stands wholly on the field's open ground: every point of it,
+    /// sampled every cell, is walkable and in the field's region (not a
+    /// roof, not a closed room).
+    pub fn footprint_clear(&self, c: Vec2, he: Vec2) -> bool {
+        let nx = (he.x / CELL).ceil().max(1.0) as i32;
+        let nz = (he.y / CELL).ceil().max(1.0) as i32;
+        for iz in -nz..=nz {
+            for ix in -nx..=nx {
+                let p = c + Vec2::new(ix as f32 * he.x / nx as f32, iz as f32 * he.y / nz as f32);
+                match self.cell_at(p) {
+                    Some(i) if self.walk[i] && self.region[i] == self.main_region => {}
+                    _ => return false,
+                }
+            }
+        }
+        true
+    }
+
+    /// The nearest centre to `c`, within `max_r` metres and passing `ok`,
+    /// where a block of half extents `he` stands clear (`footprint_clear`).
+    /// Cells with less clearance than the block's narrower half extent
+    /// are skipped without the full check.
+    pub fn nearest_footprint(&self, c: Vec2, he: Vec2, max_r: f32, ok: impl Fn(Vec2) -> bool) -> Option<Vec2> {
+        let need = he.min_element().min(CLEAR_CAP - CELL);
+        self.nearest_where(c, max_r, |i| {
+            let p = self.pos(i);
+            self.clear[i] >= need && ok(p) && self.footprint_clear(p, he)
+        })
+        .map(|i| self.pos(i))
+    }
+
     /// The unwalkable cells next to walkable ground within `radius` of
     /// `center`: the outline of the blocked ground, for the debug view.
     pub fn edge_cells(&self, center: Vec2, radius: f32) -> Vec<Vec2> {

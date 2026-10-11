@@ -881,6 +881,7 @@ pub fn setup_battle(
     mut deploy: ResMut<Deployment>,
     mut script: ResMut<crate::battle_setup::SetupScript>,
     config: Res<BattleConfig>,
+    mut routes: ResMut<crate::sim::route::Routes>,
     (mut arrows, mut arrow_spawns, mut stuck): (
         ResMut<crate::arrows::Arrows>,
         ResMut<crate::arrows::ArrowSpawns>,
@@ -900,7 +901,12 @@ pub fn setup_battle(
     crate::arrows::reset(&mut arrows, &mut arrow_spawns, &mut stuck);
     virt_time.unpause();
     sync_scenario_env(config.scenario);
-    crate::regiments::do_spawn_battle(&mut units, &terrain, &mut groups, &config);
+    // The walkability grid first: the layout keeps regiments off blocked
+    // ground, and the first tick then finds the grid built.
+    if crate::sim::route::enabled() {
+        routes.prepare(&terrain);
+    }
+    crate::regiments::do_spawn_battle(&mut units, &terrain, &mut groups, &config, routes.grid());
     *script = default();
     if let Some(setup) = crate::battle_setup::for_battle(config.scenario) {
         match setup.place(&mut groups, &mut units, &terrain) {

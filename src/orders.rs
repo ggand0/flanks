@@ -673,24 +673,42 @@ pub(crate) fn deploy_zone_for(terrain: &Terrain, army_gap: f32) -> (Vec2, Vec2) 
 
 /// Clamp an anchor so the block stays inside the zone; a block deeper or
 /// wider than the zone itself sits centered on the tight axis.
-fn clamp_anchor(anchor: Vec2, he: Vec2, terrain: &Terrain) -> Vec2 {
+/// The anchor a block of half extents `he` may be deployed at nearest
+/// `anchor`: inside the deployment zone, and on a map with blocked
+/// ground, wholly on open ground (the nearest such spot within 300 m,
+/// else the zone clamp alone).
+fn clamp_anchor(anchor: Vec2, he: Vec2, terrain: &Terrain, nav: Option<&crate::nav::NavGrid>) -> Vec2 {
     let (lo, hi) = deploy_zone(terrain);
     let axis = |v: f32, lo: f32, hi: f32| {
         if lo > hi { (lo + hi) * 0.5 } else { v.clamp(lo, hi) }
     };
-    Vec2::new(
-        axis(anchor.x, lo.x + he.x, hi.x - he.x),
-        axis(anchor.y, lo.y + he.y, hi.y - he.y),
-    )
+    let in_zone = |a: Vec2| {
+        Vec2::new(
+            axis(a.x, lo.x + he.x, hi.x - he.x),
+            axis(a.y, lo.y + he.y, hi.y - he.y),
+        )
+    };
+    let a = in_zone(anchor);
+    match nav {
+        Some(nav) if !nav.footprint_clear(a, he) => nav
+            .nearest_footprint(a, he, 300.0, |p| in_zone(p) == p)
+            .unwrap_or(a),
+        _ => a,
+    }
 }
 
 /// Clamp a drag layout into the zone IN THE PREVIEW, so the green slots
 /// always show exactly where the men will stand (TW behavior: a drag
 /// outside the zone slides along its edge).
-fn clamp_layout_to_zone(groups: &Groups, layout: &mut [LinePlacement], terrain: &Terrain) {
+fn clamp_layout_to_zone(
+    groups: &Groups,
+    layout: &mut [LinePlacement],
+    terrain: &Terrain,
+    nav: Option<&crate::nav::NavGrid>,
+) {
     for p in layout {
         let he = crate::formation::block_half_extents(&groups.list[p.g], p.files, p.facing);
-        p.anchor = clamp_anchor(p.anchor, he, terrain);
+        p.anchor = clamp_anchor(p.anchor, he, terrain, nav);
     }
 }
 
@@ -723,6 +741,7 @@ fn deploy_move(
     groups: &mut Groups,
     units: &mut Units,
     terrain: &Terrain,
+    nav: Option<&crate::nav::NavGrid>,
     picked: &[usize],
     target: Vec2,
 ) {
@@ -734,7 +753,7 @@ fn deploy_move(
     for &g in picked {
         let gd = &mut groups.list[g];
         let he = crate::formation::block_half_extents(gd, gd.files, gd.facing);
-        gd.anchor = clamp_anchor(target + (gd.centroid - centroid), he, terrain);
+        gd.anchor = clamp_anchor(target + (gd.centroid - centroid), he, terrain, nav);
         gd.order = None;
         gd.auto_order = false;
         crate::formation::snap_to_slots(units, terrain, g as u32, gd);
@@ -782,6 +801,7 @@ fn issue_order(
     deploy: Res<crate::game_state::Deployment>,
     mut cues: MessageWriter<crate::audio::UiCue>,
     ui: Query<&Interaction>,
+    routes: Res<crate::sim::route::Routes>,
 ) {
     if selection.count_units == 0 {
         drag.start = None;
@@ -831,7 +851,7 @@ fn issue_order(
             let face_hint = fwd_g * if hand >= 0.0 { 1.0 } else { -1.0 };
             drag.layout = line_layout(&groups, &selected, start, cur, face_hint);
             if deploy.active {
-                clamp_layout_to_zone(&groups, &mut drag.layout, &terrain);
+                clamp_layout_to_zone(&groups, &mut drag.layout, &terrain, routes.grid());
             }
         }
     }
@@ -852,7 +872,7 @@ fn issue_order(
     } else if deploy.active {
         // No attack targets while deploying: every click is a placement.
         let picked: Vec<usize> = selection.picked_controllable(&groups).collect();
-        deploy_move(&mut groups, &mut units, &terrain, &picked, start);
+        deploy_move(&mut groups, &mut units, &terrain, routes.grid(), &picked, start);
         cues.write(crate::audio::UiCue::Deploy);
     } else if let Some(t) = enemy_regiment_at(&groups, start) {
         attack_regiments(&mut groups, &selected, t);

@@ -195,11 +195,14 @@ pub(crate) fn spawn_regiment(
     crate::formation::assign_slots(units, g, gd);
 }
 
+/// `nav` is the map's walkability grid when it has one: the layout then
+/// keeps every regiment's footprint on open ground.
 pub fn do_spawn_battle(
     units: &mut Units,
     terrain: &Terrain,
     groups: &mut Groups,
     config: &crate::game_state::BattleConfig,
+    nav: Option<&crate::nav::NavGrid>,
 ) {
     use crate::game_state::Scenario;
     if crate::path_test::scene().is_some() {
@@ -272,6 +275,10 @@ pub fn do_spawn_battle(
 
     units.pos.reserve(per_team * 2);
     let mut list: Vec<GroupData> = Vec::with_capacity(n_regs * 2);
+    // A block's footprint, for the ground check.
+    let half_ext = Vec2::new(block_w * 0.5 + 1.0, block_d * 0.5 + 1.0);
+    let fits = |a: Vec2| nav.is_none_or(|n| n.footprint_clear(a, half_ext));
+    let mut moved = 0usize;
 
     // The FL_*_FRAC envs trump the picker compositions: test batteries
     // and sandbox runs script composition through them and never see
@@ -322,16 +329,58 @@ pub fn do_spawn_battle(
         }
         let n_regs = kinds.len();
         let dir: f32 = if team == 0 { -1.0 } else { 1.0 };
+        let rank_z = |rank: usize| dir * (army_gap / 2.0 + block_d / 2.0 + rank as f32 * (block_d + REG_GAP));
+        // A regiment whose planned slot stands on blocked ground (a wall,
+        // a house, a roof) takes the next free slot in the spare ranks
+        // behind the army instead: full-width ranks, walked file by file,
+        // out to the field's edge.
+        let planned_ranks = n_regs.div_ceil(per_rank);
+        let mut spare = planned_ranks * per_rank;
+        let deepest = field_max.y - EDGE_MARGIN - block_d / 2.0;
         for (r, &kind) in kinds.iter().enumerate() {
             let rank = r / per_rank;
             let file = r % per_rank;
             // This rank's regiment count (last rank may be partial) — center it.
             let in_rank = per_rank.min(n_regs - rank * per_rank);
             let x0 = (file as f32 - (in_rank - 1) as f32 / 2.0) * pitch_x;
-            let z0 = dir * (army_gap / 2.0 + block_d / 2.0 + rank as f32 * (block_d + REG_GAP));
-            let anchor = Vec2::new(x0, z0);
+            let mut anchor = Vec2::new(x0, rank_z(rank));
+            if !fits(anchor) {
+                loop {
+                    let (rank, file) = (spare / per_rank, spare % per_rank);
+                    spare += 1;
+                    let z = rank_z(rank);
+                    if z.abs() > deepest {
+                        warn!("regiment layout: no open ground left for a regiment; placed on its planned slot");
+                        break;
+                    }
+                    let candidate = Vec2::new((file as f32 - (per_rank - 1) as f32 / 2.0) * pitch_x, z);
+                    if fits(candidate) {
+                        anchor = candidate;
+                        moved += 1;
+                        break;
+                    }
+                }
+            }
             spawn_regiment(units, terrain, &mut list, team, kind, anchor, size, dir);
         }
+    }
+    if moved > 0 {
+        info!("regiment layout: {moved} regiments moved off blocked ground to the spare ranks");
+    }
+    // The cost tables the first routes will need, one per regiment
+    // width, built now rather than in a tick.
+    if let Some(nav) = nav {
+        let widths: Vec<crate::nav::PlanRequest> = list
+            .iter()
+            .map(|gd| crate::nav::PlanRequest {
+                g: 0,
+                serial: 0,
+                start: Vec2::ZERO,
+                goal: Vec2::ZERO,
+                half_w: crate::sim::route::half_width(gd, Vec2::Y),
+            })
+            .collect();
+        nav.prepare_costs(&widths);
     }
     // FL_ENEMY_STATIC=1: the enemy army holds position (never auto-
     // engages, never chases — hold's existing semantics) and the AI

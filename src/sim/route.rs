@@ -131,6 +131,40 @@ impl Routes {
         self.nav.as_ref()
     }
 
+    /// The grid as the placers read it.
+    pub fn grid(&self) -> Option<&NavGrid> {
+        self.nav.as_deref()
+    }
+
+    /// Bring the grid in step with `terrain`: built at the battle's setup
+    /// and after a map change, refreshed after a crater. Returns whether
+    /// it changed, in which case every route is stale.
+    pub fn prepare(&mut self, terrain: &Terrain) -> bool {
+        let t0 = std::time::Instant::now();
+        let fresh = match self.nav.as_mut() {
+            Some(nav) if self.built && nav.kind == terrain.kind => Arc::make_mut(nav).refresh(terrain),
+            _ => {
+                self.nav = NavGrid::build(terrain).map(Arc::new);
+                true
+            }
+        };
+        self.built = true;
+        if fresh {
+            if self.nav.is_some() {
+                info!(
+                    "[path] walkability grid ready for the {} map in {:.1} ms",
+                    terrain.kind.label(),
+                    t0.elapsed().as_secs_f32() * 1000.0
+                );
+            }
+            // Routes made on the old ground are planned again.
+            for r in self.per.iter_mut() {
+                r.order = None;
+            }
+        }
+        fresh
+    }
+
     /// Fill a tick job's route inputs: the requests waiting to go out,
     /// each regiment's route, and the grid.
     pub(crate) fn fill_job(
@@ -245,28 +279,7 @@ pub fn update_routes(
     }
     let routes = &mut *routes;
     if !routes.built || terrain.is_changed() {
-        let t0 = std::time::Instant::now();
-        let fresh = match routes.nav.as_mut() {
-            Some(nav) if routes.built && nav.kind == terrain.kind => Arc::make_mut(nav).refresh(&terrain),
-            _ => {
-                routes.nav = NavGrid::build(&terrain).map(Arc::new);
-                true
-            }
-        };
-        routes.built = true;
-        if fresh {
-            if routes.nav.is_some() {
-                info!(
-                    "[path] walkability grid ready for the {} map in {:.1} ms",
-                    terrain.kind.label(),
-                    t0.elapsed().as_secs_f32() * 1000.0
-                );
-            }
-            // Routes made on the old ground are planned again.
-            for r in routes.per.iter_mut() {
-                r.order = None;
-            }
-        }
+        routes.prepare(&terrain);
     }
     if units.generation != routes.generation {
         routes.generation = units.generation;
