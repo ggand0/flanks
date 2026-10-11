@@ -107,6 +107,11 @@ pub struct Units {
     /// running to the fight (sim/soldier.rs SIGHT_* bits). A man looks
     /// around every few ticks, not every tick, and acts on what he saw.
     pub sight: Column<u16>,
+    /// Where he last chose to walk on his regiment's route (sim/route.rs
+    /// `man_target`): NaN when his regiment has no route, infinite when
+    /// his way to his slot was clear. He reads his route every few ticks,
+    /// not every tick, and walks on what he chose.
+    pub way: Column<Vec2>,
     /// Bumped every time a battle rebuilds this world. A sim tick job
     /// computed from an older world carries indices that mean nothing
     /// here: sim/mod.rs drops it instead of installing it.
@@ -279,6 +284,7 @@ pub fn push_unit(
     });
     units.out_form.push(false);
     units.sight.push(0);
+    units.way.push(Vec2::NAN);
 }
 
 /// FL_TEST_SURROUND: two equal blue detachments of light infantry, one

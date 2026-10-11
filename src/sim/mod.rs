@@ -24,6 +24,7 @@ use crate::units::Units;
 pub mod damage;
 mod diag;
 pub mod job;
+pub mod route;
 pub mod soldier;
 
 use damage::{DamageBuffers, DirTestStats};
@@ -95,15 +96,17 @@ impl Plugin for SimPlugin {
             .init_resource::<TickPipeline>()
             .init_resource::<SharedTerrain>()
             .init_resource::<RegimentRuns>()
+            .init_resource::<route::Routes>()
             .add_systems(
                 FixedUpdate,
                 (
                     (refresh_shared_terrain, take_tick, step_sim).chain(),
-                    kick_tick.after(crate::orders::clear_arrived_orders),
+                    route::update_routes.after(crate::orders::clear_arrived_orders),
+                    kick_tick.after(route::update_routes),
                 )
                     .in_set(crate::game_state::SimSet),
             )
-            .add_systems(Update, toggle_debug_viz);
+            .add_systems(Update, (toggle_debug_viz, route::draw_routes));
     }
 }
 
@@ -305,6 +308,7 @@ fn run_tick_job(job: &mut TickJob) {
         ammo_in,
         out_form_in,
         sight_in,
+        way_in,
         pos_out,
         vel,
         yaw,
@@ -317,6 +321,7 @@ fn run_tick_job(job: &mut TickJob) {
         ammo,
         out_form,
         sight,
+        way,
         orders,
         anchors,
         reg_broken,
@@ -350,6 +355,10 @@ fn run_tick_job(job: &mut TickJob) {
         grid_ms,
         step_ms,
         field_ms,
+        plan_requests,
+        plans,
+        routes,
+        nav,
         ..
     } = job;
 
@@ -447,6 +456,7 @@ fn run_tick_job(job: &mut TickJob) {
         tick,
         bounds_min,
         bounds_max,
+        paths: route::KernelRoutes { routes: &routes[..], nav: nav.as_deref() },
     };
     let f = &field;
     // The shared read-modify-write columns, for the copy-in per chunk.
@@ -460,6 +470,7 @@ fn run_tick_job(job: &mut TickJob) {
     let ammo_in = &ammo_in[..];
     let out_form_in = &out_form_in[..];
     let sight_in = &sight_in[..];
+    let way_in = &way_in[..];
     // The map edges a router leaves the field at (combat.rs), widened by
     // the charge knockback the apply pass can still add to a position:
     // the sweep's candidate list must hold every man it might remove.
@@ -482,10 +493,11 @@ fn run_tick_job(job: &mut TickJob) {
             .zip(arrow_spawns.iter_mut())
             .zip(out_form.chunks_mut(CHUNK))
             .zip(sight.chunks_mut(CHUNK))
+            .zip(way.chunks_mut(CHUNK))
             .enumerate()
         {
-            let (((((((((((((pos, vel), yaw), yaw_prev), target), swing), swing_t), flash),
-                death_t), events), ammo), arrows), out_form), sight) = chunk;
+            let ((((((((((((((pos, vel), yaw), yaw_prev), target), swing), swing_t), flash),
+                death_t), events), ammo), arrows), out_form), sight), way) = chunk;
             let start = ci * CHUNK;
             let end = start + pos.len();
             scope.spawn(async move {
@@ -501,6 +513,7 @@ fn run_tick_job(job: &mut TickJob) {
                 ammo.copy_from_slice(&ammo_in[start..end]);
                 out_form.copy_from_slice(&out_form_in[start..end]);
                 sight.copy_from_slice(&sight_in[start..end]);
+                way.copy_from_slice(&way_in[start..end]);
                 let rows = soldier::Rows {
                     start,
                     pos: &mut *pos,
@@ -515,6 +528,7 @@ fn run_tick_job(job: &mut TickJob) {
                     ammo,
                     out_form,
                     sight,
+                    way,
                 };
                 events.clear();
                 let mut out = soldier::ChunkOut { events, arrows };
@@ -547,6 +561,15 @@ fn run_tick_job(job: &mut TickJob) {
         at_edge.extend(e);
     }
     *step_ms = t2.elapsed().as_secs_f32() * 1000.0;
+    // The routes asked for at the kick, planned now that the soldiers are
+    // done; the install hands them back.
+    match nav.as_deref() {
+        Some(nav) => {
+            let _span = info_span!("plan_routes").entered();
+            route::plan_all(nav, plan_requests, plans);
+        }
+        None => plans.clear(),
+    }
 }
 
 #[allow(clippy::too_many_arguments)] // bevy system params
@@ -567,6 +590,7 @@ pub fn step_sim(
     mut pipeline: ResMut<TickPipeline>,
     mut dir_stats: ResMut<DirTestStats>,
     mut sounds: Option<ResMut<crate::audio::SoundEvents>>,
+    mut routes: ResMut<route::Routes>,
 ) {
     let finished = pipeline.taken.take();
     if units.pos.is_empty() {
@@ -586,6 +610,7 @@ pub fn step_sim(
                 &units,
                 &mut groups,
                 &tracks,
+                &mut routes,
                 terrain_arc,
                 time.delta_secs(),
                 scale.0,
@@ -620,7 +645,7 @@ pub fn step_sim(
         install!(
             vel <- vel, yaw <- yaw, yaw_prev <- yaw_prev, target <- target, swing <- swing,
             swing_t <- swing_t, flash <- flash, death_t <- death_t, ammo <- ammo,
-            out_form <- out_form, sight <- sight
+            out_form <- out_form, sight <- sight, way <- way
         );
     }
     // The sweep's candidates (combat.rs), ascending.
@@ -630,6 +655,7 @@ pub fn step_sim(
     pipeline.sweep_candidates.sort_unstable();
     pipeline.sweep_candidates.dedup();
     std::mem::swap(&mut *grid, &mut job.grid);
+    routes.hand_back(&mut job.plans, &mut job.plan_requests);
     std::mem::swap(&mut damage.0, &mut job.events);
     std::mem::swap(&mut arrow_spawns.0, &mut job.arrow_spawns);
     stats.grid_ms = job.grid_ms;
@@ -686,6 +712,7 @@ pub fn kick_tick(
         Option<ResMut<crate::render_units_gpu::SnapshotHandoff>>,
         Res<crate::settings::Settings>,
     ),
+    mut routes: ResMut<route::Routes>,
 ) {
     if !pipeline_enabled() || units.pos.is_empty() || pipeline.in_flight {
         return;
@@ -699,6 +726,7 @@ pub fn kick_tick(
         &units,
         &mut groups,
         &tracks,
+        &mut routes,
         terrain_arc,
         time.delta_secs(),
         scale.0,

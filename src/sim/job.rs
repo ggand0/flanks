@@ -58,6 +58,7 @@ pub struct TickJob {
     pub(crate) ammo_in: Arc<Vec<u8>>,
     pub(crate) out_form_in: Arc<Vec<bool>>,
     pub(crate) sight_in: Arc<Vec<u16>>,
+    pub(crate) way_in: Arc<Vec<Vec2>>,
     // Read only to pack the render snapshot.
     pub(crate) pos_prev_in: Arc<Vec<Vec3>>,
     pub(crate) color_in: Arc<Vec<[f32; 4]>>,
@@ -81,6 +82,7 @@ pub struct TickJob {
     pub(crate) ammo: Vec<u8>,
     pub(crate) out_form: Vec<bool>,
     pub(crate) sight: Vec<u16>,
+    pub(crate) way: Vec<Vec2>,
     // Per-regiment command snapshot, taken at prep.
     pub(crate) orders: Vec<Option<Vec2>>,
     pub(crate) anchors: Vec<Vec2>,
@@ -139,6 +141,12 @@ pub struct TickJob {
     pub(crate) grid_ms: f32,
     pub(crate) step_ms: f32,
     pub(crate) field_ms: f32,
+    // Routes (sim/route.rs): the plans asked for at prep, planned after
+    // the kernel, and each regiment's route with the grid its men read.
+    pub(crate) plan_requests: Vec<crate::sim::route::PlanJob>,
+    pub(crate) plans: Vec<crate::nav::Plan>,
+    pub(crate) routes: Vec<Option<crate::sim::route::RouteView>>,
+    pub(crate) nav: Option<Arc<crate::nav::NavGrid>>,
 }
 
 impl TickJob {
@@ -165,6 +173,7 @@ impl TickJob {
         self.ammo_in = Default::default();
         self.out_form_in = Default::default();
         self.sight_in = Default::default();
+        self.way_in = Default::default();
         self.pos_prev_in = Default::default();
         self.color_in = Default::default();
     }
@@ -219,6 +228,7 @@ pub(crate) fn prepare_tick(
     units: &Units,
     groups: &mut Groups,
     tracks: &crate::arrows::RegTracks,
+    routes: &mut crate::sim::route::Routes,
     terrain_arc: &std::sync::Arc<Terrain>,
     dt: f32,
     combat_scale: f32,
@@ -233,7 +243,8 @@ pub(crate) fn prepare_tick(
 
     share_columns(job, units);
     let fire = archer_fire_solutions(groups, tracks, terrain);
-    job.orders = resolve_orders(groups, &fire.standoff);
+    job.orders = resolve_orders(groups, &fire.standoff, routes);
+    routes.fill_job(&mut job.plan_requests, &mut job.routes, &mut job.nav, groups.list.len());
     snapshot_regiments(job, groups, terrain);
 
     let n_chunks = units.pos.len().div_ceil(CHUNK);
@@ -279,6 +290,7 @@ fn share_columns(job: &mut TickJob, units: &Units) {
     job.ammo_in = units.ammo.share();
     job.out_form_in = units.out_form.share();
     job.sight_in = units.sight.share();
+    job.way_in = units.way.share();
     job.pos_prev_in = units.pos_prev.share();
     job.color_in = units.color.share();
     let n = units.pos.len();
@@ -299,6 +311,7 @@ fn share_columns(job: &mut TickJob, units: &Units) {
     fit(&mut job.ammo, n);
     fit(&mut job.out_form, n);
     fit(&mut job.sight, n);
+    fit(&mut job.way, n);
 }
 
 /// An attack order for a ranged regiment is a fire order, not a melee
@@ -450,8 +463,13 @@ fn archer_fire_solutions(
 }
 
 /// Each regiment's order resolved to this tick's destination, or none
-/// for a regiment that holds where it is.
-fn resolve_orders(groups: &Groups, standoff: &[bool]) -> Vec<Option<Vec2>> {
+/// for a regiment that holds where it is. A regiment on a route heads
+/// for its current waypoint (sim/route.rs).
+fn resolve_orders(
+    groups: &Groups,
+    standoff: &[bool],
+    routes: &crate::sim::route::Routes,
+) -> Vec<Option<Vec2>> {
     // Orders resolved to this tick's destination (attack orders chase
     // their target regiment's current centroid). A regiment holding a
     // contact frame stops chasing: dragging the slot grid onward
@@ -472,7 +490,7 @@ fn resolve_orders(groups: &Groups, standoff: &[bool]) -> Vec<Option<Vec2>> {
             if gd.contact {
                 return None;
             }
-            groups.goal(g)
+            groups.goal(g).map(|goal| routes.frame(g, goal))
         })
         .collect();
     orders

@@ -20,7 +20,8 @@ pub const CHUNK_CELLS: usize = 32;
 
 /// The battlefields in the menu's Map row. At launch a setup's map wins
 /// (an `FL_SETUP` file, or the Demo's with `FL_DEMO=1`), then
-/// `FL_MAP=big_grassland`, `classic`, `river` or `sandbox`.
+/// `FL_MAP=big_grassland`, `classic`, `river`, `sandbox`, `obstacles` or
+/// `town`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub enum MapKind {
     /// Broad pasture shoulders around an open lowland: the default.
@@ -35,6 +36,13 @@ pub enum MapKind {
     /// The grassland's heights and ground again, as a scratch field for
     /// scenery and vegetation experiments that must not touch Grassland.
     Sandbox,
+    /// Flat ground with giant raised blocks, the pathfinding test field
+    /// (obstacle_map.rs). Launch-only, not in the menu.
+    Obstacles,
+    /// Big Grassland with a walled town of streets and houses across its
+    /// middle (obstacle_map.rs `town_blocks`), the pathfinding cost test.
+    /// Launch-only, not in the menu.
+    Town,
 }
 
 impl MapKind {
@@ -47,6 +55,8 @@ impl MapKind {
             Ok("river") => Self::River,
             Ok("classic") => Self::Classic,
             Ok("sandbox") => Self::Sandbox,
+            Ok("obstacles") => Self::Obstacles,
+            Ok("town") => Self::Town,
             _ => Self::Grassland,
         }
     }
@@ -58,7 +68,20 @@ impl MapKind {
             Self::Classic => "Classic",
             Self::River => "River",
             Self::Sandbox => "Sandbox",
+            Self::Obstacles => "Obstacles",
+            Self::Town => "Town",
         }
+    }
+
+    /// The 2048 m square maps.
+    pub const fn is_large(self) -> bool {
+        matches!(self, Self::BigGrassland | Self::Town)
+    }
+
+    /// Maps whose steep faces are impassable: the river map's terraces and
+    /// gorges, and the obstacle map's blocks. The others never block.
+    pub const fn has_blocked_ground(self) -> bool {
+        matches!(self, Self::River | Self::Obstacles | Self::Town)
     }
 
     /// Every map, in the menu's order.
@@ -71,10 +94,7 @@ impl MapKind {
     ];
 
     const fn chunk_counts(self) -> (usize, usize) {
-        match self {
-            Self::BigGrassland => (32, 32),
-            _ => (16, 12),
-        }
+        if self.is_large() { (32, 32) } else { (16, 12) }
     }
 
     const fn grid_verts(self) -> (usize, usize) {
@@ -105,7 +125,8 @@ pub struct Terrain {
     verts_x: usize,
     verts_z: usize,
     /// Impassable vertices (terrace risers, gorge walls, crater lips),
-    /// same grid as `heights`. All-false on the classic map.
+    /// same grid as `heights`. All-false unless the map has blocked
+    /// ground (`MapKind::has_blocked_ground`).
     blocked: Vec<bool>,
     pub kind: MapKind,
     /// True on maps without a river:
@@ -185,12 +206,12 @@ impl Terrain {
     }
 
     /// Impassable ground (nearest-vertex mask lookup). Steep ground
-    /// only — the river is wadeable and never in the mask. The bridge
-    /// deck rectangle is exempt so the deck stays walkable even if a
-    /// mask rule ever covers the channel again.
+    /// only: the river is wadeable and never in the mask. On the river
+    /// map the bridge deck rectangle is exempt so the deck stays walkable
+    /// even if a mask rule ever covers the channel again.
     #[inline]
     pub fn blocked_at(&self, x: f32, z: f32) -> bool {
-        if bridge_deck_contains(x, z) {
+        if !self.classic && bridge_deck_contains(x, z) {
             return false;
         }
         let g = (Vec2::new(x, z) - self.origin) / CELL;
@@ -241,9 +262,9 @@ impl Terrain {
             }
         }
         // Refresh the blocked mask over the touched area (one vertex of
-        // margin: the slope rule reads 4-neighbors). The classic map
-        // never blocks.
-        if !self.classic {
+        // margin: the slope rule reads 4-neighbors). Maps without
+        // blocked ground never block.
+        if self.kind.has_blocked_ground() {
             let bx0 = x0.saturating_sub(1);
             let bz0 = z0.saturating_sub(1);
             let bx1 = (x1 + 1).min(self.verts_x - 1);
@@ -276,7 +297,7 @@ impl Terrain {
         let dir = ray.direction.as_vec3();
         // The overview can see across the large field from beyond its edge.
         // Keep the same step and bisection accuracy at that longer distance.
-        let steps = if self.kind == MapKind::BigGrassland {
+        let steps = if self.kind.is_large() {
             4000
         } else {
             1500
@@ -575,10 +596,19 @@ pub(crate) fn build_terrain(kind: MapKind) -> Terrain {
         -(verts_z as f32 - 1.0) * CELL * 0.5,
     );
     let mut heights = vec![0.0f32; verts_x * verts_z];
+    let obstacle_blocks = if kind == MapKind::Obstacles {
+        crate::obstacle_map::blocks()
+    } else {
+        Vec::new()
+    };
     for z in 0..verts_z {
         for x in 0..verts_x {
             let p = origin + Vec2::new(x as f32, z as f32) * CELL;
-            if kind == MapKind::BigGrassland {
+            if kind == MapKind::Obstacles {
+                heights[z * verts_x + x] = crate::obstacle_map::height(p, &obstacle_blocks);
+                continue;
+            }
+            if kind.is_large() {
                 heights[z * verts_x + x] = big_grassland_height(p);
                 continue;
             }
@@ -631,8 +661,11 @@ pub(crate) fn build_terrain(kind: MapKind) -> Terrain {
             heights[z * verts_x + x] = h;
         }
     }
+    if kind == MapKind::Town {
+        crate::obstacle_map::raise_blocks(&mut heights, origin, (verts_x, verts_z), &crate::obstacle_map::town_blocks());
+    }
     let mut blocked = vec![false; verts_x * verts_z];
-    if !classic {
+    if kind.has_blocked_ground() {
         for z in 0..verts_z {
             for x in 0..verts_x {
                 blocked[z * verts_x + x] = vertex_blocked(&heights, (verts_x, verts_z), x, z);
@@ -696,7 +729,7 @@ fn ground_layers(assets: &AssetServer, images: &mut Assets<Image>, terrain: &Ter
     // their coverage from their own relief and put stone on steep faces.
     let authored = matches!(
         terrain.kind,
-        MapKind::Grassland | MapKind::BigGrassland | MapKind::Sandbox
+        MapKind::Grassland | MapKind::BigGrassland | MapKind::Sandbox | MapKind::Town
     );
     GroundLayers {
         pasture: ground_texture(
