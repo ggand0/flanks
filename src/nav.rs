@@ -26,7 +26,7 @@ use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::time::Instant;
 
-use crate::terrain::{Terrain, CELL};
+use crate::terrain::{MapKind, Terrain, CELL};
 
 /// Clearance is exact up to this distance (m) and capped there. Wider
 /// than the widest regiment's half width the planner ever asks for.
@@ -44,6 +44,9 @@ const SMOOTH_SLACK: f32 = 1.02;
 
 /// The grid. See the module docs.
 pub struct NavGrid {
+    /// The map it was built from: another map means a new grid, not a
+    /// refresh, even at the same size.
+    pub kind: MapKind,
     pub origin: Vec2,
     pub nx: usize,
     pub nz: usize,
@@ -68,6 +71,7 @@ pub struct NavGrid {
 impl Clone for NavGrid {
     fn clone(&self) -> Self {
         Self {
+            kind: self.kind,
             origin: self.origin,
             nx: self.nx,
             nz: self.nz,
@@ -139,6 +143,7 @@ impl NavGrid {
         let (nx, nz) = terrain.grid_verts();
         let n = nx * nz;
         let mut grid = Self {
+            kind: terrain.kind,
             origin: terrain.min(),
             nx,
             nz,

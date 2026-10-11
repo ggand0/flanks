@@ -243,7 +243,7 @@ pub fn update_routes(
     let routes = &mut *routes;
     if !routes.built || terrain.is_changed() {
         let fresh = match routes.nav.as_mut() {
-            Some(nav) if routes.built => Arc::make_mut(nav).refresh(&terrain),
+            Some(nav) if routes.built && nav.kind == terrain.kind => Arc::make_mut(nav).refresh(&terrain),
             _ => {
                 routes.nav = NavGrid::build(&terrain).map(Arc::new);
                 true
