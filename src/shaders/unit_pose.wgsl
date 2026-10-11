@@ -1386,9 +1386,9 @@ fn sword_arm() -> vec4<f32> {
 // clips (unit_build.wgsl `steps`). Faster, his legs take the gait and his
 // arms its sway. A cut plays its clip, which starts and ends in the ready
 // pose: the blade lands on the strike tick, and on the move his legs keep
-// the gait. Another blow and the cheer play the sword arm's motion from
-// the rest pose, and the body leaves the guard to face the blow. The
-// fallen lie in the standing pose.
+// the gait. Another blow plays the sword arm's motion over the guard's
+// arm, the body holding its guard; the cheer plays it from the standing
+// pose. The fallen lie in the standing pose.
 fn put_skeleton() {
     let n = rig.skel.params.x;
     let alive = pre.leg > 0.0;
@@ -1403,7 +1403,10 @@ fn put_skeleton() {
     var act = select(max(pre.celebrate, strike), pre.celebrate, pre.cut);
     act = select(0.0, act, alive && rig.arm > 0.5 && rig.hold < 1.5);
     let level = max(max(pre.stance, pre.ready * 0.75), max(pre.sprint, pre.wall)) * (1.0 - pre.celebrate);
-    let guard = select(0.0, level * (1.0 - moving) * (1.0 - act), alive);
+    // The guard holds through a blow: the stab thrusts and the overhead
+    // chops from the crouch, the arm's motion landing over the guard's
+    // arm. Only the cheer, in `level`, drops it.
+    let guard = select(0.0, level * (1.0 - moving), alive);
 
     var turn: array<vec4<f32>, 20>;
     for (var j = 0u; j < n; j++) {
