@@ -117,6 +117,9 @@ struct PullVertex {
     color: u32,
     // unorm16 each.
     atlas_uv: u32,
+    // A skinned level's joint pair, a + 256 * b, and the weight of b.
+    skin: u32,
+    weight: f32,
 };
 
 @group(3) @binding(0) var<storage, read> pull_records: array<PullInstance>;
@@ -156,9 +159,9 @@ fn vertex_pull(@builtin(vertex_index) index: u32, @builtin(instance_index) insta
     pose_from((entry & 0x3fffffffu) * bucket.z);
 #else
     let inst = pull_records[entry & 0x3fffffffu];
-    pose_begin(inst.pos_scale, inst.color, inst.anim, inst.anim2, globals.time);
+    pose_begin(inst.pos_scale, inst.color, inst.anim, inst.anim2, globals.time, false);
 #endif
-    let placed = place(v.position, v.normal, v.part, v.pivot);
+    let placed = place(v.position, v.normal, v.part, v.pivot, v.skin, v.weight);
     let team = pose_at(P_TEAM);
     var rgb = team.rgb;
 #ifdef LOD_DEBUG
@@ -188,8 +191,8 @@ fn vertex_pull(@builtin(vertex_index) index: u32, @builtin(instance_index) insta
 #else
 @vertex
 fn vertex(vertex: Vertex) -> VertexOutput {
-    pose_begin(vertex.i_pos_scale, vertex.i_color, vertex.i_anim, vertex.i_anim2, globals.time);
-    let placed = place(vertex.position, vertex.normal, vertex.part_pivot.x, vertex.part_pivot.y);
+    pose_begin(vertex.i_pos_scale, vertex.i_color, vertex.i_anim, vertex.i_anim2, globals.time, false);
+    let placed = place(vertex.position, vertex.normal, vertex.part_pivot.x, vertex.part_pivot.y, 0u, 0.0);
     let team = pose_at(P_TEAM);
     return unit_output(
         placed.position,

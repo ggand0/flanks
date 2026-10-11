@@ -97,8 +97,15 @@ pub struct UnitTypeParams {
     pub reach: f32,
     /// Fixed ticks (30 Hz) of wind-up before a swing lands.
     pub windup_ticks: u8,
-    /// Base ticks between swings (±25% jitter applied per swing).
+    /// Base ticks between swings (±COOLDOWN_JITTER applied per swing).
     pub cooldown_ticks: u8,
+    /// The slow cut (swing style 1): fixed ticks from its start to the
+    /// blow, 0 when the kind swings style 1 at `windup_ticks` like a stab.
+    pub cut_windup_ticks: u8,
+    /// Fixed ticks the cut takes to come back once it lands. The pause
+    /// after a cut is never shorter, so he is on guard before he swings
+    /// again.
+    pub cut_return_ticks: u8,
     /// Base move speed m/s (±10% per-unit jitter at spawn).
     pub speed: f32,
     /// Relative shove weight in separation (heavier pushes lighter).
@@ -118,6 +125,44 @@ pub struct UnitTypeParams {
     /// Half the soldier's height, feet to helmet top; units sit on the
     /// terrain at this Y. Every kind is 1.70 m.
     pub half_height: f32,
+}
+
+/// The pause between swings is `cooldown_ticks` times a factor drawn
+/// evenly from 1 - this to 1 + this.
+pub const COOLDOWN_JITTER: f32 = 0.25;
+
+impl UnitTypeParams {
+    /// Whether a swing byte's blow is this kind's slow cut.
+    pub fn is_cut(&self, swing: u8) -> bool {
+        use crate::units::{SWING_RANGED, SWING_STYLE_MASK, SWING_STYLE_SHIFT};
+        self.cut_windup_ticks > 0
+            && swing & SWING_RANGED == 0
+            && swing & SWING_STYLE_MASK == 1 << SWING_STYLE_SHIFT
+    }
+
+    /// Fixed ticks from the start of this swing to its blow.
+    pub fn windup_for(&self, swing: u8) -> u8 {
+        if self.is_cut(swing) { self.cut_windup_ticks } else { self.windup_ticks }
+    }
+
+    /// Seconds the cut takes to come back once it lands (30 Hz ticks).
+    pub fn cut_return_s(&self) -> f32 {
+        self.cut_return_ticks as f32 / 30.0
+    }
+
+    /// How much harder a cut lands than a stab: the ratio of their mean
+    /// cycles, wind-up plus pause, so both deal the same damage over time.
+    /// A cut is the slower, heavier blow; its price is the long wind-up,
+    /// in which the enemy strikes first or steps out of reach.
+    pub fn cut_weight(&self) -> f32 {
+        let c = self.cooldown_ticks as f32;
+        let (lo, hi) = (c * (1.0 - COOLDOWN_JITTER), c * (1.0 + COOLDOWN_JITTER));
+        let r = self.cut_return_ticks as f32;
+        // The mean of the jittered pause held at the return or above.
+        let held = ((r - lo) / (hi - lo)).clamp(0.0, 1.0);
+        let pause = held * r + (1.0 - held) * (r.max(lo) + hi) * 0.5;
+        (self.cut_windup_ticks as f32 + pause) / (self.windup_ticks as f32 + c)
+    }
 }
 
 /// The kind's name on every screen (army picker, unit panel).
@@ -188,6 +233,12 @@ pub const TYPES: [UnitTypeParams; NUM_KINDS] = [
         reach: 1.8,
         windup_ticks: 12,
         cooldown_ticks: 48,
+        // The cut clip lands its blow 1.20 s in and is back 1.40 s later
+        // (assets/units/knight.cut.json, contact and length). In play it
+        // runs twice that fast, 0.6 s to the blow and 0.7 s back: faster
+        // reads as a clip sped up.
+        cut_windup_ticks: 18,
+        cut_return_ticks: 21,
         speed: 6.0,
         // Masses sit on the vanilla EDU scale (militia 0.8 / spears 1.0 /
         // sergeants 1.2 / dismounted knights 1.5) so future cavalry mounts
@@ -216,6 +267,8 @@ pub const TYPES: [UnitTypeParams; NUM_KINDS] = [
         reach: 2.0,
         windup_ticks: 9,
         cooldown_ticks: 33,
+        cut_windup_ticks: 0,
+        cut_return_ticks: 0,
         speed: 9.5,
         mass: 0.9,
         // Armored Sergeants / Billmen row = 5 on the measured scale.
@@ -241,6 +294,8 @@ pub const TYPES: [UnitTypeParams; NUM_KINDS] = [
         reach: 2.4,
         windup_ticks: 10,
         cooldown_ticks: 38,
+        cut_windup_ticks: 0,
+        cut_return_ticks: 0,
         speed: 8.5,
         mass: 1.0,
         // Pikemen row = 5 (highly_trained); spear militia sit at 3.
@@ -267,6 +322,8 @@ pub const TYPES: [UnitTypeParams; NUM_KINDS] = [
         reach: 1.6,
         windup_ticks: 9,
         cooldown_ticks: 33,
+        cut_windup_ticks: 0,
+        cut_return_ticks: 0,
         speed: 9.5,
         mass: 0.8,
         base_morale: 3.0,
@@ -275,3 +332,26 @@ pub const TYPES: [UnitTypeParams; NUM_KINDS] = [
         half_height: 0.85,
     },
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A knight's cuts and stabs deal the same damage over time: the cut's
+    /// weight is the ratio of their mean cycles, the pause after a cut
+    /// averaged over the cooldown jitter as the sim draws it.
+    #[test]
+    fn cut_weight_matches_the_mean_cycles() {
+        let t = &TYPES[KIND_HEAVY as usize];
+        let steps = 100_000;
+        let (mut stab, mut cut) = (0.0_f64, 0.0_f64);
+        for k in 0..steps {
+            let h = (k as f32 + 0.5) / steps as f32;
+            let pause = t.cooldown_ticks as f32 * ((1.0 - COOLDOWN_JITTER) + 2.0 * COOLDOWN_JITTER * h);
+            stab += (t.windup_ticks as f32 + pause) as f64;
+            cut += (t.cut_windup_ticks as f32 + pause.max(t.cut_return_ticks as f32)) as f64;
+        }
+        let ratio = (cut / stab) as f32;
+        assert!((t.cut_weight() - ratio).abs() < 1e-3, "{} vs {ratio}", t.cut_weight());
+    }
+}

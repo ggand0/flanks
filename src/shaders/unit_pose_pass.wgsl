@@ -15,32 +15,43 @@ struct Record {
 };
 
 struct Params {
-    // Per kind: the first entry of its region in `pose_src`, and pose slots
-    // per soldier in its pose buffer.
+    // Per kind: the first entry of its region in `pose_src`, pose slots
+    // per soldier in its pose buffer, and the slots in its region.
     src_base: vec4<u32>,
     stride: vec4<u32>,
+    cap: vec4<u32>,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read> records: array<Record>;
-// Per pose slot, the record it poses (unit_build.wgsl `list_entry`).
+// Per pose slot, the record it poses, with the soldier's detail level in
+// the top two bits (unit_build.wgsl `list_entry`).
 @group(0) @binding(2) var<storage, read> pose_src: array<u32>;
-// The build pass's counters (unit_build.wgsl `counts`): 49..53 the pose
-// slots taken per kind.
+// The build pass's counters (unit_build.wgsl `counts`): per kind, the pose
+// slots taken from the front of its region by the near levels and from
+// the back by the far levels.
 @group(0) @binding(3) var<storage, read> counts: array<u32>;
 @group(0) @binding(4) var<uniform> globals: Globals;
 // x = the kind this dispatch poses.
 @group(3) @binding(10) var<uniform> kind: vec4<u32>;
 
 const POSE_COUNTER: u32 = 49u;
+const POSE_FAR_COUNTER: u32 = 53u + 16u * 128u;
 
 @compute @workgroup_size(64)
 fn pose(@builtin(global_invocation_id) gid: vec3<u32>) {
     let k = kind.x;
-    let slot = gid.x;
-    if slot >= counts[POSE_COUNTER + k] {
+    let near = counts[POSE_COUNTER + k];
+    let far = counts[POSE_FAR_COUNTER + k];
+    if gid.x >= near + far {
         return;
     }
-    let r = records[pose_src[params.src_base[k] + slot]];
-    pose_write(slot * params.stride[k], r.pos_scale, r.color, r.anim, r.anim2, globals.time);
+    // The near slots, then the far ones from the back of the region.
+    var slot = gid.x;
+    if gid.x >= near {
+        slot = params.cap[k] - 1u - (gid.x - near);
+    }
+    let src = pose_src[params.src_base[k] + slot];
+    let r = records[src & 0x3fffffffu];
+    pose_write(slot * params.stride[k], r.pos_scale, r.color, r.anim, r.anim2, globals.time, src >> 30u);
 }

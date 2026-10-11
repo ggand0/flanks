@@ -40,7 +40,7 @@ use crate::render_units::{
     BAND_FIGHTING, BOW_FALL_S, BOW_RISE_S, BOW_WALK_MS, CELEBRATE_BASE, CORPSE_CAP, CULL_RADIUS,
     Corpses, CustomPipeline, ExtractedAtlas, FOLLOW_BASE, FOLLOW_S, FOLLOW_SPAN, HOLD_S,
     ExtractedBucket, InstanceBucket, InstanceData, LodBands, LodConfig, NUM_BUCKETS, NUM_LODS,
-    RANGED_BASE, RELEASE_S, RELOAD_S, REWIND_S, RenderCounts, RigBuffer, SYNC_CHUNK, UnitRig,
+    RANGED_BASE, RELEASE_S, RELOAD_S, REWIND_S, RenderCounts, RigBuffer, STEP_SETTLE_S, SYNC_CHUNK, UnitRig,
     celebrate_progress,
     shadow_level, stance_tier, wall_signal,
 };
@@ -105,7 +105,7 @@ const DEPTH_BIN_SPAN: f32 = 24.0;
 /// Build counters: per bucket the soldiers and the fallen, the caster
 /// lists, the ring count, the pose slots taken per kind, then per bucket
 /// its depth bins.
-const COUNTERS: usize = 2 * NUM_BUCKETS + CASTER_LISTS + 1 + NUM_KINDS + NUM_BUCKETS * DEPTH_BINS;
+const COUNTERS: usize = 2 * NUM_BUCKETS + CASTER_LISTS + 1 + NUM_KINDS + NUM_BUCKETS * DEPTH_BINS + NUM_KINDS;
 
 /// Storage buffers the build pass binds (`init_gpu_unit_pipelines`), more
 /// than any other unit pass. A device that allows fewer per stage keeps the
@@ -113,15 +113,29 @@ const COUNTERS: usize = 2 * NUM_BUCKETS + CASTER_LISTS + 1 + NUM_KINDS + NUM_BUC
 const STORAGE_BUFFERS: u32 = 11;
 
 /// Pose slots (four floats each) per soldier of a kind without a bow rig,
-/// and of one with it (`POSE_SLOTS` and `POSE_SLOTS_BOW` in
+/// of one with it, and of a skinned kind: the part pose and one per joint
+/// (`POSE_SLOTS`, `POSE_SLOTS_BOW` and `POSE_SLOTS_SKEL` in
 /// shaders/unit_pose.wgsl).
 const POSE_SLOTS: u32 = 17;
 const POSE_SLOTS_BOW: u32 = 45;
+const POSE_SLOTS_SKEL: u32 = POSE_SLOTS + crate::unit_meshes::SKEL_JOINTS as u32;
+
+/// The levels a skinned kind poses by its skeleton and draws skinned: L0
+/// and L1, where a soldier stands 12 px or taller (render_units.rs
+/// `LOD_PX_PER_M`). Below that the clips' motion is under a pixel, and
+/// the soldier poses and draws by his parts as a kind without a skeleton
+/// does, so the nine soldiers in ten that are far cost what they cost
+/// without clips. The shadows draw the far levels, so they draw by parts
+/// at every distance, and a near soldier's pose holds his part pose too.
+pub(crate) const SKEL_LODS: usize = 2;
 
 /// Bytes of one set of per-bucket list entries in the bucket table: the
 /// camera's set, then one per cascade. A pulled draw binds one set, at a
 /// multiple of the storage offset alignment every device allows.
 const BUCKET_SET_BYTES: u64 = 256;
+
+/// Bytes of one soldier's smoothing state (`Smooth` in unit_build.wgsl).
+const SMOOTH_BYTES: usize = 60;
 
 /// Per-tick snapshot of one soldier, 56 bytes, every field exact. All
 /// scalars, so the WGSL struct (`Soldier` in unit_build.wgsl) has the same
@@ -186,6 +200,17 @@ pub struct BuildParams {
     /// [kind * 3 + set]: set 0 fine, 1 coarse, 2 plain.
     bands: [Vec4; 12],
     windup: Vec4,
+    /// Per kind: its cut's wind-up ticks (0 without a cut), and the
+    /// seconds the cut takes to come back.
+    cut_windup: Vec4,
+    cut_return: Vec4,
+    /// Per kind, the step clips left, right, forward and backward: the
+    /// ground one play covers in metres (0 without the clip), and its
+    /// length in seconds.
+    step_travel: [Vec4; NUM_KINDS],
+    step_len: [Vec4; NUM_KINDS],
+    /// soldier.rs STEP_FACE_SPEED, render_units.rs STEP_SETTLE_S.
+    steps: Vec4,
     /// draw_ticks, death_ticks, hit_stagger_ticks, celebrate_base
     consts: Vec4,
     /// FOLLOW_S, FOLLOW_BASE, FOLLOW_SPAN, REWIND_S (render_units.rs).
@@ -217,6 +242,9 @@ pub struct BuildParams {
     ring_base: u32,
     /// Per kind: the first entry of its region of the pose sources.
     pose_src_base: UVec4,
+    /// Per kind: the slots in its region of the pose sources and of its
+    /// pose buffer.
+    pose_cap: UVec4,
     /// 1 with the pose pass on.
     pose_pass: u32,
     /// Per cascade and kind: soldiers per instance of the level he casts
@@ -232,10 +260,11 @@ pub struct BuildParams {
 struct PoseParams {
     src_base: UVec4,
     stride: UVec4,
+    cap: UVec4,
 }
 
 const _: () = assert!(NUM_KINDS == 4, "BuildParams and PoseParams pack per-kind values in vec4s");
-const _: () = assert!(COUNTERS == 2101, "unit_build.wgsl sizes `counts` for 2101");
+const _: () = assert!(COUNTERS == 2105, "unit_build.wgsl sizes `counts` for 2105");
 const _: () = assert!(DEPTH_BINS == 128, "unit_build.wgsl has 128 depth bins per bucket");
 const _: () = assert!(NUM_BUCKETS == 16, "unit_build.wgsl sizes its counters for 16 buckets");
 const _: () = assert!(MAX_CASCADES == 4, "unit_build.wgsl sizes its cascades for 4");
@@ -472,7 +501,11 @@ fn pack_chunk(c: &PackColumns, start: usize, out: &mut [GpuSoldier], flash: bool
 fn build_frame_params(
     units: Res<Units>,
     selection: Res<crate::orders::Selection>,
-    (hover, settings): (Res<crate::orders::Hover>, Res<crate::settings::Settings>),
+    (hover, settings, rigs): (
+        Res<crate::orders::Hover>,
+        Res<crate::settings::Settings>,
+        Query<(&InstanceBucket, &UnitRig)>,
+    ),
     groups: Res<crate::orders::Groups>,
     time: Res<Time>,
     fixed_time: Res<Time<Fixed>>,
@@ -561,6 +594,25 @@ fn build_frame_params(
     p.windup = Vec4::from_array(std::array::from_fn(|k| {
         crate::unit_types::TYPES[k].windup_ticks as f32
     }));
+    p.cut_windup = Vec4::from_array(std::array::from_fn(|k| {
+        crate::unit_types::TYPES[k].cut_windup_ticks as f32
+    }));
+    p.cut_return = Vec4::from_array(std::array::from_fn(|k| {
+        crate::unit_types::TYPES[k].cut_return_s()
+    }));
+    for (bucket, rig) in &rigs {
+        let (kind, skel) = (bucket.0 / NUM_LODS, &rig.rig.skel);
+        if kind >= NUM_KINDS || skel.params[0] == 0 {
+            continue;
+        }
+        for (k, slot) in (crate::unit_glb::SKEL_CLIP_STEPS..).take(4).enumerate() {
+            if skel.clips[slot][1] > 1 {
+                p.step_travel[kind][k] = skel.rates[slot][3];
+                p.step_len[kind][k] = skel.rates[slot][1];
+            }
+        }
+    }
+    p.steps = Vec4::new(crate::sim::soldier::STEP_FACE_SPEED, STEP_SETTLE_S, 0.0, 0.0);
     p.consts = Vec4::new(
         crate::unit_types::missile::DRAW_TICKS as f32,
         crate::sim::damage::DEATH_TICKS as f32,
@@ -735,10 +787,12 @@ struct PullVertex {
     pivot: f32,
     /// Vertex colour, unorm8 rgba.
     color: u32,
-    /// Atlas coordinates, unorm16 each, then padding to the WGSL struct's
-    /// 48 bytes.
+    /// Atlas coordinates, unorm16 each.
     atlas_uv: u32,
-    pad: [u32; 2],
+    /// A skinned level's joint pair, `a + 256 * b`, and the weight of b
+    /// (unit_glb.rs `ATTRIBUTE_SKIN`). Zero on a level without a skin.
+    skin: u32,
+    weight: f32,
 }
 
 /// A bucket's level mesh with its index list expanded: the vertex shader
@@ -755,6 +809,9 @@ pub struct PullMesh {
     corners: Vec<PullVertex>,
     indexed: Option<IndexedMesh>,
     bucket: usize,
+    /// The level carries joints and weights (unit_glb.rs `ATTRIBUTE_SKIN`),
+    /// so its draw shader compiles the skinning instead of the part chain.
+    skinned: bool,
 }
 
 /// A level drawn indexed: its vertices, and its index list repeated for
@@ -836,7 +893,7 @@ fn weld(corners: &[PullVertex]) -> IndexedMesh {
     let flat_atlas = corners
         .chunks(3)
         .all(|t| t[1].atlas_uv == t[0].atlas_uv && t[2].atlas_uv == t[0].atlas_uv);
-    let key = |v: &PullVertex| -> [u32; 10] {
+    let key = |v: &PullVertex| -> [u32; 12] {
         let f = f32::to_bits;
         [
             f(v.position[0]),
@@ -849,9 +906,11 @@ fn weld(corners: &[PullVertex]) -> IndexedMesh {
             f(v.pivot),
             v.color,
             if flat_atlas { 0 } else { v.atlas_uv },
+            v.skin,
+            f(v.weight),
         ]
     };
-    let mut slots = bevy::platform::collections::HashMap::<[u32; 10], u32>::default();
+    let mut slots = bevy::platform::collections::HashMap::<[u32; 12], u32>::default();
     let mut vertices: Vec<PullVertex> = Vec::new();
     let list: Vec<u32> = corners
         .iter()
@@ -1016,6 +1075,10 @@ impl PullMesh {
         let Some(V::Float32x2(atlas_uv)) = mesh.attribute(Mesh::ATTRIBUTE_UV_1) else {
             return None;
         };
+        let skin = match mesh.attribute(crate::unit_glb::ATTRIBUTE_SKIN) {
+            Some(V::Float32x2(skin)) => Some(skin),
+            _ => None,
+        };
         let vertex = |i: usize| PullVertex {
             position: pos[i],
             part: uv[i][0],
@@ -1023,7 +1086,8 @@ impl PullMesh {
             pivot: uv[i][1],
             color: pack_unorm8(col[i]),
             atlas_uv: pack_unorm16(atlas_uv[i]),
-            pad: [0; 2],
+            skin: skin.map_or(0, |s| s[i][0] as u32),
+            weight: skin.map_or(0.0, |s| s[i][1]),
         };
         let indices = mesh.indices()?;
         let corners: Vec<PullVertex> = indices.iter().map(vertex).collect();
@@ -1048,6 +1112,7 @@ impl PullMesh {
             corners,
             indexed,
             bucket,
+            skinned: skin.is_some(),
         })
     }
 }
@@ -1062,6 +1127,8 @@ pub struct PullMeshGpu {
     pub count: u32,
     pub bucket: usize,
     pub shape: DrawShape,
+    /// As `PullMesh::skinned`.
+    pub skinned: bool,
 }
 
 /// How a bucket's level draws. `group` 0: expanded corners, one plain draw
@@ -1117,6 +1184,7 @@ fn extract_pull_meshes(
             count: mesh.corners.len() as u32,
             bucket: mesh.bucket,
             shape,
+            skinned: mesh.skinned,
         });
     }
 }
@@ -1351,6 +1419,9 @@ pub struct UnitAlloc {
     /// most one slot a frame (unit_build.wgsl `list_entry`).
     pose_src: Buffer,
     pose_src_base: [u32; NUM_KINDS],
+    /// Per kind: the slots in its region of the pose sources and of its
+    /// pose buffer, its live capacity and the bodies.
+    pose_cap: [u32; NUM_KINDS],
     /// Per kind, each drawn soldier's pose (shaders/unit_pose.wgsl):
     /// `pose_stride` slots of four floats per pose slot. One buffer per
     /// kind keeps each binding a kind's size.
@@ -1394,9 +1465,11 @@ impl UnitAlloc {
         total += live_cap;
         let regiments_cap = 256;
         let mut pose_src_base = [0u32; NUM_KINDS];
+        let mut pose_cap = [0u32; NUM_KINDS];
         let mut sources = 0usize;
         for (kind, base) in pose_src_base.iter_mut().enumerate() {
             *base = sources as u32;
+            pose_cap[kind] = (kind_cap[kind] + CORPSE_CAP) as u32;
             sources += kind_cap[kind] + CORPSE_CAP;
         }
         let limit = device.limits().max_storage_buffer_binding_size as usize;
@@ -1421,7 +1494,7 @@ impl UnitAlloc {
                 (live_cap + NUM_KINDS * CORPSE_CAP) * size_of::<crate::render_units::InstanceData>(),
                 BufferUsages::COPY_DST,
             ),
-            smooth: storage_buffer(device, "unit smoothing", live_cap * 48, BufferUsages::empty()),
+            smooth: storage_buffer(device, "unit smoothing", live_cap * SMOOTH_BYTES, BufferUsages::empty()),
             index_list: storage_buffer(device, "unit index list", total * 4, BufferUsages::empty()),
             kind_cap,
             bases,
@@ -1461,6 +1534,7 @@ impl UnitAlloc {
             ),
             pose_src: storage_buffer(device, "unit pose sources", sources * 4, BufferUsages::empty()),
             pose_src_base,
+            pose_cap,
             poses,
             pose_stride,
         }
@@ -1521,6 +1595,9 @@ fn prepare_gpu_units(
         for (bucket, rig, _) in &rigs {
             if rig.rig.bow.params[3] > 0.5 {
                 pose_stride[bucket.0 / NUM_LODS] = POSE_SLOTS_BOW;
+            }
+            if rig.rig.skel.params[0] > 0 {
+                pose_stride[bucket.0 / NUM_LODS] = POSE_SLOTS_SKEL;
             }
         }
     }
@@ -1628,6 +1705,7 @@ fn prepare_gpu_units(
     params.shadow_corners = cast_with(1);
     params.shadow_groups = cast_with(3);
     params.pose_src_base = UVec4::from_array(alloc.pose_src_base);
+    params.pose_cap = UVec4::from_array(alloc.pose_cap);
     params.pose_pass = input.pose_pass as u32;
     buffers.params.set(params);
     buffers.params.write_buffer(&device, &queue);
@@ -1636,6 +1714,7 @@ fn prepare_gpu_units(
     buffers.pose_params.set(PoseParams {
         src_base: UVec4::from_array(alloc.pose_src_base),
         stride: UVec4::from_array(alloc.pose_stride),
+        cap: UVec4::from_array(alloc.pose_cap),
     });
     buffers.pose_params.write_buffer(&device, &queue);
 
@@ -2099,7 +2178,8 @@ mod tests {
                 pivot: 0.5,
                 color: u32::MAX,
                 atlas_uv: (k / 3) as u32 * 7 + 1,
-                pad: [0; 2],
+                skin: 0,
+                weight: 0.0,
             })
             .collect();
         let m = weld(&corners);
@@ -2136,7 +2216,8 @@ mod tests {
             pivot: 0.0,
             color: 0,
             atlas_uv: atlas,
-            pad: [0; 2],
+            skin: 0,
+            weight: 0.0,
         };
         let corners = [
             corner(0.0, 1), corner(1.0, 2), corner(2.0, 3),

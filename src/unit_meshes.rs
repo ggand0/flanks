@@ -102,6 +102,42 @@ pub struct Rig {
     pub windup: [[f32; 4]; ATTACK_SAMPLES],
     pub recover: [[f32; 4]; ATTACK_SAMPLES],
     pub bow: Bow,
+    pub skel: Skel,
+}
+
+/// The most joints a skeleton can have.
+pub const SKEL_JOINTS: usize = 20;
+const _: () = assert!(SKEL_JOINTS == 20, "unit_pose.wgsl sizes its joint arrays and POSE_SLOTS_SKEL for 20");
+/// The clips a skinned kind plays, in the order of `Skel::clips`
+/// (unit_glb.rs `SKEL_CLIPS`).
+pub const SKEL_CLIP_SLOTS: usize = 12;
+
+/// A skinned kind's skeleton (unit_glb.rs `read_skeleton`): its joints and
+/// where its clips are in the clip buffer. Every joint's rest rotation is
+/// identity, so a pose is one rotation per joint from rest. All zero for a
+/// kind without one.
+#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
+pub struct Skel {
+    /// x = how many joints, 0 without a skeleton.
+    pub params: [u32; 4],
+    /// xyz = the joint's rest origin in engine local space, w = its
+    /// parent's index, -1 for the root. Parents come first.
+    pub joints: [[f32; 4]; SKEL_JOINTS],
+    /// Per clip: x = its first vec4 in the clip buffer, y = its samples,
+    /// w = 1 when it loops. A sample is one vec4 for the root's offset
+    /// from rest, then one quaternion per joint relative to its parent.
+    pub clips: [[u32; 4]; SKEL_CLIP_SLOTS],
+    /// Per clip: x = samples per second, y = its length in seconds (the
+    /// last sample's time), z = when its blow lands in seconds, -1
+    /// without one, w = how far one play carries the soldier, engine
+    /// metres.
+    pub rates: [[f32; 4]; SKEL_CLIP_SLOTS],
+    /// The joints the gait, the arm sway and the attack write: (pelvis,
+    /// chest, head, weapon), then (upper arm, forearm, hand, coat) of the
+    /// weapon side and of the shield side, then (thigh, shin, foot) of
+    /// each.
+    pub roles: [[u32; 4]; 5],
 }
 
 /// An archer's jointed arms and strung bow, in engine local space (xyz,

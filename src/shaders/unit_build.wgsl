@@ -69,6 +69,13 @@ struct Smooth {
     // Smoothed ground velocity, m/s (x, z): `walk` is its length.
     drift_x: f32,
     drift_z: f32,
+    // A skinned soldier's steps, which the CPU path does not play
+    // (`steps`): where he is in the step clip, in plays, its slot from
+    // the left step, and how far he is in it rather than in his stance or
+    // his gait, 0 to 1.
+    step: f32,
+    step_clip: u32,
+    step_w: f32,
 };
 
 // Per-regiment pose signals for this frame (render_units_gpu.rs
@@ -103,6 +110,17 @@ struct Params {
     // switch distances for L0/L1, L1/L2, L2/L3 (inf = switch disabled).
     bands: array<vec4<f32>, 12>,
     windup: vec4<f32>,
+    // Per kind: its cut's wind-up ticks (0 without a cut), and the
+    // seconds the cut takes to come back.
+    cut_windup: vec4<f32>,
+    cut_return: vec4<f32>,
+    // Per kind, the step clips left, right, forward and backward: the
+    // ground one play covers in metres (0 without the clip), and its
+    // length in seconds.
+    step_travel: array<vec4<f32>, 4>,
+    step_len: array<vec4<f32>, 4>,
+    // soldier.rs STEP_FACE_SPEED, render_units.rs STEP_SETTLE_S.
+    steps: vec4<f32>,
     // draw_ticks, death_ticks, hit_stagger_ticks, celebrate_base
     consts: vec4<f32>,
     // FOLLOW_S, FOLLOW_BASE, FOLLOW_SPAN, REWIND_S (render_units.rs).
@@ -134,6 +152,9 @@ struct Params {
     ring_base: u32,
     // Per kind: the first entry of its region in `pose_src`.
     pose_src_base: vec4<u32>,
+    // Per kind: the slots in its region of the pose sources and of its
+    // pose buffer.
+    pose_cap: vec4<u32>,
     // 1 with the pose pass on.
     pose_pass: u32,
     // Per cascade and kind: soldiers per instance of the level the caster
@@ -163,7 +184,7 @@ struct DrawArgs {
 // selection rings, 49..53 the pose slots taken per kind, then per bucket
 // and depth bin (`BIN_COUNTER`) the soldiers in it, which `finalize` turns
 // into the bin's first slot in the bucket's list.
-@group(0) @binding(6) var<storage, read_write> counts: array<atomic<u32>, 2101>;
+@group(0) @binding(6) var<storage, read_write> counts: array<atomic<u32>, 2105>;
 // 0..16 the camera's buckets, 16..32 the casters as in `counts`, 32 the
 // selection rings, 33..37 the pose pass's dispatch per kind (x, y, z).
 @group(0) @binding(7) var<storage, read_write> args: array<DrawArgs, 37>;
@@ -226,11 +247,17 @@ const RING_HOVER_ENEMY: u32 = 2u;
 const RING_COUNTER: u32 = 48u;
 const RING_ARG: u32 = 32u;
 // The pose slot counters in `counts`, and the pose dispatches in `args`.
+// Per kind, the near levels' slots count up from the front of the kind's
+// region and the far levels' down from its back (`list_entry`).
 const POSE_COUNTER: u32 = 49u;
 const POSE_ARG: u32 = 33u;
 // Depth bins per bucket, and where their counters start in `counts`.
 const DEPTH_BINS: u32 = 128u;
 const BIN_COUNTER: u32 = 53u;
+const POSE_FAR_COUNTER: u32 = BIN_COUNTER + 16u * DEPTH_BINS;
+// The levels a skinned kind poses by its skeleton (render_units_gpu.rs
+// SKEL_LODS, unit_pose.wgsl `pose_write`).
+const SKEL_LODS: u32 = 2u;
 // Levels drawn near to far: below this one. The near levels' soldiers are
 // large on screen, so the depth test spares the shading of most of those
 // behind them. A far soldier is a few pixels, and his neighbours in his
@@ -296,16 +323,29 @@ fn queue_draw(t: u32, bucket: u32, entry: u32, lod: u32, dist2: f32) {
     draws[t] = Draw(cell, slot, entry | (lod << 30u));
 }
 
-// The list entry of drawn record `r` of a soldier of `kind`: the record,
-// or with the pose pass a pose slot of his kind that the pass fills from
-// the record. A soldier or body takes at most one slot a frame, so a
-// kind's region holds its living and its fallen.
-fn list_entry(kind: u32, r: u32) -> u32 {
+// The list entry of drawn record `r` of a soldier of `kind` at level
+// `lod`: the record, or with the pose pass a pose slot of his kind that
+// the pass fills from the record. A soldier or body takes at most one
+// slot a frame, so a kind's region holds its living and its fallen.
+//
+// A skinned kind poses by its skeleton at the near levels only
+// (unit_pose.wgsl `pose_write`), and the level rides the top two bits of
+// the slot's source. The near levels take their slots from the front of
+// the region and the far levels from its back: the pose pass runs the
+// skeleton for a whole warp when one thread of it needs it, and in a
+// region in soldier order nearly every warp of a kind holds one of the
+// near soldiers (8% of the knights in the flank view, 93% of its warps).
+fn list_entry(kind: u32, r: u32, lod: u32) -> u32 {
     if params.pose_pass == 0u {
         return r;
     }
-    let slot = atomicAdd(&counts[POSE_COUNTER + kind], 1u);
-    pose_src[params.pose_src_base[kind] + slot] = r;
+    var slot: u32;
+    if lod < SKEL_LODS {
+        slot = atomicAdd(&counts[POSE_COUNTER + kind], 1u);
+    } else {
+        slot = params.pose_cap[kind] - 1u - atomicAdd(&counts[POSE_FAR_COUNTER + kind], 1u);
+    }
+    pose_src[params.pose_src_base[kind] + slot] = r | (lod << 30u);
     return slot;
 }
 
@@ -348,6 +388,71 @@ fn append_casters(mask: u32, kind: u32, entry: u32) {
     }
 }
 
+// Whether a swing byte's blow is this kind's slow cut, as
+// unit_types.rs `UnitTypeParams::is_cut`.
+fn is_cut(kind: u32, swing: u32) -> bool {
+    return params.cut_windup[kind] > 0.0
+        && (swing & SWING_RANGED) == 0u
+        && (swing & SWING_STYLE_MASK) == (1u << SWING_STYLE_SHIFT);
+}
+
+// A skinned soldier's steps. Near the enemy and slower than he turns to
+// walk, he steps in the clip nearest his motion relative to his facing,
+// one play per the ground it covers, so his feet keep to the ground.
+// A play starts and ends in the ready pose, so he changes clip only
+// there. When he stops or speeds up into his gait, the foot in the air
+// lands at the clip's own pace and he settles into his stance. Returns
+// the record's fourth position float: the clip slot, plus 4 times the
+// place in the play and 4096 times his weight in it, both in 1023rds.
+fn steps(sm: ptr<function, Smooth>, kind: u32, vel: vec2<f32>, yaw: f32, alive: bool) -> f32 {
+    let travel = params.step_travel[kind];
+    let fwd = vec2<f32>(sin(yaw), cos(yaw));
+    let local = vec2<f32>(dot(vel, vec2<f32>(fwd.y, -fwd.x)), dot(vel, fwd));
+    var pick = select(1u, 0u, local.x > 0.0);
+    if abs(local.y) > abs(local.x) {
+        pick = select(3u, 2u, local.y > 0.0);
+    }
+    let speed = length(vel);
+    let want = alive && (*sm).band > 0.15 && (*sm).walk < params.steps.x && speed > 0.06
+        && travel[pick] > 0.0;
+    if (*sm).step_w <= 0.0 {
+        (*sm).step = 0.0;
+        (*sm).step_clip = pick;
+    }
+    let ease = params.dt / params.steps.y;
+    var x = (*sm).step;
+    if want {
+        x += speed * params.dt / max(travel[(*sm).step_clip], 0.01);
+        (*sm).step_w = min((*sm).step_w + ease, 1.0);
+    } else {
+        // A step is half a play: one foot moves. The foot in the air
+        // lands, then he settles.
+        let half = x * 2.0;
+        if half - floor(half) > 0.0 {
+            x = min(x + params.dt / max(params.step_len[kind][(*sm).step_clip], 0.01), (floor(half) + 1.0) * 0.5);
+        } else {
+            (*sm).step_w = max((*sm).step_w - ease, 0.0);
+        }
+    }
+    if x >= 1.0 {
+        x -= floor(x);
+        if want {
+            (*sm).step_clip = pick;
+        }
+    }
+    (*sm).step = x;
+    return f32((*sm).step_clip) + 4.0 * round(x * 1023.0) + 4096.0 * round((*sm).step_w * 1023.0);
+}
+
+// Seconds a blow of this swing byte takes to come back once it lands, as
+// render_units.rs `follow_s`.
+fn follow_s(kind: u32, swing: u32) -> f32 {
+    if is_cut(kind, swing) {
+        return params.cut_return[kind];
+    }
+    return params.attack.x;
+}
+
 fn build_soldier(i: u32) {
     let s = soldiers[i];
     let pos = vec3<f32>(s.px, s.py, s.pz);
@@ -377,7 +482,6 @@ fn build_soldier(i: u32) {
 
     // The attack on anim z, 0 when he is not attacking, as in
     // render_units.rs `attack_signal`.
-    let follow_s = params.attack.x;
     let shot_s = params.shot.x + params.shot.y + params.shot.z;
     let winding = (swing & SWING_STATE_MASK) == SWING_WINDUP && death_t == 0.0;
     sm.shot = max(sm.shot - params.dt, 0.0);
@@ -385,6 +489,8 @@ fn build_soldier(i: u32) {
         var w = params.windup[kind];
         if (swing & SWING_RANGED) != 0u {
             w = params.consts.x;
+        } else if is_cut(kind, swing) {
+            w = params.cut_windup[kind];
         }
         sm.atk = clamp((w - swing_t + params.alpha) / (w + 1.0), 0.0, 1.0);
         sm.swing = swing;
@@ -396,7 +502,7 @@ fn build_soldier(i: u32) {
         if (sm.swing & SWING_RANGED) != 0u {
             sm.shot = shot_s;
         } else {
-            sm.follow = follow_s;
+            sm.follow = follow_s(kind, sm.swing);
         }
         sm.atk = 0.0;
     } else {
@@ -431,7 +537,7 @@ fn build_soldier(i: u32) {
     } else if ranged && (sm.atk > 0.0 || sm.bow > 0.0) {
         attack = params.bow.w + sm.atk;
     } else if sm.follow > 0.0 {
-        attack = digit * 2.0 + params.attack.y + params.attack.z * (1.0 - sm.follow / follow_s);
+        attack = digit * 2.0 + params.attack.y + params.attack.z * (1.0 - sm.follow / follow_s(kind, sm.swing));
     } else if sm.atk > 0.0 {
         attack = digit * 2.0 + sm.atk;
     }
@@ -445,6 +551,12 @@ fn build_soldier(i: u32) {
     // The step is capped as in gait.rs `advance`.
     let g = sm.gait + min(gait_rate(sm.walk) * params.dt, 0.25);
     sm.gait = g - floor(g);
+    // The record's fourth position float: an archer's bow, a skinned
+    // kind's steps.
+    var fourth = sm.bow;
+    if any(params.step_travel[kind] > vec4<f32>(0.0)) {
+        fourth = steps(&sm, kind, step.xz * params.inv_dt, s.yaw, death_t == 0.0);
+    }
 
     let position = mix(prev, pos, params.alpha);
     let jitter = lod_jitter(s.seed);
@@ -502,13 +614,13 @@ fn build_soldier(i: u32) {
     }
 
     records[i] = Record(
-        vec4<f32>(position, sm.bow),
+        vec4<f32>(position, fourth),
         vec4<f32>(rgb, s.seed),
         vec4<f32>(yaw, sm.walk, lunge, fx),
         vec4<f32>(sm.band, sm.wall, sm.gait, stagger),
     );
     smoothing[i] = sm;
-    let entry = list_entry(kind, i);
+    let entry = list_entry(kind, i, lod);
     if visible {
         queue_draw(i, kind * NUM_LODS + lod, entry, lod, dot(d, d));
         if death_t == 0.0 && (reg.flags & (REG_SELECTED | REG_HOVERED | REG_HOVER_OWN)) != 0u {
@@ -562,7 +674,7 @@ fn build_corpse(j: u32, t: u32) {
     if !visible && casts == 0u {
         return;
     }
-    let entry = list_entry(kind, ridx);
+    let entry = list_entry(kind, ridx, lod);
     if visible {
         let bucket = kind * NUM_LODS + lod;
         atomicAdd(&counts[16u + bucket], 1u);
@@ -656,7 +768,7 @@ fn finalize(@builtin(local_invocation_index) b: u32) {
     readback[b] = count;
     readback[16u + b] = fallen;
     if b < 4u {
-        let posed = atomicLoad(&counts[POSE_COUNTER + b]);
+        let posed = atomicLoad(&counts[POSE_COUNTER + b]) + atomicLoad(&counts[POSE_FAR_COUNTER + b]);
         args[POSE_ARG + b] = DrawArgs((posed + 63u) / 64u, 1u, 1u, 0u);
     }
     if b == 0u {

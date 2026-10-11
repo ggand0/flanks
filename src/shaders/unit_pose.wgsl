@@ -36,6 +36,30 @@ struct Rig {
     windup: array<vec4<f32>, 33>,
     recover: array<vec4<f32>, 33>,
     bow: Bow,
+    skel: Skel,
+};
+
+// A skinned kind's skeleton (unit_meshes.rs `Skel`). Every joint's rest
+// rotation is identity, so a pose is one rotation per joint from rest.
+struct Skel {
+    // x = how many joints, 0 without a skeleton.
+    params: vec4<u32>,
+    // xyz = the joint's rest origin, local space; w = its parent's index,
+    // -1 for the root. Parents come first.
+    joints: array<vec4<f32>, 20>,
+    // Per clip: x = its first vec4 in `clips`, y = its samples, w = 1 when
+    // it loops. A sample is the root's offset from rest, then one
+    // quaternion per joint relative to its parent.
+    clips: array<vec4<u32>, 12>,
+    // Per clip: x = samples per second, y = its length in seconds, z =
+    // when its blow lands in seconds, -1 without one, w = how far one play
+    // carries the soldier.
+    rates: array<vec4<f32>, 12>,
+    // The joints the gait, the arm sway and the attack write: (pelvis,
+    // chest, head, weapon), then (upper arm, forearm, hand, coat) of the
+    // weapon side and of the shield side, then (thigh, shin, foot) of
+    // each.
+    roles: array<vec4<u32>, 5>,
 };
 
 // An archer's jointed arms and strung bow (unit_meshes.rs `Bow`), local
@@ -62,7 +86,8 @@ struct Bow {
     clips: array<vec4<u32>, 2>,
 };
 @group(3) @binding(6) var<uniform> rig: Rig;
-// The shot tables of this bucket's kind (unit_glb.rs `Shots::buffer`).
+// The tables of this bucket's kind: an archer's shots (unit_glb.rs
+// `Shots::buffer`), or a skinned kind's clips (`read_skeleton`).
 // A pose is 8 vec4s: six joint turns as xyzw quaternions (the drawing
 // arm's shoulder, elbow and wrist, then the bow arm's), (bow yaw, limb
 // bend, arrow shown, body yaw), (torso pitch, bow pitch). A free-arrow
@@ -365,6 +390,29 @@ fn qalign(a: vec3<f32>, b: vec3<f32>) -> vec4<f32> {
     return normalize(vec4<f32>(cross(a, b), 1.0 + dot(a, b)));
 }
 
+// A posed joint in one pose slot: its rotation and its origin as halves,
+// (x, y), (z, w), (ox, oy), (oz, 0). Halves of finite values never form a
+// NaN pattern in the float slot they ride in. Written by the pose pass
+// (`put_skeleton`), read by every corner of a skinned level (`place`).
+fn pack_joint(rot: vec4<f32>, org: vec3<f32>) -> vec4<f32> {
+    return bitcast<vec4<f32>>(vec4<u32>(
+        pack2x16float(rot.xy),
+        pack2x16float(rot.zw),
+        pack2x16float(org.xy),
+        pack2x16float(vec2<f32>(org.z, 0.0)),
+    ));
+}
+
+fn joint_rot(slot: vec4<f32>) -> vec4<f32> {
+    let u = bitcast<vec4<u32>>(slot);
+    return vec4<f32>(unpack2x16float(u.x), unpack2x16float(u.y));
+}
+
+fn joint_org(slot: vec4<f32>) -> vec3<f32> {
+    let u = bitcast<vec4<u32>>(slot);
+    return vec3<f32>(unpack2x16float(u.z), unpack2x16float(u.w).x);
+}
+
 // Where a shot is in its table: the first of the two poses it lies
 // between, how far toward the second, and where the table starts.
 struct ShotAt {
@@ -579,10 +627,27 @@ const P_RIG: u32 = 13u;
 // Two slots per bow rig part (`bow_part`): the rotation, then the offset
 // and the scale.
 const P_BOW: u32 = 17u;
-// Slots per soldier: without a bow rig, and with one (render_units_gpu.rs
-// POSE_SLOTS).
+// A skinned kind: one slot per joint from here, after the part pose,
+// which his shadow and his far levels draw by. The joint's rotation in
+// local space and its posed origin, as halves (`pack_joint`).
+const P_SKEL: u32 = 17u;
+// Slots per soldier: without a bow rig, with one, and with a skeleton
+// (render_units_gpu.rs POSE_SLOTS).
 const POSE_SLOTS: u32 = 17u;
 const POSE_SLOTS_BOW: u32 = 45u;
+const POSE_SLOTS_SKEL: u32 = 37u;
+// The levels a skinned kind poses by its skeleton (render_units_gpu.rs
+// SKEL_LODS): L0 and L1. Further out he poses by his parts.
+const SKEL_LODS: u32 = 2u;
+// A skinned kind's clips, by slot (unit_glb.rs `SKEL_CLIPS`).
+const CLIP_STAND: u32 = 0u;
+const CLIP_READY: u32 = 1u;
+const CLIP_SHUFFLE_LEFT: u32 = 2u;
+const CLIP_SHUFFLE_RIGHT: u32 = 3u;
+const CLIP_SHUFFLE_FORWARD: u32 = 4u;
+const CLIP_SHUFFLE_BACKWARD: u32 = 5u;
+const CLIP_CUT: u32 = 6u;
+const CLIP_STAB: u32 = 7u;
 // Parts of the bow rig.
 const BOW_PARTS: u32 = 14u;
 
@@ -669,6 +734,14 @@ struct Pre {
     clip: u32,
     clip_x: f32,
     style: f32,
+    // A skinned kind's blow that plays its cut clip, or its stab clip.
+    cut: bool,
+    stab: bool,
+    // A skinned kind's steps: the clip slot, the place in its play 0 to 1,
+    // and his weight in it rather than in his stance or gait.
+    step_clip: u32,
+    step_x: f32,
+    step_w: f32,
     following: bool,
     windup: f32,
     follow: f32,
@@ -696,11 +769,26 @@ var<private> pre: Pre;
 
 // Work out the animation state of the soldier with this instance record
 // (render_units.rs InstanceData) and fill the slots every corner reads.
-fn pose_begin(pos_scale: vec4<f32>, color: vec4<f32>, anim: vec4<f32>, anim2: vec4<f32>, time: f32) {
+// `skel`: his skeleton poses him (a skinned kind at a near level,
+// SKEL_LODS), so his steps and his cut clip count; else he poses by his
+// parts as on a kind without a skeleton.
+fn pose_begin(pos_scale: vec4<f32>, color: vec4<f32>, anim: vec4<f32>, anim2: vec4<f32>, time: f32, skel: bool) {
     let inst = Inst(pos_scale, color, anim, anim2);
     let yaw = inst.anim.x;
     let speed = inst.anim.y;
-    let moving = walk_gate(speed);
+    // A skinned kind's steps ride the fourth position float
+    // (unit_build.wgsl `steps`). While he steps, his gait gives way.
+    var step_clip = 0u;
+    var step_x = 0.0;
+    var step_w = 0.0;
+    if skel {
+        let q = u32(max(inst.pos_scale.w, 0.0) + 0.5);
+        step_clip = CLIP_SHUFFLE_LEFT + (q & 3u);
+        step_x = f32((q >> 2u) & 1023u) / 1023.0;
+        step_w = f32(q >> 12u) / 1023.0;
+    }
+    let walking = 1.0 - step_w;
+    let moving = walk_gate(speed) * walking;
     // A bow shot from 16: clip * 2 + progress, clip 0 the raise, 1 the
     // release, 2 the reload (render_units.rs RANGED_BASE). A kind with a
     // bow rig plays it from its tables. Without one the draw arms read it
@@ -736,11 +824,23 @@ fn pose_begin(pos_scale: vec4<f32>, color: vec4<f32>, anim: vec4<f32>, anim2: ve
     let cheering = zpos > 11.5;
     let digit = floor(zpos * 0.5 + 0.001);
     let charge = digit > 2.5 && !cheering;
-    let style = digit - select(0.0, 3.0, charge);
+    let swing_style = digit - select(0.0, 3.0, charge);
     let within = zpos - digit * 2.0;
     let following = within > 1.395 && !cheering;
     let windup = select(select(within, 0.0, following), 0.0, cheering);
     let follow = clamp((within - 1.4) / 0.59, 0.0, 1.0);
+    // A kind with a cut clip draws three styles (soldier.rs): 1 is the
+    // slow cut, which his skeleton plays from the clip at the near levels
+    // and his parts play as the overhead swing further out, and 2 is the
+    // overhead swing at the stab's pace, which is the code's style 1. A
+    // charging blow is a stab.
+    let has_cut = rig.skel.clips[CLIP_CUT].y > 0u && rig.skel.rates[CLIP_CUT].z > 0.0;
+    let cut = skel && has_cut && !charge && !cheering && abs(swing_style - 1.0) < 0.5;
+    let style = select(swing_style, 1.0, has_cut && swing_style > 1.5);
+    // The stab clip plays the ordinary stab (style 0) the same way; the
+    // charging blow stays the code's.
+    let has_stab = rig.skel.clips[CLIP_STAB].y > 0u && rig.skel.rates[CLIP_STAB].z > 0.0;
+    let stab = skel && has_stab && !charge && !cheering && swing_style < 0.5;
     // The lunge the code-posed arms and the body lean follow: quadratic
     // over the wind-up and harder on a charge, where it raises from the
     // levelled run-in point instead of dipping the blade first. After the
@@ -793,9 +893,9 @@ fn pose_begin(pos_scale: vec4<f32>, color: vec4<f32>, anim: vec4<f32>, anim2: ve
     let g = gait_at(speed, leg);
     // The step wave the arms counter, and the idle wobble, which is the
     // one oscillator that is not locomotion.
-    let limb = cos(TAU * gait);
+    let limb = cos(TAU * gait) * walking;
     let wobble = time * 9.0 + seed * TAU;
-    let dip = gait_dip(fract(2.0 * gait), g);
+    let dip = gait_dip(fract(2.0 * gait), g) * walking;
 
     pre = Pre(
         inst.pos_scale.xyz,
@@ -811,6 +911,11 @@ fn pose_begin(pos_scale: vec4<f32>, color: vec4<f32>, anim: vec4<f32>, anim2: ve
         clip,
         clip_x,
         style,
+        cut,
+        stab,
+        step_clip,
+        step_x,
+        step_w,
         following,
         windup,
         follow,
@@ -851,13 +956,15 @@ fn put_common() {
     // the planted foot, both at full weight here: the torso eases them in
     // up its height (`place`).
     let turn = 0.10 * g.run * g.stride * pre.limb;
-    let shift = 0.02 * pre.leg * g.run * g.stride * cos(TAU * (pre.gait - 0.5 * g.duty));
+    let shift = 0.02 * pre.leg * g.run * g.stride * cos(TAU * (pre.gait - 0.5 * g.duty))
+        * (1.0 - pre.step_w);
     // The body rides the hip drop from the gait. A runner leans as far
-    // forward as a charger.
+    // forward as a charger. A blow leans into it, except one from a clip
+    // (the cut, the stab), which moves the whole body itself.
+    let blow = select(0.30 * pre.lunge + 0.25 * pre.chop, 0.0, pre.cut || pre.stab);
     let lean = 0.10 * pre.moving
         + 0.24 * max(g.run * pre.moving, pre.sprint * (0.25 + 0.75 * pre.moving))
-        + 0.30 * pre.lunge
-        + 0.25 * pre.chop;
+        + blow;
     // Stagger (anim2.w = remaining stun, 1 at the blow -> 0 recovered):
     // rocked back off a charging blow or a spear point. The whole body
     // pitches backward from the feet with a short reel, hardest at the
@@ -1203,8 +1310,201 @@ fn chain_slot(part: f32) -> u32 {
 }
 
 #ifdef UNIT_POSE_WRITE
+// Joint j's rotation in sample i of a skeleton clip, and the root's offset.
+fn skel_turn(clip: u32, i: u32, j: u32) -> vec4<f32> {
+    return clips[rig.skel.clips[clip].x + i * (rig.skel.params.x + 1u) + 1u + j];
+}
+
+fn skel_root(clip: u32, i: u32) -> vec3<f32> {
+    return clips[rig.skel.clips[clip].x + i * (rig.skel.params.x + 1u)].xyz;
+}
+
+// Whether a skeleton clip slot holds a clip.
+fn skel_has(clip: u32) -> bool {
+    return rig.skel.clips[clip].y > 0u;
+}
+
+// Where a skeleton clip is at time t (seconds): the clip, the sample
+// before, and how far toward the next. A looping clip wraps, another
+// holds its ends.
+struct SkelAt {
+    clip: u32,
+    i: u32,
+    f: f32,
+};
+
+fn skel_at(clip: u32, t: f32) -> SkelAt {
+    let count = rig.skel.clips[clip].y;
+    let len = rig.skel.rates[clip].y;
+    var x = clamp(t, 0.0, len);
+    if rig.skel.clips[clip].w > 0u && len > 0.0 {
+        x = t - len * floor(t / len);
+    }
+    let s = x * rig.skel.rates[clip].x;
+    let i = min(u32(s), max(count, 2u) - 2u);
+    return SkelAt(clip, i, select(0.0, clamp(s - f32(i), 0.0, 1.0), count > 1u));
+}
+
+// Joint j's rotation, and the root's offset, at a place in a clip.
+fn skel_turn_at(s: SkelAt, j: u32) -> vec4<f32> {
+    let next = min(s.i + 1u, rig.skel.clips[s.clip].y - 1u);
+    return qblend(skel_turn(s.clip, s.i, j), skel_turn(s.clip, next, j), s.f);
+}
+
+fn skel_root_at(s: SkelAt) -> vec3<f32> {
+    let next = min(s.i + 1u, rig.skel.clips[s.clip].y - 1u);
+    return mix(skel_root(s.clip, s.i), skel_root(s.clip, next), s.f);
+}
+
+// Rotation a toward b by t, the shorter way.
+fn qblend(a: vec4<f32>, b: vec4<f32>, t: f32) -> vec4<f32> {
+    return normalize(mix(a, select(b, -b, dot(a, b) < 0.0), t));
+}
+
+// The sword arm's blow and cheer as `put_rig_arm` plays them from the
+// rest pose, without the march's sway and carry: shoulder, elbow and
+// wrist pitches (+ taking +Z toward +Y), and the slash's yaw.
+fn sword_arm() -> vec4<f32> {
+    let reach = length(rig.elbow - rig.shoulder) + length(rig.grip - rig.elbow);
+    let rest = yz_angle(rig.tip);
+    var goal = rig.grip;
+    var aim = rest;
+    var turn = 0.0;
+    var yaw = 0.0;
+    if pre.celebrate > 0.001 {
+        turn = pre.celebrate * (1.75 + 0.35 * sin(pre.wobble));
+    } else if pre.style < 0.5 {
+        goal = rig.grip + yz_dir(rest) * reach * (-0.4 * pre.raise * (1.0 - pre.chop) + 0.7 * pre.chop);
+        aim = rest + 0.15 * pre.raise - 0.1 * pre.chop;
+    } else if pre.style < 1.5 {
+        turn = 1.9 * pre.raise - 2.5 * pre.chop;
+    } else {
+        yaw = -1.1 * pre.raise + 2.3 * pre.chop;
+        turn = 0.5 * pre.raise - 0.3 * pre.chop;
+    }
+    let pose = arm_pose(goal, aim);
+    return vec4<f32>(pose.x + turn, pose.y, pose.z, yaw);
+}
+
+// A skinned soldier: one rotation per joint, relative to its parent, then
+// the hierarchy walked once into each joint's rotation and posed origin.
+// He stands in the standing clip, and in the ready clip while an enemy is
+// near and he is still. Near the enemy and slow he steps in the step
+// clips (unit_build.wgsl `steps`). Faster, his legs take the gait and his
+// arms its sway. A cut plays its clip, which starts and ends in the ready
+// pose: the blade lands on the strike tick, and on the move his legs keep
+// the gait. Another blow plays the sword arm's motion over the guard's
+// arm, the body holding its guard; the cheer plays it from the standing
+// pose. The fallen lie in the standing pose.
+fn put_skeleton() {
+    let n = rig.skel.params.x;
+    let alive = pre.leg > 0.0;
+    let moving = select(0.0, pre.moving, alive);
+    var strike = 0.0;
+    if pre.following {
+        strike = 1.0 - smoothstep(0.75, 1.0, pre.follow);
+    } else if pre.windup > 0.0 {
+        strike = smoothstep(0.0, 0.2, pre.windup);
+    }
+    // A blow from a clip: the cut or the stab, played the same way.
+    let clip_blow = pre.cut || pre.stab;
+    let blow_clip = select(CLIP_CUT, CLIP_STAB, pre.stab);
+    let cut = select(0.0, strike, alive && clip_blow);
+    var act = select(max(pre.celebrate, strike), pre.celebrate, clip_blow);
+    act = select(0.0, act, alive && rig.arm > 0.5 && rig.hold < 1.5);
+    let level = max(max(pre.stance, pre.ready * 0.75), max(pre.sprint, pre.wall)) * (1.0 - pre.celebrate);
+    // The guard holds through a blow: the stab thrusts and the overhead
+    // chops from the crouch, the arm's motion landing over the guard's
+    // arm. Only the cheer, in `level`, drops it.
+    let guard = select(0.0, level * (1.0 - moving), alive);
+
+    var turn: array<vec4<f32>, 20>;
+    for (var j = 0u; j < n; j++) {
+        turn[j] = qblend(skel_turn(CLIP_STAND, 0u, j), skel_turn(CLIP_READY, 0u, j), guard);
+    }
+    var root = mix(skel_root(CLIP_STAND, 0u), skel_root(CLIP_READY, 0u), guard);
+    let core = rig.skel.roles[0];
+    let arm_r = rig.skel.roles[1];
+    let arm_l = rig.skel.roles[2];
+
+    let step_w = select(0.0, pre.step_w, alive);
+    if step_w > 0.0 {
+        // His steps, the whole body: each play starts and ends in the
+        // ready pose.
+        let at = skel_at(pre.step_clip, pre.step_x * rig.skel.rates[pre.step_clip].y);
+        for (var j = 0u; j < n; j++) {
+            turn[j] = qblend(turn[j], skel_turn_at(at, j), step_w);
+        }
+        root = mix(root, skel_root_at(at), step_w);
+    }
+    if moving > 0.0 {
+        // The gait: thigh, knee and foot pitches, the weapon side's leg
+        // half a cycle after the shield side's (`put_leg`). The coat
+        // swings with the thigh.
+        for (var side = 0u; side < 2u; side++) {
+            let pose = leg_pose(fract(pre.gait + select(0.5, 0.0, side == 1u)), pre.g);
+            let shin = pose.x - pose.y;
+            let leg = rig.skel.roles[3u + side];
+            let coat = rig.skel.roles[1u + side].w;
+            turn[leg.x] = qblend(turn[leg.x], qx(-pose.x), moving);
+            turn[leg.y] = qblend(turn[leg.y], qx(pose.y), moving);
+            turn[leg.z] = qblend(turn[leg.z], qx(shin - pose.z), moving);
+            turn[coat] = qblend(turn[coat], qx(-pose.x), moving);
+        }
+        // The shoulders turn against the legs, and the arms counter them.
+        turn[core.y] = qmul(turn[core.y], qy(0.10 * pre.g.run * pre.g.stride * pre.limb * moving));
+        let sway = (0.18 - 0.06 * pre.g.run) * moving * pre.limb * (1.0 - pre.raise);
+        turn[arm_r.x] = qmul(qx(-sway), turn[arm_r.x]);
+        turn[arm_l.x] = qmul(qx(0.06 * moving * pre.limb * (1.0 - pre.wall)), turn[arm_l.x]);
+    }
+    if cut > 0.0 {
+        // Clip time from the wind-up to the blow at its contact, then
+        // from the blow to its end over the follow-through.
+        let rates = rig.skel.rates[blow_clip];
+        var t = pre.windup * rates.z;
+        if pre.following {
+            t = rates.z + pre.follow * (rates.y - rates.z);
+        }
+        let at = skel_at(blow_clip, t);
+        // On the move the pelvis, legs and coat keep the gait.
+        let low = cut * (1.0 - moving);
+        let leg_r = rig.skel.roles[3];
+        let leg_l = rig.skel.roles[4];
+        for (var j = 0u; j < n; j++) {
+            let lower = j == core.x || j == arm_r.w || j == arm_l.w
+                || any(vec3<u32>(j) == leg_r.xyz) || any(vec3<u32>(j) == leg_l.xyz);
+            turn[j] = qblend(turn[j], skel_turn_at(at, j), select(cut, low, lower));
+        }
+        root = mix(root, skel_root_at(at), low);
+    }
+    if act > 0.0 {
+        let blow = sword_arm();
+        turn[arm_r.x] = qblend(turn[arm_r.x], qmul(qx(-blow.x), qy(blow.w)), act);
+        turn[arm_r.y] = qblend(turn[arm_r.y], qx(-blow.y), act);
+        turn[arm_r.z] = qblend(turn[arm_r.z], QI, act);
+        turn[core.w] = qblend(turn[core.w], qx(-blow.z), act);
+    }
+
+    var rot: array<vec4<f32>, 20>;
+    var org: array<vec3<f32>, 20>;
+    for (var j = 0u; j < n; j++) {
+        let rest = rig.skel.joints[j];
+        let p = i32(rest.w);
+        if p < 0 {
+            rot[j] = normalize(turn[j]);
+            org[j] = rest.xyz + root;
+        } else {
+            rot[j] = normalize(qmul(rot[p], turn[j]));
+            org[j] = org[p] + qrot(rot[p], rest.xyz - rig.skel.joints[p].xyz);
+        }
+        pose_put(P_SKEL + j, pack_joint(rot[j], org[j]));
+    }
+}
+
 // The whole pose of the soldier with this instance record, into the slots
-// from `base` on.
+// from `base` on. His part pose always: his shadow draws by his parts at
+// every distance, and so do his far levels. His joints as well when his
+// level (`lod`) plays the clips.
 fn pose_write(
     base: u32,
     pos_scale: vec4<f32>,
@@ -1212,9 +1512,11 @@ fn pose_write(
     anim: vec4<f32>,
     anim2: vec4<f32>,
     time: f32,
+    lod: u32,
 ) {
     pose_base = base;
-    pose_begin(pos_scale, color, anim, anim2, time);
+    let skel = rig.skel.params.x > 0u && lod < SKEL_LODS;
+    pose_begin(pos_scale, color, anim, anim2, time, skel);
     put_simple();
     // The fallen keep the legs they fell with (`place`).
     if pre.leg > 0.0 {
@@ -1233,6 +1535,9 @@ fn pose_write(
         }
     } else if rig.arm > 0.5 {
         put_rig_arm();
+    }
+    if skel {
+        put_skeleton();
     }
 }
 #else
@@ -1256,8 +1561,16 @@ fn pitch_normal_cs(n: vec3<f32>, c: f32, s: f32) -> vec3<f32> {
 
 // Where a corner of the mesh lands in the world, posed: its rest position
 // and normal in the soldier's local space, its body part and the part's
-// pivot height.
-fn place(rest: vec3<f32>, rest_normal: vec3<f32>, part_id: f32, pivot_height: f32) -> Placed {
+// pivot height. On a skinned kind, `skin` is its joint pair, a + 256 * b,
+// and `weight` the share of b.
+fn place(
+    rest: vec3<f32>,
+    rest_normal: vec3<f32>,
+    part_id: f32,
+    pivot_height: f32,
+    skin: u32,
+    weight: f32,
+) -> Placed {
     let corner = Corner(rest, rest_normal, part_id, pivot_height);
     let part = corner.part;
     let pivot = corner.pivot;
@@ -1266,6 +1579,24 @@ fn place(rest: vec3<f32>, rest_normal: vec3<f32>, part_id: f32, pivot_height: f3
     let bow_rig = rig.bow.params.w > 0.5;
 
     // --- Part animation (rotations around the part pivot) ---
+    // A skinned level's shader (UNIT_SKINNED, with the pose pass) compiles
+    // the skinning alone, the others the part chain alone.
+#ifdef UNIT_SKINNED
+    // The corner turns about joint b's origin by the blend of its two
+    // joints' rotations: rigid on a at weight 0, on b at 1.
+    let a = skin & 0xffu;
+    let b = (skin >> 8u) & 0xffu;
+    let ja = pose_at(P_SKEL + a);
+    var jb = ja;
+    var q = joint_rot(ja);
+    if b != a {
+        jb = pose_at(P_SKEL + b);
+        let qb = joint_rot(jb);
+        q = normalize(mix(q, select(qb, -qb, dot(q, qb) < 0.0), weight));
+    }
+    local = joint_org(jb) + qrot(q, local - rig.skel.joints[b].xyz);
+    normal = qrot(q, normal);
+#else
     if bow_rig && (abs(part - 1.0) < 0.5 || abs(part - 6.0) < 0.5 || (part > 7.5 && part < 19.5)) {
 #ifdef UNIT_POSE_READ
         var k = u32(part + 0.5) - 6u;
@@ -1394,6 +1725,7 @@ fn place(rest: vec3<f32>, rest_normal: vec3<f32>, part_id: f32, pivot_height: f3
         local = pitch_about_cs(local, pivot, a.x, a.y);
         normal = pitch_normal_cs(normal, a.x, a.y);
     }
+#endif
 
     // An archer's hips and legs turn side-on with his body as his bow
     // comes up. The rest of his body turned with the bow rig.
@@ -1405,7 +1737,9 @@ fn place(rest: vec3<f32>, rest_normal: vec3<f32>, part_id: f32, pivot_height: f3
 
     // The shoulders turn against the legs and the upper body shifts over
     // the planted foot, easing in up the torso so the hips stay square.
+    // A skinned kind takes the turn in its chest joint.
     let yaw = pose_at(P_YAW);
+#ifndef UNIT_SKINNED
     if part < 1.5 || (part > 3.5 && part < 6.5) || (part > 7.5 && part < 19.5) {
         let turn = pose_at(P_TURN);
         let torso = part < 0.5 || abs(part - 19.0) < 0.5;
@@ -1421,6 +1755,7 @@ fn place(rest: vec3<f32>, rest_normal: vec3<f32>, part_id: f32, pivot_height: f3
         normal = rot_y(normal, c, s);
         local.x += turn.z * w;
     }
+#endif
 
     // The lean shears the body forward from the soles up.
     let lean = yaw.z * clamp(local.y + rig.half, 0.0, 3.0 * rig.half);
