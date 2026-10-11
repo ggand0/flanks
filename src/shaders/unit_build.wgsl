@@ -152,6 +152,9 @@ struct Params {
     ring_base: u32,
     // Per kind: the first entry of its region in `pose_src`.
     pose_src_base: vec4<u32>,
+    // Per kind: the slots in its region of the pose sources and of its
+    // pose buffer.
+    pose_cap: vec4<u32>,
     // 1 with the pose pass on.
     pose_pass: u32,
     // Per cascade and kind: soldiers per instance of the level the caster
@@ -181,7 +184,7 @@ struct DrawArgs {
 // selection rings, 49..53 the pose slots taken per kind, then per bucket
 // and depth bin (`BIN_COUNTER`) the soldiers in it, which `finalize` turns
 // into the bin's first slot in the bucket's list.
-@group(0) @binding(6) var<storage, read_write> counts: array<atomic<u32>, 2101>;
+@group(0) @binding(6) var<storage, read_write> counts: array<atomic<u32>, 2105>;
 // 0..16 the camera's buckets, 16..32 the casters as in `counts`, 32 the
 // selection rings, 33..37 the pose pass's dispatch per kind (x, y, z).
 @group(0) @binding(7) var<storage, read_write> args: array<DrawArgs, 37>;
@@ -244,11 +247,17 @@ const RING_HOVER_ENEMY: u32 = 2u;
 const RING_COUNTER: u32 = 48u;
 const RING_ARG: u32 = 32u;
 // The pose slot counters in `counts`, and the pose dispatches in `args`.
+// Per kind, the near levels' slots count up from the front of the kind's
+// region and the far levels' down from its back (`list_entry`).
 const POSE_COUNTER: u32 = 49u;
 const POSE_ARG: u32 = 33u;
 // Depth bins per bucket, and where their counters start in `counts`.
 const DEPTH_BINS: u32 = 128u;
 const BIN_COUNTER: u32 = 53u;
+const POSE_FAR_COUNTER: u32 = BIN_COUNTER + 16u * DEPTH_BINS;
+// The levels a skinned kind poses by its skeleton (render_units_gpu.rs
+// SKEL_LODS, unit_pose.wgsl `pose_write`).
+const SKEL_LODS: u32 = 2u;
 // Levels drawn near to far: below this one. The near levels' soldiers are
 // large on screen, so the depth test spares the shading of most of those
 // behind them. A far soldier is a few pixels, and his neighbours in his
@@ -314,16 +323,29 @@ fn queue_draw(t: u32, bucket: u32, entry: u32, lod: u32, dist2: f32) {
     draws[t] = Draw(cell, slot, entry | (lod << 30u));
 }
 
-// The list entry of drawn record `r` of a soldier of `kind`: the record,
-// or with the pose pass a pose slot of his kind that the pass fills from
-// the record. A soldier or body takes at most one slot a frame, so a
-// kind's region holds its living and its fallen.
-fn list_entry(kind: u32, r: u32) -> u32 {
+// The list entry of drawn record `r` of a soldier of `kind` at level
+// `lod`: the record, or with the pose pass a pose slot of his kind that
+// the pass fills from the record. A soldier or body takes at most one
+// slot a frame, so a kind's region holds its living and its fallen.
+//
+// A skinned kind poses by its skeleton at the near levels only
+// (unit_pose.wgsl `pose_write`), and the level rides the top two bits of
+// the slot's source. The near levels take their slots from the front of
+// the region and the far levels from its back: the pose pass runs the
+// skeleton for a whole warp when one thread of it needs it, and in a
+// region in soldier order nearly every warp of a kind holds one of the
+// near soldiers (8% of the knights in the flank view, 93% of its warps).
+fn list_entry(kind: u32, r: u32, lod: u32) -> u32 {
     if params.pose_pass == 0u {
         return r;
     }
-    let slot = atomicAdd(&counts[POSE_COUNTER + kind], 1u);
-    pose_src[params.pose_src_base[kind] + slot] = r;
+    var slot: u32;
+    if lod < SKEL_LODS {
+        slot = atomicAdd(&counts[POSE_COUNTER + kind], 1u);
+    } else {
+        slot = params.pose_cap[kind] - 1u - atomicAdd(&counts[POSE_FAR_COUNTER + kind], 1u);
+    }
+    pose_src[params.pose_src_base[kind] + slot] = r | (lod << 30u);
     return slot;
 }
 
@@ -598,7 +620,7 @@ fn build_soldier(i: u32) {
         vec4<f32>(sm.band, sm.wall, sm.gait, stagger),
     );
     smoothing[i] = sm;
-    let entry = list_entry(kind, i);
+    let entry = list_entry(kind, i, lod);
     if visible {
         queue_draw(i, kind * NUM_LODS + lod, entry, lod, dot(d, d));
         if death_t == 0.0 && (reg.flags & (REG_SELECTED | REG_HOVERED | REG_HOVER_OWN)) != 0u {
@@ -652,7 +674,7 @@ fn build_corpse(j: u32, t: u32) {
     if !visible && casts == 0u {
         return;
     }
-    let entry = list_entry(kind, ridx);
+    let entry = list_entry(kind, ridx, lod);
     if visible {
         let bucket = kind * NUM_LODS + lod;
         atomicAdd(&counts[16u + bucket], 1u);
@@ -746,7 +768,7 @@ fn finalize(@builtin(local_invocation_index) b: u32) {
     readback[b] = count;
     readback[16u + b] = fallen;
     if b < 4u {
-        let posed = atomicLoad(&counts[POSE_COUNTER + b]);
+        let posed = atomicLoad(&counts[POSE_COUNTER + b]) + atomicLoad(&counts[POSE_FAR_COUNTER + b]);
         args[POSE_ARG + b] = DrawArgs((posed + 63u) / 64u, 1u, 1u, 0u);
     }
     if b == 0u {

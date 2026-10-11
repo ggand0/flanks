@@ -105,7 +105,7 @@ const DEPTH_BIN_SPAN: f32 = 24.0;
 /// Build counters: per bucket the soldiers and the fallen, the caster
 /// lists, the ring count, the pose slots taken per kind, then per bucket
 /// its depth bins.
-const COUNTERS: usize = 2 * NUM_BUCKETS + CASTER_LISTS + 1 + NUM_KINDS + NUM_BUCKETS * DEPTH_BINS;
+const COUNTERS: usize = 2 * NUM_BUCKETS + CASTER_LISTS + 1 + NUM_KINDS + NUM_BUCKETS * DEPTH_BINS + NUM_KINDS;
 
 /// Storage buffers the build pass binds (`init_gpu_unit_pipelines`), more
 /// than any other unit pass. A device that allows fewer per stage keeps the
@@ -113,12 +113,21 @@ const COUNTERS: usize = 2 * NUM_BUCKETS + CASTER_LISTS + 1 + NUM_KINDS + NUM_BUC
 const STORAGE_BUFFERS: u32 = 11;
 
 /// Pose slots (four floats each) per soldier of a kind without a bow rig,
-/// of one with it, and of one posed by a skeleton: the six common slots
-/// and one per joint (`POSE_SLOTS`, `POSE_SLOTS_BOW` and `POSE_SLOTS_SKEL`
-/// in shaders/unit_pose.wgsl).
+/// of one with it, and of a skinned kind: the part pose and one per joint
+/// (`POSE_SLOTS`, `POSE_SLOTS_BOW` and `POSE_SLOTS_SKEL` in
+/// shaders/unit_pose.wgsl).
 const POSE_SLOTS: u32 = 17;
 const POSE_SLOTS_BOW: u32 = 45;
-const POSE_SLOTS_SKEL: u32 = 6 + crate::unit_meshes::SKEL_JOINTS as u32;
+const POSE_SLOTS_SKEL: u32 = POSE_SLOTS + crate::unit_meshes::SKEL_JOINTS as u32;
+
+/// The levels a skinned kind poses by its skeleton and draws skinned: L0
+/// and L1, where a soldier stands 12 px or taller (render_units.rs
+/// `LOD_PX_PER_M`). Below that the clips' motion is under a pixel, and
+/// the soldier poses and draws by his parts as a kind without a skeleton
+/// does, so the nine soldiers in ten that are far cost what they cost
+/// without clips. The shadows draw the far levels, so they draw by parts
+/// at every distance, and a near soldier's pose holds his part pose too.
+pub(crate) const SKEL_LODS: usize = 2;
 
 /// Bytes of one set of per-bucket list entries in the bucket table: the
 /// camera's set, then one per cascade. A pulled draw binds one set, at a
@@ -233,6 +242,9 @@ pub struct BuildParams {
     ring_base: u32,
     /// Per kind: the first entry of its region of the pose sources.
     pose_src_base: UVec4,
+    /// Per kind: the slots in its region of the pose sources and of its
+    /// pose buffer.
+    pose_cap: UVec4,
     /// 1 with the pose pass on.
     pose_pass: u32,
     /// Per cascade and kind: soldiers per instance of the level he casts
@@ -248,10 +260,11 @@ pub struct BuildParams {
 struct PoseParams {
     src_base: UVec4,
     stride: UVec4,
+    cap: UVec4,
 }
 
 const _: () = assert!(NUM_KINDS == 4, "BuildParams and PoseParams pack per-kind values in vec4s");
-const _: () = assert!(COUNTERS == 2101, "unit_build.wgsl sizes `counts` for 2101");
+const _: () = assert!(COUNTERS == 2105, "unit_build.wgsl sizes `counts` for 2105");
 const _: () = assert!(DEPTH_BINS == 128, "unit_build.wgsl has 128 depth bins per bucket");
 const _: () = assert!(NUM_BUCKETS == 16, "unit_build.wgsl sizes its counters for 16 buckets");
 const _: () = assert!(MAX_CASCADES == 4, "unit_build.wgsl sizes its cascades for 4");
@@ -1406,6 +1419,9 @@ pub struct UnitAlloc {
     /// most one slot a frame (unit_build.wgsl `list_entry`).
     pose_src: Buffer,
     pose_src_base: [u32; NUM_KINDS],
+    /// Per kind: the slots in its region of the pose sources and of its
+    /// pose buffer, its live capacity and the bodies.
+    pose_cap: [u32; NUM_KINDS],
     /// Per kind, each drawn soldier's pose (shaders/unit_pose.wgsl):
     /// `pose_stride` slots of four floats per pose slot. One buffer per
     /// kind keeps each binding a kind's size.
@@ -1449,9 +1465,11 @@ impl UnitAlloc {
         total += live_cap;
         let regiments_cap = 256;
         let mut pose_src_base = [0u32; NUM_KINDS];
+        let mut pose_cap = [0u32; NUM_KINDS];
         let mut sources = 0usize;
         for (kind, base) in pose_src_base.iter_mut().enumerate() {
             *base = sources as u32;
+            pose_cap[kind] = (kind_cap[kind] + CORPSE_CAP) as u32;
             sources += kind_cap[kind] + CORPSE_CAP;
         }
         let limit = device.limits().max_storage_buffer_binding_size as usize;
@@ -1516,6 +1534,7 @@ impl UnitAlloc {
             ),
             pose_src: storage_buffer(device, "unit pose sources", sources * 4, BufferUsages::empty()),
             pose_src_base,
+            pose_cap,
             poses,
             pose_stride,
         }
@@ -1686,6 +1705,7 @@ fn prepare_gpu_units(
     params.shadow_corners = cast_with(1);
     params.shadow_groups = cast_with(3);
     params.pose_src_base = UVec4::from_array(alloc.pose_src_base);
+    params.pose_cap = UVec4::from_array(alloc.pose_cap);
     params.pose_pass = input.pose_pass as u32;
     buffers.params.set(params);
     buffers.params.write_buffer(&device, &queue);
@@ -1694,6 +1714,7 @@ fn prepare_gpu_units(
     buffers.pose_params.set(PoseParams {
         src_base: UVec4::from_array(alloc.pose_src_base),
         stride: UVec4::from_array(alloc.pose_stride),
+        cap: UVec4::from_array(alloc.pose_cap),
     });
     buffers.pose_params.write_buffer(&device, &queue);
 

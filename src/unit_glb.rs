@@ -33,9 +33,11 @@
 //!
 //! A model with a glTF skin and the clips of `SKEL_CLIPS` next to it
 //! (`<kind>.<clip>.json`, the one clip format of docs/plans/022) is posed
-//! by its skeleton unless `FL_CLIPS=0`: every vertex follows a joint pair
+//! by its skeleton at the near levels (render_units_gpu.rs `SKEL_LODS`)
+//! unless `FL_CLIPS=0`: every vertex follows a joint pair
 //! (`ATTRIBUTE_SKIN`), and the pose pass plays the clips (unit_pose.wgsl
-//! `put_skeleton`). With `FL_CLIPS=0` the same file draws by its parts.
+//! `put_skeleton`). At the far levels, and everywhere with `FL_CLIPS=0`,
+//! the same file draws by its parts.
 //!
 //! `FL_UNIT_MESH=code` keeps the code-built meshes and `FL_GLB_FAR=code`
 //! fills only the missing levels from them. `FL_GLB_<KIND>=path` loads

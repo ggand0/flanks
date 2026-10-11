@@ -627,15 +627,18 @@ const P_RIG: u32 = 13u;
 // Two slots per bow rig part (`bow_part`): the rotation, then the offset
 // and the scale.
 const P_BOW: u32 = 17u;
-// A skinned kind: one slot per joint from here, after the common slots.
-// The joint's rotation in local space and its posed origin, as halves
-// (`pack_joint`).
-const P_SKEL: u32 = 6u;
+// A skinned kind: one slot per joint from here, after the part pose,
+// which his shadow and his far levels draw by. The joint's rotation in
+// local space and its posed origin, as halves (`pack_joint`).
+const P_SKEL: u32 = 17u;
 // Slots per soldier: without a bow rig, with one, and with a skeleton
 // (render_units_gpu.rs POSE_SLOTS).
 const POSE_SLOTS: u32 = 17u;
 const POSE_SLOTS_BOW: u32 = 45u;
-const POSE_SLOTS_SKEL: u32 = 26u;
+const POSE_SLOTS_SKEL: u32 = 37u;
+// The levels a skinned kind poses by its skeleton (render_units_gpu.rs
+// SKEL_LODS): L0 and L1. Further out he poses by his parts.
+const SKEL_LODS: u32 = 2u;
 // A skinned kind's clips, by slot (unit_glb.rs `SKEL_CLIPS`).
 const CLIP_STAND: u32 = 0u;
 const CLIP_READY: u32 = 1u;
@@ -764,7 +767,10 @@ var<private> pre: Pre;
 
 // Work out the animation state of the soldier with this instance record
 // (render_units.rs InstanceData) and fill the slots every corner reads.
-fn pose_begin(pos_scale: vec4<f32>, color: vec4<f32>, anim: vec4<f32>, anim2: vec4<f32>, time: f32) {
+// `skel`: his skeleton poses him (a skinned kind at a near level,
+// SKEL_LODS), so his steps and his cut clip count; else he poses by his
+// parts as on a kind without a skeleton.
+fn pose_begin(pos_scale: vec4<f32>, color: vec4<f32>, anim: vec4<f32>, anim2: vec4<f32>, time: f32, skel: bool) {
     let inst = Inst(pos_scale, color, anim, anim2);
     let yaw = inst.anim.x;
     let speed = inst.anim.y;
@@ -773,7 +779,7 @@ fn pose_begin(pos_scale: vec4<f32>, color: vec4<f32>, anim: vec4<f32>, anim2: ve
     var step_clip = 0u;
     var step_x = 0.0;
     var step_w = 0.0;
-    if rig.skel.params.x > 0u {
+    if skel {
         let q = u32(max(inst.pos_scale.w, 0.0) + 0.5);
         step_clip = CLIP_SHUFFLE_LEFT + (q & 3u);
         step_x = f32((q >> 2u) & 1023u) / 1023.0;
@@ -823,7 +829,7 @@ fn pose_begin(pos_scale: vec4<f32>, color: vec4<f32>, anim: vec4<f32>, anim2: ve
     let follow = clamp((within - 1.4) / 0.59, 0.0, 1.0);
     // A skinned kind with a cut clip plays it for the classic swing (the
     // sim's slow cut; a charging blow is a stab).
-    let cut = rig.skel.params.x > 0u
+    let cut = skel
         && rig.skel.clips[CLIP_CUT].y > 0u
         && rig.skel.rates[CLIP_CUT].z > 0.0
         && !charge
@@ -1483,7 +1489,9 @@ fn put_skeleton() {
 }
 
 // The whole pose of the soldier with this instance record, into the slots
-// from `base` on.
+// from `base` on. His part pose always: his shadow draws by his parts at
+// every distance, and so do his far levels. His joints as well when his
+// level (`lod`) plays the clips.
 fn pose_write(
     base: u32,
     pos_scale: vec4<f32>,
@@ -1491,13 +1499,11 @@ fn pose_write(
     anim: vec4<f32>,
     anim2: vec4<f32>,
     time: f32,
+    lod: u32,
 ) {
     pose_base = base;
-    pose_begin(pos_scale, color, anim, anim2, time);
-    if rig.skel.params.x > 0u {
-        put_skeleton();
-        return;
-    }
+    let skel = rig.skel.params.x > 0u && lod < SKEL_LODS;
+    pose_begin(pos_scale, color, anim, anim2, time, skel);
     put_simple();
     // The fallen keep the legs they fell with (`place`).
     if pre.leg > 0.0 {
@@ -1516,6 +1522,9 @@ fn pose_write(
         }
     } else if rig.arm > 0.5 {
         put_rig_arm();
+    }
+    if skel {
+        put_skeleton();
     }
 }
 #else
