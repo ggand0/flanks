@@ -50,10 +50,13 @@ const PLANS_PER_TICK: usize = 16;
 /// An attack order checks this often (ticks) whether its target has left
 /// the end of its route.
 const ATTACK_RECHECK: u32 = 15;
-/// A man looking along his route for a point he can walk to checks every
-/// this many metres of it, and looks back along it at most `FOLLOW_BACK`.
-const FOLLOW_STEP: f32 = 2.0;
-const FOLLOW_BACK: f32 = 30.0;
+/// Where a man whose way to his slot is blocked looks for a point of his
+/// route he can walk to: this far ahead of his place on it, the farthest
+/// first, then this far back. Each is one line check (nav.rs `SIGHT`
+/// bounds it), so a man's tick costs at most these plus his route's
+/// waypoints.
+const FOLLOW_AHEAD: [f32; 5] = [48.0, 24.0, 12.0, 6.0, 3.0];
+const FOLLOW_BACK: [f32; 2] = [6.0, 20.0];
 
 /// One regiment's route as the kernel reads it: the points from the
 /// route's start to its current waypoint (`points[k]`; the regiment's
@@ -494,12 +497,12 @@ pub(crate) fn plan_all(nav: &NavGrid, requests: &[PlanRequest], out: &mut Vec<Pl
 ///
 /// `frame` is his regiment's frame point (its current waypoint, or the
 /// goal on the last leg) and `slot` his own slot around it. With his
-/// straight way to his slot open, he walks to it. Otherwise he follows the
-/// route: from his place on it (the nearest point of its legs up to the
-/// frame), the farthest point ahead he can walk to straight. Failing any,
-/// the nearest point behind his place he can walk to. Failing that too, he
-/// steps round what stands in front of him, to the side his place on the
-/// route lies.
+/// straight way to his slot open as far as he sees, he walks to it.
+/// Otherwise he follows the route: from his place on it (the nearest
+/// point of its legs up to the frame), the farthest of a few points ahead
+/// he can walk to straight. Failing any, a point behind his place he can
+/// walk to. Failing that too, he steps round what stands in front of him,
+/// to the side his place on the route lies.
 #[inline]
 pub(crate) fn man_target(
     nav: &NavGrid,
@@ -533,31 +536,29 @@ pub(crate) fn man_target(
             return (point(j), true);
         }
     }
-    // Along his leg, from his place to its end: the farthest he can reach.
+    // Along his leg from his place toward its end, the farthest first.
     let end = point(leg + 1);
     let len = at.distance(end);
-    let steps = (len / FOLLOW_STEP).ceil() as usize;
-    let mut reach = None;
-    for s in (0..steps).rev() {
-        let q = at.lerp(end, s as f32 * FOLLOW_STEP / len.max(1e-6));
-        if nav.walk_line(p, q) {
-            reach = Some(q);
-            break;
+    for &ahead in &FOLLOW_AHEAD {
+        if ahead >= len {
+            continue;
         }
-    }
-    if let Some(q) = reach {
-        return (q, true);
-    }
-    // Back along the route from his place.
-    let start = point(leg);
-    let back = at.distance(start).min(FOLLOW_BACK);
-    let mut s = FOLLOW_STEP;
-    while s <= back {
-        let q = at.lerp(start, s / at.distance(start).max(1e-6));
+        let q = at.lerp(end, ahead / len);
         if nav.walk_line(p, q) {
             return (q, true);
         }
-        s += FOLLOW_STEP;
+    }
+    // Back along the route from his place.
+    let start = point(leg);
+    let back = at.distance(start);
+    for &b in &FOLLOW_BACK {
+        if b >= back {
+            break;
+        }
+        let q = at.lerp(start, b / back);
+        if nav.walk_line(p, q) {
+            return (q, true);
+        }
     }
     // Nothing on the route in reach: step round what is in front of him,
     // turning first to the side his place on the route lies.

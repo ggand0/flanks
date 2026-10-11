@@ -41,6 +41,10 @@ const ROOM: f32 = 2.0;
 /// A smoothed segment may cost this much more than the grid path it
 /// replaces (the sampled cost and the stepped cost differ slightly).
 const SMOOTH_SLACK: f32 = 1.02;
+/// How far ahead a man looks along his way for blocked ground (m). What
+/// lies beyond he meets when he gets there; his regiment's waypoint
+/// leads him meanwhile. Bounds every line check a man makes.
+pub const SIGHT: f32 = 48.0;
 
 /// The grid. See the module docs.
 pub struct NavGrid {
@@ -376,14 +380,16 @@ impl NavGrid {
         self.cell_at(p).map_or(0.0, |i| self.clear[i])
     }
 
-    /// A man can walk the straight line from `a` to `b` without stepping
-    /// on unwalkable ground. Marches along the line by the clearance: in
-    /// open ground a few lookups cover the whole way, next to a wall it
-    /// steps half a metre.
+    /// A man at `a` sees no unwalkable ground on the straight line to `b`,
+    /// as far as he looks (`SIGHT`). Marches along the line by the
+    /// clearance: in open ground a few lookups cover the whole way, next
+    /// to a wall it steps half a metre, so a look is at most about a
+    /// hundred lookups.
     pub fn walk_line(&self, a: Vec2, b: Vec2) -> bool {
         let d = b - a;
         let len = d.length();
         let dir = if len > 1e-4 { d / len } else { Vec2::ZERO };
+        let len = len.min(SIGHT);
         // A point is within half a cell's diagonal of its vertex, and an
         // unwalkable cell reaches as far from its own: the free radius
         // around a point is its vertex's clearance less a full diagonal.
