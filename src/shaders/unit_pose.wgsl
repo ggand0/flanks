@@ -390,6 +390,29 @@ fn qalign(a: vec3<f32>, b: vec3<f32>) -> vec4<f32> {
     return normalize(vec4<f32>(cross(a, b), 1.0 + dot(a, b)));
 }
 
+// A posed joint in one pose slot: its rotation and its origin as halves,
+// (x, y), (z, w), (ox, oy), (oz, 0). Halves of finite values never form a
+// NaN pattern in the float slot they ride in. Written by the pose pass
+// (`put_skeleton`), read by every corner of a skinned level (`place`).
+fn pack_joint(rot: vec4<f32>, org: vec3<f32>) -> vec4<f32> {
+    return bitcast<vec4<f32>>(vec4<u32>(
+        pack2x16float(rot.xy),
+        pack2x16float(rot.zw),
+        pack2x16float(org.xy),
+        pack2x16float(vec2<f32>(org.z, 0.0)),
+    ));
+}
+
+fn joint_rot(slot: vec4<f32>) -> vec4<f32> {
+    let u = bitcast<vec4<u32>>(slot);
+    return vec4<f32>(unpack2x16float(u.x), unpack2x16float(u.y));
+}
+
+fn joint_org(slot: vec4<f32>) -> vec3<f32> {
+    let u = bitcast<vec4<u32>>(slot);
+    return vec3<f32>(unpack2x16float(u.z), unpack2x16float(u.w).x);
+}
+
 // Where a shot is in its table: the first of the two poses it lies
 // between, how far toward the second, and where the table starts.
 struct ShotAt {
@@ -604,14 +627,15 @@ const P_RIG: u32 = 13u;
 // Two slots per bow rig part (`bow_part`): the rotation, then the offset
 // and the scale.
 const P_BOW: u32 = 17u;
-// A skinned kind: two slots per joint from here, after the common slots.
-// The joint's rotation in local space, then its posed origin.
+// A skinned kind: one slot per joint from here, after the common slots.
+// The joint's rotation in local space and its posed origin, as halves
+// (`pack_joint`).
 const P_SKEL: u32 = 6u;
 // Slots per soldier: without a bow rig, with one, and with a skeleton
 // (render_units_gpu.rs POSE_SLOTS).
 const POSE_SLOTS: u32 = 17u;
 const POSE_SLOTS_BOW: u32 = 45u;
-const POSE_SLOTS_SKEL: u32 = 46u;
+const POSE_SLOTS_SKEL: u32 = 26u;
 // A skinned kind's clips, by slot (unit_glb.rs `SKEL_CLIPS`).
 const CLIP_STAND: u32 = 0u;
 const CLIP_READY: u32 = 1u;
@@ -1454,8 +1478,7 @@ fn put_skeleton() {
             rot[j] = normalize(qmul(rot[p], turn[j]));
             org[j] = org[p] + qrot(rot[p], rest.xyz - rig.skel.joints[p].xyz);
         }
-        pose_put(P_SKEL + 2u * j, rot[j]);
-        pose_put(P_SKEL + 2u * j + 1u, vec4<f32>(org[j], 0.0));
+        pose_put(P_SKEL + j, pack_joint(rot[j], org[j]));
     }
 }
 
@@ -1532,28 +1555,27 @@ fn place(
     var local = corner.position;
     var normal = corner.normal;
     let bow_rig = rig.bow.params.w > 0.5;
-#ifdef UNIT_POSE_READ
-    let skinned = rig.skel.params.x > 0u;
-#else
-    let skinned = false;
-#endif
 
     // --- Part animation (rotations around the part pivot) ---
-    if skinned {
-#ifdef UNIT_POSE_READ
-        // The corner turns about joint b's origin by the blend of its two
-        // joints' rotations: rigid on a at weight 0, on b at 1.
-        let a = skin & 0xffu;
-        let b = (skin >> 8u) & 0xffu;
-        var q = pose_at(P_SKEL + 2u * a);
-        if b != a {
-            let qb = pose_at(P_SKEL + 2u * b);
-            q = normalize(mix(q, select(qb, -qb, dot(q, qb) < 0.0), weight));
-        }
-        local = pose_at(P_SKEL + 2u * b + 1u).xyz + qrot(q, local - rig.skel.joints[b].xyz);
-        normal = qrot(q, normal);
-#endif
-    } else if bow_rig && (abs(part - 1.0) < 0.5 || abs(part - 6.0) < 0.5 || (part > 7.5 && part < 19.5)) {
+    // A skinned level's shader (UNIT_SKINNED, with the pose pass) compiles
+    // the skinning alone, the others the part chain alone.
+#ifdef UNIT_SKINNED
+    // The corner turns about joint b's origin by the blend of its two
+    // joints' rotations: rigid on a at weight 0, on b at 1.
+    let a = skin & 0xffu;
+    let b = (skin >> 8u) & 0xffu;
+    let ja = pose_at(P_SKEL + a);
+    var jb = ja;
+    var q = joint_rot(ja);
+    if b != a {
+        jb = pose_at(P_SKEL + b);
+        let qb = joint_rot(jb);
+        q = normalize(mix(q, select(qb, -qb, dot(q, qb) < 0.0), weight));
+    }
+    local = joint_org(jb) + qrot(q, local - rig.skel.joints[b].xyz);
+    normal = qrot(q, normal);
+#else
+    if bow_rig && (abs(part - 1.0) < 0.5 || abs(part - 6.0) < 0.5 || (part > 7.5 && part < 19.5)) {
 #ifdef UNIT_POSE_READ
         var k = u32(part + 0.5) - 6u;
         if part < 1.5 {
@@ -1681,6 +1703,7 @@ fn place(
         local = pitch_about_cs(local, pivot, a.x, a.y);
         normal = pitch_normal_cs(normal, a.x, a.y);
     }
+#endif
 
     // An archer's hips and legs turn side-on with his body as his bow
     // comes up. The rest of his body turned with the bow rig.
@@ -1694,7 +1717,8 @@ fn place(
     // the planted foot, easing in up the torso so the hips stay square.
     // A skinned kind takes the turn in its chest joint.
     let yaw = pose_at(P_YAW);
-    if !skinned && (part < 1.5 || (part > 3.5 && part < 6.5) || (part > 7.5 && part < 19.5)) {
+#ifndef UNIT_SKINNED
+    if part < 1.5 || (part > 3.5 && part < 6.5) || (part > 7.5 && part < 19.5) {
         let turn = pose_at(P_TURN);
         let torso = part < 0.5 || abs(part - 19.0) < 0.5;
         let w = select(1.0, smoothstep(0.0, 0.5 * rig.half, corner.position.y), torso);
@@ -1709,6 +1733,7 @@ fn place(
         normal = rot_y(normal, c, s);
         local.x += turn.z * w;
     }
+#endif
 
     // The lean shears the body forward from the soles up.
     let lean = yaw.z * clamp(local.y + rig.half, 0.0, 3.0 * rig.half);

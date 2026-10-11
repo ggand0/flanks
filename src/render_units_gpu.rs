@@ -114,11 +114,11 @@ const STORAGE_BUFFERS: u32 = 11;
 
 /// Pose slots (four floats each) per soldier of a kind without a bow rig,
 /// of one with it, and of one posed by a skeleton: the six common slots
-/// and two per joint (`POSE_SLOTS`, `POSE_SLOTS_BOW` and `POSE_SLOTS_SKEL`
+/// and one per joint (`POSE_SLOTS`, `POSE_SLOTS_BOW` and `POSE_SLOTS_SKEL`
 /// in shaders/unit_pose.wgsl).
 const POSE_SLOTS: u32 = 17;
 const POSE_SLOTS_BOW: u32 = 45;
-const POSE_SLOTS_SKEL: u32 = 6 + 2 * crate::unit_meshes::SKEL_JOINTS as u32;
+const POSE_SLOTS_SKEL: u32 = 6 + crate::unit_meshes::SKEL_JOINTS as u32;
 
 /// Bytes of one set of per-bucket list entries in the bucket table: the
 /// camera's set, then one per cascade. A pulled draw binds one set, at a
@@ -796,6 +796,9 @@ pub struct PullMesh {
     corners: Vec<PullVertex>,
     indexed: Option<IndexedMesh>,
     bucket: usize,
+    /// The level carries joints and weights (unit_glb.rs `ATTRIBUTE_SKIN`),
+    /// so its draw shader compiles the skinning instead of the part chain.
+    skinned: bool,
 }
 
 /// A level drawn indexed: its vertices, and its index list repeated for
@@ -1096,6 +1099,7 @@ impl PullMesh {
             corners,
             indexed,
             bucket,
+            skinned: skin.is_some(),
         })
     }
 }
@@ -1110,6 +1114,8 @@ pub struct PullMeshGpu {
     pub count: u32,
     pub bucket: usize,
     pub shape: DrawShape,
+    /// As `PullMesh::skinned`.
+    pub skinned: bool,
 }
 
 /// How a bucket's level draws. `group` 0: expanded corners, one plain draw
@@ -1165,6 +1171,7 @@ fn extract_pull_meshes(
             count: mesh.corners.len() as u32,
             bucket: mesh.bucket,
             shape,
+            skinned: mesh.skinned,
         });
     }
 }

@@ -1184,6 +1184,7 @@ fn queue_custom(
                         atlas,
                         receive,
                         pose_pass,
+                        skinned: pull_mesh.skinned,
                         shape: pull_mesh.shape,
                     },
                 ),
@@ -1503,6 +1504,9 @@ pub(crate) struct PullPipelineKey {
     /// The pose pass posed the soldiers: the index list holds pose slots
     /// (render_units_gpu.rs).
     pose_pass: bool,
+    /// The level is skinned to a skeleton the pose pass posed, so the
+    /// shader compiles the skinning and not the part chain (`place`).
+    skinned: bool,
     /// Expanded or indexed, and how (render_units_gpu.rs `DrawShape`).
     shape: DrawShape,
 }
@@ -1525,6 +1529,7 @@ impl PullPipelineKey {
             atlas: false,
             receive: false,
             pose_pass,
+            skinned: pull_mesh.skinned,
             shape: DrawShape {
                 flat_atlas: false,
                 ..pull_mesh.shape
@@ -1600,6 +1605,9 @@ impl SpecializedRenderPipeline for CustomPipeline {
         }
         if key.pose_pass {
             defs.push("UNIT_POSE_READ".into());
+            if key.skinned {
+                defs.push("UNIT_SKINNED".into());
+            }
         }
         if key.shape.group > 0 {
             defs.push("PULL_INDEXED".into());
