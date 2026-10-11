@@ -367,19 +367,20 @@ pub fn do_spawn_battle(
     if moved > 0 {
         info!("regiment layout: {moved} regiments moved off blocked ground to the spare ranks");
     }
-    // The cost tables the first routes will need, one per regiment
-    // width, built now rather than in a tick.
+    // The cost tables the routes will need, one per width class a
+    // regiment spans across any way it may take, built now rather than
+    // in a tick.
     if let Some(nav) = nav {
-        let widths: Vec<crate::nav::PlanRequest> = list
-            .iter()
-            .map(|gd| crate::nav::PlanRequest {
-                g: 0,
-                serial: 0,
-                start: Vec2::ZERO,
-                goal: Vec2::ZERO,
-                half_w: crate::sim::route::half_width(gd, Vec2::Y),
-            })
-            .collect();
+        let mut widths: Vec<crate::nav::PlanRequest> = Vec::new();
+        for gd in &list {
+            for half_w in [
+                crate::sim::route::half_width(gd, Vec2::Y),
+                crate::sim::route::half_width(gd, Vec2::X),
+                crate::sim::route::half_width_max(gd),
+            ] {
+                widths.push(crate::nav::PlanRequest { g: 0, serial: 0, start: Vec2::ZERO, goal: Vec2::ZERO, half_w });
+            }
+        }
         nav.prepare_costs(&widths);
     }
     // FL_ENEMY_STATIC=1: the enemy army holds position (never auto-

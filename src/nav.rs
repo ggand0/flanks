@@ -45,6 +45,9 @@ const SMOOTH_SLACK: f32 = 1.02;
 /// lies beyond he meets when he gets there; his regiment's waypoint
 /// leads him meanwhile. Bounds every line check a man makes.
 pub const SIGHT: f32 = 48.0;
+/// How far round an unreachable goal the planner looks for reachable
+/// ground to end the route at (m).
+const NEAR_GOAL: f32 = 400.0;
 
 /// The grid. See the module docs.
 pub struct NavGrid {
@@ -123,10 +126,9 @@ pub struct Plan {
     /// The goal itself is reachable; else the route ends at the nearest
     /// reachable ground with room for the regiment.
     pub reached: bool,
-    /// Not planned: the tick built the cost table it needs instead, and
-    /// the request goes out again with the next job.
-    pub deferred: bool,
+    /// Cells the search closed, the ticks it ran over, and its total time.
     pub cells: u32,
+    pub ticks: u32,
     pub ms: f32,
 }
 
@@ -720,19 +722,40 @@ impl NavGrid {
         out
     }
 
-    /// Plan a route for `req`: A* over the grid from the cell nearest the
-    /// start to the goal's cell, or, when the goal is out of reach, to the
-    /// nearest reachable cell with room for the regiment; then the grid
-    /// path is pulled straight wherever a straight segment keeps the same
-    /// clearance and costs no more.
-    pub fn plan(&self, req: &PlanRequest, s: &mut Scratch) -> Plan {
+    /// Plan a route for `req` in one go: a search begun and run to its end.
+    #[cfg(test)]
+    pub fn plan(&self, req: &PlanRequest) -> Plan {
+        let mut search = self.begin(req);
+        self.advance(&mut search, u32::MAX).expect("an unbounded search finishes")
+    }
+
+    /// Begin a route search for `req`: A* over the grid from the cell
+    /// nearest the start to the goal's cell, or, when the goal is out of
+    /// reach, to the nearest reachable cell with room for the regiment.
+    /// `advance` runs it, a budget of cells at a time, so a long search
+    /// spreads over ticks and no tick waits for it.
+    pub fn begin(&self, req: &PlanRequest) -> Search {
         let t0 = Instant::now();
         let need = req.half_w.clamp(CELL, CLEAR_CAP - CELL);
         let costs = self.costs(Span::of(need));
-        let mut out = Plan { req: *req, points: Vec::new(), reached: false, deferred: false, cells: 0, ms: 0.0 };
+        let mut search = Search {
+            req: *req,
+            need,
+            costs,
+            start: 0,
+            target: 0,
+            reached: false,
+            heap: BinaryHeap::new(),
+            seen: std::collections::HashMap::new(),
+            cells: 0,
+            ticks: 0,
+            ms: 0.0,
+            done: false,
+        };
         let Some(start) = self.nearest_walkable(req.start, CLEAR_CAP) else {
-            out.ms = t0.elapsed().as_secs_f32() * 1000.0;
-            return out;
+            search.done = true;
+            search.ms = t0.elapsed().as_secs_f32() * 1000.0;
+            return search;
         };
         let region = self.region[start];
         let goal_cell = self.cell_at(req.goal).filter(|&i| self.region[i] == region);
@@ -740,83 +763,121 @@ impl NavGrid {
             Some(i) => (i, true),
             None => {
                 // The nearest reachable ground where the block fits, else
-                // the nearest reachable ground at all.
-                let roomy = self.nearest_where(req.goal, 400.0, |i| {
+                // the nearest reachable ground at all, within `NEAR_GOAL`
+                // (a ring search costs by the square of its radius); none
+                // in reach makes a route of one point, the start.
+                let roomy = self.nearest_where(req.goal, NEAR_GOAL, |i| {
                     self.region[i] == region && self.clear[i] >= need
                 });
-                let any = || {
-                    self.nearest_where(req.goal, self.nx.max(self.nz) as f32 * CELL, |i| {
-                        self.region[i] == region
-                    })
-                };
+                let any = || self.nearest_where(req.goal, NEAR_GOAL, |i| self.region[i] == region);
                 match roomy.or_else(any) {
                     Some(i) => (i, false),
                     None => (start, false),
                 }
             }
         };
-        s.prepare(self.walk.len());
+        search.start = start;
+        search.target = target;
+        search.reached = reached;
         let goal_p = self.pos(target);
-        let h = |i: usize| octile(self.pos(i), goal_p);
-        s.set(start, 0.0, u32::MAX);
-        s.heap.push(Node { f: h(start), i: start as u32 });
-        let mut cells = 0u32;
-        let mut nb = [(0u32, 0.0f32, 0u8); 8];
-        while let Some(Node { i, .. }) = s.heap.pop() {
-            let i = i as usize;
-            if s.closed[i] == s.cur {
-                continue;
-            }
-            s.closed[i] = s.cur;
-            cells += 1;
-            if i == target {
-                break;
-            }
-            let gi = s.g[i];
-            let k = self.neighbours(i, &mut nb);
-            for &(j, len, class) in &nb[..k] {
-                let j = j as usize;
-                if s.closed[j] == s.cur {
+        search.seen.insert(start as u32, Seen { g: 0.0, parent: u32::MAX, closed: false });
+        search.heap.push(Node { f: octile(self.pos(start), goal_p), i: start as u32 });
+        search.ms = t0.elapsed().as_secs_f32() * 1000.0;
+        search
+    }
+
+    /// Run `search` for at most `budget` more cells. Returns the plan once
+    /// the search is over: the grid path pulled straight wherever a
+    /// straight segment keeps the same clearance and costs no more.
+    pub fn advance(&self, search: &mut Search, budget: u32) -> Option<Plan> {
+        let t0 = Instant::now();
+        search.ticks += 1;
+        if !search.done {
+            let goal_p = self.pos(search.target);
+            let h = |i: usize| octile(self.pos(i), goal_p);
+            let mut nb = [(0u32, 0.0f32, 0u8); 8];
+            let mut spent = 0u32;
+            loop {
+                if spent >= budget {
+                    search.ms += t0.elapsed().as_secs_f32() * 1000.0;
+                    return None;
+                }
+                let Some(Node { i, .. }) = search.heap.pop() else { break };
+                let seen = search.seen.get_mut(&i).expect("a heap entry was seen");
+                if seen.closed {
                     continue;
                 }
-                let gj = gi + len * 0.5 * (costs.w[i][class as usize] + costs.w[j][class as usize]);
-                if s.stamp[j] != s.cur || gj < s.g[j] {
-                    s.set(j, gj, i as u32);
-                    s.heap.push(Node { f: gj + h(j), i: j as u32 });
+                seen.closed = true;
+                let gi = seen.g;
+                spent += 1;
+                search.cells += 1;
+                if i as usize == search.target {
+                    break;
+                }
+                let k = self.neighbours(i as usize, &mut nb);
+                for &(j, len, class) in &nb[..k] {
+                    let class = class as usize;
+                    let gj = gi + len * 0.5 * (search.costs.w[i as usize][class] + search.costs.w[j as usize][class]);
+                    match search.seen.get_mut(&j) {
+                        Some(sj) if sj.closed => continue,
+                        Some(sj) if gj >= sj.g => continue,
+                        Some(sj) => {
+                            sj.g = gj;
+                            sj.parent = i;
+                        }
+                        None => {
+                            search.seen.insert(j, Seen { g: gj, parent: i, closed: false });
+                        }
+                    }
+                    search.heap.push(Node { f: gj + h(j as usize), i: j });
                 }
             }
+            search.done = true;
         }
-        out.cells = cells;
+        let req = search.req;
+        let mut out = Plan {
+            req,
+            points: Vec::new(),
+            reached: search.reached,
+            cells: search.cells,
+            ticks: search.ticks,
+            ms: search.ms,
+        };
+        if search.seen.is_empty() {
+            // No walkable ground near the start.
+            out.ms += t0.elapsed().as_secs_f32() * 1000.0;
+            return Some(out);
+        }
         // The grid path, start to target.
-        let mut path = vec![target];
-        let mut i = target;
-        while i != start {
-            let p = s.parent[i];
-            if p == u32::MAX || s.stamp[i] != s.cur {
+        let mut path = vec![search.target];
+        let mut i = search.target as u32;
+        while i as usize != search.start {
+            let Some(sn) = search.seen.get(&i) else { break };
+            if sn.parent == u32::MAX {
                 break;
             }
-            i = p as usize;
-            path.push(i);
+            i = sn.parent;
+            path.push(i as usize);
         }
         path.reverse();
-        let kept = self.pull_straight(&path, s, need, &costs);
+        let g_of = |i: usize| search.seen.get(&(i as u32)).map_or(0.0, |sn| sn.g);
+        let kept = self.pull_straight(&path, &g_of, search.need, &search.costs);
         out.points.push(req.start);
         if kept.len() > 2 {
             for &k in &kept[1..kept.len() - 1] {
                 out.points.push(self.pos(path[k]));
             }
         }
-        out.points.push(if reached { req.goal } else { goal_p });
-        out.reached = reached;
-        out.ms = t0.elapsed().as_secs_f32() * 1000.0;
-        out
+        out.points.push(if search.reached { req.goal } else { self.pos(search.target) });
+        out.ms += t0.elapsed().as_secs_f32() * 1000.0;
+        Some(out)
     }
 
     /// The indices of `path` kept as waypoints: from each kept cell, the
     /// farthest later cell reachable by a straight segment that is
     /// walkable, keeps the clearance the grid path had between them (up to
     /// the regiment's half width) and costs no more than that stretch.
-    fn pull_straight(&self, path: &[usize], s: &Scratch, need: f32, costs: &Costs) -> Vec<usize> {
+    fn pull_straight(&self, path: &[usize], g_of: &dyn Fn(usize) -> f32, need: f32, costs: &Costs) -> Vec<usize> {
         let last = path.len() - 1;
         let mut kept = vec![0];
         let mut i = 0;
@@ -826,7 +887,7 @@ impl NavGrid {
             for j in i + 2..=last {
                 min_clear = min_clear.min(self.clear[path[j]]);
                 let want = min_clear.min(need);
-                let budget = (s.g[path[j]] - s.g[path[i]]) * SMOOTH_SLACK + 0.1;
+                let budget = (g_of(path[j]) - g_of(path[i])) * SMOOTH_SLACK + 0.1;
                 if self.segment_fits(self.pos(path[i]), self.pos(path[j]), want, costs, budget) {
                     best = j;
                 } else if j > best + 12 {
@@ -873,7 +934,9 @@ impl NavGrid {
 }
 
 /// A regiment's half width in cells, across an axis step and across a
-/// diagonal one (diagonal cells lie a cell's diagonal apart).
+/// diagonal one (diagonal cells lie a cell's diagonal apart). Widths are
+/// rounded up to `SPAN_STEP` cells, so a battle's regiments share a few
+/// cost tables (one is 16 bytes a cell) instead of one per facing.
 #[derive(Clone, Copy)]
 pub struct Span {
     half_w: f32,
@@ -881,11 +944,16 @@ pub struct Span {
     k_diag: usize,
 }
 
+/// Cells per width class of the cost tables (6 m of half width).
+const SPAN_STEP: usize = 3;
+
 impl Span {
     fn of(half_w: f32) -> Self {
+        let k_axis = ((half_w / CELL).ceil() as usize).div_ceil(SPAN_STEP).max(1) * SPAN_STEP;
+        let half_w = k_axis as f32 * CELL;
         Self {
             half_w,
-            k_axis: (half_w / CELL).round() as usize,
+            k_axis,
             k_diag: (half_w / (CELL * std::f32::consts::SQRT_2)).round() as usize,
         }
     }
@@ -975,42 +1043,29 @@ impl Ord for Node {
     }
 }
 
-/// The search's buffers, reused across plans: a cell's `g` and `parent`
-/// are valid when its stamp is the current search's.
-#[derive(Default)]
-pub struct Scratch {
-    g: Vec<f32>,
-    parent: Vec<u32>,
-    stamp: Vec<u32>,
-    closed: Vec<u32>,
-    cur: u32,
+/// A route search in progress (`NavGrid::begin`, `advance`), carried
+/// across ticks by sim/route.rs. The visited cells live in a map, so a
+/// search costs memory for the cells it touched, not for the grid.
+pub struct Search {
+    pub req: PlanRequest,
+    need: f32,
+    costs: std::sync::Arc<Costs>,
+    start: usize,
+    target: usize,
+    reached: bool,
     heap: BinaryHeap<Node>,
+    seen: std::collections::HashMap<u32, Seen>,
+    cells: u32,
+    ticks: u32,
+    ms: f32,
+    done: bool,
 }
 
-impl Scratch {
-    fn prepare(&mut self, n: usize) {
-        if self.g.len() != n {
-            self.g = vec![0.0; n];
-            self.parent = vec![u32::MAX; n];
-            self.stamp = vec![0; n];
-            self.closed = vec![0; n];
-            self.cur = 0;
-        }
-        self.cur = self.cur.wrapping_add(1);
-        if self.cur == 0 {
-            self.stamp.fill(0);
-            self.closed.fill(0);
-            self.cur = 1;
-        }
-        self.heap.clear();
-    }
-
-    #[inline]
-    fn set(&mut self, i: usize, g: f32, parent: u32) {
-        self.g[i] = g;
-        self.parent[i] = parent;
-        self.stamp[i] = self.cur;
-    }
+/// What the search knows of a cell it has touched.
+struct Seen {
+    g: f32,
+    parent: u32,
+    closed: bool,
 }
 
 #[cfg(test)]
@@ -1056,9 +1111,8 @@ mod tests {
     #[test]
     fn every_case_plans_a_walkable_route_and_the_box_is_out_of_reach() {
         let g = grid();
-        let mut s = Scratch::default();
         for case in &CASES {
-            let plan = g.plan(&req(case.start, case.goal), &mut s);
+            let plan = g.plan(&req(case.start, case.goal));
             assert!(plan.points.len() >= 2, "{}: no route", case.name);
             assert_walkable(&g, &plan);
             if case.name == "box" {
@@ -1076,12 +1130,11 @@ mod tests {
     #[test]
     fn the_narrow_gap_is_taken_and_the_wide_gap_route_keeps_room() {
         let g = grid();
-        let mut s = Scratch::default();
         let narrow = &CASES[2];
-        let plan = g.plan(&req(narrow.start, narrow.goal), &mut s);
+        let plan = g.plan(&req(narrow.start, narrow.goal));
         assert!(plan.length() < narrow.start.distance(narrow.goal) * 1.2, "narrow: {}", plan.length());
         let wide = &CASES[1];
-        let plan = g.plan(&req(wide.start, wide.goal), &mut s);
+        let plan = g.plan(&req(wide.start, wide.goal));
         // It crosses the wall inside the wide gap, with room.
         let cross = plan
             .points
@@ -1097,10 +1150,20 @@ mod tests {
     #[test]
     fn the_same_request_plans_the_same_route() {
         let g = grid();
-        let mut s = Scratch::default();
-        let a = g.plan(&req(CASES[4].start, CASES[4].goal), &mut s);
-        let b = g.plan(&req(CASES[4].start, CASES[4].goal), &mut s);
+        let a = g.plan(&req(CASES[4].start, CASES[4].goal));
+        let b = g.plan(&req(CASES[4].start, CASES[4].goal));
         assert_eq!(a.points, b.points);
         assert_eq!(a.cells, b.cells);
+        // The same search a budget at a time gives the same route.
+        let mut search = g.begin(&req(CASES[4].start, CASES[4].goal));
+        let mut ticks = 0;
+        let c = loop {
+            ticks += 1;
+            if let Some(plan) = g.advance(&mut search, 4000) {
+                break plan;
+            }
+        };
+        assert_eq!(a.points, c.points);
+        assert!(ticks > 5, "{ticks} ticks");
     }
 }

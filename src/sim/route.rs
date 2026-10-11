@@ -7,13 +7,16 @@
 //!   exactly as it always did. Maps with no blocked ground and no water
 //!   never get this far (there is no grid).
 //! - Otherwise a plan is requested. Requests ride in the tick job, a
-//!   fixed number per tick, and are planned on the pool after the
-//!   soldiers' kernel; the job's install hands the plans back at the next
-//!   tick. A tick that must first build the cost table for a new
-//!   regiment width builds only that, and its plans go out with the next
-//!   job. The schedule is counted in ticks, never in wall time, so a run
-//!   repeats bit for bit. While a regiment waits for its plan (one or two
-//!   ticks, longer when many order at once) it walks straight, as before.
+//!   fixed number at a time, and are searched on the pool after the
+//!   soldiers' kernel, each for a budget of cells per tick (`PLAN_BUDGET`,
+//!   about a millisecond); a search that is not over comes back and goes
+//!   out again with the next job, so no tick waits for a long route. The
+//!   job's install hands the finished plans back. A tick that must first
+//!   build the cost table for a new regiment width builds only that. The
+//!   schedule is counted in ticks, never in wall time, so a run repeats
+//!   bit for bit. While a regiment waits for its plan (one or two ticks
+//!   for a short route, a second or two for a long one through a town) it
+//!   walks straight, as before.
 //! - The regiment's frame (the point `resolve_orders` hands its men) is
 //!   the route's current waypoint; the last waypoint is the live goal. It
 //!   moves on to the next waypoint once the way there is clear and dry for
@@ -40,13 +43,25 @@ use bevy::prelude::*;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use crate::nav::{NavGrid, Plan, PlanRequest, Scratch};
+use crate::nav::{NavGrid, Plan, PlanRequest, Search};
 use crate::orders::{GroupData, Groups, Order};
 use crate::terrain::Terrain;
 
-/// Plans asked of one tick job at most. They run in parallel on the pool,
-/// so a tick costs about as much as its slowest plan.
+/// Searches one tick job carries at most. They run in parallel on the
+/// pool, each for `PLAN_BUDGET` cells, so a tick's planning costs about
+/// one budget's worth of wall time.
 const PLANS_PER_TICK: usize = 16;
+/// Cells one search closes per tick at most: about a millisecond, and
+/// enough for most routes in one tick (the obstacle map's zig-zag takes
+/// twenty).
+const PLAN_BUDGET: u32 = 4000;
+
+/// A route search on its way through the tick jobs: the request, and the
+/// search once it has begun.
+pub struct PlanJob {
+    pub req: PlanRequest,
+    pub search: Option<Search>,
+}
 /// An attack order checks this often (ticks) whether its target has left
 /// the end of its route.
 const ATTACK_RECHECK: u32 = 15;
@@ -110,10 +125,12 @@ pub struct Routes {
     nav: Option<Arc<NavGrid>>,
     per: Vec<RegRoute>,
     queue: VecDeque<PlanRequest>,
-    /// The requests the next tick job takes.
-    outgoing: Vec<PlanRequest>,
-    /// Plans handed back by the last install.
+    /// The searches the next tick job takes.
+    outgoing: Vec<PlanJob>,
+    /// Plans handed back by the last install, and the searches it did not
+    /// finish.
     incoming: Vec<Plan>,
+    unfinished: Vec<PlanJob>,
     serial: u32,
     generation: u64,
     built: bool,
@@ -169,7 +186,7 @@ impl Routes {
     /// each regiment's route, and the grid.
     pub(crate) fn fill_job(
         &mut self,
-        requests: &mut Vec<PlanRequest>,
+        requests: &mut Vec<PlanJob>,
         views: &mut Vec<Option<RouteView>>,
         nav: &mut Option<Arc<NavGrid>>,
         n_groups: usize,
@@ -197,9 +214,10 @@ impl Routes {
         };
     }
 
-    /// Take the plans a tick job made.
-    pub(crate) fn hand_back(&mut self, plans: &mut Vec<Plan>) {
+    /// Take the plans a tick job made and the searches it did not finish.
+    pub(crate) fn hand_back(&mut self, plans: &mut Vec<Plan>, unfinished: &mut Vec<PlanJob>) {
         self.incoming.append(plans);
+        self.unfinished.append(unfinished);
     }
 
     /// Each regiment's resolved frame this tick: its route's current
@@ -245,6 +263,12 @@ impl Routes {
     }
 }
 
+/// The widest `half_width` a regiment has across any way (m): the
+/// block's half diagonal.
+pub fn half_width_max(gd: &GroupData) -> f32 {
+    half_width(gd, Vec2::Y).hypot(half_width(gd, Vec2::X))
+}
+
 /// Half a regiment's extent across the way `dir` (m): what must fit
 /// between obstacles for the block to walk on unbroken.
 pub fn half_width(gd: &GroupData, dir: Vec2) -> f32 {
@@ -287,6 +311,7 @@ pub fn update_routes(
         routes.queue.clear();
         routes.outgoing.clear();
         routes.incoming.clear();
+        routes.unfinished.clear();
     }
     let n = groups.list.len();
     routes.per.resize_with(n, RegRoute::default);
@@ -295,23 +320,18 @@ pub fn update_routes(
     };
     let tick = pipeline.tick;
 
-    // The plans the last install handed back; the deferred go out again
-    // first, in their order.
-    let mut again = Vec::new();
+    // The plans the last install handed back, and the searches it did
+    // not finish, which go out again first unless a newer request for
+    // their regiment has replaced them.
     for plan in std::mem::take(&mut routes.incoming) {
-        if plan.deferred {
-            again.push(plan.req);
-        } else {
-            adopt(routes, &mut groups, plan);
-        }
+        adopt(routes, &mut groups, plan);
     }
-    for req in again.into_iter().rev() {
-        let still = matches!(routes.per.get(req.g as usize).map(|r| &r.state),
-            Some(State::Pending { serial, .. }) if *serial == req.serial);
-        if still && !routes.queue.iter().any(|q| q.g == req.g) {
-            routes.queue.push_front(req);
-        }
-    }
+    let mut unfinished = std::mem::take(&mut routes.unfinished);
+    unfinished.retain(|job| {
+        matches!(routes.per.get(job.req.g as usize).map(|r| &r.state),
+            Some(State::Pending { serial, .. }) if *serial == job.req.serial)
+    });
+    routes.outgoing.append(&mut unfinished);
 
     for g in 0..n {
         let gd = &groups.list[g];
@@ -403,12 +423,11 @@ pub fn update_routes(
         }
     }
 
-    // The requests the next job carries, if the last ones went out.
-    if routes.outgoing.is_empty() {
-        while routes.outgoing.len() < PLANS_PER_TICK {
-            let Some(req) = routes.queue.pop_front() else { break };
-            routes.outgoing.push(req);
-        }
+    // The searches the next job carries: the unfinished first, then new
+    // requests up to the limit.
+    while routes.outgoing.len() < PLANS_PER_TICK {
+        let Some(req) = routes.queue.pop_front() else { break };
+        routes.outgoing.push(PlanJob { req, search: None });
     }
 }
 
@@ -438,9 +457,10 @@ fn adopt(routes: &mut Routes, groups: &mut Groups, plan: Plan) {
     }
     let straight = plan.req.start.distance(plan.req.goal);
     info!(
-        "[path] regiment {g}: planned in {:.2} ms over {} cells, route {:.0} m against {:.0} m straight, {} waypoints{}",
+        "[path] regiment {g}: planned in {:.2} ms over {} cells in {} ticks, route {:.0} m against {:.0} m straight, {} waypoints{}",
         plan.ms,
         plan.cells,
+        plan.ticks,
         plan.length(),
         straight,
         plan.points.len().saturating_sub(1),
@@ -467,46 +487,51 @@ fn adopt(routes: &mut Routes, groups: &mut Groups, plan: Plan) {
     }
 }
 
-thread_local! {
-    static SCRATCH: std::cell::RefCell<Scratch> = std::cell::RefCell::new(Scratch::default());
-}
-
-/// Plan a tick job's requests, in parallel on the pool, results in request
-/// order. Runs on the sim worker after the kernel.
-pub(crate) fn plan_all(nav: &NavGrid, requests: &[PlanRequest], out: &mut Vec<Plan>) {
+/// Advance a tick job's searches, in parallel on the pool, each by one
+/// budget: the finished ones become plans (in request order), the rest
+/// go back for the next job. Runs on the sim worker after the kernel.
+pub(crate) fn plan_all(nav: &NavGrid, jobs: &mut Vec<PlanJob>, out: &mut Vec<Plan>) {
     out.clear();
-    if requests.is_empty() {
+    if jobs.is_empty() {
         return;
     }
     let t0 = std::time::Instant::now();
-    // A tick that has to build a cost table does only that; its plans go
-    // out with the next job, so no tick pays for both.
-    if nav.prepare_costs(requests) {
-        out.extend(requests.iter().map(|req| Plan {
-            req: *req,
-            points: Vec::new(),
-            reached: false,
-            deferred: true,
-            cells: 0,
-            ms: 0.0,
-        }));
+    // A tick that has to build a cost table does only that; the searches
+    // begin with the next job, so no tick pays for both.
+    let reqs: Vec<PlanRequest> = jobs.iter().map(|j| j.req).collect();
+    if nav.prepare_costs(&reqs) {
         info!(
-            "[path] cost table built in the tick job: {:.2} ms; {} plans wait for the next",
+            "[path] cost table built in the tick job: {:.2} ms; {} searches wait for the next",
             t0.elapsed().as_secs_f32() * 1000.0,
-            requests.len()
+            jobs.len()
         );
         return;
     }
-    let plans = crate::util::sim_scope(|scope| {
-        for req in requests {
-            scope.spawn(async move { SCRATCH.with(|s| nav.plan(req, &mut s.borrow_mut())) });
+    let taken = std::mem::take(jobs);
+    let results: Vec<(PlanJob, Option<Plan>)> = crate::util::sim_scope(|scope| {
+        for mut job in taken {
+            scope.spawn(async move {
+                let mut search = job.search.take().unwrap_or_else(|| nav.begin(&job.req));
+                let plan = nav.advance(&mut search, PLAN_BUDGET);
+                if plan.is_none() {
+                    job.search = Some(search);
+                }
+                (job, plan)
+            });
         }
     });
-    out.extend(plans);
+    let n = results.len();
+    for (job, plan) in results {
+        match plan {
+            Some(plan) => out.push(plan),
+            None => jobs.push(job),
+        }
+    }
     info!(
-        "[path] {} plans in the tick job: {:.2} ms",
-        out.len(),
-        t0.elapsed().as_secs_f32() * 1000.0
+        "[path] {} searches in the tick job: {:.2} ms, {} finished",
+        n,
+        t0.elapsed().as_secs_f32() * 1000.0,
+        out.len()
     );
 }
 

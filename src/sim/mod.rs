@@ -649,7 +649,7 @@ pub fn step_sim(
     pipeline.sweep_candidates.sort_unstable();
     pipeline.sweep_candidates.dedup();
     std::mem::swap(&mut *grid, &mut job.grid);
-    routes.hand_back(&mut job.plans);
+    routes.hand_back(&mut job.plans, &mut job.plan_requests);
     std::mem::swap(&mut damage.0, &mut job.events);
     std::mem::swap(&mut arrow_spawns.0, &mut job.arrow_spawns);
     stats.grid_ms = job.grid_ms;

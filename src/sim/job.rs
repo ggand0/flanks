@@ -141,7 +141,7 @@ pub struct TickJob {
     pub(crate) field_ms: f32,
     // Routes (sim/route.rs): the plans asked for at prep, planned after
     // the kernel, and each regiment's route with the grid its men read.
-    pub(crate) plan_requests: Vec<crate::nav::PlanRequest>,
+    pub(crate) plan_requests: Vec<crate::sim::route::PlanJob>,
     pub(crate) plans: Vec<crate::nav::Plan>,
     pub(crate) routes: Vec<Option<crate::sim::route::RouteView>>,
     pub(crate) nav: Option<Arc<crate::nav::NavGrid>>,
