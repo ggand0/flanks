@@ -318,6 +318,7 @@ pub(crate) struct Soldier<'a> {
     pub ammo: &'a mut u8,
     pub out_form: &'a mut bool,
     pub sight: &'a mut u16,
+    pub way: &'a mut Vec2,
 }
 
 /// The rows of one chunk of soldiers, in index order.
@@ -335,6 +336,7 @@ pub(crate) struct Rows<'a> {
     pub ammo: &'a mut [u8],
     pub out_form: &'a mut [bool],
     pub sight: &'a mut [u16],
+    pub way: &'a mut [Vec2],
 }
 
 /// What a chunk emits beside its rows: landed swings and loosed arrows.
@@ -414,6 +416,7 @@ pub(crate) fn tick_chunk(f: &Field, rows: Rows, out: &mut ChunkOut) {
             ammo: &mut rows.ammo[j],
             out_form: &mut rows.out_form[j],
             sight: &mut rows.sight[j],
+            way: &mut rows.way[j],
         };
         let mut st = begin(f, &mut s);
         drive(f, &mut s, &mut st);
@@ -555,11 +558,27 @@ fn drive(f: &Field, s: &mut Soldier, st: &mut Step) {
         let mut goal = orders[gi].unwrap_or(anchors[gi]) + home[i];
         // On a route, a man whose straight way to his slot is blocked
         // follows the route instead (sim/route.rs); short of the last leg
-        // he keeps his pace.
+        // he keeps his pace. He reads the route every LOOK_TICKS, when he
+        // reaches the point he chose, or when he has none, and walks on
+        // what he chose between reads.
         let mut through = false;
-        if let (Some(route), Some(nav)) = (paths.routes.get(gi).and_then(Option::as_ref), paths.nav) {
-            let frame = orders[gi].unwrap_or(anchors[gi]);
-            (goal, through) = crate::sim::route::man_target(nav, terrain, route, frame, p, goal, i);
+        match (paths.routes.get(gi).and_then(Option::as_ref), paths.nav) {
+            (Some(route), Some(nav)) => {
+                let frame = orders[gi].unwrap_or(anchors[gi]);
+                let way = *s.way;
+                let kept = !way.x.is_nan();
+                let at_way = kept && way.x.is_finite() && p.distance_squared(way) < 4.0;
+                if !kept || at_way || (i as u32).wrapping_add(f.tick).is_multiple_of(LOOK_TICKS) {
+                    let (t, th) = crate::sim::route::man_target(nav, terrain, route, frame, p, goal, i);
+                    *s.way = if t == goal && !th { Vec2::INFINITY } else if t == goal { Vec2::NEG_INFINITY } else { t };
+                    (goal, through) = (t, th);
+                } else if way.x.is_infinite() {
+                    through = way.x < 0.0;
+                } else {
+                    (goal, through) = (way, true);
+                }
+            }
+            _ => *s.way = Vec2::NAN,
         }
         let to_goal = goal - p;
         let dist = to_goal.length();

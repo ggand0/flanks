@@ -308,6 +308,7 @@ fn run_tick_job(job: &mut TickJob) {
         ammo_in,
         out_form_in,
         sight_in,
+        way_in,
         pos_out,
         vel,
         yaw,
@@ -320,6 +321,7 @@ fn run_tick_job(job: &mut TickJob) {
         ammo,
         out_form,
         sight,
+        way,
         orders,
         anchors,
         reg_broken,
@@ -468,6 +470,7 @@ fn run_tick_job(job: &mut TickJob) {
     let ammo_in = &ammo_in[..];
     let out_form_in = &out_form_in[..];
     let sight_in = &sight_in[..];
+    let way_in = &way_in[..];
     // The map edges a router leaves the field at (combat.rs), widened by
     // the charge knockback the apply pass can still add to a position:
     // the sweep's candidate list must hold every man it might remove.
@@ -490,10 +493,11 @@ fn run_tick_job(job: &mut TickJob) {
             .zip(arrow_spawns.iter_mut())
             .zip(out_form.chunks_mut(CHUNK))
             .zip(sight.chunks_mut(CHUNK))
+            .zip(way.chunks_mut(CHUNK))
             .enumerate()
         {
-            let (((((((((((((pos, vel), yaw), yaw_prev), target), swing), swing_t), flash),
-                death_t), events), ammo), arrows), out_form), sight) = chunk;
+            let ((((((((((((((pos, vel), yaw), yaw_prev), target), swing), swing_t), flash),
+                death_t), events), ammo), arrows), out_form), sight), way) = chunk;
             let start = ci * CHUNK;
             let end = start + pos.len();
             scope.spawn(async move {
@@ -509,6 +513,7 @@ fn run_tick_job(job: &mut TickJob) {
                 ammo.copy_from_slice(&ammo_in[start..end]);
                 out_form.copy_from_slice(&out_form_in[start..end]);
                 sight.copy_from_slice(&sight_in[start..end]);
+                way.copy_from_slice(&way_in[start..end]);
                 let rows = soldier::Rows {
                     start,
                     pos: &mut *pos,
@@ -523,6 +528,7 @@ fn run_tick_job(job: &mut TickJob) {
                     ammo,
                     out_form,
                     sight,
+                    way,
                 };
                 events.clear();
                 let mut out = soldier::ChunkOut { events, arrows };
@@ -639,7 +645,7 @@ pub fn step_sim(
         install!(
             vel <- vel, yaw <- yaw, yaw_prev <- yaw_prev, target <- target, swing <- swing,
             swing_t <- swing_t, flash <- flash, death_t <- death_t, ammo <- ammo,
-            out_form <- out_form, sight <- sight
+            out_form <- out_form, sight <- sight, way <- way
         );
     }
     // The sweep's candidates (combat.rs), ascending.
