@@ -22,17 +22,11 @@ const PAN_SLOW_RAMP: f32 = 1.5;
 const ZOOM_SMOOTH: f32 = 0.12;
 
 fn max_distance(kind: crate::terrain::MapKind) -> f32 {
-    match kind {
-        crate::terrain::MapKind::BigGrassland => 2800.0,
-        _ => 900.0,
-    }
+    if kind.is_large() { 2800.0 } else { 900.0 }
 }
 
 fn far_plane(kind: crate::terrain::MapKind) -> f32 {
-    match kind {
-        crate::terrain::MapKind::BigGrassland => 6000.0,
-        _ => PerspectiveProjection::default().far,
-    }
+    if kind.is_large() { 6000.0 } else { PerspectiveProjection::default().far }
 }
 
 #[derive(Component)]

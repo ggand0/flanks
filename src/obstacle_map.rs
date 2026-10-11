@@ -1,5 +1,8 @@
 //! The obstacle map (`FL_MAP=obstacles`): flat ground with giant raised
-//! blocks, the proving ground for pathfinding. Every block is a 6 m step
+//! blocks, the proving ground for pathfinding. Also the town
+//! (`FL_MAP=town`, `town_blocks`): Big Grassland's ground with a walled
+//! town of streets and houses across the middle, the map that shows what
+//! many obstacles cost in a full battle. Every block is a 6 m step
 //! between neighbouring vertices, so the terrain's own blocked rule
 //! (`SLOPE_BLOCK`) closes every side of it and the soldiers' wall slide
 //! applies with no new collision code. Each test case stands in its own
@@ -156,6 +159,78 @@ pub fn height(p: Vec2, blocks: &[Block]) -> f32 {
     if on_top { BLOCK_HEIGHT } else { 0.0 }
 }
 
+
+/// The town's half size (m): the wall ring stands at x ±600, z ±300.
+pub const TOWN_HALF: Vec2 = Vec2::new(600.0, 300.0);
+
+/// The walled town across the middle of Big Grassland: a 6 m wall with
+/// three gates on each long side and one on each short side (24 m
+/// between the wall's tops, 18 m walkable), avenues 30 m wide through the
+/// gates, a plaza 100 m across at the centre, and 14 m houses on a 30 m
+/// pitch (16 m streets, 10 m walkable) everywhere else, about one in eight
+/// left out for yards. Armies stand north and south of it
+/// (`FL_ARMY_GAP=700` keeps the spawn clear of the wall).
+pub fn town_blocks() -> Vec<Block> {
+    let (hx, hz) = (TOWN_HALF.x, TOWN_HALF.y);
+    let gate = 12.0; // half the gap between the wall's tops
+    let gates_x = [-400.0, 0.0, 400.0];
+    let mut b = Vec::new();
+    // The north and south walls, cut at the gates.
+    for z0 in [-hz, hz - 6.0] {
+        let mut x = -hx;
+        for &g in &gates_x {
+            b.push(block(x, g - gate, z0, z0 + 6.0));
+            x = g + gate;
+        }
+        b.push(block(x, hx, z0, z0 + 6.0));
+    }
+    // The west and east walls, one gate each at z 0.
+    for x0 in [-hx, hx - 6.0] {
+        b.push(block(x0, x0 + 6.0, -hz, -gate));
+        b.push(block(x0, x0 + 6.0, gate, hz));
+    }
+    // Houses: 14 m tops on a 30 m pitch, skipping the avenues (30 m about
+    // the gates' lines), the plaza and a wall margin, and one in eight by
+    // hash for yards.
+    let avenue = 15.0;
+    let plaza = 50.0;
+    let mut k = 0u32;
+    let mut z = -hz + 30.0;
+    while z + 14.0 <= hz - 30.0 {
+        let mut x = -hx + 30.0;
+        while x + 14.0 <= hx - 30.0 {
+            let (cx, cz) = (x + 7.0, z + 7.0);
+            let on_avenue = gates_x.iter().any(|&g| (cx - g).abs() < avenue + 7.0) || cz.abs() < avenue + 7.0;
+            let on_plaza = cx.abs() < plaza + 7.0 && cz.abs() < plaza + 7.0;
+            k += 1;
+            let yard = crate::units::hash01(k.wrapping_mul(0x9E37_79B1)) < 0.125;
+            if !on_avenue && !on_plaza && !yard {
+                b.push(block(x, x + 14.0, z, z + 14.0));
+            }
+            x += 30.0;
+        }
+        z += 30.0;
+    }
+    b
+}
+
+/// Raise every vertex inside a block's top by `BLOCK_HEIGHT`, so the
+/// block stands on whatever ground is there. Walks each block's own
+/// vertices, so a town of hundreds of blocks costs nothing per vertex.
+pub fn raise_blocks(heights: &mut [f32], origin: Vec2, (verts_x, verts_z): (usize, usize), blocks: &[Block]) {
+    for b in blocks {
+        let x0 = (((b.x0 - origin.x) / crate::terrain::CELL).ceil().max(0.0)) as usize;
+        let z0 = (((b.z0 - origin.y) / crate::terrain::CELL).ceil().max(0.0)) as usize;
+        let x1 = (((b.x1 - origin.x) / crate::terrain::CELL).floor().max(0.0) as usize).min(verts_x - 1);
+        let z1 = (((b.z1 - origin.y) / crate::terrain::CELL).floor().max(0.0) as usize).min(verts_z - 1);
+        for z in z0..=z1 {
+            for x in x0..=x1 {
+                heights[z * verts_x + x] += BLOCK_HEIGHT;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::terrain::{build_terrain, MapKind, CELL};
@@ -249,5 +324,51 @@ mod tests {
         assert_eq!(open_run(super::WIDE_GAP_X), 21);
         assert_eq!(open_run(super::NARROW_GAP_X), 3);
         assert_eq!(open_run(super::SHARED_GAP_X), 7);
+    }
+
+    /// The town: every street is reachable from outside through the gates,
+    /// no house top is, and the plaza at the centre is open ground.
+    #[test]
+    fn the_town_is_open_through_its_gates_and_its_houses_are_closed() {
+        let t = build_terrain(MapKind::Town);
+        let (vx, vz) = t.grid_verts();
+        let pos = |x: usize, z: usize| t.min() + Vec2::new(x as f32, z as f32) * CELL;
+        let open = |x: usize, z: usize| {
+            let p = pos(x, z);
+            !t.blocked_at(p.x, p.y)
+        };
+        let to_idx = |p: Vec2| {
+            let g = ((p - t.min()) / CELL).round();
+            (g.x as usize, g.y as usize)
+        };
+        let (sx, sz) = to_idx(Vec2::new(0.0, -500.0));
+        assert!(open(sx, sz));
+        let mut seen = vec![false; vx * vz];
+        let mut stack = vec![(sx, sz)];
+        seen[sz * vx + sx] = true;
+        while let Some((x, z)) = stack.pop() {
+            for (dx, dz) in [(1i32, 0i32), (-1, 0), (0, 1), (0, -1)] {
+                let (nx, nz) = (x as i32 + dx, z as i32 + dz);
+                if nx < 0 || nz < 0 || nx >= vx as i32 || nz >= vz as i32 {
+                    continue;
+                }
+                let (nx, nz) = (nx as usize, nz as usize);
+                if !seen[nz * vx + nx] && open(nx, nz) {
+                    seen[nz * vx + nx] = true;
+                    stack.push((nx, nz));
+                }
+            }
+        }
+        let blocks = super::town_blocks();
+        assert!(blocks.len() > 400, "{} blocks", blocks.len());
+        for b in &blocks {
+            let (x, z) = to_idx(Vec2::new((b.x0 + b.x1) * 0.5, (b.z0 + b.z1) * 0.5));
+            assert!(!seen[z * vx + x], "a top at ({}, {}) is reachable", b.x0, b.z0);
+        }
+        let (px, pz) = to_idx(Vec2::ZERO);
+        assert!(seen[pz * vx + px], "the plaza is cut off");
+        // A street between two houses deep inside.
+        let (qx, qz) = to_idx(Vec2::new(-485.0, -215.0));
+        assert!(seen[qz * vx + qx], "a street is cut off");
     }
 }

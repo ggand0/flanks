@@ -245,6 +245,7 @@ pub fn update_routes(
     }
     let routes = &mut *routes;
     if !routes.built || terrain.is_changed() {
+        let t0 = std::time::Instant::now();
         let fresh = match routes.nav.as_mut() {
             Some(nav) if routes.built && nav.kind == terrain.kind => Arc::make_mut(nav).refresh(&terrain),
             _ => {
@@ -255,7 +256,11 @@ pub fn update_routes(
         routes.built = true;
         if fresh {
             if routes.nav.is_some() {
-                info!("[path] walkability grid ready for the {} map", terrain.kind.label());
+                info!(
+                    "[path] walkability grid ready for the {} map in {:.1} ms",
+                    terrain.kind.label(),
+                    t0.elapsed().as_secs_f32() * 1000.0
+                );
             }
             // Routes made on the old ground are planned again.
             for r in routes.per.iter_mut() {
