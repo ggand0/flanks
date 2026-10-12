@@ -40,7 +40,8 @@
 //! `put_skeleton`). At the far levels, and everywhere with `FL_CLIPS=0`,
 //! the same file draws by its parts. An archer's skin and bow rig work
 //! together: his near levels shoot from the clips, his far levels from
-//! the shot tables.
+//! the shot tables. The man-at-arms has the knight's skeleton and plays
+//! the knight's clips (`CLIP_KIND`).
 //!
 //! `FL_UNIT_MESH=code` keeps the code-built meshes and `FL_GLB_FAR=code`
 //! fills only the missing levels from them. `FL_GLB_<KIND>=path` loads
@@ -64,6 +65,11 @@ type Fallible<T> = Result<T, String>;
 
 /// One file per kind, named as the asset spec names them.
 const KIND_FILE: [&str; NUM_KINDS] = ["knight", "man_at_arms", "spearman", "archer"];
+
+/// The kind whose clips a skinned kind plays: the man-at-arms is built on
+/// the knight's body and skeleton, so he plays the knight's clips, read
+/// from `knight.<clip>.json` beside his model.
+const CLIP_KIND: [usize; NUM_KINDS] = [0, 0, 2, 3];
 
 /// Part id to the name its pivot empty carries (`pivot_<part>`), in the
 /// order unit_meshes.rs and the vertex shader use. Id 7 is the arrow in
@@ -396,7 +402,7 @@ fn import(kind: usize, path: &Path) -> Fallible<KindMeshes> {
     // A skeleton's clips follow a bow rig's shots in the clip buffer.
     let skinned = clips_on() && gltf.document.skins().next().is_some();
     if skinned {
-        match read_skeleton(&gltf, &origins, &mut levels, local3, scale, path) {
+        match read_skeleton(&gltf, &origins, &mut levels, local3, scale, path, kind) {
             Ok((mut skel, rows)) => {
                 info!(
                     "{name}: skeleton of {} joints, clips {:?} ({} rows)",
@@ -656,6 +662,7 @@ fn read_skeleton(
     local3: impl Fn(Vec3) -> Vec3,
     scale: f32,
     model: &Path,
+    kind: usize,
 ) -> Fallible<(Skel, Vec<[f32; 4]>)> {
     let skin = gltf.document.skins().next().ok_or("no skin")?;
     let nodes: Vec<gltf::Node> = skin.joints().collect();
@@ -720,8 +727,18 @@ fn read_skeleton(
     }
     let mut rows: Vec<[f32; 4]> = Vec::new();
     let mut missing: Vec<&str> = Vec::new();
+    // A cut clip plays the sim's slow cut; a kind whose sim has none
+    // swings his style 1 quick, and the player draws it by the arm.
+    let has_cut = crate::unit_types::TYPES[kind].cut_windup_ticks > 0;
     for (slot, clip) in SKEL_CLIPS.iter().enumerate() {
-        let path = model.with_extension(format!("{clip}.json"));
+        if *clip == "cut" && !has_cut {
+            continue;
+        }
+        let path = if CLIP_KIND[kind] == kind {
+            model.with_extension(format!("{clip}.json"))
+        } else {
+            model.with_file_name(format!("{}.{clip}.json", KIND_FILE[CLIP_KIND[kind]]))
+        };
         let text = match crate::game_files::read_to_string(&path) {
             Ok(text) => text,
             Err(_) if slot >= SKEL_CLIPS_NEEDED => {
