@@ -67,6 +67,21 @@ pub mod missile {
     pub const FACTOR_MULT: f32 = 1.28;
     /// Damage of a landed arrow at missile factor 0.
     pub const BASE_DMG: f32 = 20.0;
+    /// The share of the arrows that strike a man which wound him; the
+    /// rest glance off armour, helmet or the shield's rim and do
+    /// nothing, as M2TW's lethality has it. Set in the archery scene so
+    /// a block dies as fast as under the curve above with the 1.0 to
+    /// 1.1 m bodies it was calibrated with: a 1.70 m man takes 13 to 18
+    /// percent more strikes per arrow, and since hit points add the
+    /// strikes up, the dead rose up to 1.9 times. At 0.83 a block of
+    /// men-at-arms loses the same men within a tenth over a minute,
+    /// spearmen within 4 percent and knights within a fifth over two
+    /// minutes. Kills per arrow that lands, in the archery scene: 9.5
+    /// percent against men-at-arms, 4 against spearmen, 0.4 against
+    /// knights, 18 against bowmen, 0.2.1's rates within a tenth and the
+    /// 10 percent M2TW measures against unarmoured men. FL_WOUND
+    /// overrides it.
+    pub const WOUND_SHARE: f32 = 0.83;
 }
 
 /// Damage swing per combat factor point (M2TW uses ~1.2 on kill CHANCE;

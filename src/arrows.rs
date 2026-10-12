@@ -29,6 +29,11 @@ const LITTER_CAP_DEFAULT: usize = 50_000;
 /// soldier's axis to strike him. A man is about 0.5 m across the torso
 /// and 0.8 m with his arms.
 const HIT_RADIUS: f32 = 0.35;
+/// FL_WOUND=<share> overrides `missile::WOUND_SHARE` for calibration.
+fn wound_share() -> f32 {
+    static W: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *W.get_or_init(|| crate::util::env_or("FL_WOUND", missile::WOUND_SHARE).clamp(0.0, 1.0))
+}
 /// Collision tests only run below the tallest body plus this.
 const STRIKE_MARGIN: f32 = 0.3;
 /// How far over his own head an archer's arrow leaves the bow
@@ -110,6 +115,12 @@ pub struct ArrowStats {
     pub hits: usize,
     /// Looses dropped at the pool cap (cumulative; should stay 0).
     pub dropped: u64,
+    /// Since the start, for the archery tally: arrows loosed, and by the
+    /// victim's team and kind the men struck, wounded and killed.
+    pub loosed_total: u64,
+    pub struck: [[u32; crate::unit_types::NUM_KINDS]; 2],
+    pub wounded: [[u32; crate::unit_types::NUM_KINDS]; 2],
+    pub killed: [[u32; crate::unit_types::NUM_KINDS]; 2],
 }
 
 /// Arrows standing in the ground where they landed (ring buffer like
@@ -339,6 +350,7 @@ fn update_arrows(
                 continue;
             }
             stats.loosed += 1;
+            stats.loosed_total += 1;
             if let Some(se) = sounds.as_deref_mut() {
                 se.push_loose(s.group, s.pos);
             }
@@ -365,6 +377,8 @@ fn update_arrows(
         /// convention: where the blow comes FROM).
         from_dir: Vec2,
         jit: f32,
+        /// False for a shaft that glanced off: heard, nothing else.
+        wound: bool,
     }
     let mut hits: Vec<Hit> = Vec::new();
     let strike_band = crate::unit_types::tallest() + STRIKE_MARGIN;
@@ -420,12 +434,16 @@ fn update_arrows(
             // one tick.
             if units.death_t[u] == 0 && units.hp[u] > 0.0 {
                 let seed = (*tick).wrapping_mul(0x9E37_79B1) ^ (i as u32).wrapping_mul(0x85EB);
+                // The shaft that crosses a man strikes him; whether it
+                // wounds him is the one roll here. The rest glance off
+                // armour, helmet or the shield's rim.
                 hits.push(Hit {
                     victim: u,
                     team: arrows.team[i],
                     group: arrows.group[i],
                     from_dir: -v.xz().normalize_or_zero(),
                     jit: 0.85 + 0.3 * hash01(seed),
+                    wound: hash01(seed ^ 0x6A09_E667) < wound_share(),
                 });
                 stats.hits += 1;
                 stats.landed += 1;
@@ -472,6 +490,8 @@ fn update_arrows(
             continue;
         }
         let pv = &TYPES[units.kind[v] as usize];
+        let (vt, vk) = (units.team[v] as usize, units.kind[v] as usize);
+        stats.struck[vt][vk] += 1;
         let fwd = Vec2::new(units.yaw[v].sin(), units.yaw[v].cos());
         let along = fwd.dot(h.from_dir);
         let front = along >= crate::sim::damage::SECTOR_COS_60;
@@ -483,8 +503,10 @@ fn update_arrows(
         // The missile curve is steeper than melee's (missile::FACTOR_MULT):
         // armour classes must separate hard under arrows.
         let dmg = missile::BASE_DMG * missile::FACTOR_MULT.powf(factor) * h.jit * combat_scale;
-        units.hp[v] -= dmg;
-        units.flash[v] = 4;
+        if h.wound {
+            units.hp[v] -= dmg;
+            units.flash[v] = 4;
+        }
         if let Some(se) = sounds.as_deref_mut() {
             // A shaft cannot be parried: shield or armour takes it.
             se.push_arrow_hit(crate::audio::ArrowHit {
@@ -500,7 +522,12 @@ fn update_arrows(
                 killed: units.hp[v] <= 0.0,
             });
         }
+        if !h.wound {
+            continue;
+        }
+        stats.wounded[vt][vk] += 1;
         if units.hp[v] <= 0.0 {
+            stats.killed[vt][vk] += 1;
             units.death_t[v] = crate::sim::damage::DEATH_TICKS;
             cstats.kills[units.team[v] as usize] += 1;
             groups.list[units.group[v] as usize].recent_deaths += 1;
@@ -541,6 +568,39 @@ fn update_arrows(
             }
         }
     }
+    if tally_log() && tick.is_multiple_of(120) {
+        log_tally(*tick, &stats, arrows.len());
+    }
+}
+
+/// FL_TEST_ARCHERY logs the calibration tally every 4 s of sim time.
+fn tally_log() -> bool {
+    static T: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *T.get_or_init(|| std::env::var("FL_TEST_ARCHERY").is_ok())
+}
+
+/// The calibration tally: arrows loosed and ended, and by kind
+/// (knights/men-at-arms/spearmen/bowmen) the men struck, wounded and
+/// killed on each side.
+fn log_tally(tick: u32, stats: &ArrowStats, in_flight: usize) {
+    let kinds = |c: &[u32; crate::unit_types::NUM_KINDS]| {
+        c.iter().map(|n| n.to_string()).collect::<Vec<_>>().join("/")
+    };
+    let side = |team: usize| {
+        format!(
+            "struck {} wounded {} killed {}",
+            kinds(&stats.struck[team]),
+            kinds(&stats.wounded[team]),
+            kinds(&stats.killed[team])
+        )
+    };
+    info!(
+        "[archery-tally] tick {tick} loosed {} ended {} | orange {} | blue {}",
+        stats.loosed_total,
+        stats.loosed_total - in_flight as u64,
+        side(1),
+        side(0),
+    );
 }
 
 /// Skirmish trigger: EDGE gap (centroid distance minus both footprint
