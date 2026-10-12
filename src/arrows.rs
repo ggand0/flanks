@@ -115,6 +115,12 @@ pub struct ArrowStats {
     pub hits: usize,
     /// Looses dropped at the pool cap (cumulative; should stay 0).
     pub dropped: u64,
+    /// Since the start, for the archery tally: arrows loosed, and by the
+    /// victim's team and kind the men struck, wounded and killed.
+    pub loosed_total: u64,
+    pub struck: [[u32; crate::unit_types::NUM_KINDS]; 2],
+    pub wounded: [[u32; crate::unit_types::NUM_KINDS]; 2],
+    pub killed: [[u32; crate::unit_types::NUM_KINDS]; 2],
 }
 
 /// Arrows standing in the ground where they landed (ring buffer like
@@ -344,6 +350,7 @@ fn update_arrows(
                 continue;
             }
             stats.loosed += 1;
+            stats.loosed_total += 1;
             if let Some(se) = sounds.as_deref_mut() {
                 se.push_loose(s.group, s.pos);
             }
@@ -483,6 +490,8 @@ fn update_arrows(
             continue;
         }
         let pv = &TYPES[units.kind[v] as usize];
+        let (vt, vk) = (units.team[v] as usize, units.kind[v] as usize);
+        stats.struck[vt][vk] += 1;
         let fwd = Vec2::new(units.yaw[v].sin(), units.yaw[v].cos());
         let along = fwd.dot(h.from_dir);
         let front = along >= crate::sim::damage::SECTOR_COS_60;
@@ -516,7 +525,9 @@ fn update_arrows(
         if !h.wound {
             continue;
         }
+        stats.wounded[vt][vk] += 1;
         if units.hp[v] <= 0.0 {
+            stats.killed[vt][vk] += 1;
             units.death_t[v] = crate::sim::damage::DEATH_TICKS;
             cstats.kills[units.team[v] as usize] += 1;
             groups.list[units.group[v] as usize].recent_deaths += 1;
@@ -557,6 +568,39 @@ fn update_arrows(
             }
         }
     }
+    if tally_log() && tick.is_multiple_of(120) {
+        log_tally(*tick, &stats, arrows.len());
+    }
+}
+
+/// FL_TEST_ARCHERY logs the calibration tally every 4 s of sim time.
+fn tally_log() -> bool {
+    static T: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *T.get_or_init(|| std::env::var("FL_TEST_ARCHERY").is_ok())
+}
+
+/// The calibration tally: arrows loosed and ended, and by kind
+/// (knights/men-at-arms/spearmen/bowmen) the men struck, wounded and
+/// killed on each side.
+fn log_tally(tick: u32, stats: &ArrowStats, in_flight: usize) {
+    let kinds = |c: &[u32; crate::unit_types::NUM_KINDS]| {
+        c.iter().map(|n| n.to_string()).collect::<Vec<_>>().join("/")
+    };
+    let side = |team: usize| {
+        format!(
+            "struck {} wounded {} killed {}",
+            kinds(&stats.struck[team]),
+            kinds(&stats.wounded[team]),
+            kinds(&stats.killed[team])
+        )
+    };
+    info!(
+        "[archery-tally] tick {tick} loosed {} ended {} | orange {} | blue {}",
+        stats.loosed_total,
+        stats.loosed_total - in_flight as u64,
+        side(1),
+        side(0),
+    );
 }
 
 /// Skirmish trigger: EDGE gap (centroid distance minus both footprint
