@@ -112,13 +112,12 @@ const COUNTERS: usize = 2 * NUM_BUCKETS + CASTER_LISTS + 1 + NUM_KINDS + NUM_BUC
 /// CPU path.
 const STORAGE_BUFFERS: u32 = 11;
 
-/// Pose slots (four floats each) per soldier of a kind without a bow rig,
-/// of one with it, and of a skinned kind: the part pose and one per joint
-/// (`POSE_SLOTS`, `POSE_SLOTS_BOW` and `POSE_SLOTS_SKEL` in
-/// shaders/unit_pose.wgsl).
+/// Pose slots (four floats each) per soldier of a kind without a bow rig
+/// and of one with it (`POSE_SLOTS` and `POSE_SLOTS_BOW` in
+/// shaders/unit_pose.wgsl). A skinned kind has one more per joint after
+/// its part pose.
 const POSE_SLOTS: u32 = 17;
 const POSE_SLOTS_BOW: u32 = 45;
-const POSE_SLOTS_SKEL: u32 = POSE_SLOTS + crate::unit_meshes::SKEL_JOINTS as u32;
 
 /// The levels a skinned kind poses by its skeleton and draws skinned: L0
 /// and L1, where a soldier stands 12 px or taller (render_units.rs
@@ -1593,12 +1592,11 @@ fn prepare_gpu_units(
     if input.pose_pass {
         pose_stride = [POSE_SLOTS; NUM_KINDS];
         for (bucket, rig, _) in &rigs {
-            if rig.rig.bow.params[3] > 0.5 {
-                pose_stride[bucket.0 / NUM_LODS] = POSE_SLOTS_BOW;
-            }
+            let mut stride = if rig.rig.bow.params[3] > 0.5 { POSE_SLOTS_BOW } else { POSE_SLOTS };
             if rig.rig.skel.params[0] > 0 {
-                pose_stride[bucket.0 / NUM_LODS] = POSE_SLOTS_SKEL;
+                stride += crate::unit_meshes::SKEL_JOINTS as u32;
             }
+            pose_stride[bucket.0 / NUM_LODS] = stride;
         }
     }
     let grow = match &buffers.alloc {

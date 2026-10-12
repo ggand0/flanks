@@ -585,7 +585,11 @@ pub(crate) const SYNC_CHUNK: usize = 16_384;
 ///     0..1 linear in time, or from FOLLOW_BASE the follow-through;
 ///   z >= CELEBRATE_BASE: victory cheer, fraction = progress 0..1;
 ///   z >= RANGED_BASE: a bow shot, RANGED_BASE + clip * 2 + progress,
-///     clip 0 the raise, 1 the release, 2 the reload.
+///     clip 0 the draw from the bow down, 1 its release, 2 its reload,
+///     3 the raise from the held aim, 4 its release, 5 its reload. The
+///     held aim between shots is clip 3 at 0. The tables of a bow rig
+///     play 3 to 5 as 0 to 2; a skeleton plays its own clips for each
+///     (unit_pose.wgsl `put_skeleton`).
 /// The stance band rides anim2.x.
 pub(crate) const CELEBRATE_BASE: f32 = 12.0;
 pub(crate) const RANGED_BASE: f32 = 16.0;
@@ -601,6 +605,10 @@ pub(crate) const RELOAD_S: f32 = 5.8;
 pub(crate) const HOLD_S: f32 = 2.5;
 /// The whole cycle after a loose.
 const SHOT_S: f32 = RELEASE_S + RELOAD_S + HOLD_S;
+/// Seconds before his reload's end that a skeleton's draw reaches its
+/// held aim (the draw clip holds it over its last 0.2 s). A draw the sim
+/// starts that late still raises the aim.
+const DRAWN_EARLY_S: f32 = 0.2;
 /// Seconds to bring the bow up from the carry to the drawn ready pose,
 /// and to lower it again.
 pub(crate) const BOW_RISE_S: f32 = 0.4;
@@ -702,6 +710,12 @@ struct Smooth {
     shot: f32,
     /// How far his bow is up toward the drawn ready pose, 0 to 1.
     bow: f32,
+    /// Whether his current or last draw started from the held aim, so
+    /// it raises the aim rather than drawing from the bow down.
+    up: bool,
+    /// Whether he holds the drawn aim: from the end of his reload until
+    /// his bow is down.
+    drawn: bool,
     /// Smoothed ground velocity, m/s (x, z): `walk` is its length.
     drift: Vec2,
 }
@@ -719,6 +733,9 @@ fn attack_signal(sm: &mut Smooth, sw: u8, swing_t: u8, kind: usize, dying: bool,
     let winding = sw & SWING_STATE_MASK == SWING_WINDUP && !dying;
     sm.shot = (sm.shot - dt).max(0.0);
     if winding {
+        if !sm.winding && sw & SWING_RANGED != 0 {
+            sm.up = sm.drawn;
+        }
         // A bow draw runs on the missile draw time, not the melee wind-up.
         let w = if sw & SWING_RANGED != 0 {
             crate::unit_types::missile::DRAW_TICKS as f32
@@ -738,6 +755,7 @@ fn attack_signal(sm: &mut Smooth, sw: u8, swing_t: u8, kind: usize, dying: bool,
     {
         if sm.swing & SWING_RANGED != 0 {
             sm.shot = SHOT_S;
+            sm.drawn = false;
         } else {
             sm.follow = follow_s(kind, sm.swing);
         }
@@ -752,19 +770,32 @@ fn attack_signal(sm: &mut Smooth, sw: u8, swing_t: u8, kind: usize, dying: bool,
     let shooting = (winding && ranged) || sm.shot > 0.0;
     let up = if shooting && !dying && sm.walk < BOW_WALK_MS { 1.0 } else { 0.0 };
     sm.bow = (sm.bow + (up - sm.bow).clamp(-dt / BOW_FALL_S, dt / BOW_RISE_S)).clamp(0.0, 1.0);
+    // His reload ends at the drawn aim, which a skeleton's draw reaches
+    // DRAWN_EARLY_S before the reload's end.
+    if sm.shot > 0.0 && sm.shot <= HOLD_S + DRAWN_EARLY_S {
+        sm.drawn = true;
+    }
+    if sm.bow <= 0.0 {
+        sm.drawn = false;
+    }
     let digit = attack_digit(sm.swing);
     if sm.shot > 0.0 {
         let t = SHOT_S - sm.shot;
+        let from = if sm.up { 6.0 } else { 0.0 };
         if t < RELEASE_S {
-            RANGED_BASE + 2.0 + t / RELEASE_S
+            RANGED_BASE + from + 2.0 + t / RELEASE_S
         } else if t < RELEASE_S + RELOAD_S {
-            RANGED_BASE + 4.0 + (t - RELEASE_S) / RELOAD_S
+            RANGED_BASE + from + 4.0 + (t - RELEASE_S) / RELOAD_S
         } else {
-            // Holding the drawn bow: the raise at its start.
-            RANGED_BASE
+            // Holding the drawn aim.
+            RANGED_BASE + 6.0
         }
     } else if ranged && (sm.atk > 0.0 || sm.bow > 0.0) {
-        RANGED_BASE + sm.atk
+        // A draw, or one cut short going back, from where it started;
+        // else the bow coming down from the aim or from ready.
+        let aim = if winding || sm.atk > 0.0 { sm.up } else { sm.drawn };
+        let from = if aim { 6.0 } else { 0.0 };
+        RANGED_BASE + from + sm.atk
     } else if sm.follow > 0.0 {
         digit * 2.0 + FOLLOW_BASE + FOLLOW_SPAN * (1.0 - sm.follow / follow_s(kind, sm.swing))
     } else if sm.atk > 0.0 {
