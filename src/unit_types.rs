@@ -73,10 +73,11 @@ pub mod missile {
     /// a block dies as fast as under the curve above with the 1.0 to
     /// 1.1 m bodies it was calibrated with: a 1.70 m man takes 13 to 18
     /// percent more strikes per arrow, and since hit points add the
-    /// strikes up, the dead rose up to 1.9 times. At 0.8 a block of
-    /// each kind loses the same men within a fifth over two minutes.
-    /// FL_WOUND overrides it.
-    pub const WOUND_SHARE: f32 = 0.8;
+    /// strikes up, the dead rose up to 1.9 times. At 0.83 a block of
+    /// men-at-arms loses the same men within a tenth over a minute,
+    /// spearmen within 4 percent and knights within a fifth over two
+    /// minutes. FL_WOUND overrides it.
+    pub const WOUND_SHARE: f32 = 0.83;
 }
 
 /// Damage swing per combat factor point (M2TW uses ~1.2 on kill CHANCE;
