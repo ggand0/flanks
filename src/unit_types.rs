@@ -267,8 +267,10 @@ pub const TYPES: [UnitTypeParams; NUM_KINDS] = [
         reach: 2.0,
         windup_ticks: 9,
         cooldown_ticks: 33,
-        cut_windup_ticks: 0,
-        cut_return_ticks: 0,
+        // The knight's cut: he plays the knight's clips
+        // (unit_glb.rs CLIP_KIND), the cut among them.
+        cut_windup_ticks: 18,
+        cut_return_ticks: 21,
         speed: 9.5,
         mass: 0.9,
         // Armored Sergeants / Billmen row = 5 on the measured scale.
