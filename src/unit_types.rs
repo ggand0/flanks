@@ -69,12 +69,14 @@ pub mod missile {
     pub const BASE_DMG: f32 = 20.0;
     /// The share of the arrows that strike a man which wound him; the
     /// rest glance off armour, helmet or the shield's rim and do
-    /// nothing, as M2TW's lethality has it. Set so the kills per arrow
-    /// at the men's true height match the ones the curve above was
-    /// calibrated to with the 1.1 m bodies, whose window a shaft could
-    /// hit was half as tall: 146 dead against 279 at 36 s of the
-    /// archery scene. FL_WOUND overrides it.
-    pub const WOUND_SHARE: f32 = 0.52;
+    /// nothing, as M2TW's lethality has it. Set in the archery scene so
+    /// a block dies as fast as under the curve above with the 1.0 m
+    /// bodies it was calibrated with: a 1.70 m man takes 17 percent
+    /// more strikes per arrow, and since hit points add the strikes
+    /// up, the dead rose up to 1.9 times. At 0.8 a block of each kind
+    /// loses the same men within a fifth over two minutes. FL_WOUND
+    /// overrides it.
+    pub const WOUND_SHARE: f32 = 0.8;
 }
 
 /// Damage swing per combat factor point (M2TW uses ~1.2 on kill CHANCE;
