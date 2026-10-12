@@ -59,8 +59,7 @@ struct Smooth {
     // Wind-up progress shown last frame, running back to 0 once the
     // wind-up is cut short.
     atk: f32,
-    // The swing byte of the current or last attack, and 1 << 8 when he
-    // was winding up last frame.
+    // The swing byte of the current or last attack, and the SM_ bits.
     swing: u32,
     // Seconds left of the release, reload and hold after his last shot.
     shot: f32,
@@ -232,6 +231,14 @@ const SWING_STYLE_SHIFT: u32 = 3u;
 const SWING_STYLE_MASK: u32 = 24u;
 const SWING_STAGGERED: u32 = 32u;
 const SWING_RANGED: u32 = 128u;
+// Bits `Smooth::swing` carries above the swing byte: he was winding up
+// last frame; his current or last draw started from the held aim; he
+// holds the drawn aim (render_units.rs `Smooth::up`, `Smooth::drawn`).
+const SM_WINDING: u32 = 256u;
+const SM_UP: u32 = 512u;
+const SM_DRAWN: u32 = 1024u;
+// render_units.rs DRAWN_EARLY_S.
+const DRAWN_EARLY_S: f32 = 0.2;
 
 // RegimentRecord flags.
 const REG_BROKEN: u32 = 1u;
@@ -484,8 +491,12 @@ fn build_soldier(i: u32) {
     // render_units.rs `attack_signal`.
     let shot_s = params.shot.x + params.shot.y + params.shot.z;
     let winding = (swing & SWING_STATE_MASK) == SWING_WINDUP && death_t == 0.0;
+    var flags = sm.swing & (SM_UP | SM_DRAWN);
     sm.shot = max(sm.shot - params.dt, 0.0);
     if winding {
+        if (sm.swing & SM_WINDING) == 0u && (swing & SWING_RANGED) != 0u {
+            flags = select(flags & ~SM_UP, flags | SM_UP, (flags & SM_DRAWN) != 0u);
+        }
         var w = params.windup[kind];
         if (swing & SWING_RANGED) != 0u {
             w = params.consts.x;
@@ -495,12 +506,13 @@ fn build_soldier(i: u32) {
         sm.atk = clamp((w - swing_t + params.alpha) / (w + 1.0), 0.0, 1.0);
         sm.swing = swing;
         sm.shot = 0.0;
-    } else if (sm.swing & 256u) != 0u
+    } else if (sm.swing & SM_WINDING) != 0u
         && (swing & SWING_STATE_MASK) == SWING_RECOVER
         && (swing & SWING_STAGGERED) == 0u
         && ((sm.swing & SWING_RANGED) == 0u || swing_t > params.bow.z) {
         if (sm.swing & SWING_RANGED) != 0u {
             sm.shot = shot_s;
+            flags &= ~SM_DRAWN;
         } else {
             sm.follow = follow_s(kind, sm.swing);
         }
@@ -509,7 +521,6 @@ fn build_soldier(i: u32) {
         sm.follow = max(sm.follow - params.dt, 0.0);
         sm.atk = max(sm.atk - params.dt / params.attack.w, 0.0);
     }
-    sm.swing = (sm.swing & 0xffu) | select(0u, 256u, winding);
     let ranged = (sm.swing & SWING_RANGED) != 0u;
     let shooting = (winding && ranged) || sm.shot > 0.0;
     var up = 0.0;
@@ -521,6 +532,15 @@ fn build_soldier(i: u32) {
         0.0,
         1.0,
     );
+    // His reload ends at the drawn aim, which a skeleton's draw reaches
+    // DRAWN_EARLY_S before the reload's end.
+    if sm.shot > 0.0 && sm.shot <= params.shot.z + DRAWN_EARLY_S {
+        flags |= SM_DRAWN;
+    }
+    if sm.bow <= 0.0 {
+        flags &= ~SM_DRAWN;
+    }
+    sm.swing = (sm.swing & 0xffu) | flags | select(0u, SM_WINDING, winding);
     var digit = f32((sm.swing & SWING_STYLE_MASK) >> SWING_STYLE_SHIFT);
     if (sm.swing & SWING_CHARGE) != 0u {
         digit += 3.0;
@@ -528,14 +548,19 @@ fn build_soldier(i: u32) {
     var attack = 0.0;
     if sm.shot > 0.0 {
         let t = shot_s - sm.shot;
-        attack = params.bow.w;
+        let start = select(0.0, 6.0, (flags & SM_UP) != 0u);
+        // Holding the drawn aim.
+        attack = params.bow.w + 6.0;
         if t < params.shot.x {
-            attack = params.bow.w + 2.0 + t / params.shot.x;
+            attack = params.bow.w + start + 2.0 + t / params.shot.x;
         } else if t < params.shot.x + params.shot.y {
-            attack = params.bow.w + 4.0 + (t - params.shot.x) / params.shot.y;
+            attack = params.bow.w + start + 4.0 + (t - params.shot.x) / params.shot.y;
         }
     } else if ranged && (sm.atk > 0.0 || sm.bow > 0.0) {
-        attack = params.bow.w + sm.atk;
+        // A draw, or one cut short going back, from where it started;
+        // else the bow coming down from the aim or from ready.
+        let aim = select(SM_DRAWN, SM_UP, winding || sm.atk > 0.0);
+        attack = params.bow.w + select(0.0, 6.0, (flags & aim) != 0u) + sm.atk;
     } else if sm.follow > 0.0 {
         attack = digit * 2.0 + params.attack.y + params.attack.z * (1.0 - sm.follow / follow_s(kind, sm.swing));
     } else if sm.atk > 0.0 {
