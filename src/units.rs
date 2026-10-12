@@ -122,12 +122,20 @@ pub struct Units {
 pub const SWING_READY: u8 = 0;
 pub const SWING_WINDUP: u8 = 1;
 pub const SWING_RECOVER: u8 = 2;
+/// Answering a swing he saw coming: the shield block or the weapon parry
+/// of sim/damage.rs (`GUARD_*`). `swing_t` counts the answer down, the
+/// style bits say which answer, `target` is the attacker he squares up
+/// to. Set by the damage apply when the warning of a swing arrives,
+/// cleared when the timer runs out or a parry that stopped the blow
+/// turns into its counter wind-up.
+pub const SWING_DEFEND: u8 = 3;
 pub const SWING_STATE_MASK: u8 = 3;
 /// Attack style for the CURRENT swing (bits 3-4, set at wind-up start,
 /// wiped with the state): 0 = stab, 1 = classic overhead swing, 2 = slash
 /// (benched). Only the look, except for a kind with a cut, whose style 1
 /// is the slow cut (`UnitTypeParams::is_cut`) and whose style 2 is the
-/// overhead swing at the stab's pace.
+/// overhead swing at the stab's pace. In the defend state the same bits
+/// name the answer: 0 the shield block, 1 the weapon parry.
 pub const SWING_STYLE_SHIFT: u8 = 3;
 pub const SWING_STYLE_MASK: u8 = 0b11 << SWING_STYLE_SHIFT;
 /// Set when the swing was started at charging speed: bonus damage and a

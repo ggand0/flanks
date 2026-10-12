@@ -615,16 +615,30 @@ fn dir_test_log(
     let per_hit = |s: usize| dir_stats.dmg[0][s] / dir_stats.hits[0][s].max(1) as f64;
     info!(
         "[dir-test] t={t:.0}s kills by sector: front {} side {} rear {} \
-         (dmg/hit {:.1}/{:.1}/{:.1}); victims alive: control {ctl}/500, test {test}/500, \
-         lone {lone}/500 (yaw dev {:.2} rad)",
+         (blows {}/{}/{}, dmg/blow {:.1}/{:.1}/{:.1}); victims alive: control {ctl}/500, \
+         test {test}/500, lone {lone}/500 (yaw dev {:.2} rad); outcomes {}",
         k[0],
         k[1],
         k[2],
+        dir_stats.hits[0][0],
+        dir_stats.hits[0][1],
+        dir_stats.hits[0][2],
         per_hit(0),
         per_hit(1),
         per_hit(2),
         yaw_dev / yaw_n.max(1) as f32,
+        outcome_line(&dir_stats.outcomes[0]),
     );
+}
+
+/// The outcome counts of the blows on one team, named, for the logs.
+fn outcome_line(o: &[u64; crate::sim::damage::NUM_OUTCOMES]) -> String {
+    crate::sim::damage::OUTCOME_NAMES
+        .iter()
+        .zip(o)
+        .map(|(n, c)| format!("{n} {c}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// FL_TEST_CHARGE=1: the phase-B acceptance. Two lanes of blue spears on
@@ -1632,7 +1646,8 @@ fn arena_log(
     info!(
         "[arena] t={t:.0}s FRONT lane you {} vs {} (morale {:.0}) | \
          REAR lane you {} vs {} (morale {:.0}) | \
-         your kills: front {} ({:.1}/hit), side {} ({:.1}/hit), rear {} ({:.1}/hit)",
+         your kills: front {} ({:.1}/blow), side {} ({:.1}/blow), rear {} ({:.1}/blow) | \
+         your blows: {} | theirs: {}",
         alive[0][0],
         alive[0][1],
         groups.list[1].morale,
@@ -1645,6 +1660,8 @@ fn arena_log(
         per_hit(1),
         k[2],
         per_hit(2),
+        outcome_line(&dir_stats.outcomes[1]),
+        outcome_line(&dir_stats.outcomes[0]),
     );
 }
 

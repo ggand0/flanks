@@ -19,13 +19,13 @@ pub enum Weapon {
     Spear,
 }
 
-/// Damage of a landed hit at combat factor 0, per weapon class. Anchored
-/// so the median matchup (light vs light, frontal) deals the same damage
-/// per hit as the old flat model: pacing anchors survive the stat swap.
-pub const BASE_DMG: [f32; 2] = [
-    23.0, // Sword: light-vs-light frontal factor is -2 -> 23 * 1.13^-2 = 18
-    32.5, // Spear: spear-vs-light frontal factor is -4 -> 32.5 * 1.13^-4 = 20
-];
+/// Damage of a blow that lands, per weapon class, the same whatever the
+/// stats: the stats decide whether it lands (sim/damage.rs
+/// `land_chance`), as M2TW's one roll does, and hit points add the landed
+/// blows up. Anchored at what the median matchup dealt per hit before the
+/// roll (light against light, frontal: 18 for the sword, 20 for the spear),
+/// so a man-at-arms still falls to five sword blows and a knight to nine.
+pub const BASE_DMG: [f32; 2] = [18.0, 20.0];
 
 /// Ranged stats, archer-only for now (a second ranged kind needs the
 /// spatial META widen first, so these stay consts instead of a TYPES
@@ -84,27 +84,29 @@ pub mod missile {
     pub const WOUND_SHARE: f32 = 0.83;
 }
 
-/// Damage swing per combat factor point (M2TW uses ~1.2 on kill CHANCE;
-/// on hp damage 1.13 keeps a +/-6 factor spread inside ~2x swings).
-pub const FACTOR_MULT: f32 = 1.13;
-/// Factor clamp: +/-12 caps the damage spread at ~4.3x either way.
-pub const FACTOR_CLAMP: f32 = 12.0;
-
 pub struct UnitTypeParams {
     pub hp: f32,
-    /// M2TW-style combat stats. Damage per hit is
-    /// `BASE_DMG[weapon] * FACTOR_MULT^(attack + situational - defence)`,
-    /// resolved directionally at damage apply (sim/damage.rs): defence_skill
-    /// counts vs front/side attacks but NOT rear; shield covers the front
-    /// and LEFT side only (shield arm); armour counts everywhere, halved
-    /// by `ap` attackers.
+    /// M2TW-style combat stats. `attack + situational - defence` is the
+    /// chance a blow lands (sim/damage.rs `land_chance`), resolved by
+    /// sector at damage apply: defence_skill counts in full from the
+    /// front and half from the sides, never from the rear; shield covers
+    /// the front and LEFT side only (shield arm); armour counts
+    /// everywhere, halved by `ap` attackers. A landed blow deals
+    /// `BASE_DMG[weapon]`.
     pub attack: f32,
     /// Extra attack points while the swing carries the charge flag
     /// (momentum). A braced spearwall victim nullifies it.
     pub charge_bonus: f32,
+    /// Also how often his answer to a swing he sees is on time: skill
+    /// times `GUARD_PER_SKILL` (sim/damage.rs).
     pub defence_skill: f32,
     pub armour: f32,
     pub shield: f32,
+    /// How often a man with a shield meets a blow from its side with the
+    /// weapon instead of the shield (sim/damage.rs): the parry is the
+    /// risky answer that counters at once, the block the safe one.
+    /// Without a shield every answer is a parry.
+    pub parry_share: f32,
     /// Armour-piercing weapon: halves the victim's armour points.
     pub ap: bool,
     pub weapon: Weapon,
@@ -243,6 +245,7 @@ pub const TYPES: [UnitTypeParams; NUM_KINDS] = [
         defence_skill: 6.0,
         armour: 5.0,
         shield: 5.0,
+        parry_share: 0.5,
         ap: false,
         weapon: Weapon::Sword,
         reach: 1.8,
@@ -277,6 +280,7 @@ pub const TYPES: [UnitTypeParams; NUM_KINDS] = [
         defence_skill: 4.0,
         armour: 3.0,
         shield: 4.0,
+        parry_share: 0.35,
         ap: false,
         weapon: Weapon::Sword,
         reach: 2.0,
@@ -304,6 +308,7 @@ pub const TYPES: [UnitTypeParams; NUM_KINDS] = [
         defence_skill: 3.0,
         armour: 4.0,
         shield: 6.0,
+        parry_share: 0.2,
         ap: false,
         weapon: Weapon::Spear,
         reach: 2.4,
@@ -332,6 +337,7 @@ pub const TYPES: [UnitTypeParams; NUM_KINDS] = [
         defence_skill: 2.0,
         armour: 1.0,
         shield: 0.0,
+        parry_share: 1.0,
         ap: false,
         weapon: Weapon::Sword,
         reach: 1.6,

@@ -16,8 +16,12 @@ use bevy::camera::visibility::NoFrustumCulling;
 use bevy::render::batching::NoAutomaticBatching;
 
 use crate::render_units::{InstanceData, InstanceMaterialData};
-use crate::unit_types::{FACTOR_CLAMP, TYPES, missile};
+use crate::unit_types::{TYPES, missile};
 use crate::units::hash01;
+
+/// The missile factor's clamp: +/-12 caps the damage spread of the
+/// missile curve at about 20x either way.
+const MISSILE_FACTOR_CLAMP: f32 = 12.0;
 
 /// Live-arrow pool cap. Sized ~4x the steady state of a 200k battle with
 /// a full archer rear rank; looses past it are dropped and counted.
@@ -499,7 +503,7 @@ fn update_arrows(
         let left_side = !front && !rear && h.from_dir.dot(Vec2::new(fwd.y, -fwd.x)) > 0.0;
         let shield = if front || left_side { pv.shield } else { 0.0 };
         let factor =
-            (missile::ATTACK - (pv.armour + shield)).clamp(-FACTOR_CLAMP, FACTOR_CLAMP);
+            (missile::ATTACK - (pv.armour + shield)).clamp(-MISSILE_FACTOR_CLAMP, MISSILE_FACTOR_CLAMP);
         // The missile curve is steeper than melee's (missile::FACTOR_MULT):
         // armour classes must separate hard under arrows.
         let dmg = missile::BASE_DMG * missile::FACTOR_MULT.powf(factor) * h.jit * combat_scale;

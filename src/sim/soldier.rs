@@ -467,6 +467,8 @@ fn begin(f: &Field, s: &mut Soldier) -> Step {
         *s.out_form = false;
     } else if *s.swing & crate::units::SWING_STATE_MASK
         != crate::units::SWING_READY
+        && *s.swing & crate::units::SWING_STATE_MASK
+            != crate::units::SWING_DEFEND
         && *s.swing & crate::units::SWING_RANGED == 0
     {
         *s.out_form = true;
@@ -768,6 +770,7 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
             jit,
             charge: false,
             impale: true,
+            warn: 0,
         });
     }
     st.push = push;
@@ -1280,6 +1283,7 @@ fn swing(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
                         jit,
                         charge: *s.swing & crate::units::SWING_CHARGE != 0,
                         impale: false,
+                        warn: 0,
                     });
                     *s.swing = crate::units::SWING_RECOVER;
                     let cjit = (1.0 - crate::unit_types::COOLDOWN_JITTER)
@@ -1292,6 +1296,24 @@ fn swing(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
                     if cut {
                         *s.swing_t = (*s.swing_t).max(params.cut_return_ticks);
                     }
+                } else {
+                    *s.swing_t -= 1;
+                }
+            }
+            crate::units::SWING_DEFEND => {
+                // Answering a swing he saw coming (sim/damage.rs): feet
+                // planted, eyes on the attacker, the shield or the blade
+                // up to meet the blow, then back on guard. The damage
+                // apply set this and may end it early: a parry that
+                // stopped the blow turns into the counter's wind-up.
+                desired *= 0.25;
+                let t = *s.target as usize;
+                if t < pos_prev.len() {
+                    face_target = Some(pos_prev[t].xz());
+                }
+                if *s.swing_t == 0 {
+                    *s.swing = crate::units::SWING_READY
+                        | (*s.swing & crate::units::SWING_STAGGER_IMMUNE);
                 } else {
                     *s.swing_t -= 1;
                 }
@@ -1374,6 +1396,20 @@ fn swing(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
                         crate::units::SWING_WINDUP | style
                     };
                     *s.swing_t = params.windup_for(*s.swing);
+                    // The target is told of the swing now, so that he
+                    // can answer it with a block or a parry timed to the
+                    // strike (sim/damage.rs). The counter after a parry
+                    // starts in the apply pass and warns nobody: it
+                    // comes while the attacker is still recovering, when
+                    // he could not answer anyway.
+                    out.events.push(DamageEvent {
+                        victim: chosen,
+                        attacker: i as u32,
+                        jit: 0.0,
+                        charge: false,
+                        impale: false,
+                        warn: *s.swing_t,
+                    });
                 } else if my_kind == crate::unit_types::KIND_ARCHER as usize
                     && !routed
                     && *s.ammo > 0
