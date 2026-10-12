@@ -70,12 +70,12 @@ pub mod missile {
     /// The share of the arrows that strike a man which wound him; the
     /// rest glance off armour, helmet or the shield's rim and do
     /// nothing, as M2TW's lethality has it. Set in the archery scene so
-    /// a block dies as fast as under the curve above with the 1.0 m
-    /// bodies it was calibrated with: a 1.70 m man takes 17 percent
-    /// more strikes per arrow, and since hit points add the strikes
-    /// up, the dead rose up to 1.9 times. At 0.8 a block of each kind
-    /// loses the same men within a fifth over two minutes. FL_WOUND
-    /// overrides it.
+    /// a block dies as fast as under the curve above with the 1.0 to
+    /// 1.1 m bodies it was calibrated with: a 1.70 m man takes 13 to 18
+    /// percent more strikes per arrow, and since hit points add the
+    /// strikes up, the dead rose up to 1.9 times. At 0.8 a block of
+    /// each kind loses the same men within a fifth over two minutes.
+    /// FL_WOUND overrides it.
     pub const WOUND_SHARE: f32 = 0.8;
 }
 
