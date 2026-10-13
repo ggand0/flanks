@@ -61,6 +61,10 @@ pub struct RenderCounts {
     pub lod_drawn: [usize; NUM_LODS],
     /// Fallen soldiers drawn this frame. The counts above are the living.
     pub corpses_drawn: usize,
+    /// Per detail level, the soldiers and bodies in the frustum the
+    /// occlusion test hid (render_units_occlusion.rs). In count mode they
+    /// are drawn all the same.
+    pub hidden: [usize; NUM_LODS],
     /// Cost of sync_instance_data this frame (cull + bucket build).
     pub sync_ms: f32,
     /// FL_GPU_CHECK: what the CPU sweep would have drawn on recent frames,
@@ -436,6 +440,7 @@ impl Plugin for UnitRenderPlugin {
             .init_resource::<LodConfig>()
             .init_resource::<Corpses>()
             .add_plugins(crate::render_units_gpu::GpuUnitRenderPlugin)
+            .add_plugins(crate::render_units_occlusion::UnitOcclusionPlugin)
             .add_plugins(crate::render_units_phase::UnitPhasePlugin)
             .add_plugins(crate::render_units_shadow::UnitShadowPlugin)
             .add_systems(Startup, setup_unit_mesh)
@@ -1396,7 +1401,7 @@ pub(crate) fn init_custom_pipeline(
         mesh_pipeline: mesh_pipeline.clone(),
         pull_layout: BindGroupLayoutDescriptor::new(
             "unit pull layout",
-            &BindGroupLayoutEntries::with_indices(
+            &pull_layout_entries(BindGroupLayoutEntries::with_indices(
                 ShaderStages::VERTEX,
                 (
                     (0, binding_types::storage_buffer_read_only_sized(false, None)),
@@ -1418,7 +1423,7 @@ pub(crate) fn init_custom_pipeline(
                     (8, sun()),
                     (9, binding_types::storage_buffer_read_only_sized(false, None)),
                 ),
-            ),
+            )),
         ),
         bucket_layout: BindGroupLayoutDescriptor::new(
             "unit bucket layout",
@@ -1435,6 +1440,25 @@ pub(crate) fn init_custom_pipeline(
         ),
         blank_atlas: (blank_view, blank_sampler),
     });
+}
+
+/// Group 3 of a pulled bucket, with `FL_OCCLUDE_CHECK` the reach the
+/// corners measure at binding 10 (render_units_occlusion.rs).
+fn pull_layout_entries(entries: impl std::ops::Deref<Target = [BindGroupLayoutEntry]>) -> Vec<BindGroupLayoutEntry> {
+    let mut entries = entries.to_vec();
+    if crate::render_units_occlusion::bound_check() {
+        entries.push(BindGroupLayoutEntry {
+            binding: 10,
+            visibility: ShaderStages::VERTEX,
+            ty: BindingType::Buffer {
+                ty: BufferBindingType::Storage { read_only: false },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        });
+    }
+    entries
 }
 
 /// Each bucket's rig as a uniform, made once: rigs do not change.
@@ -1637,6 +1661,12 @@ impl SpecializedRenderPipeline for CustomPipeline {
         defs.push(bevy::shader::ShaderDefVal::UInt("PULL_BUCKET".into(), key.bucket));
         if key.lod_debug {
             defs.push("LOD_DEBUG".into());
+        }
+        if crate::render_units_occlusion::bound_check() {
+            defs.push("UNIT_BOUND_CHECK".into());
+            if let Some(fragment) = descriptor.fragment.as_mut() {
+                fragment.shader_defs.push("UNIT_BOUND_CHECK".into());
+            }
         }
         if key.pose_pass {
             defs.push("UNIT_POSE_READ".into());

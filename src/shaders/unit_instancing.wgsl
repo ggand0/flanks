@@ -2,7 +2,7 @@
 #import bevy_pbr::mesh_view_types::DIRECTIONAL_LIGHT_FLAGS_SHADOWS_ENABLED_BIT
 #import bevy_pbr::shadows::fetch_directional_shadow
 #import bevy_pbr::view_transformations::position_world_to_clip
-#import flanks::unit_pose::{P_DEATH, P_TEAM, place, pose_at}
+#import flanks::unit_pose::{P_DEATH, P_POS, P_TEAM, P_YAW, place, pose_at}
 #ifdef UNIT_POSE_READ
 #import flanks::unit_pose::pose_from
 #else
@@ -50,7 +50,8 @@ struct VertexOutput {
     // light, the part the shadow takes away.
     @location(0) color: vec4<f32>,
     // Per instance, so flat. x = team colour, unorm8 rgb, and the death
-    // darkening in the top byte; y = the hit flash, unorm8 in the low byte.
+    // darkening in the top byte; y = the hit flash, unorm8 in the low byte,
+    // and under FL_OCCLUDE_CHECK the occlusion mark in bit 8.
     @location(1) @interpolate(flat) packed: vec2<u32>,
 #ifdef UNIT_SHADOW_RECEIVE
     // World position pushed off the surface by the shadow map's normal
@@ -129,6 +130,28 @@ struct PullVertex {
 // per soldier in the kind's pose buffer, w = soldiers per instance.
 @group(3) @binding(3) var<storage, read> pull_buckets: array<vec4<u32>>;
 
+#ifdef UNIT_BOUND_CHECK
+// FL_OCCLUDE_CHECK (render_units_occlusion.rs): per kind, standing then
+// dying or fallen, how far any drawn corner reached from his position in
+// his facing frame: forward, back, sideways, up, down, as float bits.
+@group(3) @binding(10) var<storage, read_write> bound_reach: array<atomic<u32>, 40>;
+
+fn measure_reach(placed: vec3<f32>) {
+    let d = placed - pose_at(P_POS).xyz;
+    let yaw = pose_at(P_YAW);
+    // unit_pose.wgsl `rot_y` turned his frame by cos, sin: turn it back.
+    let x = d.x * yaw.x - d.z * yaw.y;
+    let z = d.x * yaw.y + d.z * yaw.x;
+    let fallen = select(0u, 1u, pose_at(P_DEATH).w > 0.0);
+    let base = ((#{PULL_BUCKET}u / 4u) * 2u + fallen) * 5u;
+    atomicMax(&bound_reach[base], bitcast<u32>(max(z, 0.0)));
+    atomicMax(&bound_reach[base + 1u], bitcast<u32>(max(-z, 0.0)));
+    atomicMax(&bound_reach[base + 2u], bitcast<u32>(abs(x)));
+    atomicMax(&bound_reach[base + 3u], bitcast<u32>(max(d.y, 0.0)));
+    atomicMax(&bound_reach[base + 4u], bitcast<u32>(max(-d.y, 0.0)));
+}
+#endif
+
 @vertex
 fn vertex_pull(@builtin(vertex_index) index: u32, @builtin(instance_index) instance: u32) -> VertexOutput {
 #ifdef PULL_INDEXED
@@ -156,12 +179,17 @@ fn vertex_pull(@builtin(vertex_index) index: u32, @builtin(instance_index) insta
 #endif
     let v = pull_vertices[corner];
 #ifdef UNIT_POSE_READ
-    pose_from((entry & 0x3fffffffu) * bucket.z);
+    // The level rides the top two bits and the occlusion check's mark the
+    // bit below (unit_build.wgsl `queue_draw`).
+    pose_from((entry & 0x1fffffffu) * bucket.z);
 #else
-    let inst = pull_records[entry & 0x3fffffffu];
+    let inst = pull_records[entry & 0x1fffffffu];
     pose_begin(inst.pos_scale, inst.color, inst.anim, inst.anim2, globals.time, false);
 #endif
     let placed = place(v.position, v.normal, v.part, v.pivot, v.skin, v.weight);
+#ifdef UNIT_BOUND_CHECK
+    measure_reach(placed.position);
+#endif
     let team = pose_at(P_TEAM);
     var rgb = team.rgb;
 #ifdef LOD_DEBUG
@@ -178,7 +206,7 @@ fn vertex_pull(@builtin(vertex_index) index: u32, @builtin(instance_index) insta
         rgb = rgb * 0.4 + tint * 0.6;
     }
 #endif
-    return unit_output(
+    var out = unit_output(
         placed.position,
         placed.normal,
         unpack4x8unorm(v.color),
@@ -187,6 +215,12 @@ fn vertex_pull(@builtin(vertex_index) index: u32, @builtin(instance_index) insta
         team.w,
         unpack2x16unorm(v.atlas_uv),
     );
+#ifdef UNIT_BOUND_CHECK
+    // A soldier the occlusion test hid draws flat magenta (unit_build.wgsl
+    // `occlusion`).
+    out.packed.y |= ((entry >> 29u) & 1u) << 8u;
+#endif
+    return out;
 }
 #else
 @vertex
@@ -307,6 +341,11 @@ fn sun_shadow(shadow_position: vec3<f32>, frag_xy: vec2<f32>) -> f32 {
 
 @fragment
 fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
+#ifdef UNIT_BOUND_CHECK
+    if (in.packed.y & 256u) != 0u {
+        return vec4<f32>(1.0, 0.0, 1.0, 1.0);
+    }
+#endif
     // rgb = team colour, a = death darkening.
     let team = unpack4x8unorm(in.packed.x);
     let flash = unpack4x8unorm(in.packed.y).x;

@@ -614,6 +614,14 @@ fn update_overlay(
                 ms.len()
             )
         };
+        let occlude = crate::render_units_occlusion::mode();
+        if occlude != crate::render_units_occlusion::OccludeMode::Off {
+            // In count mode the hidden are drawn all the same.
+            info!(
+                "  unit occlusion ({occlude:?}): hidden per level {:?}, the living and the fallen",
+                render_counts.hidden
+            );
+        }
         let pacing = &mut *pacing;
         info!(
             "  frame ms without a tick: {} | with a tick: {} | inside the fixed tick: {}",
