@@ -10,14 +10,22 @@
 //! soldier out of the frustum is not. His shadow and his ring stay.
 //!
 //! The test lags a frame: a soldier who comes out from behind a nearer man
-//! shows a frame late. A camera cut (`build_frame_params`), a resize or a
+//! is tested against where that man stood a frame ago. His box is wider
+//! than he is, so the nearer man must move by that margin before he shows.
+//! A camera cut (render_units_gpu.rs `occlusion_params`), a resize or a
 //! frame without a pyramid skips the test.
 //!
-//! `FL_OCCLUDE`: 0 off, 1 cull, 2 count (the test runs and counts, nothing
-//! is culled). `FL_GPU_CHECK` turns cull into count, since the CPU sweep it
-//! compares against has no test. `FL_OCCLUDE_CHECK=1` measures how far each
-//! drawn corner reaches from his soldier (unit_instancing.wgsl), against
-//! the boxes the test uses (`BOUNDS`).
+//! While the test hides little, as in a view from above where the mass
+//! never hides itself, the pyramid is built only every few frames as a
+//! probe (render_units_gpu.rs `OcclusionProbe`).
+//!
+//! `FL_OCCLUDE`: 0 off (the default), 1 cull, 2 count (the test runs and
+//! counts, nothing is culled). `FL_GPU_CHECK` turns cull into count, since
+//! the CPU sweep it compares against has no test. `FL_OCCLUDE_CHECK=1`
+//! measures how far each drawn corner reaches from his soldier, against the
+//! boxes the test uses (`BOUNDS`), and in count mode draws the soldiers the
+//! test hid flat magenta, so any magenta on screen is a hidden soldier who
+//! shows (unit_instancing.wgsl). `=2` marks every soldier the test reads.
 
 use bevy::asset::{embedded_asset, load_embedded_asset};
 use bevy::core_pipeline::core_3d::{main_opaque_pass_3d, main_transparent_pass_3d};
@@ -241,9 +249,15 @@ fn prepare_unit_pyramid(
     pipeline_cache: Res<PipelineCache>,
     device: Res<RenderDevice>,
     views: Query<(Entity, &ExtractedView, &ExtractedCamera, &ViewDepthTexture), With<Camera3d>>,
+    input: Res<crate::render_units_gpu::GpuUnitInput>,
 ) {
     let pyramid = &mut *pyramid;
     pyramid.last = pyramid.this.take();
+    // The CPU path has no test.
+    if !input.enabled {
+        pyramid.last = None;
+        return;
+    }
     let mut views = views.iter().filter(|(.., camera, _)| camera.order == 0);
     let Some((entity, view, _, depth)) = views.next() else {
         pyramid.last = None;
@@ -309,7 +323,10 @@ fn prepare_unit_pyramid(
         pyramid.depth_id = Some(depth.view().id());
     }
     let first = if multisampled { pipelines.first_ms } else { pipelines.first };
-    let ready = pipeline_cache.get_compute_pipeline(first).is_some()
+    // Built only when the main world asks (render_units_gpu.rs
+    // `OcclusionProbe`): the next frame tests against it.
+    let ready = input.build_pyramid
+        && pipeline_cache.get_compute_pipeline(first).is_some()
         && pipeline_cache.get_compute_pipeline(pipelines.down).is_some();
     if ready {
         let clip_from_world = view
@@ -386,5 +403,48 @@ impl Plugin for UnitOcclusionPlugin {
                     .after(main_opaque_pass_3d)
                     .before(main_transparent_pass_3d),
             );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Level k's texel x covers pixels [x, x + 1) * 2^(k + 1), and the last
+    /// texel of a level everything to the edge (unit_depth_pyramid.wgsl):
+    /// every pixel lands on a texel of every level, clamped to the last.
+    #[test]
+    fn levels_cover_every_pixel() {
+        for size in [UVec2::new(2494, 1363), UVec2::new(2560, 1360), UVec2::new(1, 1), UVec2::new(3, 1000)] {
+            let sizes = level_sizes(size);
+            assert!(!sizes.is_empty());
+            assert_eq!(sizes[0], (size + 1) / 2);
+            for (k, s) in sizes.iter().enumerate() {
+                // As wgpu sizes mip k of level 0.
+                assert_eq!(*s, (sizes[0] >> k as u32).max(UVec2::ONE));
+                for axis in 0..2 {
+                    // Pixels each texel reads through the levels below it,
+                    // the last texel taking the odd rows and columns.
+                    let mut reach: Vec<(u32, u32)> =
+                        (0..sizes[0][axis]).map(|x| (2 * x, (2 * x + 1).min(size[axis] - 1))).collect();
+                    for next in &sizes[1..=k] {
+                        let n = next[axis];
+                        let src = std::mem::take(&mut reach);
+                        reach = (0..n)
+                            .map(|x| {
+                                // Two source texels, three for the last.
+                                let last = if x == n - 1 { 2 * x + 2 } else { 2 * x + 1 };
+                                (src[2 * x as usize].0, src[last.min(src.len() as u32 - 1) as usize].1)
+                            })
+                            .collect();
+                    }
+                    for p in 0..size[axis] {
+                        let t = (p >> (k + 1)).min(s[axis] - 1);
+                        let (lo, hi) = reach[t as usize];
+                        assert!(lo <= p && p <= hi, "size {size} level {k} axis {axis} pixel {p} on texel {t} reads {lo}..={hi}");
+                    }
+                }
+            }
+        }
     }
 }

@@ -71,9 +71,9 @@ pub fn cpu_sweep(cfg: Res<GpuSyncConfig>) -> bool {
 }
 
 /// Words of the counts readback: 16 bucket totals, 16 fallen per bucket,
-/// the frame stamp, the soldier count, two spare, the 16 caster list
-/// counts (cascade * 4 + kind), then the 16 bucket counts of soldiers the
-/// occlusion test hid.
+/// the frame stamp, the soldier count, 1 if the occlusion test ran, one
+/// spare, the 16 caster list counts (cascade * 4 + kind), then the 16
+/// bucket counts of soldiers the occlusion test hid.
 const READBACK_WORDS: usize = 68;
 
 /// Sun shadow cascades the build fills caster lists for, Bevy's maximum.
@@ -312,7 +312,33 @@ pub struct GpuFrameInput {
     pub lod_debug: bool,
     /// Per cascade and kind: the detail level soldiers cast with.
     pub shadow_levels: [[u32; NUM_KINDS]; MAX_CASCADES],
+    /// The occlusion test's depth pyramid is built after this frame's
+    /// opaque pass (`OcclusionProbe`).
+    pub build_pyramid: bool,
 }
+
+/// Whether the occlusion test pays for its depth pyramid, main world side.
+/// While the last test hid fewer vertex runs than the pyramid costs, the
+/// pyramid is built only every `PROBE_EVERY` frames and the test runs on
+/// the frame after: a probe. Once a probe hides more, it is built every
+/// frame. In the mid-air view the mass never hides itself (devlog 0173)
+/// and the probes cost a sixteenth of the pass. Cull mode only: count mode
+/// and the checks build it every frame.
+#[derive(Resource, Default)]
+pub struct OcclusionProbe {
+    /// The last test hid enough: build every frame.
+    active: bool,
+    /// Frames since the pyramid was last built.
+    since: u32,
+}
+
+/// Frames between probes.
+const PROBE_EVERY: u32 = 16;
+
+/// The vertex runs a test must hide to keep the pyramid every frame: the
+/// pyramid pass costs 0.12 to 0.14 ms at 2560x1360 (devlog 0247), the
+/// unit draw 44 ps a run (devlog 0174).
+const PROBE_RUNS: f32 = 3.0e6;
 
 /// The columns a snapshot record is packed from: the live ones, or the
 /// tick job's shared copies of them.
@@ -515,7 +541,7 @@ fn pack_chunk(c: &PackColumns, start: usize, out: &mut [GpuSoldier], flash: bool
 /// The per-frame parameters: camera, clock, level bands, one record per
 /// regiment. This is the top of `sync_instance_data` without the per
 /// soldier sweep.
-#[allow(clippy::too_many_arguments)] // bevy system params
+#[allow(clippy::too_many_arguments, clippy::type_complexity)] // bevy system params
 fn build_frame_params(
     units: Res<Units>,
     selection: Res<crate::orders::Selection>,
@@ -540,10 +566,12 @@ fn build_frame_params(
     mut counts: ResMut<RenderCounts>,
     mut no_cull: Local<Option<bool>>,
     frame_count: Res<FrameCount>,
-    (mut logged, rts, mut last_rts): (
+    (mut logged, rts, mut last_rts, terrain, mut probe): (
         Local<[Option<[u32; NUM_KINDS]>; MAX_CASCADES]>,
         Query<&crate::camera::RtsCamera>,
         Local<Option<crate::camera::RtsCamera>>,
+        Res<crate::terrain::Terrain>,
+        ResMut<OcclusionProbe>,
     ),
 ) {
     let t0 = std::time::Instant::now();
@@ -655,7 +683,17 @@ fn build_frame_params(
     if depth_order() {
         p.order = DEPTH_BINS as f32 / DEPTH_BIN_SPAN;
     }
-    occlusion_params(&mut p, rts.single().ok(), &mut last_rts);
+    occlusion_params(&mut p, rts.single().ok(), &mut last_rts, terrain.is_changed());
+    frame.build_pyramid = false;
+    if p.occlude.x != 0 {
+        use crate::render_units_occlusion::{OccludeMode, mode};
+        probe.since += 1;
+        let every_frame = mode() != OccludeMode::Cull || p.occlude.w != 0;
+        if every_frame || probe.active || probe.since >= PROBE_EVERY {
+            probe.since = 0;
+            frame.build_pyramid = true;
+        }
+    }
     // The sun's cascades for this camera, as the shadow pass draws them
     // this frame. A soldier casts into a cascade when the ground his shadow
     // can fall on is in view at depths the cascade serves, with the level
@@ -717,6 +755,7 @@ fn occlusion_params(
     p: &mut BuildParams,
     cam: Option<&crate::camera::RtsCamera>,
     last: &mut Option<crate::camera::RtsCamera>,
+    new_terrain: bool,
 ) {
     use crate::render_units_occlusion::{BOUNDS, OccludeMode, mode};
     if mode() == OccludeMode::Off || p.cull == 0 {
@@ -725,14 +764,18 @@ fn occlusion_params(
     p.occlude.x = mode() as u32;
     p.occlude.w = crate::render_units_occlusion::check_level();
     // A cut: the camera moved further than a frame of its fastest pan or
-    // zoom takes it, or turned further than a fast drag turns it. Last
-    // frame's depth then shows another view, and the test skips a frame.
+    // zoom takes it, or turned further than a fast drag turns it, or the
+    // map was rebuilt under it. Last frame's depth then shows another
+    // scene, and the test skips a frame.
     if let (Some(cam), Some(prev)) = (cam, last.as_ref()) {
         let moved = cam.focus.distance(prev.focus) > CUT_SHARE * cam.distance
             || (cam.distance - prev.distance).abs() > CUT_SHARE * cam.distance
             || (cam.yaw - prev.yaw).abs() > CUT_TURN
             || (cam.pitch - prev.pitch).abs() > CUT_TURN;
         p.occlude.z = moved as u32;
+    }
+    if new_terrain {
+        p.occlude.z = 1;
     }
     *last = cam.cloned();
     for (kind, [live, fall]) in BOUNDS.iter().enumerate() {
@@ -845,6 +888,7 @@ fn on_counts_readback(
     cfg: Res<GpuSyncConfig>,
     mut counts: ResMut<RenderCounts>,
     mut stats: Local<CheckStats>,
+    (mut probe, meshes): (ResMut<OcclusionProbe>, Query<&PullMesh>),
 ) {
     let words: Vec<u32> = event
         .data
@@ -861,6 +905,18 @@ fn on_counts_readback(
     counts.hidden = std::array::from_fn(|lod| {
         words[52..68].iter().skip(lod).step_by(NUM_LODS).map(|&n| n as usize).sum()
     });
+    // A frame the test ran on: the vertex runs it saved, at least one per
+    // vertex of each hidden soldier's level, decide the next probe.
+    if words[34] != 0 {
+        let runs: f32 = meshes
+            .iter()
+            .map(|m| {
+                let verts = m.indexed.as_ref().map_or(m.corners.len(), |i| i.vertices.len());
+                words[52 + m.bucket] as f32 * verts as f32
+            })
+            .sum();
+        probe.active = runs >= PROBE_RUNS;
+    }
     // The sun shadow casters per cascade, one count per kind, about every
     // two seconds next to the periodic log.
     stats.since_casters += 1;
@@ -1333,7 +1389,8 @@ pub struct PulledBucketGpu {
 /// The extracted inputs, render world side.
 #[derive(Resource, Default)]
 pub struct GpuUnitInput {
-    enabled: bool,
+    /// The GPU path is on (`GpuSyncConfig::enabled`).
+    pub enabled: bool,
     /// The pose pass is on (`GpuSyncConfig::pose_pass`).
     pub pose_pass: bool,
     records: Vec<GpuSoldier>,
@@ -1354,6 +1411,8 @@ pub struct GpuUnitInput {
     readback: Option<Handle<ShaderBuffer>>,
     /// `FL_OCCLUDE_CHECK`: the reach buffer the draws write.
     pub reach: Option<Handle<ShaderBuffer>>,
+    /// As `GpuFrameInput::build_pyramid`.
+    pub build_pyramid: bool,
 }
 
 /// Swap the snapshot into the render world and copy the small per-frame
@@ -1389,6 +1448,7 @@ fn extract_gpu_units(mut main_world: ResMut<MainWorld>, mut input: ResMut<GpuUni
     input.regiments.extend_from_slice(&frame.regiments);
     input.lod_debug = frame.lod_debug;
     input.shadow_levels = frame.shadow_levels;
+    input.build_pyramid = frame.build_pyramid;
     if input.readback.is_none() {
         input.readback = main_world
             .get_resource::<CountsReadback>()
@@ -2154,6 +2214,7 @@ impl Plugin for GpuUnitRenderPlugin {
         embedded_asset!(app, "shaders/unit_pose_pass.wgsl");
         app.init_resource::<SoldierSnapshot>()
             .init_resource::<GpuFrameInput>()
+            .init_resource::<OcclusionProbe>()
             .add_systems(Startup, (setup_counts_readback, setup_reach_readback).run_if(gpu_sync))
             .add_systems(
                 PostUpdate,

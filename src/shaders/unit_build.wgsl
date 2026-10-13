@@ -205,8 +205,8 @@ struct DrawArgs {
 // selection rings, 33..37 the pose pass's dispatch per kind (x, y, z).
 @group(0) @binding(7) var<storage, read_write> args: array<DrawArgs, 37>;
 // Copied back to the CPU by Bevy's readback plugin: the 32 counts, the
-// frame stamp and the soldier count, two spare, the 16 caster counts, the
-// 16 hidden counts.
+// frame stamp and the soldier count, 1 if the occlusion test ran, one
+// spare, the 16 caster counts, the 16 hidden counts.
 @group(0) @binding(8) var<storage, read_write> readback: array<u32, 68>;
 // Per pose slot, the record it poses, in one region per kind.
 @group(0) @binding(9) var<storage, read_write> pose_src: array<u32>;
@@ -930,6 +930,8 @@ fn finalize(@builtin(local_invocation_index) b: u32) {
     if b == 0u {
         readback[32u] = params.frame;
         readback[33u] = params.n;
+        // Whether the occlusion test ran this frame.
+        readback[34u] = select(0u, 1u, params.occlude.y != 0u);
         // Six corners per ring (two triangles).
         args[RING_ARG] = DrawArgs(atomicLoad(&counts[RING_COUNTER]) * 6u, 1u, 0u, 0u);
     }
