@@ -321,9 +321,10 @@ pub struct GpuFrameInput {
 /// While the last test hid fewer vertex runs than the pyramid costs, the
 /// pyramid is built only every `PROBE_EVERY` frames and the test runs on
 /// the frame after: a probe. Once a probe hides more, it is built every
-/// frame. In the mid-air view the mass never hides itself (devlog 0173)
-/// and the probes cost a sixteenth of the pass. Cull mode only: count mode
-/// and the checks build it every frame.
+/// frame. Seen from above, each rank's heads stand higher on screen than
+/// the rank in front, so an army hides almost none of itself, and there the
+/// probes cost a sixteenth of the pass. Cull mode only: count mode and the
+/// checks build it every frame.
 #[derive(Resource, Default)]
 pub struct OcclusionProbe {
     /// The last test hid enough: build every frame.
@@ -336,8 +337,8 @@ pub struct OcclusionProbe {
 const PROBE_EVERY: u32 = 16;
 
 /// The vertex runs a test must hide to keep the pyramid every frame: the
-/// pyramid pass costs 0.12 to 0.14 ms at 2560x1360 (devlog 0247), the
-/// unit draw 44 ps a run (devlog 0174).
+/// pyramid pass costs 0.12 to 0.14 ms at 2560x1360 and the unit draw 44 ps
+/// a run, both on an RTX 3090.
 const PROBE_RUNS: f32 = 3.0e6;
 
 /// The columns a snapshot record is packed from: the live ones, or the

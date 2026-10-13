@@ -1,4 +1,4 @@
-//! Occlusion culling of soldiers (docs/plans/025-occlusion-culling.md).
+//! Occlusion culling of soldiers.
 //!
 //! After Bevy's opaque pass, which draws the soldiers, the terrain and the
 //! trees, a compute pass (`shaders/unit_depth_pyramid.wgsl`) takes the
