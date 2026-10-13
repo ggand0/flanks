@@ -19,7 +19,7 @@
 //! never hides itself, the pyramid is built only every few frames as a
 //! probe (render_units_gpu.rs `OcclusionProbe`).
 //!
-//! `FL_OCCLUDE`: 0 off (the default), 1 cull, 2 count (the test runs and
+//! `FL_OCCLUDE`: 0 off, 1 cull (the default), 2 count (the test runs and
 //! counts, nothing is culled). `FL_GPU_CHECK` turns cull into count, since
 //! the CPU sweep it compares against has no test. `FL_OCCLUDE_CHECK=1`
 //! measures how far each drawn corner reaches from his soldier, against the
@@ -55,7 +55,7 @@ pub enum OccludeMode {
 pub fn mode() -> OccludeMode {
     static MODE: std::sync::OnceLock<OccludeMode> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| {
-        let mode = match crate::util::env_or("FL_OCCLUDE", 0_u32) {
+        let mode = match crate::util::env_or("FL_OCCLUDE", 1_u32) {
             1 => OccludeMode::Cull,
             2 => OccludeMode::Count,
             _ => OccludeMode::Off,
