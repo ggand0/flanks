@@ -221,6 +221,10 @@ pub struct BuildParams {
     shot: Vec4,
     /// BOW_RISE_S, BOW_FALL_S, CANCEL_TICKS, RANGED_BASE.
     bow: Vec4,
+    /// The block's raise, hold and whole length in ticks (sim/damage.rs
+    /// BLOCK_*); the parry's.
+    guard: Vec4,
+    parry: Vec4,
     /// x = first index slot of the bucket, y = mesh corners per soldier,
     /// w = soldiers per instance of its indexed draw (0: expanded).
     buckets: [UVec4; NUM_BUCKETS],
@@ -674,6 +678,11 @@ fn build_frame_params(
     p.fighting = BAND_FIGHTING;
     p.attack = Vec4::new(FOLLOW_S, FOLLOW_BASE, FOLLOW_SPAN, REWIND_S);
     p.shot = Vec4::new(RELEASE_S, RELOAD_S, HOLD_S, BOW_WALK_MS);
+    {
+        use crate::sim::damage::{BLOCK_LEN, BLOCK_RAISE, BLOCK_UP, PARRY_LEN, PARRY_RAISE, PARRY_UP};
+        p.guard = Vec4::new(BLOCK_RAISE as f32, BLOCK_UP as f32, BLOCK_LEN as f32, 0.0);
+        p.parry = Vec4::new(PARRY_RAISE as f32, PARRY_UP as f32, PARRY_LEN as f32, 0.0);
+    }
     p.bow = Vec4::new(
         BOW_RISE_S,
         BOW_FALL_S,

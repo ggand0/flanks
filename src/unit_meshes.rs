@@ -110,8 +110,8 @@ pub const SKEL_JOINTS: usize = 22;
 const _: () = assert!(SKEL_JOINTS == 22, "unit_pose.wgsl sizes its joint arrays for 22");
 /// The clips a skinned kind plays, in the order of `Skel::clips`
 /// (unit_glb.rs `SKEL_CLIPS`).
-pub const SKEL_CLIP_SLOTS: usize = 14;
-const _: () = assert!(SKEL_CLIP_SLOTS == 14, "unit_pose.wgsl sizes Skel's clips and rates for 14");
+pub const SKEL_CLIP_SLOTS: usize = 16;
+const _: () = assert!(SKEL_CLIP_SLOTS == 16, "unit_pose.wgsl sizes Skel's clips and rates for 16");
 /// A role the kind's skeleton has no joint for (`Skel::roles`).
 pub const SKEL_NO_JOINT: u32 = 255;
 

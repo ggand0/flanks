@@ -128,6 +128,10 @@ struct Params {
     shot: vec4<f32>,
     // BOW_RISE_S, BOW_FALL_S, CANCEL_TICKS, RANGED_BASE.
     bow: vec4<f32>,
+    // The block's raise, hold and whole length in ticks (sim/damage.rs
+    // BLOCK_*); the parry's.
+    guard: vec4<f32>,
+    parry: vec4<f32>,
     // x = first index slot of the bucket, y = mesh corners per soldier,
     // w = soldiers per instance of its indexed draw (0: expanded).
     buckets: array<vec4<u32>, 16>,
@@ -248,6 +252,7 @@ const TAU: f32 = 6.2831853;
 const SWING_STATE_MASK: u32 = 3u;
 const SWING_WINDUP: u32 = 1u;
 const SWING_RECOVER: u32 = 2u;
+const SWING_DEFEND: u32 = 3u;
 const SWING_CHARGE: u32 = 4u;
 const SWING_STYLE_SHIFT: u32 = 3u;
 const SWING_STYLE_MASK: u32 = 24u;
@@ -753,9 +758,19 @@ fn build_soldier(i: u32) {
         fx = 2.0 - death_t / params.consts.y;
     }
 
+    // The fourth anim2 float: the stagger 0 to 1; a block 1 + how far
+    // its clip has run, 0 to 1; a parry 2 + the same (render_units.rs
+    // the same). Through the wait before the clip he shows nothing.
     var stagger = 0.0;
     if death_t == 0.0 && (swing & SWING_STAGGERED) != 0u {
         stagger = min(swing_t / params.consts.z, 1.0);
+    } else if death_t == 0.0 && (swing & SWING_STATE_MASK) == SWING_DEFEND {
+        let parrying = (swing & SWING_STYLE_MASK) == (1u << SWING_STYLE_SHIFT);
+        let len = select(params.guard.z, params.parry.z, parrying);
+        let e = len - swing_t + params.alpha;
+        if e > 0.0 {
+            stagger = select(1.0, 2.0, parrying) + min(e / len, 0.999);
+        }
     }
 
     records[i] = Record(

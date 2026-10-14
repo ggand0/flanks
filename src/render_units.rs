@@ -1060,6 +1060,19 @@ fn sync_instance_data(
                         (units.swing_t[i] as f32
                             / crate::sim::damage::HIT_STAGGER_TICKS as f32)
                             .min(1.0)
+                    } else if sw & crate::units::SWING_STATE_MASK == crate::units::SWING_DEFEND {
+                        // A block as 1 + how far its clip has run, a
+                        // parry as 2 + the same (unit_build.wgsl the
+                        // same); nothing through the wait before it.
+                        let parrying = sw & crate::units::SWING_STYLE_MASK
+                            == crate::sim::damage::GUARD_PARRY;
+                        let (_, _, len) = crate::sim::damage::guard_timeline(parrying);
+                        let e = len as f32 - units.swing_t[i] as f32 + alpha;
+                        if e > 0.0 {
+                            (if parrying { 2.0 } else { 1.0 }) + (e / len as f32).min(0.999)
+                        } else {
+                            0.0
+                        }
                     } else {
                         0.0
                     };

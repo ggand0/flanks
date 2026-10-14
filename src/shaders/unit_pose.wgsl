@@ -50,11 +50,11 @@ struct Skel {
     // Per clip: x = its first vec4 in `clips`, y = its samples, w = 1 when
     // it loops. A sample is the root's offset from rest, then one
     // quaternion per joint relative to its parent.
-    clips: array<vec4<u32>, 14>,
+    clips: array<vec4<u32>, 16>,
     // Per clip: x = samples per second, y = its length in seconds, z =
     // when its blow lands, or when a draw nocks its arrow, in seconds, -1
     // without one, w = how far one play carries the soldier.
-    rates: array<vec4<f32>, 14>,
+    rates: array<vec4<f32>, 16>,
     // The joints the gait, the arm sway and the attack write: (pelvis,
     // chest, head, weapon), then (upper arm, forearm, hand, coat) of the
     // weapon side and of the shield side, then (thigh, shin, foot) of
@@ -665,6 +665,11 @@ const CLIP_DRAW: u32 = 10u;
 const CLIP_RELEASE: u32 = 11u;
 const CLIP_AIM_UP: u32 = 12u;
 const CLIP_RELEASE_UP: u32 = 13u;
+// The answers to a blow (unit_glb.rs SKEL_CLIPS): the shield block, the
+// weapon parry. Their rates.z is the guard event, when the shield or the
+// blade is up.
+const CLIP_BLOCK: u32 = 14u;
+const CLIP_PARRY: u32 = 15u;
 // render_units.rs RELOAD_S: the reload a skeleton's shot plays after its
 // release, from its end down to the ready pose and through the draw to
 // the held aim.
@@ -793,6 +798,10 @@ struct Pre {
     wobble: f32,
     dip: f32,
     stagger: f32,
+    // His answer to a blow: the clip (CLIP_BLOCK or CLIP_PARRY, 0 for
+    // none) and how far it has run, 0 to 1.
+    answer: u32,
+    answer_t: f32,
     time: f32,
 };
 
@@ -936,6 +945,18 @@ fn pose_begin(pos_scale: vec4<f32>, color: vec4<f32>, anim: vec4<f32>, anim2: ve
     let limb = cos(TAU * gait) * walking;
     let wobble = time * 9.0 + seed * TAU;
     let dip = gait_dip(fract(2.0 * gait), g) * walking;
+    // The fourth anim2 float (unit_build.wgsl, render_units.rs): the
+    // stagger 0 to 1; a block 1 + how far its clip has run; a parry 2 +
+    // the same.
+    let w4 = max(inst.anim2.w, 0.0);
+    let stagger = select(0.0, w4, w4 <= 1.0);
+    var answer = 0u;
+    if w4 > 2.0 {
+        answer = CLIP_PARRY;
+    } else if w4 > 1.0 {
+        answer = CLIP_BLOCK;
+    }
+    let answer_t = w4 - floor(w4);
 
     pre = Pre(
         inst.pos_scale.xyz,
@@ -978,7 +999,9 @@ fn pose_begin(pos_scale: vec4<f32>, color: vec4<f32>, anim: vec4<f32>, anim2: ve
         limb,
         wobble,
         dip,
-        inst.anim2.w,
+        stagger,
+        answer,
+        answer_t,
         time,
     );
     put_common();
@@ -1566,6 +1589,16 @@ fn put_skeleton() {
         // stops.
         let low = cut * (1.0 - moving);
         skel_over(&turn, at, cut, low);
+        root = mix(root, skel_root_at(at), low);
+    }
+    // His answer to a blow: the block or the parry clip (sim/damage.rs
+    // SWING_DEFEND), the sim's timer driving it, played as authored. A
+    // parry that stops the blow leaves the clip at its guard for the
+    // counter stab. On the move his legs keep the gait.
+    if alive && pre.answer != 0u && skel_has(pre.answer) {
+        let at = skel_at(pre.answer, pre.answer_t * rig.skel.rates[pre.answer].y);
+        let low = 1.0 - moving;
+        skel_over(&turn, at, 1.0, low);
         root = mix(root, skel_root_at(at), low);
     }
     // An archer's shot, over his stance by how far his bow is up. A draw

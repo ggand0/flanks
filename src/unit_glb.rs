@@ -590,7 +590,7 @@ pub fn clips_on() -> bool {
 /// empty and the player does without it. The last four are an archer's
 /// shot: the draw from ready to the level aim, its release, the raise from
 /// the level aim to the high one, and its release.
-const SKEL_CLIPS: [&str; 14] = [
+const SKEL_CLIPS: [&str; 16] = [
     "stand",
     "ready",
     "shuffle_left",
@@ -605,6 +605,10 @@ const SKEL_CLIPS: [&str; 14] = [
     "release",
     "aim_up",
     "release_up",
+    // The answers to a blow (sim/damage.rs SWING_DEFEND): the shield
+    // block, the weapon parry.
+    "block",
+    "parry",
 ];
 const SKEL_CLIPS_NEEDED: usize = 2;
 /// The slot of the first step clip: left, right, forward and backward
@@ -650,6 +654,8 @@ struct ClipEvents {
     contact: Option<f32>,
     /// When a draw shows its arrow on the string.
     nock: Option<f32>,
+    /// When a block's shield or a parry's blade is up to meet the blow.
+    guard: Option<f32>,
 }
 
 /// The model's skeleton and its clips as rows of the clip buffer, and
@@ -734,8 +740,13 @@ fn read_skeleton(
         if *clip == "cut" && !has_cut {
             continue;
         }
-        let path = if CLIP_KIND[kind] == kind {
-            model.with_extension(format!("{clip}.json"))
+        // His own file first; a kind that plays another's clips takes
+        // that kind's file when he has none of his own (the man-at-arms
+        // keeps the knight's 19-joint clips of his own until his model
+        // gets the knight's 20-joint skeleton).
+        let own = model.with_extension(format!("{clip}.json"));
+        let path = if CLIP_KIND[kind] == kind || crate::game_files::is_file(&own) {
+            own
         } else {
             model.with_file_name(format!("{}.{clip}.json", KIND_FILE[CLIP_KIND[kind]]))
         };
@@ -753,6 +764,12 @@ fn read_skeleton(
             return Err(format!("{} is not a flanks-clip of version 1", path.display()));
         }
         if file.joints != names {
+            // Another kind's clip on a skeleton that is not his: an
+            // optional one is done without, as a missing one is.
+            if slot >= SKEL_CLIPS_NEEDED && CLIP_KIND[kind] != kind {
+                missing.push(*clip);
+                continue;
+            }
             return Err(format!("{}: its joints are not the model's, in the model's order", path.display()));
         }
         if file.samples.is_empty() || !file.fps.is_finite() || file.fps <= 0.0 {
@@ -760,7 +777,7 @@ fn read_skeleton(
         }
         skel.clips[slot] = [rows.len() as u32, file.samples.len() as u32, 0, file.looped as u32];
         let length = (file.samples.len() - 1) as f32 / file.fps;
-        let contact = file.events.contact.or(file.events.nock).unwrap_or(-1.0);
+        let contact = file.events.contact.or(file.events.nock).or(file.events.guard).unwrap_or(-1.0);
         if contact > length {
             return Err(format!("{}: its event at {contact} s is after its end at {length} s", path.display()));
         }

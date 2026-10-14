@@ -46,17 +46,21 @@ pub const GUARD_PER_SKILL: f32 = 0.10;
 /// block, and the weapon parry that counters at once when it is on time.
 pub const GUARD_BLOCK: u8 = 0;
 pub const GUARD_PARRY: u8 = 1 << crate::units::SWING_STYLE_SHIFT;
-/// The block's timeline in ticks: the shield comes up, stays up, comes
-/// down (M2TW's block holds 0.7 s; its defend clips raise the guard in
-/// 0.15 to 0.35 s and last 0.85 to 1.05 s).
+/// The block's timeline in ticks, the knight's block clip's
+/// (`assets/units/knight.block.json`, 0.80 s): the shield is up at its
+/// guard event (0.20 s), the blow recoils off it at 0.40 s, and the
+/// rest is the recovery. The guard stops blows from the raise to the
+/// recoil.
 pub const BLOCK_RAISE: u8 = 6;
-pub const BLOCK_UP: u8 = 15;
-pub const BLOCK_LEN: u8 = 27;
-/// The parry's: the blade meets the blow in a short window and he is
-/// back on guard sooner.
-pub const PARRY_RAISE: u8 = 6;
-pub const PARRY_UP: u8 = 6;
-pub const PARRY_LEN: u8 = 21;
+pub const BLOCK_UP: u8 = 6;
+pub const BLOCK_LEN: u8 = 24;
+/// The parry's, the knight's parry clip's (`knight.parry.json`, 0.90 s):
+/// the blade is up at its guard event (0.15 s) and deflects at 0.20 s;
+/// a parry that stops the blow leaves the clip there for the counter,
+/// a late one plays the whole wide follow-through.
+pub const PARRY_RAISE: u8 = 5;
+pub const PARRY_UP: u8 = 3;
+pub const PARRY_LEN: u8 = 27;
 /// A parry that stopped the blow counters at once from the bind: a stab
 /// at this share of the kind's wind-up, while the attacker is still
 /// recovering from his stopped swing.
