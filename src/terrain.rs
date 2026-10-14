@@ -4,7 +4,10 @@
 
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::primitives::{Aabb, MeshAabb};
-use bevy::image::{ImageAddressMode, ImageLoaderSettings, ImageSampler, ImageSamplerDescriptor};
+use bevy::image::{
+    CompressedImageFormats, ImageAddressMode, ImageLoaderSettings, ImageSampler,
+    ImageSamplerDescriptor, ImageType,
+};
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::pbr::{ExtendedMaterial, MaterialExtension};
 use bevy::prelude::*;
@@ -20,8 +23,8 @@ pub const CHUNK_CELLS: usize = 32;
 
 /// The battlefields in the menu's Map row. At launch a setup's map wins
 /// (an `FL_SETUP` file, or the Demo's with `FL_DEMO=1`), then
-/// `FL_MAP=big_grassland`, `classic`, `river`, `sandbox`, `obstacles` or
-/// `town`.
+/// `FL_MAP=big_grassland`, `hill`, `big_hill`, `classic`, `river`,
+/// `sandbox`, `obstacles` or `town`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub enum MapKind {
     /// Broad pasture shoulders around an open lowland: the default.
@@ -29,6 +32,10 @@ pub enum MapKind {
     Grassland,
     /// A 2048 m square pasture with an open centre and low outer hills.
     BigGrassland,
+    /// An open approach to a broad ridge, 1024 by 768 m.
+    Hill,
+    /// The hill layout at twice the ground dimensions and height.
+    BigHill,
     /// The 0.1.0 heightfield: rolling noise with ridged peaks, no river.
     Classic,
     /// Experimental: the same noise with terraces, a river and a bridge.
@@ -52,6 +59,8 @@ impl MapKind {
         }
         match std::env::var("FL_MAP").as_deref() {
             Ok("big_grassland") => Self::BigGrassland,
+            Ok("hill") => Self::Hill,
+            Ok("big_hill") => Self::BigHill,
             Ok("river") => Self::River,
             Ok("classic") => Self::Classic,
             Ok("sandbox") => Self::Sandbox,
@@ -65,6 +74,8 @@ impl MapKind {
         match self {
             Self::Grassland => "Grassland",
             Self::BigGrassland => "Big Grassland",
+            Self::Hill => "Hill",
+            Self::BigHill => "Big Hill",
             Self::Classic => "Classic",
             Self::River => "River",
             Self::Sandbox => "Sandbox",
@@ -73,9 +84,9 @@ impl MapKind {
         }
     }
 
-    /// The 2048 m square maps.
+    /// Maps with a 2048 m width and the larger camera range.
     pub const fn is_large(self) -> bool {
-        matches!(self, Self::BigGrassland | Self::Town)
+        matches!(self, Self::BigGrassland | Self::BigHill | Self::Town)
     }
 
     /// Maps whose steep faces are impassable: the river map's terraces and
@@ -85,16 +96,22 @@ impl MapKind {
     }
 
     /// Every map, in the menu's order.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 7] = [
         Self::Grassland,
         Self::BigGrassland,
+        Self::Hill,
+        Self::BigHill,
         Self::Classic,
         Self::River,
         Self::Sandbox,
     ];
 
     const fn chunk_counts(self) -> (usize, usize) {
-        if self.is_large() { (32, 32) } else { (16, 12) }
+        match self {
+            Self::BigGrassland | Self::Town => (32, 32),
+            Self::BigHill => (32, 24),
+            _ => (16, 12),
+        }
     }
 
     const fn grid_verts(self) -> (usize, usize) {
@@ -580,13 +597,92 @@ fn big_grassland_height(p: Vec2) -> f32 {
     5.0 + rolls + west + east + north + south
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HeightMapConfig {
+    heightmap: String,
+    height_scale_m: f32,
+}
+
+/// Linear 16-bit samples in metres, row-major from the negative-z edge.
+struct FileHeightMap {
+    width: usize,
+    height: usize,
+    samples: Vec<f32>,
+}
+
+impl FileHeightMap {
+    fn load(path: &std::path::Path) -> Result<Self, String> {
+        let json = crate::game_files::read(path)
+            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        let config: HeightMapConfig = serde_json::from_slice(&json)
+            .map_err(|e| format!("invalid {}: {e}", path.display()))?;
+        let image_path = path.parent().unwrap().join(&config.heightmap);
+        let bytes = crate::game_files::read(&image_path)
+            .map_err(|e| format!("cannot read {}: {e}", image_path.display()))?;
+        Self::decode(&bytes, config.height_scale_m)
+            .map_err(|e| format!("{}: {e}", image_path.display()))
+    }
+
+    fn decode(bytes: &[u8], height_scale_m: f32) -> Result<Self, String> {
+        if !height_scale_m.is_finite() || height_scale_m <= 0.0 {
+            return Err("height_scale_m must be finite and positive".into());
+        }
+        let image = Image::from_buffer(
+            bytes,
+            ImageType::Extension("png"),
+            CompressedImageFormats::NONE,
+            false,
+            ImageSampler::Default,
+            RenderAssetUsages::MAIN_WORLD,
+        )
+        .map_err(|e| format!("cannot decode heightmap: {e}"))?;
+        if image.texture_descriptor.format != TextureFormat::R16Uint {
+            return Err("heightmap must be a 16-bit greyscale PNG without alpha".into());
+        }
+        let (width, height) = (image.width() as usize, image.height() as usize);
+        if width < 2 || height < 2 {
+            return Err("heightmap needs at least two vertices on each axis".into());
+        }
+        let data = image.data.ok_or("heightmap has no sample data")?;
+        if data.len() != width * height * 2 {
+            return Err("heightmap sample count does not match its dimensions".into());
+        }
+        // Bevy decodes 16-bit PNG samples to native-endian u16 bytes.
+        let samples = data
+            .chunks_exact(2)
+            .map(|b| u16::from_ne_bytes([b[0], b[1]]) as f32 / 65535.0 * height_scale_m)
+            .collect();
+        Ok(Self {
+            width,
+            height,
+            samples,
+        })
+    }
+
+    /// Bilinear interpolation in source pixel coordinates, including both edges.
+    fn sample(&self, x: f32, z: f32) -> f32 {
+        let x = x.clamp(0.0, (self.width - 1) as f32);
+        let z = z.clamp(0.0, (self.height - 1) as f32);
+        let (x0, z0) = (x as usize, z as usize);
+        let (x1, z1) = ((x0 + 1).min(self.width - 1), (z0 + 1).min(self.height - 1));
+        let a = self.samples[z0 * self.width + x0];
+        let b = self.samples[z0 * self.width + x1];
+        let c = self.samples[z1 * self.width + x0];
+        let d = self.samples[z1 * self.width + x1];
+        let upper = a + (b - a) * (x - x0 as f32);
+        let lower = c + (d - c) * (x - x0 as f32);
+        upper + (lower - upper) * (z - z0 as f32)
+    }
+}
+
 fn generate_terrain(mut commands: Commands) {
     commands.insert_resource(build_terrain(MapKind::from_env()));
 }
 
-/// The heightfield and the blocked mask of one map. Grassland has its
-/// own analytic landforms; classic and river share the noise formula,
-/// and river alone carves the channel, terraces and impassable walls.
+/// The heightfield and blocked mask of one map. Hill maps read a shared
+/// image; the other maps use analytic heights. River carves its channel
+/// and terraces, while the town and obstacle maps add their raised blocks.
 pub(crate) fn build_terrain(kind: MapKind) -> Terrain {
     let (verts_x, verts_z) = kind.grid_verts();
     let (chunks_x, chunks_z) = kind.chunk_counts();
@@ -595,6 +691,15 @@ pub(crate) fn build_terrain(kind: MapKind) -> Terrain {
         -(verts_x as f32 - 1.0) * CELL * 0.5,
         -(verts_z as f32 - 1.0) * CELL * 0.5,
     );
+    let hill = if matches!(kind, MapKind::Hill | MapKind::BigHill) {
+        let path = crate::util::game_root().join("assets/terrain/hill.json");
+        let source = FileHeightMap::load(&path).unwrap_or_else(|e| panic!("hill terrain: {e}"));
+        assert_eq!((source.width, source.height), MapKind::Hill.grid_verts(),
+                   "hill terrain: expected a 513 by 385 vertex heightmap");
+        Some(source)
+    } else {
+        None
+    };
     let mut heights = vec![0.0f32; verts_x * verts_z];
     let obstacle_blocks = if kind == MapKind::Obstacles {
         crate::obstacle_map::blocks()
@@ -608,7 +713,12 @@ pub(crate) fn build_terrain(kind: MapKind) -> Terrain {
                 heights[z * verts_x + x] = crate::obstacle_map::height(p, &obstacle_blocks);
                 continue;
             }
-            if kind.is_large() {
+            if let Some(source) = &hill {
+                let scale = if kind == MapKind::BigHill { 2.0 } else { 1.0 };
+                heights[z * verts_x + x] = source.sample(x as f32 / scale, z as f32 / scale) * scale;
+                continue;
+            }
+            if matches!(kind, MapKind::BigGrassland | MapKind::Town) {
                 heights[z * verts_x + x] = big_grassland_height(p);
                 continue;
             }
@@ -721,15 +831,12 @@ fn ground_base() -> StandardMaterial {
     }
 }
 
-/// The ground material's layers for one map: the grassland gets the
-/// authored layout and the natural pasture, the classic field and the
-/// river map get procedural coverage from their relief and stony slopes.
+/// Pasture maps share the authored colour layout and natural grass detail.
+/// The other maps derive coverage from their relief and stony slopes.
 fn ground_layers(assets: &AssetServer, images: &mut Assets<Image>, terrain: &Terrain) -> GroundLayers {
-    // Only the grassland has a painted layout; the other maps derive
-    // their coverage from their own relief and put stone on steep faces.
     let authored = matches!(
         terrain.kind,
-        MapKind::Grassland | MapKind::BigGrassland | MapKind::Sandbox | MapKind::Town
+        MapKind::Grassland | MapKind::BigGrassland | MapKind::Hill | MapKind::BigHill | MapKind::Sandbox | MapKind::Town
     );
     GroundLayers {
         pasture: ground_texture(
@@ -1346,13 +1453,13 @@ mod tests {
     }
 
     #[test]
-    fn map_sizes_keep_the_existing_fields_and_add_the_large_square() {
+    fn map_sizes_keep_the_existing_fields_and_include_the_large_rectangle() {
         for kind in MapKind::ALL {
             let terrain = build_terrain(kind);
-            let (size, vertices, chunks) = if kind == MapKind::BigGrassland {
-                (Vec2::splat(2048.0), (1025, 1025), 1024)
-            } else {
-                (Vec2::new(1024.0, 768.0), (513, 385), 192)
+            let (size, vertices, chunks) = match kind {
+                MapKind::BigGrassland => (Vec2::splat(2048.0), (1025, 1025), 1024),
+                MapKind::BigHill => (Vec2::new(2048.0, 1536.0), (1025, 769), 768),
+                _ => (Vec2::new(1024.0, 768.0), (513, 385), 192),
             };
             assert_eq!(terrain.max() - terrain.min(), size);
             assert_eq!(terrain.min(), -kind.half_extents());
@@ -1373,6 +1480,71 @@ mod tests {
                     terrain.blocked[z * vertices.0 + x]
                 );
             }
+        }
+    }
+
+    #[test]
+    fn heightmap_preserves_16_bit_values_axes_and_interpolation() {
+        let png: &[u8] = &[
+            137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 2, 0, 0, 0, 2,
+            16, 0, 0, 0, 0, 7, 77, 142, 187, 0, 0, 0, 18, 73, 68, 65, 84, 120, 156, 99, 96, 96,
+            100, 100, 100, 104, 96, 248, 255, 31, 0, 5, 28, 2, 130, 49, 37, 51, 14, 0, 0, 0, 0, 73,
+            69, 78, 68, 174, 66, 96, 130,
+        ];
+        let source = FileHeightMap::decode(png, 65535.0).unwrap();
+        assert_eq!((source.width, source.height), (2, 2));
+        assert_eq!(source.samples, vec![1.0, 257.0, 32768.0, 65535.0]);
+        assert_eq!(source.sample(0.5, 0.0), 129.0);
+        assert_eq!(source.sample(0.5, 0.5), 24640.25);
+        assert_eq!(source.sample(1.0, 1.0), 65535.0);
+        assert!(FileHeightMap::decode(png, 0.0).is_err());
+        assert!(FileHeightMap::decode(png, f32::NAN).is_err());
+        assert!(
+            FileHeightMap::decode(
+                &[
+                    137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 2, 0, 0,
+                    0, 2, 8, 0, 0, 0, 0, 87, 221, 82, 248, 0, 0, 0, 14, 73, 68, 65, 84, 120, 156,
+                    99, 96, 96, 100, 104, 248, 15, 0, 2, 9, 1, 129, 132, 12, 100, 10, 0, 0, 0, 0,
+                    73, 69, 78, 68, 174, 66, 96, 130
+                ],
+                36.0
+            )
+            .is_err()
+        );
+        assert!(FileHeightMap::decode(b"not a PNG", 36.0).is_err());
+    }
+
+    #[test]
+    fn hill_variants_share_heights_and_grade_with_a_double_scale() {
+        let hill = build_terrain(MapKind::Hill);
+        let big = build_terrain(MapKind::BigHill);
+        assert_eq!(hill.height_at(0.0, -160.0), 36.0);
+        assert_eq!(hill.height_at(0.0, 280.0), 0.0);
+        for z in 0..hill.verts_z {
+            for x in 0..hill.verts_x {
+                assert_eq!(big.h(x * 2, z * 2), hill.h(x, z) * 2.0);
+                if x + 1 < hill.verts_x {
+                    let grade = (hill.h(x + 1, z) - hill.h(x, z)) / CELL;
+                    let big_grade = (big.h(x * 2 + 2, z * 2) - big.h(x * 2, z * 2)) / (CELL * 2.0);
+                    assert_eq!(grade, big_grade);
+                }
+            }
+        }
+        assert!(hill.blocked.iter().all(|b| !b));
+        assert!(big.blocked.iter().all(|b| !b));
+        for terrain in [&hill, &big] {
+            let corner = terrain.max() - Vec2::splat(4.0);
+            let ground = Vec3::new(corner.x, terrain.height_at(corner.x, corner.y), corner.y);
+            let distance = if terrain.kind.is_large() {
+                2800.0
+            } else {
+                900.0
+            };
+            let offset = Vec3::new(0.0, 1.0, 1.0).normalize() * distance;
+            let hit = terrain
+                .raycast(Ray3d::new(ground + offset, Dir3::new(-offset).unwrap()))
+                .unwrap();
+            assert!(hit.distance(ground) < 0.01);
         }
     }
 
@@ -1453,6 +1625,8 @@ mod tests {
         app.update();
         for kind in [
             MapKind::BigGrassland,
+            MapKind::Hill,
+            MapKind::BigHill,
             MapKind::Classic,
             MapKind::BigGrassland,
             MapKind::River,
@@ -1461,10 +1635,10 @@ mod tests {
         ] {
             app.world_mut().write_message(MapChanged(kind));
             app.update();
-            let count = if kind == MapKind::BigGrassland {
-                1024
-            } else {
-                192
+            let count = match kind {
+                MapKind::BigGrassland => 1024,
+                MapKind::BigHill => 768,
+                _ => 192,
             };
             let world = app.world_mut();
             assert_eq!(

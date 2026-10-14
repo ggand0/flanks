@@ -88,7 +88,7 @@ fn respawn_vegetation(
             let groups = RIVER_ZONES.map(|zone| (zone, None));
             planting.log(&specs, "river", &groups);
         }
-        MapKind::Classic | MapKind::BigGrassland | MapKind::Obstacles | MapKind::Town => {}
+        MapKind::Classic | MapKind::BigGrassland | MapKind::Hill | MapKind::BigHill | MapKind::Obstacles | MapKind::Town => {}
     }
 }
 
