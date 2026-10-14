@@ -163,6 +163,21 @@ struct Params {
     // soldier in bin 0, the camera's lists in the order the build found
     // them).
     order: f32,
+    // The occlusion test (render_units_occlusion.rs): x the mode (0 off,
+    // 1 cull, 2 count), y the pyramid levels it reads, 0 to skip it this
+    // frame, z 1 on a camera cut, w the FL_OCCLUDE_CHECK level (1 marks
+    // the hidden in count mode, 2 every soldier the test reads).
+    occlude: vec4<u32>,
+    // The camera's clip_from_world the pyramid was drawn with, last
+    // frame's, and its viewport in pixels: x, y, width, height.
+    occlude_clip: mat4x4<f32>,
+    occlude_view: vec4<f32>,
+    // Per kind, the box the test projects: forward, back, sideways, up,
+    // standing and then dying or fallen, and how far down each reaches.
+    bound_live: array<vec4<f32>, 4>,
+    bound_fall: array<vec4<f32>, 4>,
+    bound_down_live: vec4<f32>,
+    bound_down_fall: vec4<f32>,
 };
 
 struct DrawArgs {
@@ -182,14 +197,17 @@ struct DrawArgs {
 // 32..48 the casters per cascade and kind (cascade * 4 + kind), 48 the
 // selection rings, 49..53 the pose slots taken per kind, then per bucket
 // and depth bin (`BIN_COUNTER`) the soldiers in it, which `finalize` turns
-// into the bin's first slot in the bucket's list.
-@group(0) @binding(6) var<storage, read_write> counts: array<atomic<u32>, 2105>;
+// into the bin's first slot in the bucket's list, then the far levels'
+// pose slots per kind, then per bucket the soldiers the occlusion test hid
+// (`HIDDEN_COUNTER`).
+@group(0) @binding(6) var<storage, read_write> counts: array<atomic<u32>, 2121>;
 // 0..16 the camera's buckets, 16..32 the casters as in `counts`, 32 the
 // selection rings, 33..37 the pose pass's dispatch per kind (x, y, z).
 @group(0) @binding(7) var<storage, read_write> args: array<DrawArgs, 37>;
 // Copied back to the CPU by Bevy's readback plugin: the 32 counts, the
-// frame stamp and the soldier count, two spare, the 16 caster counts.
-@group(0) @binding(8) var<storage, read_write> readback: array<u32, 52>;
+// frame stamp and the soldier count, 1 if the occlusion test ran, one
+// spare, the 16 caster counts, the 16 hidden counts.
+@group(0) @binding(8) var<storage, read_write> readback: array<u32, 68>;
 // Per pose slot, the record it poses, in one region per kind.
 @group(0) @binding(9) var<storage, read_write> pose_src: array<u32>;
 // Five words per list, 0..16 the camera's buckets and 16..32 the casters as
@@ -210,6 +228,10 @@ struct Draw {
 
 // One per build thread: the living, then the fallen.
 @group(0) @binding(11) var<storage, read_write> draws: array<Draw>;
+
+// Last frame's farthest depths over the view (render_units_occlusion.rs):
+// level k's texel covers 2^(k + 1) pixels on each axis.
+@group(0) @binding(12) var depth_pyramid: texture_2d<f32>;
 
 // An index list slot past the last soldier, up to the end of the last group
 // of an indexed draw: the vertex shader draws nothing for it
@@ -262,6 +284,11 @@ const POSE_ARG: u32 = 33u;
 const DEPTH_BINS: u32 = 128u;
 const BIN_COUNTER: u32 = 53u;
 const POSE_FAR_COUNTER: u32 = BIN_COUNTER + 16u * DEPTH_BINS;
+// Per bucket, the soldiers in the frustum the occlusion test hid.
+const HIDDEN_COUNTER: u32 = POSE_FAR_COUNTER + 4u;
+// Texels per axis the occlusion test reads at most: it reads the finest
+// level where the box spans this many.
+const OCCLUDE_SPAN: u32 = 8u;
 // The levels a skinned kind poses by its skeleton (render_units_gpu.rs
 // SKEL_LODS, unit_pose.wgsl `pose_write`).
 const SKEL_LODS: u32 = 2u;
@@ -305,6 +332,95 @@ fn culled(p: vec3<f32>) -> bool {
     return false;
 }
 
+// Whether the soldier at `p` facing `yaw` was hidden last frame: his box
+// projected with last frame's camera, his nearest point behind the farthest
+// depth of every pixel the box covers. A box partly off last frame's
+// screen, or reaching past the camera's near plane, is never hidden.
+fn occluded(p: vec3<f32>, yaw: f32, kind: u32, fallen: bool) -> bool {
+    var b = params.bound_live[kind];
+    var down = params.bound_down_live[kind];
+    if fallen {
+        b = params.bound_fall[kind];
+        down = params.bound_down_fall[kind];
+    }
+    // The world directions of his forward (+z) and his right (+x), as
+    // unit_pose.wgsl `rot_y` turns them.
+    let f = vec2<f32>(sin(yaw), cos(yaw));
+    let r = vec2<f32>(f.y, -f.x);
+    var lo = vec2<f32>(1e9);
+    var hi = vec2<f32>(-1e9);
+    var near = 0.0;
+    for (var k = 0u; k < 8u; k++) {
+        let lz = select(-b.y, b.x, (k & 1u) != 0u);
+        let lx = select(-b.z, b.z, (k & 2u) != 0u);
+        let ly = select(-down, b.w, (k & 4u) != 0u);
+        let w = p + vec3<f32>(r.x * lx + f.x * lz, ly, r.y * lx + f.y * lz);
+        let c = params.occlude_clip * vec4<f32>(w, 1.0);
+        // Reversed depth: z over w grows toward the camera and passes 1
+        // at the near plane.
+        if c.w <= 0.0 || c.z >= c.w {
+            return false;
+        }
+        let ndc = c.xyz / c.w;
+        lo = min(lo, ndc.xy);
+        hi = max(hi, ndc.xy);
+        near = max(near, ndc.z);
+    }
+    // To pixels, y down. A sample of pixel i lies in [i, i + 1).
+    let vp = params.occlude_view;
+    let px_lo = vp.xy + vec2<f32>(lo.x * 0.5 + 0.5, 0.5 - hi.y * 0.5) * vp.zw;
+    let px_hi = vp.xy + vec2<f32>(hi.x * 0.5 + 0.5, 0.5 - lo.y * 0.5) * vp.zw;
+    if any(px_lo < vp.xy) || any(px_hi >= vp.xy + vp.zw) {
+        return false;
+    }
+    let a = vec2<u32>(px_lo);
+    let z = vec2<u32>(px_hi);
+    var level = 0u;
+    while level < params.occlude.y && any((z >> vec2<u32>(level + 1u)) - (a >> vec2<u32>(level + 1u)) >= vec2<u32>(OCCLUDE_SPAN)) {
+        level++;
+    }
+    if level >= params.occlude.y {
+        return false;
+    }
+    // The last texel of a level covers everything to the screen's edge
+    // (unit_depth_pyramid.wgsl).
+    let last = textureDimensions(depth_pyramid, level) - 1u;
+    let ta = min(a >> vec2<u32>(level + 1u), last);
+    let tz = min(z >> vec2<u32>(level + 1u), last);
+    for (var y = ta.y; y <= tz.y; y++) {
+        for (var x = ta.x; x <= tz.x; x++) {
+            if textureLoad(depth_pyramid, vec2<u32>(x, y), i32(level)).r <= near {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// The occlusion test for a soldier or body in the frustum, counted on his
+// bucket: DRAWN, or hidden and left undrawn in cull mode (HIDDEN), or
+// hidden and drawn marked in count mode under FL_OCCLUDE_CHECK (MARKED):
+// unit_instancing.wgsl shows a marked soldier flat magenta, so any magenta
+// on screen is a hidden soldier who shows.
+const DRAWN: u32 = 0u;
+const HIDDEN: u32 = 1u;
+const MARKED: u32 = 2u;
+fn occlusion(bucket: u32, p: vec3<f32>, yaw: f32, kind: u32, fallen: bool) -> u32 {
+    // FL_OCCLUDE_CHECK=2 marks every soldier the test reads, to show the
+    // mark works.
+    if params.occlude.w == 2u && params.occlude.y != 0u {
+        return MARKED;
+    }
+    if params.occlude.y == 0u || !occluded(p, yaw, kind, fallen) {
+        return DRAWN;
+    }
+    atomicAdd(&counts[HIDDEN_COUNTER + bucket], 1u);
+    if params.occlude.x == 1u {
+        return HIDDEN;
+    }
+    return select(DRAWN, MARKED, params.occlude.w != 0u);
+}
+
 // Gait cycles per second at this ground speed (gait.rs `rate`).
 fn gait_rate(speed: f32) -> f32 {
     return 1.0 + 0.16 * speed;
@@ -318,8 +434,9 @@ fn lod_jitter(seed: f32) -> f32 {
 // camera, into his bucket and its depth bin, and keep where he goes:
 // `scatter` writes his entry once `finalize` knows where each bin starts.
 // The bins run near to far on the levels below ORDERED_LODS; a farther
-// level keeps one bin.
-fn queue_draw(t: u32, bucket: u32, entry: u32, lod: u32, dist2: f32) {
+// level keeps one bin. The entry carries his level in its top two bits and
+// the occlusion check's mark in the bit below (`occlusion`).
+fn queue_draw(t: u32, bucket: u32, entry: u32, lod: u32, dist2: f32, marked: bool) {
     atomicAdd(&counts[bucket], 1u);
     var bin = 0u;
     if lod < ORDERED_LODS {
@@ -327,7 +444,7 @@ fn queue_draw(t: u32, bucket: u32, entry: u32, lod: u32, dist2: f32) {
     }
     let cell = bucket * DEPTH_BINS + bin;
     let slot = atomicAdd(&counts[BIN_COUNTER + cell], 1u);
-    draws[t] = Draw(cell, slot, entry | (lod << 30u));
+    draws[t] = Draw(cell, slot, entry | (lod << 30u) | select(0u, 1u << 29u, marked));
 }
 
 // The list entry of drawn record `r` of a soldier of `kind` at level
@@ -587,23 +704,31 @@ fn build_soldier(i: u32) {
     let jitter = lod_jitter(s.seed);
     let d = position - params.cam_pos;
     let d2 = dot(d, d) * jitter * jitter;
-    let visible = !culled(position);
+    let in_view = !culled(position);
+    // Facing interpolates like position, wrap-aware.
+    let dyr = s.yaw - s.yaw_prev + PI;
+    let dy = dyr - floor(dyr / TAU) * TAU - PI;
+    let yaw = s.yaw_prev + dy * params.alpha;
     // Detail level: jittered distance against this frame's thresholds,
     // held inside the hysteresis bounds. A soldier the camera does not see
     // keeps his held level for when he comes back, and casts by the plain
-    // thresholds.
+    // thresholds. One hidden behind nearer things keeps his level up to
+    // date, so he comes back at it.
     var lod = level(params.bands[kind * 3u + 2u], d2);
-    if visible {
+    var occl = DRAWN;
+    if in_view {
         let fine = level(params.bands[kind * 3u], d2);
         let coarse = level(params.bands[kind * 3u + 1u], d2);
         sm.lod = clamp(sm.lod, fine, coarse);
         lod = sm.lod;
+        occl = occlusion(kind * NUM_LODS + lod, position, yaw, kind, death_t > 0.0);
     }
+    let visible = in_view && occl != HIDDEN;
     var casts = 0u;
     if lod < params.cast_lods {
         casts = cascade_mask(position);
     }
-    if !visible && casts == 0u {
+    if !in_view && casts == 0u {
         smoothing[i] = sm;
         return;
     }
@@ -613,11 +738,6 @@ fn build_soldier(i: u32) {
         let gray = 0.299 * rgb.r + 0.587 * rgb.g + 0.114 * rgb.b;
         rgb = rgb * 0.55 + vec3<f32>(gray) * 0.45;
     }
-
-    // Facing interpolates like position, wrap-aware.
-    let dyr = s.yaw - s.yaw_prev + PI;
-    let dy = dyr - floor(dyr / TAU) * TAU - PI;
-    let yaw = s.yaw_prev + dy * params.alpha;
 
     // The attack, else the victory cheer, else nothing.
     var lunge = attack;
@@ -645,12 +765,17 @@ fn build_soldier(i: u32) {
         vec4<f32>(sm.band, sm.wall, sm.gait, stagger),
     );
     smoothing[i] = sm;
+    // A hidden soldier keeps his ring, which reads his record: it lies on
+    // the ground around him, past his box.
+    if in_view && death_t == 0.0 && (reg.flags & (REG_SELECTED | REG_HOVERED | REG_HOVER_OWN)) != 0u {
+        append_ring(i, reg.flags, kind);
+    }
+    if !visible && casts == 0u {
+        return;
+    }
     let entry = list_entry(kind, i, lod);
     if visible {
-        queue_draw(i, kind * NUM_LODS + lod, entry, lod, dot(d, d));
-        if death_t == 0.0 && (reg.flags & (REG_SELECTED | REG_HOVERED | REG_HOVER_OWN)) != 0u {
-            append_ring(i, reg.flags, kind);
-        }
+        queue_draw(i, kind * NUM_LODS + lod, entry, lod, dot(d, d), occl == MARKED);
     }
     append_casters(casts, kind, entry);
 }
@@ -691,7 +816,12 @@ fn build_corpse(j: u32, t: u32) {
     let d = position - params.cam_pos;
     let d2 = dot(d, d) * jitter * jitter;
     let lod = level(params.bands[kind * 3u + 2u], d2);
-    let visible = !culled(position);
+    let in_view = !culled(position);
+    var occl = DRAWN;
+    if in_view {
+        occl = occlusion(kind * NUM_LODS + lod, position, rec.anim.x, kind, true);
+    }
+    let visible = in_view && occl != HIDDEN;
     var casts = 0u;
     if lod < params.cast_lods {
         casts = cascade_mask(position);
@@ -703,7 +833,7 @@ fn build_corpse(j: u32, t: u32) {
     if visible {
         let bucket = kind * NUM_LODS + lod;
         atomicAdd(&counts[16u + bucket], 1u);
-        queue_draw(t, bucket, entry, lod, dot(d, d));
+        queue_draw(t, bucket, entry, lod, dot(d, d), occl == MARKED);
     }
     append_casters(casts, kind, entry);
 }
@@ -792,6 +922,7 @@ fn finalize(@builtin(local_invocation_index) b: u32) {
     finish_indexed(b, bucket.x, count, bucket.y, bucket.w);
     readback[b] = count;
     readback[16u + b] = fallen;
+    readback[52u + b] = atomicLoad(&counts[HIDDEN_COUNTER + b]);
     if b < 4u {
         let posed = atomicLoad(&counts[POSE_COUNTER + b]) + atomicLoad(&counts[POSE_FAR_COUNTER + b]);
         args[POSE_ARG + b] = DrawArgs((posed + 63u) / 64u, 1u, 1u, 0u);
@@ -799,6 +930,8 @@ fn finalize(@builtin(local_invocation_index) b: u32) {
     if b == 0u {
         readback[32u] = params.frame;
         readback[33u] = params.n;
+        // Whether the occlusion test ran this frame.
+        readback[34u] = select(0u, 1u, params.occlude.y != 0u);
         // Six corners per ring (two triangles).
         args[RING_ARG] = DrawArgs(atomicLoad(&counts[RING_COUNTER]) * 6u, 1u, 0u, 0u);
     }

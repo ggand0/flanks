@@ -516,7 +516,10 @@ impl Plugin for SelectionRingsPlugin {
             .init_resource::<RingInput>()
             .init_resource::<SpecializedRenderPipelines<RingPipeline>>()
             .add_render_command::<Transparent3d, DrawRings>()
-            .add_systems(RenderStartup, (init_ring_pipeline, init_ring_gpu))
+            .add_systems(
+                RenderStartup,
+                (init_ring_pipeline.after(bevy::pbr::MeshPipelineSystems), init_ring_gpu),
+            )
             .add_systems(ExtractSchedule, extract_rings)
             .add_systems(
                 Render,

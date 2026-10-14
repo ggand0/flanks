@@ -29,7 +29,7 @@ fn far_plane(kind: crate::terrain::MapKind) -> f32 {
     if kind.is_large() { 6000.0 } else { PerspectiveProjection::default().far }
 }
 
-#[derive(Component)]
+#[derive(Component, Clone)]
 pub struct RtsCamera {
     pub focus: Vec3,
     pub yaw: f32,
@@ -61,8 +61,17 @@ impl Plugin for RtsCameraPlugin {
 }
 
 fn spawn_camera(mut commands: Commands) {
+    // The unit occlusion test reads the depth buffer in a compute pass
+    // (render_units_occlusion.rs).
+    let mut depth_usage = bevy::render::render_resource::TextureUsages::RENDER_ATTACHMENT;
+    if crate::render_units_occlusion::mode() != crate::render_units_occlusion::OccludeMode::Off {
+        depth_usage |= bevy::render::render_resource::TextureUsages::TEXTURE_BINDING;
+    }
     commands.spawn((
-        Camera3d::default(),
+        Camera3d {
+            depth_texture_usages: depth_usage.into(),
+            ..default()
+        },
         msaa(),
         // Required: the unit renderer issues direct (non-indirect) draws.
         NoIndirectDrawing,
@@ -233,6 +242,11 @@ pub fn apply_camera_transform(
             cam.distance = close_distance + (limit - close_distance) * (0.5 - 0.5 * phase.cos());
             cam.yaw += phase.sin() * 0.35;
         }
+        // FL_CAM_ORBIT=r: the locked camera turns about its focus at r
+        // radians a second, for checking what lags a moving camera
+        // (render_units_occlusion.rs) without desktop input.
+        let orbit = crate::util::env_or("FL_CAM_ORBIT", 0.0_f32);
+        cam.yaw += orbit * time.elapsed_secs();
         cam.target_distance = cam.distance;
     }
     let min = terrain.min();
