@@ -444,8 +444,14 @@ fn begin(f: &Field, s: &mut Soldier) -> Step {
     let p = pos_prev[i].xz();
     let my_kind = kind[i] as usize;
     let dying = *s.death_t > 0;
-    // Hit flash decays here (set by the serial apply pass).
-    *s.flash = s.flash.saturating_sub(1);
+    // Hit flash decays here (set by the serial apply pass). A twitch code
+    // (sim/damage.rs TWITCH_TICKS) counts its low nibble down and goes
+    // at once.
+    *s.flash = if *s.flash >= 16 {
+        if *s.flash & 15 > 1 { *s.flash - 1 } else { 0 }
+    } else {
+        s.flash.saturating_sub(1)
+    };
     // Corpses play out their death anim: no orders, no combat; they stay as
     // an obstacle until swept.
     if dying && *s.death_t > 1 {
@@ -655,13 +661,14 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
     let mut sticky = false;
     // Moving at charge speed with unspent momentum: braced enemy spears in
     // the path are a collision hazard, and the scan must see out to SPEAR
-    // reach, not just mine. A man already run through (flash) or reeling is
-    // not re-impaled every tick — a spear is a point, not an aura.
+    // reach, not just mine. A man already run through (flash; a twitch
+    // code of 16 up is a render cue, not a wound) or reeling is not
+    // re-impaled every tick: a spear is a point, not an aura.
     let spear_reach = TYPES[crate::unit_types::KIND_SPEAR as usize].reach;
     let cs = speed[i] * CHARGE_SPEED_FRAC;
     let at_charge_speed = faces_spearwall[team[i] as usize]
         && !dying
-        && *s.flash == 0
+        && (*s.flash == 0 || *s.flash >= 16)
         && *s.swing & crate::units::SWING_STAGGERED == 0
         && s.vel.xz().length_squared() > cs * cs;
     let mut impale_idx = u32::MAX;
@@ -1311,7 +1318,19 @@ fn swing(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
                 if t < pos_prev.len() {
                     face_target = Some(pos_prev[t].xz());
                 }
-                if *s.swing_t == 0 {
+                // A parry that stopped the blow plays on to
+                // PARRY_COUNTER_AT, then the counter: a stab at half the
+                // wind-up at the man he parried.
+                let stopped = *s.swing & crate::sim::damage::GUARD_STOPPED != 0;
+                let elapsed = crate::sim::damage::PARRY_LEN.saturating_sub(*s.swing_t);
+                if stopped && elapsed >= crate::sim::damage::PARRY_COUNTER_AT {
+                    *s.swing = crate::units::SWING_WINDUP
+                        | (*s.swing & crate::units::SWING_STAGGER_IMMUNE);
+                    *s.swing_t = ((params.windup_ticks as f32
+                        * crate::sim::damage::COUNTER_WINDUP)
+                        as u8)
+                        .max(1);
+                } else if *s.swing_t == 0 {
                     *s.swing = crate::units::SWING_READY
                         | (*s.swing & crate::units::SWING_STAGGER_IMMUNE);
                 } else {

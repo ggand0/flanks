@@ -222,7 +222,7 @@ pub struct BuildParams {
     /// BOW_RISE_S, BOW_FALL_S, CANCEL_TICKS, RANGED_BASE.
     bow: Vec4,
     /// The block's raise, hold and whole length in ticks (sim/damage.rs
-    /// BLOCK_*); the parry's.
+    /// BLOCK_*) and TWITCH_TICKS; the parry's raise, hold and length.
     guard: Vec4,
     parry: Vec4,
     /// x = first index slot of the bucket, y = mesh corners per soldier,
@@ -535,7 +535,9 @@ fn pack_chunk(c: &PackColumns, start: usize, out: &mut [GpuSoldier], flash: bool
             a: kind
                 | (c.swing[i] as u32) << 8
                 | (c.swing_t[i] as u32) << 16
-                | if flash { (c.flash[i] as u32) << 24 } else { 0 },
+                // A twitch code (16 up) is a pose, not a flash: it packs
+                // whatever the setting says.
+                | if flash || c.flash[i] >= 16 { (c.flash[i] as u32) << 24 } else { 0 },
             b: (group & 0x00ff_ffff) | (c.death_t[i] as u32) << 24,
             color: c.color[i],
         };
@@ -680,7 +682,12 @@ fn build_frame_params(
     p.shot = Vec4::new(RELEASE_S, RELOAD_S, HOLD_S, BOW_WALK_MS);
     {
         use crate::sim::damage::{BLOCK_LEN, BLOCK_RAISE, BLOCK_UP, PARRY_LEN, PARRY_RAISE, PARRY_UP};
-        p.guard = Vec4::new(BLOCK_RAISE as f32, BLOCK_UP as f32, BLOCK_LEN as f32, 0.0);
+        p.guard = Vec4::new(
+            BLOCK_RAISE as f32,
+            BLOCK_UP as f32,
+            BLOCK_LEN as f32,
+            crate::sim::damage::TWITCH_TICKS as f32,
+        );
         p.parry = Vec4::new(PARRY_RAISE as f32, PARRY_UP as f32, PARRY_LEN as f32, 0.0);
     }
     p.bow = Vec4::new(

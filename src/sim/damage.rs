@@ -61,10 +61,35 @@ pub const BLOCK_LEN: u8 = 24;
 pub const PARRY_RAISE: u8 = 5;
 pub const PARRY_UP: u8 = 3;
 pub const PARRY_LEN: u8 = 27;
-/// A parry that stopped the blow counters at once from the bind: a stab
-/// at this share of the kind's wind-up, while the attacker is still
-/// recovering from his stopped swing.
-const COUNTER_WINDUP: f32 = 0.5;
+/// A parry that stopped the blow counters from the bind: a stab at this
+/// share of the kind's wind-up, while the attacker is still recovering
+/// from his stopped swing.
+pub const COUNTER_WINDUP: f32 = 0.5;
+/// The parry that stopped the blow plays on to here, ticks into its
+/// clip (0.37 s: through the deflect at 0.20 s), before the counter's
+/// wind-up starts (sim/soldier.rs), so every successful parry shows the
+/// same motion. The stopped blow marks the parry with `GUARD_STOPPED`.
+pub const PARRY_COUNTER_AT: u8 = 11;
+/// On a parrying defend byte: the blow was stopped, the counter follows
+/// at `PARRY_COUNTER_AT` (the charge bit, free in the defend state).
+pub const GUARD_STOPPED: u8 = crate::units::SWING_CHARGE;
+/// A blow the dice stopped leaves a twitch in the hit-flash column for
+/// the render: values from 16 up are not a flash but the side the blow
+/// came from (1 front, 2 his left, 3 his right, 4 behind) in the high
+/// nibble and the ticks left in the low one. The kernel counts the low
+/// nibble down and drops the value at zero. The render rocks him away
+/// from it; the sim never reads it.
+pub const TWITCH_TICKS: u8 = 9;
+
+/// The twitch a flash value carries: the side the blow came from (1 to
+/// 4) and how much is left, 1 at the blow; (0, 0) for a plain flash.
+pub fn twitch_of(flash: u8) -> (u8, f32) {
+    if flash < 16 {
+        (0, 0.0)
+    } else {
+        (flash >> 4, f32::from(flash & 15) / f32::from(TWITCH_TICKS))
+    }
+}
 /// Charge impact. A charge-flagged hit shoves its victim along
 /// the blow: displacement = KNOCKBACK * m_a/(m_a+m_v), applied straight
 /// to position (next tick's separation resolves the pile — same pipe as
@@ -410,9 +435,9 @@ pub fn apply_damage(
                 let v_guard_up = v_defending && guard_up(swing[v], swing_t[v]);
                 if v_guard_up && along >= GUARD_COS_45 && !ev.impale {
                     let outcome = if v_parrying {
-                        swing[v] = crate::units::SWING_WINDUP
-                            | (swing[v] & crate::units::SWING_STAGGER_IMMUNE);
-                        swing_t[v] = ((pv.windup_ticks as f32 * COUNTER_WINDUP) as u8).max(1);
+                        // The counter follows once the parry has played
+                        // to PARRY_COUNTER_AT (the kernel starts it).
+                        swing[v] |= GUARD_STOPPED;
                         target[v] = ev.attacker;
                         OUT_PARRIED
                     } else {
@@ -509,6 +534,12 @@ pub fn apply_damage(
                     };
                     if let Some(m) = material {
                         blow_sound(&mut sounds, blow_at, m, false);
+                    }
+                    // The render's cue: a man not showing an answer
+                    // twitches away from the side the blow came from.
+                    if !v_defending && !v_staggered && flash[v] < 16 {
+                        let side: u8 = if front { 1 } else if rear { 4 } else if left_side { 2 } else { 3 };
+                        flash[v] = (side << 4) | TWITCH_TICKS;
                     }
                     if dir_stats.enabled {
                         dir_stats.outcomes[vt][outcome] += 1;

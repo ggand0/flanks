@@ -1044,7 +1044,7 @@ fn sync_instance_data(
                         && units.death_t[i] < crate::sim::damage::DEATH_TICKS;
                     let fx = if dying {
                         2.0 - units.death_t[i] as f32 / crate::sim::damage::DEATH_TICKS as f32
-                    } else if hit_flash {
+                    } else if hit_flash && units.flash[i] < 16 {
                         units.flash[i] as f32 * 0.25
                     } else {
                         0.0
@@ -1074,7 +1074,10 @@ fn sync_instance_data(
                             0.0
                         }
                     } else {
-                        0.0
+                        // A twitch away from a blow the dice stopped: 3 +
+                        // the side it came from + how much is left.
+                        let (side, left) = crate::sim::damage::twitch_of(units.flash[i]);
+                        if side == 0 { 0.0 } else { 2.0 + side as f32 + left.min(0.999) }
                     };
                     let instance = InstanceData {
                         position,

@@ -802,6 +802,11 @@ struct Pre {
     // none) and how far it has run, 0 to 1.
     answer: u32,
     answer_t: f32,
+    // A twitch away from a blow the dice stopped: a pitch of the whole
+    // body (back off a frontal blow, forward off one from behind) and a
+    // turn of the shoulders (the struck shoulder back off a side blow).
+    twitch_pitch: f32,
+    twitch_turn: f32,
     time: f32,
 };
 
@@ -948,15 +953,33 @@ fn pose_begin(pos_scale: vec4<f32>, color: vec4<f32>, anim: vec4<f32>, anim2: ve
     // The fourth anim2 float (unit_build.wgsl, render_units.rs): the
     // stagger 0 to 1; a block 1 + how far its clip has run; a parry 2 +
     // the same.
+    // the same; a twitch 3 + the side the blow came from (0 front, 1 his
+    // left, 2 his right, 3 behind) + how much of it is left.
     let w4 = max(inst.anim2.w, 0.0);
     let stagger = select(0.0, w4, w4 <= 1.0);
     var answer = 0u;
-    if w4 > 2.0 {
+    if w4 > 2.0 && w4 < 3.0 {
         answer = CLIP_PARRY;
-    } else if w4 > 1.0 {
+    } else if w4 > 1.0 && w4 < 2.0 {
         answer = CLIP_BLOCK;
     }
     let answer_t = w4 - floor(w4);
+    // The twitch: quick in over its first quarter, eased out by its end.
+    var twitch_pitch = 0.0;
+    var twitch_turn = 0.0;
+    if w4 >= 3.0 {
+        let side = floor(w4) - 3.0;
+        let since = 1.0 - (w4 - floor(w4));
+        let env = smoothstep(0.0, 0.25, since) * (1.0 - smoothstep(0.35, 1.0, since));
+        if side < 0.5 {
+            twitch_pitch = -0.10 * env;
+        } else if side > 2.5 {
+            twitch_pitch = 0.08 * env;
+        } else {
+            twitch_pitch = -0.04 * env;
+            twitch_turn = select(-0.25, 0.25, side < 1.5) * env;
+        }
+    }
 
     pre = Pre(
         inst.pos_scale.xyz,
@@ -1002,6 +1025,8 @@ fn pose_begin(pos_scale: vec4<f32>, color: vec4<f32>, anim: vec4<f32>, anim2: ve
         stagger,
         answer,
         answer_t,
+        twitch_pitch,
+        twitch_turn,
         time,
     );
     put_common();
@@ -1021,7 +1046,7 @@ fn put_common() {
     // The shoulders turn against the legs and the upper body shifts over
     // the planted foot, both at full weight here: the torso eases them in
     // up its height (`place`).
-    let turn = 0.10 * g.run * g.stride * pre.limb;
+    let turn = 0.10 * g.run * g.stride * pre.limb + pre.twitch_turn;
     let shift = 0.02 * pre.leg * g.run * g.stride * cos(TAU * (pre.gait - 0.5 * g.duty))
         * (1.0 - pre.step_w);
     // The body rides the hip drop from the gait. A runner leans as far
@@ -1037,10 +1062,12 @@ fn put_common() {
     // pitches backward from the feet with a short reel, hardest at the
     // hit and easing out as the man finds his balance; the knee-buckle
     // sink rides the vertical offset.
+    // A twitch off a blow the dice stopped pitches him the same way, a
+    // little.
     var stagger = vec2<f32>(1.0, 0.0);
-    if pre.stagger > 0.001 {
+    if pre.stagger > 0.001 || pre.twitch_pitch != 0.0 {
         let reel = 1.0 + 0.18 * sin(pre.time * 22.0 + pre.seed * TAU);
-        let sang = -0.42 * pre.stagger * pre.stagger * reel;
+        let sang = -0.42 * pre.stagger * pre.stagger * reel + pre.twitch_pitch;
         stagger = vec2<f32>(cos(sang), sin(sang));
     }
     // Death: topple around the feet and sink slightly. Fall direction
@@ -1590,6 +1617,11 @@ fn put_skeleton() {
         let low = cut * (1.0 - moving);
         skel_over(&turn, at, cut, low);
         root = mix(root, skel_root_at(at), low);
+    }
+    // A side blow the dice stopped turns his struck shoulder back (the
+    // parts take it in `put_common`'s turn).
+    if alive && pre.twitch_turn != 0.0 {
+        turn[core.y] = qmul(turn[core.y], qy(pre.twitch_turn));
     }
     // His answer to a blow: the block or the parry clip (sim/damage.rs
     // SWING_DEFEND), the sim's timer driving it, played as authored. A

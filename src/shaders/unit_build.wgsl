@@ -753,14 +753,17 @@ fn build_soldier(i: u32) {
     // fx: [0,1] hit flash, (1,2] death progress. A death's first tick has
     // progress 0, the living pose, and at 1.0 it would read as a full
     // flash, so it keeps the hit flash like a living man.
-    var fx = flash * 0.25;
+    // A flash value of 16 or more is a twitch code, not a flash.
+    var fx = select(flash * 0.25, 0.0, flash >= 16.0);
     if death_t > 0.0 && death_t < params.consts.y {
         fx = 2.0 - death_t / params.consts.y;
     }
 
     // The fourth anim2 float: the stagger 0 to 1; a block 1 + how far
-    // its clip has run, 0 to 1; a parry 2 + the same (render_units.rs
-    // the same). Through the wait before the clip he shows nothing.
+    // its clip has run, 0 to 1; a parry 2 + the same; a twitch away from
+    // a blow the dice stopped, 3 + the side it came from (0 front, 1 his
+    // left, 2 his right, 3 behind) + how much is left (render_units.rs
+    // the same). Through the wait before a clip he shows nothing.
     var stagger = 0.0;
     if death_t == 0.0 && (swing & SWING_STAGGERED) != 0u {
         stagger = min(swing_t / params.consts.z, 1.0);
@@ -771,6 +774,10 @@ fn build_soldier(i: u32) {
         if e > 0.0 {
             stagger = select(1.0, 2.0, parrying) + min(e / len, 0.999);
         }
+    } else if death_t == 0.0 && flash >= 16.0 {
+        let side = floor(flash / 16.0);
+        let left = (flash - side * 16.0) / params.guard.w;
+        stagger = 2.0 + side + min(left, 0.999);
     }
 
     records[i] = Record(
