@@ -165,8 +165,8 @@ struct Params {
     order: f32,
     // The occlusion test (render_units_occlusion.rs): x the mode (0 off,
     // 1 cull, 2 count), y the pyramid levels it reads, 0 to skip it this
-    // frame, z 1 on a camera cut, w 1 to mark the hidden in count mode
-    // (FL_OCCLUDE_CHECK).
+    // frame, z 1 on a camera cut, w the FL_OCCLUDE_CHECK level (1 marks
+    // the hidden in count mode, 2 every soldier the test reads).
     occlude: vec4<u32>,
     // The camera's clip_from_world the pyramid was drawn with, last
     // frame's, and its viewport in pixels: x, y, width, height.
