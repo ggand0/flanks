@@ -46,20 +46,21 @@ struct Skel {
     params: vec4<u32>,
     // xyz = the joint's rest origin, local space; w = its parent's index,
     // -1 for the root. Parents come first.
-    joints: array<vec4<f32>, 20>,
+    joints: array<vec4<f32>, 22>,
     // Per clip: x = its first vec4 in `clips`, y = its samples, w = 1 when
     // it loops. A sample is the root's offset from rest, then one
     // quaternion per joint relative to its parent.
-    clips: array<vec4<u32>, 12>,
+    clips: array<vec4<u32>, 14>,
     // Per clip: x = samples per second, y = its length in seconds, z =
-    // when its blow lands in seconds, -1 without one, w = how far one play
-    // carries the soldier.
-    rates: array<vec4<f32>, 12>,
+    // when its blow lands, or when a draw nocks its arrow, in seconds, -1
+    // without one, w = how far one play carries the soldier.
+    rates: array<vec4<f32>, 14>,
     // The joints the gait, the arm sway and the attack write: (pelvis,
     // chest, head, weapon), then (upper arm, forearm, hand, coat) of the
     // weapon side and of the shield side, then (thigh, shin, foot) of
-    // each.
-    roles: array<vec4<u32>, 5>,
+    // each, then (an archer's arrow, -, -, -). 255 where the kind has no
+    // such joint.
+    roles: array<vec4<u32>, 6>,
 };
 
 // An archer's jointed arms and strung bow (unit_meshes.rs `Bow`), local
@@ -87,7 +88,7 @@ struct Bow {
 };
 @group(3) @binding(6) var<uniform> rig: Rig;
 // The tables of this bucket's kind: an archer's shots (unit_glb.rs
-// `Shots::buffer`), or a skinned kind's clips (`read_skeleton`).
+// `Shots::buffer`), then a skinned kind's clips (`read_skeleton`).
 // A pose is 8 vec4s: six joint turns as xyzw quaternions (the drawing
 // arm's shoulder, elbow and wrist, then the bow arm's), (bow yaw, limb
 // bend, arrow shown, body yaw), (torso pitch, bow pitch). A free-arrow
@@ -390,16 +391,17 @@ fn qalign(a: vec3<f32>, b: vec3<f32>) -> vec4<f32> {
     return normalize(vec4<f32>(cross(a, b), 1.0 + dot(a, b)));
 }
 
-// A posed joint in one pose slot: its rotation and its origin as halves,
-// (x, y), (z, w), (ox, oy), (oz, 0). Halves of finite values never form a
-// NaN pattern in the float slot they ride in. Written by the pose pass
-// (`put_skeleton`), read by every corner of a skinned level (`place`).
-fn pack_joint(rot: vec4<f32>, org: vec3<f32>) -> vec4<f32> {
+// A posed joint in one pose slot: its rotation, its origin and its scale
+// as halves, (x, y), (z, w), (ox, oy), (oz, scale). Halves of finite
+// values never form a NaN pattern in the float slot they ride in. Written
+// by the pose pass (`put_skeleton`), read by every corner of a skinned
+// level (`place`).
+fn pack_joint(rot: vec4<f32>, org: vec3<f32>, scale: f32) -> vec4<f32> {
     return bitcast<vec4<f32>>(vec4<u32>(
         pack2x16float(rot.xy),
         pack2x16float(rot.zw),
         pack2x16float(org.xy),
-        pack2x16float(vec2<f32>(org.z, 0.0)),
+        pack2x16float(vec2<f32>(org.z, scale)),
     ));
 }
 
@@ -411,6 +413,12 @@ fn joint_rot(slot: vec4<f32>) -> vec4<f32> {
 fn joint_org(slot: vec4<f32>) -> vec3<f32> {
     let u = bitcast<vec4<u32>>(slot);
     return vec3<f32>(unpack2x16float(u.z), unpack2x16float(u.w).x);
+}
+
+// 1, or 0 for a joint whose part is not shown (an archer's arrow off the
+// string): its corners land on its origin.
+fn joint_scale(slot: vec4<f32>) -> f32 {
+    return unpack2x16float(bitcast<vec4<u32>>(slot).w).y;
 }
 
 // Where a shot is in its table: the first of the two poses it lies
@@ -627,15 +635,18 @@ const P_RIG: u32 = 13u;
 // Two slots per bow rig part (`bow_part`): the rotation, then the offset
 // and the scale.
 const P_BOW: u32 = 17u;
-// A skinned kind: one slot per joint from here, after the part pose,
-// which his shadow and his far levels draw by. The joint's rotation in
-// local space and its posed origin, as halves (`pack_joint`).
-const P_SKEL: u32 = 17u;
-// Slots per soldier: without a bow rig, with one, and with a skeleton
-// (render_units_gpu.rs POSE_SLOTS).
+// Slots per soldier: without a bow rig and with one (render_units_gpu.rs
+// POSE_SLOTS). A skinned kind has one more per joint (`p_skel`).
 const POSE_SLOTS: u32 = 17u;
 const POSE_SLOTS_BOW: u32 = 45u;
-const POSE_SLOTS_SKEL: u32 = 37u;
+
+// A skinned kind's first joint slot: one slot per joint after the part
+// pose, which his shadow and his far levels draw by. The joint's rotation
+// in local space, its posed origin and its scale, as halves
+// (`pack_joint`).
+fn p_skel() -> u32 {
+    return select(POSE_SLOTS, POSE_SLOTS_BOW, rig.bow.params.w > 0.5);
+}
 // The levels a skinned kind poses by its skeleton (render_units_gpu.rs
 // SKEL_LODS): L0 and L1. Further out he poses by his parts.
 const SKEL_LODS: u32 = 2u;
@@ -648,6 +659,19 @@ const CLIP_SHUFFLE_FORWARD: u32 = 4u;
 const CLIP_SHUFFLE_BACKWARD: u32 = 5u;
 const CLIP_CUT: u32 = 6u;
 const CLIP_STAB: u32 = 7u;
+const CLIP_CHARGE: u32 = 8u;
+const CLIP_CHARGE_ATTACK: u32 = 9u;
+const CLIP_DRAW: u32 = 10u;
+const CLIP_RELEASE: u32 = 11u;
+const CLIP_AIM_UP: u32 = 12u;
+const CLIP_RELEASE_UP: u32 = 13u;
+// render_units.rs RELOAD_S: the reload a skeleton's shot plays after its
+// release, from its end down to the ready pose and through the draw to
+// the held aim.
+const SHOT_RELOAD_S: f32 = 5.8;
+// Seconds a skeleton's release end takes to come down to the ready pose.
+// No clip covers it yet (the reload is to come), so it is a blend.
+const SHOT_LOWER_S: f32 = 0.5;
 // Parts of the bow rig.
 const BOW_PARTS: u32 = 14u;
 
@@ -731,12 +755,19 @@ struct Pre {
     pitch: f32,
     bow_rig: bool,
     bow_w: f32,
+    // The bow rig's table and the place in it, 0 to 1.
     clip: u32,
     clip_x: f32,
+    // A shot (render_units.rs RANGED_BASE) and its clip, 0 to 5, which a
+    // skeleton plays at clip_x.
+    shooting: bool,
+    shot: u32,
     style: f32,
-    // A skinned kind's blow that plays its cut clip, or its stab clip.
+    // A skinned kind's blow that plays its cut clip, its stab clip or its
+    // charging blow's clip.
     cut: bool,
     stab: bool,
+    charge_attack: bool,
     // A skinned kind's steps: the clip slot, the place in its play 0 to 1,
     // and his weight in it rather than in his stance or gait.
     step_clip: u32,
@@ -777,11 +808,13 @@ fn pose_begin(pos_scale: vec4<f32>, color: vec4<f32>, anim: vec4<f32>, anim2: ve
     let yaw = inst.anim.x;
     let speed = inst.anim.y;
     // A skinned kind's steps ride the fourth position float
-    // (unit_build.wgsl `steps`). While he steps, his gait gives way.
+    // (unit_build.wgsl `steps`), unless his bow does. While he steps, his
+    // gait gives way.
+    let bow_rig = rig.bow.params.w > 0.5;
     var step_clip = 0u;
     var step_x = 0.0;
     var step_w = 0.0;
-    if skel {
+    if skel && !bow_rig {
         let q = u32(max(inst.pos_scale.w, 0.0) + 0.5);
         step_clip = CLIP_SHUFFLE_LEFT + (q & 3u);
         step_x = f32((q >> 2u) & 1023u) / 1023.0;
@@ -789,22 +822,25 @@ fn pose_begin(pos_scale: vec4<f32>, color: vec4<f32>, anim: vec4<f32>, anim2: ve
     }
     let walking = 1.0 - step_w;
     let moving = walk_gate(speed) * walking;
-    // A bow shot from 16: clip * 2 + progress, clip 0 the raise, 1 the
-    // release, 2 the reload (render_units.rs RANGED_BASE). A kind with a
-    // bow rig plays it from its tables. Without one the draw arms read it
-    // as a stab: the raise is the wind-up and the release the
+    // A bow shot from 16: clip * 2 + progress (render_units.rs
+    // RANGED_BASE), clips 0 to 2 the draw, release and reload of a shot
+    // from the bow down, 3 to 5 of one from the held aim. A skeleton plays
+    // each from its clips (`put_skeleton`), and a bow rig both from its
+    // tables, the raise, release and reload. Without either the draw arms
+    // read it as a stab: the raise is the wind-up and the release the
     // follow-through.
-    let bow_rig = rig.bow.params.w > 0.5;
     let zraw = max(inst.anim.z, 0.0);
     let shooting = zraw > 15.5;
     let shot_clip = floor((zraw - 16.0) * 0.5 + 0.001);
     let shot_x = clamp(zraw - 16.0 - shot_clip * 2.0, 0.0, 1.0);
+    let shot = u32(clamp(shot_clip, 0.0, 5.0));
+    let table = shot % 3u;
     var zpos = zraw;
     if shooting {
         zpos = 0.0;
-        if !bow_rig && shot_clip < 0.5 {
+        if !bow_rig && table == 0u {
             zpos = shot_x;
-        } else if !bow_rig && shot_clip < 1.5 {
+        } else if !bow_rig && table == 1u {
             zpos = 1.4 + 0.59 * shot_x;
         }
     }
@@ -814,7 +850,7 @@ fn pose_begin(pos_scale: vec4<f32>, color: vec4<f32>, anim: vec4<f32>, anim2: ve
     var clip = 0u;
     var clip_x = 0.0;
     if shooting {
-        clip = u32(clamp(shot_clip, 0.0, 2.0));
+        clip = table;
         clip_x = shot_x;
     }
     // Attack: the 2s digit is the swing style (0 stab, 1 classic swing,
@@ -837,10 +873,14 @@ fn pose_begin(pos_scale: vec4<f32>, color: vec4<f32>, anim: vec4<f32>, anim2: ve
     let has_cut = rig.skel.clips[CLIP_CUT].y > 0u && rig.skel.rates[CLIP_CUT].z > 0.0;
     let cut = skel && has_cut && !charge && !cheering && abs(swing_style - 1.0) < 0.5;
     let style = select(swing_style, 1.0, has_cut && swing_style > 1.5);
-    // The stab clip plays the ordinary stab (style 0) the same way; the
-    // charging blow stays the code's.
+    // The stab clip plays the ordinary stab (style 0) the same way, and
+    // the charge blow clip the charging blow. A kind without a charge blow
+    // clip stabs on the charge too: a spear only ever thrusts.
+    let has_charge_attack =
+        rig.skel.clips[CLIP_CHARGE_ATTACK].y > 0u && rig.skel.rates[CLIP_CHARGE_ATTACK].z > 0.0;
+    let charge_attack = skel && has_charge_attack && charge;
     let has_stab = rig.skel.clips[CLIP_STAB].y > 0u && rig.skel.rates[CLIP_STAB].z > 0.0;
-    let stab = skel && has_stab && !charge && !cheering && swing_style < 0.5;
+    let stab = skel && has_stab && !charge_attack && !cheering && swing_style < 0.5;
     // The lunge the code-posed arms and the body lean follow: quadratic
     // over the wind-up and harder on a charge, where it raises from the
     // levelled run-in point instead of dipping the blade first. After the
@@ -910,9 +950,12 @@ fn pose_begin(pos_scale: vec4<f32>, color: vec4<f32>, anim: vec4<f32>, anim2: ve
         bow_w,
         clip,
         clip_x,
+        shooting,
+        shot,
         style,
         cut,
         stab,
+        charge_attack,
         step_clip,
         step_x,
         step_w,
@@ -960,8 +1003,9 @@ fn put_common() {
         * (1.0 - pre.step_w);
     // The body rides the hip drop from the gait. A runner leans as far
     // forward as a charger. A blow leans into it, except one from a clip
-    // (the cut, the stab), which moves the whole body itself.
-    let blow = select(0.30 * pre.lunge + 0.25 * pre.chop, 0.0, pre.cut || pre.stab);
+    // (the cut, the stab, the charging blow), which moves the whole body
+    // itself.
+    let blow = select(0.30 * pre.lunge + 0.25 * pre.chop, 0.0, pre.cut || pre.stab || pre.charge_attack);
     let lean = 0.10 * pre.moving
         + 0.24 * max(g.run * pre.moving, pre.sprint * (0.25 + 0.75 * pre.moving))
         + blow;
@@ -1361,6 +1405,38 @@ fn qblend(a: vec4<f32>, b: vec4<f32>, t: f32) -> vec4<f32> {
     return normalize(mix(a, select(b, -b, dot(a, b) < 0.0), t));
 }
 
+// Whether joint j is of the lower body: the pelvis, a leg or the coat.
+fn skel_lower(j: u32) -> bool {
+    let core = rig.skel.roles[0];
+    let arm_r = rig.skel.roles[1];
+    let arm_l = rig.skel.roles[2];
+    return j == core.x || j == arm_r.w || j == arm_l.w
+        || any(vec3<u32>(j) == rig.skel.roles[3].xyz) || any(vec3<u32>(j) == rig.skel.roles[4].xyz);
+}
+
+// Lay a place in a clip over the pose: the lower body by `low`, the rest
+// by `up`. A joint whose parent is of the lower body (the chest) blends
+// toward the clip's turn in the world, so his upper body faces as the
+// clip has it whatever his hips do: over hips that keep the gait it does
+// not take on the clip's hip turn.
+fn skel_over(turn: ptr<function, array<vec4<f32>, 22>>, at: SkelAt, up: f32, low: f32) {
+    let n = rig.skel.params.x;
+    let was = *turn;
+    for (var j = 0u; j < n; j++) {
+        let clip = skel_turn_at(at, j);
+        let p = i32(rig.skel.joints[j].w);
+        if skel_lower(j) {
+            (*turn)[j] = qblend(was[j], clip, low);
+        } else if p >= 0 && skel_lower(u32(p)) {
+            let world = qblend(qmul(was[p], was[j]), qmul(skel_turn_at(at, u32(p)), clip), up);
+            let hips = (*turn)[p];
+            (*turn)[j] = normalize(qmul(vec4<f32>(-hips.xyz, hips.w), world));
+        } else {
+            (*turn)[j] = qblend(was[j], clip, up);
+        }
+    }
+}
+
 // The sword arm's blow and cheer as `put_rig_arm` plays them from the
 // rest pose, without the march's sway and carry: shoulder, elbow and
 // wrist pitches (+ taking +Z toward +Y), and the slash's yaw.
@@ -1391,11 +1467,14 @@ fn sword_arm() -> vec4<f32> {
 // He stands in the standing clip, and in the ready clip while an enemy is
 // near and he is still. Near the enemy and slow he steps in the step
 // clips (unit_build.wgsl `steps`). Faster, his legs take the gait and his
-// arms its sway. A cut plays its clip, which starts and ends in the ready
+// arms its sway; running at the enemy, his upper body holds the charge
+// pose over the gait. A cut plays its clip, which starts and ends in the ready
 // pose: the blade lands on the strike tick, and on the move his legs keep
-// the gait. Another blow plays the sword arm's motion over the guard's
-// arm, the body holding its guard; the cheer plays it from the standing
-// pose. The fallen lie in the standing pose.
+// the gait. So do the stab and the charging blow. Another blow plays the
+// sword arm's motion over the guard's arm, the body holding its guard;
+// the cheer plays it from the standing pose. An archer shoots from his
+// shot clips, and his blows and cheer swing his arms as his bow rig
+// swings them. The fallen lie in the standing pose.
 fn put_skeleton() {
     let n = rig.skel.params.x;
     let alive = pre.leg > 0.0;
@@ -1406,19 +1485,21 @@ fn put_skeleton() {
     } else if pre.windup > 0.0 {
         strike = smoothstep(0.0, 0.2, pre.windup);
     }
-    // A blow from a clip: the cut or the stab, played the same way.
-    let clip_blow = pre.cut || pre.stab;
-    let blow_clip = select(CLIP_CUT, CLIP_STAB, pre.stab);
+    // A blow from a clip: the cut, the stab or the charging blow, played
+    // the same way.
+    let clip_blow = pre.cut || pre.stab || pre.charge_attack;
+    let blow_clip = select(select(CLIP_CUT, CLIP_STAB, pre.stab), CLIP_CHARGE_ATTACK, pre.charge_attack);
     let cut = select(0.0, strike, alive && clip_blow);
     var act = select(max(pre.celebrate, strike), pre.celebrate, clip_blow);
     act = select(0.0, act, alive && rig.arm > 0.5 && rig.hold < 1.5);
     let level = max(max(pre.stance, pre.ready * 0.75), max(pre.sprint, pre.wall)) * (1.0 - pre.celebrate);
     // The guard holds through a blow: the stab thrusts and the overhead
     // chops from the crouch, the arm's motion landing over the guard's
-    // arm. Only the cheer, in `level`, drops it.
-    let guard = select(0.0, level * (1.0 - moving), alive);
+    // arm. Only the cheer, in `level`, drops it. An archer stands ready
+    // while his bow is up.
+    let guard = select(0.0, max(level * (1.0 - moving), pre.bow_w), alive);
 
-    var turn: array<vec4<f32>, 20>;
+    var turn: array<vec4<f32>, 22>;
     for (var j = 0u; j < n; j++) {
         turn[j] = qblend(skel_turn(CLIP_STAND, 0u, j), skel_turn(CLIP_READY, 0u, j), guard);
     }
@@ -1437,6 +1518,19 @@ fn put_skeleton() {
         }
         root = mix(root, skel_root_at(at), step_w);
     }
+    // Running at the enemy, his upper body holds the charge pose: on the
+    // charge, and after it while he runs in, since his regiment's charge
+    // ends when its first man strikes. A wavering or broken regiment's
+    // runner does not. Its hips and legs are the standing pose's, so his
+    // own keep the gait.
+    let hold = select(
+        0.0,
+        pre.confident * pre.g.run * moving * (1.0 - pre.celebrate),
+        alive && skel_has(CLIP_CHARGE),
+    );
+    if hold > 0.0 {
+        skel_over(&turn, SkelAt(CLIP_CHARGE, 0u, 0.0), hold, 0.0);
+    }
     if moving > 0.0 {
         // The gait: thigh, knee and foot pitches, the weapon side's leg
         // half a cycle after the shield side's (`put_leg`). The coat
@@ -1451,11 +1545,12 @@ fn put_skeleton() {
             turn[leg.z] = qblend(turn[leg.z], qx(shin - pose.z), moving);
             turn[coat] = qblend(turn[coat], qx(-pose.x), moving);
         }
-        // The shoulders turn against the legs, and the arms counter them.
+        // The shoulders turn against the legs, and the arms counter them,
+        // except arms held in the charge pose.
         turn[core.y] = qmul(turn[core.y], qy(0.10 * pre.g.run * pre.g.stride * pre.limb * moving));
-        let sway = (0.18 - 0.06 * pre.g.run) * moving * pre.limb * (1.0 - pre.raise);
+        let sway = (0.18 - 0.06 * pre.g.run) * moving * pre.limb * (1.0 - pre.raise) * (1.0 - hold);
         turn[arm_r.x] = qmul(qx(-sway), turn[arm_r.x]);
-        turn[arm_l.x] = qmul(qx(0.06 * moving * pre.limb * (1.0 - pre.wall)), turn[arm_l.x]);
+        turn[arm_l.x] = qmul(qx(0.06 * moving * pre.limb * (1.0 - pre.wall) * (1.0 - hold)), turn[arm_l.x]);
     }
     if cut > 0.0 {
         // Clip time from the wind-up to the blow at its contact, then
@@ -1466,18 +1561,72 @@ fn put_skeleton() {
             t = rates.z + pre.follow * (rates.y - rates.z);
         }
         let at = skel_at(blow_clip, t);
-        // On the move the pelvis, legs and coat keep the gait.
+        // On the move the pelvis, legs and coat keep the gait: a charger
+        // runs on into his blow, and the clip's legs take over as he
+        // stops.
         let low = cut * (1.0 - moving);
-        let leg_r = rig.skel.roles[3];
-        let leg_l = rig.skel.roles[4];
-        for (var j = 0u; j < n; j++) {
-            let lower = j == core.x || j == arm_r.w || j == arm_l.w
-                || any(vec3<u32>(j) == leg_r.xyz) || any(vec3<u32>(j) == leg_l.xyz);
-            turn[j] = qblend(turn[j], skel_turn_at(at, j), select(cut, low, lower));
-        }
+        skel_over(&turn, at, cut, low);
         root = mix(root, skel_root_at(at), low);
     }
-    if act > 0.0 {
+    // An archer's shot, over his stance by how far his bow is up. A draw
+    // from the bow down plays the draw clip and the level release; one
+    // from the held aim the raise to the high aim and its release. After
+    // a release its end comes down to the ready pose and he waits there,
+    // then the draw brings him to the held aim as his reload ends, and he
+    // holds it until his next draw. His arrow shows from the draw's nock
+    // until the release.
+    var arrow = 0.0;
+    let bow = select(0.0, pre.bow_w, alive && pre.shooting && skel_has(CLIP_DRAW));
+    if bow > 0.0 {
+        let low = bow * (1.0 - moving);
+        let up = pre.shot >= 3u && skel_has(CLIP_AIM_UP) && skel_has(CLIP_RELEASE_UP);
+        let release = select(CLIP_RELEASE, CLIP_RELEASE_UP, up);
+        let draw = rig.skel.rates[CLIP_DRAW];
+        let x = pre.clip_x;
+        // The held aim, unless the shot says otherwise.
+        var at = skel_at(CLIP_DRAW, draw.y);
+        var shown = true;
+        var lowered = 0.0;
+        if pre.shot == 0u {
+            at = skel_at(CLIP_DRAW, x * draw.y);
+            shown = x * draw.y >= draw.z;
+        } else if pre.shot == 3u && up {
+            at = skel_at(CLIP_AIM_UP, x * rig.skel.rates[CLIP_AIM_UP].y);
+        } else if pre.shot % 3u == 1u {
+            at = skel_at(release, x * rig.skel.rates[release].y);
+            shown = false;
+        } else if pre.shot % 3u == 2u {
+            let t = x * SHOT_RELOAD_S;
+            let start = max(SHOT_RELOAD_S - draw.y, 0.0);
+            if t >= start {
+                at = skel_at(CLIP_DRAW, t - start);
+                shown = t - start >= draw.z;
+            } else {
+                at = skel_at(release, rig.skel.rates[release].y);
+                shown = false;
+                lowered = smoothstep(0.0, SHOT_LOWER_S, t);
+            }
+        }
+        skel_over(&turn, at, bow, low);
+        root = mix(root, skel_root_at(at), low);
+        if lowered > 0.0 {
+            skel_over(&turn, SkelAt(CLIP_READY, 0u, 0.0), bow * lowered, low * lowered);
+            root = mix(root, skel_root(CLIP_READY, 0u), low * lowered);
+        }
+        arrow = select(0.0, 1.0, shown && bow > 0.5);
+    }
+    if rig.bow.params.w > 0.5 && alive {
+        // An archer's blow and cheer swing his arms rigidly about the
+        // shoulders, as his bow rig swings them (`put_bow`), and fade as
+        // his bow comes up.
+        var draw_ang = select(1.9 * pre.raise - 2.5 * pre.chop, 0.55 * pre.raise - 0.45 * pre.chop, pre.style < 0.5);
+        draw_ang = select(draw_ang, pre.celebrate * (1.75 + 0.35 * sin(pre.wobble)), pre.celebrate > 0.001);
+        let bow_ang = pre.celebrate * (1.5 + 0.3 * sin(pre.wobble));
+        let down = 1.0 - pre.bow_w;
+        turn[arm_r.x] = qmul(qx(-draw_ang * down), turn[arm_r.x]);
+        turn[arm_l.x] = qmul(qx(-bow_ang * down), turn[arm_l.x]);
+    }
+    if act > 0.0 && core.w < n {
         let blow = sword_arm();
         turn[arm_r.x] = qblend(turn[arm_r.x], qmul(qx(-blow.x), qy(blow.w)), act);
         turn[arm_r.y] = qblend(turn[arm_r.y], qx(-blow.y), act);
@@ -1485,8 +1634,10 @@ fn put_skeleton() {
         turn[core.w] = qblend(turn[core.w], qx(-blow.z), act);
     }
 
-    var rot: array<vec4<f32>, 20>;
-    var org: array<vec3<f32>, 20>;
+    var rot: array<vec4<f32>, 22>;
+    var org: array<vec3<f32>, 22>;
+    let base = p_skel();
+    let arrow_j = rig.skel.roles[5].x;
     for (var j = 0u; j < n; j++) {
         let rest = rig.skel.joints[j];
         let p = i32(rest.w);
@@ -1497,7 +1648,7 @@ fn put_skeleton() {
             rot[j] = normalize(qmul(rot[p], turn[j]));
             org[j] = org[p] + qrot(rot[p], rest.xyz - rig.skel.joints[p].xyz);
         }
-        pose_put(P_SKEL + j, pack_joint(rot[j], org[j]));
+        pose_put(base + j, pack_joint(rot[j], org[j], select(1.0, arrow, j == arrow_j)));
     }
 }
 
@@ -1584,17 +1735,18 @@ fn place(
 #ifdef UNIT_SKINNED
     // The corner turns about joint b's origin by the blend of its two
     // joints' rotations: rigid on a at weight 0, on b at 1.
+    // A joint not shown (`joint_scale`) gathers its corners at its origin.
     let a = skin & 0xffu;
     let b = (skin >> 8u) & 0xffu;
-    let ja = pose_at(P_SKEL + a);
+    let ja = pose_at(p_skel() + a);
     var jb = ja;
     var q = joint_rot(ja);
     if b != a {
-        jb = pose_at(P_SKEL + b);
+        jb = pose_at(p_skel() + b);
         let qb = joint_rot(jb);
         q = normalize(mix(q, select(qb, -qb, dot(q, qb) < 0.0), weight));
     }
-    local = joint_org(jb) + qrot(q, local - rig.skel.joints[b].xyz);
+    local = joint_org(jb) + qrot(q, local - rig.skel.joints[b].xyz) * joint_scale(jb);
     normal = qrot(q, normal);
 #else
     if bow_rig && (abs(part - 1.0) < 0.5 || abs(part - 6.0) < 0.5 || (part > 7.5 && part < 19.5)) {
@@ -1728,12 +1880,15 @@ fn place(
 #endif
 
     // An archer's hips and legs turn side-on with his body as his bow
-    // comes up. The rest of his body turned with the bow rig.
+    // comes up. The rest of his body turned with the bow rig. His skeleton
+    // turns them in its clips.
     let hip = pose_at(P_HIP);
+#ifndef UNIT_SKINNED
     if bow_rig && (part < 0.5 || (part > 1.5 && part < 3.5)) {
         local = rot_y(local, hip.x, hip.y);
         normal = rot_y(normal, hip.x, hip.y);
     }
+#endif
 
     // The shoulders turn against the legs and the upper body shifts over
     // the planted foot, easing in up the torso so the hips stay square.

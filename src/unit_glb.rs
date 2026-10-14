@@ -24,8 +24,9 @@
 //! regiment grey. On a textured model they come from the atlas.
 //!
 //! A weapon arm split into upper arm, forearm and hand is posed by
-//! attack tables that ship next to the model, `<kind>.stab.json`, which
-//! the build scripts in tools/blender write. Without them the arm bends
+//! attack tables that ship next to the model, `<kind>.arm_stab.json`,
+//! which the build scripts in tools/blender write. (`<kind>.stab.json` is
+//! a skeleton's stab clip.) Without them the arm bends
 //! at the elbow as one piece. An archer with jointed arms, a strung bow,
 //! a held arrow and a separate head and torso shoots from the tables in
 //! `<kind>.shoot.json`. Without them the parts join the arm, bow arm or
@@ -37,7 +38,10 @@
 //! unless `FL_CLIPS=0`: every vertex follows a joint pair
 //! (`ATTRIBUTE_SKIN`), and the pose pass plays the clips (unit_pose.wgsl
 //! `put_skeleton`). At the far levels, and everywhere with `FL_CLIPS=0`,
-//! the same file draws by its parts.
+//! the same file draws by its parts. An archer's skin and bow rig work
+//! together: his near levels shoot from the clips, his far levels from
+//! the shot tables. The man-at-arms has the knight's skeleton and plays
+//! the knight's clips (`CLIP_KIND`).
 //!
 //! `FL_UNIT_MESH=code` keeps the code-built meshes and `FL_GLB_FAR=code`
 //! fills only the missing levels from them. `FL_GLB_<KIND>=path` loads
@@ -54,13 +58,18 @@ use bevy::prelude::*;
 use bevy::render::render_resource::TextureFormat;
 
 use crate::render_units::NUM_LODS;
-use crate::unit_meshes::{MeshBuf, Rig, SKEL_CLIP_SLOTS, SKEL_JOINTS, Skel, blend};
+use crate::unit_meshes::{MeshBuf, Rig, SKEL_CLIP_SLOTS, SKEL_JOINTS, SKEL_NO_JOINT, Skel, blend};
 use crate::unit_types::NUM_KINDS;
 
 type Fallible<T> = Result<T, String>;
 
 /// One file per kind, named as the asset spec names them.
 const KIND_FILE: [&str; NUM_KINDS] = ["knight", "man_at_arms", "spearman", "archer"];
+
+/// The kind whose clips a skinned kind plays: the man-at-arms is built on
+/// the knight's body and skeleton, so he plays the knight's clips, read
+/// from `knight.<clip>.json` beside his model.
+const CLIP_KIND: [usize; NUM_KINDS] = [0, 0, 2, 3];
 
 /// Part id to the name its pivot empty carries (`pivot_<part>`), in the
 /// order unit_meshes.rs and the vertex shader use. Id 7 is the arrow in
@@ -122,7 +131,8 @@ const SLABS: [(usize, usize); NUM_LODS] = [(0, 0), (8, 4), (3, 2), (3, 0)];
 const MIN_HALF: f32 = 0.005;
 
 /// A kind's meshes, the texture atlas its imported levels sample, its
-/// rig, and the shot tables of an archer's bow rig (empty without one).
+/// rig, and its clip buffer: the shot tables of an archer's bow rig, then
+/// a skeleton's clips (empty without either).
 pub struct KindMeshes {
     pub lods: [Mesh; NUM_LODS],
     /// The model's base colour atlas: sRGB colour, alpha the team tint
@@ -389,19 +399,22 @@ fn import(kind: usize, path: &Path) -> Fallible<KindMeshes> {
         Some(bow) => bow,
         None => (arm_rig(&mut levels, &empties, local, scale, path, name), Vec::new()),
     };
-    // A skeleton takes the clip buffer, which a bow rig's shots fill.
-    let skinned = clips_on() && clips.is_empty() && gltf.document.skins().next().is_some();
+    // A skeleton's clips follow a bow rig's shots in the clip buffer.
+    let skinned = clips_on() && gltf.document.skins().next().is_some();
     if skinned {
-        match read_skeleton(&gltf, &origins, &mut levels, local3, scale, path) {
-            Ok((skel, rows)) => {
+        match read_skeleton(&gltf, &origins, &mut levels, local3, scale, path, kind) {
+            Ok((mut skel, rows)) => {
                 info!(
                     "{name}: skeleton of {} joints, clips {:?} ({} rows)",
                     skel.params[0],
                     SKEL_CLIPS,
                     rows.len()
                 );
+                for clip in &mut skel.clips {
+                    clip[0] += clips.len() as u32;
+                }
                 rig.skel = skel;
-                clips = rows;
+                clips.extend(rows);
             }
             Err(e) => warn!("{name}: its skeleton is not usable, it draws by its parts: {e}"),
         }
@@ -574,9 +587,25 @@ pub fn clips_on() -> bool {
 /// The clips a skinned kind plays, by slot (unit_pose.wgsl `CLIP_STAND`
 /// and on). Each is `<kind>.<name>.json` next to the model. The first
 /// `SKEL_CLIPS_NEEDED` must be there; a missing later one leaves its slot
-/// empty and the player does without it.
-const SKEL_CLIPS: [&str; 8] =
-    ["stand", "ready", "shuffle_left", "shuffle_right", "shuffle_forward", "shuffle_backward", "cut", "stab"];
+/// empty and the player does without it. The last four are an archer's
+/// shot: the draw from ready to the level aim, its release, the raise from
+/// the level aim to the high one, and its release.
+const SKEL_CLIPS: [&str; 14] = [
+    "stand",
+    "ready",
+    "shuffle_left",
+    "shuffle_right",
+    "shuffle_forward",
+    "shuffle_backward",
+    "cut",
+    "stab",
+    "charge",
+    "charge_attack",
+    "draw",
+    "release",
+    "aim_up",
+    "release_up",
+];
 const SKEL_CLIPS_NEEDED: usize = 2;
 /// The slot of the first step clip: left, right, forward and backward
 /// follow in that order (unit_pose.wgsl CLIP_SHUFFLE_LEFT).
@@ -585,13 +614,17 @@ const _: () = assert!(SKEL_CLIPS.len() <= SKEL_CLIP_SLOTS);
 
 /// The joints the player's gait, arm sway and attack write, in the order
 /// of `Skel::roles`.
-const SKEL_ROLES: [[&str; 4]; 5] = [
+const SKEL_ROLES: [[&str; 4]; 6] = [
     ["pelvis", "chest", "head", "weapon"],
     ["upperarm_r", "forearm_r", "hand_r", "coat_r"],
     ["upperarm_l", "forearm_l", "hand_l", "coat_l"],
     ["thigh_r", "shin_r", "foot_r", ""],
     ["thigh_l", "shin_l", "foot_l", ""],
+    ["arrow", "", "", ""],
 ];
+/// Roles a skeleton may lack: an archer holds no weapon, and only he has
+/// an arrow.
+const SKEL_ROLES_OPTIONAL: [&str; 2] = ["weapon", "arrow"];
 
 /// A clip in the one format (docs/plans/022): per sample the root's
 /// offset from rest, then one quaternion per joint relative to its parent.
@@ -615,6 +648,8 @@ struct ClipFile {
 struct ClipEvents {
     /// When the blow lands, seconds from the clip's start.
     contact: Option<f32>,
+    /// When a draw shows its arrow on the string.
+    nock: Option<f32>,
 }
 
 /// The model's skeleton and its clips as rows of the clip buffer, and
@@ -627,6 +662,7 @@ fn read_skeleton(
     local3: impl Fn(Vec3) -> Vec3,
     scale: f32,
     model: &Path,
+    kind: usize,
 ) -> Fallible<(Skel, Vec<[f32; 4]>)> {
     let skin = gltf.document.skins().next().ok_or("no skin")?;
     let nodes: Vec<gltf::Node> = skin.joints().collect();
@@ -657,8 +693,11 @@ fn read_skeleton(
             if role.is_empty() {
                 continue;
             }
-            let j = names.iter().position(|n| n == role).ok_or(format!("no joint named {role}"))?;
-            skel.roles[row][k] = j as u32;
+            skel.roles[row][k] = match names.iter().position(|n| n == role) {
+                Some(j) => j as u32,
+                None if SKEL_ROLES_OPTIONAL.contains(role) => SKEL_NO_JOINT,
+                None => return Err(format!("no joint named {role}")),
+            };
         }
     }
     // A vertex follows a joint and one of its children, the child second.
@@ -687,12 +726,23 @@ fn read_skeleton(
         }
     }
     let mut rows: Vec<[f32; 4]> = Vec::new();
+    let mut missing: Vec<&str> = Vec::new();
+    // A cut clip plays the sim's slow cut; a kind whose sim has none
+    // swings his style 1 quick, and the player draws it by the arm.
+    let has_cut = crate::unit_types::TYPES[kind].cut_windup_ticks > 0;
     for (slot, clip) in SKEL_CLIPS.iter().enumerate() {
-        let path = model.with_extension(format!("{clip}.json"));
+        if *clip == "cut" && !has_cut {
+            continue;
+        }
+        let path = if CLIP_KIND[kind] == kind {
+            model.with_extension(format!("{clip}.json"))
+        } else {
+            model.with_file_name(format!("{}.{clip}.json", KIND_FILE[CLIP_KIND[kind]]))
+        };
         let text = match crate::game_files::read_to_string(&path) {
             Ok(text) => text,
-            Err(e) if slot >= SKEL_CLIPS_NEEDED => {
-                warn!("{}: no clip {clip}, the player does without it: {e}", model.display());
+            Err(_) if slot >= SKEL_CLIPS_NEEDED => {
+                missing.push(*clip);
                 continue;
             }
             Err(e) => return Err(format!("cannot read its clip {}: {e}", path.display())),
@@ -710,9 +760,9 @@ fn read_skeleton(
         }
         skel.clips[slot] = [rows.len() as u32, file.samples.len() as u32, 0, file.looped as u32];
         let length = (file.samples.len() - 1) as f32 / file.fps;
-        let contact = file.events.contact.unwrap_or(-1.0);
+        let contact = file.events.contact.or(file.events.nock).unwrap_or(-1.0);
         if contact > length {
-            return Err(format!("{}: contact at {contact} s is after its end at {length} s", path.display()));
+            return Err(format!("{}: its event at {contact} s is after its end at {length} s", path.display()));
         }
         let travel = scale * Vec3::from_array(file.travel).length();
         skel.rates[slot] = [file.fps, length, contact, travel];
@@ -726,6 +776,9 @@ fn read_skeleton(
                 rows.push(q.to_array());
             }
         }
+    }
+    if !missing.is_empty() {
+        info!("{}: no clips {missing:?}, the player does without them", model.display());
     }
     Ok((skel, rows))
 }
@@ -1055,7 +1108,7 @@ fn read_shoot(path: &Path) -> Fallible<Shots> {
 
 /// The attack tables of a model with a jointed arm, next to it.
 fn attack_path(model: &Path) -> PathBuf {
-    model.with_extension("stab.json")
+    model.with_extension("arm_stab.json")
 }
 
 /// A jointed arm's attack as the build scripts write it
