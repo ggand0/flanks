@@ -93,8 +93,11 @@ pub struct Rig {
     pub chain: f32,
     /// The soldier's centre above his soles: half his height.
     pub half: f32,
+    /// The strength of the twitch off a blow the dice stopped
+    /// (unit_pose.wgsl): FL_TWITCH, 1 by default.
+    pub twitch: f32,
     /// Keeps the attack tables on the shader's 16-byte boundary.
-    pub pad: [f32; 3],
+    pub pad: [f32; 2],
     /// A jointed arm's attack, sampled evenly over the wind-up and over
     /// the follow-through: shoulder, elbow and wrist turns from the rest
     /// pose, and how far the weapon is levelled. Entry 0 of the wind-up
@@ -174,7 +177,9 @@ pub struct Bow {
 
 impl Default for Rig {
     fn default() -> Self {
-        bytemuck::Zeroable::zeroed()
+        let mut rig: Self = bytemuck::Zeroable::zeroed();
+        rig.twitch = crate::util::env_or("FL_TWITCH", 1.0_f32);
+        rig
     }
 }
 

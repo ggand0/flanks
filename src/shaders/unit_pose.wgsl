@@ -30,6 +30,8 @@ struct Rig {
     chain: f32,
     // His centre above his soles: half his height.
     half: f32,
+    // The strength of the twitch off a blow the dice stopped: FL_TWITCH.
+    twitch: f32,
     // A jointed arm's attack, even samples over the wind-up and over the
     // follow-through: shoulder, elbow and wrist turns from the rest pose,
     // and how far the weapon is levelled. windup[0] is the guard.
@@ -970,14 +972,15 @@ fn pose_begin(pos_scale: vec4<f32>, color: vec4<f32>, anim: vec4<f32>, anim2: ve
     if w4 >= 3.0 {
         let side = floor(w4) - 3.0;
         let since = 1.0 - (w4 - floor(w4));
-        let env = smoothstep(0.0, 0.25, since) * (1.0 - smoothstep(0.35, 1.0, since));
+        // Its strength: rig.twitch, FL_TWITCH times 1 (render_units_gpu.rs).
+        let env = smoothstep(0.0, 0.25, since) * (1.0 - smoothstep(0.35, 1.0, since)) * rig.twitch;
         if side < 0.5 {
-            twitch_pitch = -0.10 * env;
+            twitch_pitch = -0.20 * env;
         } else if side > 2.5 {
-            twitch_pitch = 0.08 * env;
+            twitch_pitch = 0.16 * env;
         } else {
-            twitch_pitch = -0.04 * env;
-            twitch_turn = select(-0.25, 0.25, side < 1.5) * env;
+            twitch_pitch = -0.08 * env;
+            twitch_turn = select(-0.40, 0.40, side < 1.5) * env;
         }
     }
 
