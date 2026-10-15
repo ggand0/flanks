@@ -185,7 +185,7 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
 
     let coverage_uv = (p.xz - coverage_bounds.xy) / coverage_bounds.zw;
     var field = textureSample(coverage, coverage_sampler, coverage_uv);
-    if natural_ground != 0u {
+    if natural_ground == 1u {
         field = meadow_transition(field, coverage_uv, p.xz, max(length(dx.xz), length(dy.xz)));
     }
     // On the authored ground every mix below takes the earth layer at

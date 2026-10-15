@@ -374,7 +374,7 @@ struct TerrainChunks {
     warm: Vec<Handle<Image>>,
 }
 
-const GROUND_TEXTURES: [&str; 8] = [
+const GROUND_TEXTURES: [&str; 9] = [
     "terrain/pasture_natural_color.ktx2",
     "terrain/pasture_color.ktx2",
     "terrain/pasture_normal_roughness.ktx2",
@@ -383,6 +383,7 @@ const GROUND_TEXTURES: [&str; 8] = [
     "terrain/stony_soil_color.ktx2",
     "terrain/stony_soil_normal_roughness.ktx2",
     "terrain/grassland_layout_color.ktx2",
+    "terrain/hill_layout_color.ktx2",
 ];
 
 type GroundMaterial = ExtendedMaterial<StandardMaterial, GroundLayers>;
@@ -831,9 +832,10 @@ fn ground_base() -> StandardMaterial {
     }
 }
 
-/// Pasture maps share the authored colour layout and natural grass detail.
+/// Pasture maps use authored colour layouts and natural grass detail.
 /// The other maps derive coverage from their relief and stony slopes.
 fn ground_layers(assets: &AssetServer, images: &mut Assets<Image>, terrain: &Terrain) -> GroundLayers {
+    let hill = matches!(terrain.kind, MapKind::Hill | MapKind::BigHill);
     let authored = matches!(
         terrain.kind,
         MapKind::Grassland | MapKind::BigGrassland | MapKind::Hill | MapKind::BigHill | MapKind::Sandbox | MapKind::Town
@@ -866,7 +868,9 @@ fn ground_layers(assets: &AssetServer, images: &mut Assets<Image>, terrain: &Ter
         ),
         earth: ground_texture(assets, "terrain/earth_color.ktx2"),
         earth_normal: ground_texture(assets, "terrain/earth_normal_roughness.ktx2"),
-        coverage: if authored {
+        coverage: if hill {
+            ground_texture(assets, "terrain/hill_layout_color.ktx2")
+        } else if authored {
             ground_texture(assets, "terrain/grassland_layout_color.ktx2")
         } else {
             images.add(ground_coverage(terrain))
@@ -886,7 +890,8 @@ fn ground_layers(assets: &AssetServer, images: &mut Assets<Image>, terrain: &Ter
                 terrain.verts_z as f32 * CELL,
             )
         },
-        natural_ground: u32::from(authored),
+        // Mode 1 includes the grassland artwork's eastern meadow blend.
+        natural_ground: if hill { 2 } else { u32::from(authored) },
     }
 }
 

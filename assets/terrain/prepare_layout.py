@@ -1,7 +1,8 @@
-"""Pack the unique grassland albedo with an exposed-earth detail mask in alpha.
+"""Pack a unique battlefield albedo with an exposed-earth detail mask in alpha.
 
 Run python3 assets/terrain/prepare_layout.py --toktx /path/to/toktx.
-The source artwork covers the full 1024 by 768 metre battlefield once.
+Pass --source hill_layout.source.json for the hill.
+Each source artwork covers its battlefield once.
 """
 
 import argparse
@@ -23,9 +24,11 @@ def transition(low, high, value):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--toktx", default="toktx")
+    parser.add_argument("--source", default="grassland_layout.source.json")
+    parser.add_argument("--out", type=Path, help="Override the packed texture destination")
     args = parser.parse_args()
     root = Path(__file__).resolve().parent
-    spec = json.loads((root / "grassland_layout.source.json").read_text())
+    spec = json.loads((root / args.source).read_text())
     source_path = root / spec["file"]
     if hashlib.sha256(source_path.read_bytes()).hexdigest() != spec["sha256"]:
         raise ValueError(f"Checksum mismatch: {source_path}")
@@ -37,10 +40,13 @@ def main():
     red_excess = (rgb[:, :, 0] - rgb[:, :, 1]) / np.maximum(rgb[:, :, 0] + rgb[:, :, 1], 0.001)
     # Pale warm openings receive soil detail. Their source color stays intact;
     # this mask only chooses the close scan and normal, never distant color.
-    soil = (1.0 - transition(0.20, 0.48, saturation)) * transition(0.02, 0.09, red_excess)
+    mask = spec.get("soil_mask", {})
+    sat_low, sat_high = mask.get("saturation", [0.20, 0.48])
+    red_low, red_high = mask.get("red_excess", [0.02, 0.09])
+    soil = (1.0 - transition(sat_low, sat_high, saturation)) * transition(red_low, red_high, red_excess)
     packed = source.convert("RGBA")
     packed.putalpha(Image.fromarray(np.round(soil * 255.0).astype(np.uint8)))
-    destination = root / "grassland_layout_color.ktx2"
+    destination = args.out or root / f"{spec['asset']}_color.ktx2"
     with tempfile.TemporaryDirectory(prefix="flanks-layout-") as temporary:
         png = Path(temporary) / "layout.png"
         packed.save(png)
