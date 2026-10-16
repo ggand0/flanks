@@ -611,9 +611,11 @@ pub fn apply_damage(
                     if let Some(m) = material {
                         blow_sound(&mut sounds, blow_at, m, false);
                     }
-                    // The render's cue: a man not showing an answer
-                    // twitches away from the side the blow came from.
-                    if !v_defending && !v_staggered && flash[v] < 16 {
+                    // The render's cue: he twitches away from the side
+                    // the blow came from, unless he is reeling. A man
+                    // whose answer clip is playing shows that instead;
+                    // a kind without the clip shows the twitch.
+                    if !v_staggered && flash[v] < 16 {
                         let side: u8 = if front { 1 } else if rear { 4 } else if left_side { 2 } else { 3 };
                         flash[v] = (side << 4) | TWITCH_TICKS;
                     }

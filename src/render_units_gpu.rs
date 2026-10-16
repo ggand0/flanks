@@ -222,7 +222,9 @@ pub struct BuildParams {
     /// BOW_RISE_S, BOW_FALL_S, CANCEL_TICKS, RANGED_BASE.
     bow: Vec4,
     /// The block's raise, hold and whole length in ticks (sim/damage.rs
-    /// BLOCK_*) and TWITCH_TICKS; the parry's raise, hold and length.
+    /// BLOCK_*) and TWITCH_TICKS; the parry's raise, hold and length, and
+    /// in w which kinds have the clips: bit 2k the block of kind k, bit
+    /// 2k + 1 his parry. A kind without the clip shows the twitch instead.
     guard: Vec4,
     parry: Vec4,
     /// x = first index slot of the bucket, y = mesh corners per soldier,
@@ -657,10 +659,19 @@ fn build_frame_params(
     p.cut_return = Vec4::from_array(std::array::from_fn(|k| {
         crate::unit_types::TYPES[k].cut_return_s()
     }));
+    let mut answers = 0u32;
     for (bucket, rig) in &rigs {
         let (kind, skel) = (bucket.0 / NUM_LODS, &rig.rig.skel);
         if kind >= NUM_KINDS || skel.params[0] == 0 {
             continue;
+        }
+        for (k, slot) in [crate::unit_glb::SKEL_CLIP_BLOCK, crate::unit_glb::SKEL_CLIP_PARRY]
+            .into_iter()
+            .enumerate()
+        {
+            if skel.clips[slot][1] > 1 {
+                answers |= 1 << (kind * 2 + k);
+            }
         }
         for (k, slot) in (crate::unit_glb::SKEL_CLIP_STEPS..).take(4).enumerate() {
             if skel.clips[slot][1] > 1 {
@@ -688,7 +699,7 @@ fn build_frame_params(
             BLOCK_LEN as f32,
             crate::sim::damage::TWITCH_TICKS as f32,
         );
-        p.parry = Vec4::new(PARRY_RAISE as f32, PARRY_UP as f32, PARRY_LEN as f32, 0.0);
+        p.parry = Vec4::new(PARRY_RAISE as f32, PARRY_UP as f32, PARRY_LEN as f32, answers as f32);
     }
     p.bow = Vec4::new(
         BOW_RISE_S,

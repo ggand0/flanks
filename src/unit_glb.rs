@@ -614,6 +614,11 @@ const SKEL_CLIPS_NEEDED: usize = 2;
 /// The slot of the first step clip: left, right, forward and backward
 /// follow in that order (unit_pose.wgsl CLIP_SHUFFLE_LEFT).
 pub(crate) const SKEL_CLIP_STEPS: usize = 2;
+/// The slots of the block and the parry (unit_pose.wgsl CLIP_BLOCK,
+/// CLIP_PARRY).
+pub(crate) const SKEL_CLIP_BLOCK: usize = 14;
+pub(crate) const SKEL_CLIP_PARRY: usize = 15;
+const _: () = assert!(SKEL_CLIPS[SKEL_CLIP_BLOCK].len() == 5 && SKEL_CLIPS[SKEL_CLIP_PARRY].len() == 5);
 const _: () = assert!(SKEL_CLIPS.len() <= SKEL_CLIP_SLOTS);
 
 /// The joints the player's gait, arm sway and attack write, in the order
