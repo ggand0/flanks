@@ -14,8 +14,8 @@ import numpy as np
 from PIL import Image
 
 
-CROWN_M = 45.0
-CLIMB_M = 180.0
+CROWN_M = 36.0
+CLIMB_M = 280.0
 LOWER_GRADE = 0.025
 
 
@@ -51,7 +51,7 @@ def surface(x, z):
     envelope = envelope**2 * (3 - 2 * envelope)
     rolls = (3.4 * np.exp(-((x + 230) / 40)**2 - ((z - 110) / 24)**2)
              + 2.6 * np.exp(-((x - 190) / 50)**2 - ((z - 45) / 25)**2)
-             + 3.0 * np.exp(-((x + 5) / 42)**2 - ((z + 55) / 28)**2)
+             + 3.0 * np.exp(-((x + 5) / 42)**2 - ((z + 55) / 50)**2)
              - 1.5 * np.exp(-((x + 40) / 100)**2 - ((z - 125) / 80)**2))
     return np.clip(height + rolls * envelope, 0, CROWN_M)
 
@@ -69,7 +69,7 @@ def main():
     assert error <= CROWN_M / 65535 / 2 + 1e-10
     dz, dx = np.gradient(decoded, 2)
     angles = np.degrees(np.arctan(np.hypot(dx, dz)))
-    assert 18 < angles.max() < 28
+    assert 12 < angles.max() < 15
     assert decoded[192, 256] > 6
     assert decoded[152, 256] > 20
     print(json.dumps({

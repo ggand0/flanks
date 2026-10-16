@@ -1523,7 +1523,7 @@ mod tests {
     fn hill_variants_share_heights_and_grade_with_a_double_scale() {
         let hill = build_terrain(MapKind::Hill);
         let big = build_terrain(MapKind::BigHill);
-        assert_eq!(hill.height_at(0.0, -160.0), 45.0);
+        assert_eq!(hill.height_at(0.0, -160.0), 36.0);
         assert_eq!(hill.height_at(0.0, 280.0), 0.0);
         for z in 0..hill.verts_z {
             for x in 0..hill.verts_x {
@@ -1564,13 +1564,13 @@ mod tests {
                 dx.hypot(dz).atan().to_degrees()
             };
             // Substantial height halfway up the approach prevents a short bank.
-            assert!(terrain.height_at(0.0, -80.0 * scale) > 24.0 * scale);
-            assert!(terrain.height_at(0.0, -40.0 * scale) > 12.0 * scale);
-            assert!((18.0..26.0).contains(&angle_at(-100.0)));
-            assert!(angle_at(-140.0) < 9.0);
-            assert!(angle_at(-150.0) < 3.0);
+            assert!(terrain.height_at(0.0, -80.0 * scale) > 28.0 * scale);
+            assert!(terrain.height_at(0.0, -40.0 * scale) > 20.0 * scale);
+            assert!((12.0..15.0).contains(&angle_at(-40.0)));
+            assert!(angle_at(-140.0) < 2.0);
+            assert!(angle_at(-150.0) < 1.0);
             for z in (-160..=280).step_by(2) {
-                assert!(angle_at(z as f32) < 28.0, "{kind:?}: cliff at z={z}");
+                assert!(angle_at(z as f32) < 15.0, "{kind:?}: cliff at z={z}");
             }
         }
     }
