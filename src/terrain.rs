@@ -1523,7 +1523,7 @@ mod tests {
     fn hill_variants_share_heights_and_grade_with_a_double_scale() {
         let hill = build_terrain(MapKind::Hill);
         let big = build_terrain(MapKind::BigHill);
-        assert_eq!(hill.height_at(0.0, -160.0), 36.0);
+        assert_eq!(hill.height_at(0.0, -160.0), 45.0);
         assert_eq!(hill.height_at(0.0, 280.0), 0.0);
         for z in 0..hill.verts_z {
             for x in 0..hill.verts_x {
@@ -1550,6 +1550,26 @@ mod tests {
                 .raycast(Ray3d::new(ground + offset, Dir3::new(-offset).unwrap()))
                 .unwrap();
             assert!(hit.distance(ground) < 0.01);
+        }
+    }
+
+    #[test]
+    fn hill_upper_face_is_35_to_40_degrees_above_a_gentler_approach() {
+        for (kind, scale) in [(MapKind::Hill, 1.0), (MapKind::BigHill, 2.0)] {
+            let terrain = build_terrain(kind);
+            let angle_at = |z: f32| {
+                let z = z * scale;
+                let dx = (terrain.height_at(2.0, z) - terrain.height_at(-2.0, z)) / 4.0;
+                let dz = (terrain.height_at(0.0, z + 2.0) - terrain.height_at(0.0, z - 2.0)) / 4.0;
+                dx.hypot(dz).atan().to_degrees()
+            };
+            for z in [-148.0, -136.0, -124.0] {
+                let angle = angle_at(z);
+                assert!((35.0..=40.0).contains(&angle), "{kind:?}: {angle} degrees at z={z}");
+            }
+            for z in [-60.0, 0.0, 80.0, 200.0] {
+                assert!(angle_at(z) < 15.0, "{kind:?}: lower approach too steep at z={z}");
+            }
         }
     }
 
