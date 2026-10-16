@@ -616,7 +616,8 @@ fn dir_test_log(
     info!(
         "[dir-test] t={t:.0}s kills by sector: front {} side {} rear {} \
          (blows {}/{}/{}, dmg/blow {:.1}/{:.1}/{:.1}); victims alive: control {ctl}/500, \
-         test {test}/500, lone {lone}/500 (yaw dev {:.2} rad); outcomes {}",
+         test {test}/500, lone {lone}/500 (yaw dev {:.2} rad); outcomes {}; \
+         parries by depth {:?}",
         k[0],
         k[1],
         k[2],
@@ -628,6 +629,7 @@ fn dir_test_log(
         per_hit(2),
         yaw_dev / yaw_n.max(1) as f32,
         outcome_line(&dir_stats.outcomes[0]),
+        dir_stats.chain,
     );
 }
 
@@ -1647,7 +1649,7 @@ fn arena_log(
         "[arena] t={t:.0}s FRONT lane you {} vs {} (morale {:.0}) | \
          REAR lane you {} vs {} (morale {:.0}) | \
          your kills: front {} ({:.1}/blow), side {} ({:.1}/blow), rear {} ({:.1}/blow) | \
-         your blows: {} | theirs: {}",
+         your blows: {} | theirs: {} | parries by depth {:?}",
         alive[0][0],
         alive[0][1],
         groups.list[1].morale,
@@ -1662,6 +1664,7 @@ fn arena_log(
         per_hit(2),
         outcome_line(&dir_stats.outcomes[1]),
         outcome_line(&dir_stats.outcomes[0]),
+        dir_stats.chain,
     );
 }
 

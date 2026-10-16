@@ -107,6 +107,11 @@ pub struct Units {
     /// running to the fight (sim/soldier.rs SIGHT_* bits). A man looks
     /// around every few ticks, not every tick, and acts on what he saw.
     pub sight: Column<u16>,
+    /// The depth of the exchange he is answering (sim/damage.rs): 0 a
+    /// plain blow, 1 the counter of his parried blow, 2 the counter of
+    /// a parried counter, and so on. Written when he answers a warning,
+    /// read when his own counter warns its target.
+    pub chain: Column<u8>,
     /// Where he last chose to walk on his regiment's route (sim/route.rs
     /// `man_target`): NaN when his regiment has no route, infinite when
     /// his way to his slot was clear. He reads his route every few ticks,
@@ -292,6 +297,7 @@ pub fn push_unit(
     });
     units.out_form.push(false);
     units.sight.push(0);
+    units.chain.push(0);
     units.way.push(Vec2::NAN);
 }
 

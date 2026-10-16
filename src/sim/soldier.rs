@@ -319,6 +319,7 @@ pub(crate) struct Soldier<'a> {
     pub out_form: &'a mut bool,
     pub sight: &'a mut u16,
     pub way: &'a mut Vec2,
+    pub chain: &'a mut u8,
 }
 
 /// The rows of one chunk of soldiers, in index order.
@@ -337,6 +338,7 @@ pub(crate) struct Rows<'a> {
     pub out_form: &'a mut [bool],
     pub sight: &'a mut [u16],
     pub way: &'a mut [Vec2],
+    pub chain: &'a mut [u8],
 }
 
 /// What a chunk emits beside its rows: landed swings and loosed arrows.
@@ -417,6 +419,7 @@ pub(crate) fn tick_chunk(f: &Field, rows: Rows, out: &mut ChunkOut) {
             out_form: &mut rows.out_form[j],
             sight: &mut rows.sight[j],
             way: &mut rows.way[j],
+            chain: &mut rows.chain[j],
         };
         let mut st = begin(f, &mut s);
         drive(f, &mut s, &mut st);
@@ -778,6 +781,7 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
             charge: false,
             impale: true,
             warn: 0,
+            chain: 0,
         });
     }
     st.push = push;
@@ -1291,6 +1295,7 @@ fn swing(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
                         charge: *s.swing & crate::units::SWING_CHARGE != 0,
                         impale: false,
                         warn: 0,
+                        chain: 0,
                     });
                     *s.swing = crate::units::SWING_RECOVER;
                     let cjit = (1.0 - crate::unit_types::COOLDOWN_JITTER)
@@ -1333,8 +1338,20 @@ fn swing(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
                         | (*s.swing & crate::units::SWING_STAGGER_IMMUNE);
                     *s.swing_t = ((params.windup_ticks as f32
                         * crate::sim::damage::COUNTER_WINDUP)
-                        as u8)
+                        .ceil() as u8)
                         .max(1);
+                    // The man he parried is warned like any target, one
+                    // deeper in the exchange: he may answer from the
+                    // bind, with less chance each time (sim/damage.rs).
+                    out.events.push(DamageEvent {
+                        victim: *s.target,
+                        attacker: i as u32,
+                        jit: 0.0,
+                        charge: false,
+                        impale: false,
+                        warn: *s.swing_t,
+                        chain: s.chain.saturating_add(1),
+                    });
                 } else if *s.swing_t == 0 {
                     *s.swing = crate::units::SWING_READY
                         | (*s.swing & crate::units::SWING_STAGGER_IMMUNE);
@@ -1422,10 +1439,7 @@ fn swing(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
                     *s.swing_t = params.windup_for(*s.swing);
                     // The target is told of the swing now, so that he
                     // can answer it with a block or a parry timed to the
-                    // strike (sim/damage.rs). The counter after a parry
-                    // starts in the apply pass and warns nobody: it
-                    // comes while the attacker is still recovering, when
-                    // he could not answer anyway.
+                    // strike (sim/damage.rs).
                     out.events.push(DamageEvent {
                         victim: chosen,
                         attacker: i as u32,
@@ -1433,6 +1447,7 @@ fn swing(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
                         charge: false,
                         impale: false,
                         warn: *s.swing_t,
+                        chain: 0,
                     });
                 } else if my_kind == crate::unit_types::KIND_ARCHER as usize
                     && !routed

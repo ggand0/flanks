@@ -82,6 +82,14 @@ pub const COUNTER_PER_TICK: f32 = 0.04;
 /// FL_COUNTER_BASE and FL_COUNTER_SKILL.
 pub const COUNTER_CHANCE_BASE: f32 = 0.8;
 pub const COUNTER_CHANCE_PER_SKILL: f32 = 0.03;
+/// A counter can be answered too, from the bind: the man it is aimed at
+/// has just had his blow stopped, his blade is at the other man's, so
+/// he may answer through his recovery. His chance of being on time is
+/// his share times this, by how deep the exchange is (the blow 1, its
+/// counter, the counter of that parried counter, and so on); beyond the
+/// table he answers nothing, so no exchange runs on for ever. FL_CHAIN
+/// as a comma list.
+pub const CHAIN_SHARE: [f32; 4] = [1.0, 0.6, 0.3, 0.1];
 /// On a parrying defend byte: the blow was stopped, the counter follows
 /// at `PARRY_COUNTER_AT` (the charge bit, free in the defend state).
 pub const GUARD_STOPPED: u8 = crate::units::SWING_CHARGE;
@@ -173,6 +181,18 @@ fn guard_per_skill() -> f32 {
     *V.get_or_init(|| crate::util::env_or("FL_GUARD", GUARD_PER_SKILL))
 }
 
+fn chain_share(depth: u8) -> f32 {
+    static V: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
+    let table = V.get_or_init(|| {
+        std::env::var("FL_CHAIN")
+            .ok()
+            .map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+            .filter(|t: &Vec<f32>| !t.is_empty())
+            .unwrap_or_else(|| CHAIN_SHARE.to_vec())
+    });
+    table.get(usize::from(depth)).copied().unwrap_or(0.0)
+}
+
 pub fn counter_per_tick() -> f32 {
     static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
     *V.get_or_init(|| crate::util::env_or("FL_COUNTER_TICK", COUNTER_PER_TICK))
@@ -245,6 +265,10 @@ pub struct DamageEvent {
     /// parry timed to meet it (M2TW tells the target at the swing's
     /// start and schedules his reaction to its strike frame).
     pub warn: u8,
+    /// With a warning: how deep in an exchange the swing is. 0 a plain
+    /// blow, 1 the counter of a parried blow, 2 the counter of a parried
+    /// counter, and so on (`CHAIN_SHARE`).
+    pub chain: u8,
 }
 
 /// One event buffer per integrate chunk; allocations persist across ticks.
@@ -264,8 +288,14 @@ pub struct DirTestStats {
     pub dmg: [[f64; 3]; 2],
     /// Indexed [victim team][OUT_*].
     pub outcomes: [[u64; NUM_OUTCOMES]; 2],
+    /// Parries that stopped the blow, by how deep in an exchange the
+    /// blow was: a plain blow, a counter, a counter's counter, on.
+    pub chain: [u64; CHAIN_DEPTHS],
     pub enabled: bool,
 }
+
+/// How many depths of an exchange the stats count.
+pub const CHAIN_DEPTHS: usize = 5;
 
 impl Default for DirTestStats {
     fn default() -> Self {
@@ -274,6 +304,7 @@ impl Default for DirTestStats {
             hits: [[0; 3]; 2],
             dmg: [[0.0; 3]; 2],
             outcomes: [[0; NUM_OUTCOMES]; 2],
+            chain: [0; CHAIN_DEPTHS],
             enabled: std::env::var("FL_TEST_DIR").is_ok() || std::env::var("FL_ARENA").is_ok(),
         }
     }
@@ -345,6 +376,7 @@ pub fn apply_damage(
         swing_t,
         flash,
         death_t,
+        chain,
         ..
     } = units;
     let team = &team[..];
@@ -401,18 +433,22 @@ pub fn apply_damage(
                     // last blow, not reeling, not already answering
                     // another) and sees the attacker in front of him
                     // (within 90 degrees). Routed men answer nothing.
+                    // The counter of his own parried blow he may answer
+                    // from the bind, anywhere in his recovery.
                     let vs = swing[v];
                     let state = vs & crate::units::SWING_STATE_MASK;
                     let free = match state {
                         crate::units::SWING_READY => true,
                         crate::units::SWING_RECOVER => {
                             vs & crate::units::SWING_STAGGERED == 0
-                                && u16::from(swing_t[v]) + u16::from(pv.windup_ticks)
+                                && (u16::from(swing_t[v]) + u16::from(pv.windup_ticks)
                                     <= u16::from(pv.cooldown_ticks)
+                                    || (ev.chain > 0 && target[v] == ev.attacker))
                         }
                         _ => false,
                     };
-                    if !free || along < 0.0 || broken[group[v] as usize] {
+                    let share = chain_share(ev.chain);
+                    if !free || share <= 0.0 || along < 0.0 || broken[group[v] as usize] {
                         continue;
                     }
                     // Which answer: the shield meets a blow from its side,
@@ -425,7 +461,7 @@ pub fn apply_damage(
                     // arrives and still costs him the clip; a late parry
                     // meets the blow with his guard open.
                     let skill = (pv.defence_skill + fat_atk[group[v] as usize]).max(0.0);
-                    let on_time = roll(0x9E37_79B9) < skill * guard_per_skill();
+                    let on_time = roll(0x9E37_79B9) < skill * guard_per_skill() * share;
                     let (raise, _, len) = guard_timeline(parry);
                     let wait = if on_time && ev.warn >= raise { ev.warn - raise } else { ev.warn };
                     swing[v] = crate::units::SWING_DEFEND
@@ -433,6 +469,7 @@ pub fn apply_damage(
                         | (vs & crate::units::SWING_STAGGER_IMMUNE);
                     swing_t[v] = wait.saturating_add(len);
                     target[v] = ev.attacker;
+                    chain[v] = ev.chain;
                     continue;
                 }
 
@@ -471,6 +508,9 @@ pub fn apply_damage(
                         if roll(0x2545_F491) < counter_chance(skill) {
                             swing[v] |= GUARD_STOPPED;
                             target[v] = ev.attacker;
+                        }
+                        if dir_stats.enabled {
+                            dir_stats.chain[usize::from(chain[v]).min(CHAIN_DEPTHS - 1)] += 1;
                         }
                         OUT_PARRIED
                     } else {
