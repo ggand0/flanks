@@ -65,11 +65,23 @@ pub const PARRY_LEN: u8 = 27;
 /// share of the kind's wind-up, while the attacker is still recovering
 /// from his stopped swing.
 pub const COUNTER_WINDUP: f32 = 0.5;
-/// The parry that stopped the blow plays on to here, ticks into its
-/// clip (0.37 s: through the deflect at 0.20 s), before the counter's
-/// wind-up starts (sim/soldier.rs), so every successful parry shows the
-/// same motion. The stopped blow marks the parry with `GUARD_STOPPED`.
+/// The latest the counter starts, ticks into the parry clip (0.37 s:
+/// through the deflect at 0.20 s). From the tick after his blade stops
+/// the blow the man has `COUNTER_PER_TICK` per point of defence skill
+/// each tick to launch it (sim/soldier.rs), so the counters of a
+/// skilled man come early and spread, a poor man's mostly at the
+/// latest. The stopped blow marks the parry with `GUARD_STOPPED`.
 pub const PARRY_COUNTER_AT: u8 = 11;
+/// His chance per tick to launch the counter, per point of defence
+/// skill (a knight 0.24 a tick, a spearman 0.12). FL_COUNTER_TICK.
+pub const COUNTER_PER_TICK: f32 = 0.04;
+/// Whether a parry that stopped the blow counters at all: this much,
+/// plus `COUNTER_CHANCE_PER_SKILL` per point of defence skill less the
+/// fatigue penalty (a knight 0.98, a bowman 0.86). A parry that does
+/// not counter plays its whole clip and he is back on guard.
+/// FL_COUNTER_BASE and FL_COUNTER_SKILL.
+pub const COUNTER_CHANCE_BASE: f32 = 0.8;
+pub const COUNTER_CHANCE_PER_SKILL: f32 = 0.03;
 /// On a parrying defend byte: the blow was stopped, the counter follows
 /// at `PARRY_COUNTER_AT` (the charge bit, free in the defend state).
 pub const GUARD_STOPPED: u8 = crate::units::SWING_CHARGE;
@@ -159,6 +171,22 @@ fn hit_rate() -> f32 {
 fn guard_per_skill() -> f32 {
     static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
     *V.get_or_init(|| crate::util::env_or("FL_GUARD", GUARD_PER_SKILL))
+}
+
+pub fn counter_per_tick() -> f32 {
+    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| crate::util::env_or("FL_COUNTER_TICK", COUNTER_PER_TICK))
+}
+
+fn counter_chance(skill: f32) -> f32 {
+    static V: std::sync::OnceLock<(f32, f32)> = std::sync::OnceLock::new();
+    let (base, per_skill) = *V.get_or_init(|| {
+        (
+            crate::util::env_or("FL_COUNTER_BASE", COUNTER_CHANCE_BASE),
+            crate::util::env_or("FL_COUNTER_SKILL", COUNTER_CHANCE_PER_SKILL),
+        )
+    });
+    base + per_skill * skill
 }
 
 /// The chance a blow lands from its points, attack minus defence: M2TW's
@@ -424,10 +452,11 @@ pub fn apply_damage(
                 // comes from within 45 degrees of his front (the swing
                 // he answered, or another that arrived while he was
                 // up). Stopped before the stats say anything. A parry
-                // that stops the blow counters at once: a stab from the
-                // bind at half the wind-up, while the attacker is still
-                // recovering. A parry that is not up yet has his guard
-                // open: his skill counts for nothing against this blow.
+                // that stops the blow counters, most of the time: a
+                // stab from the bind at half the wind-up, while the
+                // attacker is still recovering. A parry that is not up
+                // yet has his guard open: his skill counts for nothing
+                // against this blow.
                 let v_defending =
                     swing[v] & crate::units::SWING_STATE_MASK == crate::units::SWING_DEFEND;
                 let v_parrying =
@@ -435,10 +464,14 @@ pub fn apply_damage(
                 let v_guard_up = v_defending && guard_up(swing[v], swing_t[v]);
                 if v_guard_up && along >= GUARD_COS_45 && !ev.impale {
                     let outcome = if v_parrying {
-                        // The counter follows once the parry has played
-                        // to PARRY_COUNTER_AT (the kernel starts it).
-                        swing[v] |= GUARD_STOPPED;
-                        target[v] = ev.attacker;
+                        // Whether the counter follows (the kernel
+                        // launches it): his skill, less what fatigue
+                        // took from his arm.
+                        let skill = (pv.defence_skill + fat_atk[group[v] as usize]).max(0.0);
+                        if roll(0x2545_F491) < counter_chance(skill) {
+                            swing[v] |= GUARD_STOPPED;
+                            target[v] = ev.attacker;
+                        }
                         OUT_PARRIED
                     } else {
                         OUT_BLOCKED

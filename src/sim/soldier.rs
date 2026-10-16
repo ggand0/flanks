@@ -1318,12 +1318,17 @@ fn swing(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
                 if t < pos_prev.len() {
                     face_target = Some(pos_prev[t].xz());
                 }
-                // A parry that stopped the blow plays on to
-                // PARRY_COUNTER_AT, then the counter: a stab at half the
-                // wind-up at the man he parried.
+                // A parry that stopped the blow counters: a stab at
+                // half the wind-up at the man he parried. From the tick
+                // after the stop he launches it with a chance each tick
+                // by his skill, at PARRY_COUNTER_AT for sure.
                 let stopped = *s.swing & crate::sim::damage::GUARD_STOPPED != 0;
                 let elapsed = crate::sim::damage::PARRY_LEN.saturating_sub(*s.swing_t);
-                if stopped && elapsed >= crate::sim::damage::PARRY_COUNTER_AT {
+                let launch = stopped
+                    && (elapsed >= crate::sim::damage::PARRY_COUNTER_AT
+                        || crate::units::hash01(tick_seed ^ (i as u32).wrapping_mul(0x7F4A_7C15))
+                            < params.defence_skill * crate::sim::damage::counter_per_tick());
+                if launch {
                     *s.swing = crate::units::SWING_WINDUP
                         | (*s.swing & crate::units::SWING_STAGGER_IMMUNE);
                     *s.swing_t = ((params.windup_ticks as f32
