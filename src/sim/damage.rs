@@ -87,8 +87,9 @@ pub const COUNTER_CHANCE_PER_SKILL: f32 = 0.03;
 /// he may answer through his recovery. His chance of being on time is
 /// his share times this, by how deep the exchange is (the blow 1, its
 /// counter, the counter of that parried counter, and so on); beyond the
-/// table he answers nothing, so no exchange runs on for ever. FL_CHAIN
-/// as a comma list.
+/// table he answers nothing, so no exchange runs on for ever. A counter
+/// is never blocked, only parried back or taken on the body: the parry
+/// earned it. FL_CHAIN as a comma list.
 pub const CHAIN_SHARE: [f32; 4] = [1.0, 0.6, 0.3, 0.1];
 /// On a parrying defend byte: the blow was stopped, the counter follows
 /// at `PARRY_COUNTER_AT` (the charge bit, free in the defend state).
@@ -453,9 +454,11 @@ pub fn apply_damage(
                     }
                     // Which answer: the shield meets a blow from its side,
                     // except when he chooses the parry; a blow from the
-                    // open side, or a man without a shield, parries.
+                    // open side, or a man without a shield, parries. A
+                    // counter is never blocked: the parry that earned it
+                    // is answered with the blade or taken on the body.
                     let shield_side = pv.shield > 0.0 && (front || left_side);
-                    let parry = !shield_side || roll(0x27D4_EB2F) < pv.parry_share;
+                    let parry = ev.chain > 0 || !shield_side || roll(0x27D4_EB2F) < pv.parry_share;
                     // On time: his skill, less what fatigue took from his
                     // arm. A late answer raises the guard as the blow
                     // arrives and still costs him the clip; a late parry
