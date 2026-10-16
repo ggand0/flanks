@@ -1554,7 +1554,7 @@ mod tests {
     }
 
     #[test]
-    fn hill_upper_face_is_35_to_40_degrees_above_a_gentler_approach() {
+    fn hill_climb_has_depth_and_a_rounded_crest() {
         for (kind, scale) in [(MapKind::Hill, 1.0), (MapKind::BigHill, 2.0)] {
             let terrain = build_terrain(kind);
             let angle_at = |z: f32| {
@@ -1563,12 +1563,14 @@ mod tests {
                 let dz = (terrain.height_at(0.0, z + 2.0) - terrain.height_at(0.0, z - 2.0)) / 4.0;
                 dx.hypot(dz).atan().to_degrees()
             };
-            for z in [-148.0, -136.0, -124.0] {
-                let angle = angle_at(z);
-                assert!((35.0..=40.0).contains(&angle), "{kind:?}: {angle} degrees at z={z}");
-            }
-            for z in [-60.0, 0.0, 80.0, 200.0] {
-                assert!(angle_at(z) < 15.0, "{kind:?}: lower approach too steep at z={z}");
+            // Substantial height halfway up the approach prevents a short bank.
+            assert!(terrain.height_at(0.0, -80.0 * scale) > 24.0 * scale);
+            assert!(terrain.height_at(0.0, -40.0 * scale) > 12.0 * scale);
+            assert!((18.0..26.0).contains(&angle_at(-100.0)));
+            assert!(angle_at(-140.0) < 9.0);
+            assert!(angle_at(-150.0) < 3.0);
+            for z in (-160..=280).step_by(2) {
+                assert!(angle_at(z as f32) < 28.0, "{kind:?}: cliff at z={z}");
             }
         }
     }

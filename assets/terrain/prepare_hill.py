@@ -15,45 +15,39 @@ from PIL import Image
 
 
 CROWN_M = 45.0
-FACE_M = 48.0
-JOIN_M = 8.0
-FACE_DEGREES = 37.5
+CLIMB_M = 180.0
+LOWER_GRADE = 0.025
 
 
 def surface(x, z):
-    """A gentle lower approach followed by a short, steep upper face."""
+    """A broad climb with a rounded shoulder and an uneven ridge."""
     crest_z = -160 + 12 * np.sin(x / 180) + 6 * np.sin(x / 75)
     crest_height = CROWN_M - 2.2 * (1 - np.cos(x / 115)) - 1.5 * (np.abs(x) / 512)**4
+    climb = CLIMB_M + 18 * np.sin(x / 145)
     distance = z - crest_z
-    lower_length = 280 - (crest_z + FACE_M)
+    lower_length = 280 - (crest_z + climb)
     foot_m = 80.0
-    face_grade = np.tan(np.radians(FACE_DEGREES))
-    # Solve the lower grade so the joined profile reaches the authored crown.
-    lower_grade = (crest_height - face_grade * (FACE_M - JOIN_M)) / (
-        lower_length - foot_m / 2 + JOIN_M / 2
-    )
     travel = np.clip(280 - z, 0, lower_length)
     lower_rise = np.where(travel < foot_m, travel**2 / (2 * foot_m), travel - foot_m / 2)
-    lower_height = lower_grade * lower_rise
-    face_base = lower_grade * (lower_length - foot_m / 2)
+    base = LOWER_GRADE * (lower_length - foot_m / 2)
 
-    # Integrate smoothstep grades at the toe and crown; the middle stays 37.5 degrees.
-    q = np.clip(FACE_M - distance, 0, FACE_M)
-    toe_u = np.clip(q / JOIN_M, 0, 1)
-    toe = lower_grade * q + (face_grade - lower_grade) * JOIN_M * (toe_u**3 - 0.5 * toe_u**4)
-    toe_height = JOIN_M * (lower_grade + face_grade) / 2
-    middle = toe_height + face_grade * (q - JOIN_M)
-    cap_u = np.clip((q - (FACE_M - JOIN_M)) / JOIN_M, 0, 1)
-    cap = toe_height + face_grade * (FACE_M - 2 * JOIN_M) + face_grade * JOIN_M * (
-        cap_u - cap_u**3 + 0.5 * cap_u**4
-    )
-    face_rise = np.where(q < JOIN_M, toe, np.where(q > FACE_M - JOIN_M, cap, middle))
-    height = np.where(distance <= FACE_M, face_base + face_rise, lower_height)
+    # Integrate a changing grade over the whole climb, with no straight face.
+    toe_m = climb * 2 / 3
+    crown_m = climb - toe_m
+    peak_grade = 2 * (crest_height - base - LOWER_GRADE * toe_m / 2) / climb
+    q = np.clip(climb - distance, 0, climb)
+    u = np.clip(q / toe_m, 0, 1)
+    toe = LOWER_GRADE * q + (peak_grade - LOWER_GRADE) * toe_m * (u**3 - 0.5 * u**4)
+    toe_height = toe_m * (LOWER_GRADE + peak_grade) / 2
+    v = np.clip((q - toe_m) / crown_m, 0, 1)
+    crown = toe_height + peak_grade * crown_m * (v - v**3 + 0.5 * v**4)
+    rise = np.where(q < toe_m, toe, crown)
+    height = np.where(distance <= climb, base + rise, LOWER_GRADE * lower_rise)
     rear = np.clip(-distance / 224, 0, 1)
     height = np.where(distance < 0, crest_height * (1 - 0.11 * rear**2), height)
 
-    # Retain the lower rolls, fading them out before the steep face.
-    envelope = np.minimum(np.clip(travel / 60, 0, 1), np.clip((distance - FACE_M) / 40, 0, 1))
+    # Carry the low rolls onto the climb, easing them away from the crown.
+    envelope = np.minimum(np.clip((280 - z) / 60, 0, 1), np.clip(distance / 50, 0, 1))
     envelope = envelope**2 * (3 - 2 * envelope)
     rolls = (3.4 * np.exp(-((x + 230) / 40)**2 - ((z - 110) / 24)**2)
              + 2.6 * np.exp(-((x - 190) / 50)**2 - ((z - 45) / 25)**2)
@@ -75,24 +69,19 @@ def main():
     assert error <= CROWN_M / 65535 / 2 + 1e-10
     dz, dx = np.gradient(decoded, 2)
     angles = np.degrees(np.arctan(np.hypot(dx, dz)))
-    crest_z = -160 + 12 * np.sin(x / 180) + 6 * np.sin(x / 75)
-    distance = z - crest_z
-    face = (np.abs(x) <= 440) & (distance >= JOIN_M + 2) & (distance <= FACE_M - JOIN_M - 2)
-    lower = (np.abs(x) <= 440) & (distance >= FACE_M + 4) & (z <= 280)
-    assert angles[face].min() >= 35 and angles.max() <= 40
+    assert 18 < angles.max() < 28
+    assert decoded[192, 256] > 6
+    assert decoded[152, 256] > 20
     print(json.dumps({
         "file": str(args.out),
         "dimensions": [513, 385],
         "sha256": hashlib.sha256(args.out.read_bytes()).hexdigest(),
         "height_min_max_m": [float(decoded.min()), float(decoded.max())],
-        "face_horizontal_run_m": FACE_M,
-        "face_join_m": JOIN_M,
-        "face_angle_min_max_degrees": [float(angles[face].min()), float(angles[face].max())],
-        "lower_angle_median_p95_max_degrees": np.percentile(angles[lower], [50, 95, 100]).tolist(),
+        "centre_climb_horizontal_run_m": CLIMB_M,
+        "climb_horizontal_run_min_max_m": [CLIMB_M - 18, CLIMB_M + 18],
         "maximum_angle_degrees": float(angles.max()),
-        "height_at_centre_crest_m": float(decoded[112, 256]),
-        "height_at_face_foot_m": float(decoded[136, 256]),
-        "height_at_valley_m": float(decoded[332, 256]),
+        "centre_maximum_angle_degrees": float(angles[:, 256].max()),
+        "centre_height_at_z_m": {str(zz): float(decoded[(zz + 384)//2, 256]) for zz in [-160, -120, -80, -40, 0, 20, 280]},
         "quantization_error_max_m": float(error),
     }, indent=2))
 
