@@ -1,0 +1,30 @@
+{
+  "asset": "hill_layout",
+  "source": "Original artwork created for this project",
+  "file": "hill_layout.png",
+  "sha256": "1557f4a143c0442febbb7ffccbfc7fd0ec639ce93a947f6f4be4d8cb3b77b854",
+  "pixels": [
+    1448,
+    1086
+  ],
+  "world_size_m": [
+    1024,
+    768
+  ],
+  "prompt": "hill_layout.prompt.txt",
+  "preparation": "prepare_layout.py --source hill_layout.source.json",
+  "soil_mask": {
+    "saturation": [
+      0.12,
+      0.4
+    ],
+    "red_excess": [
+      0.005,
+      0.04
+    ]
+  },
+  "channels": {
+    "RGB": "sRGB ground albedo",
+    "A": "linear exposed-earth detail weight"
+  }
+}

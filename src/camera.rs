@@ -254,15 +254,42 @@ pub fn apply_camera_transform(
     cam.focus.x = cam.focus.x.clamp(min.x, max.x);
     cam.focus.z = cam.focus.z.clamp(min.y, max.y);
     cam.focus.y = terrain.height_at(cam.focus.x, cam.focus.z);
+    *transform = Transform::from_translation(camera_eye(&cam, &terrain)).looking_at(cam.focus, Vec3::Y);
+}
+
+fn camera_eye(cam: &RtsCamera, terrain: &crate::terrain::Terrain) -> Vec3 {
     let rot = Quat::from_euler(EulerRot::YXZ, cam.yaw, -cam.pitch, 0.0);
-    let offset = rot * Vec3::new(0.0, 0.0, cam.distance);
-    *transform = Transform::from_translation(cam.focus + offset).looking_at(cam.focus, Vec3::Y);
+    let mut eye = cam.focus + rot * Vec3::new(0.0, 0.0, cam.distance);
+    // The focus can sit downhill from the eye at low pitch.
+    eye.y = eye.y.max(terrain.height_at(eye.x, eye.z) + 1.5);
+    eye
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::terrain::{MapKind, build_terrain};
+
+    #[test]
+    fn camera_clears_the_ground_at_minimum_zoom_and_pitch() {
+        for kind in MapKind::ALL {
+            let terrain = build_terrain(kind);
+            let mut lowest = f32::INFINITY;
+            for z in (terrain.min().y as i32..=terrain.max().y as i32).step_by(16) {
+                for x in (terrain.min().x as i32..=terrain.max().x as i32).step_by(16) {
+                    let focus = Vec3::new(x as f32, terrain.height_at(x as f32, z as f32), z as f32);
+                    for angle in 0..16 {
+                        let yaw = angle as f32 * std::f32::consts::TAU / 16.0;
+                        let cam = RtsCamera { focus, yaw, pitch: 0.25, distance: 15.0, target_distance: 15.0 };
+                        let eye = camera_eye(&cam, &terrain);
+                        lowest = lowest.min(eye.y - terrain.height_at(eye.x, eye.z));
+                    }
+                }
+            }
+            println!("{} minimum camera clearance: {lowest:.3} m", kind.label());
+            assert!(lowest >= 1.5 - 1e-4, "{} camera clearance {lowest}", kind.label());
+        }
+    }
 
     #[test]
     fn map_switches_update_camera_range_and_keep_focus_on_the_field() {
@@ -286,7 +313,9 @@ mod tests {
             .id();
         for (kind, limit, far, corner) in [
             (MapKind::BigGrassland, 2800.0, 6000.0, Vec2::splat(1024.0)),
+            (MapKind::BigHill, 2800.0, 6000.0, Vec2::new(1024.0, 768.0)),
             (MapKind::Grassland, 900.0, 1000.0, Vec2::new(512.0, 384.0)),
+            (MapKind::Hill, 900.0, 1000.0, Vec2::new(512.0, 384.0)),
         ] {
             app.insert_resource(build_terrain(kind));
             app.update();
