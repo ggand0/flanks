@@ -33,9 +33,8 @@ const GUARD_COS_45: f32 = std::f32::consts::FRAC_1_SQRT_2;
 /// what he does not see.
 const OPEN_SIDE_PTS: f32 = 5.0;
 const REAR_PTS: f32 = 10.0;
-/// The land roll's scale: M2TW's `combat-balancing/melee-hit-rate`, 1.75
-/// (a blow at even points lands 35 times in 100). FL_HIT_RATE overrides
-/// it for the calibration runs.
+/// The land roll's scale, 1.75 (a blow at even points lands 35 times in
+/// 100). FL_HIT_RATE overrides it for the calibration runs.
 pub const HIT_RATE: f32 = 1.75;
 /// How often a man's answer to a swing he sees is up in time, per point
 /// of defence skill (a knight 6 in 10, a man-at-arms 4, a spearman 3, a
@@ -62,17 +61,19 @@ pub const PARRY_RAISE: u8 = 5;
 pub const PARRY_UP: u8 = 3;
 pub const PARRY_LEN: u8 = 27;
 /// A parry that stopped the blow counters: a stab at this share of the
-/// kind's wind-up (1: the whole stab, Gota 2026-10-17; half was too
-/// little to read), while the attacker is still recovering from his
-/// stopped swing.
+/// kind's wind-up (1, the whole stab; half was too little to read),
+/// while the attacker is still recovering from his stopped swing.
 pub const COUNTER_WINDUP: f32 = 1.0;
-/// The latest the counter starts, ticks into the parry clip (0.37 s:
-/// through the deflect at 0.20 s). From the tick after his blade stops
-/// the blow the man has `COUNTER_PER_TICK` per point of defence skill
-/// each tick to launch it (sim/soldier.rs), so the counters of a
-/// skilled man come early and spread, a poor man's mostly at the
-/// latest. The stopped blow marks the parry with `GUARD_STOPPED`.
-pub const PARRY_COUNTER_AT: u8 = 11;
+/// When the counter starts, ticks into the parry clip, by kind: from
+/// the first value on, and at the second for sure. Between them the man
+/// has `COUNTER_PER_TICK` per point of defence skill each tick to
+/// launch it (sim/soldier.rs), so the counters of a skilled man come
+/// early and spread, a poor man's mostly at the latest. The sword kinds
+/// go from the tick after the blade stops the blow to 0.37 s, through
+/// the deflect at 0.20 s. The spearman's parry is shield-led, so his
+/// waits for the deflect to play: 0.37 s to the recover event at
+/// 0.50 s. The stopped blow marks the parry with `GUARD_STOPPED`.
+pub const COUNTER_WINDOW: [(u8, u8); crate::unit_types::NUM_KINDS] = [(0, 11), (0, 11), (11, 15), (0, 11)];
 /// His chance per tick to launch the counter, per point of defence
 /// skill (a knight 0.24 a tick, a spearman 0.12). FL_COUNTER_TICK.
 pub const COUNTER_PER_TICK: f32 = 0.04;
@@ -93,7 +94,7 @@ pub const COUNTER_CHANCE_PER_SKILL: f32 = 0.03;
 /// earned it. FL_CHAIN as a comma list.
 pub const CHAIN_SHARE: [f32; 4] = [1.0, 0.6, 0.3, 0.1];
 /// On a parrying defend byte: the blow was stopped, the counter follows
-/// at `PARRY_COUNTER_AT` (the charge bit, free in the defend state).
+/// in its `COUNTER_WINDOW` (the charge bit, free in the defend state).
 pub const GUARD_STOPPED: u8 = crate::units::SWING_CHARGE;
 /// A blow the dice stopped leaves a twitch in the hit-flash column for
 /// the render: values from 16 up are not a flash but the side the blow
@@ -130,7 +131,7 @@ const WALL_KNOCKBACK_RESIST: f32 = 0.25;
 /// render sync derives the rocked-back pose progress from swing_t/this.
 pub const STAGGER_TICKS: u8 = 30;
 /// Per-hit stagger: a blow that landed and did not kill rocks its man
-/// this often (M2TW: a hit that connects and does not kill shakes him).
+/// this often.
 /// Whether the defence stopped the blow was decided by the land roll
 /// before this; nothing of the stats is left in the stumble. Charge
 /// impacts and impalements stay certain (physics, not a contest). A
@@ -232,11 +233,11 @@ fn counter_chance(skill: f32) -> f32 {
     base + per_skill * skill
 }
 
-/// The chance a blow lands from its points, attack minus defence: M2TW's
-/// hit curve (`Combat_rollHit`, verified in the decompile), a chance in
-/// thousandths, piecewise linear with kinks at -6 and -12, times the hit
-/// rate. Even points land 35 in 100; each point near parity is worth 3.5
-/// in 100, half that from 6 behind, a fifth from 12 behind.
+/// The chance a blow lands from its points, attack minus defence: a
+/// chance in thousandths, piecewise linear with kinks at -6 and -12,
+/// times the hit rate. Even points land 35 in 100; each point near
+/// parity is worth 3.5 in 100, half that from 6 behind, a fifth from 12
+/// behind.
 pub fn land_chance(d: f32) -> f32 {
     let per_mille = if d >= -6.0 {
         20.0 * d + 200.0
@@ -285,8 +286,7 @@ pub struct DamageEvent {
     pub impale: bool,
     /// Nonzero: not a blow but its warning, this many ticks before the
     /// strike. The victim who sees it coming answers with a block or a
-    /// parry timed to meet it (M2TW tells the target at the swing's
-    /// start and schedules his reaction to its strike frame).
+    /// parry timed to meet it.
     pub warn: u8,
     /// With a warning: how deep in an exchange the swing is. 0 a plain
     /// blow, 1 the counter of a parried blow, 2 the counter of a parried
@@ -515,7 +515,7 @@ pub fn apply_damage(
                 // he answered, or another that arrived while he was
                 // up). Stopped before the stats say anything. A parry
                 // that stops the blow counters, most of the time: a
-                // stab from the bind at half the wind-up, while the
+                // stab from the bind, while the
                 // attacker is still recovering. A parry that is not up
                 // yet has his guard open: his skill counts for nothing
                 // against this blow.
@@ -553,7 +553,7 @@ pub fn apply_damage(
                     continue;
                 }
 
-                // M2TW directional resolution, the points of the land
+                // Directional resolution, the points of the land
                 // roll. Sector of the blow against the victim's facing:
                 // defence skill counts in full from the front, half from
                 // the sides and not from the rear; the shield covers front

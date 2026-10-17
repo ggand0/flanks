@@ -21,7 +21,7 @@ pub enum Weapon {
 
 /// Damage of a blow that lands, per weapon class, the same whatever the
 /// stats: the stats decide whether it lands (sim/damage.rs
-/// `land_chance`), as M2TW's one roll does, and hit points add the landed
+/// `land_chance`), and hit points add the landed
 /// blows up. Anchored at what the median matchup dealt per hit before the
 /// roll (light against light, frontal: 18 for the sword, 20 for the spear),
 /// so a man-at-arms still falls to five sword blows and a knight to nine.
@@ -86,7 +86,7 @@ pub mod missile {
 
 pub struct UnitTypeParams {
     pub hp: f32,
-    /// M2TW-style combat stats. `attack + situational - defence` is the
+    /// Combat stats. `attack + situational - defence` is the
     /// chance a blow lands (sim/damage.rs `land_chance`), resolved by
     /// sector at damage apply: defence_skill counts in full from the
     /// front and half from the sides, never from the rear; shield covers

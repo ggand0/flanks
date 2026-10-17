@@ -746,9 +746,7 @@ fn read_skeleton(
             continue;
         }
         // His own file first; a kind that plays another's clips takes
-        // that kind's file when he has none of his own (the man-at-arms
-        // keeps the knight's 19-joint clips of his own until his model
-        // gets the knight's 20-joint skeleton).
+        // that kind's file when he has none of his own.
         let own = model.with_extension(format!("{clip}.json"));
         let path = if CLIP_KIND[kind] == kind || crate::game_files::is_file(&own) {
             own
