@@ -30,6 +30,8 @@ struct Rig {
     chain: f32,
     // His centre above his soles: half his height.
     half: f32,
+    // The strength of the twitch off a blow the dice stopped: FL_TWITCH.
+    twitch: f32,
     // A jointed arm's attack, even samples over the wind-up and over the
     // follow-through: shoulder, elbow and wrist turns from the rest pose,
     // and how far the weapon is levelled. windup[0] is the guard.
@@ -50,11 +52,11 @@ struct Skel {
     // Per clip: x = its first vec4 in `clips`, y = its samples, w = 1 when
     // it loops. A sample is the root's offset from rest, then one
     // quaternion per joint relative to its parent.
-    clips: array<vec4<u32>, 14>,
+    clips: array<vec4<u32>, 16>,
     // Per clip: x = samples per second, y = its length in seconds, z =
     // when its blow lands, or when a draw nocks its arrow, in seconds, -1
     // without one, w = how far one play carries the soldier.
-    rates: array<vec4<f32>, 14>,
+    rates: array<vec4<f32>, 16>,
     // The joints the gait, the arm sway and the attack write: (pelvis,
     // chest, head, weapon), then (upper arm, forearm, hand, coat) of the
     // weapon side and of the shield side, then (thigh, shin, foot) of
@@ -665,6 +667,11 @@ const CLIP_DRAW: u32 = 10u;
 const CLIP_RELEASE: u32 = 11u;
 const CLIP_AIM_UP: u32 = 12u;
 const CLIP_RELEASE_UP: u32 = 13u;
+// The answers to a blow (unit_glb.rs SKEL_CLIPS): the shield block, the
+// weapon parry. Their rates.z is the guard event, when the shield or the
+// blade is up.
+const CLIP_BLOCK: u32 = 14u;
+const CLIP_PARRY: u32 = 15u;
 // render_units.rs RELOAD_S: the reload a skeleton's shot plays after its
 // release, from its end down to the ready pose and through the draw to
 // the held aim.
@@ -793,6 +800,15 @@ struct Pre {
     wobble: f32,
     dip: f32,
     stagger: f32,
+    // His answer to a blow: the clip (CLIP_BLOCK or CLIP_PARRY, 0 for
+    // none) and how far it has run, 0 to 1.
+    answer: u32,
+    answer_t: f32,
+    // A twitch away from a blow the dice stopped: a pitch of the whole
+    // body (back off a frontal blow, forward off one from behind) and a
+    // turn of the shoulders (the struck shoulder back off a side blow).
+    twitch_pitch: f32,
+    twitch_turn: f32,
     time: f32,
 };
 
@@ -936,6 +952,37 @@ fn pose_begin(pos_scale: vec4<f32>, color: vec4<f32>, anim: vec4<f32>, anim2: ve
     let limb = cos(TAU * gait) * walking;
     let wobble = time * 9.0 + seed * TAU;
     let dip = gait_dip(fract(2.0 * gait), g) * walking;
+    // The fourth anim2 float (unit_build.wgsl, render_units.rs): the
+    // stagger 0 to 1; a block 1 + how far its clip has run; a parry 2 +
+    // the same.
+    // the same; a twitch 3 + the side the blow came from (0 front, 1 his
+    // left, 2 his right, 3 behind) + how much of it is left.
+    let w4 = max(inst.anim2.w, 0.0);
+    let stagger = select(0.0, w4, w4 <= 1.0);
+    var answer = 0u;
+    if w4 > 2.0 && w4 < 3.0 {
+        answer = CLIP_PARRY;
+    } else if w4 > 1.0 && w4 < 2.0 {
+        answer = CLIP_BLOCK;
+    }
+    let answer_t = w4 - floor(w4);
+    // The twitch: quick in over its first quarter, eased out by its end.
+    var twitch_pitch = 0.0;
+    var twitch_turn = 0.0;
+    if w4 >= 3.0 {
+        let side = floor(w4) - 3.0;
+        let since = 1.0 - (w4 - floor(w4));
+        // Its strength: rig.twitch, FL_TWITCH times 1 (render_units_gpu.rs).
+        let env = smoothstep(0.0, 0.25, since) * (1.0 - smoothstep(0.35, 1.0, since)) * rig.twitch;
+        if side < 0.5 {
+            twitch_pitch = -0.20 * env;
+        } else if side > 2.5 {
+            twitch_pitch = 0.16 * env;
+        } else {
+            twitch_pitch = -0.08 * env;
+            twitch_turn = select(-0.40, 0.40, side < 1.5) * env;
+        }
+    }
 
     pre = Pre(
         inst.pos_scale.xyz,
@@ -978,7 +1025,11 @@ fn pose_begin(pos_scale: vec4<f32>, color: vec4<f32>, anim: vec4<f32>, anim2: ve
         limb,
         wobble,
         dip,
-        inst.anim2.w,
+        stagger,
+        answer,
+        answer_t,
+        twitch_pitch,
+        twitch_turn,
         time,
     );
     put_common();
@@ -998,7 +1049,7 @@ fn put_common() {
     // The shoulders turn against the legs and the upper body shifts over
     // the planted foot, both at full weight here: the torso eases them in
     // up its height (`place`).
-    let turn = 0.10 * g.run * g.stride * pre.limb;
+    let turn = 0.10 * g.run * g.stride * pre.limb + pre.twitch_turn;
     let shift = 0.02 * pre.leg * g.run * g.stride * cos(TAU * (pre.gait - 0.5 * g.duty))
         * (1.0 - pre.step_w);
     // The body rides the hip drop from the gait. A runner leans as far
@@ -1014,10 +1065,12 @@ fn put_common() {
     // pitches backward from the feet with a short reel, hardest at the
     // hit and easing out as the man finds his balance; the knee-buckle
     // sink rides the vertical offset.
+    // A twitch off a blow the dice stopped pitches him the same way, a
+    // little.
     var stagger = vec2<f32>(1.0, 0.0);
-    if pre.stagger > 0.001 {
+    if pre.stagger > 0.001 || pre.twitch_pitch != 0.0 {
         let reel = 1.0 + 0.18 * sin(pre.time * 22.0 + pre.seed * TAU);
-        let sang = -0.42 * pre.stagger * pre.stagger * reel;
+        let sang = -0.42 * pre.stagger * pre.stagger * reel + pre.twitch_pitch;
         stagger = vec2<f32>(cos(sang), sin(sang));
     }
     // Death: topple around the feet and sink slightly. Fall direction
@@ -1566,6 +1619,21 @@ fn put_skeleton() {
         // stops.
         let low = cut * (1.0 - moving);
         skel_over(&turn, at, cut, low);
+        root = mix(root, skel_root_at(at), low);
+    }
+    // A side blow the dice stopped turns his struck shoulder back (the
+    // parts take it in `put_common`'s turn).
+    if alive && pre.twitch_turn != 0.0 {
+        turn[core.y] = qmul(turn[core.y], qy(pre.twitch_turn));
+    }
+    // His answer to a blow: the block or the parry clip (sim/damage.rs
+    // SWING_DEFEND), the sim's timer driving it, played as authored. A
+    // parry that stops the blow leaves the clip at its guard for the
+    // counter stab. On the move his legs keep the gait.
+    if alive && pre.answer != 0u && skel_has(pre.answer) {
+        let at = skel_at(pre.answer, pre.answer_t * rig.skel.rates[pre.answer].y);
+        let low = 1.0 - moving;
+        skel_over(&turn, at, 1.0, low);
         root = mix(root, skel_root_at(at), low);
     }
     // An archer's shot, over his stance by how far his bow is up. A draw

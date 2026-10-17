@@ -93,8 +93,11 @@ pub struct Rig {
     pub chain: f32,
     /// The soldier's centre above his soles: half his height.
     pub half: f32,
+    /// The strength of the twitch off a blow the dice stopped
+    /// (unit_pose.wgsl): FL_TWITCH, 1 by default.
+    pub twitch: f32,
     /// Keeps the attack tables on the shader's 16-byte boundary.
-    pub pad: [f32; 3],
+    pub pad: [f32; 2],
     /// A jointed arm's attack, sampled evenly over the wind-up and over
     /// the follow-through: shoulder, elbow and wrist turns from the rest
     /// pose, and how far the weapon is levelled. Entry 0 of the wind-up
@@ -110,8 +113,8 @@ pub const SKEL_JOINTS: usize = 22;
 const _: () = assert!(SKEL_JOINTS == 22, "unit_pose.wgsl sizes its joint arrays for 22");
 /// The clips a skinned kind plays, in the order of `Skel::clips`
 /// (unit_glb.rs `SKEL_CLIPS`).
-pub const SKEL_CLIP_SLOTS: usize = 14;
-const _: () = assert!(SKEL_CLIP_SLOTS == 14, "unit_pose.wgsl sizes Skel's clips and rates for 14");
+pub const SKEL_CLIP_SLOTS: usize = 16;
+const _: () = assert!(SKEL_CLIP_SLOTS == 16, "unit_pose.wgsl sizes Skel's clips and rates for 16");
 /// A role the kind's skeleton has no joint for (`Skel::roles`).
 pub const SKEL_NO_JOINT: u32 = 255;
 
@@ -174,7 +177,9 @@ pub struct Bow {
 
 impl Default for Rig {
     fn default() -> Self {
-        bytemuck::Zeroable::zeroed()
+        let mut rig: Self = bytemuck::Zeroable::zeroed();
+        rig.twitch = crate::util::env_or("FL_TWITCH", 1.0_f32);
+        rig
     }
 }
 

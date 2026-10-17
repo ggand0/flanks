@@ -58,6 +58,7 @@ pub struct TickJob {
     pub(crate) ammo_in: Arc<Vec<u8>>,
     pub(crate) out_form_in: Arc<Vec<bool>>,
     pub(crate) sight_in: Arc<Vec<u16>>,
+    pub(crate) chain_in: Arc<Vec<u8>>,
     pub(crate) way_in: Arc<Vec<Vec2>>,
     // Read only to pack the render snapshot.
     pub(crate) pos_prev_in: Arc<Vec<Vec3>>,
@@ -82,6 +83,7 @@ pub struct TickJob {
     pub(crate) ammo: Vec<u8>,
     pub(crate) out_form: Vec<bool>,
     pub(crate) sight: Vec<u16>,
+    pub(crate) chain: Vec<u8>,
     pub(crate) way: Vec<Vec2>,
     // Per-regiment command snapshot, taken at prep.
     pub(crate) orders: Vec<Option<Vec2>>,
@@ -173,6 +175,7 @@ impl TickJob {
         self.ammo_in = Default::default();
         self.out_form_in = Default::default();
         self.sight_in = Default::default();
+        self.chain_in = Default::default();
         self.way_in = Default::default();
         self.pos_prev_in = Default::default();
         self.color_in = Default::default();
@@ -290,6 +293,7 @@ fn share_columns(job: &mut TickJob, units: &Units) {
     job.ammo_in = units.ammo.share();
     job.out_form_in = units.out_form.share();
     job.sight_in = units.sight.share();
+    job.chain_in = units.chain.share();
     job.way_in = units.way.share();
     job.pos_prev_in = units.pos_prev.share();
     job.color_in = units.color.share();
@@ -311,6 +315,7 @@ fn share_columns(job: &mut TickJob, units: &Units) {
     fit(&mut job.ammo, n);
     fit(&mut job.out_form, n);
     fit(&mut job.sight, n);
+    fit(&mut job.chain, n);
     fit(&mut job.way, n);
 }
 

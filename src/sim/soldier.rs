@@ -319,6 +319,7 @@ pub(crate) struct Soldier<'a> {
     pub out_form: &'a mut bool,
     pub sight: &'a mut u16,
     pub way: &'a mut Vec2,
+    pub chain: &'a mut u8,
 }
 
 /// The rows of one chunk of soldiers, in index order.
@@ -337,6 +338,7 @@ pub(crate) struct Rows<'a> {
     pub out_form: &'a mut [bool],
     pub sight: &'a mut [u16],
     pub way: &'a mut [Vec2],
+    pub chain: &'a mut [u8],
 }
 
 /// What a chunk emits beside its rows: landed swings and loosed arrows.
@@ -417,6 +419,7 @@ pub(crate) fn tick_chunk(f: &Field, rows: Rows, out: &mut ChunkOut) {
             out_form: &mut rows.out_form[j],
             sight: &mut rows.sight[j],
             way: &mut rows.way[j],
+            chain: &mut rows.chain[j],
         };
         let mut st = begin(f, &mut s);
         drive(f, &mut s, &mut st);
@@ -444,8 +447,14 @@ fn begin(f: &Field, s: &mut Soldier) -> Step {
     let p = pos_prev[i].xz();
     let my_kind = kind[i] as usize;
     let dying = *s.death_t > 0;
-    // Hit flash decays here (set by the serial apply pass).
-    *s.flash = s.flash.saturating_sub(1);
+    // Hit flash decays here (set by the serial apply pass). A twitch code
+    // (sim/damage.rs TWITCH_TICKS) counts its low nibble down and goes
+    // at once.
+    *s.flash = if *s.flash >= 16 {
+        if *s.flash & 15 > 1 { *s.flash - 1 } else { 0 }
+    } else {
+        s.flash.saturating_sub(1)
+    };
     // Corpses play out their death anim: no orders, no combat; they stay as
     // an obstacle until swept.
     if dying && *s.death_t > 1 {
@@ -467,6 +476,8 @@ fn begin(f: &Field, s: &mut Soldier) -> Step {
         *s.out_form = false;
     } else if *s.swing & crate::units::SWING_STATE_MASK
         != crate::units::SWING_READY
+        && *s.swing & crate::units::SWING_STATE_MASK
+            != crate::units::SWING_DEFEND
         && *s.swing & crate::units::SWING_RANGED == 0
     {
         *s.out_form = true;
@@ -653,13 +664,14 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
     let mut sticky = false;
     // Moving at charge speed with unspent momentum: braced enemy spears in
     // the path are a collision hazard, and the scan must see out to SPEAR
-    // reach, not just mine. A man already run through (flash) or reeling is
-    // not re-impaled every tick — a spear is a point, not an aura.
+    // reach, not just mine. A man already run through (flash; a twitch
+    // code of 16 up is a render cue, not a wound) or reeling is not
+    // re-impaled every tick: a spear is a point, not an aura.
     let spear_reach = TYPES[crate::unit_types::KIND_SPEAR as usize].reach;
     let cs = speed[i] * CHARGE_SPEED_FRAC;
     let at_charge_speed = faces_spearwall[team[i] as usize]
         && !dying
-        && *s.flash == 0
+        && (*s.flash == 0 || *s.flash >= 16)
         && *s.swing & crate::units::SWING_STAGGERED == 0
         && s.vel.xz().length_squared() > cs * cs;
     let mut impale_idx = u32::MAX;
@@ -768,6 +780,8 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
             jit,
             charge: false,
             impale: true,
+            warn: 0,
+            chain: 0,
         });
     }
     st.push = push;
@@ -1280,6 +1294,8 @@ fn swing(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
                         jit,
                         charge: *s.swing & crate::units::SWING_CHARGE != 0,
                         impale: false,
+                        warn: 0,
+                        chain: 0,
                     });
                     *s.swing = crate::units::SWING_RECOVER;
                     let cjit = (1.0 - crate::unit_types::COOLDOWN_JITTER)
@@ -1292,6 +1308,55 @@ fn swing(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
                     if cut {
                         *s.swing_t = (*s.swing_t).max(params.cut_return_ticks);
                     }
+                } else {
+                    *s.swing_t -= 1;
+                }
+            }
+            crate::units::SWING_DEFEND => {
+                // Answering a swing he saw coming (sim/damage.rs): feet
+                // planted, eyes on the attacker, the shield or the blade
+                // up to meet the blow, then back on guard. The damage
+                // apply set this and may end it early: a parry that
+                // stopped the blow turns into the counter's wind-up.
+                desired *= 0.25;
+                let t = *s.target as usize;
+                if t < pos_prev.len() {
+                    face_target = Some(pos_prev[t].xz());
+                }
+                // A parry that stopped the blow counters: a stab at
+                // the man he parried. In his kind's window he launches
+                // it with a chance each tick by his skill, at the
+                // window's end for sure.
+                let stopped = *s.swing & crate::sim::damage::GUARD_STOPPED != 0;
+                let elapsed = crate::sim::damage::PARRY_LEN.saturating_sub(*s.swing_t);
+                let (from, by) = crate::sim::damage::COUNTER_WINDOW[st.my_kind];
+                let launch = stopped
+                    && elapsed >= from
+                    && (elapsed >= by
+                        || crate::units::hash01(tick_seed ^ (i as u32).wrapping_mul(0x7F4A_7C15))
+                            < params.defence_skill * crate::sim::damage::counter_per_tick());
+                if launch {
+                    *s.swing = crate::units::SWING_WINDUP
+                        | (*s.swing & crate::units::SWING_STAGGER_IMMUNE);
+                    *s.swing_t = ((params.windup_ticks as f32
+                        * crate::sim::damage::counter_windup())
+                        .ceil() as u8)
+                        .clamp(1, params.windup_ticks);
+                    // The man he parried is warned like any target, one
+                    // deeper in the exchange: he may answer from the
+                    // bind, with less chance each time (sim/damage.rs).
+                    out.events.push(DamageEvent {
+                        victim: *s.target,
+                        attacker: i as u32,
+                        jit: 0.0,
+                        charge: false,
+                        impale: false,
+                        warn: *s.swing_t,
+                        chain: s.chain.saturating_add(1),
+                    });
+                } else if *s.swing_t == 0 {
+                    *s.swing = crate::units::SWING_READY
+                        | (*s.swing & crate::units::SWING_STAGGER_IMMUNE);
                 } else {
                     *s.swing_t -= 1;
                 }
@@ -1374,6 +1439,18 @@ fn swing(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
                         crate::units::SWING_WINDUP | style
                     };
                     *s.swing_t = params.windup_for(*s.swing);
+                    // The target is told of the swing now, so that he
+                    // can answer it with a block or a parry timed to the
+                    // strike (sim/damage.rs).
+                    out.events.push(DamageEvent {
+                        victim: chosen,
+                        attacker: i as u32,
+                        jit: 0.0,
+                        charge: false,
+                        impale: false,
+                        warn: *s.swing_t,
+                        chain: 0,
+                    });
                 } else if my_kind == crate::unit_types::KIND_ARCHER as usize
                     && !routed
                     && *s.ammo > 0

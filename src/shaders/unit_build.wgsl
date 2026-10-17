@@ -128,6 +128,11 @@ struct Params {
     shot: vec4<f32>,
     // BOW_RISE_S, BOW_FALL_S, CANCEL_TICKS, RANGED_BASE.
     bow: vec4<f32>,
+    // The block's raise, hold and whole length in ticks (sim/damage.rs
+    // BLOCK_*) and TWITCH_TICKS; the parry's, and in w which kinds have
+    // the clips: bit 2k the block of kind k, bit 2k + 1 his parry.
+    guard: vec4<f32>,
+    parry: vec4<f32>,
     // x = first index slot of the bucket, y = mesh corners per soldier,
     // w = soldiers per instance of its indexed draw (0: expanded).
     buckets: array<vec4<u32>, 16>,
@@ -248,6 +253,7 @@ const TAU: f32 = 6.2831853;
 const SWING_STATE_MASK: u32 = 3u;
 const SWING_WINDUP: u32 = 1u;
 const SWING_RECOVER: u32 = 2u;
+const SWING_DEFEND: u32 = 3u;
 const SWING_CHARGE: u32 = 4u;
 const SWING_STYLE_SHIFT: u32 = 3u;
 const SWING_STYLE_MASK: u32 = 24u;
@@ -748,14 +754,34 @@ fn build_soldier(i: u32) {
     // fx: [0,1] hit flash, (1,2] death progress. A death's first tick has
     // progress 0, the living pose, and at 1.0 it would read as a full
     // flash, so it keeps the hit flash like a living man.
-    var fx = flash * 0.25;
+    // A flash value of 16 or more is a twitch code, not a flash.
+    var fx = select(flash * 0.25, 0.0, flash >= 16.0);
     if death_t > 0.0 && death_t < params.consts.y {
         fx = 2.0 - death_t / params.consts.y;
     }
 
+    // The fourth anim2 float: the stagger 0 to 1; a block 1 + how far
+    // its clip has run, 0 to 1; a parry 2 + the same; a twitch away from
+    // a blow the dice stopped, 3 + the side it came from (0 front, 1 his
+    // left, 2 his right, 3 behind) + how much is left (render_units.rs
+    // the same). Through the wait before a clip he shows nothing. A kind
+    // without the clip of his answer shows the twitch, as a man not
+    // answering does.
     var stagger = 0.0;
+    let parrying = (swing & SWING_STYLE_MASK) == (1u << SWING_STYLE_SHIFT);
+    let has_answer = ((u32(params.parry.w) >> (kind * 2u + select(0u, 1u, parrying))) & 1u) != 0u;
     if death_t == 0.0 && (swing & SWING_STAGGERED) != 0u {
         stagger = min(swing_t / params.consts.z, 1.0);
+    } else if death_t == 0.0 && (swing & SWING_STATE_MASK) == SWING_DEFEND && has_answer {
+        let len = select(params.guard.z, params.parry.z, parrying);
+        let e = len - swing_t + params.alpha;
+        if e > 0.0 {
+            stagger = select(1.0, 2.0, parrying) + min(e / len, 0.999);
+        }
+    } else if death_t == 0.0 && flash >= 16.0 {
+        let side = floor(flash / 16.0);
+        let left = (flash - side * 16.0) / params.guard.w;
+        stagger = 2.0 + side + min(left, 0.999);
     }
 
     records[i] = Record(
