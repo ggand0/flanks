@@ -61,10 +61,11 @@ pub const BLOCK_LEN: u8 = 24;
 pub const PARRY_RAISE: u8 = 5;
 pub const PARRY_UP: u8 = 3;
 pub const PARRY_LEN: u8 = 27;
-/// A parry that stopped the blow counters from the bind: a stab at this
-/// share of the kind's wind-up, while the attacker is still recovering
-/// from his stopped swing.
-pub const COUNTER_WINDUP: f32 = 0.5;
+/// A parry that stopped the blow counters: a stab at this share of the
+/// kind's wind-up (1: the whole stab, Gota 2026-10-17; half was too
+/// little to read), while the attacker is still recovering from his
+/// stopped swing.
+pub const COUNTER_WINDUP: f32 = 1.0;
 /// The latest the counter starts, ticks into the parry clip (0.37 s:
 /// through the deflect at 0.20 s). From the tick after his blade stops
 /// the blow the man has `COUNTER_PER_TICK` per point of defence skill
@@ -194,13 +195,27 @@ fn chain_share(depth: u8) -> f32 {
     table.get(usize::from(depth)).copied().unwrap_or(0.0)
 }
 
+/// A kind's parry share (unit_types.rs), or FL_PARRY_SHARE: one value
+/// per kind, comma separated, in kind order (heavy, light, spear,
+/// archer); a missing value keeps the kind's own.
+fn parry_share(kind: usize) -> f32 {
+    static V: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
+    let table = V.get_or_init(|| {
+        std::env::var("FL_PARRY_SHARE")
+            .ok()
+            .map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+            .unwrap_or_default()
+    });
+    table.get(kind).copied().unwrap_or(TYPES[kind].parry_share)
+}
+
 pub fn counter_per_tick() -> f32 {
     static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
     *V.get_or_init(|| crate::util::env_or("FL_COUNTER_TICK", COUNTER_PER_TICK))
 }
 
-/// COUNTER_WINDUP, or FL_COUNTER_WINDUP: 1 starts the counter's stab from
-/// its full wind-up.
+/// COUNTER_WINDUP, or FL_COUNTER_WINDUP: 0.5 starts the counter's stab
+/// from half its wind-up.
 pub fn counter_windup() -> f32 {
     static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
     *V.get_or_init(|| crate::util::env_or("FL_COUNTER_WINDUP", COUNTER_WINDUP))
@@ -465,7 +480,7 @@ pub fn apply_damage(
                     // counter is never blocked: the parry that earned it
                     // is answered with the blade or taken on the body.
                     let shield_side = pv.shield > 0.0 && (front || left_side);
-                    let parry = ev.chain > 0 || !shield_side || roll(0x27D4_EB2F) < pv.parry_share;
+                    let parry = ev.chain > 0 || !shield_side || roll(0x27D4_EB2F) < parry_share(kind[v] as usize);
                     // On time: his skill, less what fatigue took from his
                     // arm. A late answer raises the guard as the blow
                     // arrives and still costs him the clip; a late parry
