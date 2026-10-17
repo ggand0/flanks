@@ -1,4 +1,4 @@
-//! Authored trees and shrubs on the grassland, river and sandbox maps.
+//! Authored trees and shrubs on the grassland, hill, river and sandbox maps.
 //! Vegetation is visual only and does not affect terrain or pathfinding.
 
 use bevy::asset::RenderAssetUsages;
@@ -88,7 +88,18 @@ fn respawn_vegetation(
             let groups = RIVER_ZONES.map(|zone| (zone, None));
             planting.log(&specs, "river", &groups);
         }
-        MapKind::Classic | MapKind::BigGrassland | MapKind::Hill | MapKind::BigHill | MapKind::Obstacles | MapKind::Town => {}
+        MapKind::Hill | MapKind::BigHill => {
+            let specs: Vec<_> = trees.0.iter().map(|tree| (tree.name, tree.reach)).collect();
+            let stands = hill_stands(terrain.kind);
+            let planting = hill_planting(&specs, &terrain, &stands);
+            spawn_planting(&mut commands, &terrain, &trees, &planting);
+            let groups: Vec<_> = stands.iter()
+                .map(|stand| (stand.name, Some((stand.trees, stand.shrubs))))
+                .collect();
+            let map = if terrain.kind == MapKind::BigHill { "big_hill" } else { "hill" };
+            planting.log(&specs, map, &groups);
+        }
+        MapKind::Classic | MapKind::BigGrassland | MapKind::Obstacles | MapKind::Town => {}
     }
 }
 
@@ -463,10 +474,22 @@ impl Planting {
 /// run. `specs` pairs each loaded asset's name with its crown reach.
 fn grassland_planting(specs: &[(&'static str, f32)], terrain: &Terrain, army_gap: f32) -> Planting {
     let clearance = Clearance::new(terrain, army_gap);
+    plant_stands(specs, terrain, GRASSLAND_STANDS, 0, &|p, r, stand| {
+        clearance.clear(p, r, stand.inside)
+    })
+}
+
+fn plant_stands(
+    specs: &[(&'static str, f32)],
+    terrain: &Terrain,
+    stands: &[Stand],
+    seed: usize,
+    clear: &dyn Fn(Vec2, f32, &Stand) -> bool,
+) -> Planting {
     let mut out = Planting::default();
-    for (s, stand) in GRASSLAND_STANDS.iter().enumerate() {
-        let clear = |p: Vec2, r: f32| clearance.clear(p, r, stand.inside);
-        let mut d = Draws::new(s);
+    for (s, stand) in stands.iter().enumerate() {
+        let clear = |p: Vec2, r: f32| clear(p, r, stand);
+        let mut d = Draws::new(seed + s);
         let tree_scale = |d: &mut Draws| TREE_SCALE.0 + (TREE_SCALE.1 - TREE_SCALE.0) * d.next();
         let shrub_scale = |d: &mut Draws| SHRUB_SCALE.0 + (SHRUB_SCALE.1 - SHRUB_SCALE.0) * d.next();
 
@@ -554,6 +577,53 @@ fn grassland_planting(specs: &[(&'static str, f32)], terrain: &Terrain, army_gap
         }
     }
     out
+}
+
+// Hill coordinates describe the small map. Stand boundaries double on
+// Big Hill, while crown radii, cluster spacing and plant sizes stay in metres.
+fn hill_stands(kind: MapKind) -> Vec<Stand> {
+    let large = kind == MapKind::BigHill;
+    let scale = if large { 2.0 } else { 1.0 };
+    [
+        ("rear west", -470.0, -170.0, -367.0, -320.0, (130, 29), (420, 100), 0.18),
+        ("rear centre", -180.0, 160.0, -368.0, -330.0, (120, 30), (400, 80), 0.22),
+        ("rear east", 150.0, 470.0, -367.0, -318.0, (130, 29), (420, 100), 0.26),
+        ("west shoulder", -492.0, -466.0, -300.0, -90.0, (35, 20), (120, 60), 0.15),
+        ("east shoulder", 466.0, 492.0, -290.0, -65.0, (35, 20), (120, 60), 0.25),
+        ("west outliers", -488.0, -460.0, -40.0, 180.0, (15, 10), (60, 25), 0.12),
+        ("east outliers", 460.0, 488.0, 90.0, 240.0, (15, 10), (60, 25), 0.20),
+        ("west hedge", -457.0, -449.0, 50.0, 140.0, (0, 16), (0, 25), 0.0),
+        ("east hedge", 449.0, 457.0, -30.0, 44.0, (0, 16), (0, 25), 0.0),
+    ].into_iter().map(|(name, x0, x1, z0, z1, small, big, birch)| {
+        let (trees, shrubs) = if large { big } else { small };
+        Stand {
+            name,
+            area: strip(x0 * scale, x1 * scale, z0 * scale, z1 * scale),
+            trees,
+            shrubs,
+            birch,
+            leaning: 0.30,
+            shrub_a: 0.20,
+            inside: None,
+        }
+    }).collect()
+}
+
+fn hill_planting(specs: &[(&'static str, f32)], terrain: &Terrain, stands: &[Stand]) -> Planting {
+    let scale = if terrain.kind == MapKind::BigHill { 2.0 } else { 1.0 };
+    let field = Rect::from_corners(terrain.min(), terrain.max());
+    // Keep the planned ridge deployment, valley deployment and their whole
+    // connecting approach clear. Gameplay deployment is configured separately.
+    let open = Rect::from_corners(Vec2::new(-440.0, -286.0) * scale, Vec2::new(440.0, 364.0) * scale);
+    plant_stands(specs, terrain, stands, 1000, &|pos, radius, _| {
+        if !field.inflate(-radius).contains(pos) || distance_to_rect(pos, open) < radius {
+            return false;
+        }
+        let p = pos / scale;
+        // An uneven woodland edge leaves reserve space behind the defenders.
+        let edge = -318.0 + 8.0 * (p.x / 80.0).sin() + 5.0 * (p.x / 39.0).sin();
+        p.x.abs() >= 450.0 || p.y + radius / scale <= edge
+    })
 }
 
 // The river map: woods where the forest noise runs high, off the middle of
@@ -1353,6 +1423,36 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn hill_woods_keep_crowns_out_of_the_army_corridor_at_both_sizes() {
+        let specs = grassland_specs();
+        for (kind, scale, wanted) in [
+            (MapKind::Hill, 1.0, (480, 180)),
+            (MapKind::BigHill, 2.0, (1600, 500)),
+        ] {
+            let terrain = crate::terrain::build_terrain(kind);
+            let stands = hill_stands(kind);
+            let planting = hill_planting(&specs, &terrain, &stands);
+            assert!(planting.missing.is_empty());
+            let trees = planting.plants.iter().filter(|p| p.tree).count();
+            assert_eq!((trees, planting.plants.len() - trees), wanted);
+            let lo = Vec2::new(-440.0, -286.0) * scale;
+            let hi = Vec2::new(440.0, 364.0) * scale;
+            for p in &planting.plants {
+                let (low, high) = if p.tree { TREE_SCALE } else { SHRUB_SCALE };
+                assert!((low..=high).contains(&p.scale));
+                let r = specs[p.asset].1 * high;
+                assert!(p.pos.distance(p.pos.clamp(lo, hi)) >= r - 1e-4);
+                assert!(p.pos.cmpge(terrain.min() + Vec2::splat(r)).all());
+                assert!(p.pos.cmple(terrain.max() - Vec2::splat(r)).all());
+            }
+            let key = |p: &Placed| (p.asset, p.pos.to_array(), p.yaw, p.scale);
+            let again = hill_planting(&specs, &terrain, &stands);
+            assert_eq!(planting.plants.iter().map(key).collect::<Vec<_>>(),
+                       again.plants.iter().map(key).collect::<Vec<_>>());
         }
     }
 
