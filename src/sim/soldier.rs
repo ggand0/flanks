@@ -1337,9 +1337,9 @@ fn swing(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
                     *s.swing = crate::units::SWING_WINDUP
                         | (*s.swing & crate::units::SWING_STAGGER_IMMUNE);
                     *s.swing_t = ((params.windup_ticks as f32
-                        * crate::sim::damage::COUNTER_WINDUP)
+                        * crate::sim::damage::counter_windup())
                         .ceil() as u8)
-                        .max(1);
+                        .clamp(1, params.windup_ticks);
                     // The man he parried is warned like any target, one
                     // deeper in the exchange: he may answer from the
                     // bind, with less chance each time (sim/damage.rs).

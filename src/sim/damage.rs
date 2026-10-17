@@ -199,6 +199,13 @@ pub fn counter_per_tick() -> f32 {
     *V.get_or_init(|| crate::util::env_or("FL_COUNTER_TICK", COUNTER_PER_TICK))
 }
 
+/// COUNTER_WINDUP, or FL_COUNTER_WINDUP: 1 starts the counter's stab from
+/// its full wind-up.
+pub fn counter_windup() -> f32 {
+    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| crate::util::env_or("FL_COUNTER_WINDUP", COUNTER_WINDUP))
+}
+
 fn counter_chance(skill: f32) -> f32 {
     static V: std::sync::OnceLock<(f32, f32)> = std::sync::OnceLock::new();
     let (base, per_skill) = *V.get_or_init(|| {
