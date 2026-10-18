@@ -481,6 +481,15 @@ fn spawn_archery_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups)
             list[g].order = Some(crate::orders::Order::Attack(5));
         }
     }
+    // FL_ARCHERY_SWORDS=1: both archer regiments with swords out,
+    // ordered at the middle block: a charge like any infantry's, no
+    // stand-off, no shooting.
+    if std::env::var("FL_ARCHERY_SWORDS").is_ok() {
+        for g in [1, 2] {
+            list[g].melee = true;
+            list[g].order = Some(crate::orders::Order::Attack(4));
+        }
+    }
     groups.list = list;
     info!(
         "[archery] 2 archer regiments behind a screen; orange holds STATIC — middle block in \
@@ -509,10 +518,10 @@ fn archery_log(
     *next = t + 4.0;
     // E engaged, B broken, S skirmishing, O under an order, F firing (the
     // card's mark), H standing off its attack target, h standing instead
-    // of walking into an enemy block.
+    // of walking into an enemy block, M swords out, C charging.
     let flag = |gd: &crate::orders::GroupData| {
         format!(
-            "{}{}{}{}{}{}{}",
+            "{}{}{}{}{}{}{}{}{}",
             if gd.engaged { "E" } else { "-" },
             if gd.state.is_broken() { "B" } else { "-" },
             if gd.skirmishing { "S" } else { "-" },
@@ -520,6 +529,8 @@ fn archery_log(
             if gd.firing { "F" } else { "-" },
             if gd.standoff { "H" } else { "-" },
             if gd.skirmish_hold { "h" } else { "-" },
+            if gd.melee { "M" } else { "-" },
+            if gd.charging { "C" } else { "-" },
         )
     };
     // Men of an archer regiment drawing their bows this tick.

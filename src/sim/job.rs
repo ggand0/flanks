@@ -581,6 +581,7 @@ fn skirmish_reactions(
     for g in 0..n {
         let gd = &groups.list[g];
         let able = gd.kind == crate::unit_types::KIND_ARCHER
+            && !gd.melee
             && gd.count > 0
             && !gd.state.is_broken()
             && gd.skirmish
@@ -709,8 +710,11 @@ fn archer_fire_solutions(
     // The stand-off of every archer regiment under an attack order.
     for g in 0..n_groups {
         let gd = &groups.list[g];
-        let archer =
-            gd.kind == crate::unit_types::KIND_ARCHER && gd.count > 0 && !gd.state.is_broken();
+        // With swords out the order is a charge like any infantry's.
+        let archer = gd.kind == crate::unit_types::KIND_ARCHER
+            && !gd.melee
+            && gd.count > 0
+            && !gd.state.is_broken();
         let target = match gd.order {
             Some(crate::orders::Order::Attack(t)) if archer => t,
             _ => {
@@ -766,6 +770,7 @@ fn archer_fire_solutions(
         .map(|g| {
             let gd = &gl.list[g];
             if gd.kind != crate::unit_types::KIND_ARCHER
+                || gd.melee
                 || gd.count == 0
                 || gd.state.is_broken()
                 || gd.melee_ticks > 0

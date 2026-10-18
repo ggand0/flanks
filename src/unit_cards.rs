@@ -581,6 +581,38 @@ fn skirmish_shapes() -> Vec<IconShape> {
     ]
 }
 
+/// Swords out: the archer's sidearm drawn, point up.
+fn melee_shapes() -> Vec<IconShape> {
+    vec![
+        IconShape::Tri {
+            a: Vec2::new(22.0, 3.0),
+            b: Vec2::new(18.5, 10.5),
+            c: Vec2::new(25.5, 10.5),
+            rgb: ICON_RGB,
+        },
+        IconShape::Rect {
+            rect: (18.5, 10.0, 7.0, 16.5),
+            radius: [0.0; 4],
+            rgb: ICON_RGB,
+        },
+        IconShape::Rect {
+            rect: (12.0, 26.0, 20.0, 3.5),
+            radius: [1.5; 4],
+            rgb: ICON_RGB,
+        },
+        IconShape::Rect {
+            rect: (20.0, 29.5, 4.0, 8.5),
+            radius: [1.0; 4],
+            rgb: ICON_RGB,
+        },
+        IconShape::Rect {
+            rect: (18.5, 37.5, 7.0, 3.5),
+            radius: [1.5; 4],
+            rgb: ICON_RGB,
+        },
+    ]
+}
+
 /// Rasterized button icon textures. Rebuilt on every battle entry: the
 /// whole set is ~10 tiny images and sub-millisecond to draw, and the
 /// old handles free themselves when the previous bar despawns.
@@ -593,6 +625,7 @@ struct ButtonIcons {
     hold: Handle<Image>,
     fire_at_will: Handle<Image>,
     skirmish: Handle<Image>,
+    melee: Handle<Image>,
 }
 
 impl ButtonIcons {
@@ -607,6 +640,7 @@ impl ButtonIcons {
             hold: add(hold_shapes()),
             fire_at_will: add(fire_at_will_shapes()),
             skirmish: add(skirmish_shapes()),
+            melee: add(melee_shapes()),
         }
     }
 }
@@ -777,13 +811,14 @@ fn spawn_card(strip: &mut ChildSpawnerCommands, g: usize, kind: u8, icon: Handle
 
 /// M2TW-style round icon buttons, right end of the bar.
 fn spawn_control_panel(bar: &mut ChildSpawnerCommands, icons: &ButtonIcons) {
-    const BUTTONS: [(ControlButton, &str); 6] = [
+    const BUTTONS: [(ControlButton, &str); 7] = [
         (ControlButton::Halt, "Halt (Backspace)"),
         (ControlButton::Form(FormCmd::Wall), "Shield Wall (F)"),
         (ControlButton::Form(FormCmd::Loose), "Loose (L)"),
         (ControlButton::Form(FormCmd::Hold), "Hold (B)"),
         (ControlButton::Form(FormCmd::FireAtWill), "Fire at Will (T)"),
         (ControlButton::Form(FormCmd::Skirmish), "Skirmish (K)"),
+        (ControlButton::Form(FormCmd::Melee), "Swords Out (F)"),
     ];
     bar.spawn(Node {
         flex_shrink: 0.0,
@@ -896,6 +931,9 @@ fn spawn_control_panel(bar: &mut ChildSpawnerCommands, icons: &ButtonIcons) {
                                 }
                                 ControlButton::Form(FormCmd::Skirmish) => {
                                     icons.skirmish.clone()
+                                }
+                                ControlButton::Form(FormCmd::Melee) => {
+                                    icons.melee.clone()
                                 }
                                 _ => unreachable!(),
                             }),
@@ -1148,24 +1186,29 @@ fn refresh_control_buttons(
     // all-in-mode flag the buttons need (no per-frame Vec).
     let (mut any, mut all_wall, mut all_loose, mut all_hold) = (false, true, true, true);
     let mut all_spear = true;
-    let (mut any_archer, mut all_faw, mut all_skirm) = (false, true, true);
+    let (mut any_archer, mut all_faw, mut all_skirm, mut all_melee) = (false, true, true, true);
     for g in selection.picked_controllable(&groups) {
         let gd = &groups.list[g];
         any = true;
-        all_wall &= gd.spacing == FormSpacing::Wall;
-        all_loose &= gd.spacing == FormSpacing::Loose;
-        all_hold &= gd.hold;
-        all_spear &= is_spearwall_kind(gd.kind);
+        // Archers form no wall: the Wall button reads the other kinds.
         if gd.kind == KIND_ARCHER {
             any_archer = true;
             all_faw &= gd.fire_at_will;
             all_skirm &= gd.skirmish;
+            all_melee &= gd.melee;
+        } else {
+            all_wall &= gd.spacing == FormSpacing::Wall;
+            all_spear &= is_spearwall_kind(gd.kind);
         }
+        all_loose &= gd.spacing == FormSpacing::Loose;
+        all_hold &= gd.hold;
     }
     let archer_btn = |btn: ControlButton| {
         matches!(
             btn,
-            ControlButton::Form(FormCmd::FireAtWill) | ControlButton::Form(FormCmd::Skirmish)
+            ControlButton::Form(FormCmd::FireAtWill)
+                | ControlButton::Form(FormCmd::Skirmish)
+                | ControlButton::Form(FormCmd::Melee)
         )
     };
     let active_of = |btn: ControlButton| match btn {
@@ -1175,6 +1218,7 @@ fn refresh_control_buttons(
         ControlButton::Form(FormCmd::Hold) => all_hold,
         ControlButton::Form(FormCmd::FireAtWill) => any_archer && all_faw,
         ControlButton::Form(FormCmd::Skirmish) => any_archer && all_skirm,
+        ControlButton::Form(FormCmd::Melee) => any_archer && all_melee,
     };
 
     let mut hovered: Option<ControlButton> = None;

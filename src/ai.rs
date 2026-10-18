@@ -177,10 +177,11 @@ fn auto_engage(time: Res<Time>, mut groups: ResMut<Groups>, mut next: Local<f32>
         if gd.count == 0 || gd.state.is_broken() || gd.hold {
             continue;
         }
-        // Archers never CHARGE at ease — their fire-at-will already
-        // engages at bow range, and skirmish mode handles proximity.
-        // (Out of ammo they still defend themselves when reached.)
-        if gd.kind == crate::unit_types::KIND_ARCHER {
+        // Archers with their bows never CHARGE at ease: their
+        // fire-at-will already engages at bow range, and skirmish mode
+        // handles proximity. (Out of ammo they still defend themselves
+        // when reached.) With swords out they engage as infantry does.
+        if gd.kind == crate::unit_types::KIND_ARCHER && !gd.melee {
             continue;
         }
         // Stand down a finished AUTO attack (target broken or wiped).

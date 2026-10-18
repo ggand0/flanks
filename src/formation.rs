@@ -538,10 +538,13 @@ pub enum FormCmd {
     FireAtWill,
     /// Skirmish mode on/off (archer regiments in the selection only).
     Skirmish,
+    /// Swords out on/off (archer regiments in the selection only). The F
+    /// key is `Wall`, which does this to the archers it finds.
+    Melee,
 }
 
-/// Formation hotkeys for the selection: F wall, L loose, B hold
-/// position, T fire-at-will, K skirmish.
+/// Formation hotkeys for the selection: F wall (swords out for archers),
+/// L loose, B hold position, T fire-at-will, K skirmish.
 fn formation_keys(
     keys: Res<ButtonInput<KeyCode>>,
     selection: Res<crate::orders::Selection>,
@@ -574,10 +577,25 @@ pub fn apply_formation_cmd(
         return;
     }
 
+    // The F key is one key for the whole selection: the wall on the
+    // swordsmen and spearmen, the swords on the archers, who form no wall.
+    if cmd == FormCmd::Wall
+        && picked.iter().any(|&g| groups.list[g].kind == crate::unit_types::KIND_ARCHER)
+    {
+        apply_formation_cmd(FormCmd::Melee, selection, groups);
+    }
     match cmd {
         FormCmd::Wall | FormCmd::Loose => {
             let wall = cmd == FormCmd::Wall;
             let want = if wall { FormSpacing::Wall } else { FormSpacing::Loose };
+            let picked: Vec<usize> = picked
+                .iter()
+                .copied()
+                .filter(|&g| !(wall && groups.list[g].kind == crate::unit_types::KIND_ARCHER))
+                .collect();
+            if picked.is_empty() {
+                return;
+            }
             // Toggle as a set: if anyone is not yet in the mode, everyone
             // enters it; if all are, everyone falls back to close order.
             let on = picked.iter().any(|&g| groups.list[g].spacing != want);
@@ -621,7 +639,7 @@ pub fn apply_formation_cmd(
             );
         }
 
-        FormCmd::FireAtWill | FormCmd::Skirmish => {
+        FormCmd::FireAtWill | FormCmd::Skirmish | FormCmd::Melee => {
             // Archer toggles; melee regiments in the selection ignore them.
             let archers: Vec<usize> = picked
                 .into_iter()
@@ -630,28 +648,45 @@ pub fn apply_formation_cmd(
             if archers.is_empty() {
                 return;
             }
-            let faw = cmd == FormCmd::FireAtWill;
             let on = archers.iter().any(|&g| {
                 let gd = &groups.list[g];
-                if faw { !gd.fire_at_will } else { !gd.skirmish }
+                match cmd {
+                    FormCmd::FireAtWill => !gd.fire_at_will,
+                    FormCmd::Skirmish => !gd.skirmish,
+                    _ => !gd.melee,
+                }
             });
             for &g in &archers {
                 let gd = &mut groups.list[g];
-                if faw {
-                    gd.fire_at_will = on;
-                } else {
-                    gd.skirmish = on;
-                    // Switching skirmish off mid-run: the run ends where
-                    // the regiment stands and its own order comes back.
-                    if !on && gd.skirmishing {
-                        crate::sim::job::end_skirmish(gd);
+                match cmd {
+                    FormCmd::FireAtWill => gd.fire_at_will = on,
+                    FormCmd::Skirmish => {
+                        gd.skirmish = on;
+                        // Switching skirmish off mid-run: the run ends
+                        // where the regiment stands and its own order
+                        // comes back.
+                        if !on && gd.skirmishing {
+                            crate::sim::job::end_skirmish(gd);
+                        }
+                    }
+                    _ => {
+                        gd.melee = on;
+                        // Swords out end a run the same way; the bows go
+                        // down with the toggle (sim/job.rs).
+                        if on && gd.skirmishing {
+                            crate::sim::job::end_skirmish(gd);
+                        }
                     }
                 }
             }
             info!(
                 "{} archer regiments {} {}",
                 archers.len(),
-                if faw { "fire-at-will" } else { "skirmish" },
+                match cmd {
+                    FormCmd::FireAtWill => "fire-at-will",
+                    FormCmd::Skirmish => "skirmish",
+                    _ => "swords out",
+                },
                 if on { "ON" } else { "OFF" }
             );
         }

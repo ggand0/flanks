@@ -202,6 +202,11 @@ pub struct GroupData {
     /// Fire-at-will (M2TW default ON): with no explicit target order,
     /// the regiment's bows engage the nearest enemy block in range.
     pub fire_at_will: bool,
+    /// Swords out (archers; the F key, shared with the wall): the
+    /// regiment fights with its sidearm and shoots nothing, an attack
+    /// order is a charge like any infantry's, the skirmish run is off,
+    /// and it engages at ease as infantry does.
+    pub melee: bool,
     /// Skirmish mode (on by default for missile troops): the regiment
     /// runs from an enemy block on it or coming for it, a bow's range
     /// away, and shoots again (sim/job.rs `skirmish_reactions`).
@@ -285,6 +290,7 @@ impl GroupData {
             recent_deaths: 0,
             recent_kills: 0,
             fire_at_will: true,
+            melee: false,
             skirmish: kind == crate::unit_types::KIND_ARCHER,
             skirmishing: false,
             skirmish_to: None,
@@ -533,9 +539,10 @@ pub fn attack_regiments(groups: &mut Groups, selected: &[usize], target: u32) {
         }
         group.order = Some(Order::Attack(target));
         group.auto_order = false;
-        // An archer regiment turns and dresses only when it has to march
-        // (sim/job.rs): in range it shoots where it stands.
-        if group.kind == crate::unit_types::KIND_ARCHER {
+        // An archer regiment with its bows turns and dresses only when it
+        // has to march (sim/job.rs): in range it shoots where it stands.
+        // With swords out its order is a charge like any other.
+        if group.kind == crate::unit_types::KIND_ARCHER && !group.melee {
             continue;
         }
         let dir = target_c - group.centroid;

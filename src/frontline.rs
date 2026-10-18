@@ -714,7 +714,9 @@ fn update_groups(
             let t = t as usize;
             counts[t] > 0
                 && cents[t].distance(group.centroid) < CHARGE_RANGE
-                && !(group.kind == crate::unit_types::KIND_ARCHER && group.ammo_left > 0)
+                && !(group.kind == crate::unit_types::KIND_ARCHER
+                    && group.ammo_left > 0
+                    && !group.melee)
                 && running
         } else {
             false
