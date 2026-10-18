@@ -189,7 +189,7 @@ impl Plugin for ArrowsPlugin {
             .add_systems(
                 FixedUpdate,
                 (
-                    skirmish_and_ammo
+                    ammo_tally
                         .after(crate::sim::take_tick)
                         .before(crate::sim::step_sim),
                     update_arrows
@@ -607,30 +607,14 @@ fn log_tally(tick: u32, stats: &ArrowStats, in_flight: usize) {
     );
 }
 
-/// Skirmish trigger: EDGE gap (centroid distance minus both footprint
-/// radii) — centroid rings read absurdly late for 1000-man blocks
-/// whose fronts touch at 30+ m of centroid separation. No M2TW value
-/// exists (the manual only says "keep a safe distance, usually its
-/// missile range") — these are feel knobs sized so the back-step
-/// starts with real room to run.
-const SKIRMISH_TRIGGER: f32 = 22.0;
-/// The withdrawal runs until the edge gap reopens to this.
-const SKIRMISH_REOPEN: f32 = 40.0;
-
-/// Archer regiment upkeep, before the tick: the M2TW skirmish rule
-/// ("keep a safe distance between itself and the enemy", manual) as an
-/// auto Move order — real movement through the real order pipe, cleared
-/// when the gap reopens. Player-issued orders always win: skirmish only
-/// steers an idle regiment or its own withdrawal. Also tallies the
-/// regiment ammo pools for the HUD.
-fn skirmish_and_ammo(
+/// Archer regiment upkeep, before the tick: the regiment ammo pools for
+/// the HUD, summed over the archer regiments' own men. The skirmish run
+/// is a reaction of the tick's prep (sim/job.rs `skirmish_reactions`).
+fn ammo_tally(
     mut groups: ResMut<crate::orders::Groups>,
     units: Res<crate::units::Units>,
     runs: Res<crate::sim::RegimentRuns>,
-    terrain: Res<crate::terrain::Terrain>,
 ) {
-    // Regiment ammo pools (the unit-card ammo bar), summed over the
-    // archer regiments' own men.
     for (g, gd) in groups.list.iter_mut().enumerate() {
         if gd.kind != crate::unit_types::KIND_ARCHER {
             continue;
@@ -642,67 +626,6 @@ fn skirmish_and_ammo(
                     gd.ammo_left += units.ammo[i] as u32;
                 }
             }
-        }
-    }
-
-    let n = groups.list.len();
-    for g in 0..n {
-        let gd = &groups.list[g];
-        if gd.kind != crate::unit_types::KIND_ARCHER
-            || gd.count == 0
-            || gd.state.is_broken()
-            || !gd.skirmish
-            || gd.hold
-            || gd.engaged
-        {
-            continue;
-        }
-        // Player orders win; only idle regiments and our own withdrawal
-        // Move are steered.
-        if gd.order.is_some() && !gd.skirmishing {
-            continue;
-        }
-        // Nearest formed enemy block, by EDGE gap.
-        let mut nearest: Option<(f32, Vec2)> = None;
-        for eg in groups.list.iter() {
-            if eg.team == gd.team || eg.count == 0 || eg.state.is_broken() {
-                continue;
-            }
-            let gap = eg.centroid.distance(gd.centroid) - eg.radius - gd.radius;
-            if nearest.is_none_or(|(bd, _)| gap < bd) {
-                nearest = Some((gap, eg.centroid));
-            }
-        }
-        let centroid = gd.centroid;
-        let was_skirmishing = gd.skirmishing;
-        match nearest {
-            Some((gap, ec)) if gap < SKIRMISH_TRIGGER => {
-                // Back-step directly away, far enough to reopen the gap.
-                let away = (centroid - ec).normalize_or_zero();
-                let away = if away == Vec2::ZERO { Vec2::Y } else { away };
-                let mut dest = centroid + away * (SKIRMISH_REOPEN - gap + 5.0);
-                let (mn, mx) = (terrain.min() + 12.0, terrain.max() - 12.0);
-                dest = dest.clamp(mn, mx);
-                let gd = &mut groups.list[g];
-                gd.order = Some(crate::orders::Order::Move(dest));
-                gd.auto_order = true;
-                gd.skirmishing = true;
-            }
-            Some((gap, _)) if was_skirmishing && gap > SKIRMISH_REOPEN => {
-                // Gap reopened: stand, dress where we are, shoot.
-                let gd = &mut groups.list[g];
-                gd.skirmishing = false;
-                gd.order = None;
-                gd.anchor = gd.centroid;
-                gd.reform = true;
-            }
-            None if was_skirmishing => {
-                let gd = &mut groups.list[g];
-                gd.skirmishing = false;
-                gd.order = None;
-                gd.anchor = gd.centroid;
-            }
-            _ => {}
         }
     }
 }

@@ -264,6 +264,7 @@ pub(crate) fn prepare_tick(
     let terrain: &Terrain = terrain_arc;
 
     share_columns(job, units);
+    skirmish_reactions(groups, tracks, terrain, tick);
     let fire = archer_fire_solutions(groups, tracks, terrain, &job.clear_members);
     job.orders = resolve_orders(groups, routes);
     routes.fill_job(&mut job.plan_requests, &mut job.routes, &mut job.nav, groups.list.len());
@@ -379,12 +380,59 @@ fn in_bow_range(g: &GroupData, t: &GroupData, t_vel: Vec2, heights: (f32, f32)) 
     edge_gap(g, t) <= crate::unit_types::missile::RANGE + 3.0 * closing + (heights.0 - heights.1)
 }
 
+/// Where along the line from `origin` (`dir`, `len` metres) the block
+/// `b`'s centre is nearest, when the line passes within `b`'s reach of
+/// it there, plus `width`.
+fn line_hit(
+    groups: &Groups,
+    origin: Vec2,
+    dir: Vec2,
+    len: f32,
+    width: f32,
+    b: usize,
+) -> Option<f32> {
+    let bd = &groups.list[b];
+    let rel = bd.centroid - origin;
+    let s = rel.dot(dir).clamp(0.0, len);
+    let off = rel - dir * s;
+    let n = off.normalize_or_zero();
+    let reach = if n == Vec2::ZERO {
+        f32::MAX
+    } else {
+        crate::formation::block_reach_along(bd, -n) + width
+    };
+    (off.length() <= reach).then_some(s)
+}
+
+/// Where along `mover`'s path ahead (`dir`, `len` metres from its
+/// centre) the block `b`'s centre is nearest, when the path, swept by
+/// the mover's own width, comes within `b`'s reach of it there.
+fn path_hit(groups: &Groups, mover: usize, dir: Vec2, len: f32, b: usize) -> Option<f32> {
+    let md = &groups.list[mover];
+    let rel = groups.list[b].centroid - md.centroid;
+    let s = rel.dot(dir).clamp(0.0, len);
+    let n = (rel - dir * s).normalize_or_zero();
+    let width = crate::formation::block_reach_along(md, n);
+    line_hit(groups, md.centroid, dir, len, width, b)
+}
+
+/// The way a regiment is going: toward its order's goal when it has one
+/// further than a metre off, else along `vel` when that is a walk.
+fn heading_of(groups: &Groups, g: usize, vel: Vec2) -> Option<Vec2> {
+    let c = groups.list[g].centroid;
+    match groups.goal(g) {
+        Some(goal) if goal.distance_squared(c) > 1.0 => Some((goal - c).normalize()),
+        _ => (vel.length() >= 0.3).then(|| vel.normalize()),
+    }
+}
+
 /// Whether the enemy block `e`, going its way, reaches `g` within
-/// `horizon` seconds: its path ahead (toward its order's goal, else
-/// along its velocity) for min(its speed * horizon, `cap`, the distance)
-/// comes within both blocks' reach of `g`'s centre, and no friendly
-/// block of `g`'s that is not itself running stands on that path nearer
-/// to `e`: a friend in the way screens `g`.
+/// `horizon` seconds: its path ahead for min(its speed * horizon, `cap`,
+/// the distance), swept by its width, comes within `g`'s reach of `g`'s
+/// centre, and no friendly block of `g`'s that is not itself running
+/// screens `g` on the way: a friend screens when its block covers the
+/// path's centre line nearer to `e`, or both of the path's sides (one
+/// side only is passed by, as the attacker's men stream around it).
 pub(crate) fn approach_hits(
     groups: &Groups,
     g: usize,
@@ -399,31 +447,17 @@ pub(crate) fn approach_hits(
     if speed < 0.3 {
         return false;
     }
-    let dir = match groups.goal(e) {
-        Some(goal) if goal.distance_squared(ed.centroid) > 1.0 => {
-            (goal - ed.centroid).normalize()
-        }
-        _ => e_vel / speed,
-    };
-    let dist = gd.centroid.distance(ed.centroid);
-    let len = (speed * horizon).min(cap).min(dist);
-    // Where along the path a block's centre is nearest, if the path comes
-    // within both blocks' reach of it there.
-    let hits = |b: &GroupData| -> Option<f32> {
-        let rel = b.centroid - ed.centroid;
-        let s = rel.dot(dir).clamp(0.0, len);
-        let off = rel - dir * s;
-        let n = off.normalize_or_zero();
-        let reach = if n == Vec2::ZERO {
-            f32::MAX
-        } else {
-            crate::formation::block_reach_along(b, -n)
-                + crate::formation::block_reach_along(ed, n)
-        };
-        (off.length() <= reach).then_some(s)
-    };
-    let Some(s_g) = hits(gd) else {
+    let Some(dir) = heading_of(groups, e, e_vel) else {
         return false;
+    };
+    let len = (speed * horizon).min(cap).min(gd.centroid.distance(ed.centroid));
+    let Some(s_g) = path_hit(groups, e, dir, len, g) else {
+        return false;
+    };
+    let perp = Vec2::new(-dir.y, dir.x);
+    let side = perp * crate::formation::block_reach_along(ed, perp);
+    let before = |origin: Vec2, f: usize| {
+        line_hit(groups, origin, dir, len, 0.0, f).is_some_and(|s_f| s_f < s_g)
     };
     !groups.list.iter().enumerate().any(|(f, fd)| {
         f != g
@@ -431,8 +465,220 @@ pub(crate) fn approach_hits(
             && fd.count > 0
             && !fd.state.is_broken()
             && !fd.skirmishing
-            && hits(fd).is_some_and(|s_f| s_f < s_g)
+            && (before(ed.centroid, f)
+                || (before(ed.centroid + side, f) && before(ed.centroid - side, f)))
     })
+}
+
+/// An enemy block's edge this close to the regiment's: run (the first
+/// skirmish trigger).
+const SKIRMISH_NEAR: f32 = 15.0;
+/// Added to the approach horizon while the regiment already runs: the
+/// run's hysteresis (8 + 12 = 20 s).
+const SKIRMISH_RETREAT_S: f32 = 12.0;
+/// How far ahead the regiment's own path is tested for an enemy block
+/// it would walk into (the third trigger: stand and shoot instead).
+const SKIRMISH_WALK_AHEAD: f32 = 50.0;
+/// Enemy blocks further than this many ranges off are no trigger.
+const SKIRMISH_SCOPE: f32 = 1.5;
+/// Headings tried for the retreat point.
+const RETREAT_HEADINGS: u32 = 32;
+/// Ticks between two recomputations of a running regiment's point.
+const RETREAT_REFRESH: u32 = 15;
+
+/// Where a regiment runs to: a bow's range from where it stands, times
+/// (1 + the nearest enemy's speed over its own, at most 1), in the one of
+/// RETREAT_HEADINGS headings that lies most nearly away from every
+/// unbroken enemy block on the field (the least sum of squared angular
+/// differences to their bearings), kept inside the map. None when the
+/// map's edge leaves no room: the regiment stands and shoots instead.
+fn retreat_point(
+    groups: &Groups,
+    g: usize,
+    tracks: &crate::arrows::RegTracks,
+    terrain: &Terrain,
+) -> Option<Vec2> {
+    use std::f32::consts::{PI, TAU};
+    let gd = &groups.list[g];
+    let mut bearings: Vec<f32> = Vec::new();
+    let mut nearest: Option<(f32, usize)> = None;
+    for (e, ed) in groups.list.iter().enumerate() {
+        if ed.team == gd.team || ed.count == 0 || ed.state.is_broken() {
+            continue;
+        }
+        let d = gd.centroid - ed.centroid;
+        let d2 = d.length_squared();
+        if d2 < 1e-3 {
+            continue;
+        }
+        bearings.push(d.y.atan2(d.x));
+        if nearest.is_none_or(|(bd, _)| d2 < bd) {
+            nearest = Some((d2, e));
+        }
+    }
+    let (_, nearest) = nearest?;
+    let mut best = (f32::MAX, 0.0f32);
+    for k in 0..RETREAT_HEADINGS {
+        let h = k as f32 / RETREAT_HEADINGS as f32 * TAU;
+        let cost: f32 = bearings
+            .iter()
+            .map(|&b| {
+                let d = (h - b).rem_euclid(TAU);
+                let d = if d > PI { TAU - d } else { d };
+                d * d
+            })
+            .sum();
+        if cost < best.0 {
+            best = (cost, h);
+        }
+    }
+    let heading = Vec2::new(best.1.cos(), best.1.sin());
+    let their = tracks.vel.get(nearest).copied().unwrap_or(Vec2::ZERO).length();
+    let ours = crate::unit_types::TYPES[gd.kind as usize].speed;
+    let ratio = if their > 0.1 { (their / ours).min(1.0) } else { 0.0 };
+    let dist = crate::unit_types::missile::RANGE * (1.0 + ratio);
+    let (mn, mx) = (terrain.min() + 12.0, terrain.max() - 12.0);
+    let dest = (gd.centroid + heading * dist).clamp(mn, mx);
+    // A point the regiment has as good as reached (orders.rs arrival)
+    // is no run.
+    let arrive = crate::orders::ARRIVE_CLEAR;
+    (dest.distance_squared(gd.centroid) > arrive * arrive).then_some(dest)
+}
+
+/// The run ends where the regiment stands: its own order comes back, or
+/// it dresses where it stopped.
+pub(crate) fn end_skirmish(gd: &mut GroupData) {
+    gd.skirmishing = false;
+    gd.skirmish_to = None;
+    gd.skirmish_hold = false;
+    gd.order = gd.skirmish_saved.take();
+    if gd.order.is_none() {
+        gd.anchor = gd.centroid;
+        gd.reform = true;
+    }
+}
+
+/// The skirmish reaction: an archer regiment in skirmish mode runs from
+/// an enemy block whose edge is on it (SKIRMISH_NEAR) or that is coming
+/// for it (`approach_hits` within the approach horizon, longer while it
+/// already runs), to `retreat_point`, recomputed as it goes. The run is
+/// a Move order; the regiment's own order, and any order given during
+/// the run, waits in `skirmish_saved` and comes back when the trigger
+/// lapses. A regiment walking into an enemy block on its path within
+/// SKIRMISH_WALK_AHEAD stands and shoots instead (`skirmish_hold`).
+/// Enemy men already in reach of the regiment's own men, with no real
+/// melee begun (the melee clock), are the block's leading men on it: a
+/// run. Hold position, skirmish off and a regiment in a real melee: no
+/// run.
+fn skirmish_reactions(
+    groups: &mut Groups,
+    tracks: &crate::arrows::RegTracks,
+    terrain: &Terrain,
+    tick: u32,
+) {
+    use crate::unit_types::missile::RANGE;
+    let n = groups.list.len();
+    for g in 0..n {
+        let gd = &groups.list[g];
+        let able = gd.kind == crate::unit_types::KIND_ARCHER
+            && gd.count > 0
+            && !gd.state.is_broken()
+            && gd.skirmish
+            && !gd.hold
+            && gd.melee_ticks == 0;
+        if !able {
+            if gd.skirmishing || gd.skirmish_hold {
+                end_skirmish(&mut groups.list[g]);
+            }
+            continue;
+        }
+        // An order anyone else wrote during the run (the player, the AI,
+        // the run's own move arriving) is the one the run parks; the
+        // run's move is the auto Move order below.
+        let runs_move = gd.auto_order && matches!(gd.order, Some(crate::orders::Order::Move(_)));
+        if gd.skirmishing && !runs_move {
+            let new = gd.order;
+            if new.is_some() {
+                groups.list[g].skirmish_saved = new;
+            }
+        }
+        let gl: &Groups = &*groups;
+        let gd = &gl.list[g];
+        let vel = |t: usize| tracks.vel.get(t).copied().unwrap_or(Vec2::ZERO);
+        let horizon = if gd.skirmishing { APPROACH_S + SKIRMISH_RETREAT_S } else { APPROACH_S };
+        let standing = gd.order.is_none() || gd.standoff || gd.skirmish_hold;
+        let cap = if standing { 0.8 * RANGE } else { 1.1 * RANGE };
+        let own_dir = if gd.skirmishing { None } else { heading_of(gl, g, vel(g)) };
+        let mut run = gd.engaged;
+        let mut hold = false;
+        for e in 0..n {
+            if run {
+                break;
+            }
+            let ed = &gl.list[e];
+            if ed.team == gd.team || ed.count == 0 || ed.state.is_broken() {
+                continue;
+            }
+            let gap = edge_gap(gd, ed);
+            if gap > SKIRMISH_SCOPE * RANGE {
+                continue;
+            }
+            if gap <= SKIRMISH_NEAR || approach_hits(gl, g, e, vel(e), horizon, cap) {
+                run = true;
+                break;
+            }
+            if let Some(dir) = own_dir
+                && path_hit(gl, g, dir, SKIRMISH_WALK_AHEAD.min(RANGE - 3.0), e).is_some()
+            {
+                hold = true;
+            }
+        }
+        // A running or cornered regiment looks for its point every
+        // RETREAT_REFRESH ticks; one about to run looks now.
+        let due = if gd.skirmishing || gd.skirmish_hold {
+            tick.wrapping_add(g as u32).is_multiple_of(RETREAT_REFRESH)
+        } else {
+            true
+        };
+        let point = if run && due { retreat_point(gl, g, tracks, terrain) } else { None };
+        let gd = &mut groups.list[g];
+        if run {
+            if !due {
+                // On its way, or cornered and standing, until the next look.
+            } else if let Some(p) = point {
+                if !gd.skirmishing {
+                    gd.skirmish_saved = gd.order;
+                    gd.skirmishing = true;
+                    info!("regiment {g} runs (skirmish)");
+                }
+                gd.skirmish_hold = false;
+                gd.order = Some(crate::orders::Order::Move(p));
+                gd.auto_order = true;
+                gd.skirmish_to = Some(p);
+            } else {
+                // Cornered: no room to run. The regiment stands and shoots
+                // until room appears or the trigger lapses.
+                if gd.skirmishing {
+                    end_skirmish(gd);
+                }
+                if !gd.skirmish_hold {
+                    info!("regiment {g} is cornered, stands and shoots");
+                }
+                gd.skirmish_hold = true;
+            }
+        } else {
+            if gd.skirmishing {
+                end_skirmish(gd);
+                info!("regiment {g} ends its run (skirmish)");
+            } else if hold != gd.skirmish_hold {
+                info!(
+                    "regiment {g} {}",
+                    if hold { "stands and shoots at the block in its path" } else { "walks on" }
+                );
+            }
+            gd.skirmish_hold = hold;
+        }
+    }
 }
 
 /// An attack order for a ranged regiment is a fire order, not a melee
@@ -510,8 +756,10 @@ fn archer_fire_solutions(
     }
 
     // What each archer regiment's bows shoot at this tick, and the blocks
-    // its men search in. Regiments in melee or on the march don't volley
-    // (foot archers halt to shoot; fire at will pauses on the move).
+    // its men search in. Regiments in a real melee (the melee clock; a
+    // few enemy men in reach leave the rest of the bows up) or on the
+    // march don't volley (foot archers halt to shoot; fire at will pauses
+    // on the move).
     let gl: &Groups = &*groups;
     let mut search_blocks: Vec<Vec<u32>> = vec![Vec::new(); n_groups];
     let shoot_at: Vec<Option<ShootAt>> = (0..n_groups)
@@ -520,7 +768,7 @@ fn archer_fire_solutions(
             if gd.kind != crate::unit_types::KIND_ARCHER
                 || gd.count == 0
                 || gd.state.is_broken()
-                || gd.engaged
+                || gd.melee_ticks > 0
             {
                 return None;
             }
@@ -528,53 +776,58 @@ fn archer_fire_solutions(
                 let eg = &gl.list[e];
                 eg.team != gd.team && eg.count > 0 && !eg.state.is_broken()
             };
+            // With fire at will on, the enemy blocks about: one coming for
+            // the regiment within the approach horizon (`danger`), the
+            // nearest in range that is not in melee, and those in melee.
+            let mut danger: Option<(f32, usize)> = None;
+            let mut best_free: Option<(f32, usize)> = None;
+            let mut busy: Vec<(f32, usize)> = Vec::new();
+            if gd.fire_at_will {
+                for e in 0..n_groups {
+                    if !live(e) {
+                        continue;
+                    }
+                    let eg = &gl.list[e];
+                    let gap = edge_gap(gd, eg);
+                    if gap > RANGE * 1.5 {
+                        continue;
+                    }
+                    if danger.is_none_or(|(bg, _)| gap < bg)
+                        && approach_hits(gl, g, e, vel(e), APPROACH_S, RANGE * 0.8)
+                    {
+                        danger = Some((gap, e));
+                    }
+                    if !in_bow_range(gd, eg, vel(e), (heights[g], heights[e])) {
+                        continue;
+                    }
+                    if eg.engaged {
+                        busy.push((gap, e));
+                    } else if best_free.is_none_or(|(bg, _)| gap < bg) {
+                        best_free = Some((gap, e));
+                    }
+                }
+            }
             let (t, search) = match gd.order {
-                Some(crate::orders::Order::Move(_)) => return None,
-                Some(crate::orders::Order::Attack(t)) => {
-                    // The ordered target, once standing off. At a block
-                    // in melee the men shoot its clear members only.
+                // On the march the bows stay down; a regiment standing
+                // instead of walking into an enemy block shoots at will.
+                Some(crate::orders::Order::Move(_)) if !gd.skirmish_hold => return None,
+                // The ordered target, once standing off, unless a block is
+                // coming for the regiment: the men turn their bows on that
+                // one first, whatever the order. At a block in melee the
+                // men shoot its clear members only.
+                Some(crate::orders::Order::Attack(t)) if !gd.skirmish_hold && danger.is_none() => {
                     let t = t as usize;
                     if !gd.standoff || !live(t) {
                         return None;
                     }
                     (t, gl.list[t].engaged)
                 }
-                None => {
-                    if !gd.fire_at_will {
-                        return None;
-                    }
-                    // An enemy block coming for the regiment within the
-                    // approach horizon: every man turns his bow on it,
-                    // whatever else is in range. (With skirmish on, the
-                    // run takes the regiment away before this.) Else the
-                    // nearest block in range that is not in melee; else
-                    // the men search the blocks in melee, nearest first.
-                    let mut danger: Option<(f32, usize)> = None;
-                    let mut best_free: Option<(f32, usize)> = None;
-                    let mut busy: Vec<(f32, usize)> = Vec::new();
-                    for e in 0..n_groups {
-                        if !live(e) {
-                            continue;
-                        }
-                        let eg = &gl.list[e];
-                        let gap = edge_gap(gd, eg);
-                        if gap > RANGE * 1.5 {
-                            continue;
-                        }
-                        if danger.is_none_or(|(bg, _)| gap < bg)
-                            && approach_hits(gl, g, e, vel(e), APPROACH_S, RANGE * 0.8)
-                        {
-                            danger = Some((gap, e));
-                        }
-                        if !in_bow_range(gd, eg, vel(e), (heights[g], heights[e])) {
-                            continue;
-                        }
-                        if eg.engaged {
-                            busy.push((gap, e));
-                        } else if best_free.is_none_or(|(bg, _)| gap < bg) {
-                            best_free = Some((gap, e));
-                        }
-                    }
+                // Fire at will: the block coming for the regiment, every
+                // man on it (with skirmish on, the run takes the regiment
+                // away before this); else the nearest block in range that
+                // is not in melee; else the men search the blocks in
+                // melee, nearest first. Fire at will off: nothing.
+                _ => {
                     if let Some((_, e)) = danger {
                         (e, true)
                     } else if let Some((_, e)) = best_free {
@@ -674,8 +927,9 @@ fn resolve_orders(groups: &Groups, routes: &crate::sim::route::Routes) -> Vec<Op
             let gd = &groups.list[g];
             // Archer stand-off: in range of the ordered target — stand
             // and shoot (the order survives; the chase resumes if the
-            // target moves out of range).
-            if gd.standoff {
+            // target moves out of range). A regiment that would walk into
+            // an enemy block stands and shoots as well (`skirmish_hold`).
+            if gd.standoff || gd.skirmish_hold {
                 return None;
             }
             // Contact frame (frontline.rs): the regiment holds its slots

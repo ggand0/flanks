@@ -452,12 +452,20 @@ fn spawn_archery_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups)
         let g = list.len() - 1;
         list[g].hold = true;
     }
-    // Optional deep attacker, ordered onto the west archer regiment.
+    // Optional attacker from the west flank, ordered onto the west archer
+    // regiment with no friendly block in its way: the skirmish run, or
+    // with FL_ARCHERY_NOSKIRMISH=1 the men turning their bows on the
+    // block coming for them.
     if std::env::var("FL_ARCHERY_ATTACK").is_ok() {
-        spawn_regiment(units, terrain, &mut list, 1, KIND_LIGHT, Vec2::new(-30.0, 110.0), size, 1.0);
+        spawn_regiment(units, terrain, &mut list, 1, KIND_LIGHT, Vec2::new(-130.0, -30.0), size, 1.0);
         let g = list.len() - 1;
         list[g].order = Some(crate::orders::Order::Attack(1));
         list[g].auto_order = true;
+    }
+    if std::env::var("FL_ARCHERY_NOSKIRMISH").is_ok() {
+        for g in [1, 2] {
+            list[g].skirmish = false;
+        }
     }
     if melee {
         spawn_regiment(units, terrain, &mut list, 1, KIND_SPEAR, Vec2::new(75.0, -45.0), size, 1.0);
@@ -500,16 +508,18 @@ fn archery_log(
     }
     *next = t + 4.0;
     // E engaged, B broken, S skirmishing, O under an order, F firing (the
-    // card's mark), H standing off its attack target.
+    // card's mark), H standing off its attack target, h standing instead
+    // of walking into an enemy block.
     let flag = |gd: &crate::orders::GroupData| {
         format!(
-            "{}{}{}{}{}{}",
+            "{}{}{}{}{}{}{}",
             if gd.engaged { "E" } else { "-" },
             if gd.state.is_broken() { "B" } else { "-" },
             if gd.skirmishing { "S" } else { "-" },
             if gd.order.is_some() { "O" } else { "-" },
             if gd.firing { "F" } else { "-" },
             if gd.standoff { "H" } else { "-" },
+            if gd.skirmish_hold { "h" } else { "-" },
         )
     };
     // Men of an archer regiment drawing their bows this tick.

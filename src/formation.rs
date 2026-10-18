@@ -641,11 +641,10 @@ pub fn apply_formation_cmd(
                     gd.fire_at_will = on;
                 } else {
                     gd.skirmish = on;
-                    // Switching skirmish off mid-withdrawal: stand fast.
+                    // Switching skirmish off mid-run: the run ends where
+                    // the regiment stands and its own order comes back.
                     if !on && gd.skirmishing {
-                        gd.skirmishing = false;
-                        gd.order = None;
-                        gd.anchor = gd.centroid;
+                        crate::sim::job::end_skirmish(gd);
                     }
                 }
             }

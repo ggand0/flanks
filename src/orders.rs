@@ -23,7 +23,7 @@ use crate::units::Units;
 
 pub const PLAYER_TEAM: u8 = 0;
 /// Groups whose centroid gets this close to their order target go idle.
-const ARRIVE_CLEAR: f32 = 18.0;
+pub(crate) const ARRIVE_CLEAR: f32 = 18.0;
 /// Right-clicking within this range of an enemy regiment's centroid is an
 /// attack order on that regiment (else it's a move order to the point).
 pub const ATTACK_PICK_RADIUS: f32 = 20.0;
@@ -202,12 +202,22 @@ pub struct GroupData {
     /// Fire-at-will (M2TW default ON): with no explicit target order,
     /// the regiment's bows engage the nearest enemy block in range.
     pub fire_at_will: bool,
-    /// Skirmish mode (M2TW default ON for missile troops): back-step
-    /// when a formed enemy closes, reopen the gap, resume shooting.
+    /// Skirmish mode (on by default for missile troops): the regiment
+    /// runs from an enemy block on it or coming for it, a bow's range
+    /// away, and shoots again (sim/job.rs `skirmish_reactions`).
     pub skirmish: bool,
-    /// The current Move order is an auto skirmish withdrawal (ours to
-    /// clear when the gap reopens; distinct from player orders).
+    /// Running from an enemy (the skirmish reaction, sim/job.rs
+    /// `skirmish_reactions`): the regiment's Move order is the run's,
+    /// and its own order waits in `skirmish_saved`.
     pub skirmishing: bool,
+    /// The run's own Move order, so an order anyone else writes during
+    /// the run is noticed and parked.
+    pub skirmish_to: Option<Vec2>,
+    /// The order the run parked, handed back when the run ends.
+    pub skirmish_saved: Option<Order>,
+    /// The regiment stands and shoots instead of walking into an enemy
+    /// block on its path (the skirmish trigger's third case).
+    pub skirmish_hold: bool,
     /// Arrows left across the regiment (summed per tick, HUD ammo bar).
     pub ammo_left: u32,
     /// The regiment has a live fire solution this tick (archers:
@@ -277,6 +287,9 @@ impl GroupData {
             fire_at_will: true,
             skirmish: kind == crate::unit_types::KIND_ARCHER,
             skirmishing: false,
+            skirmish_to: None,
+            skirmish_saved: None,
+            skirmish_hold: false,
             ammo_left: if kind == crate::unit_types::KIND_ARCHER {
                 count as u32 * crate::unit_types::missile::AMMO as u32
             } else {
