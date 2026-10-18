@@ -5,7 +5,7 @@
 use bevy::prelude::*;
 use std::sync::Arc;
 
-use crate::orders::Groups;
+use crate::orders::{GroupData, Groups};
 use crate::sim::damage::DamageEvent;
 use crate::spatial::SpatialGrid;
 use crate::terrain::Terrain;
@@ -23,6 +23,10 @@ pub(crate) struct ShootAt {
     /// Target regiment (index into `Groups::list`): the per-shot
     /// aim picks one of its living soldiers.
     pub(crate) t: usize,
+    /// The men search for clear men themselves (sim/soldier.rs
+    /// `pick_quarry`), in the regiment's `search_blocks`: the target is
+    /// in melee, or coming for the regiment.
+    pub(crate) search: bool,
 }
 
 /// Everything one kinematic tick owns: the shared columns it reads, the
@@ -60,6 +64,7 @@ pub struct TickJob {
     pub(crate) sight_in: Arc<Vec<u16>>,
     pub(crate) chain_in: Arc<Vec<u8>>,
     pub(crate) way_in: Arc<Vec<Vec2>>,
+    pub(crate) quarry_in: Arc<Vec<u32>>,
     // Read only to pack the render snapshot.
     pub(crate) pos_prev_in: Arc<Vec<Vec3>>,
     pub(crate) color_in: Arc<Vec<[f32; 4]>>,
@@ -85,6 +90,7 @@ pub struct TickJob {
     pub(crate) sight: Vec<u16>,
     pub(crate) chain: Vec<u8>,
     pub(crate) way: Vec<Vec2>,
+    pub(crate) quarry: Vec<u32>,
     // Per-regiment command snapshot, taken at prep.
     pub(crate) orders: Vec<Option<Vec2>>,
     pub(crate) anchors: Vec<Vec2>,
@@ -118,6 +124,17 @@ pub struct TickJob {
     /// Living members of every regiment under fire, per regiment, in
     /// index order.
     pub(crate) target_members: Vec<Vec<u32>>,
+    /// Per regiment: some archer regiment's men search in it this tick
+    /// (`ShootAt::search`), so its men keep their clear marks.
+    pub(crate) searched: Vec<bool>,
+    /// Per archer regiment: the enemy blocks its men search in, nearest
+    /// first; empty when its bows have a plain target or none.
+    pub(crate) search_blocks: Vec<Vec<u32>>,
+    /// The clear men of every regiment under search, per regiment, in
+    /// index order: marked clear by their own look around and with no
+    /// enemy in their reach (sim/soldier.rs SIGHT_CLEAR, SIGHT_FOE), as
+    /// of the last tick. Prep reads the last run's lists for the card.
+    pub(crate) clear_members: Vec<Vec<u32>>,
     /// The density field of the tick's start positions (frontline.rs),
     /// built when a taker wants it (not on the inline path, where
     /// `update_field` already rebuilt the resource this tick).
@@ -177,6 +194,7 @@ impl TickJob {
         self.sight_in = Default::default();
         self.chain_in = Default::default();
         self.way_in = Default::default();
+        self.quarry_in = Default::default();
         self.pos_prev_in = Default::default();
         self.color_in = Default::default();
     }
@@ -209,12 +227,13 @@ pub(crate) fn regiment_runs(group: &[u32], n_groups: usize, out: &mut Vec<Vec<(u
 
 /// The archers' fire solutions of a tick.
 struct FireSolutions {
-    /// Archer regiments standing off their ordered target: in range,
-    /// halted, volleying.
-    standoff: Vec<bool>,
     shoot_at: Vec<Option<ShootAt>>,
     /// Per regiment: under fire this tick.
     targeted: Vec<bool>,
+    /// Per regiment: under search this tick.
+    searched: Vec<bool>,
+    /// Per archer regiment: the blocks its men search in.
+    search_blocks: Vec<Vec<u32>>,
     /// Friendly formed blocks per team as discs with a clearance ceiling,
     /// for the loft-over-friendlies check.
     blocks: [Vec<(Vec2, f32, f32)>; 2],
@@ -245,8 +264,8 @@ pub(crate) fn prepare_tick(
     let terrain: &Terrain = terrain_arc;
 
     share_columns(job, units);
-    let fire = archer_fire_solutions(groups, tracks, terrain);
-    job.orders = resolve_orders(groups, &fire.standoff, routes);
+    let fire = archer_fire_solutions(groups, tracks, terrain, &job.clear_members);
+    job.orders = resolve_orders(groups, routes);
     routes.fill_job(&mut job.plan_requests, &mut job.routes, &mut job.nav, groups.list.len());
     snapshot_regiments(job, groups, terrain);
 
@@ -266,6 +285,8 @@ pub(crate) fn prepare_tick(
     job.tick = tick;
     job.shoot_at = fire.shoot_at;
     job.targeted = fire.targeted;
+    job.searched = fire.searched;
+    job.search_blocks = fire.search_blocks;
     job.blocks = fire.blocks;
     job.field.size_to(terrain.min(), terrain.max());
 }
@@ -295,6 +316,7 @@ fn share_columns(job: &mut TickJob, units: &Units) {
     job.sight_in = units.sight.share();
     job.chain_in = units.chain.share();
     job.way_in = units.way.share();
+    job.quarry_in = units.quarry.share();
     job.pos_prev_in = units.pos_prev.share();
     job.color_in = units.color.share();
     let n = units.pos.len();
@@ -317,53 +339,184 @@ fn share_columns(job: &mut TickJob, units: &Units) {
     fit(&mut job.sight, n);
     fit(&mut job.chain, n);
     fit(&mut job.way, n);
+    fit(&mut job.quarry, n);
+}
+
+/// How far an archer regiment marches at a target it cannot reach: the
+/// edge gap it closes to before it stands and shoots, 0.8 of the range.
+/// It shoots on until the gap passes the range; the band between is the
+/// hysteresis that keeps a block from marching and halting by turns.
+const CLOSE_IN_GAP: f32 = crate::unit_types::missile::RANGE * 0.8;
+/// The time an enemy block takes to reach a regiment that counts as
+/// coming for it (seconds): the skirmish trigger and, with skirmish off,
+/// the moment the men turn their bows on it.
+pub(crate) const APPROACH_S: f32 = 8.0;
+/// Enemy blocks a regiment's search lists at most, nearest first.
+const SEARCH_BLOCKS: usize = 4;
+
+/// The gap between two regiments' block edges along the line between
+/// their centres (metres, negative when the blocks overlap). The edges
+/// are the blocks' rectangles (formation.rs `block_reach_along`), so a
+/// wide line is not credited with a reach it has only sideways.
+pub(crate) fn edge_gap(a: &GroupData, b: &GroupData) -> f32 {
+    let d = b.centroid - a.centroid;
+    let dist = d.length();
+    if dist < 1e-3 {
+        return -(a.radius + b.radius);
+    }
+    let u = d / dist;
+    dist - crate::formation::block_reach_along(a, u) - crate::formation::block_reach_along(b, -u)
+}
+
+/// Whether `g` can shoot at `t` from where it stands: the edge gap
+/// within the bow's range, plus three seconds of `t`'s speed toward `g`
+/// (the shafts land where the target will be), plus the height `g`
+/// stands above `t` (the high ground's reach). `heights` are the two
+/// centres' ground heights.
+fn in_bow_range(g: &GroupData, t: &GroupData, t_vel: Vec2, heights: (f32, f32)) -> bool {
+    let to_g = (g.centroid - t.centroid).normalize_or_zero();
+    let closing = t_vel.dot(to_g);
+    edge_gap(g, t) <= crate::unit_types::missile::RANGE + 3.0 * closing + (heights.0 - heights.1)
+}
+
+/// Whether the enemy block `e`, going its way, reaches `g` within
+/// `horizon` seconds: its path ahead (toward its order's goal, else
+/// along its velocity) for min(its speed * horizon, `cap`, the distance)
+/// comes within both blocks' reach of `g`'s centre, and no friendly
+/// block of `g`'s that is not itself running stands on that path nearer
+/// to `e`: a friend in the way screens `g`.
+pub(crate) fn approach_hits(
+    groups: &Groups,
+    g: usize,
+    e: usize,
+    e_vel: Vec2,
+    horizon: f32,
+    cap: f32,
+) -> bool {
+    let gd = &groups.list[g];
+    let ed = &groups.list[e];
+    let speed = e_vel.length();
+    if speed < 0.3 {
+        return false;
+    }
+    let dir = match groups.goal(e) {
+        Some(goal) if goal.distance_squared(ed.centroid) > 1.0 => {
+            (goal - ed.centroid).normalize()
+        }
+        _ => e_vel / speed,
+    };
+    let dist = gd.centroid.distance(ed.centroid);
+    let len = (speed * horizon).min(cap).min(dist);
+    // Where along the path a block's centre is nearest, if the path comes
+    // within both blocks' reach of it there.
+    let hits = |b: &GroupData| -> Option<f32> {
+        let rel = b.centroid - ed.centroid;
+        let s = rel.dot(dir).clamp(0.0, len);
+        let off = rel - dir * s;
+        let n = off.normalize_or_zero();
+        let reach = if n == Vec2::ZERO {
+            f32::MAX
+        } else {
+            crate::formation::block_reach_along(b, -n)
+                + crate::formation::block_reach_along(ed, n)
+        };
+        (off.length() <= reach).then_some(s)
+    };
+    let Some(s_g) = hits(gd) else {
+        return false;
+    };
+    !groups.list.iter().enumerate().any(|(f, fd)| {
+        f != g
+            && fd.team == gd.team
+            && fd.count > 0
+            && !fd.state.is_broken()
+            && !fd.skirmishing
+            && hits(fd).is_some_and(|s_f| s_f < s_g)
+    })
 }
 
 /// An attack order for a ranged regiment is a fire order, not a melee
-/// charge: the regiment halts once the target is inside range and
-/// volleys from where it stands; the march resumes if the target slips
-/// back out of range. Makes the two regiment writes prep always made:
-/// the stand-off anchor snap and the `firing` flag.
+/// charge: in range of its target the regiment stands and shoots where
+/// it is, turning nothing; out of range it marches, facing the way it
+/// goes, until the edge gap is CLOSE_IN_GAP, then stands; it marches
+/// again only when the gap passes the range. Fire at will takes the
+/// nearest enemy block in range that is not in melee; when every block
+/// in range is in melee, or one is coming for the regiment, its men
+/// search for clear men themselves (`ShootAt::search`, sim/soldier.rs).
+/// Makes the regiment writes prep makes: the stand-off state with its
+/// anchor snap and march facing, and the `firing` flag.
 fn archer_fire_solutions(
     groups: &mut Groups,
     tracks: &crate::arrows::RegTracks,
     terrain: &Terrain,
+    clear_members: &[Vec<u32>],
 ) -> FireSolutions {
-    // An attack order for a
-    // ranged regiment is a FIRE order, not a melee charge: the regiment
-    // halts once the target is inside range (the stand-off below feeds
-    // the order resolution) and volleys from where it stands; the march
-    // resumes if the target slips back out of range.
+    use crate::unit_types::missile::RANGE;
     let n_groups = groups.list.len();
-    let standoff: Vec<bool> = groups
+    let heights: Vec<f32> = groups
         .list
         .iter()
-        .map(|gd| {
-            gd.kind == crate::unit_types::KIND_ARCHER
-                && gd.count > 0
-                && !gd.state.is_broken()
-                && matches!(gd.order, Some(crate::orders::Order::Attack(t))
-                    if groups.list[t as usize].count > 0
-                        && groups.list[t as usize].centroid.distance(gd.centroid)
-                            < crate::unit_types::missile::RANGE * 0.85)
-        })
+        .map(|g| terrain.height_at(g.centroid.x, g.centroid.y))
         .collect();
-    for (g, &so) in standoff.iter().enumerate() {
-        // Entering the stand-off freezes the frame here (the same anchor
-        // snap engagement does): holding units dress where they stopped
-        // instead of walking back to a stale anchor.
-        if so && groups.list[g].anchor.distance(groups.list[g].centroid) > 2.0 {
-            let c = groups.list[g].centroid;
-            groups.list[g].anchor = c;
+    let vel = |t: usize| tracks.vel.get(t).copied().unwrap_or(Vec2::ZERO);
+
+    // The stand-off of every archer regiment under an attack order.
+    for g in 0..n_groups {
+        let gd = &groups.list[g];
+        let archer =
+            gd.kind == crate::unit_types::KIND_ARCHER && gd.count > 0 && !gd.state.is_broken();
+        let target = match gd.order {
+            Some(crate::orders::Order::Attack(t)) if archer => t,
+            _ => {
+                let gd = &mut groups.list[g];
+                gd.standoff = false;
+                gd.standoff_target = None;
+                continue;
+            }
+        };
+        let td = &groups.list[target as usize];
+        if td.count == 0 {
+            continue;
+        }
+        let in_range =
+            in_bow_range(gd, td, vel(target as usize), (heights[g], heights[target as usize]));
+        let gap = edge_gap(gd, td);
+        let fresh = gd.standoff_target != Some(target);
+        let was = gd.standoff && !fresh;
+        // A fresh order shoots where it stands when it can; a standing
+        // regiment stands until its target is out of range; a marching
+        // one halts at the close-in gap.
+        let now = if fresh || was { in_range } else { gap <= CLOSE_IN_GAP };
+        let to_target = td.centroid - gd.centroid;
+        let gd = &mut groups.list[g];
+        gd.standoff_target = Some(target);
+        gd.standoff = now;
+        if now && !was && gd.anchor.distance(gd.centroid) > 2.0 {
+            // Entering the stand-off freezes the frame here (the same
+            // anchor snap engagement does): holding units dress where
+            // they stopped instead of walking back to a stale anchor.
+            gd.anchor = gd.centroid;
+        }
+        if !now
+            && (fresh || was)
+            && gd.shape == crate::formation::FormShape::Rect
+            && to_target.length() > 1.0
+        {
+            // The march begins: face the way we go and dress for it. In
+            // range the order turns nothing.
+            gd.facing = crate::formation::facing_of(to_target);
+            gd.reform = true;
         }
     }
-    // What each archer regiment's bows shoot at this tick: the ordered
-    // target once standing off, else fire-at-will's nearest live enemy
-    // regiment in range. Regiments in melee or on the march don't volley
-    // (M2TW: foot archers halt to shoot; fire-at-will pauses on the move).
+
+    // What each archer regiment's bows shoot at this tick, and the blocks
+    // its men search in. Regiments in melee or on the march don't volley
+    // (foot archers halt to shoot; fire at will pauses on the move).
+    let gl: &Groups = &*groups;
+    let mut search_blocks: Vec<Vec<u32>> = vec![Vec::new(); n_groups];
     let shoot_at: Vec<Option<ShootAt>> = (0..n_groups)
         .map(|g| {
-            let gd = &groups.list[g];
+            let gd = &gl.list[g];
             if gd.kind != crate::unit_types::KIND_ARCHER
                 || gd.count == 0
                 || gd.state.is_broken()
@@ -371,72 +524,110 @@ fn archer_fire_solutions(
             {
                 return None;
             }
-            let t = match gd.order {
+            let live = |e: usize| {
+                let eg = &gl.list[e];
+                eg.team != gd.team && eg.count > 0 && !eg.state.is_broken()
+            };
+            let (t, search) = match gd.order {
                 Some(crate::orders::Order::Move(_)) => return None,
                 Some(crate::orders::Order::Attack(t)) => {
-                    // An explicit target overrides fire-at-will: no
-                    // shots until the march brings it into range.
-                    if !standoff[g] || groups.list[t as usize].count == 0 {
+                    // The ordered target, once standing off. At a block
+                    // in melee the men shoot its clear members only.
+                    let t = t as usize;
+                    if !gd.standoff || !live(t) {
                         return None;
                     }
-                    t as usize
+                    (t, gl.list[t].engaged)
                 }
                 None => {
-                    // Fire-at-will: nearest live, unbroken enemy block
-                    // that is NOT locked in melee. In M2TW fire-at-will
-                    // holds instead of volleying into a fight with
-                    // friends standing in it; an explicit target order
-                    // (the Attack arm above) still forces the shot.
-                    // The flight stays honest either way: no team check
-                    // on what the shaft actually crosses.
                     if !gd.fire_at_will {
                         return None;
                     }
-                    let mut best: Option<(f32, usize)> = None;
-                    for (e, eg) in groups.list.iter().enumerate() {
-                        if eg.team == gd.team
-                            || eg.count == 0
-                            || eg.state.is_broken()
-                            || eg.engaged
-                        {
+                    // An enemy block coming for the regiment within the
+                    // approach horizon: every man turns his bow on it,
+                    // whatever else is in range. (With skirmish on, the
+                    // run takes the regiment away before this.) Else the
+                    // nearest block in range that is not in melee; else
+                    // the men search the blocks in melee, nearest first.
+                    let mut danger: Option<(f32, usize)> = None;
+                    let mut best_free: Option<(f32, usize)> = None;
+                    let mut busy: Vec<(f32, usize)> = Vec::new();
+                    for e in 0..n_groups {
+                        if !live(e) {
                             continue;
                         }
-                        let d2 = eg.centroid.distance_squared(gd.centroid);
-                        if best.is_none_or(|(bd, _)| d2 < bd) {
-                            best = Some((d2, e));
+                        let eg = &gl.list[e];
+                        let gap = edge_gap(gd, eg);
+                        if gap > RANGE * 1.5 {
+                            continue;
+                        }
+                        if danger.is_none_or(|(bg, _)| gap < bg)
+                            && approach_hits(gl, g, e, vel(e), APPROACH_S, RANGE * 0.8)
+                        {
+                            danger = Some((gap, e));
+                        }
+                        if !in_bow_range(gd, eg, vel(e), (heights[g], heights[e])) {
+                            continue;
+                        }
+                        if eg.engaged {
+                            busy.push((gap, e));
+                        } else if best_free.is_none_or(|(bg, _)| gap < bg) {
+                            best_free = Some((gap, e));
                         }
                     }
-                    let (d2, e) = best?;
-                    let range = crate::unit_types::missile::RANGE;
-                    if d2 > range * range {
-                        return None;
+                    if let Some((_, e)) = danger {
+                        (e, true)
+                    } else if let Some((_, e)) = best_free {
+                        (e, false)
+                    } else {
+                        busy.sort_by(|a, b| a.0.total_cmp(&b.0));
+                        let (_, e) = *busy.first()?;
+                        search_blocks[g] =
+                            busy.iter().take(SEARCH_BLOCKS).map(|&(_, e)| e as u32).collect();
+                        (e, true)
                     }
-                    e
                 }
             };
-            let tg = &groups.list[t];
+            if search && search_blocks[g].is_empty() {
+                search_blocks[g].push(t as u32);
+            }
+            let tg = &gl.list[t];
             Some(ShootAt {
                 c: tg.centroid,
-                vel: tracks.vel.get(t).copied().unwrap_or(Vec2::ZERO),
+                vel: vel(t),
                 r: tg.radius.clamp(3.0, 25.0),
                 t,
+                search,
             })
         })
         .collect();
-    // The card's firing indicator: a fire solution exists and there are
-    // arrows to spend on it.
+    // The card's firing mark: a fire solution, arrows to spend on it and,
+    // in a search, clear men to shoot (the lists of the last tick run).
     for (g, s) in shoot_at.iter().enumerate() {
-        groups.list[g].firing = s.is_some() && groups.list[g].ammo_left > 0;
+        let has_men = s.as_ref().is_some_and(|s| {
+            !s.search
+                || search_blocks[g]
+                    .iter()
+                    .any(|&b| clear_members.get(b as usize).is_some_and(|m| !m.is_empty()))
+        });
+        groups.list[g].firing = has_men && groups.list[g].ammo_left > 0;
     }
-    // Regiments under fire this tick. The job lists their living members
-    // (`target_members`, built on the worker from its shared columns):
-    // each shot aims at an actual soldier (M2TW's per-soldier aim
-    // targets), not at a spot on the block's footprint. Into a locked
-    // melee the shafts head for enemy bodies; friends die only to
-    // genuine misses and interceptions.
+    // Regiments under fire this tick, and those under search. The job
+    // lists their living members (`target_members`, built on the worker
+    // from its shared columns) and the searched ones' clear members
+    // (`clear_members`): each shot aims at an actual soldier, not at a
+    // spot on the block's footprint.
     let mut targeted = vec![false; n_groups];
-    for s in shoot_at.iter().flatten() {
+    let mut searched = vec![false; n_groups];
+    for (g, s) in shoot_at.iter().enumerate() {
+        let Some(s) = s else { continue };
         targeted[s.t] = true;
+        if s.search {
+            for &b in &search_blocks[g] {
+                targeted[b as usize] = true;
+                searched[b as usize] = true;
+            }
+        }
     }
     // Friendly blocks per team for the loft-over-friendlies check: every
     // live formed regiment as a disc with a clearance ceiling. A
@@ -460,9 +651,10 @@ fn archer_fire_solutions(
     });
 
     FireSolutions {
-        standoff,
         shoot_at,
         targeted,
+        searched,
+        search_blocks,
         blocks,
     }
 }
@@ -470,11 +662,7 @@ fn archer_fire_solutions(
 /// Each regiment's order resolved to this tick's destination, or none
 /// for a regiment that holds where it is. A regiment on a route heads
 /// for its current waypoint (sim/route.rs).
-fn resolve_orders(
-    groups: &Groups,
-    standoff: &[bool],
-    routes: &crate::sim::route::Routes,
-) -> Vec<Option<Vec2>> {
+fn resolve_orders(groups: &Groups, routes: &crate::sim::route::Routes) -> Vec<Option<Vec2>> {
     // Orders resolved to this tick's destination (attack orders chase
     // their target regiment's current centroid). A regiment holding a
     // contact frame stops chasing: dragging the slot grid onward
@@ -487,7 +675,7 @@ fn resolve_orders(
             // Archer stand-off: in range of the ordered target — stand
             // and shoot (the order survives; the chase resumes if the
             // target moves out of range).
-            if standoff[g] {
+            if gd.standoff {
                 return None;
             }
             // Contact frame (frontline.rs): the regiment holds its slots

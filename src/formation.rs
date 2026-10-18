@@ -224,6 +224,25 @@ pub fn block_half_extents(gd: &GroupData, files: u32, facing: f32) -> Vec2 {
     )
 }
 
+/// How far a regiment's block edge stands from its centre toward the
+/// unit direction `dir` (the rectangle's support in that direction):
+/// the gap between two blocks is their centre distance less both of
+/// these along the line between them (sim/job.rs `edge_gap`). A blob,
+/// or a block not yet given its files, answers its footprint radius.
+pub fn block_reach_along(gd: &GroupData, dir: Vec2) -> f32 {
+    if gd.shape == FormShape::Blob || gd.files == 0 {
+        return if gd.radius > 0.0 { gd.radius } else { blob_radius(gd.count) };
+    }
+    let files = (gd.files as usize).min(gd.count.max(1));
+    let ranks = gd.count.max(1).div_ceil(files);
+    let pitch = gd.spacing.pitch(gd.kind);
+    let half_w = (files - 1) as f32 * 0.5 * pitch.x + 1.0;
+    let half_d = (ranks - 1) as f32 * 0.5 * pitch.y + 1.0;
+    let fwd = facing_dir(gd.facing);
+    let right = Vec2::new(fwd.y, -fwd.x);
+    dir.dot(right).abs() * half_w + dir.dot(fwd).abs() * half_d
+}
+
 /// Deployment placement: rebake slots, then TELEPORT every man onto his
 /// mark (pos, prev, yaw, zero velocity) — TW deployment moves are
 /// instant, and the sim is frozen so nobody could march there anyway.

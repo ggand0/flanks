@@ -39,7 +39,7 @@ fn wound_share() -> f32 {
     *W.get_or_init(|| crate::util::env_or("FL_WOUND", missile::WOUND_SHARE).clamp(0.0, 1.0))
 }
 /// Collision tests only run below the tallest body plus this.
-const STRIKE_MARGIN: f32 = 0.3;
+pub(crate) const STRIKE_MARGIN: f32 = 0.3;
 /// How far over his own head an archer's arrow leaves the bow
 /// (sim/soldier.rs). Above the body-hit band's top margin below, or a
 /// shaft is inside its own shooter at flight-time zero and kills him.

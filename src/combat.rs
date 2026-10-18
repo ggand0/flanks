@@ -124,6 +124,7 @@ pub fn process_deaths(
             units.color.swap_remove(i);
             units.hp.swap_remove(i);
             units.target.swap_remove(i);
+            units.quarry.swap_remove(i);
             units.swing.swap_remove(i);
             units.swing_t.swap_remove(i);
             units.flash.swap_remove(i);

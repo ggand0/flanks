@@ -35,7 +35,13 @@ pub mod missile {
     /// Plain-archer tier with a bit of punch: plain archers first.
     pub const ATTACK: f32 = 6.0;
     /// Meters, the vanilla `arrow` range (bodkin/composite reach 160).
+    /// The regiment's range test is the gap between the two blocks'
+    /// edges (sim/job.rs `in_bow_range`).
     pub const RANGE: f32 = 120.0;
+    /// How far a man shoots at a man: the range stretched by a fifth,
+    /// since the regiment is in range by its front edge and the rear
+    /// ranks stand that much further back.
+    pub const REACH: f32 = RANGE * 1.2;
     /// Arrows per man — 30 for every vanilla foot archer.
     pub const AMMO: u8 = 30;
     /// Draw time before the loose (ticks at 30 Hz): 1.5 s.
@@ -55,6 +61,11 @@ pub mod missile {
     /// Landing scatter sigma in meters, RANGE-INDEPENDENT (the measured
     /// M2TW quirk: accuracy does not improve up close).
     pub const SCATTER_SIGMA: f32 = 3.0;
+    /// The aim's spread: a shaft lands within this of its aim point in
+    /// each axis (two draws summed, sim/soldier.rs). With the shaft's
+    /// fall through the strike band it gives the distance a target man
+    /// must keep from the shooter's friends to be clear (`SIGHT_CLEAR`).
+    pub const AIM_SPREAD: f32 = SCATTER_SIGMA * 1.75;
     /// Missile damage curve, CALIBRATED against archery-range logs.
     /// Arrows use a steeper factor multiplier than melee:
     /// armour and shields blunt a falling shaft far harder than they

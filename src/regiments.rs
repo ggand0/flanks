@@ -437,10 +437,16 @@ fn spawn_archery_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups)
         Ok("archer") => KIND_ARCHER,
         _ => KIND_LIGHT,
     };
+    // FL_ARCHERY_MELEE=1: archers behind a line in melee. The static blocks
+    // stand beyond bow range and an orange spear block attacks the end
+    // of the screen, so the one enemy in the archers' range is in melee
+    // and its open flank and rear are what the men must find.
+    let melee = std::env::var("FL_ARCHERY_MELEE").is_ok();
+    let far = if melee { 70.0 } else { 0.0 };
     for (x, z, kind) in [
-        (-60.0, 40.0, KIND_LIGHT),
-        (0.0, 20.0, mid_kind),
-        (60.0, 40.0, KIND_LIGHT),
+        (-60.0, 40.0 + far, KIND_LIGHT),
+        (0.0, 20.0 + far, mid_kind),
+        (60.0, 40.0 + far, KIND_LIGHT),
     ] {
         spawn_regiment(units, terrain, &mut list, 1, kind, Vec2::new(x, z), size, 1.0);
         let g = list.len() - 1;
@@ -452,6 +458,20 @@ fn spawn_archery_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups)
         let g = list.len() - 1;
         list[g].order = Some(crate::orders::Order::Attack(1));
         list[g].auto_order = true;
+    }
+    if melee {
+        spawn_regiment(units, terrain, &mut list, 1, KIND_SPEAR, Vec2::new(75.0, -45.0), size, 1.0);
+        let g = list.len() - 1;
+        list[g].order = Some(crate::orders::Order::Attack(0));
+        list[g].auto_order = true;
+    }
+    // FL_ARCHERY_ORDER=1: both archer regiments ordered at the east
+    // flank block, in range by the edge gap: the stand-off must hold at
+    // once, no march, no re-dressing.
+    if std::env::var("FL_ARCHERY_ORDER").is_ok() {
+        for g in [1, 2] {
+            list[g].order = Some(crate::orders::Order::Attack(5));
+        }
     }
     groups.list = list;
     info!(
@@ -465,6 +485,7 @@ fn spawn_archery_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups)
 /// live arrow pool, and orange's bleed.
 fn archery_log(
     groups: Res<Groups>,
+    units: Res<Units>,
     arrows: Res<crate::arrows::Arrows>,
     astats: Res<crate::arrows::ArrowStats>,
     time: Res<Time>,
@@ -478,15 +499,39 @@ fn archery_log(
         return;
     }
     *next = t + 4.0;
+    // E engaged, B broken, S skirmishing, O under an order, F firing (the
+    // card's mark), H standing off its attack target.
     let flag = |gd: &crate::orders::GroupData| {
         format!(
-            "{}{}{}{}",
+            "{}{}{}{}{}{}",
             if gd.engaged { "E" } else { "-" },
             if gd.state.is_broken() { "B" } else { "-" },
             if gd.skirmishing { "S" } else { "-" },
             if gd.order.is_some() { "O" } else { "-" },
+            if gd.firing { "F" } else { "-" },
+            if gd.standoff { "H" } else { "-" },
         )
     };
+    // Men of an archer regiment drawing their bows this tick.
+    let drawing = |g: u32| {
+        units
+            .group
+            .iter()
+            .zip(units.swing.iter())
+            .filter(|&(&gg, &sw)| {
+                gg == g
+                    && sw & crate::units::SWING_STATE_MASK == crate::units::SWING_WINDUP
+                    && sw & crate::units::SWING_RANGED != 0
+            })
+            .count()
+    };
+    let drawn = format!(
+        " | drawing {}/{} | struck blue {} orange {}",
+        drawing(1),
+        drawing(2),
+        astats.struck[0].iter().sum::<u32>(),
+        astats.struck[1].iter().sum::<u32>(),
+    );
     let attacker = groups
         .list
         .get(6)
@@ -501,7 +546,7 @@ fn archery_log(
         .unwrap_or_default();
     info!(
         "[archery] t={t:.0}s archers {} ({}, ammo {}) / {} ({}, ammo {}) | flight {} \
-         (dropped {}) | screen {} | holders {}/{}/{}{attacker}",
+         (dropped {}) | screen {} | holders {}/{}/{}{attacker}{drawn}",
         groups.list[1].count,
         flag(&groups.list[1]),
         groups.list[1].ammo_left,

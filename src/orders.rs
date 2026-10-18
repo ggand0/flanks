@@ -214,6 +214,14 @@ pub struct GroupData {
     /// target in range, not marching, not in melee, arrows left) —
     /// drives the unit card's firing indicator, M2TW-style.
     pub firing: bool,
+    /// An archer regiment under an attack order standing off its target:
+    /// in range, halted, volleying. Kept by sim/job.rs: entered where the
+    /// order found the target in range or where the march closed to 0.8
+    /// of the range, left when the target is out of range.
+    pub standoff: bool,
+    /// The attack target the stand-off was judged for; a new target is
+    /// judged afresh.
+    pub standoff_target: Option<u32>,
 }
 
 impl GroupData {
@@ -275,6 +283,8 @@ impl GroupData {
                 0
             },
             firing: false,
+            standoff: false,
+            standoff_target: None,
         }
     }
 }
@@ -510,6 +520,11 @@ pub fn attack_regiments(groups: &mut Groups, selected: &[usize], target: u32) {
         }
         group.order = Some(Order::Attack(target));
         group.auto_order = false;
+        // An archer regiment turns and dresses only when it has to march
+        // (sim/job.rs): in range it shoots where it stands.
+        if group.kind == crate::unit_types::KIND_ARCHER {
+            continue;
+        }
         let dir = target_c - group.centroid;
         if group.shape == FormShape::Rect && dir.length() > 1.0 {
             group.facing = facing_of(dir);

@@ -82,6 +82,11 @@ pub struct Units {
     /// (swings re-check at hit time; the closing drive checks team and
     /// distance). Do not read it as "current enemy" anywhere else.
     pub target: Column<u32>,
+    /// The enemy soldier an archer has aimed at (unit index; `u32::MAX`
+    /// = none): picked as his draw starts, shot at the loose, kept by
+    /// some men between shots (sim/soldier.rs `pick_quarry`). Reindexed
+    /// by the death sweep like `target`: validated on use.
+    pub quarry: Column<u32>,
     /// Swing state: 0 = Ready, 1 = WindUp, 2 = Recover.
     pub swing: Column<u8>,
     /// Ticks left in the current swing phase.
@@ -281,6 +286,7 @@ pub fn push_unit(
     };
     units.color.push([c.x, c.y, c.z, hash01(seed.wrapping_mul(11) + 7)]);
     units.target.push(u32::MAX);
+    units.quarry.push(u32::MAX);
     units.swing.push(SWING_RECOVER);
     // Stagger first swings across a full cooldown: contact must not
     // produce a synchronized metronome wave.

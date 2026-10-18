@@ -310,6 +310,7 @@ fn run_tick_job(job: &mut TickJob) {
         sight_in,
         chain_in,
         way_in,
+        quarry_in,
         pos_out,
         vel,
         yaw,
@@ -324,6 +325,7 @@ fn run_tick_job(job: &mut TickJob) {
         sight,
         chain,
         way,
+        quarry,
         orders,
         anchors,
         reg_broken,
@@ -347,6 +349,9 @@ fn run_tick_job(job: &mut TickJob) {
         blocks,
         reg_runs,
         target_members,
+        searched,
+        search_blocks,
+        clear_members,
         field,
         field_wanted,
         dead,
@@ -386,6 +391,23 @@ fn run_tick_job(job: &mut TickJob) {
             }
         }
     }
+    // And of every regiment under search, its clear men: marked clear
+    // by their own look around and with no enemy in their reach
+    // (soldier.rs SIGHT_CLEAR, SIGHT_FOE), as of the last tick.
+    clear_members.resize_with(n_groups, Vec::new);
+    for (g, members) in clear_members.iter_mut().enumerate() {
+        members.clear();
+        if searched[g] {
+            for &(s, e) in &reg_runs[g] {
+                members.extend((s..e).filter(|&i| {
+                    let i = i as usize;
+                    death_t_in[i] == 0
+                        && sight_in[i] & soldier::SIGHT_CLEAR != 0
+                        && sight_in[i] & soldier::SIGHT_FOE == 0
+                }));
+            }
+        }
+    }
 
     let t0 = Instant::now();
     {
@@ -421,6 +443,9 @@ fn run_tick_job(job: &mut TickJob) {
     let fat_nocharge = &fat_nocharge[..];
     let shoot_at = &shoot_at[..];
     let target_members = &target_members[..];
+    let clear_members = &clear_members[..];
+    let search_blocks = &search_blocks[..];
+    let searched = &searched[..];
     let blocks = &*blocks;
     let field = soldier::Field {
         grid,
@@ -451,6 +476,11 @@ fn run_tick_job(job: &mut TickJob) {
         fat_nocharge,
         shoot_at,
         target_members,
+        clear_members,
+        search_blocks,
+        searched,
+        sight_snap: &sight_in[..],
+        death_snap: death_t_in,
         blocks,
         faces_spearwall,
         dt,
@@ -474,6 +504,7 @@ fn run_tick_job(job: &mut TickJob) {
     let sight_in = &sight_in[..];
     let chain_in = &chain_in[..];
     let way_in = &way_in[..];
+    let quarry_in = &quarry_in[..];
     // The map edges a router leaves the field at (combat.rs), widened by
     // the charge knockback the apply pass can still add to a position:
     // the sweep's candidate list must hold every man it might remove.
@@ -498,10 +529,12 @@ fn run_tick_job(job: &mut TickJob) {
             .zip(sight.chunks_mut(CHUNK))
             .zip(way.chunks_mut(CHUNK))
             .zip(chain.chunks_mut(CHUNK))
+            .zip(quarry.chunks_mut(CHUNK))
             .enumerate()
         {
-            let (((((((((((((((pos, vel), yaw), yaw_prev), target), swing), swing_t), flash),
-                death_t), events), ammo), arrows), out_form), sight), way), chain) = chunk;
+            let ((((((((((((((((pos, vel), yaw), yaw_prev), target), swing), swing_t), flash),
+                death_t), events), ammo), arrows), out_form), sight), way), chain), quarry) =
+                chunk;
             let start = ci * CHUNK;
             let end = start + pos.len();
             scope.spawn(async move {
@@ -519,6 +552,7 @@ fn run_tick_job(job: &mut TickJob) {
                 sight.copy_from_slice(&sight_in[start..end]);
                 way.copy_from_slice(&way_in[start..end]);
                 chain.copy_from_slice(&chain_in[start..end]);
+                quarry.copy_from_slice(&quarry_in[start..end]);
                 let rows = soldier::Rows {
                     start,
                     pos: &mut *pos,
@@ -535,6 +569,7 @@ fn run_tick_job(job: &mut TickJob) {
                     sight,
                     way,
                     chain,
+                    quarry,
                 };
                 events.clear();
                 let mut out = soldier::ChunkOut { events, arrows };
@@ -651,7 +686,8 @@ pub fn step_sim(
         install!(
             vel <- vel, yaw <- yaw, yaw_prev <- yaw_prev, target <- target, swing <- swing,
             swing_t <- swing_t, flash <- flash, death_t <- death_t, ammo <- ammo,
-            out_form <- out_form, sight <- sight, way <- way, chain <- chain
+            out_form <- out_form, sight <- sight, way <- way, chain <- chain,
+            quarry <- quarry
         );
     }
     // The sweep's candidates (combat.rs), ascending.
