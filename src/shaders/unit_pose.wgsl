@@ -1593,12 +1593,12 @@ fn put_skeleton() {
     // Running at the enemy, his upper body holds the charge pose: on the
     // charge, and after it while he runs in, since his regiment's charge
     // ends when its first man strikes. A wavering or broken regiment's
-    // runner does not. Its hips and legs are the standing pose's, so his
-    // own keep the gait.
+    // runner does not, nor an archer with his bow out. Its hips and legs
+    // are the standing pose's, so his own keep the gait.
     let hold = select(
         0.0,
         pre.confident * pre.g.run * moving * (1.0 - pre.celebrate),
-        alive && skel_has(CLIP_CHARGE),
+        alive && skel_has(CLIP_CHARGE) && (!pre.bow_rig || pre.knife),
     );
     if hold > 0.0 {
         skel_over(&turn, SkelAt(CLIP_CHARGE, 0u, 0.0), hold, 0.0);
