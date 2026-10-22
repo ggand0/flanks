@@ -29,6 +29,21 @@ pub(crate) struct ShootAt {
     pub(crate) search: bool,
 }
 
+/// Why an archer regiment's men take their knives out this tick
+/// (sim/soldier.rs SIGHT_KNIFE). Empty for every other regiment.
+#[derive(Clone, Default)]
+pub(crate) struct Sidearm {
+    /// Its swords-out order: every man's knife is out.
+    pub(crate) swords: bool,
+    /// An enemy block is within its bow range: a man with an empty
+    /// quiver takes his knife out.
+    pub(crate) foe_in_range: bool,
+    /// The enemy blocks whose edges may come within a man's knife
+    /// distance of him (soldier.rs KNIFE_EDGE): each man measures his
+    /// own distance to them.
+    pub(crate) blocks: Vec<crate::formation::BlockRect>,
+}
+
 /// Everything one kinematic tick owns: the shared columns it reads, the
 /// per-regiment command snapshot, and the buffers it fills. Fully
 /// self-contained, so the tick can run on a worker thread while the main
@@ -130,6 +145,8 @@ pub struct TickJob {
     /// Per archer regiment: the enemy blocks its men search in, nearest
     /// first; empty when its bows have a plain target or none.
     pub(crate) search_blocks: Vec<Vec<u32>>,
+    /// Per regiment: why its men take their knives out (archers only).
+    pub(crate) sidearm: Vec<Sidearm>,
     /// The clear men of every regiment under search, per regiment, in
     /// index order: marked clear by their own look around and with no
     /// enemy in their reach (sim/soldier.rs SIGHT_CLEAR, SIGHT_FOE), as
@@ -289,6 +306,7 @@ pub(crate) fn prepare_tick(
     job.searched = fire.searched;
     job.search_blocks = fire.search_blocks;
     job.blocks = fire.blocks;
+    job.sidearm = sidearm_reasons(groups, tracks, terrain);
     job.field.size_to(terrain.min(), terrain.max());
 }
 
@@ -915,6 +933,45 @@ fn archer_fire_solutions(
         search_blocks,
         blocks,
     }
+}
+
+/// Why each archer regiment's men take their knives out this tick
+/// (`Sidearm`): its swords-out order, an enemy block in bow range for the
+/// men with empty quivers, and the unbroken enemy blocks within the knife
+/// distance of its own block. The gap between two blocks along the line
+/// between their centres is never more than the distance between any man
+/// of one and any point of the other, so no block left out is within the
+/// knife distance of a man inside his block. A man outside it is
+/// fighting, which his own reach covers, or dressing back into it.
+fn sidearm_reasons(
+    groups: &Groups,
+    tracks: &crate::arrows::RegTracks,
+    terrain: &Terrain,
+) -> Vec<Sidearm> {
+    let vel = |t: usize| tracks.vel.get(t).copied().unwrap_or(Vec2::ZERO);
+    let height = |g: &GroupData| terrain.height_at(g.centroid.x, g.centroid.y);
+    groups
+        .list
+        .iter()
+        .map(|gd| {
+            let mut arm = Sidearm::default();
+            if gd.kind != crate::unit_types::KIND_ARCHER || gd.count == 0 {
+                return arm;
+            }
+            arm.swords = gd.melee;
+            for (e, eg) in groups.list.iter().enumerate() {
+                if eg.team == gd.team || eg.count == 0 || eg.state.is_broken() {
+                    continue;
+                }
+                if edge_gap(gd, eg) <= crate::sim::soldier::KNIFE_EDGE {
+                    arm.blocks.push(crate::formation::block_rect(eg));
+                }
+                arm.foe_in_range = arm.foe_in_range
+                    || in_bow_range(gd, eg, vel(e), (height(gd), height(eg)));
+            }
+            arm
+        })
+        .collect()
 }
 
 /// Each regiment's order resolved to this tick's destination, or none

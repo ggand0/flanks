@@ -25,7 +25,7 @@ struct Soldier {
     qz: f32,
     yaw: f32,
     yaw_prev: f32,
-    // kind | swing << 8 | swing_t << 16 | flash << 24
+    // kind | knife << 7 | swing << 8 | swing_t << 16 | flash << 24
     a: u32,
     // group | death_t << 24
     b: u32,
@@ -118,7 +118,8 @@ struct Params {
     // length in seconds.
     step_travel: array<vec4<f32>, 4>,
     step_len: array<vec4<f32>, 4>,
-    // soldier.rs STEP_FACE_SPEED, render_units.rs STEP_SETTLE_S.
+    // soldier.rs STEP_FACE_SPEED, render_units.rs STEP_SETTLE_S, and in
+    // z which kinds have a bow rig: bit k for kind k.
     steps: vec4<f32>,
     // draw_ticks, death_ticks, hit_stagger_ticks, celebrate_base
     consts: vec4<f32>,
@@ -587,7 +588,9 @@ fn build_soldier(i: u32) {
     let s = soldiers[i];
     let pos = vec3<f32>(s.px, s.py, s.pz);
     let prev = vec3<f32>(s.qx, s.qy, s.qz);
-    let kind = s.a & 0xffu;
+    let kind = s.a & 0x7fu;
+    // An archer's knife is out (sim/soldier.rs SIGHT_KNIFE).
+    let knife = (s.a & 0x80u) != 0u;
     let swing = (s.a >> 8u) & 0xffu;
     let swing_t = f32((s.a >> 16u) & 0xffu);
     let flash = f32((s.a >> 24u) & 0xffu);
@@ -700,10 +703,19 @@ fn build_soldier(i: u32) {
     let g = sm.gait + min(gait_rate(sm.walk) * params.dt, 0.25);
     sm.gait = g - floor(g);
     // The record's fourth position float: an archer's bow, a skinned
-    // kind's steps.
+    // kind's steps, and an archer's steps with his knife out as -1 - the
+    // steps (unit_pose.wgsl `pose_begin`).
     var fourth = sm.bow;
+    let bow_kind = ((u32(params.steps.z) >> kind) & 1u) != 0u;
     if any(params.step_travel[kind] > vec4<f32>(0.0)) {
-        fourth = steps(&sm, kind, step.xz * params.inv_dt, s.yaw, death_t == 0.0);
+        let q = steps(&sm, kind, step.xz * params.inv_dt, s.yaw, death_t == 0.0);
+        if !bow_kind {
+            fourth = q;
+        } else if knife {
+            fourth = -1.0 - q;
+        }
+    } else if bow_kind && knife {
+        fourth = -1.0;
     }
 
     let position = mix(prev, pos, params.alpha);

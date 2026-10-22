@@ -17,7 +17,8 @@ struct Vertex {
     // 7 arrow, 8 weapon, 9 and 10 a jointed weapon arm's forearm and
     // hand, and an archer's bow rig: 11 and 12 the bow forearm and hand,
     // 13 and 17 the string halves, 14 and 15 the limbs, 16 the held
-    // arrow, 18 head, 19 torso), y = the part's pivot height.
+    // arrow, 18 head, 19 torso, 20 the archer's knife), y = the part's
+    // pivot height.
     @location(2) part_pivot: vec2<f32>,
     // Where the vertex samples the kind's atlas (zero without one).
     @location(3) atlas_uv: vec2<f32>,

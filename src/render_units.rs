@@ -1070,9 +1070,12 @@ fn sync_instance_data(
                         let (side, left) = crate::sim::damage::twitch_of(units.flash[i]);
                         if side == 0 { 0.0 } else { 2.0 + side as f32 + left.min(0.999) }
                     };
+                    // The fourth position float: his bow, or below zero
+                    // an archer's knife out (unit_pose.wgsl `pose_begin`).
+                    let knife = units.sight[i] & crate::sim::soldier::SIGHT_KNIFE != 0;
                     let instance = InstanceData {
                         position,
-                        w: sm.bow,
+                        w: if knife { -1.0 } else { sm.bow },
                         color,
                         anim: [yaw, sm.walk, lunge, fx],
                         anim2: [sm.band, sm.wall, sm.gait, stagger],

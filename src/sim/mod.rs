@@ -278,6 +278,7 @@ fn run_tick_job(job: &mut TickJob) {
             flash: &job.flash_in,
             group: &job.group,
             death_t: &job.death_t_in,
+            sight: &job.sight_in,
             color: &job.color_in,
         };
         slot.pack((job.generation, job.tick), &columns, job.hit_flash);
@@ -351,6 +352,7 @@ fn run_tick_job(job: &mut TickJob) {
         target_members,
         searched,
         search_blocks,
+        sidearm,
         clear_members,
         field,
         field_wanted,
@@ -446,6 +448,7 @@ fn run_tick_job(job: &mut TickJob) {
     let clear_members = &clear_members[..];
     let search_blocks = &search_blocks[..];
     let searched = &searched[..];
+    let sidearm = &sidearm[..];
     let blocks = &*blocks;
     let field = soldier::Field {
         grid,
@@ -479,6 +482,7 @@ fn run_tick_job(job: &mut TickJob) {
         clear_members,
         search_blocks,
         searched,
+        sidearm,
         sight_snap: &sight_in[..],
         death_snap: death_t_in,
         blocks,

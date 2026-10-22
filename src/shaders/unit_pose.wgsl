@@ -52,11 +52,11 @@ struct Skel {
     // Per clip: x = its first vec4 in `clips`, y = its samples, w = 1 when
     // it loops. A sample is the root's offset from rest, then one
     // quaternion per joint relative to its parent.
-    clips: array<vec4<u32>, 16>,
+    clips: array<vec4<u32>, 18>,
     // Per clip: x = samples per second, y = its length in seconds, z =
     // when its blow lands, or when a draw nocks its arrow, in seconds, -1
     // without one, w = how far one play carries the soldier.
-    rates: array<vec4<f32>, 16>,
+    rates: array<vec4<f32>, 18>,
     // The joints the gait, the arm sway and the attack write: (pelvis,
     // chest, head, weapon), then (upper arm, forearm, hand, coat) of the
     // weapon side and of the shield side, then (thigh, shin, foot) of
@@ -637,10 +637,13 @@ const P_RIG: u32 = 13u;
 // Two slots per bow rig part (`bow_part`): the rotation, then the offset
 // and the scale.
 const P_BOW: u32 = 17u;
+// A bow rig kind's knife: x = 1 with it out and his bow put away, 0 with
+// his bow out (`put_away`).
+const P_KNIFE: u32 = 45u;
 // Slots per soldier: without a bow rig and with one (render_units_gpu.rs
 // POSE_SLOTS). A skinned kind has one more per joint (`p_skel`).
 const POSE_SLOTS: u32 = 17u;
-const POSE_SLOTS_BOW: u32 = 45u;
+const POSE_SLOTS_BOW: u32 = 46u;
 
 // A skinned kind's first joint slot: one slot per joint after the part
 // pose, which his shadow and his far levels draw by. The joint's rotation
@@ -672,6 +675,10 @@ const CLIP_RELEASE_UP: u32 = 13u;
 // blade is up.
 const CLIP_BLOCK: u32 = 14u;
 const CLIP_PARRY: u32 = 15u;
+// An archer's stand and ready with his knife out, in place of his stand
+// and ready while it is.
+const CLIP_MELEE_STAND: u32 = 16u;
+const CLIP_MELEE_READY: u32 = 17u;
 // render_units.rs RELOAD_S: the reload a skeleton's shot plays after its
 // release, from its end down to the ready pose and through the draw to
 // the held aim.
@@ -762,6 +769,8 @@ struct Pre {
     pitch: f32,
     bow_rig: bool,
     bow_w: f32,
+    // An archer's knife is out and his bow put away.
+    knife: bool,
     // The bow rig's table and the place in it, 0 to 1.
     clip: u32,
     clip_x: f32,
@@ -824,14 +833,16 @@ fn pose_begin(pos_scale: vec4<f32>, color: vec4<f32>, anim: vec4<f32>, anim2: ve
     let yaw = inst.anim.x;
     let speed = inst.anim.y;
     // A skinned kind's steps ride the fourth position float
-    // (unit_build.wgsl `steps`), unless his bow does. While he steps, his
+    // (unit_build.wgsl `steps`), unless his bow does. An archer's knife
+    // out rides it below zero, as -1 - his steps. While he steps, his
     // gait gives way.
     let bow_rig = rig.bow.params.w > 0.5;
+    let knife = bow_rig && inst.pos_scale.w < -0.5;
     var step_clip = 0u;
     var step_x = 0.0;
     var step_w = 0.0;
-    if skel && !bow_rig {
-        let q = u32(max(inst.pos_scale.w, 0.0) + 0.5);
+    if skel && (!bow_rig || knife) {
+        let q = u32(select(max(inst.pos_scale.w, 0.0), -1.0 - inst.pos_scale.w, knife) + 0.5);
         step_clip = CLIP_SHUFFLE_LEFT + (q & 3u);
         step_x = f32((q >> 2u) & 1023u) / 1023.0;
         step_w = f32(q >> 12u) / 1023.0;
@@ -862,7 +873,7 @@ fn pose_begin(pos_scale: vec4<f32>, color: vec4<f32>, anim: vec4<f32>, anim2: ve
     }
     // How far the bow is up from the carry toward the drawn ready pose,
     // and the clip it poses: between shots, the raise at its start.
-    let bow_w = select(0.0, smoothstep(0.0, 1.0, inst.pos_scale.w), bow_rig);
+    let bow_w = select(0.0, smoothstep(0.0, 1.0, inst.pos_scale.w), bow_rig && !knife);
     var clip = 0u;
     var clip_x = 0.0;
     if shooting {
@@ -995,6 +1006,7 @@ fn pose_begin(pos_scale: vec4<f32>, color: vec4<f32>, anim: vec4<f32>, anim2: ve
         inst.anim2.z,
         bow_rig,
         bow_w,
+        knife,
         clip,
         clip_x,
         shooting,
@@ -1552,11 +1564,18 @@ fn put_skeleton() {
     // while his bow is up.
     let guard = select(0.0, max(level * (1.0 - moving), pre.bow_w), alive);
 
+    // An archer with his knife out stands in his knife's stand and ready.
+    var stand = CLIP_STAND;
+    var ready = CLIP_READY;
+    if pre.knife && skel_has(CLIP_MELEE_STAND) && skel_has(CLIP_MELEE_READY) {
+        stand = CLIP_MELEE_STAND;
+        ready = CLIP_MELEE_READY;
+    }
     var turn: array<vec4<f32>, 22>;
     for (var j = 0u; j < n; j++) {
-        turn[j] = qblend(skel_turn(CLIP_STAND, 0u, j), skel_turn(CLIP_READY, 0u, j), guard);
+        turn[j] = qblend(skel_turn(stand, 0u, j), skel_turn(ready, 0u, j), guard);
     }
-    var root = mix(skel_root(CLIP_STAND, 0u), skel_root(CLIP_READY, 0u), guard);
+    var root = mix(skel_root(stand, 0u), skel_root(ready, 0u), guard);
     let core = rig.skel.roles[0];
     let arm_r = rig.skel.roles[1];
     let arm_l = rig.skel.roles[2];
@@ -1678,16 +1697,17 @@ fn put_skeleton() {
         skel_over(&turn, at, bow, low);
         root = mix(root, skel_root_at(at), low);
         if lowered > 0.0 {
-            skel_over(&turn, SkelAt(CLIP_READY, 0u, 0.0), bow * lowered, low * lowered);
-            root = mix(root, skel_root(CLIP_READY, 0u), low * lowered);
+            skel_over(&turn, SkelAt(ready, 0u, 0.0), bow * lowered, low * lowered);
+            root = mix(root, skel_root(ready, 0u), low * lowered);
         }
         arrow = select(0.0, 1.0, shown && bow > 0.5);
     }
     if rig.bow.params.w > 0.5 && alive {
-        // An archer's blow and cheer swing his arms rigidly about the
-        // shoulders, as his bow rig swings them (`put_bow`), and fade as
-        // his bow comes up.
+        // An archer's cheer, and a blow no clip plays, swing his arms
+        // rigidly about the shoulders, as his bow rig swings them
+        // (`put_bow`), and fade as his bow comes up.
         var draw_ang = select(1.9 * pre.raise - 2.5 * pre.chop, 0.55 * pre.raise - 0.45 * pre.chop, pre.style < 0.5);
+        draw_ang = select(draw_ang, 0.0, clip_blow);
         draw_ang = select(draw_ang, pre.celebrate * (1.75 + 0.35 * sin(pre.wobble)), pre.celebrate > 0.001);
         let bow_ang = pre.celebrate * (1.5 + 0.3 * sin(pre.wobble));
         let down = 1.0 - pre.bow_w;
@@ -1747,6 +1767,7 @@ fn pose_write(
         for (var k = 0u; k < BOW_PARTS; k++) {
             put_bow(k, k);
         }
+        pose_put(P_KNIFE, vec4<f32>(select(0.0, 1.0, pre.knife), 0.0, 0.0, 0.0));
     }
     if rig.chain > 0.5 {
         for (var k = 0u; k < 4u; k++) {
@@ -1778,6 +1799,26 @@ fn pitch_normal_cs(n: vec3<f32>, c: f32, s: f32) -> vec3<f32> {
     return vec3<f32>(n.x, n.y * c + n.z * s, -n.y * s + n.z * c);
 }
 
+// Whether this archer's knife is out and his bow put away (`P_KNIFE`).
+fn knife_out() -> bool {
+#ifdef UNIT_POSE_READ
+    return pose_at(P_KNIFE).x > 0.5;
+#else
+    return pre.knife;
+#endif
+}
+
+// Whether a part of an archer is put away: the bow (its grip, string
+// halves and limbs) and the arrow on it while his knife is out, the knife
+// while his bow is.
+fn put_away(part: f32) -> bool {
+    let p = u32(part + 0.5);
+    if knife_out() {
+        return p == 8u || (p >= 13u && p <= 17u);
+    }
+    return p == 20u;
+}
+
 // Where a corner of the mesh lands in the world, posed: its rest position
 // and normal in the soldier's local space, its body part and the part's
 // pivot height. On a skinned kind, `skin` is its joint pair, a + 256 * b,
@@ -1790,12 +1831,19 @@ fn place(
     skin: u32,
     weight: f32,
 ) -> Placed {
-    let corner = Corner(rest, rest_normal, part_id, pivot_height);
+    let bow_rig = rig.bow.params.w > 0.5;
+    // The bow or the knife an archer has put away gathers at his
+    // position: its triangles have no area and draw nothing.
+    if bow_rig && put_away(part_id) {
+        return Placed(pose_at(P_POS).xyz, rest_normal);
+    }
+    // The knife moves with the hand that holds it.
+    let held = select(part_id, 10.0, abs(part_id - 20.0) < 0.5);
+    let corner = Corner(rest, rest_normal, held, pivot_height);
     let part = corner.part;
     let pivot = corner.pivot;
     var local = corner.position;
     var normal = corner.normal;
-    let bow_rig = rig.bow.params.w > 0.5;
 
     // --- Part animation (rotations around the part pivot) ---
     // A skinned level's shader (UNIT_SKINNED, with the pose pass) compiles

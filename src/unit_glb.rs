@@ -40,8 +40,11 @@
 //! `put_skeleton`). At the far levels, and everywhere with `FL_CLIPS=0`,
 //! the same file draws by its parts. An archer's skin and bow rig work
 //! together: his near levels shoot from the clips, his far levels from
-//! the shot tables. The man-at-arms has the knight's skeleton and plays
-//! the knight's clips (`CLIP_KIND`).
+//! the shot tables. A clip's tracks go to the model's joints by name, so
+//! a kind plays another's clips on the joints the two share: the
+//! man-at-arms has the knight's skeleton and plays the knight's clips,
+//! and the archer plays them for the slots his own files leave empty
+//! (`CLIP_KIND`).
 //!
 //! `FL_UNIT_MESH=code` keeps the code-built meshes and `FL_GLB_FAR=code`
 //! fills only the missing levels from them. `FL_GLB_<KIND>=path` loads
@@ -66,15 +69,18 @@ type Fallible<T> = Result<T, String>;
 /// One file per kind, named as the asset spec names them.
 const KIND_FILE: [&str; NUM_KINDS] = ["knight", "man_at_arms", "spearman", "archer"];
 
-/// The kind whose clips a skinned kind plays: the man-at-arms is built on
-/// the knight's body and skeleton, so he plays the knight's clips, read
-/// from `knight.<clip>.json` beside his model.
-const CLIP_KIND: [usize; NUM_KINDS] = [0, 0, 2, 3];
+/// The kind whose clips a skinned kind plays where he has no file of his
+/// own, read from `<kind>.<clip>.json` beside his model: the man-at-arms
+/// is built on the knight's body and skeleton, and the archer's body
+/// joints are the knight's by name, so both play the knight's clips.
+const CLIP_KIND: [usize; NUM_KINDS] = [0, 0, 2, 0];
 
 /// Part id to the name its pivot empty carries (`pivot_<part>`), in the
 /// order unit_meshes.rs and the vertex shader use. Id 7 is the arrow in
-/// flight, which no model carries.
-const PART_NAMES: [&str; 20] = [
+/// flight, which no model carries. Id 20 is the archer's knife, which
+/// moves with the hand that holds it and shows only while it is out
+/// (unit_pose.wgsl `put_away`).
+const PART_NAMES: [&str; 21] = [
     "body",
     "arm_weapon",
     "leg_l",
@@ -95,6 +101,7 @@ const PART_NAMES: [&str; 20] = [
     "bow_string_lower",
     "head",
     "torso",
+    "knife",
 ];
 
 /// Other names a part goes by: an archer's drawing forearm and hand take
@@ -402,7 +409,8 @@ fn import(kind: usize, path: &Path) -> Fallible<KindMeshes> {
     // A skeleton's clips follow a bow rig's shots in the clip buffer.
     let skinned = clips_on() && gltf.document.skins().next().is_some();
     if skinned {
-        match read_skeleton(&gltf, &origins, &mut levels, local3, scale, path, kind) {
+        let bow = rig.bow.params[3] > 0.5;
+        match read_skeleton(&gltf, &origins, &mut levels, local3, scale, path, kind, bow) {
             Ok((mut skel, rows)) => {
                 info!(
                     "{name}: skeleton of {} joints, clips {:?} ({} rows)",
@@ -587,10 +595,10 @@ pub fn clips_on() -> bool {
 /// The clips a skinned kind plays, by slot (unit_pose.wgsl `CLIP_STAND`
 /// and on). Each is `<kind>.<name>.json` next to the model. The first
 /// `SKEL_CLIPS_NEEDED` must be there; a missing later one leaves its slot
-/// empty and the player does without it. The last four are an archer's
+/// empty and the player does without it. Slots 10 to 13 are an archer's
 /// shot: the draw from ready to the level aim, its release, the raise from
 /// the level aim to the high one, and its release.
-const SKEL_CLIPS: [&str; 16] = [
+const SKEL_CLIPS: [&str; 18] = [
     "stand",
     "ready",
     "shuffle_left",
@@ -609,6 +617,10 @@ const SKEL_CLIPS: [&str; 16] = [
     // block, the weapon parry.
     "block",
     "parry",
+    // An archer's stand and ready with his knife out, which take the
+    // place of his stand and ready while it is.
+    "melee_stand",
+    "melee_ready",
 ];
 const SKEL_CLIPS_NEEDED: usize = 2;
 /// The slot of the first step clip: left, right, forward and backward
@@ -666,6 +678,8 @@ struct ClipEvents {
 /// The model's skeleton and its clips as rows of the clip buffer, and
 /// every level's joint pairs put in parent then child order. Fails when
 /// the skin, a level's weights or a clip file do not fit the player.
+/// `bow`: the kind has a bow rig, so no weapon arm draws a blow.
+#[allow(clippy::too_many_arguments)]
 fn read_skeleton(
     gltf: &gltf::Gltf,
     origins: &[Vec3],
@@ -674,6 +688,7 @@ fn read_skeleton(
     scale: f32,
     model: &Path,
     kind: usize,
+    bow: bool,
 ) -> Fallible<(Skel, Vec<[f32; 4]>)> {
     let skin = gltf.document.skins().next().ok_or("no skin")?;
     let nodes: Vec<gltf::Node> = skin.joints().collect();
@@ -738,11 +753,15 @@ fn read_skeleton(
     }
     let mut rows: Vec<[f32; 4]> = Vec::new();
     let mut missing: Vec<&str> = Vec::new();
+    let mut at_rest: Vec<&str> = Vec::new();
     // A cut clip plays the sim's slow cut; a kind whose sim has none
-    // swings his style 1 quick, and the player draws it by the arm.
-    let has_cut = crate::unit_types::TYPES[kind].cut_windup_ticks > 0;
+    // swings his style 1 quick, and the player draws it by the arm. An
+    // archer has no weapon arm to draw it by, so the cut clip plays his
+    // quick blow at its pace. A kind without a shield never blocks.
+    let params = &crate::unit_types::TYPES[kind];
+    let has_cut = params.cut_windup_ticks > 0 || bow;
     for (slot, clip) in SKEL_CLIPS.iter().enumerate() {
-        if *clip == "cut" && !has_cut {
+        if (*clip == "cut" && !has_cut) || (*clip == "block" && params.shield <= 0.0) {
             continue;
         }
         // His own file first; a kind that plays another's clips takes
@@ -766,14 +785,20 @@ fn read_skeleton(
         if file.format != "flanks-clip" || file.version != 1 {
             return Err(format!("{} is not a flanks-clip of version 1", path.display()));
         }
-        if file.joints != names {
-            // Another kind's clip on a skeleton that is not his: an
-            // optional one is done without, as a missing one is.
-            if slot >= SKEL_CLIPS_NEEDED && CLIP_KIND[kind] != kind {
-                missing.push(*clip);
-                continue;
+        // Each of the model's joints takes the clip's track of its name.
+        // One the clip does not name keeps its rest pose, and a track for
+        // a joint the model lacks is dropped, so another kind's clip plays
+        // on the joints the two skeletons share. The root carries the
+        // clip's offset, so the clip must name it.
+        let track: Vec<Option<usize>> =
+            names.iter().map(|n| file.joints.iter().position(|c| c == n)).collect();
+        if track[0].is_none() {
+            return Err(format!("{} does not name the model's root joint {}", path.display(), names[0]));
+        }
+        for (j, t) in track.iter().enumerate() {
+            if t.is_none() && !at_rest.contains(&names[j].as_str()) {
+                at_rest.push(&names[j]);
             }
-            return Err(format!("{}: its joints are not the model's, in the model's order", path.display()));
         }
         if file.samples.is_empty() || !file.fps.is_finite() || file.fps <= 0.0 {
             return Err(format!("{} has no samples or no rate", path.display()));
@@ -786,19 +811,33 @@ fn read_skeleton(
         }
         let travel = scale * Vec3::from_array(file.travel).length();
         skel.rates[slot] = [file.fps, length, contact, travel];
+        let width = 3 + 4 * file.joints.len();
         for sample in &file.samples {
-            if sample.len() != 3 + 4 * count || sample.iter().any(|v| !v.is_finite()) {
-                return Err(format!("{}: a sample is not 3 + 4 x {count} numbers", path.display()));
+            if sample.len() != width || sample.iter().any(|v| !v.is_finite()) {
+                return Err(format!(
+                    "{}: a sample is not 3 + 4 x {} numbers",
+                    path.display(),
+                    file.joints.len()
+                ));
             }
             rows.push([scale * sample[0], scale * sample[1], scale * sample[2], 0.0]);
-            for q in sample[3..].chunks_exact(4) {
-                let q = Quat::from_xyzw(q[0], q[1], q[2], q[3]).normalize();
+            for t in &track {
+                let q = match t {
+                    Some(c) => {
+                        let q = &sample[3 + 4 * c..7 + 4 * c];
+                        Quat::from_xyzw(q[0], q[1], q[2], q[3]).normalize()
+                    }
+                    None => Quat::IDENTITY,
+                };
                 rows.push(q.to_array());
             }
         }
     }
     if !missing.is_empty() {
         info!("{}: no clips {missing:?}, the player does without them", model.display());
+    }
+    if !at_rest.is_empty() {
+        info!("{}: joints {at_rest:?} keep their rest pose in clips that do not name them", model.display());
     }
     Ok((skel, rows))
 }
@@ -871,7 +910,7 @@ fn bow_rig(
         }
         Err(e) => {
             warn!("{name}: {e}, so the bow rig's parts join the arms and body");
-            fold(levels, &[9, 10], 1);
+            fold(levels, &[9, 10, 20], 1);
             fold(levels, &[11, 12, 8, 13, 14, 15, 16, 17], 6);
             fold(levels, &[18, 19], 0);
             None

@@ -200,6 +200,20 @@ pub(crate) const SIGHT_FOE: u16 = 1 << 8;
 /// tick while some archer regiment searches his block: a shaft aimed at
 /// him cannot come down on a friend of the shooter.
 pub(crate) const SIGHT_CLEAR: u16 = 1 << 9;
+/// An archer's knife: bits 10 to 14 count down (one every fourth tick)
+/// from the last tick an enemy came close to him (`KNIFE_HOLD`), and
+/// `SIGHT_KNIFE` is set while the knife is out, by that count or by his
+/// regiment's swords-out order. With it out he draws no bow, and the
+/// renderer shows the knife and hides the bow (render_units_gpu.rs).
+const SIGHT_KNIFE_SHIFT: u16 = 10;
+const SIGHT_KNIFE_COUNT: u16 = 0x1f << SIGHT_KNIFE_SHIFT;
+pub(crate) const SIGHT_KNIFE: u16 = 1 << 15;
+/// The count an enemy close to him sets: 31 steps of four ticks, about
+/// 4 s at 30 ticks a second, before he puts the knife away.
+const KNIFE_HOLD: u16 = 31;
+/// How close an enemy block's edge comes before he takes his knife out:
+/// about two seconds of a charge, one bow draw.
+pub(crate) const KNIFE_EDGE: f32 = 10.0;
 /// Even with nobody going in sight, a man joins once his regiment has
 /// been in melee longer than his own patience, spread between these
 /// (seconds; FL_JOIN_PATIENCE sets the upper end): the fight's noise and
@@ -306,6 +320,8 @@ pub(crate) struct Field<'a> {
     pub search_blocks: &'a [Vec<u32>],
     /// Per regiment: some archer regiment searches in it this tick.
     pub searched: &'a [bool],
+    /// Per regiment: why its men take their knives out (archers only).
+    pub sidearm: &'a [crate::sim::job::Sidearm],
     /// The sight and death columns at the tick's start: another man's
     /// marks and life, read by the archer who picks him.
     pub sight_snap: &'a [u16],
@@ -847,6 +863,24 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
             }
         }
     }
+    // An archer's knife: out while his regiment has its swords out, and
+    // for a few seconds after an enemy came close to him, one in his
+    // reach, an enemy block's edge within KNIFE_EDGE of him, or with his
+    // quiver empty an enemy block in his regiment's bow range.
+    if !dying && st.my_kind == crate::unit_types::KIND_ARCHER as usize {
+        let arm = &f.sidearm[gi];
+        let close = best_idx != u32::MAX
+            || (*s.ammo == 0 && arm.foe_in_range)
+            || arm.blocks.iter().any(|b| b.distance(p) <= KNIFE_EDGE);
+        let mut count = (*s.sight & SIGHT_KNIFE_COUNT) >> SIGHT_KNIFE_SHIFT;
+        if close {
+            count = KNIFE_HOLD;
+        } else if count > 0 && f.tick.wrapping_add(i as u32).is_multiple_of(4) {
+            count -= 1;
+        }
+        let out = if arm.swords || count > 0 { SIGHT_KNIFE } else { 0 };
+        *s.sight = (*s.sight & !(SIGHT_KNIFE_COUNT | SIGHT_KNIFE)) | count << SIGHT_KNIFE_SHIFT | out;
+    }
     st.push = push;
     st.corr = corr;
     if overlap > 0.0 {
@@ -1005,7 +1039,9 @@ fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
                 | (right as u16 * SIGHT_RIGHT)
                 | (back as u16 * SIGHT_BACK);
         }
-        *s.sight = (*s.sight & (SIGHT_GO_FAR | SIGHT_FOE | SIGHT_CLEAR)) | seen;
+        *s.sight = (*s.sight
+            & (SIGHT_GO_FAR | SIGHT_FOE | SIGHT_CLEAR | SIGHT_KNIFE_COUNT | SIGHT_KNIFE))
+            | seen;
     }
     let way_blocked = *s.sight & SIGHT_WAY != 0;
     let left_blocked = *s.sight & SIGHT_LEFT != 0;
@@ -1248,8 +1284,10 @@ fn swing(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
                 if *s.swing & crate::units::SWING_RANGED != 0 =>
             {
                 // Drawing the bow: feet planted, eyes on the target block.
+                // A man whose knife came out lets the draw go.
                 desired = Vec2::ZERO;
-                if let Some(shot) = &shoot_at[gi] {
+                let knife = *s.sight & SIGHT_KNIFE != 0;
+                if let Some(shot) = shoot_at[gi].as_ref().filter(|_| !knife) {
                     let q = *s.quarry as usize;
                     face_target =
                         Some(if q < pos_prev.len() { pos_prev[q].xz() } else { shot.c });
@@ -1330,7 +1368,8 @@ fn swing(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
                         *s.swing_t -= 1;
                     }
                 } else {
-                    // Target gone mid-draw: ease off and reassess shortly.
+                    // Target gone mid-draw, or the knife out: ease off and
+                    // reassess shortly.
                     *s.swing = crate::units::SWING_RECOVER;
                     *s.swing_t = crate::unit_types::missile::CANCEL_TICKS;
                 }
@@ -1525,6 +1564,7 @@ fn swing(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
                 } else if my_kind == crate::unit_types::KIND_ARCHER as usize
                     && !routed
                     && *s.ammo > 0
+                    && *s.sight & SIGHT_KNIFE == 0
                     && s.vel.xz().length_squared() < 4.0
                     && let Some(shot) = &shoot_at[gi]
                     && let Some(q) = pick_quarry(f, s, p, gi, shot)

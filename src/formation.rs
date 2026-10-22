@@ -230,17 +230,64 @@ pub fn block_half_extents(gd: &GroupData, files: u32, facing: f32) -> Vec2 {
 /// these along the line between them (sim/job.rs `edge_gap`). A blob,
 /// or a block not yet given its files, answers its footprint radius.
 pub fn block_reach_along(gd: &GroupData, dir: Vec2) -> f32 {
+    block_rect(gd).reach_along(dir)
+}
+
+/// A regiment's block as the gap tests see it: its rectangle (files and
+/// ranks at its spacing, a metre of margin around the outer men, turned
+/// to its facing) about its centroid, or for a blob a disc.
+#[derive(Clone, Copy, Debug)]
+pub struct BlockRect {
+    pub centre: Vec2,
+    /// The facing, zero for a disc.
+    pub fwd: Vec2,
+    /// Half its width and half its depth; a disc's radius in both.
+    pub half_w: f32,
+    pub half_d: f32,
+}
+
+impl BlockRect {
+    /// How far the edge stands from the centre toward the unit direction
+    /// `dir`.
+    pub fn reach_along(&self, dir: Vec2) -> f32 {
+        if self.fwd == Vec2::ZERO {
+            return self.half_w;
+        }
+        let right = Vec2::new(self.fwd.y, -self.fwd.x);
+        dir.dot(right).abs() * self.half_w + dir.dot(self.fwd).abs() * self.half_d
+    }
+
+    /// The distance from `p` to the nearest point of the block, 0 inside.
+    pub fn distance(&self, p: Vec2) -> f32 {
+        let d = p - self.centre;
+        if self.fwd == Vec2::ZERO {
+            return (d.length() - self.half_w).max(0.0);
+        }
+        let right = Vec2::new(self.fwd.y, -self.fwd.x);
+        let out = Vec2::new(
+            (d.dot(right).abs() - self.half_w).max(0.0),
+            (d.dot(self.fwd).abs() - self.half_d).max(0.0),
+        );
+        out.length()
+    }
+}
+
+/// The block of a regiment (`BlockRect`). A blob, or a block not yet
+/// given its files, is a disc of its footprint radius.
+pub fn block_rect(gd: &GroupData) -> BlockRect {
     if gd.shape == FormShape::Blob || gd.files == 0 {
-        return if gd.radius > 0.0 { gd.radius } else { blob_radius(gd.count) };
+        let r = if gd.radius > 0.0 { gd.radius } else { blob_radius(gd.count) };
+        return BlockRect { centre: gd.centroid, fwd: Vec2::ZERO, half_w: r, half_d: r };
     }
     let files = (gd.files as usize).min(gd.count.max(1));
     let ranks = gd.count.max(1).div_ceil(files);
     let pitch = gd.spacing.pitch(gd.kind);
-    let half_w = (files - 1) as f32 * 0.5 * pitch.x + 1.0;
-    let half_d = (ranks - 1) as f32 * 0.5 * pitch.y + 1.0;
-    let fwd = facing_dir(gd.facing);
-    let right = Vec2::new(fwd.y, -fwd.x);
-    dir.dot(right).abs() * half_w + dir.dot(fwd).abs() * half_d
+    BlockRect {
+        centre: gd.centroid,
+        fwd: facing_dir(gd.facing),
+        half_w: (files - 1) as f32 * 0.5 * pitch.x + 1.0,
+        half_d: (ranks - 1) as f32 * 0.5 * pitch.y + 1.0,
+    }
 }
 
 /// Deployment placement: rebake slots, then TELEPORT every man onto his
