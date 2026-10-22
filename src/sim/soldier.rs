@@ -97,6 +97,11 @@ const CORR_GAIN: f32 = 0.15;
 const CORR_MAX: f32 = 0.1;
 /// Units slow down proportionally inside this distance to the target.
 const ARRIVE_RADIUS: f32 = 35.0;
+/// How close to his slot a parked man stands without stepping (metres):
+/// rigid slots sit exactly at the separation rest distance, so a dressed
+/// rank is force-free and can afford a tight tolerance; with 1.5 the
+/// ranks never finished dressing.
+pub(crate) const HOLD_DEADZONE: f32 = 0.7;
 /// A holding soldier who leaves his mark by more than the hold deadzone
 /// walks back at this pace at least, and keeps going until he is within
 /// STEP_STOP of it: a real step, never a creep. M2TW's slowest
@@ -631,15 +636,12 @@ fn drive(f: &Field, s: &mut Soldier, st: &mut Step) {
         }
         let to_goal = goal - p;
         let dist = to_goal.length();
-        // Hold deadzone: parked units don't jitter around their slot point.
-        // 0.7 m (was 1.5 when homes were jittered spawn offsets): rigid slots
-        // sit exactly at the separation rest distance, so a dressed rank is
-        // force-free and can afford tight tolerance — with 1.5 the ranks
-        // never finished dressing. A soldier already stepping finishes the
-        // step (STEP_STOP) instead of stalling at the deadzone's edge.
+        // Hold deadzone: parked units don't jitter around their slot point
+        // (HOLD_DEADZONE). A soldier already stepping finishes the step
+        // (STEP_STOP) instead of stalling at the deadzone's edge.
         let stepping = s.vel.xz().length_squared()
             > (0.5 * STEP_PACE) * (0.5 * STEP_PACE);
-        let deadzone = if stepping { STEP_STOP } else { 0.7 };
+        let deadzone = if stepping { STEP_STOP } else { HOLD_DEADZONE };
         if !(holding && dist < deadzone) {
             // Slope penalty: steep ground is slow ground. Wading the river is
             // slow too (the bridge deck is dry: full speed).
@@ -1616,6 +1618,7 @@ fn quarry_ok(
     f: &Field,
     p: Vec2,
     my_team: u8,
+    reach2: f32,
     shot: &crate::sim::job::ShootAt,
     blocks: &[u32],
     m: u32,
@@ -1626,8 +1629,7 @@ fn quarry_ok(
         && team[mi] != my_team
         && death_snap[mi] == 0
         && blocks.contains(&group[mi])
-        && pos_prev[mi].xz().distance_squared(p)
-            <= crate::unit_types::missile::REACH * crate::unit_types::missile::REACH
+        && pos_prev[mi].xz().distance_squared(p) <= reach2
         && (!shot.search
             || (sight_snap[mi] & SIGHT_CLEAR != 0 && sight_snap[mi] & SIGHT_FOE == 0))
 }
@@ -1646,9 +1648,12 @@ fn pick_quarry(
     gi: usize,
     shot: &crate::sim::job::ShootAt,
 ) -> Option<u32> {
-    let Field { team, target_members, clear_members, search_blocks, tick, tick_seed, .. } = *f;
+    let Field { team, kind, target_members, clear_members, search_blocks, tick, tick_seed, .. } =
+        *f;
     let i = s.i;
     let my_team = team[i];
+    let reach = crate::unit_types::bow_reach(kind[i]);
+    let reach2 = reach * reach;
     let single = [shot.t as u32];
     let blocks: &[u32] = if shot.search && !search_blocks[gi].is_empty() {
         &search_blocks[gi]
@@ -1657,7 +1662,7 @@ fn pick_quarry(
     };
     let keeps =
         crate::units::hash01((i as u32).wrapping_mul(0x9E37) ^ 0x1B3D) < KEEP_QUARRY_SHARE;
-    if keeps && quarry_ok(f, p, my_team, shot, blocks, *s.quarry) {
+    if keeps && quarry_ok(f, p, my_team, reach2, shot, blocks, *s.quarry) {
         return Some(*s.quarry);
     }
     if !tick.wrapping_add((i as u32).wrapping_mul(7)).is_multiple_of(QUARRY_LOOK_TICKS) {
@@ -1674,7 +1679,7 @@ fn pick_quarry(
                 ^ (i as u32).wrapping_mul(0x7F4A_7C15).wrapping_add(k.wrapping_mul(0x2545_F491)),
         );
         let m = list[((h * list.len() as f32) as usize).min(list.len() - 1)];
-        if quarry_ok(f, p, my_team, shot, blocks, m) {
+        if quarry_ok(f, p, my_team, reach2, shot, blocks, m) {
             return Some(m);
         }
     }

@@ -339,6 +339,9 @@ struct RegimentSums {
     slot_err: f32,
     front_off: f32,
     back_off: f32,
+    /// The foremost living man's distance ahead of the centroid along
+    /// the forward vector (`GroupData::lead`).
+    lead: f32,
     line_sum: f32,
     line_n: u32,
     fight_n: u32,
@@ -369,6 +372,7 @@ fn regiment_sums(
         slot_err: 0.0,
         front_off: f32::MIN,
         back_off: f32::MAX,
+        lead: f32::MIN,
         line_sum: 0.0,
         line_n: 0,
         fight_n: 0,
@@ -384,6 +388,9 @@ fn regiment_sums(
             a.pos += p;
             a.count += 1;
             a.home += units.home[i];
+            if units.death_t[i] == 0 {
+                a.lead = a.lead.max((p - pc).dot(f));
+            }
             a.r2 += (p - pc).length_squared();
             a.slot_err += (p - pc - units.home[i] + pb).length();
             // Ground-truth contact: a unit in WIND-UP has an enemy in reach
@@ -489,6 +496,8 @@ fn update_groups(
         }
         group.centroid = cents[g];
         group.home_bias = sums[g].home / counts[g] as f32;
+        // Measured against last tick's centroid, a step at most off.
+        group.lead = if sums[g].lead > f32::MIN { sums[g].lead } else { 0.0 };
         // Formation disorder: how far the regiment stands from its slots,
         // smoothed ~2 s. Only Rect makes the discipline claim.
         let err = if group.shape == crate::formation::FormShape::Rect {

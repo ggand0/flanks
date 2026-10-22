@@ -220,9 +220,10 @@ pub struct GroupData {
     pub skirmish_to: Option<Vec2>,
     /// The order the run parked, handed back when the run ends.
     pub skirmish_saved: Option<Order>,
-    /// The regiment stands and shoots instead of walking into an enemy
-    /// block on its path (the skirmish trigger's third case).
-    pub skirmish_hold: bool,
+    /// The enemy block in the regiment's path that it stands and shoots
+    /// at instead of walking into (the skirmish trigger's third case;
+    /// with skirmish off, the attack order's close-in march alone).
+    pub skirmish_hold: Option<u32>,
     /// Arrows left across the regiment (summed per tick, HUD ammo bar).
     pub ammo_left: u32,
     /// The regiment has a live fire solution this tick (archers:
@@ -231,12 +232,22 @@ pub struct GroupData {
     pub firing: bool,
     /// An archer regiment under an attack order standing off its target:
     /// in range, halted, volleying. Kept by sim/job.rs: entered where the
-    /// order found the target in range or where the march closed to 0.8
-    /// of the range, left when the target is out of range.
+    /// order found the target in range or where the march arrived at the
+    /// firing place, left when the target is out of range.
     pub standoff: bool,
     /// The attack target the stand-off was judged for; a new target is
     /// judged afresh.
     pub standoff_target: Option<u32>,
+    /// Where an archer regiment's attack order marches it: the frame
+    /// centre from which its front rank stands the close-in distance
+    /// short of the target's near edge (sim/job.rs `firing_place`). The
+    /// march's goal in place of the target's centre, so no man's slot
+    /// lies in the enemy. None without a bows-out attack order.
+    pub fire_place: Option<Vec2>,
+    /// How far the regiment's foremost living man stands ahead of its
+    /// centre along its facing (metres; frontline.rs). A column strung
+    /// out on the march is seen by its head, not its middle.
+    pub lead: f32,
 }
 
 impl GroupData {
@@ -295,7 +306,7 @@ impl GroupData {
             skirmishing: false,
             skirmish_to: None,
             skirmish_saved: None,
-            skirmish_hold: false,
+            skirmish_hold: None,
             ammo_left: if kind == crate::unit_types::KIND_ARCHER {
                 count as u32 * crate::unit_types::missile::AMMO as u32
             } else {
@@ -304,6 +315,8 @@ impl GroupData {
             firing: false,
             standoff: false,
             standoff_target: None,
+            fire_place: None,
+            lead: 0.0,
         }
     }
 }
@@ -315,13 +328,23 @@ pub struct Groups {
 
 impl Groups {
     /// A group's order destination this tick: Move goes to the point,
-    /// Attack chases the target regiment's current centroid.
+    /// Attack chases the target regiment's current centroid, or for an
+    /// archer regiment shooting its target, the firing place short of it
+    /// (sim/job.rs `archer_fire_solutions`), so that no man's slot lies
+    /// in the enemy and the march ends where the bows reach.
     pub fn goal(&self, g: usize) -> Option<Vec2> {
-        match self.list[g].order? {
+        let gd = &self.list[g];
+        match gd.order? {
             Order::Move(p) => Some(p),
             Order::Attack(t) => {
-                let t = &self.list[t as usize];
-                (t.count > 0).then_some(t.centroid)
+                let td = &self.list[t as usize];
+                if td.count == 0 {
+                    return None;
+                }
+                match gd.fire_place {
+                    Some(p) if gd.standoff_target == Some(t) => Some(p),
+                    _ => Some(td.centroid),
+                }
             }
         }
     }

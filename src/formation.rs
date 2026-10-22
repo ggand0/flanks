@@ -275,19 +275,36 @@ impl BlockRect {
 /// The block of a regiment (`BlockRect`). A blob, or a block not yet
 /// given its files, is a disc of its footprint radius.
 pub fn block_rect(gd: &GroupData) -> BlockRect {
+    block_rect_at(gd, gd.centroid)
+}
+
+/// The block of a regiment as it stands about `centre`: its frame when
+/// `centre` is its anchor, the dressed formation rather than the men's
+/// average, which stragglers drag off it.
+pub fn block_rect_at(gd: &GroupData, centre: Vec2) -> BlockRect {
     if gd.shape == FormShape::Blob || gd.files == 0 {
         let r = if gd.radius > 0.0 { gd.radius } else { blob_radius(gd.count) };
-        return BlockRect { centre: gd.centroid, fwd: Vec2::ZERO, half_w: r, half_d: r };
+        return BlockRect { centre, fwd: Vec2::ZERO, half_w: r, half_d: r };
+    }
+    let files = (gd.files as usize).min(gd.count.max(1));
+    let pitch = gd.spacing.pitch(gd.kind);
+    BlockRect {
+        centre,
+        fwd: facing_dir(gd.facing),
+        half_w: (files - 1) as f32 * 0.5 * pitch.x + 1.0,
+        half_d: front_offset(gd) + 1.0,
+    }
+}
+
+/// How far a block's front rank stands ahead of its frame centre: the
+/// slots' own half depth. A blob's is its radius.
+pub fn front_offset(gd: &GroupData) -> f32 {
+    if gd.shape == FormShape::Blob || gd.files == 0 {
+        return if gd.radius > 0.0 { gd.radius } else { blob_radius(gd.count) };
     }
     let files = (gd.files as usize).min(gd.count.max(1));
     let ranks = gd.count.max(1).div_ceil(files);
-    let pitch = gd.spacing.pitch(gd.kind);
-    BlockRect {
-        centre: gd.centroid,
-        fwd: facing_dir(gd.facing),
-        half_w: (files - 1) as f32 * 0.5 * pitch.x + 1.0,
-        half_d: (ranks - 1) as f32 * 0.5 * pitch.y + 1.0,
-    }
+    (ranks - 1) as f32 * 0.5 * gd.spacing.pitch(gd.kind).y
 }
 
 /// Deployment placement: rebake slots, then TELEPORT every man onto his
