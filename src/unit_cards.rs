@@ -1185,7 +1185,7 @@ fn refresh_control_buttons(
     // One pass over the controllable selection accumulates every
     // all-in-mode flag the buttons need (no per-frame Vec).
     let (mut any, mut all_wall, mut all_loose, mut all_hold) = (false, true, true, true);
-    let mut all_spear = true;
+    let (mut any_wall, mut all_spear) = (false, true);
     let (mut any_archer, mut all_faw, mut all_skirm, mut all_melee) = (false, true, true, true);
     for g in selection.picked_controllable(&groups) {
         let gd = &groups.list[g];
@@ -1197,6 +1197,7 @@ fn refresh_control_buttons(
             all_skirm &= gd.skirmish;
             all_melee &= gd.melee;
         } else {
+            any_wall = true;
             all_wall &= gd.spacing == FormSpacing::Wall;
             all_spear &= is_spearwall_kind(gd.kind);
         }
@@ -1213,7 +1214,7 @@ fn refresh_control_buttons(
     };
     let active_of = |btn: ControlButton| match btn {
         ControlButton::Halt => false,
-        ControlButton::Form(FormCmd::Wall) => all_wall,
+        ControlButton::Form(FormCmd::Wall) => any_wall && all_wall,
         ControlButton::Form(FormCmd::Loose) => all_loose,
         ControlButton::Form(FormCmd::Hold) => all_hold,
         ControlButton::Form(FormCmd::FireAtWill) => any_archer && all_faw,
@@ -1226,7 +1227,8 @@ fn refresh_control_buttons(
         if matches!(interaction, Interaction::Hovered | Interaction::Pressed) {
             hovered = Some(*btn);
         }
-        let want = if !any || (archer_btn(*btn) && !any_archer) {
+        let wall_btn = *btn == ControlButton::Form(FormCmd::Wall);
+        let want = if !any || (archer_btn(*btn) && !any_archer) || (wall_btn && !any_wall) {
             BTN_DISABLED
         } else {
             match (active_of(*btn), interaction) {
@@ -1242,8 +1244,9 @@ fn refresh_control_buttons(
 
     // Stateful icons preview what pressing yields: the Loose icon shows
     // the target spacing, the Wall icon the wall the selection's KIND
-    // would form (spearwall when everything picked is spears).
-    let wall_spear = any && all_spear;
+    // would form (spearwall when everything picked that can form one is
+    // spears).
+    let wall_spear = any_wall && all_spear;
     for (icon, mut vis) in &mut icons {
         let alt_wanted = match icon.btn {
             ControlButton::Form(FormCmd::Loose) => any && all_loose,
