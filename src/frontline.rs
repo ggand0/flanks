@@ -342,6 +342,10 @@ struct RegimentSums {
     /// The foremost living man's distance ahead of the centroid along
     /// the forward vector (`GroupData::lead`).
     lead: f32,
+    /// The living men's velocities summed, and their number
+    /// (`GroupData::vel`).
+    vel: Vec2,
+    alive: u32,
     line_sum: f32,
     line_n: u32,
     fight_n: u32,
@@ -373,6 +377,8 @@ fn regiment_sums(
         front_off: f32::MIN,
         back_off: f32::MAX,
         lead: f32::MIN,
+        vel: Vec2::ZERO,
+        alive: 0,
         line_sum: 0.0,
         line_n: 0,
         fight_n: 0,
@@ -390,6 +396,8 @@ fn regiment_sums(
             a.home += units.home[i];
             if units.death_t[i] == 0 {
                 a.lead = a.lead.max((p - pc).dot(f));
+                a.vel += Vec2::new(units.vel[i].x, units.vel[i].z);
+                a.alive += 1;
             }
             a.r2 += (p - pc).length_squared();
             a.slot_err += (p - pc - units.home[i] + pb).length();
@@ -498,6 +506,7 @@ fn update_groups(
         group.home_bias = sums[g].home / counts[g] as f32;
         // Measured against last tick's centroid, a step at most off.
         group.lead = if sums[g].lead > f32::MIN { sums[g].lead } else { 0.0 };
+        group.vel = if sums[g].alive > 0 { sums[g].vel / sums[g].alive as f32 } else { Vec2::ZERO };
         // Formation disorder: how far the regiment stands from its slots,
         // smoothed ~2 s. Only Rect makes the discipline claim.
         let err = if group.shape == crate::formation::FormShape::Rect {

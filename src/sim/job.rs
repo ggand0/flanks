@@ -393,10 +393,19 @@ fn rect_gap(a: &crate::formation::BlockRect, b: &crate::formation::BlockRect) ->
     dist - a.reach_along(u) - b.reach_along(-u)
 }
 
-/// How far `g`'s bows reach toward `t` from `from` (metres): the bows'
-/// range, plus three seconds of `t`'s speed toward `from` (the shafts
-/// land where the target will be), plus the height `from` stands above
-/// `t` (the high ground's reach).
+/// How far `g`'s bows reach toward `t` from `from` (metres) with `t`
+/// standing: the bows' range plus the height `from` stands above `t`
+/// (the high ground's reach). The ground the firing place is laid on.
+fn bow_reach_standing(g: &GroupData, from: Vec2, t: &GroupData, terrain: &Terrain) -> f32 {
+    let height = terrain.height_at(from.x, from.y) - terrain.height_at(t.centroid.x, t.centroid.y);
+    crate::unit_types::bow_range(g.kind) + height
+}
+
+/// How far `g`'s bows reach toward `t` from `from` (metres): the
+/// standing reach plus three seconds of `t`'s speed toward `from` (the
+/// shafts land where the target will be). The range test's reach; the
+/// firing place does not follow the target's speed, or the regiment
+/// would walk back and forth with every change of it.
 fn bow_reach_toward(
     g: &GroupData,
     from: Vec2,
@@ -405,9 +414,7 @@ fn bow_reach_toward(
     terrain: &Terrain,
 ) -> f32 {
     let to_g = (from - t.centroid).normalize_or_zero();
-    let closing = t_vel.dot(to_g);
-    let height = terrain.height_at(from.x, from.y) - terrain.height_at(t.centroid.x, t.centroid.y);
-    crate::unit_types::bow_range(g.kind) + 3.0 * closing + height
+    bow_reach_standing(g, from, t, terrain) + 3.0 * t_vel.dot(to_g)
 }
 
 /// Whether `g` can shoot at `t` from where it stands: the edge gap
@@ -436,14 +443,14 @@ fn frame_in_bow_range(
 /// of its reach short of the target's near edge, kept inside the map.
 /// Every man walks to his slot about it, so no slot lies in the enemy
 /// and a column's head stops at the place like everyone else.
-fn firing_place(g: &GroupData, t: &GroupData, t_vel: Vec2, terrain: &Terrain) -> Vec2 {
+fn firing_place(g: &GroupData, t: &GroupData, terrain: &Terrain) -> Vec2 {
     let to_t = t.centroid - g.centroid;
     let dist = to_t.length();
     if dist < 1e-3 {
         return g.centroid;
     }
     let u = to_t / dist;
-    let reach = bow_reach_toward(g, g.centroid, t, t_vel, terrain);
+    let reach = bow_reach_standing(g, g.centroid, t, terrain);
     let short = crate::formation::block_reach_along(t, -u)
         + (CLOSE_IN * reach).max(0.0)
         + crate::formation::block_rect(g).half_d;
@@ -721,10 +728,13 @@ fn skirmish_reactions(
         let horizon = if gd.skirmishing { APPROACH_S + SKIRMISH_RETREAT_S } else { APPROACH_S };
         let standing = gd.order.is_none() || gd.standoff || gd.skirmish_hold.is_some();
         let cap = if standing { 0.8 * range } else { 1.1 * range };
-        // A running regiment's path is the run's; a standing one has
-        // none: neither holds.
-        let own_dir =
-            if gd.skirmishing || gd.standoff { None } else { heading_of(gl, g, vel(g)) };
+        // A running regiment's path is the run's; a standing one, or one
+        // without an order, has none: none of them holds.
+        let own_dir = if gd.skirmishing || gd.standoff || gd.order.is_none() {
+            None
+        } else {
+            heading_of(gl, g, vel(g))
+        };
         // The path ahead starts at the leading men: a column strung out
         // round a friendly block is seen by its head. A regiment already
         // holding looks SKIRMISH_NEAR further, the hysteresis: it walks on
@@ -875,7 +885,7 @@ fn archer_fire_solutions(
             continue;
         }
         let t_vel = vel(target as usize);
-        let place = firing_place(gd, td, t_vel, terrain);
+        let place = firing_place(gd, td, terrain);
         let fresh = gd.standoff_target != Some(target);
         let was = gd.standoff && !fresh;
         // A fresh order shoots where it stands when it can; a standing
@@ -890,6 +900,18 @@ fn archer_fire_solutions(
             head_arrived(gd, place) && frame_in_bow_range(gd, place, td, t_vel, terrain)
         };
         let to_target = td.centroid - gd.centroid;
+        if now != gd.standoff || fresh {
+            let gap = edge_gap(gd, td);
+            let reach = bow_reach_toward(gd, gd.centroid, td, t_vel, terrain);
+            info!(
+                "regiment {g} {} its target {target} (gap {gap:.1} m, reach {reach:.1} m, \
+                 place {:.1} m off, lead {:.1} m{})",
+                if now { "stands off" } else { "marches at" },
+                gd.centroid.distance(place),
+                gd.lead,
+                if fresh { ", fresh order" } else { "" },
+            );
+        }
         let gd = &mut groups.list[g];
         gd.standoff_target = Some(target);
         gd.standoff = now;

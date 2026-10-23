@@ -426,6 +426,11 @@ fn spawn_archery_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups)
         groups.list = list;
         return;
     }
+    if let Ok(v) = std::env::var("FL_ARCHERY_SIDE") {
+        spawn_archery_side(units, terrain, &mut list, size, v == "2");
+        groups.list = list;
+        return;
+    }
     // Blue: light screen up front, two archer blocks behind it.
     spawn_regiment(units, terrain, &mut list, 0, KIND_LIGHT, Vec2::new(0.0, -70.0), size, -1.0);
     list[0].hold = true;
@@ -543,6 +548,52 @@ fn spawn_archery_blocked(
     );
 }
 
+/// FL_ARCHERY_SIDE=1: the partly blocked march at a target off to the
+/// side: an archer regiment ordered at an enemy block far off to the
+/// right and ahead, a friendly block across the
+/// left part of its path only, so part of the regiment is caught in the
+/// friend while the rest streams past its end, and a closer enemy block
+/// off the path. FL_ARCHERY_SIDE=2: the target walks away slowly, the
+/// case of a target drifting about the edge of range. Indices as the
+/// base scene's: 0 the friendly block, 1 and 2 the archers, 3 to 5
+/// orange, 5 the target, 4 the closer block.
+fn spawn_archery_side(
+    units: &mut Units,
+    terrain: &Terrain,
+    list: &mut Vec<GroupData>,
+    size: usize,
+    walks: bool,
+) {
+    spawn_regiment(units, terrain, list, 0, KIND_LIGHT, Vec2::new(-40.0, -100.0), size, -1.0);
+    list[0].hold = true;
+    for x in [-30.0, 30.0] {
+        spawn_regiment(units, terrain, list, 0, KIND_ARCHER, Vec2::new(x, -150.0), size, -1.0);
+    }
+    for (x, z) in [(-120.0, 160.0), (0.0, 60.0), (150.0, 150.0)] {
+        spawn_regiment(units, terrain, list, 1, KIND_LIGHT, Vec2::new(x, z), size, 1.0);
+        let g = list.len() - 1;
+        list[g].hold = true;
+    }
+    for g in [1, 2] {
+        list[g].order = Some(crate::orders::Order::Attack(5));
+    }
+    if walks {
+        list[5].hold = false;
+        list[5].order = Some(crate::orders::Order::Move(Vec2::new(170.0, 230.0)));
+    }
+    if std::env::var("FL_ARCHERY_NOSKIRMISH").is_ok() {
+        for g in [1, 2] {
+            list[g].skirmish = false;
+        }
+    }
+    info!(
+        "[archery] side march: both archer regiments ordered at the far block (5) off to the \
+         right, a friendly block across the left part of regiment 1's path, a closer orange \
+         block (4) off the path{}",
+        if walks { ", the target walking away" } else { "" }
+    );
+}
+
 /// The blocked march's numbers for one archer regiment: the leading
 /// man's distance to the target block's edge and to the block in the
 /// way, the men swinging a weapon (in melee), and where the regiment
@@ -647,7 +698,9 @@ fn archery_log(
             )
         })
         .unwrap_or_default();
-    let blocked = if std::env::var("FL_ARCHERY_BLOCKED").is_ok() {
+    let blocked = if std::env::var("FL_ARCHERY_BLOCKED").is_ok()
+        || std::env::var("FL_ARCHERY_SIDE").is_ok()
+    {
         blocked_march_report(&groups, &units, 1) + &blocked_march_report(&groups, &units, 2)
     } else {
         String::new()

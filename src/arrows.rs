@@ -100,11 +100,12 @@ impl Arrows {
     }
 }
 
-/// Per-regiment centroid velocity (m/s, EMA-smoothed): the volley lead.
-/// Updated here each tick, read by step_sim's loose the next tick.
+/// Per-regiment velocity (m/s, EMA-smoothed): the volley lead, and the
+/// range tests' closing speed. Updated here each tick from the men's
+/// mean velocity (`GroupData::vel`), read by step_sim's loose the next
+/// tick.
 #[derive(Resource, Default)]
 pub struct RegTracks {
-    last: Vec<Vec2>,
     pub vel: Vec<Vec2>,
 }
 
@@ -332,17 +333,16 @@ fn update_arrows(
     let dt = time.delta_secs();
     *tick = tick.wrapping_add(1);
 
-    // Regiment centroid velocities (the volley lead, one tick stale by
-    // construction — step_sim consumed last tick's values already).
-    if tracks.last.len() != groups.list.len() {
-        tracks.last = groups.list.iter().map(|g| g.centroid).collect();
+    // Regiment velocities (the volley lead, one tick stale by
+    // construction: step_sim consumed last tick's values already): the
+    // men's mean velocity, not the centroid's motion, which jumps when
+    // men fall and read as a speed of tens of m/s for a dying block.
+    if tracks.vel.len() != groups.list.len() {
         tracks.vel = vec![Vec2::ZERO; groups.list.len()];
     }
     for (g, gd) in groups.list.iter().enumerate() {
-        let v = (gd.centroid - tracks.last[g]) / dt.max(1e-3);
-        // EMA over ~0.5 s: per-tick centroid noise must not steer aim.
-        tracks.vel[g] = tracks.vel[g] * 0.9 + v * 0.1;
-        tracks.last[g] = gd.centroid;
+        // EMA over ~0.5 s: per-tick noise must not steer aim.
+        tracks.vel[g] = tracks.vel[g] * 0.9 + gd.vel * 0.1;
     }
 
     // Drain this tick's looses into the pool.

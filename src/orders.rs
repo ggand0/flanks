@@ -248,6 +248,10 @@ pub struct GroupData {
     /// centre along its facing (metres; frontline.rs). A column strung
     /// out on the march is seen by its head, not its middle.
     pub lead: f32,
+    /// The mean velocity of its living men (m/s; frontline.rs): how the
+    /// regiment moves. The centroid's own motion is not that: it jumps
+    /// whenever men fall, and a shrinking block's jumps read as speed.
+    pub vel: Vec2,
 }
 
 impl GroupData {
@@ -317,6 +321,7 @@ impl GroupData {
             standoff_target: None,
             fire_place: None,
             lead: 0.0,
+            vel: Vec2::ZERO,
         }
     }
 }
