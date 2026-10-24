@@ -29,6 +29,33 @@ pub(crate) struct ShootAt {
     pub(crate) search: bool,
 }
 
+/// Ticks between two looks of an archer regiment at the blocks about
+/// it: the skirmish triggers, the fire solutions' scan and the sidearm
+/// reasons, each a pass over every block on the field, staggered by
+/// regiment so a quarter of the archer regiments look each tick. Seven
+/// and a half looks a second; a block moves at most a metre between
+/// two. What a look found is kept until the next.
+pub(crate) const ARCHER_LOOK: u32 = 4;
+
+/// What an archer regiment's scan of the field found, kept between
+/// looks (`archer_fire_solutions`): the block coming for it, the
+/// nearest block in range that is not in melee, and the blocks in melee
+/// in range, each with its edge gap. `tick` is the look's; u32::MAX
+/// marks a regiment that has not looked.
+#[derive(Clone)]
+pub(crate) struct ArcherScan {
+    pub(crate) tick: u32,
+    pub(crate) danger: Option<(f32, usize)>,
+    pub(crate) best_free: Option<(f32, usize)>,
+    pub(crate) busy: Vec<(f32, usize)>,
+}
+
+impl Default for ArcherScan {
+    fn default() -> Self {
+        Self { tick: u32::MAX, danger: None, best_free: None, busy: Vec::new() }
+    }
+}
+
 /// Why an archer regiment's men take their knives out this tick
 /// (sim/soldier.rs SIGHT_KNIFE). Empty for every other regiment.
 #[derive(Clone, Default)]
@@ -151,6 +178,9 @@ pub struct TickJob {
     pub(crate) search_blocks: Vec<Vec<u32>>,
     /// Per regiment: why its men take their knives out (archers only).
     pub(crate) sidearm: Vec<Sidearm>,
+    /// Per regiment: what its last look at the field found (archers
+    /// only; prep's own, between looks).
+    pub(crate) archer_scans: Vec<ArcherScan>,
     /// The clear men of every regiment under search, per regiment, in
     /// index order: no enemy in their reach (sim/soldier.rs SIGHT_FOE,
     /// as of the last tick) and farther than a shaft's reach from every
@@ -292,7 +322,8 @@ pub(crate) fn prepare_tick(
     let t1 = std::time::Instant::now();
     skirmish_reactions(groups, tracks, terrain, tick);
     let t2 = std::time::Instant::now();
-    let fire = archer_fire_solutions(groups, tracks, terrain, &job.clear_members);
+    let fire =
+        archer_fire_solutions(groups, tracks, terrain, &job.clear_members, &mut job.archer_scans, tick);
     let t3 = std::time::Instant::now();
     job.orders = resolve_orders(groups, routes);
     routes.fill_job(&mut job.plan_requests, &mut job.routes, &mut job.nav, groups.list.len());
@@ -319,7 +350,8 @@ pub(crate) fn prepare_tick(
     job.search_blocks = fire.search_blocks;
     job.clear_blocks = fire.clear_blocks;
     job.blocks = fire.blocks;
-    job.sidearm = sidearm_reasons(groups, tracks, terrain);
+    let last = std::mem::take(&mut job.sidearm);
+    job.sidearm = sidearm_reasons(groups, tracks, terrain, &last, tick);
     job.field.size_to(terrain.min(), terrain.max());
     let t5 = std::time::Instant::now();
     log_prep([t1 - t0, t2 - t1, t3 - t2, t4 - t3, t5 - t4, t5 - t0]);
@@ -650,8 +682,9 @@ const SKIRMISH_WALK_AHEAD: f32 = 50.0;
 const SKIRMISH_SCOPE: f32 = 1.5;
 /// Headings tried for the retreat point.
 const RETREAT_HEADINGS: u32 = 32;
-/// Ticks between two recomputations of a running regiment's point.
-const RETREAT_REFRESH: u32 = 15;
+/// Ticks between two recomputations of a running regiment's point, a
+/// multiple of ARCHER_LOOK so the look falls on a recomputation.
+const RETREAT_REFRESH: u32 = 16;
 
 /// Where a regiment runs to: a bow's range from where it stands, times
 /// (1 + the nearest enemy's speed over its own, at most 1), in the one of
@@ -779,6 +812,11 @@ fn skirmish_reactions(
             if new.is_some() {
                 groups.list[g].skirmish_saved = new;
             }
+        }
+        // The regiment's look at the field, every ARCHER_LOOK ticks;
+        // between looks it keeps on as it is.
+        if !tick.wrapping_add(g as u32).is_multiple_of(ARCHER_LOOK) {
+            continue;
         }
         let gl: &Groups = &*groups;
         let gd = &gl.list[g];
@@ -916,9 +954,12 @@ fn archer_fire_solutions(
     tracks: &crate::arrows::RegTracks,
     terrain: &Terrain,
     clear_members: &[Vec<u32>],
+    scans: &mut Vec<ArcherScan>,
+    tick: u32,
 ) -> FireSolutions {
     let n_groups = groups.list.len();
     let vel = |t: usize| tracks.vel.get(t).copied().unwrap_or(Vec2::ZERO);
+    scans.resize_with(n_groups, Default::default);
 
     // The stand-off of every archer regiment under an attack order.
     for g in 0..n_groups {
@@ -1025,11 +1066,17 @@ fn archer_fire_solutions(
             // With fire at will on, the enemy blocks about: one coming for
             // the regiment within the approach horizon (`danger`), the
             // nearest in range that is not in melee, and those in melee.
-            let mut danger: Option<(f32, usize)> = None;
-            let mut best_free: Option<(f32, usize)> = None;
-            let mut busy: Vec<(f32, usize)> = Vec::new();
+            // The look is made every ARCHER_LOOK ticks and kept between
+            // looks; a block that died since is dropped.
             let range = crate::unit_types::bow_range(gd.kind);
-            if gd.fire_at_will {
+            let scan = &mut scans[g];
+            if !gd.fire_at_will {
+                *scan = ArcherScan::default();
+            } else if scan.tick == u32::MAX || tick.wrapping_add(g as u32).is_multiple_of(ARCHER_LOOK)
+            {
+                let mut danger: Option<(f32, usize)> = None;
+                let mut best_free: Option<(f32, usize)> = None;
+                let mut busy: Vec<(f32, usize)> = Vec::new();
                 for e in 0..n_groups {
                     if !live(e) {
                         continue;
@@ -1052,7 +1099,12 @@ fn archer_fire_solutions(
                         best_free = Some((gap, e));
                     }
                 }
+                *scan = ArcherScan { tick, danger, best_free, busy };
             }
+            let danger = scan.danger.filter(|&(_, e)| live(e));
+            let best_free = scan.best_free.filter(|&(_, e)| live(e));
+            let mut busy: Vec<(f32, usize)> =
+                scan.busy.iter().copied().filter(|&(_, e)| live(e)).collect();
             // A regiment standing instead of walking into an enemy block
             // shoots that block, whatever its order and fire at will say,
             // unless a block is coming for it.
@@ -1214,14 +1266,26 @@ fn sidearm_reasons(
     groups: &Groups,
     tracks: &crate::arrows::RegTracks,
     terrain: &Terrain,
+    last: &[Sidearm],
+    tick: u32,
 ) -> Vec<Sidearm> {
     let vel = |t: usize| tracks.vel.get(t).copied().unwrap_or(Vec2::ZERO);
     groups
         .list
         .iter()
-        .map(|gd| {
+        .enumerate()
+        .map(|(g, gd)| {
             let mut arm = Sidearm::default();
             if gd.kind != crate::unit_types::KIND_ARCHER || gd.count == 0 {
+                return arm;
+            }
+            // The look at the blocks about, every ARCHER_LOOK ticks; the
+            // swords-out order is read every tick.
+            if let Some(kept) = last.get(g)
+                && !tick.wrapping_add(g as u32).is_multiple_of(ARCHER_LOOK)
+            {
+                arm = kept.clone();
+                arm.swords = gd.melee;
                 return arm;
             }
             arm.swords = gd.melee;
