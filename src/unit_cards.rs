@@ -1177,7 +1177,7 @@ fn control_buttons(
 fn refresh_control_buttons(
     groups: Res<Groups>,
     selection: Res<Selection>,
-    mut query: Query<(&ControlButton, &Interaction, &mut BackgroundColor)>,
+    mut query: Query<(&ControlButton, &Interaction, &mut BackgroundColor, &mut Node)>,
     mut icons: Query<(&StatefulIcon, &mut Visibility)>,
     mut tooltips: Query<(&BtnTooltip, &mut Visibility), Without<StatefulIcon>>,
     mut wall_tip_text: Query<&mut Text, With<WallTooltipText>>,
@@ -1223,7 +1223,15 @@ fn refresh_control_buttons(
     };
 
     let mut hovered: Option<ControlButton> = None;
-    for (btn, interaction, mut bg) in &mut query {
+    for (btn, interaction, mut bg, mut node) in &mut query {
+        // Swords Out is the archers' button alone: with no archer in the
+        // selection it leaves the bar (Display, so the row closes up),
+        // since a drawn sword on a knight's card reads as his state.
+        let shown = *btn != ControlButton::Form(FormCmd::Melee) || any_archer;
+        let display = if shown { Display::Flex } else { Display::None };
+        if node.display != display {
+            node.display = display;
+        }
         if matches!(interaction, Interaction::Hovered | Interaction::Pressed) {
             hovered = Some(*btn);
         }
