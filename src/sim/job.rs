@@ -322,8 +322,16 @@ pub(crate) fn prepare_tick(
     let t1 = std::time::Instant::now();
     skirmish_reactions(groups, tracks, terrain, tick);
     let t2 = std::time::Instant::now();
-    let fire =
-        archer_fire_solutions(groups, tracks, terrain, &job.clear_members, &mut job.archer_scans, tick);
+    let kept_clear_blocks = std::mem::take(&mut job.clear_blocks);
+    let fire = archer_fire_solutions(
+        groups,
+        tracks,
+        terrain,
+        &job.clear_members,
+        &mut job.archer_scans,
+        kept_clear_blocks,
+        tick,
+    );
     let t3 = std::time::Instant::now();
     job.orders = resolve_orders(groups, routes);
     routes.fill_job(&mut job.plan_requests, &mut job.routes, &mut job.nav, groups.list.len());
@@ -955,6 +963,7 @@ fn archer_fire_solutions(
     terrain: &Terrain,
     clear_members: &[Vec<u32>],
     scans: &mut Vec<ArcherScan>,
+    kept_clear_blocks: Vec<Vec<crate::formation::BlockRect>>,
     tick: u32,
 ) -> FireSolutions {
     let n_groups = groups.list.len();
@@ -1197,17 +1206,31 @@ fn archer_fire_solutions(
     // `clear_members`). A block with a wider gap has no point of its
     // footprint within the reach of any man inside the searched block.
     // Broken blocks count too: the rectangle sits on the men's centroid.
+    // Listed every ARCHER_LOOK ticks per searched block, staggered, and
+    // kept between (the last tick's list, or none for a block newly
+    // under search).
     let clear_r = clear_reach();
-    let clear_blocks: Vec<Vec<crate::formation::BlockRect>> = (0..n_groups)
-        .map(|e| {
+    let mut kept = kept_clear_blocks;
+    kept.resize_with(n_groups, Vec::new);
+    let clear_blocks: Vec<Vec<crate::formation::BlockRect>> = kept
+        .into_iter()
+        .enumerate()
+        .map(|(e, old)| {
             if !searched[e] {
                 return Vec::new();
+            }
+            if !old.is_empty() && !tick.wrapping_add(e as u32).is_multiple_of(ARCHER_LOOK) {
+                return old;
             }
             let eg = &groups.list[e];
             groups
                 .list
                 .iter()
-                .filter(|fg| fg.team != eg.team && fg.count > 0 && edge_gap(fg, eg) <= clear_r)
+                .filter(|fg| {
+                    fg.team != eg.team
+                        && fg.count > 0
+                        && gap_within(fg, eg, clear_r).is_some_and(|gap| gap <= clear_r)
+                })
                 .map(crate::formation::block_rect)
                 .collect()
         })
