@@ -362,11 +362,12 @@ const REGIMENTS_PER_TASK: usize = 16;
 
 /// One regiment's sums over its men, walking its runs in index order. `pc`
 /// and `pb` are its centroid and home bias from the last tick, `f` its
-/// forward vector, `tg` its attack target.
+/// forward vector, `tg` its attack target, `bows` whether it is an archer
+/// regiment, the only kind whose lead and velocity anything reads.
 fn regiment_sums(
     units: &Units,
     runs: &[(u32, u32)],
-    (pc, pb, f, tg): (Vec2, Vec2, Vec2, Option<u32>),
+    (pc, pb, f, tg, bows): (Vec2, Vec2, Vec2, Option<u32>, bool),
 ) -> RegimentSums {
     let mut a = RegimentSums {
         pos: Vec2::ZERO,
@@ -394,7 +395,7 @@ fn regiment_sums(
             a.pos += p;
             a.count += 1;
             a.home += units.home[i];
-            if units.death_t[i] == 0 {
+            if bows && units.death_t[i] == 0 {
                 a.lead = a.lead.max((p - pc).dot(f));
                 a.vel += Vec2::new(units.vel[i].x, units.vel[i].z);
                 a.alive += 1;
@@ -464,20 +465,22 @@ fn update_groups(
             _ => None,
         })
         .collect();
+    let bows: Vec<bool> = groups.list.iter().map(|g| g.kind == crate::unit_types::KIND_ARCHER).collect();
     // The sums over the men, a pool task per few regiments, each regiment's
     // runs walked in index order: the same additions in the same order as
     // one scan of the army, regiment by regiment, so the same bits. Bevy's
     // scope returns the tasks' results in spawn order.
     let units = &*units;
     let runs = &*runs;
-    let (prev_cents_r, prev_bias_r, fwd_r, target_r) =
-        (&prev_cents, &prev_bias, &fwd, &attack_target);
+    let (prev_cents_r, prev_bias_r, fwd_r, target_r, bows_r) =
+        (&prev_cents, &prev_bias, &fwd, &attack_target, &bows);
     let batches: Vec<Vec<RegimentSums>> = bevy::tasks::ComputeTaskPool::get().scope(|scope| {
         for first in (0..n).step_by(REGIMENTS_PER_TASK) {
             scope.spawn(async move {
                 (first..n.min(first + REGIMENTS_PER_TASK))
                     .map(|g| {
-                        let regiment = (prev_cents_r[g], prev_bias_r[g], fwd_r[g], target_r[g]);
+                        let regiment =
+                            (prev_cents_r[g], prev_bias_r[g], fwd_r[g], target_r[g], bows_r[g]);
                         regiment_sums(units, runs.of(g), regiment)
                     })
                     .collect::<Vec<RegimentSums>>()
