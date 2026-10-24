@@ -327,6 +327,20 @@ pub fn do_spawn_battle(
         for k in [KIND_HEAVY, KIND_SPEAR, KIND_LIGHT, KIND_ARCHER] {
             kinds.extend(std::iter::repeat_n(k, comp[k as usize]));
         }
+        // FL_ARCHER_SCATTER=1: the archer regiments stand spread through
+        // the army, one at the middle of each equal stretch of the
+        // ladder, instead of together in the rear ranks. The scene of the
+        // ten-archer measurement: every archer regiment has its own
+        // neighbours and its own enemy blocks in range.
+        let n_archer = comp[KIND_ARCHER as usize];
+        if std::env::var("FL_ARCHER_SCATTER").is_ok() && n_archer > 0 {
+            let n = kinds.len();
+            let slots: Vec<usize> = (0..n_archer).map(|k| (2 * k + 1) * n / (2 * n_archer)).collect();
+            let mut others = kinds.iter().copied().filter(|&k| k != KIND_ARCHER);
+            kinds = (0..n)
+                .map(|r| if slots.contains(&r) { KIND_ARCHER } else { others.next().unwrap_or(KIND_LIGHT) })
+                .collect();
+        }
         let n_regs = kinds.len();
         let dir: f32 = if team == 0 { -1.0 } else { 1.0 };
         let rank_z = |rank: usize| dir * (army_gap / 2.0 + block_d / 2.0 + rank as f32 * (block_d + REG_GAP));
