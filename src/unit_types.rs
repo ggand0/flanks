@@ -34,8 +34,10 @@ pub mod missile {
     /// EDU missile attack: Peasant Archers 5, Longbowmen 6, Yeoman 8.
     /// Plain-archer tier with a bit of punch: plain archers first.
     pub const ATTACK: f32 = 6.0;
-    /// Meters, the vanilla `arrow` range (bodkin/composite reach 160).
-    pub const RANGE: f32 = 120.0;
+    /// How far a man shoots at a man, as a share of his kind's
+    /// `bow_range`: stretched by a fifth, since the regiment is in range
+    /// by its front edge and the rear ranks stand that much further back.
+    pub const REACH_FACTOR: f32 = 1.2;
     /// Arrows per man — 30 for every vanilla foot archer.
     pub const AMMO: u8 = 30;
     /// Draw time before the loose (ticks at 30 Hz): 1.5 s.
@@ -55,6 +57,11 @@ pub mod missile {
     /// Landing scatter sigma in meters, RANGE-INDEPENDENT (the measured
     /// M2TW quirk: accuracy does not improve up close).
     pub const SCATTER_SIGMA: f32 = 3.0;
+    /// The aim's spread: a shaft lands within this of its aim point in
+    /// each axis (two draws summed, sim/soldier.rs). With the shaft's
+    /// fall through the strike band it gives the distance a target man
+    /// must keep from the shooter's friends to be clear (`SIGHT_CLEAR`).
+    pub const AIM_SPREAD: f32 = SCATTER_SIGMA * 1.75;
     /// Missile damage curve, CALIBRATED against archery-range logs.
     /// Arrows use a steeper factor multiplier than melee:
     /// armour and shields blunt a falling shaft far harder than they
@@ -142,6 +149,24 @@ pub struct UnitTypeParams {
     /// Half the soldier's height, feet to helmet top; units sit on the
     /// terrain at this Y. Every kind is 1.70 m.
     pub half_height: f32,
+    /// The bow's range in metres, 0 for a kind without one. Every
+    /// distance a shooting regiment measures follows from it: the
+    /// regiment's range test is the gap between the two blocks' edges
+    /// (sim/job.rs `in_bow_range`), the attack order closes in to
+    /// `sim/job.rs::CLOSE_IN` of it, a man shoots a man within
+    /// `missile::REACH_FACTOR` of it (`bow_reach`). The archer's 120 is
+    /// the vanilla `arrow` range (bodkin and composite reach 160).
+    pub bow_range: f32,
+}
+
+/// The bow's range of a kind (metres), 0 for a kind without one.
+pub fn bow_range(kind: u8) -> f32 {
+    TYPES[kind as usize].bow_range
+}
+
+/// How far a man of `kind` shoots at a man (metres).
+pub fn bow_reach(kind: u8) -> f32 {
+    bow_range(kind) * missile::REACH_FACTOR
 }
 
 /// The pause between swings is `cooldown_ticks` times a factor drawn
@@ -271,6 +296,7 @@ pub const TYPES: [UnitTypeParams; NUM_KINDS] = [
         discipline: 0.6,
         fatigue_rate: 1.3,
         half_height: 0.85,
+        bow_range: 0.0,
     },
     // KIND_LIGHT — men-at-arms: fast, fragile, quicker swings, spear reach.
     UnitTypeParams {
@@ -297,6 +323,7 @@ pub const TYPES: [UnitTypeParams; NUM_KINDS] = [
         discipline: 1.0,
         fatigue_rate: 1.0,
         half_height: 0.85,
+        bow_range: 0.0,
     },
     // KIND_SPEAR — spear infantry: chainmail line troops behind big
     // shields. Longest reach (first strike on contact), steadier than
@@ -325,6 +352,7 @@ pub const TYPES: [UnitTypeParams; NUM_KINDS] = [
         discipline: 0.85,
         fatigue_rate: 1.1,
         half_height: 0.85,
+        bow_range: 0.0,
     },
     // KIND_ARCHER — levy bowmen: the ranged kind (missile stats live in
     // `missile`); this row is their WEAK melee fallback. Flesh-tier
@@ -353,6 +381,7 @@ pub const TYPES: [UnitTypeParams; NUM_KINDS] = [
         discipline: 1.15,
         fatigue_rate: 0.9,
         half_height: 0.85,
+        bow_range: 120.0,
     },
 ];
 

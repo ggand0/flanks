@@ -97,6 +97,11 @@ const CORR_GAIN: f32 = 0.15;
 const CORR_MAX: f32 = 0.1;
 /// Units slow down proportionally inside this distance to the target.
 const ARRIVE_RADIUS: f32 = 35.0;
+/// How close to his slot a parked man stands without stepping (metres):
+/// rigid slots sit exactly at the separation rest distance, so a dressed
+/// rank is force-free and can afford a tight tolerance; with 1.5 the
+/// ranks never finished dressing.
+pub(crate) const HOLD_DEADZONE: f32 = 0.7;
 /// A holding soldier who leaves his mark by more than the hold deadzone
 /// walks back at this pace at least, and keeps going until he is within
 /// STEP_STOP of it: a real step, never a creep. M2TW's slowest
@@ -192,6 +197,24 @@ const SIGHT_MARK: u16 = 1 << 4;
 const SIGHT_GO: u16 = 1 << 5;
 const SIGHT_GO_FAR: u16 = 1 << 6;
 const SIGHT_BACK: u16 = 1 << 7;
+/// An enemy stands in his weapon's reach (the scan's finding, every
+/// tick): the archers' search never aims at him (sim/mod.rs
+/// `clear_members`).
+pub(crate) const SIGHT_FOE: u16 = 1 << 8;
+/// An archer's knife: bits 10 to 14 count down (one every fourth tick)
+/// from the last tick an enemy came close to him (`KNIFE_HOLD`), and
+/// `SIGHT_KNIFE` is set while the knife is out, by that count or by his
+/// regiment's swords-out order. With it out he draws no bow, and the
+/// renderer shows the knife and hides the bow (render_units_gpu.rs).
+const SIGHT_KNIFE_SHIFT: u16 = 10;
+const SIGHT_KNIFE_COUNT: u16 = 0x1f << SIGHT_KNIFE_SHIFT;
+pub(crate) const SIGHT_KNIFE: u16 = 1 << 15;
+/// The count an enemy close to him sets: 31 steps of four ticks, about
+/// 4 s at 30 ticks a second, before he puts the knife away.
+const KNIFE_HOLD: u16 = 31;
+/// How close an enemy block's edge comes before he takes his knife out:
+/// about two seconds of a charge, one bow draw.
+pub(crate) const KNIFE_EDGE: f32 = 10.0;
 /// Even with nobody going in sight, a man joins once his regiment has
 /// been in melee longer than his own patience, spread between these
 /// (seconds; FL_JOIN_PATIENCE sets the upper end): the fight's noise and
@@ -291,6 +314,16 @@ pub(crate) struct Field<'a> {
     pub fat_nocharge: &'a [bool],
     pub shoot_at: &'a [Option<crate::sim::job::ShootAt>],
     pub target_members: &'a [Vec<u32>],
+    /// Per regiment under search: its clear men, ascending (sim/mod.rs
+    /// `clear_members`).
+    pub clear_members: &'a [Vec<u32>],
+    /// Per archer regiment: the blocks its men search in, nearest first.
+    pub search_blocks: &'a [Vec<u32>],
+    /// Per regiment: why its men take their knives out (archers only).
+    pub sidearm: &'a [crate::sim::job::Sidearm],
+    /// The death column at the tick's start: another man's life, read
+    /// by the archer who picks him.
+    pub death_snap: &'a [u8],
     pub blocks: &'a [Vec<(Vec2, f32, f32)>; 2],
     pub faces_spearwall: [bool; 2],
     pub dt: f32,
@@ -320,6 +353,7 @@ pub(crate) struct Soldier<'a> {
     pub sight: &'a mut u16,
     pub way: &'a mut Vec2,
     pub chain: &'a mut u8,
+    pub quarry: &'a mut u32,
 }
 
 /// The rows of one chunk of soldiers, in index order.
@@ -339,6 +373,7 @@ pub(crate) struct Rows<'a> {
     pub sight: &'a mut [u16],
     pub way: &'a mut [Vec2],
     pub chain: &'a mut [u8],
+    pub quarry: &'a mut [u32],
 }
 
 /// What a chunk emits beside its rows: landed swings and loosed arrows.
@@ -420,6 +455,7 @@ pub(crate) fn tick_chunk(f: &Field, rows: Rows, out: &mut ChunkOut) {
             sight: &mut rows.sight[j],
             way: &mut rows.way[j],
             chain: &mut rows.chain[j],
+            quarry: &mut rows.quarry[j],
         };
         let mut st = begin(f, &mut s);
         drive(f, &mut s, &mut st);
@@ -593,15 +629,12 @@ fn drive(f: &Field, s: &mut Soldier, st: &mut Step) {
         }
         let to_goal = goal - p;
         let dist = to_goal.length();
-        // Hold deadzone: parked units don't jitter around their slot point.
-        // 0.7 m (was 1.5 when homes were jittered spawn offsets): rigid slots
-        // sit exactly at the separation rest distance, so a dressed rank is
-        // force-free and can afford tight tolerance — with 1.5 the ranks
-        // never finished dressing. A soldier already stepping finishes the
-        // step (STEP_STOP) instead of stalling at the deadzone's edge.
+        // Hold deadzone: parked units don't jitter around their slot point
+        // (HOLD_DEADZONE). A soldier already stepping finishes the step
+        // (STEP_STOP) instead of stalling at the deadzone's edge.
         let stepping = s.vel.xz().length_squared()
             > (0.5 * STEP_PACE) * (0.5 * STEP_PACE);
-        let deadzone = if stepping { STEP_STOP } else { 0.7 };
+        let deadzone = if stepping { STEP_STOP } else { HOLD_DEADZONE };
         if !(holding && dist < deadzone) {
             // Slope penalty: steep ground is slow ground. Wading the river is
             // slow too (the bridge deck is dry: full speed).
@@ -784,6 +817,33 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
             chain: 0,
         });
     }
+    // His mark for the archers (sim/mod.rs `clear_members`): every tick
+    // whether an enemy stands in his reach.
+    if !dying {
+        if best_idx != u32::MAX {
+            *s.sight |= SIGHT_FOE;
+        } else {
+            *s.sight &= !SIGHT_FOE;
+        }
+    }
+    // An archer's knife: out while his regiment has its swords out, and
+    // for a few seconds after an enemy came close to him, one in his
+    // reach, an enemy block's edge within KNIFE_EDGE of him, or with his
+    // quiver empty an enemy block in his regiment's bow range.
+    if !dying && st.my_kind == crate::unit_types::KIND_ARCHER as usize {
+        let arm = &f.sidearm[gi];
+        let close = best_idx != u32::MAX
+            || (*s.ammo == 0 && arm.foe_in_range)
+            || arm.blocks.iter().any(|b| b.distance(p) <= KNIFE_EDGE);
+        let mut count = (*s.sight & SIGHT_KNIFE_COUNT) >> SIGHT_KNIFE_SHIFT;
+        if close {
+            count = KNIFE_HOLD;
+        } else if count > 0 && f.tick.wrapping_add(i as u32).is_multiple_of(4) {
+            count -= 1;
+        }
+        let out = if arm.swords || count > 0 { SIGHT_KNIFE } else { 0 };
+        *s.sight = (*s.sight & !(SIGHT_KNIFE_COUNT | SIGHT_KNIFE)) | count << SIGHT_KNIFE_SHIFT | out;
+    }
     st.push = push;
     st.corr = corr;
     if overlap > 0.0 {
@@ -942,7 +1002,9 @@ fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
                 | (right as u16 * SIGHT_RIGHT)
                 | (back as u16 * SIGHT_BACK);
         }
-        *s.sight = (*s.sight & SIGHT_GO_FAR) | seen;
+        *s.sight = (*s.sight
+            & (SIGHT_GO_FAR | SIGHT_FOE | SIGHT_KNIFE_COUNT | SIGHT_KNIFE))
+            | seen;
     }
     let way_blocked = *s.sight & SIGHT_WAY != 0;
     let left_blocked = *s.sight & SIGHT_LEFT != 0;
@@ -1185,9 +1247,13 @@ fn swing(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
                 if *s.swing & crate::units::SWING_RANGED != 0 =>
             {
                 // Drawing the bow: feet planted, eyes on the target block.
+                // A man whose knife came out lets the draw go.
                 desired = Vec2::ZERO;
-                if let Some(shot) = &shoot_at[gi] {
-                    face_target = Some(shot.c);
+                let knife = *s.sight & SIGHT_KNIFE != 0;
+                if let Some(shot) = shoot_at[gi].as_ref().filter(|_| !knife) {
+                    let q = *s.quarry as usize;
+                    face_target =
+                        Some(if q < pos_prev.len() { pos_prev[q].xz() } else { shot.c });
                     if *s.swing_t == 0 {
                         let h = |k: u32| {
                             crate::units::hash01(
@@ -1195,13 +1261,20 @@ fn swing(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
                                     ^ (i as u32).wrapping_mul(k).wrapping_add(k),
                             )
                         };
-                        // Aim: an actual soldier of the target regiment (M2TW
-                        // keeps a per-soldier aim target), the M2TW range-
-                        // INDEPENDENT landing scatter, and a lead for the
-                        // block's drift over the flight. The footprint-disc
-                        // spot stands in only if every member died this tick.
+                        // Aim: the man he drew at (every man has his own
+                        // aim target) while he lives, else another man of
+                        // the block; the footprint-disc spot stands in only
+                        // if every member died this tick. Then the range-
+                        // INDEPENDENT landing scatter and a lead for the
+                        // block's drift over the flight.
                         let members = &target_members[shot.t];
-                        let base = if members.is_empty() {
+                        let q = *s.quarry as usize;
+                        let base = if q < pos_prev.len()
+                            && team[q] != team[i]
+                            && f.death_snap[q] == 0
+                        {
+                            pos_prev[q].xz()
+                        } else if members.is_empty() {
                             let ang =
                                 h(0x1F3B) * std::f32::consts::TAU;
                             let rad = shot.r * 0.85 * h(0x2E5D).sqrt();
@@ -1214,8 +1287,7 @@ fn swing(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
                                 as usize;
                             pos_prev[m].xz()
                         };
-                        let sigma =
-                            crate::unit_types::missile::SCATTER_SIGMA * 1.75;
+                        let sigma = crate::unit_types::missile::AIM_SPREAD;
                         let mut aim = base
                             + Vec2::new(
                                 (h(0x3B7F) + h(0x45A3) - 1.0) * sigma,
@@ -1259,7 +1331,8 @@ fn swing(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
                         *s.swing_t -= 1;
                     }
                 } else {
-                    // Target gone mid-draw: ease off and reassess shortly.
+                    // Target gone mid-draw, or the knife out: ease off and
+                    // reassess shortly.
                     *s.swing = crate::units::SWING_RECOVER;
                     *s.swing_t = crate::unit_types::missile::CANCEL_TICKS;
                 }
@@ -1454,16 +1527,16 @@ fn swing(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
                 } else if my_kind == crate::unit_types::KIND_ARCHER as usize
                     && !routed
                     && *s.ammo > 0
+                    && *s.sight & SIGHT_KNIFE == 0
                     && s.vel.xz().length_squared() < 4.0
                     && let Some(shot) = &shoot_at[gi]
-                    && p.distance_squared(shot.c)
-                        < crate::unit_types::missile::RANGE
-                            * crate::unit_types::missile::RANGE
+                    && let Some(q) = pick_quarry(f, s, p, gi, shot)
                 {
-                    // Nock and draw (foot archers shoot standing only; the
-                    // walk gate keeps a marching or skirmishing man's bow on
-                    // his back). Style bits stay 0: the stab pull-back IS the
-                    // string draw.
+                    // Nock and draw at his man (foot archers shoot standing
+                    // only; the speed test keeps a marching or skirmishing
+                    // man's bow on his back). Style bits stay 0: the stab
+                    // pull-back IS the string draw.
+                    *s.quarry = q;
                     *s.swing = crate::units::SWING_WINDUP
                         | crate::units::SWING_RANGED;
                     *s.swing_t = crate::unit_types::missile::DRAW_TICKS
@@ -1486,6 +1559,90 @@ fn swing(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
     }
     st.desired = desired;
     st.face_target = face_target;
+}
+
+/// The share of the archers who keep shooting at the same man while he
+/// lives and stays in reach; the rest pick afresh for every shot, as men
+/// in the chaos of a battle do.
+const KEEP_QUARRY_SHARE: f32 = 1.0 / 3.0;
+/// An archer without a man to shoot looks for one every this many ticks.
+const QUARRY_LOOK_TICKS: u32 = 8;
+/// Random members he tries in one look.
+const QUARRY_TRIES: u32 = 3;
+
+/// Whether `m` is a man this archer may shoot: an enemy of a block his
+/// regiment shoots at, alive, within his reach and, in a search, among
+/// his block's clear men (sim/mod.rs `clear_members`).
+#[inline]
+fn quarry_ok(
+    f: &Field,
+    p: Vec2,
+    my_team: u8,
+    reach2: f32,
+    shot: &crate::sim::job::ShootAt,
+    blocks: &[u32],
+    m: u32,
+) -> bool {
+    let Field { pos_prev, team, group, death_snap, clear_members, .. } = *f;
+    let mi = m as usize;
+    mi < pos_prev.len()
+        && team[mi] != my_team
+        && death_snap[mi] == 0
+        && blocks.contains(&group[mi])
+        && pos_prev[mi].xz().distance_squared(p) <= reach2
+        && (!shot.search || clear_members[group[mi] as usize].binary_search(&m).is_ok())
+}
+
+/// The man an archer draws at: the one he keeps, when he is one of the
+/// men who keep theirs and the man still serves; else a new pick from
+/// his regiment's blocks (sim/job.rs `shoot_at`, `search_blocks`): a
+/// random living member, or in a search a random clear member, the
+/// nearest block first, a few tries a look and a look every few ticks.
+/// None: he waits with the bow down.
+#[inline]
+fn pick_quarry(
+    f: &Field,
+    s: &Soldier,
+    p: Vec2,
+    gi: usize,
+    shot: &crate::sim::job::ShootAt,
+) -> Option<u32> {
+    let Field { team, kind, target_members, clear_members, search_blocks, tick, tick_seed, .. } =
+        *f;
+    let i = s.i;
+    let my_team = team[i];
+    let reach = crate::unit_types::bow_reach(kind[i]);
+    let reach2 = reach * reach;
+    let single = [shot.t as u32];
+    let blocks: &[u32] = if shot.search && !search_blocks[gi].is_empty() {
+        &search_blocks[gi]
+    } else {
+        &single
+    };
+    let keeps =
+        crate::units::hash01((i as u32).wrapping_mul(0x9E37) ^ 0x1B3D) < KEEP_QUARRY_SHARE;
+    if keeps && quarry_ok(f, p, my_team, reach2, shot, blocks, *s.quarry) {
+        return Some(*s.quarry);
+    }
+    if !tick.wrapping_add((i as u32).wrapping_mul(7)).is_multiple_of(QUARRY_LOOK_TICKS) {
+        return None;
+    }
+    for k in 0..QUARRY_TRIES {
+        let b = blocks[k as usize % blocks.len()] as usize;
+        let list: &[u32] = if shot.search { &clear_members[b] } else { &target_members[b] };
+        if list.is_empty() {
+            continue;
+        }
+        let h = crate::units::hash01(
+            tick_seed
+                ^ (i as u32).wrapping_mul(0x7F4A_7C15).wrapping_add(k.wrapping_mul(0x2545_F491)),
+        );
+        let m = list[((h * list.len() as f32) as usize).min(list.len() - 1)];
+        if quarry_ok(f, p, my_team, reach2, shot, blocks, m) {
+            return Some(m);
+        }
+    }
+    None
 }
 
 /// What the crowd does to his drive: overlap corrections and pushes are

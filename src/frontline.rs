@@ -339,6 +339,13 @@ struct RegimentSums {
     slot_err: f32,
     front_off: f32,
     back_off: f32,
+    /// The foremost living man's distance ahead of the centroid along
+    /// the forward vector (`GroupData::lead`).
+    lead: f32,
+    /// The living men's velocities summed, and their number
+    /// (`GroupData::vel`).
+    vel: Vec2,
+    alive: u32,
     line_sum: f32,
     line_n: u32,
     fight_n: u32,
@@ -355,11 +362,12 @@ const REGIMENTS_PER_TASK: usize = 16;
 
 /// One regiment's sums over its men, walking its runs in index order. `pc`
 /// and `pb` are its centroid and home bias from the last tick, `f` its
-/// forward vector, `tg` its attack target.
+/// forward vector, `tg` its attack target, `bows` whether it is an archer
+/// regiment, the only kind whose lead and velocity anything reads.
 fn regiment_sums(
     units: &Units,
     runs: &[(u32, u32)],
-    (pc, pb, f, tg): (Vec2, Vec2, Vec2, Option<u32>),
+    (pc, pb, f, tg, bows): (Vec2, Vec2, Vec2, Option<u32>, bool),
 ) -> RegimentSums {
     let mut a = RegimentSums {
         pos: Vec2::ZERO,
@@ -369,6 +377,9 @@ fn regiment_sums(
         slot_err: 0.0,
         front_off: f32::MIN,
         back_off: f32::MAX,
+        lead: f32::MIN,
+        vel: Vec2::ZERO,
+        alive: 0,
         line_sum: 0.0,
         line_n: 0,
         fight_n: 0,
@@ -384,6 +395,11 @@ fn regiment_sums(
             a.pos += p;
             a.count += 1;
             a.home += units.home[i];
+            if bows && units.death_t[i] == 0 {
+                a.lead = a.lead.max((p - pc).dot(f));
+                a.vel += Vec2::new(units.vel[i].x, units.vel[i].z);
+                a.alive += 1;
+            }
             a.r2 += (p - pc).length_squared();
             a.slot_err += (p - pc - units.home[i] + pb).length();
             // Ground-truth contact: a unit in WIND-UP has an enemy in reach
@@ -449,20 +465,22 @@ fn update_groups(
             _ => None,
         })
         .collect();
+    let bows: Vec<bool> = groups.list.iter().map(|g| g.kind == crate::unit_types::KIND_ARCHER).collect();
     // The sums over the men, a pool task per few regiments, each regiment's
     // runs walked in index order: the same additions in the same order as
     // one scan of the army, regiment by regiment, so the same bits. Bevy's
     // scope returns the tasks' results in spawn order.
     let units = &*units;
     let runs = &*runs;
-    let (prev_cents_r, prev_bias_r, fwd_r, target_r) =
-        (&prev_cents, &prev_bias, &fwd, &attack_target);
+    let (prev_cents_r, prev_bias_r, fwd_r, target_r, bows_r) =
+        (&prev_cents, &prev_bias, &fwd, &attack_target, &bows);
     let batches: Vec<Vec<RegimentSums>> = bevy::tasks::ComputeTaskPool::get().scope(|scope| {
         for first in (0..n).step_by(REGIMENTS_PER_TASK) {
             scope.spawn(async move {
                 (first..n.min(first + REGIMENTS_PER_TASK))
                     .map(|g| {
-                        let regiment = (prev_cents_r[g], prev_bias_r[g], fwd_r[g], target_r[g]);
+                        let regiment =
+                            (prev_cents_r[g], prev_bias_r[g], fwd_r[g], target_r[g], bows_r[g]);
                         regiment_sums(units, runs.of(g), regiment)
                     })
                     .collect::<Vec<RegimentSums>>()
@@ -489,6 +507,9 @@ fn update_groups(
         }
         group.centroid = cents[g];
         group.home_bias = sums[g].home / counts[g] as f32;
+        // Measured against last tick's centroid, a step at most off.
+        group.lead = if sums[g].lead > f32::MIN { sums[g].lead } else { 0.0 };
+        group.vel = if sums[g].alive > 0 { sums[g].vel / sums[g].alive as f32 } else { Vec2::ZERO };
         // Formation disorder: how far the regiment stands from its slots,
         // smoothed ~2 s. Only Rect makes the discipline claim.
         let err = if group.shape == crate::formation::FormShape::Rect {
@@ -714,7 +735,9 @@ fn update_groups(
             let t = t as usize;
             counts[t] > 0
                 && cents[t].distance(group.centroid) < CHARGE_RANGE
-                && !(group.kind == crate::unit_types::KIND_ARCHER && group.ammo_left > 0)
+                && !(group.kind == crate::unit_types::KIND_ARCHER
+                    && group.ammo_left > 0
+                    && !group.melee)
                 && running
         } else {
             false

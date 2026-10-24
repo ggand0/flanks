@@ -23,7 +23,7 @@ use crate::units::Units;
 
 pub const PLAYER_TEAM: u8 = 0;
 /// Groups whose centroid gets this close to their order target go idle.
-const ARRIVE_CLEAR: f32 = 18.0;
+pub(crate) const ARRIVE_CLEAR: f32 = 18.0;
 /// Right-clicking within this range of an enemy regiment's centroid is an
 /// attack order on that regiment (else it's a move order to the point).
 pub const ATTACK_PICK_RADIUS: f32 = 20.0;
@@ -202,18 +202,56 @@ pub struct GroupData {
     /// Fire-at-will (M2TW default ON): with no explicit target order,
     /// the regiment's bows engage the nearest enemy block in range.
     pub fire_at_will: bool,
-    /// Skirmish mode (M2TW default ON for missile troops): back-step
-    /// when a formed enemy closes, reopen the gap, resume shooting.
+    /// Swords out (archers; the F key, shared with the wall): the
+    /// regiment fights with its sidearm and shoots nothing, an attack
+    /// order is a charge like any infantry's, the skirmish run is off,
+    /// and it engages at ease as infantry does.
+    pub melee: bool,
+    /// Skirmish mode (on by default for missile troops): the regiment
+    /// runs from an enemy block on it or coming for it, a bow's range
+    /// away, and shoots again (sim/job.rs `skirmish_reactions`).
     pub skirmish: bool,
-    /// The current Move order is an auto skirmish withdrawal (ours to
-    /// clear when the gap reopens; distinct from player orders).
+    /// Running from an enemy (the skirmish reaction, sim/job.rs
+    /// `skirmish_reactions`): the regiment's Move order is the run's,
+    /// and its own order waits in `skirmish_saved`.
     pub skirmishing: bool,
+    /// The run's own Move order, so an order anyone else writes during
+    /// the run is noticed and parked.
+    pub skirmish_to: Option<Vec2>,
+    /// The order the run parked, handed back when the run ends.
+    pub skirmish_saved: Option<Order>,
+    /// The enemy block in the regiment's path that it stands and shoots
+    /// at instead of walking into (the skirmish trigger's third case;
+    /// with skirmish off, the attack order's close-in march alone).
+    pub skirmish_hold: Option<u32>,
     /// Arrows left across the regiment (summed per tick, HUD ammo bar).
     pub ammo_left: u32,
     /// The regiment has a live fire solution this tick (archers:
     /// target in range, not marching, not in melee, arrows left) —
     /// drives the unit card's firing indicator, M2TW-style.
     pub firing: bool,
+    /// An archer regiment under an attack order standing off its target:
+    /// in range, halted, volleying. Kept by sim/job.rs: entered where the
+    /// order found the target in range or where the march arrived at the
+    /// firing place, left when the target is out of range.
+    pub standoff: bool,
+    /// The attack target the stand-off was judged for; a new target is
+    /// judged afresh.
+    pub standoff_target: Option<u32>,
+    /// Where an archer regiment's attack order marches it: the frame
+    /// centre from which its front rank stands the close-in distance
+    /// short of the target's near edge (sim/job.rs `firing_place`). The
+    /// march's goal in place of the target's centre, so no man's slot
+    /// lies in the enemy. None without a bows-out attack order.
+    pub fire_place: Option<Vec2>,
+    /// How far the regiment's foremost living man stands ahead of its
+    /// centre along its facing (metres; frontline.rs). A column strung
+    /// out on the march is seen by its head, not its middle.
+    pub lead: f32,
+    /// The mean velocity of its living men (m/s; frontline.rs): how the
+    /// regiment moves. The centroid's own motion is not that: it jumps
+    /// whenever men fall, and a shrinking block's jumps read as speed.
+    pub vel: Vec2,
 }
 
 impl GroupData {
@@ -267,14 +305,23 @@ impl GroupData {
             recent_deaths: 0,
             recent_kills: 0,
             fire_at_will: true,
+            melee: false,
             skirmish: kind == crate::unit_types::KIND_ARCHER,
             skirmishing: false,
+            skirmish_to: None,
+            skirmish_saved: None,
+            skirmish_hold: None,
             ammo_left: if kind == crate::unit_types::KIND_ARCHER {
                 count as u32 * crate::unit_types::missile::AMMO as u32
             } else {
                 0
             },
             firing: false,
+            standoff: false,
+            standoff_target: None,
+            fire_place: None,
+            lead: 0.0,
+            vel: Vec2::ZERO,
         }
     }
 }
@@ -286,13 +333,23 @@ pub struct Groups {
 
 impl Groups {
     /// A group's order destination this tick: Move goes to the point,
-    /// Attack chases the target regiment's current centroid.
+    /// Attack chases the target regiment's current centroid, or for an
+    /// archer regiment shooting its target, the firing place short of it
+    /// (sim/job.rs `archer_fire_solutions`), so that no man's slot lies
+    /// in the enemy and the march ends where the bows reach.
     pub fn goal(&self, g: usize) -> Option<Vec2> {
-        match self.list[g].order? {
+        let gd = &self.list[g];
+        match gd.order? {
             Order::Move(p) => Some(p),
             Order::Attack(t) => {
-                let t = &self.list[t as usize];
-                (t.count > 0).then_some(t.centroid)
+                let td = &self.list[t as usize];
+                if td.count == 0 {
+                    return None;
+                }
+                match gd.fire_place {
+                    Some(p) if gd.standoff_target == Some(t) => Some(p),
+                    _ => Some(td.centroid),
+                }
             }
         }
     }
@@ -510,6 +567,12 @@ pub fn attack_regiments(groups: &mut Groups, selected: &[usize], target: u32) {
         }
         group.order = Some(Order::Attack(target));
         group.auto_order = false;
+        // An archer regiment with its bows turns and dresses only when it
+        // has to march (sim/job.rs): in range it shoots where it stands.
+        // With swords out its order is a charge like any other.
+        if group.kind == crate::unit_types::KIND_ARCHER && !group.melee {
+            continue;
+        }
         let dir = target_c - group.centroid;
         if group.shape == FormShape::Rect && dir.length() > 1.0 {
             group.facing = facing_of(dir);

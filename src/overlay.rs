@@ -525,6 +525,7 @@ fn update_overlay(
     selection: Res<Selection>,
     combat: Res<CombatStats>,
     render_counts: Res<RenderCounts>,
+    arrows: Res<crate::arrows::Arrows>,
     outcome: Res<crate::ai::BattleOutcome>,
     mut query: Query<&mut Text, With<OverlayText>>,
     time: Res<Time>,
@@ -577,7 +578,7 @@ fn update_overlay(
     if *log_timer >= 2.0 {
         *log_timer = 0.0;
         info!(
-            "fps: {fps:.0} ({frame_ms:.2} ms), units: {} (blue {} / orange {}), sim: grid {:.2} step {:.2} field {:.2} audit {:.2} sync {:.2}, hits/tick: {}, drawn: {} [{}], nn min/avg: {:.2}/{:.2}, move avg: {:.3} m/tick, lod: {:?}, fallen drawn: {}",
+            "fps: {fps:.0} ({frame_ms:.2} ms), units: {} (blue {} / orange {}), sim: grid {:.2} step {:.2} field {:.2} audit {:.2} sync {:.2}, hits/tick: {}, arrows: {} (update {:.3} ms/frame, pack {:.3} ms/frame), drawn: {} [{}], nn min/avg: {:.2}/{:.2}, move avg: {:.3} m/tick, lod: {:?}, fallen drawn: {}",
             units.len(),
             combat.alive[0],
             combat.alive[1],
@@ -587,6 +588,9 @@ fn update_overlay(
             stats.audit_ms,
             render_counts.sync_ms,
             stats.events,
+            arrows.len(),
+            crate::arrows::ARROW_UPDATE_NS.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 * 1e-6 / (fps * 2.0).max(1.0),
+            crate::arrows::ARROW_PACK_NS.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 * 1e-6 / (fps * 2.0).max(1.0),
             render_counts.drawn,
             render_counts
                 .bucket_drawn

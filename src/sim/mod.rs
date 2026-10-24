@@ -278,6 +278,7 @@ fn run_tick_job(job: &mut TickJob) {
             flash: &job.flash_in,
             group: &job.group,
             death_t: &job.death_t_in,
+            sight: &job.sight_in,
             color: &job.color_in,
         };
         slot.pack((job.generation, job.tick), &columns, job.hit_flash);
@@ -310,6 +311,7 @@ fn run_tick_job(job: &mut TickJob) {
         sight_in,
         chain_in,
         way_in,
+        quarry_in,
         pos_out,
         vel,
         yaw,
@@ -324,6 +326,7 @@ fn run_tick_job(job: &mut TickJob) {
         sight,
         chain,
         way,
+        quarry,
         orders,
         anchors,
         reg_broken,
@@ -347,6 +350,11 @@ fn run_tick_job(job: &mut TickJob) {
         blocks,
         reg_runs,
         target_members,
+        searched,
+        search_blocks,
+        sidearm,
+        clear_members,
+        clear_blocks,
         field,
         field_wanted,
         dead,
@@ -386,6 +394,29 @@ fn run_tick_job(job: &mut TickJob) {
             }
         }
     }
+    // And of every regiment under search, its clear men: no enemy in
+    // his reach (soldier.rs SIGHT_FOE, as of the last tick) and farther
+    // than a shaft's reach from every block of the shooters' side that
+    // stands near his (job.rs `clear_blocks`). Ascending, so a kept pick
+    // is found by a binary search (soldier.rs `quarry_ok`).
+    let clear_r = job::clear_reach();
+    clear_members.resize_with(n_groups, Vec::new);
+    for (g, members) in clear_members.iter_mut().enumerate() {
+        members.clear();
+        if searched[g] {
+            let near = &clear_blocks[g];
+            for &(s, e) in &reg_runs[g] {
+                members.extend((s..e).filter(|&i| {
+                    let i = i as usize;
+                    if death_t_in[i] != 0 || sight_in[i] & soldier::SIGHT_FOE != 0 {
+                        return false;
+                    }
+                    let p = Vec2::new(pos_prev[i].x, pos_prev[i].z);
+                    near.iter().all(|b| b.distance(p) > clear_r)
+                }));
+            }
+        }
+    }
 
     let t0 = Instant::now();
     {
@@ -421,6 +452,9 @@ fn run_tick_job(job: &mut TickJob) {
     let fat_nocharge = &fat_nocharge[..];
     let shoot_at = &shoot_at[..];
     let target_members = &target_members[..];
+    let clear_members = &clear_members[..];
+    let search_blocks = &search_blocks[..];
+    let sidearm = &sidearm[..];
     let blocks = &*blocks;
     let field = soldier::Field {
         grid,
@@ -451,6 +485,10 @@ fn run_tick_job(job: &mut TickJob) {
         fat_nocharge,
         shoot_at,
         target_members,
+        clear_members,
+        search_blocks,
+        sidearm,
+        death_snap: death_t_in,
         blocks,
         faces_spearwall,
         dt,
@@ -474,6 +512,7 @@ fn run_tick_job(job: &mut TickJob) {
     let sight_in = &sight_in[..];
     let chain_in = &chain_in[..];
     let way_in = &way_in[..];
+    let quarry_in = &quarry_in[..];
     // The map edges a router leaves the field at (combat.rs), widened by
     // the charge knockback the apply pass can still add to a position:
     // the sweep's candidate list must hold every man it might remove.
@@ -498,10 +537,12 @@ fn run_tick_job(job: &mut TickJob) {
             .zip(sight.chunks_mut(CHUNK))
             .zip(way.chunks_mut(CHUNK))
             .zip(chain.chunks_mut(CHUNK))
+            .zip(quarry.chunks_mut(CHUNK))
             .enumerate()
         {
-            let (((((((((((((((pos, vel), yaw), yaw_prev), target), swing), swing_t), flash),
-                death_t), events), ammo), arrows), out_form), sight), way), chain) = chunk;
+            let ((((((((((((((((pos, vel), yaw), yaw_prev), target), swing), swing_t), flash),
+                death_t), events), ammo), arrows), out_form), sight), way), chain), quarry) =
+                chunk;
             let start = ci * CHUNK;
             let end = start + pos.len();
             scope.spawn(async move {
@@ -519,6 +560,7 @@ fn run_tick_job(job: &mut TickJob) {
                 sight.copy_from_slice(&sight_in[start..end]);
                 way.copy_from_slice(&way_in[start..end]);
                 chain.copy_from_slice(&chain_in[start..end]);
+                quarry.copy_from_slice(&quarry_in[start..end]);
                 let rows = soldier::Rows {
                     start,
                     pos: &mut *pos,
@@ -535,6 +577,7 @@ fn run_tick_job(job: &mut TickJob) {
                     sight,
                     way,
                     chain,
+                    quarry,
                 };
                 events.clear();
                 let mut out = soldier::ChunkOut { events, arrows };
@@ -651,7 +694,8 @@ pub fn step_sim(
         install!(
             vel <- vel, yaw <- yaw, yaw_prev <- yaw_prev, target <- target, swing <- swing,
             swing_t <- swing_t, flash <- flash, death_t <- death_t, ammo <- ammo,
-            out_form <- out_form, sight <- sight, way <- way, chain <- chain
+            out_form <- out_form, sight <- sight, way <- way, chain <- chain,
+            quarry <- quarry
         );
     }
     // The sweep's candidates (combat.rs), ascending.

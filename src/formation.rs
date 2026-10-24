@@ -224,6 +224,103 @@ pub fn block_half_extents(gd: &GroupData, files: u32, facing: f32) -> Vec2 {
     )
 }
 
+/// How far a regiment's block edge stands from its centre toward the
+/// unit direction `dir` (the rectangle's support in that direction):
+/// the gap between two blocks is their centre distance less both of
+/// these along the line between them (sim/job.rs `edge_gap`). A blob,
+/// or a block not yet given its files, answers its footprint radius.
+pub fn block_reach_along(gd: &GroupData, dir: Vec2) -> f32 {
+    block_rect(gd).reach_along(dir)
+}
+
+/// A regiment's block as the gap tests see it: its rectangle (files and
+/// ranks at its spacing, a metre of margin around the outer men, turned
+/// to its facing) about its centroid, or for a blob a disc.
+#[derive(Clone, Copy, Debug)]
+pub struct BlockRect {
+    pub centre: Vec2,
+    /// The facing, zero for a disc.
+    pub fwd: Vec2,
+    /// Half its width and half its depth; a disc's radius in both.
+    pub half_w: f32,
+    pub half_d: f32,
+}
+
+impl BlockRect {
+    /// How far the edge stands from the centre toward the unit direction
+    /// `dir`.
+    pub fn reach_along(&self, dir: Vec2) -> f32 {
+        if self.fwd == Vec2::ZERO {
+            return self.half_w;
+        }
+        let right = Vec2::new(self.fwd.y, -self.fwd.x);
+        dir.dot(right).abs() * self.half_w + dir.dot(self.fwd).abs() * self.half_d
+    }
+
+    /// The distance from `p` to the nearest point of the block, 0 inside.
+    pub fn distance(&self, p: Vec2) -> f32 {
+        let d = p - self.centre;
+        if self.fwd == Vec2::ZERO {
+            return (d.length() - self.half_w).max(0.0);
+        }
+        let right = Vec2::new(self.fwd.y, -self.fwd.x);
+        let out = Vec2::new(
+            (d.dot(right).abs() - self.half_w).max(0.0),
+            (d.dot(self.fwd).abs() - self.half_d).max(0.0),
+        );
+        out.length()
+    }
+}
+
+/// The block of a regiment (`BlockRect`). A blob, or a block not yet
+/// given its files, is a disc of its footprint radius.
+pub fn block_rect(gd: &GroupData) -> BlockRect {
+    block_rect_at(gd, gd.centroid)
+}
+
+/// The block of a regiment as it stands about `centre`: its frame when
+/// `centre` is its anchor, the dressed formation rather than the men's
+/// average, which stragglers drag off it.
+pub fn block_rect_at(gd: &GroupData, centre: Vec2) -> BlockRect {
+    if gd.shape == FormShape::Blob || gd.files == 0 {
+        let r = if gd.radius > 0.0 { gd.radius } else { blob_radius(gd.count) };
+        return BlockRect { centre, fwd: Vec2::ZERO, half_w: r, half_d: r };
+    }
+    let files = (gd.files as usize).min(gd.count.max(1));
+    let pitch = gd.spacing.pitch(gd.kind);
+    BlockRect {
+        centre,
+        fwd: facing_dir(gd.facing),
+        half_w: (files - 1) as f32 * 0.5 * pitch.x + 1.0,
+        half_d: front_offset(gd) + 1.0,
+    }
+}
+
+/// A radius about the centroid that holds the whole of `block_rect`
+/// (the corner's distance), found without the facing: the cheap first
+/// test of a gap or a path hit, exact because no `reach_along` exceeds
+/// it.
+pub fn block_bound(gd: &GroupData) -> f32 {
+    if gd.shape == FormShape::Blob || gd.files == 0 {
+        return if gd.radius > 0.0 { gd.radius } else { blob_radius(gd.count) };
+    }
+    let files = (gd.files as usize).min(gd.count.max(1));
+    let half_w = (files - 1) as f32 * 0.5 * gd.spacing.pitch(gd.kind).x + 1.0;
+    let half_d = front_offset(gd) + 1.0;
+    (half_w * half_w + half_d * half_d).sqrt()
+}
+
+/// How far a block's front rank stands ahead of its frame centre: the
+/// slots' own half depth. A blob's is its radius.
+pub fn front_offset(gd: &GroupData) -> f32 {
+    if gd.shape == FormShape::Blob || gd.files == 0 {
+        return if gd.radius > 0.0 { gd.radius } else { blob_radius(gd.count) };
+    }
+    let files = (gd.files as usize).min(gd.count.max(1));
+    let ranks = gd.count.max(1).div_ceil(files);
+    (ranks - 1) as f32 * 0.5 * gd.spacing.pitch(gd.kind).y
+}
+
 /// Deployment placement: rebake slots, then TELEPORT every man onto his
 /// mark (pos, prev, yaw, zero velocity) — TW deployment moves are
 /// instant, and the sim is frozen so nobody could march there anyway.
@@ -519,10 +616,13 @@ pub enum FormCmd {
     FireAtWill,
     /// Skirmish mode on/off (archer regiments in the selection only).
     Skirmish,
+    /// Swords out on/off (archer regiments in the selection only). The F
+    /// key is `Wall`, which does this to the archers it finds.
+    Melee,
 }
 
-/// Formation hotkeys for the selection: F wall, L loose, B hold
-/// position, T fire-at-will, K skirmish.
+/// Formation hotkeys for the selection: F wall (swords out for archers),
+/// L loose, B hold position, T fire-at-will, K skirmish.
 fn formation_keys(
     keys: Res<ButtonInput<KeyCode>>,
     selection: Res<crate::orders::Selection>,
@@ -555,10 +655,25 @@ pub fn apply_formation_cmd(
         return;
     }
 
+    // The F key is one key for the whole selection: the wall on the
+    // swordsmen and spearmen, the swords on the archers, who form no wall.
+    if cmd == FormCmd::Wall
+        && picked.iter().any(|&g| groups.list[g].kind == crate::unit_types::KIND_ARCHER)
+    {
+        apply_formation_cmd(FormCmd::Melee, selection, groups);
+    }
     match cmd {
         FormCmd::Wall | FormCmd::Loose => {
             let wall = cmd == FormCmd::Wall;
             let want = if wall { FormSpacing::Wall } else { FormSpacing::Loose };
+            let picked: Vec<usize> = picked
+                .iter()
+                .copied()
+                .filter(|&g| !(wall && groups.list[g].kind == crate::unit_types::KIND_ARCHER))
+                .collect();
+            if picked.is_empty() {
+                return;
+            }
             // Toggle as a set: if anyone is not yet in the mode, everyone
             // enters it; if all are, everyone falls back to close order.
             let on = picked.iter().any(|&g| groups.list[g].spacing != want);
@@ -602,7 +717,7 @@ pub fn apply_formation_cmd(
             );
         }
 
-        FormCmd::FireAtWill | FormCmd::Skirmish => {
+        FormCmd::FireAtWill | FormCmd::Skirmish | FormCmd::Melee => {
             // Archer toggles; melee regiments in the selection ignore them.
             let archers: Vec<usize> = picked
                 .into_iter()
@@ -611,29 +726,45 @@ pub fn apply_formation_cmd(
             if archers.is_empty() {
                 return;
             }
-            let faw = cmd == FormCmd::FireAtWill;
             let on = archers.iter().any(|&g| {
                 let gd = &groups.list[g];
-                if faw { !gd.fire_at_will } else { !gd.skirmish }
+                match cmd {
+                    FormCmd::FireAtWill => !gd.fire_at_will,
+                    FormCmd::Skirmish => !gd.skirmish,
+                    _ => !gd.melee,
+                }
             });
             for &g in &archers {
                 let gd = &mut groups.list[g];
-                if faw {
-                    gd.fire_at_will = on;
-                } else {
-                    gd.skirmish = on;
-                    // Switching skirmish off mid-withdrawal: stand fast.
-                    if !on && gd.skirmishing {
-                        gd.skirmishing = false;
-                        gd.order = None;
-                        gd.anchor = gd.centroid;
+                match cmd {
+                    FormCmd::FireAtWill => gd.fire_at_will = on,
+                    FormCmd::Skirmish => {
+                        gd.skirmish = on;
+                        // Switching skirmish off mid-run: the run ends
+                        // where the regiment stands and its own order
+                        // comes back.
+                        if !on && gd.skirmishing {
+                            crate::sim::job::end_skirmish(gd);
+                        }
+                    }
+                    _ => {
+                        gd.melee = on;
+                        // Swords out end a run the same way; the bows go
+                        // down with the toggle (sim/job.rs).
+                        if on && gd.skirmishing {
+                            crate::sim::job::end_skirmish(gd);
+                        }
                     }
                 }
             }
             info!(
                 "{} archer regiments {} {}",
                 archers.len(),
-                if faw { "fire-at-will" } else { "skirmish" },
+                match cmd {
+                    FormCmd::FireAtWill => "fire-at-will",
+                    FormCmd::Skirmish => "skirmish",
+                    _ => "swords out",
+                },
                 if on { "ON" } else { "OFF" }
             );
         }

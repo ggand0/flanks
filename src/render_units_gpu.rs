@@ -120,7 +120,7 @@ const STORAGE_BUFFERS: u32 = 11;
 /// shaders/unit_pose.wgsl). A skinned kind has one more per joint after
 /// its part pose.
 const POSE_SLOTS: u32 = 17;
-const POSE_SLOTS_BOW: u32 = 45;
+const POSE_SLOTS_BOW: u32 = 46;
 
 /// The levels a skinned kind poses by its skeleton and draws skinned: L0
 /// and L1, where a soldier stands 12 px or taller (render_units.rs
@@ -151,7 +151,9 @@ pub struct GpuSoldier {
     prev: [f32; 3],
     yaw: f32,
     yaw_prev: f32,
-    /// kind | swing << 8 | swing_t << 16 | flash << 24
+    /// kind | knife << 7 | swing << 8 | swing_t << 16 | flash << 24: an
+    /// archer's knife out (sim/soldier.rs SIGHT_KNIFE) in the kind byte's
+    /// top bit.
     a: u32,
     /// group | death_t << 24
     b: u32,
@@ -360,6 +362,7 @@ pub(crate) struct PackColumns<'a> {
     pub flash: &'a [u8],
     pub group: &'a [u32],
     pub death_t: &'a [u8],
+    pub sight: &'a [u16],
     pub color: &'a [[f32; 4]],
 }
 
@@ -376,6 +379,7 @@ impl<'a> PackColumns<'a> {
             flash: &units.flash,
             group: &units.group,
             death_t: &units.death_t,
+            sight: &units.sight,
             color: &units.color,
         }
     }
@@ -535,6 +539,7 @@ fn pack_chunk(c: &PackColumns, start: usize, out: &mut [GpuSoldier], flash: bool
             yaw: c.yaw[i],
             yaw_prev: c.yaw_prev[i],
             a: kind
+                | ((c.sight[i] & crate::sim::soldier::SIGHT_KNIFE != 0) as u32) << 7
                 | (c.swing[i] as u32) << 8
                 | (c.swing_t[i] as u32) << 16
                 // A twitch code (16 up) is a pose, not a flash: it packs
@@ -660,8 +665,12 @@ fn build_frame_params(
         crate::unit_types::TYPES[k].cut_return_s()
     }));
     let mut answers = 0u32;
+    let mut bow_kinds = 0u32;
     for (bucket, rig) in &rigs {
         let (kind, skel) = (bucket.0 / NUM_LODS, &rig.rig.skel);
+        if kind < NUM_KINDS && rig.rig.bow.params[3] > 0.5 {
+            bow_kinds |= 1 << kind;
+        }
         if kind >= NUM_KINDS || skel.params[0] == 0 {
             continue;
         }
@@ -680,7 +689,7 @@ fn build_frame_params(
             }
         }
     }
-    p.steps = Vec4::new(crate::sim::soldier::STEP_FACE_SPEED, STEP_SETTLE_S, 0.0, 0.0);
+    p.steps = Vec4::new(crate::sim::soldier::STEP_FACE_SPEED, STEP_SETTLE_S, bow_kinds as f32, 0.0);
     p.consts = Vec4::new(
         crate::unit_types::missile::DRAW_TICKS as f32,
         crate::sim::damage::DEATH_TICKS as f32,

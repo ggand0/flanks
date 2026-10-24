@@ -11,6 +11,21 @@
 //! morale pass).
 
 use bevy::prelude::*;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Nanoseconds spent in `update_arrows` and `sync_arrow_instances` since
+/// the overlay last read them (overlay.rs, the fps line).
+pub static ARROW_UPDATE_NS: AtomicU64 = AtomicU64::new(0);
+pub static ARROW_PACK_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Adds the time since its making to a counter when dropped.
+struct Timed(&'static AtomicU64, std::time::Instant);
+
+impl Drop for Timed {
+    fn drop(&mut self) {
+        self.0.fetch_add(self.1.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+}
 
 use bevy::camera::visibility::NoFrustumCulling;
 use bevy::render::batching::NoAutomaticBatching;
@@ -39,7 +54,7 @@ fn wound_share() -> f32 {
     *W.get_or_init(|| crate::util::env_or("FL_WOUND", missile::WOUND_SHARE).clamp(0.0, 1.0))
 }
 /// Collision tests only run below the tallest body plus this.
-const STRIKE_MARGIN: f32 = 0.3;
+pub(crate) const STRIKE_MARGIN: f32 = 0.3;
 /// How far over his own head an archer's arrow leaves the bow
 /// (sim/soldier.rs). Above the body-hit band's top margin below, or a
 /// shaft is inside its own shooter at flight-time zero and kills him.
@@ -67,6 +82,11 @@ pub struct Arrows {
     /// Position at the previous fixed tick; rendering lerps prev -> pos.
     pub pos_prev: Vec<Vec3>,
     pub vel: Vec<Vec3>,
+    /// The shaft's heading and climb from its velocity, set at the tick
+    /// (the frame's instance packing reads them instead of taking two
+    /// arctangents per arrow per frame).
+    pub yaw: Vec<f32>,
+    pub pitch: Vec<f32>,
     pub team: Vec<u8>,
     pub group: Vec<u32>,
     /// Stable per-arrow id (monotonic): swap-removes reindex the pool
@@ -85,6 +105,8 @@ impl Arrows {
         self.pos.swap_remove(i);
         self.pos_prev.swap_remove(i);
         self.vel.swap_remove(i);
+        self.yaw.swap_remove(i);
+        self.pitch.swap_remove(i);
         self.team.swap_remove(i);
         self.group.swap_remove(i);
         self.id.swap_remove(i);
@@ -94,17 +116,20 @@ impl Arrows {
         self.pos.clear();
         self.pos_prev.clear();
         self.vel.clear();
+        self.yaw.clear();
+        self.pitch.clear();
         self.team.clear();
         self.group.clear();
         self.id.clear();
     }
 }
 
-/// Per-regiment centroid velocity (m/s, EMA-smoothed): the volley lead.
-/// Updated here each tick, read by step_sim's loose the next tick.
+/// Per-regiment velocity (m/s, EMA-smoothed): the volley lead, and the
+/// range tests' closing speed. Updated here each tick from the men's
+/// mean velocity (`GroupData::vel`), read by step_sim's loose the next
+/// tick.
 #[derive(Resource, Default)]
 pub struct RegTracks {
-    last: Vec<Vec2>,
     pub vel: Vec<Vec2>,
 }
 
@@ -189,7 +214,7 @@ impl Plugin for ArrowsPlugin {
             .add_systems(
                 FixedUpdate,
                 (
-                    skirmish_and_ammo
+                    ammo_tally
                         .after(crate::sim::take_tick)
                         .before(crate::sim::step_sim),
                     update_arrows
@@ -328,21 +353,21 @@ fn update_arrows(
     mut sounds: Option<ResMut<crate::audio::SoundEvents>>,
     mut tick: Local<u32>,
 ) {
+    let _timed = Timed(&ARROW_UPDATE_NS, std::time::Instant::now());
     let _span = info_span!("update_arrows").entered();
     let dt = time.delta_secs();
     *tick = tick.wrapping_add(1);
 
-    // Regiment centroid velocities (the volley lead, one tick stale by
-    // construction — step_sim consumed last tick's values already).
-    if tracks.last.len() != groups.list.len() {
-        tracks.last = groups.list.iter().map(|g| g.centroid).collect();
+    // Regiment velocities (the volley lead, one tick stale by
+    // construction: step_sim consumed last tick's values already): the
+    // men's mean velocity, not the centroid's motion, which jumps when
+    // men fall and read as a speed of tens of m/s for a dying block.
+    if tracks.vel.len() != groups.list.len() {
         tracks.vel = vec![Vec2::ZERO; groups.list.len()];
     }
     for (g, gd) in groups.list.iter().enumerate() {
-        let v = (gd.centroid - tracks.last[g]) / dt.max(1e-3);
-        // EMA over ~0.5 s: per-tick centroid noise must not steer aim.
-        tracks.vel[g] = tracks.vel[g] * 0.9 + v * 0.1;
-        tracks.last[g] = gd.centroid;
+        // EMA over ~0.5 s: per-tick noise must not steer aim.
+        tracks.vel[g] = tracks.vel[g] * 0.9 + gd.vel * 0.1;
     }
 
     // Drain this tick's looses into the pool.
@@ -361,6 +386,9 @@ fn update_arrows(
             arrows.pos.push(s.pos);
             arrows.pos_prev.push(s.pos);
             arrows.vel.push(s.vel);
+            let (yaw, pitch) = flight_angles(s.vel);
+            arrows.yaw.push(yaw);
+            arrows.pitch.push(pitch);
             arrows.team.push(s.team);
             arrows.group.push(s.group);
             let id = arrows.next_id;
@@ -396,6 +424,7 @@ fn update_arrows(
         arrows.pos_prev[i] = prev;
         arrows.pos[i] = p;
         arrows.vel[i] = v;
+        (arrows.yaw[i], arrows.pitch[i]) = flight_angles(v);
 
         let ground = terrain.height_at(p.x, p.z);
         if p.y.min(prev.y) > ground + strike_band {
@@ -607,30 +636,14 @@ fn log_tally(tick: u32, stats: &ArrowStats, in_flight: usize) {
     );
 }
 
-/// Skirmish trigger: EDGE gap (centroid distance minus both footprint
-/// radii) — centroid rings read absurdly late for 1000-man blocks
-/// whose fronts touch at 30+ m of centroid separation. No M2TW value
-/// exists (the manual only says "keep a safe distance, usually its
-/// missile range") — these are feel knobs sized so the back-step
-/// starts with real room to run.
-const SKIRMISH_TRIGGER: f32 = 22.0;
-/// The withdrawal runs until the edge gap reopens to this.
-const SKIRMISH_REOPEN: f32 = 40.0;
-
-/// Archer regiment upkeep, before the tick: the M2TW skirmish rule
-/// ("keep a safe distance between itself and the enemy", manual) as an
-/// auto Move order — real movement through the real order pipe, cleared
-/// when the gap reopens. Player-issued orders always win: skirmish only
-/// steers an idle regiment or its own withdrawal. Also tallies the
-/// regiment ammo pools for the HUD.
-fn skirmish_and_ammo(
+/// Archer regiment upkeep, before the tick: the regiment ammo pools for
+/// the HUD, summed over the archer regiments' own men. The skirmish run
+/// is a reaction of the tick's prep (sim/job.rs `skirmish_reactions`).
+fn ammo_tally(
     mut groups: ResMut<crate::orders::Groups>,
     units: Res<crate::units::Units>,
     runs: Res<crate::sim::RegimentRuns>,
-    terrain: Res<crate::terrain::Terrain>,
 ) {
-    // Regiment ammo pools (the unit-card ammo bar), summed over the
-    // archer regiments' own men.
     for (g, gd) in groups.list.iter_mut().enumerate() {
         if gd.kind != crate::unit_types::KIND_ARCHER {
             continue;
@@ -642,67 +655,6 @@ fn skirmish_and_ammo(
                     gd.ammo_left += units.ammo[i] as u32;
                 }
             }
-        }
-    }
-
-    let n = groups.list.len();
-    for g in 0..n {
-        let gd = &groups.list[g];
-        if gd.kind != crate::unit_types::KIND_ARCHER
-            || gd.count == 0
-            || gd.state.is_broken()
-            || !gd.skirmish
-            || gd.hold
-            || gd.engaged
-        {
-            continue;
-        }
-        // Player orders win; only idle regiments and our own withdrawal
-        // Move are steered.
-        if gd.order.is_some() && !gd.skirmishing {
-            continue;
-        }
-        // Nearest formed enemy block, by EDGE gap.
-        let mut nearest: Option<(f32, Vec2)> = None;
-        for eg in groups.list.iter() {
-            if eg.team == gd.team || eg.count == 0 || eg.state.is_broken() {
-                continue;
-            }
-            let gap = eg.centroid.distance(gd.centroid) - eg.radius - gd.radius;
-            if nearest.is_none_or(|(bd, _)| gap < bd) {
-                nearest = Some((gap, eg.centroid));
-            }
-        }
-        let centroid = gd.centroid;
-        let was_skirmishing = gd.skirmishing;
-        match nearest {
-            Some((gap, ec)) if gap < SKIRMISH_TRIGGER => {
-                // Back-step directly away, far enough to reopen the gap.
-                let away = (centroid - ec).normalize_or_zero();
-                let away = if away == Vec2::ZERO { Vec2::Y } else { away };
-                let mut dest = centroid + away * (SKIRMISH_REOPEN - gap + 5.0);
-                let (mn, mx) = (terrain.min() + 12.0, terrain.max() - 12.0);
-                dest = dest.clamp(mn, mx);
-                let gd = &mut groups.list[g];
-                gd.order = Some(crate::orders::Order::Move(dest));
-                gd.auto_order = true;
-                gd.skirmishing = true;
-            }
-            Some((gap, _)) if was_skirmishing && gap > SKIRMISH_REOPEN => {
-                // Gap reopened: stand, dress where we are, shoot.
-                let gd = &mut groups.list[g];
-                gd.skirmishing = false;
-                gd.order = None;
-                gd.anchor = gd.centroid;
-                gd.reform = true;
-            }
-            None if was_skirmishing => {
-                let gd = &mut groups.list[g];
-                gd.skirmishing = false;
-                gd.order = None;
-                gd.anchor = gd.centroid;
-            }
-            _ => {}
         }
     }
 }
@@ -723,6 +675,7 @@ fn sync_arrow_instances(
     fixed: Res<Time<Fixed>>,
     mut query: Query<&mut InstanceMaterialData, With<ArrowBucket>>,
 ) {
+    let _timed = Timed(&ARROW_PACK_NS, std::time::Instant::now());
     let Ok(mut data) = query.single_mut() else {
         return;
     };
@@ -731,19 +684,22 @@ fn sync_arrow_instances(
     data.0.reserve(arrows.len());
     for i in 0..arrows.len() {
         let p = arrows.pos_prev[i].lerp(arrows.pos[i], alpha);
-        let v = arrows.vel[i];
-        let yaw = v.x.atan2(v.z);
-        let pitch = v.y.atan2(v.xz().length());
         data.0.push(InstanceData {
             position: p,
             // Flying arrows draw a third oversized: a volley must READ
             // at battle zoom (the ground litter stays true-scale).
             w: 1.35,
             color: [1.0, 1.0, 1.0, 0.0],
-            anim: [yaw, 0.0, 0.0, 0.0],
-            anim2: [0.0, 0.0, pitch, 0.0],
+            anim: [arrows.yaw[i], 0.0, 0.0, 0.0],
+            anim2: [0.0, 0.0, arrows.pitch[i], 0.0],
         });
     }
+}
+
+/// A shaft's heading and climb (radians) from its velocity.
+#[inline]
+fn flight_angles(v: Vec3) -> (f32, f32) {
+    (v.x.atan2(v.z), v.y.atan2(v.xz().length()))
 }
 
 /// Copy the litter ring into its bucket when it changed.
