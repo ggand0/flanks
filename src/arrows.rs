@@ -82,6 +82,11 @@ pub struct Arrows {
     /// Position at the previous fixed tick; rendering lerps prev -> pos.
     pub pos_prev: Vec<Vec3>,
     pub vel: Vec<Vec3>,
+    /// The shaft's heading and climb from its velocity, set at the tick
+    /// (the frame's instance packing reads them instead of taking two
+    /// arctangents per arrow per frame).
+    pub yaw: Vec<f32>,
+    pub pitch: Vec<f32>,
     pub team: Vec<u8>,
     pub group: Vec<u32>,
     /// Stable per-arrow id (monotonic): swap-removes reindex the pool
@@ -100,6 +105,8 @@ impl Arrows {
         self.pos.swap_remove(i);
         self.pos_prev.swap_remove(i);
         self.vel.swap_remove(i);
+        self.yaw.swap_remove(i);
+        self.pitch.swap_remove(i);
         self.team.swap_remove(i);
         self.group.swap_remove(i);
         self.id.swap_remove(i);
@@ -109,6 +116,8 @@ impl Arrows {
         self.pos.clear();
         self.pos_prev.clear();
         self.vel.clear();
+        self.yaw.clear();
+        self.pitch.clear();
         self.team.clear();
         self.group.clear();
         self.id.clear();
@@ -377,6 +386,9 @@ fn update_arrows(
             arrows.pos.push(s.pos);
             arrows.pos_prev.push(s.pos);
             arrows.vel.push(s.vel);
+            let (yaw, pitch) = flight_angles(s.vel);
+            arrows.yaw.push(yaw);
+            arrows.pitch.push(pitch);
             arrows.team.push(s.team);
             arrows.group.push(s.group);
             let id = arrows.next_id;
@@ -412,6 +424,7 @@ fn update_arrows(
         arrows.pos_prev[i] = prev;
         arrows.pos[i] = p;
         arrows.vel[i] = v;
+        (arrows.yaw[i], arrows.pitch[i]) = flight_angles(v);
 
         let ground = terrain.height_at(p.x, p.z);
         if p.y.min(prev.y) > ground + strike_band {
@@ -671,19 +684,22 @@ fn sync_arrow_instances(
     data.0.reserve(arrows.len());
     for i in 0..arrows.len() {
         let p = arrows.pos_prev[i].lerp(arrows.pos[i], alpha);
-        let v = arrows.vel[i];
-        let yaw = v.x.atan2(v.z);
-        let pitch = v.y.atan2(v.xz().length());
         data.0.push(InstanceData {
             position: p,
             // Flying arrows draw a third oversized: a volley must READ
             // at battle zoom (the ground litter stays true-scale).
             w: 1.35,
             color: [1.0, 1.0, 1.0, 0.0],
-            anim: [yaw, 0.0, 0.0, 0.0],
-            anim2: [0.0, 0.0, pitch, 0.0],
+            anim: [arrows.yaw[i], 0.0, 0.0, 0.0],
+            anim2: [0.0, 0.0, arrows.pitch[i], 0.0],
         });
     }
+}
+
+/// A shaft's heading and climb (radians) from its velocity.
+#[inline]
+fn flight_angles(v: Vec3) -> (f32, f32) {
+    (v.x.atan2(v.z), v.y.atan2(v.xz().length()))
 }
 
 /// Copy the litter ring into its bucket when it changed.
