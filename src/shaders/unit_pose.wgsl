@@ -685,8 +685,8 @@ const CLIP_MELEE_RUN: u32 = 18u;
 
 // The share of knife-out archers who run in the charge pose over the
 // gait, arms trailing, as all of them did before the run clip: kept for
-// variety. Repeated in unit_build.wgsl; keep in sync.
-const KNIFE_SPRINT_SHARE: f32 = 0.05;
+// variety.
+const KNIFE_SPRINT_SHARE: f32 = 0.20;
 fn knife_sprinter(seed: f32) -> bool {
     return fract(seed * 7.31) < KNIFE_SPRINT_SHARE;
 }
@@ -782,10 +782,11 @@ struct Pre {
     bow_w: f32,
     // An archer's knife is out and his bow put away.
     knife: bool,
-    // How far his knife-out run clip has the whole body, 0 to 1: the
+    // How far his knife-out run clip has his upper body, 0 to 1: the
     // gait's run share while he moves with the knife out, unless he is
-    // one of the sprinters who keep the old run. The procedural lean,
-    // bob, shift and shoulder turn give way by it.
+    // one of the sprinters who keep the old run. His hips and legs keep
+    // the gait, which sizes its stride to his speed; the clip's chest
+    // carries the lean, so the procedural lean gives way by it.
     run_clip: f32,
     // The bow rig's table and the place in it, 0 to 1.
     clip: u32,
@@ -1083,18 +1084,18 @@ fn put_common() {
     // The shoulders turn against the legs and the upper body shifts over
     // the planted foot, both at full weight here: the torso eases them in
     // up its height (`place`).
-    // The run clip carries its own turn, shift, lean and bob.
-    let own = 1.0 - pre.run_clip;
-    let turn = 0.10 * g.run * g.stride * pre.limb * own + pre.twitch_turn;
+    let turn = 0.10 * g.run * g.stride * pre.limb + pre.twitch_turn;
     let shift = 0.02 * pre.leg * g.run * g.stride * cos(TAU * (pre.gait - 0.5 * g.duty))
-        * (1.0 - pre.step_w) * own;
+        * (1.0 - pre.step_w);
     // The body rides the hip drop from the gait. A runner leans as far
     // forward as a charger. A blow leans into it, except one from a clip
     // (the cut, the stab, the charging blow), which moves the whole body
     // itself.
     let blow = select(0.30 * pre.lunge + 0.25 * pre.chop, 0.0, pre.cut || pre.stab || pre.charge_attack);
+    // The run clip's chest carries its own lean.
     let lean = (0.10 * pre.moving
-        + 0.24 * max(g.run * pre.moving, pre.sprint * (0.25 + 0.75 * pre.moving))) * own
+        + 0.24 * max(g.run * pre.moving, pre.sprint * (0.25 + 0.75 * pre.moving)))
+        * (1.0 - pre.run_clip)
         + blow;
     // Stagger (anim2.w = remaining stun, 1 at the blow -> 0 recovered):
     // rocked back off a charging blow or a spear point. The whole body
@@ -1132,7 +1133,7 @@ fn put_common() {
     // wall carry a slight crouch. Each is a share of the soldier's height.
     let height = 2.0 * rig.half;
     let hop = 0.06 * pre.celebrate * max(sin(pre.wobble), 0.0);
-    let bob = -pre.dip * own;
+    let bob = -pre.dip;
     let offset = bob + height * (hop - 0.15 * death - 0.07 * pre.brace
         - 0.03 * pre.ready * pre.moving - 0.05 * pre.wall - 0.10 * pre.stagger);
     pose_put(P_POS, vec4<f32>(pre.pos, offset));
@@ -1627,7 +1628,7 @@ fn put_skeleton() {
     if hold > 0.0 {
         skel_over(&turn, SkelAt(CLIP_CHARGE, 0u, 0.0), hold, 0.0);
     }
-    if moving > 0.0 && pre.run_clip < 1.0 {
+    if moving > 0.0 {
         // The gait: thigh, knee and foot pitches, the weapon side's leg
         // half a cycle after the shield side's (`put_leg`). The coat
         // swings with the thigh.
@@ -1648,15 +1649,15 @@ fn put_skeleton() {
         turn[arm_r.x] = qmul(qx(-sway), turn[arm_r.x]);
         turn[arm_l.x] = qmul(qx(0.06 * moving * pre.limb * (1.0 - pre.wall) * (1.0 - hold)), turn[arm_l.x]);
     }
-    // Running with his knife out, the whole body runs in the run clip,
-    // at the gait's phase, over the gait and the charge pose by the run
-    // share: a walk fades it out, a start or a stop blends through at
-    // whatever stride phase he is at. A blow or an answer below keeps
-    // his legs running as it keeps the gait's.
+    // Running with his knife out, his upper body runs in the run clip
+    // over the charge pose, by the run share, while his hips and legs
+    // keep the gait: its stride follows his speed, where the clip's is a
+    // jog's. The clip is sampled at the gait's phase half a cycle on,
+    // since the clip starts on its right foot and the gait on its left,
+    // so the arms swing against the legs.
     if pre.run_clip > 0.0 {
-        let at = skel_at(CLIP_MELEE_RUN, pre.gait * rig.skel.rates[CLIP_MELEE_RUN].y);
-        skel_over(&turn, at, pre.run_clip, pre.run_clip);
-        root = mix(root, skel_root_at(at), pre.run_clip);
+        let at = skel_at(CLIP_MELEE_RUN, fract(pre.gait + 0.5) * rig.skel.rates[CLIP_MELEE_RUN].y);
+        skel_over(&turn, at, pre.run_clip, 0.0);
     }
     if cut > 0.0 {
         // Clip time from the wind-up to the blow at its contact, then
