@@ -296,6 +296,20 @@ pub fn block_rect_at(gd: &GroupData, centre: Vec2) -> BlockRect {
     }
 }
 
+/// A radius about the centroid that holds the whole of `block_rect`
+/// (the corner's distance), found without the facing: the cheap first
+/// test of a gap or a path hit, exact because no `reach_along` exceeds
+/// it.
+pub fn block_bound(gd: &GroupData) -> f32 {
+    if gd.shape == FormShape::Blob || gd.files == 0 {
+        return if gd.radius > 0.0 { gd.radius } else { blob_radius(gd.count) };
+    }
+    let files = (gd.files as usize).min(gd.count.max(1));
+    let half_w = (files - 1) as f32 * 0.5 * gd.spacing.pitch(gd.kind).x + 1.0;
+    let half_d = front_offset(gd) + 1.0;
+    (half_w * half_w + half_d * half_d).sqrt()
+}
+
 /// How far a block's front rank stands ahead of its frame centre: the
 /// slots' own half depth. A blob's is its radius.
 pub fn front_offset(gd: &GroupData) -> f32 {

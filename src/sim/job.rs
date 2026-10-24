@@ -424,6 +424,19 @@ pub(crate) fn edge_gap(a: &GroupData, b: &GroupData) -> f32 {
     rect_gap(&crate::formation::block_rect(a), &crate::formation::block_rect(b))
 }
 
+/// `edge_gap` when it can be within `limit`, else None without the
+/// rectangles: the centres' distance less both blocks' bounding radii
+/// (`formation::block_bound`) is never more than the gap, so a pair that
+/// fails it is beyond `limit` for certain. The per-regiment loops over
+/// every block pass most pairs through here.
+fn gap_within(a: &GroupData, b: &GroupData, limit: f32) -> Option<f32> {
+    let d = a.centroid.distance(b.centroid);
+    if d - crate::formation::block_bound(a) - crate::formation::block_bound(b) > limit {
+        return None;
+    }
+    Some(edge_gap(a, b))
+}
+
 /// `edge_gap` between two blocks given as rectangles.
 fn rect_gap(a: &crate::formation::BlockRect, b: &crate::formation::BlockRect) -> f32 {
     let d = b.centre - a.centre;
@@ -515,6 +528,9 @@ fn line_hit(
     let rel = bd.centroid - origin;
     let s = rel.dot(dir).clamp(0.0, len);
     let off = rel - dir * s;
+    if off.length() > crate::formation::block_bound(bd) + width {
+        return None;
+    }
     let n = off.normalize_or_zero();
     let reach = if n == Vec2::ZERO {
         f32::MAX
@@ -797,10 +813,9 @@ fn skirmish_reactions(
             if ed.team == gd.team || ed.count == 0 || ed.state.is_broken() {
                 continue;
             }
-            let gap = edge_gap(gd, ed);
-            if gap > SKIRMISH_SCOPE * range {
+            let Some(gap) = gap_within(gd, ed, SKIRMISH_SCOPE * range) else {
                 continue;
-            }
+            };
             if run {
                 if run_from.is_none_or(|(rg, _)| gap < rg) {
                     run_from = Some((gap, e as u32));
@@ -1020,10 +1035,9 @@ fn archer_fire_solutions(
                         continue;
                     }
                     let eg = &gl.list[e];
-                    let gap = edge_gap(gd, eg);
-                    if gap > range * 1.5 {
+                    let Some(gap) = gap_within(gd, eg, range * 1.5) else {
                         continue;
-                    }
+                    };
                     if danger.is_none_or(|(bg, _)| gap < bg)
                         && approach_hits(gl, g, e, vel(e), APPROACH_S, range * 0.8)
                     {
@@ -1211,15 +1225,21 @@ fn sidearm_reasons(
                 return arm;
             }
             arm.swords = gd.melee;
+            // Blocks beyond the fire solutions' scope (1.5 ranges) are
+            // out of the knife's reach and never shot at.
+            let scope = (1.5 * crate::unit_types::bow_range(gd.kind)).max(crate::sim::soldier::KNIFE_EDGE);
             for (e, eg) in groups.list.iter().enumerate() {
                 if eg.team == gd.team || eg.count == 0 || eg.state.is_broken() {
                     continue;
                 }
-                if edge_gap(gd, eg) <= crate::sim::soldier::KNIFE_EDGE {
+                let Some(gap) = gap_within(gd, eg, scope) else {
+                    continue;
+                };
+                if gap <= crate::sim::soldier::KNIFE_EDGE {
                     arm.blocks.push(crate::formation::block_rect(eg));
                 }
                 arm.foe_in_range = arm.foe_in_range
-                    || in_bow_range(gd, eg, vel(e), terrain);
+                    || gap <= bow_reach_toward(gd, gd.centroid, eg, vel(e), terrain);
             }
             arm
         })
