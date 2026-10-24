@@ -780,6 +780,8 @@ struct Pre {
     pitch: f32,
     bow_rig: bool,
     bow_w: f32,
+    // His ground speed, m/s.
+    speed: f32,
     // An archer's knife is out and his bow put away.
     knife: bool,
     // How far his knife-out run clip has his upper body, 0 to 1: the
@@ -1028,6 +1030,7 @@ fn pose_begin(pos_scale: vec4<f32>, color: vec4<f32>, anim: vec4<f32>, anim2: ve
         inst.anim2.z,
         bow_rig,
         bow_w,
+        speed,
         knife,
         run_clip,
         clip,
@@ -1628,7 +1631,15 @@ fn put_skeleton() {
     if hold > 0.0 {
         skel_over(&turn, SkelAt(CLIP_CHARGE, 0u, 0.0), hold, 0.0);
     }
-    if moving > 0.0 {
+    // The legs' share of the gait. An archer with his bow up raises it
+    // only below a slow walk, where the gait's weight is still small, so
+    // under the draw his legs take the gait in full from a creep on:
+    // small steps at his pace instead of a glide under standing legs.
+    var legs = moving;
+    if alive && pre.bow_w > 0.0 {
+        legs = max(moving, smoothstep(0.06, 0.3, pre.speed) * (1.0 - pre.step_w));
+    }
+    if legs > 0.0 {
         // The gait: thigh, knee and foot pitches, the weapon side's leg
         // half a cycle after the shield side's (`put_leg`). The coat
         // swings with the thigh.
@@ -1637,10 +1648,10 @@ fn put_skeleton() {
             let shin = pose.x - pose.y;
             let leg = rig.skel.roles[3u + side];
             let coat = rig.skel.roles[1u + side].w;
-            turn[leg.x] = qblend(turn[leg.x], qx(-pose.x), moving);
-            turn[leg.y] = qblend(turn[leg.y], qx(pose.y), moving);
-            turn[leg.z] = qblend(turn[leg.z], qx(shin - pose.z), moving);
-            turn[coat] = qblend(turn[coat], qx(-pose.x), moving);
+            turn[leg.x] = qblend(turn[leg.x], qx(-pose.x), legs);
+            turn[leg.y] = qblend(turn[leg.y], qx(pose.y), legs);
+            turn[leg.z] = qblend(turn[leg.z], qx(shin - pose.z), legs);
+            turn[coat] = qblend(turn[coat], qx(-pose.x), legs);
         }
         // The shoulders turn against the legs, and the arms counter them,
         // except arms held in the charge pose.
@@ -1700,7 +1711,7 @@ fn put_skeleton() {
     var arrow = 0.0;
     let bow = select(0.0, pre.bow_w, alive && pre.shooting && skel_has(CLIP_DRAW));
     if bow > 0.0 {
-        let low = bow * (1.0 - moving);
+        let low = bow * (1.0 - legs);
         let up = pre.shot >= 3u && skel_has(CLIP_AIM_UP) && skel_has(CLIP_RELEASE_UP);
         let release = select(CLIP_RELEASE, CLIP_RELEASE_UP, up);
         let draw = rig.skel.rates[CLIP_DRAW];
