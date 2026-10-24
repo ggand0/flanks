@@ -35,7 +35,7 @@ pub(crate) struct ShootAt {
 /// regiment so a quarter of the archer regiments look each tick. Seven
 /// and a half looks a second; a block moves at most a metre between
 /// two. What a look found is kept until the next.
-pub(crate) const ARCHER_LOOK: u32 = 4;
+pub(crate) const ARCHER_LOOK: u32 = 8;
 
 /// What an archer regiment's scan of the field found, kept between
 /// looks (`archer_fire_solutions`): the block coming for it, the
