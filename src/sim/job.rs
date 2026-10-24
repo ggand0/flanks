@@ -287,12 +287,17 @@ pub(crate) fn prepare_tick(
     job.terrain = Some(terrain_arc.clone());
     let terrain: &Terrain = terrain_arc;
 
+    let t0 = std::time::Instant::now();
     share_columns(job, units);
+    let t1 = std::time::Instant::now();
     skirmish_reactions(groups, tracks, terrain, tick);
+    let t2 = std::time::Instant::now();
     let fire = archer_fire_solutions(groups, tracks, terrain, &job.clear_members);
+    let t3 = std::time::Instant::now();
     job.orders = resolve_orders(groups, routes);
     routes.fill_job(&mut job.plan_requests, &mut job.routes, &mut job.nav, groups.list.len());
     snapshot_regiments(job, groups, terrain);
+    let t4 = std::time::Instant::now();
 
     let n_chunks = units.pos.len().div_ceil(CHUNK);
     if job.events.len() < n_chunks {
@@ -316,6 +321,35 @@ pub(crate) fn prepare_tick(
     job.blocks = fire.blocks;
     job.sidearm = sidearm_reasons(groups, tracks, terrain);
     job.field.size_to(terrain.min(), terrain.max());
+    let t5 = std::time::Instant::now();
+    log_prep([t1 - t0, t2 - t1, t3 - t2, t4 - t3, t5 - t4, t5 - t0]);
+}
+
+/// FL_LOG_STEP=1: the mean time of each part of the prep over 150 ticks
+/// (5 s), beside the `[step]` line (sim/diag.rs): the column share, the
+/// skirmish reactions, the fire solutions, the orders and the regiment
+/// snapshot, the sidearm reasons, and the whole prep.
+fn log_prep(parts: [std::time::Duration; 6]) {
+    use std::sync::{Mutex, OnceLock};
+    static ON: OnceLock<bool> = OnceLock::new();
+    static ACC: Mutex<([f64; 6], u32)> = Mutex::new(([0.0; 6], 0));
+    if !*ON.get_or_init(|| std::env::var("FL_LOG_STEP").is_ok()) {
+        return;
+    }
+    let mut acc = ACC.lock().unwrap_or_else(|e| e.into_inner());
+    for (a, p) in acc.0.iter_mut().zip(parts) {
+        *a += p.as_secs_f64() * 1000.0;
+    }
+    acc.1 += 1;
+    if acc.1 == 150 {
+        let m = acc.0.map(|v| v / 150.0);
+        info!(
+            "[prep] share {:.3}, skirmish {:.3}, fire {:.3}, orders and snapshot {:.3}, \
+             sidearm {:.3}, whole prep {:.3} ms",
+            m[0], m[1], m[2], m[3], m[4], m[5]
+        );
+        *acc = ([0.0; 6], 0);
+    }
 }
 
 /// The soldier columns, shared into the job: `Arc` clones of the live
