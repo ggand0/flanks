@@ -52,11 +52,11 @@ struct Skel {
     // Per clip: x = its first vec4 in `clips`, y = its samples, w = 1 when
     // it loops. A sample is the root's offset from rest, then one
     // quaternion per joint relative to its parent.
-    clips: array<vec4<u32>, 18>,
+    clips: array<vec4<u32>, 19>,
     // Per clip: x = samples per second, y = its length in seconds, z =
     // when its blow lands, or when a draw nocks its arrow, in seconds, -1
     // without one, w = how far one play carries the soldier.
-    rates: array<vec4<f32>, 18>,
+    rates: array<vec4<f32>, 19>,
     // The joints the gait, the arm sway and the attack write: (pelvis,
     // chest, head, weapon), then (upper arm, forearm, hand, coat) of the
     // weapon side and of the shield side, then (thigh, shin, foot) of
@@ -679,6 +679,17 @@ const CLIP_PARRY: u32 = 15u;
 // and ready while it is.
 const CLIP_MELEE_STAND: u32 = 16u;
 const CLIP_MELEE_READY: u32 = 17u;
+// An archer's run with his knife out: the whole body, looping, its
+// phase the gait's at the gait's rate (unit_build.wgsl).
+const CLIP_MELEE_RUN: u32 = 18u;
+
+// The share of knife-out archers who run in the charge pose over the
+// gait, arms trailing, as all of them did before the run clip: kept for
+// variety. Repeated in unit_build.wgsl; keep in sync.
+const KNIFE_SPRINT_SHARE: f32 = 0.05;
+fn knife_sprinter(seed: f32) -> bool {
+    return fract(seed * 7.31) < KNIFE_SPRINT_SHARE;
+}
 // render_units.rs RELOAD_S: the reload a skeleton's shot plays after its
 // release, from its end down to the ready pose and through the draw to
 // the held aim.
@@ -771,6 +782,11 @@ struct Pre {
     bow_w: f32,
     // An archer's knife is out and his bow put away.
     knife: bool,
+    // How far his knife-out run clip has the whole body, 0 to 1: the
+    // gait's run share while he moves with the knife out, unless he is
+    // one of the sprinters who keep the old run. The procedural lean,
+    // bob, shift and shoulder turn give way by it.
+    run_clip: f32,
     // The bow rig's table and the place in it, 0 to 1.
     clip: u32,
     clip_x: f32,
@@ -958,6 +974,11 @@ fn pose_begin(pos_scale: vec4<f32>, color: vec4<f32>, anim: vec4<f32>, anim2: ve
     let leg = select(0.0, rig.leg, fx < 1.99);
     let gait = fract(inst.anim2.z + seed);
     let g = gait_at(speed, leg);
+    let run_clip = select(
+        0.0,
+        g.run * moving,
+        skel && knife && fx < 1.99 && rig.skel.clips[CLIP_MELEE_RUN].y > 0u && !knife_sprinter(seed),
+    );
     // The step wave the arms counter, and the idle wobble, which is the
     // one oscillator that is not locomotion.
     let limb = cos(TAU * gait) * walking;
@@ -1007,6 +1028,7 @@ fn pose_begin(pos_scale: vec4<f32>, color: vec4<f32>, anim: vec4<f32>, anim2: ve
         bow_rig,
         bow_w,
         knife,
+        run_clip,
         clip,
         clip_x,
         shooting,
@@ -1061,16 +1083,18 @@ fn put_common() {
     // The shoulders turn against the legs and the upper body shifts over
     // the planted foot, both at full weight here: the torso eases them in
     // up its height (`place`).
-    let turn = 0.10 * g.run * g.stride * pre.limb + pre.twitch_turn;
+    // The run clip carries its own turn, shift, lean and bob.
+    let own = 1.0 - pre.run_clip;
+    let turn = 0.10 * g.run * g.stride * pre.limb * own + pre.twitch_turn;
     let shift = 0.02 * pre.leg * g.run * g.stride * cos(TAU * (pre.gait - 0.5 * g.duty))
-        * (1.0 - pre.step_w);
+        * (1.0 - pre.step_w) * own;
     // The body rides the hip drop from the gait. A runner leans as far
     // forward as a charger. A blow leans into it, except one from a clip
     // (the cut, the stab, the charging blow), which moves the whole body
     // itself.
     let blow = select(0.30 * pre.lunge + 0.25 * pre.chop, 0.0, pre.cut || pre.stab || pre.charge_attack);
-    let lean = 0.10 * pre.moving
-        + 0.24 * max(g.run * pre.moving, pre.sprint * (0.25 + 0.75 * pre.moving))
+    let lean = (0.10 * pre.moving
+        + 0.24 * max(g.run * pre.moving, pre.sprint * (0.25 + 0.75 * pre.moving))) * own
         + blow;
     // Stagger (anim2.w = remaining stun, 1 at the blow -> 0 recovered):
     // rocked back off a charging blow or a spear point. The whole body
@@ -1108,7 +1132,7 @@ fn put_common() {
     // wall carry a slight crouch. Each is a share of the soldier's height.
     let height = 2.0 * rig.half;
     let hop = 0.06 * pre.celebrate * max(sin(pre.wobble), 0.0);
-    let bob = -pre.dip;
+    let bob = -pre.dip * own;
     let offset = bob + height * (hop - 0.15 * death - 0.07 * pre.brace
         - 0.03 * pre.ready * pre.moving - 0.05 * pre.wall - 0.10 * pre.stagger);
     pose_put(P_POS, vec4<f32>(pre.pos, offset));
@@ -1603,7 +1627,7 @@ fn put_skeleton() {
     if hold > 0.0 {
         skel_over(&turn, SkelAt(CLIP_CHARGE, 0u, 0.0), hold, 0.0);
     }
-    if moving > 0.0 {
+    if moving > 0.0 && pre.run_clip < 1.0 {
         // The gait: thigh, knee and foot pitches, the weapon side's leg
         // half a cycle after the shield side's (`put_leg`). The coat
         // swings with the thigh.
@@ -1623,6 +1647,16 @@ fn put_skeleton() {
         let sway = (0.18 - 0.06 * pre.g.run) * moving * pre.limb * (1.0 - pre.raise) * (1.0 - hold);
         turn[arm_r.x] = qmul(qx(-sway), turn[arm_r.x]);
         turn[arm_l.x] = qmul(qx(0.06 * moving * pre.limb * (1.0 - pre.wall) * (1.0 - hold)), turn[arm_l.x]);
+    }
+    // Running with his knife out, the whole body runs in the run clip,
+    // at the gait's phase, over the gait and the charge pose by the run
+    // share: a walk fades it out, a start or a stop blends through at
+    // whatever stride phase he is at. A blow or an answer below keeps
+    // his legs running as it keeps the gait's.
+    if pre.run_clip > 0.0 {
+        let at = skel_at(CLIP_MELEE_RUN, pre.gait * rig.skel.rates[CLIP_MELEE_RUN].y);
+        skel_over(&turn, at, pre.run_clip, pre.run_clip);
+        root = mix(root, skel_root_at(at), pre.run_clip);
     }
     if cut > 0.0 {
         // Clip time from the wind-up to the blow at its contact, then

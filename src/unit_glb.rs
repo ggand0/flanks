@@ -598,7 +598,7 @@ pub fn clips_on() -> bool {
 /// empty and the player does without it. Slots 10 to 13 are an archer's
 /// shot: the draw from ready to the level aim, its release, the raise from
 /// the level aim to the high one, and its release.
-const SKEL_CLIPS: [&str; 18] = [
+const SKEL_CLIPS: [&str; 19] = [
     "stand",
     "ready",
     "shuffle_left",
@@ -621,6 +621,9 @@ const SKEL_CLIPS: [&str; 18] = [
     // place of his stand and ready while it is.
     "melee_stand",
     "melee_ready",
+    // An archer's run with his knife out: the whole body, at the gait's
+    // phase (unit_pose.wgsl CLIP_MELEE_RUN).
+    "melee_run",
 ];
 const SKEL_CLIPS_NEEDED: usize = 2;
 /// The slot of the first step clip: left, right, forward and backward

@@ -433,6 +433,7 @@ fn gait_rate(speed: f32) -> f32 {
     return 1.0 + 0.16 * speed;
 }
 
+
 fn lod_jitter(seed: f32) -> f32 {
     return 1.0 - 0.5 * LOD_JITTER + LOD_JITTER * seed;
 }
@@ -700,6 +701,12 @@ fn build_soldier(i: u32) {
     sm.band += (tier - sm.band) * params.k_band;
     sm.wall += (reg.walled - sm.wall) * params.k_wall;
     // The step is capped as in gait.rs `advance`.
+    // The run clip (unit_pose.wgsl `put_skeleton`) plays at the gait's
+    // rate too. Its own stride, 2.7 m a cycle, driven by the ground
+    // covered would turn over 3.7 cycles a second at a 9.5 m/s sprint,
+    // an insect's legs; at the gait's 2.5 the planted
+    // foot slides forward a third of the ground speed at that sprint,
+    // nothing at a jog.
     let g = sm.gait + min(gait_rate(sm.walk) * params.dt, 0.25);
     sm.gait = g - floor(g);
     // The record's fourth position float: an archer's bow, a skinned
