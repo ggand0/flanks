@@ -11,6 +11,21 @@
 //! morale pass).
 
 use bevy::prelude::*;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Nanoseconds spent in `update_arrows` and `sync_arrow_instances` since
+/// the overlay last read them (overlay.rs, the fps line).
+pub static ARROW_UPDATE_NS: AtomicU64 = AtomicU64::new(0);
+pub static ARROW_PACK_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Adds the time since its making to a counter when dropped.
+struct Timed(&'static AtomicU64, std::time::Instant);
+
+impl Drop for Timed {
+    fn drop(&mut self) {
+        self.0.fetch_add(self.1.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+}
 
 use bevy::camera::visibility::NoFrustumCulling;
 use bevy::render::batching::NoAutomaticBatching;
@@ -329,6 +344,7 @@ fn update_arrows(
     mut sounds: Option<ResMut<crate::audio::SoundEvents>>,
     mut tick: Local<u32>,
 ) {
+    let _timed = Timed(&ARROW_UPDATE_NS, std::time::Instant::now());
     let _span = info_span!("update_arrows").entered();
     let dt = time.delta_secs();
     *tick = tick.wrapping_add(1);
@@ -646,6 +662,7 @@ fn sync_arrow_instances(
     fixed: Res<Time<Fixed>>,
     mut query: Query<&mut InstanceMaterialData, With<ArrowBucket>>,
 ) {
+    let _timed = Timed(&ARROW_PACK_NS, std::time::Instant::now());
     let Ok(mut data) = query.single_mut() else {
         return;
     };
