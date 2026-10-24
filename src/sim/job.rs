@@ -23,9 +23,9 @@ pub(crate) struct ShootAt {
     /// Target regiment (index into `Groups::list`): the per-shot
     /// aim picks one of its living soldiers.
     pub(crate) t: usize,
-    /// The men search for clear men themselves (sim/soldier.rs
-    /// `pick_quarry`), in the regiment's `search_blocks`: the target is
-    /// in melee, or coming for the regiment.
+    /// The men shoot the clear men of the regiment's `search_blocks`
+    /// (sim/mod.rs `clear_members`, sim/soldier.rs `pick_quarry`): the
+    /// target is in melee, or coming for the regiment.
     pub(crate) search: bool,
 }
 
@@ -140,17 +140,22 @@ pub struct TickJob {
     /// index order.
     pub(crate) target_members: Vec<Vec<u32>>,
     /// Per regiment: some archer regiment's men search in it this tick
-    /// (`ShootAt::search`), so its men keep their clear marks.
+    /// (`ShootAt::search`), so the job lists its clear men.
     pub(crate) searched: Vec<bool>,
+    /// Per regiment under search: the blocks of the shooters' side
+    /// within a shaft's reach of it (`clear_reach`), as rectangles; the
+    /// clear men stand farther than that from every one of them.
+    pub(crate) clear_blocks: Vec<Vec<crate::formation::BlockRect>>,
     /// Per archer regiment: the enemy blocks its men search in, nearest
     /// first; empty when its bows have a plain target or none.
     pub(crate) search_blocks: Vec<Vec<u32>>,
     /// Per regiment: why its men take their knives out (archers only).
     pub(crate) sidearm: Vec<Sidearm>,
     /// The clear men of every regiment under search, per regiment, in
-    /// index order: marked clear by their own look around and with no
-    /// enemy in their reach (sim/soldier.rs SIGHT_CLEAR, SIGHT_FOE), as
-    /// of the last tick. Prep reads the last run's lists for the card.
+    /// index order: no enemy in their reach (sim/soldier.rs SIGHT_FOE,
+    /// as of the last tick) and farther than a shaft's reach from every
+    /// block in `clear_blocks`. Prep reads the last run's lists for the
+    /// card.
     pub(crate) clear_members: Vec<Vec<u32>>,
     /// The density field of the tick's start positions (frontline.rs),
     /// built when a taker wants it (not on the inline path, where
@@ -251,6 +256,8 @@ struct FireSolutions {
     searched: Vec<bool>,
     /// Per archer regiment: the blocks its men search in.
     search_blocks: Vec<Vec<u32>>,
+    /// Per regiment under search: the shooters' blocks near it.
+    clear_blocks: Vec<Vec<crate::formation::BlockRect>>,
     /// Friendly formed blocks per team as discs with a clearance ceiling,
     /// for the loft-over-friendlies check.
     blocks: [Vec<(Vec2, f32, f32)>; 2],
@@ -305,6 +312,7 @@ pub(crate) fn prepare_tick(
     job.targeted = fire.targeted;
     job.searched = fire.searched;
     job.search_blocks = fire.search_blocks;
+    job.clear_blocks = fire.clear_blocks;
     job.blocks = fire.blocks;
     job.sidearm = sidearm_reasons(groups, tracks, terrain);
     job.field.size_to(terrain.min(), terrain.max());
@@ -849,8 +857,9 @@ fn skirmish_reactions(
 /// (`head_arrived`) and shoots; it marches again only when the frame it
 /// holds is out of range. Fire at will takes the nearest enemy block in range that is
 /// not in melee; when every block in range is in melee, or one is
-/// coming for the regiment, its men search for clear men themselves
-/// (`ShootAt::search`, sim/soldier.rs). Makes the regiment writes prep
+/// coming for the regiment, its men shoot the clear men of those blocks
+/// (`ShootAt::search`; the job lists them from `clear_blocks`, sim/mod.rs
+/// `clear_members`). Makes the regiment writes prep
 /// makes: the stand-off state with its anchor and march facing, the
 /// firing place, and the `firing` flag.
 fn archer_fire_solutions(
@@ -1081,6 +1090,28 @@ fn archer_fire_solutions(
             }
         }
     }
+    // The blocks of the shooters' side within a shaft's reach of each
+    // searched block, by the gap between the edges, as rectangles: a man
+    // of the searched block farther than that reach from every one of
+    // them, with no enemy in his own reach, is clear (sim/mod.rs
+    // `clear_members`). A block with a wider gap has no point of its
+    // footprint within the reach of any man inside the searched block.
+    // Broken blocks count too: the rectangle sits on the men's centroid.
+    let clear_r = clear_reach();
+    let clear_blocks: Vec<Vec<crate::formation::BlockRect>> = (0..n_groups)
+        .map(|e| {
+            if !searched[e] {
+                return Vec::new();
+            }
+            let eg = &groups.list[e];
+            groups
+                .list
+                .iter()
+                .filter(|fg| fg.team != eg.team && fg.count > 0 && edge_gap(fg, eg) <= clear_r)
+                .map(crate::formation::block_rect)
+                .collect()
+        })
+        .collect();
     // Friendly blocks per team for the loft-over-friendlies check: every
     // live formed regiment as a disc with a clearance ceiling. A
     // shooter's own regiment is in here too — that is what makes rear
@@ -1107,8 +1138,20 @@ fn archer_fire_solutions(
         targeted,
         searched,
         search_blocks,
+        clear_blocks,
         blocks,
     }
+}
+
+/// How far a shaft aimed at a man can come down from him: the corner of
+/// the aim's scatter box, plus the ground a shaft falling at 45 degrees
+/// covers while it crosses the strike band (arrows.rs). A man with no
+/// man of the shooters' side within it is one a shaft can be aimed at
+/// without landing on a friend of the shooter.
+pub(crate) fn clear_reach() -> f32 {
+    crate::unit_types::missile::AIM_SPREAD * std::f32::consts::SQRT_2
+        + crate::unit_types::tallest()
+        + crate::arrows::STRIKE_MARGIN
 }
 
 /// Why each archer regiment's men take their knives out this tick

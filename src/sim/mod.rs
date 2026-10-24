@@ -354,6 +354,7 @@ fn run_tick_job(job: &mut TickJob) {
         search_blocks,
         sidearm,
         clear_members,
+        clear_blocks,
         field,
         field_wanted,
         dead,
@@ -393,19 +394,25 @@ fn run_tick_job(job: &mut TickJob) {
             }
         }
     }
-    // And of every regiment under search, its clear men: marked clear
-    // by their own look around and with no enemy in their reach
-    // (soldier.rs SIGHT_CLEAR, SIGHT_FOE), as of the last tick.
+    // And of every regiment under search, its clear men: no enemy in
+    // his reach (soldier.rs SIGHT_FOE, as of the last tick) and farther
+    // than a shaft's reach from every block of the shooters' side that
+    // stands near his (job.rs `clear_blocks`). Ascending, so a kept pick
+    // is found by a binary search (soldier.rs `quarry_ok`).
+    let clear_r = job::clear_reach();
     clear_members.resize_with(n_groups, Vec::new);
     for (g, members) in clear_members.iter_mut().enumerate() {
         members.clear();
         if searched[g] {
+            let near = &clear_blocks[g];
             for &(s, e) in &reg_runs[g] {
                 members.extend((s..e).filter(|&i| {
                     let i = i as usize;
-                    death_t_in[i] == 0
-                        && sight_in[i] & soldier::SIGHT_CLEAR != 0
-                        && sight_in[i] & soldier::SIGHT_FOE == 0
+                    if death_t_in[i] != 0 || sight_in[i] & soldier::SIGHT_FOE != 0 {
+                        return false;
+                    }
+                    let p = Vec2::new(pos_prev[i].x, pos_prev[i].z);
+                    near.iter().all(|b| b.distance(p) > clear_r)
                 }));
             }
         }
@@ -447,7 +454,6 @@ fn run_tick_job(job: &mut TickJob) {
     let target_members = &target_members[..];
     let clear_members = &clear_members[..];
     let search_blocks = &search_blocks[..];
-    let searched = &searched[..];
     let sidearm = &sidearm[..];
     let blocks = &*blocks;
     let field = soldier::Field {
@@ -481,9 +487,7 @@ fn run_tick_job(job: &mut TickJob) {
         target_members,
         clear_members,
         search_blocks,
-        searched,
         sidearm,
-        sight_snap: &sight_in[..],
         death_snap: death_t_in,
         blocks,
         faces_spearwall,

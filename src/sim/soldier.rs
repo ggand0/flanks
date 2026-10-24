@@ -198,13 +198,9 @@ const SIGHT_GO: u16 = 1 << 5;
 const SIGHT_GO_FAR: u16 = 1 << 6;
 const SIGHT_BACK: u16 = 1 << 7;
 /// An enemy stands in his weapon's reach (the scan's finding, every
-/// tick): the archers' search never aims at him (sim/job.rs).
+/// tick): the archers' search never aims at him (sim/mod.rs
+/// `clear_members`).
 pub(crate) const SIGHT_FOE: u16 = 1 << 8;
-/// No enemy of his within a shaft's reach of him (the aim's scatter and
-/// its fall through the strike band, `scan`), looked for every eighth
-/// tick while some archer regiment searches his block: a shaft aimed at
-/// him cannot come down on a friend of the shooter.
-pub(crate) const SIGHT_CLEAR: u16 = 1 << 9;
 /// An archer's knife: bits 10 to 14 count down (one every fourth tick)
 /// from the last tick an enemy came close to him (`KNIFE_HOLD`), and
 /// `SIGHT_KNIFE` is set while the knife is out, by that count or by his
@@ -318,18 +314,15 @@ pub(crate) struct Field<'a> {
     pub fat_nocharge: &'a [bool],
     pub shoot_at: &'a [Option<crate::sim::job::ShootAt>],
     pub target_members: &'a [Vec<u32>],
-    /// Per regiment: its clear men, for the archers' search (sim/job.rs
-    /// `searched`; built in sim/mod.rs from the marks).
+    /// Per regiment under search: its clear men, ascending (sim/mod.rs
+    /// `clear_members`).
     pub clear_members: &'a [Vec<u32>],
     /// Per archer regiment: the blocks its men search in, nearest first.
     pub search_blocks: &'a [Vec<u32>],
-    /// Per regiment: some archer regiment searches in it this tick.
-    pub searched: &'a [bool],
     /// Per regiment: why its men take their knives out (archers only).
     pub sidearm: &'a [crate::sim::job::Sidearm],
-    /// The sight and death columns at the tick's start: another man's
-    /// marks and life, read by the archer who picks him.
-    pub sight_snap: &'a [u16],
+    /// The death column at the tick's start: another man's life, read
+    /// by the archer who picks him.
     pub death_snap: &'a [u8],
     pub blocks: &'a [Vec<(Vec2, f32, f32)>; 2],
     pub faces_spearwall: [bool; 2],
@@ -824,45 +817,13 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
             chain: 0,
         });
     }
-    // His marks for the archers (sim/job.rs): every tick
-    // whether an enemy stands in his reach and, while some archer
-    // regiment searches his block, every eighth tick whether any enemy
-    // stands within the aim's spread of him. A man clear of both is a
-    // target a shaft can be aimed at without landing on a friend. The
-    // wider look stops, and its mark goes, once nobody searches.
+    // His mark for the archers (sim/mod.rs `clear_members`): every tick
+    // whether an enemy stands in his reach.
     if !dying {
         if best_idx != u32::MAX {
             *s.sight |= SIGHT_FOE;
         } else {
             *s.sight &= !SIGHT_FOE;
-        }
-        if f.tick.wrapping_add(i as u32).is_multiple_of(8) {
-            if f.searched[gi] {
-                // How far a shaft aimed at him can come down from him:
-                // the corner of the aim's scatter box, plus the ground a
-                // shaft falling at 45 degrees covers while it crosses the
-                // strike band (arrows.rs). No enemy of his within that
-                // and no friend of the shooter is under the shaft.
-                let clear_r = crate::unit_types::missile::AIM_SPREAD * std::f32::consts::SQRT_2
-                    + crate::unit_types::tallest()
-                    + crate::arrows::STRIKE_MARGIN;
-                let mut foe_near = false;
-                grid.for_each_candidate(p, clear_r, |o| {
-                    if (o.meta & crate::spatial::META_TEAM) != my_team_bit
-                        && (o.meta & crate::spatial::META_DYING) == 0
-                        && p.distance_squared(o.xz()) < clear_r * clear_r
-                    {
-                        foe_near = true;
-                    }
-                });
-                if foe_near {
-                    *s.sight &= !SIGHT_CLEAR;
-                } else {
-                    *s.sight |= SIGHT_CLEAR;
-                }
-            } else {
-                *s.sight &= !SIGHT_CLEAR;
-            }
         }
     }
     // An archer's knife: out while his regiment has its swords out, and
@@ -1042,7 +1003,7 @@ fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
                 | (back as u16 * SIGHT_BACK);
         }
         *s.sight = (*s.sight
-            & (SIGHT_GO_FAR | SIGHT_FOE | SIGHT_CLEAR | SIGHT_KNIFE_COUNT | SIGHT_KNIFE))
+            & (SIGHT_GO_FAR | SIGHT_FOE | SIGHT_KNIFE_COUNT | SIGHT_KNIFE))
             | seen;
     }
     let way_blocked = *s.sight & SIGHT_WAY != 0;
@@ -1610,9 +1571,8 @@ const QUARRY_LOOK_TICKS: u32 = 8;
 const QUARRY_TRIES: u32 = 3;
 
 /// Whether `m` is a man this archer may shoot: an enemy of a block his
-/// regiment shoots at, alive, within his reach and, in a search, clear
-/// (sim/job.rs `searched`: marked by the man's own look around, with no
-/// enemy in his reach).
+/// regiment shoots at, alive, within his reach and, in a search, among
+/// his block's clear men (sim/mod.rs `clear_members`).
 #[inline]
 fn quarry_ok(
     f: &Field,
@@ -1623,15 +1583,14 @@ fn quarry_ok(
     blocks: &[u32],
     m: u32,
 ) -> bool {
-    let Field { pos_prev, team, group, death_snap, sight_snap, .. } = *f;
+    let Field { pos_prev, team, group, death_snap, clear_members, .. } = *f;
     let mi = m as usize;
     mi < pos_prev.len()
         && team[mi] != my_team
         && death_snap[mi] == 0
         && blocks.contains(&group[mi])
         && pos_prev[mi].xz().distance_squared(p) <= reach2
-        && (!shot.search
-            || (sight_snap[mi] & SIGHT_CLEAR != 0 && sight_snap[mi] & SIGHT_FOE == 0))
+        && (!shot.search || clear_members[group[mi] as usize].binary_search(&m).is_ok())
 }
 
 /// The man an archer draws at: the one he keeps, when he is one of the
