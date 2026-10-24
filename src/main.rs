@@ -105,6 +105,21 @@ fn window_resolution() -> bevy::window::WindowResolution {
     }
 }
 
+/// `FL_WINDOW_AT=x,y` opens the window at that desktop position in
+/// physical pixels, so a scripted run lands on the monitor meant for
+/// it instead of where the desktop puts it. Without it the desktop
+/// places the window.
+fn window_position() -> bevy::window::WindowPosition {
+    let at = std::env::var("FL_WINDOW_AT").ok().and_then(|v| {
+        let (x, y) = v.split_once(',')?;
+        Some(IVec2::new(x.trim().parse().ok()?, y.trim().parse().ok()?))
+    });
+    match at {
+        Some(p) => bevy::window::WindowPosition::At(p),
+        None => default(),
+    }
+}
+
 fn main() {
     // Load before the App so the window opens with the saved video
     // settings instead of switching modes one frame in.
@@ -127,6 +142,7 @@ fn main() {
                         present_mode: settings::present_mode(&user_settings),
                         mode: settings::window_mode(&user_settings),
                         resolution: window_resolution(),
+                        position: window_position(),
                         ..default()
                     }),
                     ..default()
