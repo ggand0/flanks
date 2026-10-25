@@ -332,6 +332,7 @@ fn run_tick_job(job: &mut TickJob) {
         reg_broken,
         press,
         moving,
+        passing,
         focus,
         engaged,
         contact,
@@ -438,6 +439,7 @@ fn run_tick_job(job: &mut TickJob) {
     let broken = &reg_broken[..];
     let press = &press[..];
     let moving = &moving[..];
+    let passing = &passing[..];
     let focus = &focus[..];
     let engaged = &engaged[..];
     let contact = &contact[..];
@@ -471,6 +473,7 @@ fn run_tick_job(job: &mut TickJob) {
         broken,
         press,
         moving,
+        passing,
         focus,
         engaged,
         contact,

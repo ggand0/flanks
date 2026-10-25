@@ -139,6 +139,8 @@ pub struct TickJob {
     pub(crate) reg_broken: Vec<bool>,
     pub(crate) press: Vec<bool>,
     pub(crate) moving: Vec<bool>,
+    /// Per regiment: walking through an open friend (`GroupData::passing`).
+    pub(crate) passing: Vec<bool>,
     pub(crate) focus: Vec<Option<u32>>,
     pub(crate) engaged: Vec<bool>,
     pub(crate) contact: Vec<bool>,
@@ -689,6 +691,23 @@ const OPEN_LEAD_S: f32 = 8.0;
 /// (metres).
 const OPEN_KEEP: f32 = 3.0;
 
+/// The ground a regiment's men stand on: while it passes a friend the
+/// rectangle round its men, else its block.
+fn men_rect(gd: &GroupData) -> crate::formation::BlockRect {
+    gd.men.unwrap_or_else(|| crate::formation::block_rect(gd))
+}
+
+/// A radius about the centroid that holds `men_rect`.
+fn men_bound(gd: &GroupData) -> f32 {
+    match gd.men {
+        Some(m) => {
+            let bound = m.centre.distance(gd.centroid) + m.half_w.hypot(m.half_d);
+            bound.max(crate::formation::block_bound(gd))
+        }
+        None => crate::formation::block_bound(gd),
+    }
+}
+
 /// A regiment walking somewhere: a goal further than a metre off, not
 /// standing off its target, holding before a block or fighting on a
 /// contact frame. The friends a holding regiment opens for.
@@ -710,9 +729,38 @@ fn goes_to(groups: &Groups, m: usize) -> Option<Vec2> {
 /// friend's path crosses it, no walking friend's block is within
 /// OPEN_KEEP of it and no standing friend stands on its closed ground.
 /// An order, a fight or a rout closes it at once (formation.rs
-/// `apply_reforms`).
+/// `apply_reforms`). A walking regiment whose block is within OPEN_KEEP
+/// of an open friend's is passing it (`GroupData::passing`), on its own
+/// look; its order done, it stays passing until its men
+/// (`GroupData::men`) are out of every open friend.
 fn open_for_passers(groups: &mut Groups, tracks: &crate::arrows::RegTracks, tick: u32) {
     let n = groups.list.len();
+    for m in 0..n {
+        if !tick.wrapping_add(m as u32).is_multiple_of(ARCHER_LOOK) {
+            continue;
+        }
+        let gl: &Groups = &*groups;
+        let md = &gl.list[m];
+        // Walking, it passes an open friend within OPEN_KEEP of it. Its
+        // order done, it stays passing while its men stand inside one:
+        // its tail is still in the friend when its head arrives, and a
+        // regiment that only stands beside a friend holds nobody open.
+        let walking = goes_to(gl, m).is_some();
+        let reach = if walking { OPEN_KEEP } else { 0.0 };
+        let passing = (walking || md.passing) && {
+            let bound = men_bound(md);
+            let rect = men_rect(md);
+            gl.list.iter().enumerate().any(|(h, hd)| {
+                h != m
+                    && hd.team == md.team
+                    && hd.spacing == crate::formation::FormSpacing::Open
+                    && hd.centroid.distance(md.centroid) - bound - crate::formation::block_bound(hd)
+                        <= reach
+                    && rect_gap(&rect, &crate::formation::block_rect(hd)) < reach.max(1e-3)
+            })
+        };
+        groups.list[m].passing = passing;
+    }
     for h in 0..n {
         if !tick.wrapping_add(h as u32).is_multiple_of(ARCHER_LOOK) {
             continue;
@@ -737,9 +785,12 @@ fn open_for_passers(groups: &mut Groups, tracks: &crate::arrows::RegTracks, tick
                 continue;
             }
             let Some(goal) = goes_to(gl, m) else {
-                // A standing friend on its closed ground keeps it open:
-                // one ordered onto that ground stands there now.
-                if open && md.order.is_none() {
+                // A friend still passing keeps it open until its last man
+                // is clear; a standing friend on its closed ground keeps
+                // it open too: one ordered onto that ground stands there.
+                if open && md.passing {
+                    keep |= rect_gap(&rect, &men_rect(md)) < 0.0;
+                } else if open && md.order.is_none() {
                     let ground = crate::formation::closed_rect_at(hd, hd.centroid);
                     keep |= rect_gap(&ground, &crate::formation::block_rect(md)) < 0.0;
                 }
@@ -754,12 +805,12 @@ fn open_for_passers(groups: &mut Groups, tracks: &crate::arrows::RegTracks, tick
             let ahead = ((growth + OPEN_MARGIN) / speed).max(OPEN_LEAD_S) * speed;
             let to_goal = goal.distance(md.centroid);
             let len = to_goal.min(ahead);
-            if hd.centroid.distance(md.centroid) - bound - crate::formation::block_bound(md)
+            if hd.centroid.distance(md.centroid) - bound - men_bound(md)
                 > len.max(OPEN_KEEP)
             {
                 continue;
             }
-            let gap = rect_gap(&rect, &crate::formation::block_rect(md));
+            let gap = rect_gap(&rect, &men_rect(md));
             let dir = (goal - md.centroid) / to_goal;
             let crosses = path_hit(gl, m, dir, len, h).is_some();
             if crosses || gap < 0.0 {
@@ -1586,6 +1637,7 @@ fn snapshot_regiments(job: &mut TickJob, groups: &Groups, terrain: &Terrain) {
     job.reg_broken = group_broken;
     job.press = press;
     job.moving = moving;
+    job.passing = groups.list.iter().map(|g| g.passing).collect();
     job.focus = focus;
     job.engaged = engaged;
     job.contact = contact;
