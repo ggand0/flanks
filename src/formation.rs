@@ -27,8 +27,8 @@ pub const BASE_SPACING: f32 = 1.4;
 
 /// A kind's slot pitch in normal order: how far apart its men stand.
 /// FL_GAP=k,m,s,a sets it per kind in metres (knights, men-at-arms,
-/// spearmen, bowmen). Never under the separation rest distance
-/// (sim/soldier.rs SEP_RADIUS): the physics pushes closer slots apart.
+/// spearmen, bowmen). Never under the separation rest distance at ease
+/// (sim/soldier.rs `sep_ease`): the physics pushes closer slots apart.
 pub fn gap(kind: u8) -> f32 {
     static GAPS: std::sync::OnceLock<[f32; crate::unit_types::NUM_KINDS]> =
         std::sync::OnceLock::new();
@@ -38,7 +38,7 @@ pub fn gap(kind: u8) -> f32 {
             let parsed: Vec<f32> = v.split(',').filter_map(|t| t.trim().parse().ok()).collect();
             match <[f32; crate::unit_types::NUM_KINDS]>::try_from(parsed) {
                 Ok(given) => {
-                    let floor = crate::sim::soldier::SEP_RADIUS;
+                    let floor = crate::sim::soldier::sep_ease();
                     if given.iter().any(|g| *g < floor) {
                         warn!("FL_GAP: a gap under {floor} m cannot be held, raised to it");
                     }

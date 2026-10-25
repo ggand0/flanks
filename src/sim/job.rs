@@ -106,6 +106,7 @@ pub struct TickJob {
     pub(crate) sight_in: Arc<Vec<u16>>,
     pub(crate) chain_in: Arc<Vec<u8>>,
     pub(crate) way_in: Arc<Vec<Vec2>>,
+    pub(crate) pose_in: Arc<Vec<u8>>,
     pub(crate) quarry_in: Arc<Vec<u32>>,
     // Read only to pack the render snapshot.
     pub(crate) pos_prev_in: Arc<Vec<Vec3>>,
@@ -132,6 +133,7 @@ pub struct TickJob {
     pub(crate) sight: Vec<u16>,
     pub(crate) chain: Vec<u8>,
     pub(crate) way: Vec<Vec2>,
+    pub(crate) pose: Vec<u8>,
     pub(crate) quarry: Vec<u32>,
     // Per-regiment command snapshot, taken at prep.
     pub(crate) orders: Vec<Option<Vec2>>,
@@ -141,6 +143,9 @@ pub struct TickJob {
     pub(crate) moving: Vec<bool>,
     /// Per regiment: walking through an open friend (`GroupData::passing`).
     pub(crate) passing: Vec<bool>,
+    /// Per regiment: the stance its men are drawn in, which sets their
+    /// width (sim/soldier.rs STANCE_*).
+    pub(crate) stance: Vec<u8>,
     pub(crate) focus: Vec<Option<u32>>,
     pub(crate) engaged: Vec<bool>,
     pub(crate) contact: Vec<bool>,
@@ -248,6 +253,7 @@ impl TickJob {
         self.sight_in = Default::default();
         self.chain_in = Default::default();
         self.way_in = Default::default();
+        self.pose_in = Default::default();
         self.quarry_in = Default::default();
         self.pos_prev_in = Default::default();
         self.color_in = Default::default();
@@ -422,6 +428,7 @@ fn share_columns(job: &mut TickJob, units: &Units) {
     job.sight_in = units.sight.share();
     job.chain_in = units.chain.share();
     job.way_in = units.way.share();
+    job.pose_in = units.pose.share();
     job.quarry_in = units.quarry.share();
     job.pos_prev_in = units.pos_prev.share();
     job.color_in = units.color.share();
@@ -445,6 +452,7 @@ fn share_columns(job: &mut TickJob, units: &Units) {
     fit(&mut job.sight, n);
     fit(&mut job.chain, n);
     fit(&mut job.way, n);
+    fit(&mut job.pose, n);
     fit(&mut job.quarry, n);
 }
 
@@ -690,6 +698,27 @@ const OPEN_LEAD_S: f32 = 8.0;
 /// A friend's block this close to an open regiment's keeps it open
 /// (metres).
 const OPEN_KEEP: f32 = 3.0;
+
+/// A regiment's men standing still are drawn in their ready stance
+/// (render_units.rs `stance_tier` above zero, the guard of the pose
+/// pass), or a wall: they stand at their combat width.
+pub(crate) fn ready_stance(g: &GroupData) -> bool {
+    crate::render_units::stance_tier(g) > 0.0 || crate::render_units::wall_signal(g) > 0.0
+}
+
+/// The stance a regiment's men are drawn in (sim/soldier.rs STANCE_*):
+/// fighting or in a wall, in the ready stance whatever they do; with an
+/// enemy near, attacking or charging, in it while they stand; else at
+/// ease.
+fn stance_of(g: &GroupData) -> u8 {
+    if g.engaged || crate::render_units::wall_signal(g) > 0.0 {
+        crate::sim::soldier::STANCE_FIGHT
+    } else if ready_stance(g) {
+        crate::sim::soldier::STANCE_READY
+    } else {
+        crate::sim::soldier::STANCE_EASE
+    }
+}
 
 /// A regiment walking somewhere: a goal further than a metre off, not
 /// standing off its target, holding before a block or fighting on a
@@ -1621,6 +1650,7 @@ fn snapshot_regiments(job: &mut TickJob, groups: &Groups, terrain: &Terrain) {
     job.press = press;
     job.moving = moving;
     job.passing = groups.list.iter().map(|g| g.passing).collect();
+    job.stance = groups.list.iter().map(stance_of).collect();
     job.focus = focus;
     job.engaged = engaged;
     job.contact = contact;
