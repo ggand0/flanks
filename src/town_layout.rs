@@ -1,28 +1,39 @@
 //! The walled town (`FL_MAP=walled_town`): the hill map's ground with a
 //! stone wall across the plateau and a town of houses behind it. Every
 //! piece is listed once here (`pieces`), and both the drawn models
-//! (town.rs) and the sim's heights (`sim_heights`) come from that list, so
+//! (town.rs) and the sim's ground (`sim_ground`) come from that list, so
 //! the two cannot drift.
 //!
-//! The sim sees a piece as raised ground, like the Town map's blocks: a
-//! vertex with a 4-neighbour 2 m or more away in height is blocked
-//! (`terrain::SLOPE_BLOCK`), and a soldier stands on the vertex nearest
-//! him. So a raised top loses its edge rows, a lane on it is its width
-//! less 2 m, and the ground row beside a piece is blocked too: men stop
-//! about 3 m off a face.
+//! The sim reads the ground on a 2 m vertex grid: a soldier stands on
+//! the vertex nearest him, and a vertex is open or blocked
+//! (`Terrain::blocked_at`). Natural ground is blocked by the step rule
+//! (a 4-neighbour 2 m or more away in height, `terrain::SLOPE_BLOCK`),
+//! which cannot see a kerb, a rail or a stair leaning on a wall. So the
+//! pieces say outright which vertices are open: each piece names its
+//! clear surface (`Piece::surface`), and a vertex within a cell of a
+//! piece is open when the 2 m square around it meets nothing solid, and
+//! blocked otherwise. The ground beside a vertical face is open: a man
+//! can stand at the foot of a wall. A soldier's body stops at the
+//! boundary of the open vertices (`Terrain::body_free`), half a cell
+//! from the blocked row less his own radius.
 //!
-//! - Wall units (2 m along the wall, 8 m deep): an 8 m strip whose lane is
-//!   the middle 6 m, the model's walk.
-//! - Drum towers: the strip goes on through the passage at 8 m, the rest
-//!   of the disc stands at 12 m, the roof no one reaches.
-//! - The gatehouse: the strip across all of it at 8 m, the drums' rest at
-//!   12 m. Its ground passage is under the strip, so it is closed.
-//! - Stairs: an 8 m rise over 12 m (1.33 m per cell, under the 2 m that
-//!   blocks), then the platform at 8 m. The flight touches the wall's
-//!   inner face, and the face's vertex row takes the flight's height
-//!   there: otherwise that row would stand 8 m over the middle row of a
-//!   4 m stair and block it, and nothing could climb.
-//! - Houses: their 10 by 14 m rectangle raised 6 m, the eaves.
+//! - Wall units (2 m along the wall, 8 m deep, the walk at 8 m): the
+//!   walk's clear 6 m is three open rows, the parapet and kerb strips
+//!   are solid.
+//! - Landing units: the kerb removed, so the clear surface reaches the
+//!   stair's platform. Three per stair, the last two over the platform
+//!   and one beside the flight's top, so the way onto the walk is two
+//!   open columns wide.
+//! - Drum towers: the passage floor through the disc at 8 m is clear,
+//!   the rest of the disc solid (the roof no one reaches).
+//! - The gatehouse: the bridge and the drums' passages at 8 m are clear,
+//!   the drums' rest and the gate block solid. The ground passage is
+//!   under the strip, so it is closed.
+//! - Stairs: an 8 m rise over 12 m along the flight (1.33 m per cell,
+//!   so the slope slows men but never blocks), then the platform at 8 m;
+//!   the treads and the platform are clear, the rail along the open side
+//!   and across the far end solid. `STAIR_W` is the model's width.
+//! - Houses: their 10 by 14 m rectangle raised 6 m, solid.
 //!
 //! Pieces stand on levelled ground: the wall run on one flat terrace,
 //! each house on its own pad, blended out into the hill's slopes. The
@@ -31,6 +42,10 @@
 //! Vertices sit on even metres. The wall's line, its ends and the towers'
 //! centres are even, so a strip's faces fall on vertex rows; the houses'
 //! centres are odd, so their faces (5 and 7 m out) do too.
+//!
+//! The walk is also a place units are put: `walk_lane` is where a man's
+//! centre may stand on it, and orders along it take the walk's own rows
+//! (orders.rs `lane_layout`).
 
 use bevy::math::Vec2;
 
@@ -49,6 +64,12 @@ pub const EAVES: f32 = 6.0;
 pub const TOWERS_X: [f32; 4] = [-152.0, -80.0, 80.0, 152.0];
 /// The stairs' feet (x, m), one per curtain, each rising toward +x.
 pub const STAIRS_X: [f32; 4] = [-124.0, -52.0, 36.0, 108.0];
+/// The stair model's width across the flight (m): 4 m as delivered
+/// (handoff 152), 6 m once the wider one lands (handoff 155).
+pub const STAIR_W: f32 = 4.0;
+/// The stair's rail: this thick, along the flight's open side and across
+/// the platform's far end.
+const RAIL: f32 = 0.5;
 /// The house grid: columns and rows of centres on a 30 m pitch.
 const HOUSE_PITCH: f32 = 30.0;
 const HOUSE_COLS: i32 = 10;
@@ -91,6 +112,15 @@ pub struct Piece {
     pub turns: u8,
 }
 
+/// What a point of a piece's footprint is to a soldier.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Surface {
+    /// Floor a man walks on: the walk, a passage, a tread, the platform.
+    Clear,
+    /// A kerb, a parapet, a rail, a face, a roof: nothing stands there.
+    Solid,
+}
+
 impl Piece {
     pub fn yaw(&self) -> f32 {
         self.turns as f32 * std::f32::consts::FRAC_PI_2
@@ -117,7 +147,7 @@ impl Piece {
     fn local_bounds(&self) -> (Vec2, Vec2) {
         match self.kind {
             Kind::Wall | Kind::Landing => (Vec2::new(-1.0, -4.0), Vec2::new(1.0, 4.0)),
-            Kind::Stair => (Vec2::new(0.0, -4.0), Vec2::new(16.0, 0.0)),
+            Kind::Stair => (Vec2::new(0.0, -STAIR_W), Vec2::new(16.0, 0.0)),
             Kind::Tower => (Vec2::splat(-8.0), Vec2::splat(8.0)),
             Kind::Gatehouse => (Vec2::new(-16.0, -6.0), Vec2::new(16.0, 6.0)),
             Kind::House(_) => (Vec2::new(-5.0, -7.0), Vec2::new(5.0, 7.0)),
@@ -168,6 +198,55 @@ impl Piece {
             }
         }
     }
+
+    /// What the world point `p` is on this piece, None off it. The clear
+    /// surfaces are the models' (handoffs 152 and 153): the walk's 6 m
+    /// between the parapet and the kerb, the landing's 7 m, the tower
+    /// passage's 8 m, the gatehouse's 8 m bridge and passages, the stair's
+    /// treads and platform inside its rail.
+    pub fn surface(&self, p: Vec2) -> Option<Surface> {
+        let l = self.local(p);
+        let (lo, hi) = self.local_bounds();
+        let inside = l.x >= lo.x && l.x <= hi.x && l.y >= lo.y && l.y <= hi.y;
+        match self.kind {
+            Kind::Wall => inside.then_some(if l.y.abs() <= 3.0 { Surface::Clear } else { Surface::Solid }),
+            Kind::Landing => inside.then_some(if l.y <= 3.0 { Surface::Clear } else { Surface::Solid }),
+            Kind::House(_) => inside.then_some(Surface::Solid),
+            Kind::Stair => {
+                // The return rail across the far end reaches a metre over
+                // the wall's inner strip.
+                if l.x >= 16.0 - RAIL && l.x <= 16.0 && l.y >= -STAIR_W && l.y <= 1.0 {
+                    return Some(Surface::Solid);
+                }
+                if !inside {
+                    return None;
+                }
+                let rail = l.y <= -STAIR_W + RAIL || l.x >= 16.0 - RAIL;
+                Some(if rail { Surface::Solid } else { Surface::Clear })
+            }
+            Kind::Tower => {
+                if l.length() > 8.0 {
+                    None
+                } else if l.y.abs() <= 4.0 {
+                    Some(Surface::Clear)
+                } else {
+                    Some(Surface::Solid)
+                }
+            }
+            Kind::Gatehouse => {
+                let drum = |cx: f32| (l - Vec2::new(cx, 0.0)).length() <= 6.0;
+                let strip = inside && l.y.abs() <= 4.0;
+                let block = l.x.abs() <= 5.0 && l.y.abs() <= 5.0;
+                if strip {
+                    Some(Surface::Clear)
+                } else if drum(-10.0) || drum(10.0) || block {
+                    Some(Surface::Solid)
+                } else {
+                    None
+                }
+            }
+        }
+    }
 }
 
 /// The wall units of one curtain: centres every 2 m from `a` to `b`.
@@ -175,8 +254,10 @@ fn curtain(out: &mut Vec<Piece>, a: f32, b: f32) {
     let mut x = a;
     while x <= b + 0.01 {
         // A stair's platform spans 12 to 16 m from its foot: the two units
-        // there are landings.
-        let landing = STAIRS_X.iter().any(|&s| x > s + 12.0 && x < s + 16.0);
+        // there are landings, and the one before them, beside the flight's
+        // top, so the way onto the walk is two open columns wide (the
+        // module docs).
+        let landing = STAIRS_X.iter().any(|&s| x > s + 10.0 && x < s + 16.0);
         let kind = if landing { Kind::Landing } else { Kind::Wall };
         out.push(Piece { kind, pos: Vec2::new(x, WALL_Z), turns: 0 });
         x += 2.0;
@@ -327,34 +408,123 @@ pub fn level_ground(heights: &mut [f32], origin: Vec2, dims: (usize, usize), pie
     wall_level
 }
 
-/// The sim's heights: the levelled ground with every piece raised on it.
-/// Where pieces overlap the higher wins (a drum over the walk's strip),
-/// except that a stair's footprint takes the stair's height, the wall's
-/// inner face row included (see the module docs).
-pub fn sim_heights(ground: &[f32], origin: Vec2, dims: (usize, usize), pieces: &[Piece]) -> Vec<f32> {
+/// The sim's ground over the town: the heights with every piece raised
+/// on the levelled ground, and per vertex whether it is open or blocked
+/// where a piece decides that (None where the step rule does).
+pub struct SimGround {
+    pub heights: Vec<f32>,
+    pub open: Vec<Option<bool>>,
+}
+
+/// The sim's ground: the levelled ground with every piece raised on it
+/// (where pieces overlap the higher wins, a drum over the walk's strip),
+/// and the open vertices by the pieces' surfaces (the module docs): a
+/// vertex within a cell of a piece is open unless the 2 m square around
+/// it meets something solid.
+pub fn sim_ground(ground: &[f32], origin: Vec2, dims: (usize, usize), pieces: &[Piece]) -> SimGround {
     let mut raise = vec![0.0f32; ground.len()];
-    let mut stair = vec![None::<f32>; ground.len()];
-    for p in pieces {
+    let mut near: Vec<Vec<u16>> = vec![Vec::new(); ground.len()];
+    for (k, p) in pieces.iter().enumerate() {
         let (a, b) = p.bounds();
         let pad = Pad { lo: a, hi: b, blend: 0.0 };
         let (x0, z0, x1, z1) = pad.span(origin, dims, 0.0);
         for z in z0..=z1 {
             for x in x0..=x1 {
                 let i = z * dims.0 + x;
-                let Some(r) = p.raise(origin + Vec2::new(x as f32, z as f32) * CELL) else { continue };
-                if p.kind == Kind::Stair {
-                    stair[i] = Some(r);
-                } else {
+                if let Some(r) = p.raise(origin + Vec2::new(x as f32, z as f32) * CELL) {
                     raise[i] = raise[i].max(r);
                 }
             }
         }
+        let (x0, z0, x1, z1) = pad.span(origin, dims, CELL);
+        for z in z0..=z1 {
+            for x in x0..=x1 {
+                near[z * dims.0 + x].push(k as u16);
+            }
+        }
     }
-    ground
+    let heights: Vec<f32> = ground.iter().zip(&raise).map(|(g, r)| g + r).collect();
+    // The square's samples stop just short of its edges, so a surface
+    // that ends exactly on the neighbouring vertex's line is not read.
+    const D: f32 = 0.99;
+    let solid: Vec<Option<bool>> = near
         .iter()
-        .zip(raise.iter().zip(&stair))
-        .map(|(g, (r, s))| g + s.unwrap_or(*r))
-        .collect()
+        .enumerate()
+        .map(|(i, cands)| {
+            if cands.is_empty() {
+                return None;
+            }
+            let v = origin + Vec2::new((i % dims.0) as f32, (i / dims.0) as f32) * CELL;
+            Some([-D, 0.0, D].iter().any(|&dx| {
+                [-D, 0.0, D].iter().any(|&dz| {
+                    let s = v + Vec2::new(dx, dz);
+                    cands.iter().any(|&k| pieces[k as usize].surface(s) == Some(Surface::Solid))
+                })
+            }))
+        })
+        .collect();
+    // A vertex that meets nothing solid is still blocked where a cliff
+    // runs between it and a neighbour that meets nothing solid either:
+    // an end tower's passage opening onto air, a platform's edge. Solid
+    // neighbours do not count, so the ground at a face stays open.
+    let cliff = crate::terrain::SLOPE_BLOCK * CELL;
+    let open = (0..heights.len())
+        .map(|i| {
+            let s = solid[i]?;
+            if s {
+                return Some(false);
+            }
+            let (x, z) = (i % dims.0, i / dims.0);
+            let mut around = Vec::with_capacity(4);
+            if x > 0 {
+                around.push(i - 1);
+            }
+            if x + 1 < dims.0 {
+                around.push(i + 1);
+            }
+            if z > 0 {
+                around.push(i - dims.0);
+            }
+            if z + 1 < dims.1 {
+                around.push(i + dims.0);
+            }
+            let drop = around
+                .iter()
+                .any(|&j| solid[j] != Some(true) && (heights[i] - heights[j]).abs() >= cliff);
+            Some(!drop)
+        })
+        .collect();
+    SimGround { heights, open }
+}
+
+/// A straight stretch of ground with fixed rows a unit stands in: the
+/// wall's walk. Along x, facing +z.
+#[derive(Clone, Copy, Debug)]
+pub struct Lane {
+    /// Where a man's centre may stand across the lane (z), back to front.
+    pub across: (f32, f32),
+    /// Where a man's centre may stand along it (x).
+    pub along: (f32, f32),
+}
+
+impl Lane {
+    /// `p` is on the lane: on the walk's open rows, between its ends.
+    pub fn contains(&self, p: Vec2) -> bool {
+        (p.y - WALL_Z).abs() <= 3.0 && p.x >= self.along.0 && p.x <= self.along.1
+    }
+
+    /// The lane's direction and its facing (yaw).
+    pub fn facing(&self) -> f32 {
+        crate::formation::facing_of(Vec2::Y)
+    }
+}
+
+/// The walk as a lane for a man of radius `r`: its three open rows give
+/// his centre 6 m, less his radius at the kerb and the parapet; its open
+/// columns run from the west tower's far side to the east one's.
+pub fn walk_lane(r: f32) -> Lane {
+    let (west, east) = (TOWERS_X[0] - 7.0, TOWERS_X[3] + 7.0);
+    Lane { across: (WALL_Z - 3.0 + r, WALL_Z + 3.0 - r), along: (west + r, east - r) }
 }
 
 /// Points the scripted scenes and the tests use.
@@ -362,7 +532,6 @@ pub mod spots {
     use super::*;
 
     /// Open plateau north of the town, where the defender stands.
-    #[cfg(test)]
     pub const BEHIND_TOWN: Vec2 = Vec2::new(0.0, -330.0);
     /// The plaza inside the gate.
     pub const PLAZA: Vec2 = Vec2::new(0.0, -175.0);

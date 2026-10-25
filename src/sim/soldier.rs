@@ -3044,14 +3044,17 @@ fn integrate(f: &Field, s: &mut Soldier, st: &mut Step) {
         .clamp(bounds_min.x, bounds_max.x);
     let mut nz = (pos_prev[i].z + new_v.y * dt + corr.y)
         .clamp(bounds_min.y, bounds_max.y);
-    // Impassable ground (terrace risers, gorge walls, crater lips):
-    // wall-slide — keep the axis that stays on walkable ground, drop the one
-    // that doesn't, so crowds flow along the obstacle.
-    if terrain.blocked_at(nx, nz) {
-        let (px, pz) = (pos_prev[i].x, pos_prev[i].z);
-        if !terrain.blocked_at(nx, pz) {
+    // Impassable ground (terrace risers, gorge walls, crater lips, a
+    // wall's edges): wall-slide — keep the axis that stays on walkable
+    // ground, drop the one that doesn't, so crowds flow along the
+    // obstacle. His body stops at the edge, half the distance he keeps
+    // from his neighbours (`body_distance`) out from his centre.
+    let (px, pz) = (pos_prev[i].x, pos_prev[i].z);
+    let r = terrain.body_radius();
+    if !terrain.body_free(nx, nz, r, nx - px, nz - pz) {
+        if terrain.body_free(nx, pz, r, nx - px, 0.0) {
             nz = pz;
-        } else if !terrain.blocked_at(px, nz) {
+        } else if terrain.body_free(px, nz, r, 0.0, nz - pz) {
             nx = px;
         } else {
             nx = px;

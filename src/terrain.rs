@@ -162,6 +162,11 @@ pub struct Terrain {
     /// same grid as `heights`. All-false unless the map has blocked
     /// ground (`MapKind::has_blocked_ground`).
     blocked: Vec<bool>,
+    /// Vertices whose open or blocked state a structure decides instead
+    /// of the step rule: the walled town's pieces (town_layout.rs
+    /// `sim_ground`). None on every other map, and None per vertex where
+    /// the step rule holds.
+    open: Option<Vec<Option<bool>>>,
     pub kind: MapKind,
     /// True on maps without a river:
     /// skips the river carve, terraces, ground variety, and every
@@ -230,8 +235,33 @@ impl Terrain {
 
     /// Bilinear height sample, clamped to the field. The bridge deck
     /// overrides the carved channel so units walk ON the bridge.
+    ///
+    /// On maps with blocked ground a cell can span a cliff: a wall's face,
+    /// a terrace riser, the side of a stair. A point stands on the level
+    /// of its nearest vertex (the vertex `blocked_at` reads), so a corner
+    /// a cliff's height (`SLOPE_BLOCK` over one cell) above or below that
+    /// vertex counts at the vertex's own height. Cliffs are then vertical
+    /// at the cell's middle instead of a ramp across it that a soldier
+    /// beside a wall would be drawn halfway up.
     #[inline]
     pub fn height_at(&self, x: f32, z: f32) -> f32 {
+        self.height_on(x, z, None)
+    }
+
+    /// The height of the nearest vertex: the level a man at `(x, z)`
+    /// stands on.
+    #[inline]
+    fn level_at(&self, x: f32, z: f32) -> f32 {
+        let g = (Vec2::new(x, z) - self.origin) / CELL;
+        let gx = (g.x.round() as usize).min(self.verts_x - 1);
+        let gz = (g.y.round() as usize).min(self.verts_z - 1);
+        self.h(gx, gz)
+    }
+
+    /// `height_at` on a given level: corners a cliff above or below
+    /// `level` count at `level`. None takes the nearest vertex's own.
+    #[inline]
+    fn height_on(&self, x: f32, z: f32, level: Option<f32>) -> f32 {
         if !self.classic && bridge_deck_contains(x, z) {
             return river_water_level(z) + BRIDGE_DECK_LIFT;
         }
@@ -242,23 +272,40 @@ impl Terrain {
         let z0 = gz as usize;
         let fx = gx - x0 as f32;
         let fz = gz - z0 as f32;
-        let h00 = self.h(x0, z0);
-        let h10 = self.h(x0 + 1, z0);
-        let h01 = self.h(x0, z0 + 1);
-        let h11 = self.h(x0 + 1, z0 + 1);
+        let mut h00 = self.h(x0, z0);
+        let mut h10 = self.h(x0 + 1, z0);
+        let mut h01 = self.h(x0, z0 + 1);
+        let mut h11 = self.h(x0 + 1, z0 + 1);
+        if self.kind.has_blocked_ground() {
+            let level = level.unwrap_or(match (fx >= 0.5, fz >= 0.5) {
+                (false, false) => h00,
+                (true, false) => h10,
+                (false, true) => h01,
+                (true, true) => h11,
+            });
+            for h in [&mut h00, &mut h10, &mut h01, &mut h11] {
+                if (*h - level).abs() >= SLOPE_BLOCK * CELL {
+                    *h = level;
+                }
+            }
+        }
         h00 * (1.0 - fx) * (1.0 - fz)
             + h10 * fx * (1.0 - fz)
             + h01 * (1.0 - fx) * fz
             + h11 * fx * fz
     }
 
-    /// |gradient| of the height field (rise per meter).
+    /// |gradient| of the height field (rise per meter). Sampled on the
+    /// level of `(x, z)` itself: a cliff a metre ahead is blocked ground
+    /// (`blocked_at`), not a slope to climb, so a man beside a wall, a
+    /// house or the foot of a stair walks at his flat pace, not a crawl.
     #[inline]
     pub fn slope_at(&self, x: f32, z: f32) -> f32 {
         const E: f32 = 1.0;
-        let h = self.height_at(x, z);
-        let dx = (self.height_at(x + E, z) - h) / E;
-        let dz = (self.height_at(x, z + E) - h) / E;
+        let level = self.kind.has_blocked_ground().then(|| self.level_at(x, z));
+        let h = self.height_on(x, z, level);
+        let dx = (self.height_on(x + E, z, level) - h) / E;
+        let dz = (self.height_on(x, z + E, level) - h) / E;
         (dx * dx + dz * dz).sqrt()
     }
 
@@ -275,6 +322,29 @@ impl Terrain {
         let gx = (g.x.round() as usize).min(self.verts_x - 1);
         let gz = (g.y.round() as usize).min(self.verts_z - 1);
         self.blocked[gz * self.verts_x + gx]
+    }
+
+    /// A body of radius `r` at `(x, z)` moving by `(dx, dz)` has its
+    /// centre and its leading edge on open ground: it stops with its edge,
+    /// not its centre, at a wall, a kerb or a stair's rail, and can always
+    /// move away from one. A radius of zero is the centre alone, one mask
+    /// read: the maps with no blocked ground pass that.
+    #[inline]
+    pub fn body_free(&self, x: f32, z: f32, r: f32, dx: f32, dz: f32) -> bool {
+        if self.blocked_at(x, z) {
+            return false;
+        }
+        r == 0.0
+            || ((dx == 0.0 || !self.blocked_at(x + r.copysign(dx), z))
+                && (dz == 0.0 || !self.blocked_at(x, z + r.copysign(dz))))
+    }
+
+    /// The radius a soldier's body keeps off blocked ground on this map
+    /// (`body_free`): half his distance from his neighbours, or nothing
+    /// where no ground blocks.
+    #[inline]
+    pub fn body_radius(&self) -> f32 {
+        if self.kind.has_blocked_ground() { crate::sim::soldier::body_distance() * 0.5 } else { 0.0 }
     }
 
     /// Wading slow multiplier: WADE_SLOW inside the channel, 1.0 on
@@ -332,7 +402,7 @@ impl Terrain {
             for z in bz0..=bz1 {
                 for x in bx0..=bx1 {
                     self.blocked[z * self.verts_x + x] =
-                        vertex_blocked(&self.heights, self.grid_verts(), x, z);
+                        blocked_vertex(&self.heights, self.open.as_deref(), self.grid_verts(), x, z);
                 }
             }
         }
@@ -385,7 +455,22 @@ impl Terrain {
     }
 }
 
-/// Mask rule per vertex: a face steeper than SLOPE_BLOCK against any
+/// Mask rule per vertex: what a structure says where one decides
+/// (`open`), else the step rule.
+fn blocked_vertex(
+    heights: &[f32],
+    open: Option<&[Option<bool>]>,
+    dims: (usize, usize),
+    x: usize,
+    z: usize,
+) -> bool {
+    match open.and_then(|o| o[z * dims.0 + x]) {
+        Some(open) => !open,
+        None => vertex_blocked(heights, dims, x, z),
+    }
+}
+
+/// The step rule per vertex: a face steeper than SLOPE_BLOCK against any
 /// 4-neighbor (terrace risers, gorge walls, crater lips). The river
 /// itself is wadeable and never blocks.
 fn vertex_blocked(heights: &[f32], (verts_x, verts_z): (usize, usize), x: usize, z: usize) -> bool {
@@ -818,20 +903,20 @@ pub(crate) fn build_terrain(kind: MapKind) -> Terrain {
     if kind == MapKind::Town {
         crate::obstacle_map::raise_blocks(&mut heights, origin, (verts_x, verts_z), &crate::obstacle_map::town_blocks());
     }
-    let ground = if kind == MapKind::WalledTown {
+    let (ground, open) = if kind == MapKind::WalledTown {
         let pieces = crate::town_layout::pieces();
         let level = crate::town_layout::level_ground(&mut heights, origin, (verts_x, verts_z), &pieces);
         info!("terrain: the walled town's wall run stands at {level:.2} m");
-        let sim = crate::town_layout::sim_heights(&heights, origin, (verts_x, verts_z), &pieces);
-        Some(std::mem::replace(&mut heights, sim))
+        let sim = crate::town_layout::sim_ground(&heights, origin, (verts_x, verts_z), &pieces);
+        (Some(std::mem::replace(&mut heights, sim.heights)), Some(sim.open))
     } else {
-        None
+        (None, None)
     };
     let mut blocked = vec![false; verts_x * verts_z];
     if kind.has_blocked_ground() {
         for z in 0..verts_z {
             for x in 0..verts_x {
-                blocked[z * verts_x + x] = vertex_blocked(&heights, (verts_x, verts_z), x, z);
+                blocked[z * verts_x + x] = blocked_vertex(&heights, open.as_deref(), (verts_x, verts_z), x, z);
             }
         }
     }
@@ -849,6 +934,7 @@ pub(crate) fn build_terrain(kind: MapKind) -> Terrain {
         verts_x,
         verts_z,
         blocked,
+        open,
         kind,
         classic,
         origin,
@@ -1433,6 +1519,7 @@ mod tests {
             verts_x: VERTS_X,
             verts_z: VERTS_Z,
             blocked: vec![false; VERTS_X * VERTS_Z],
+            open: None,
             kind: MapKind::Grassland,
             classic: true,
             origin: Vec2::ZERO,
