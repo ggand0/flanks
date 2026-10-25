@@ -271,9 +271,7 @@ const SIGHT_BACK: u16 = 1 << 7;
 /// tick): the archers' search never aims at him (sim/mod.rs
 /// `clear_members`).
 pub(crate) const SIGHT_FOE: u16 = 1 << 8;
-/// The side a stuck man tries while his try lasts (`try_a_side`): set,
-/// his left; clear, his right.
-pub(crate) const SIGHT_TRY_LEFT: u16 = 1 << 9;
+/// Bit 9 is free.
 /// An archer's knife: bits 10 to 14 count down (one every fourth tick)
 /// from the last tick an enemy came close to him (`KNIFE_HOLD`), and
 /// `SIGHT_KNIFE` is set while the knife is out, by that count or by his
@@ -430,7 +428,7 @@ pub(crate) struct Soldier<'a> {
     pub chain: &'a mut u8,
     pub pose: &'a mut u8,
     pub quarry: &'a mut u32,
-    pub stuck: &'a mut u8,
+    pub stuck: &'a mut u16,
 }
 
 /// The rows of one chunk of soldiers, in index order.
@@ -452,7 +450,7 @@ pub(crate) struct Rows<'a> {
     pub chain: &'a mut [u8],
     pub pose: &'a mut [u8],
     pub quarry: &'a mut [u32],
-    pub stuck: &'a mut [u8],
+    pub stuck: &'a mut [u16],
 }
 
 /// What a chunk emits beside its rows: landed swings and loosed arrows.
@@ -1141,32 +1139,55 @@ fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
     st.slot_blocked = slot_blocked;
 }
 
-/// Stuck ticks before a man tries a side (half a second), and how long a
-/// try lasts (a second).
-const STUCK_TICKS: u8 = 15;
-const TRY_TICKS: u8 = 30;
+/// Stuck ticks before a man tries a side (half a second); how long a try
+/// lasts at most (a second) and at least (a real step, not a twitch);
+/// how long he remembers the side he tried, in eighths of a second (four
+/// seconds).
+const STUCK_TICKS: u16 = 15;
+const TRY_TICKS: u16 = 30;
+const TRY_MIN: u16 = 6;
+const SIDE_MEMORY: u16 = 15;
 /// The crowd ahead of him (`Step::ahead`) that counts as someone in his
 /// way, and the sideways lean of his separation push that picks his
-/// side over his coin.
+/// side over his memory and his coin.
 const AHEAD_MIN: f32 = 0.1;
 const LEAN_MIN: f32 = 0.05;
+/// The `stuck` column: the stuck ticks (bits 0 to 3), the try's ticks
+/// left (4 to 8), the side memory in eighths of a second (9 to 12), and
+/// the remembered side (13, set for his left).
+const STUCK_COUNT: u16 = 0x000f;
+const STUCK_TRY_SHIFT: u16 = 4;
+const STUCK_TRY: u16 = 0x1f << STUCK_TRY_SHIFT;
+const STUCK_MEM_SHIFT: u16 = 9;
+const STUCK_MEM: u16 = 0x0f << STUCK_MEM_SHIFT;
+pub(crate) const STUCK_LEFT: u16 = 1 << 13;
+/// The stuck ticks and the try's ticks left packed in `stuck`.
+pub(crate) fn stuck_count(v: u16) -> u16 {
+    v & STUCK_COUNT
+}
+pub(crate) fn stuck_trying(v: u16) -> u16 {
+    (v & STUCK_TRY) >> STUCK_TRY_SHIFT
+}
 
 /// A man going somewhere who finds himself stuck tries a side. Stuck is
 /// felt, not seen: he wants to walk and has moved at under half his wish
 /// for STUCK_TICKS with bodies pressed against him ahead (the net push
-/// would not do: in a press the men behind cancel the men in front). He tries the
-/// side his separation push leans to, the side with more room, or his own
-/// coin when it leans nowhere: a sidestep at STEP_PACE for TRY_TICKS on
-/// top of whatever the crowd leaves of his drive, not faded by the crowd's
-/// brake, so a man packed in still shuffles sideways. Pressed forward and
-/// free to slide sideways, he slides into the gap beside the man in his
-/// way, and the man behind him does the same a moment later. Only a man
-/// walking under his regiment's order with no enemy in mind and his
-/// regiment not yet fighting: men walking to a fight and the rear ranks
-/// of a fighting regiment keep their own rules (`close_in`), so the
-/// melee is as it was. His state rides the
-/// `stuck` column (the low nibble the stuck ticks, the high one the try's
-/// ticks left in pairs) and SIGHT_TRY_LEFT holds the side.
+/// would not do: in a press the men behind cancel the men in front). He
+/// tries the side his separation push leans to, the side with more room;
+/// when it leans nowhere, the side he tried within the last SIDE_MEMORY,
+/// else his own coin: a sidestep at STEP_PACE on top of whatever the
+/// crowd leaves of his drive, not faded by the crowd's brake, so a man
+/// packed in still shuffles sideways. The step ends as soon as the way
+/// ahead of him is clear, after TRY_MIN ticks, and at TRY_TICKS at the
+/// latest: he steps into the gap and walks, he does not step through it
+/// into the next man (that was the pinball between the columns). Pressed
+/// forward and free to slide sideways, he slides into the gap beside the
+/// man in his way, and the man behind him does the same a moment later.
+/// Only a man walking under his regiment's order with no enemy in mind
+/// and his regiment not yet fighting: men walking to a fight and the
+/// rear ranks of a fighting regiment keep their own rules (`close_in`),
+/// so the melee is as it was. His state rides the `stuck` column
+/// (STUCK_*).
 #[inline]
 fn try_a_side(f: &Field, s: &mut Soldier, st: &mut Step) {
     let Field { orders, engaged, tick, .. } = *f;
@@ -1185,36 +1206,46 @@ fn try_a_side(f: &Field, s: &mut Soldier, st: &mut Step) {
         && want > 0.5;
     if !going {
         *s.stuck = 0;
-        *s.sight &= !SIGHT_TRY_LEFT;
         return;
     }
     let dir = wish / want;
     let left_dir = Vec2::new(-dir.y, dir.x);
-    let mut count = *s.stuck & 0x0f;
-    let mut trying = *s.stuck >> 4;
-    if trying == 0 {
+    let v = *s.stuck;
+    let mut count = stuck_count(v);
+    let mut trying = stuck_trying(v);
+    let mut mem = (v & STUCK_MEM) >> STUCK_MEM_SHIFT;
+    let mut left = v & STUCK_LEFT != 0;
+    if trying > 0 {
+        trying -= 1;
+        // The way ahead clear after the first TRY_MIN ticks: the step is
+        // done, he walks.
+        if trying <= TRY_TICKS - TRY_MIN && st.ahead < AHEAD_MIN {
+            trying = 0;
+        }
+        let side = if left { left_dir } else { -left_dir };
+        st.desired += side * STEP_PACE;
+        mem = SIDE_MEMORY;
+    } else {
         let pressed = st.ahead > AHEAD_MIN;
         let stuck = pressed && s.vel.xz().dot(dir) < 0.5 * want;
         count = if stuck { (count + 1).min(STUCK_TICKS) } else { count.saturating_sub(1) };
         if count >= STUCK_TICKS {
             let lean = st.push.dot(left_dir);
-            let left = if lean.abs() > LEAN_MIN {
+            left = if lean.abs() > LEAN_MIN {
                 lean > 0.0
+            } else if mem > 0 {
+                left
             } else {
                 crate::units::hash01((i as u32).wrapping_mul(0x2545).wrapping_add(tick)) > 0.5
             };
-            *s.sight = (*s.sight & !SIGHT_TRY_LEFT) | (left as u16 * SIGHT_TRY_LEFT);
-            trying = TRY_TICKS / 2;
+            trying = TRY_TICKS;
             count = 0;
-        }
-    } else {
-        let side = if *s.sight & SIGHT_TRY_LEFT != 0 { left_dir } else { -left_dir };
-        st.desired += side * STEP_PACE;
-        if tick.is_multiple_of(2) {
-            trying -= 1;
+            mem = SIDE_MEMORY;
+        } else if mem > 0 && tick.is_multiple_of(8) {
+            mem -= 1;
         }
     }
-    *s.stuck = (trying << 4) | count;
+    *s.stuck = count | (trying << STUCK_TRY_SHIFT) | (mem << STUCK_MEM_SHIFT) | (left as u16 * STUCK_LEFT);
 }
 
 /// Two things a man in melee does not do for his slot: step back away

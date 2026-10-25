@@ -1818,7 +1818,7 @@ fn shake_log(
             continue;
         }
         alive += 1;
-        trying += (units.stuck[i] >> 4 != 0) as u32;
+        trying += (crate::sim::soldier::stuck_trying(units.stuck[i]) != 0) as u32;
         let turns = sh.turns[i];
         if turns < SHAKE_TURNS {
             continue;
