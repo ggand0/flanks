@@ -335,6 +335,57 @@ fn update_stats_line(
     }
 }
 
+/// The contact overlay's numbers (sim/contact_viz.rs): the widths by
+/// pose, the spring rests, the hold deadzone, the grip, the paces, and
+/// per selected regiment its spacing, its open order (files to a group,
+/// the spacing within a group, the group pitch, the lane, the growth in
+/// front and behind), its passing mark, the men it counts inside open
+/// friends, and the mean pose of its men.
+fn contact_text(groups: &Groups, selection: &Selection, units: &Units) -> String {
+    use crate::sim::soldier as so;
+    let w = so::widths();
+    let mut s = format!(
+        "\ncontact: body {:.2} at ease / {:.2} ready, spring {:.2} / {:.2}, brake crowd {:.2}-{:.2} / {:.2}-{:.2}\n\
+         hold deadzone {:.2} m (step stop {:.2}), feet grip {:.0} m/s2 x 0.7-1.3, step {:.2} m/s, walk-up {:.2} m/s, legs {:.0} m/s2, rank pitch {:.2} m",
+        w[0].body, w[3].body, w[0].sep, w[3].sep, w[0].slow, w[0].stop, w[3].slow, w[3].stop,
+        so::HOLD_DEADZONE, so::STEP_STOP, so::STAND_GRIP, so::STEP_PACE, so::ADVANCE_PACE, so::LEG_ACCEL,
+        crate::formation::gap(0),
+    );
+    let mut pose_sum = vec![0u32; groups.list.len()];
+    let mut pose_n = vec![0u32; groups.list.len()];
+    for i in 0..units.len() {
+        if units.death_t[i] == 0 {
+            let g = units.group[i] as usize;
+            pose_sum[g] += units.pose[i] as u32;
+            pose_n[g] += 1;
+        }
+    }
+    for (g, gd) in groups.list.iter().enumerate() {
+        if !selection.regiments.get(g).copied().unwrap_or(false) || gd.count == 0 {
+            continue;
+        }
+        let pose = pose_sum[g] as f32 / pose_n[g].max(1) as f32 / so::POSE_READY as f32;
+        s.push_str(&format!(
+            "\nregiment {g}: {:?}, {} files x {} ranks, pose {:.2}, passing {}, inside {:?}",
+            gd.spacing,
+            crate::formation::grid(gd).0,
+            crate::formation::grid(gd).1,
+            pose,
+            gd.passing,
+            gd.inside,
+        ));
+        if gd.spacing == crate::formation::FormSpacing::Open {
+            let o = &gd.open;
+            let lane = o.pitch - (o.files.max(1) - 1) as f32 * o.sep - w[0].body;
+            s.push_str(&format!(
+                "\n  open: {} files to a group {:.2} m apart, groups every {:.2} m, lane {:.2} m of air between bodies, grown {:+.1} m ahead {:+.1} m behind, closes to {:?}",
+                o.files, o.sep, o.pitch, lane, o.front, o.back, gd.close_to
+            ));
+        }
+    }
+    s
+}
+
 /// 199640 as "199,640".
 fn thousands(n: usize) -> String {
     let digits = n.to_string();
@@ -533,8 +584,15 @@ fn update_overlay(
     mut log_timer: Local<f32>,
     mut pacing: ResMut<FramePacing>,
     mut phases: ResMut<FramePhases>,
+    settings: Res<crate::settings::Settings>,
+    viz: Res<crate::sim::DebugViz>,
 ) {
     let (frame_ms, fps) = frame_rate(&diagnostics);
+    let contact = if viz.0 && crate::sim::contact_viz::contact_viz_on(&settings) {
+        contact_text(&groups, &selection, &units)
+    } else {
+        String::new()
+    };
 
     let banner = match outcome.0 {
         Some(0) => "\n=== VICTORY: the enemy army is broken ===",
@@ -571,6 +629,7 @@ fn update_overlay(
             combat.kills[1],
             combat.fled[1],
         );
+        text.0.push_str(&contact);
     }
 
     // Periodic log so FPS is verifiable from a headless-ish run. GPU pass
@@ -634,6 +693,9 @@ fn update_overlay(
             summary(&mut pacing.tick_ms),
             summary(&mut pacing.fixed_ms)
         );
+        if !contact.is_empty() {
+            info!("[contact]{contact}");
+        }
         pacing.plain_ms.clear();
         pacing.tick_ms.clear();
         pacing.fixed_ms.clear();

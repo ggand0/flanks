@@ -21,6 +21,7 @@ use crate::spatial::SpatialGrid;
 use crate::terrain::Terrain;
 use crate::units::Units;
 
+pub mod contact_viz;
 pub mod damage;
 mod diag;
 pub mod job;
@@ -106,7 +107,7 @@ impl Plugin for SimPlugin {
                 )
                     .in_set(crate::game_state::SimSet),
             )
-            .add_systems(Update, (toggle_debug_viz, route::draw_routes));
+            .add_systems(Update, (toggle_debug_viz, route::draw_routes, contact_viz::draw_contact_viz));
     }
 }
 
