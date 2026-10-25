@@ -1141,7 +1141,10 @@ fn join_test_log(
 /// the default layout); FL_ROUTPASS_KINDS=1 knights through spearmen;
 /// FL_ROUTPASS_GAP=<m> the passer that far behind A's rear rank instead
 /// of 35 m from its centre, room for A to open toward it;
-/// FL_ROUTPASS_SPEED=<m/s> the passer's men at about that speed.
+/// FL_ROUTPASS_SPEED=<m/s> the passer's men at about that speed;
+/// FL_ROUTPASS_FLANKS=1 two more holders like A 10 m to its sides;
+/// FL_ROUTPASS_FRONT=<m> a held enemy like A that far in front of A,
+/// the passer ordered to attack it.
 fn spawn_routpass_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
     let size: Option<usize> = std::env::var("FL_ROUTPASS_SIZE").ok().and_then(|v| v.parse().ok());
     let n = size.unwrap_or(500).max(1);
@@ -1151,15 +1154,18 @@ fn spawn_routpass_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups
         (KIND_LIGHT, KIND_LIGHT)
     };
     let mut list = Vec::new();
-    spawn_regiment(units, terrain, &mut list, 0, holder_kind, Vec2::new(0.0, 0.0), n, 1.0);
+    // A faces the way the passer walks, its rear to the passer, as a
+    // first line with a second line ordered through it.
+    spawn_regiment(units, terrain, &mut list, 0, holder_kind, Vec2::new(0.0, 0.0), n, -1.0);
     list[0].hold = true;
     let gap: Option<f32> = std::env::var("FL_ROUTPASS_GAP").ok().and_then(|v| v.parse().ok());
     // The passer's centre: 35 m from A's, or `gap` behind A's rear rank.
+    let spawned_files = list[0].files;
     let files = |n: usize| {
         if size.is_some() {
             ((n as f32 * 15.0 / 8.0).sqrt().round() as u32).max(1)
         } else {
-            crate::formation::default_files(n)
+            spawned_files
         }
     };
     let half_depth = |n: usize, kind: u8| {
@@ -1169,30 +1175,53 @@ fn spawn_routpass_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups
         Some(gap) => half_depth(n, holder_kind) + gap + half_depth(n, passer_kind),
         None => 35.0,
     };
+    let holder_files = files(n);
+    let holder_depth = half_depth(n, holder_kind);
+    let width = (holder_files - 1) as f32 * crate::formation::gap(holder_kind);
     spawn_regiment(units, terrain, &mut list, 0, passer_kind, Vec2::new(0.0, z), n, -1.0);
     list[1].order = Some(crate::orders::Order::Move(Vec2::new(0.0, -60.0)));
     list[1].auto_order = true;
-    if size.is_some() {
-        for (g, gd) in list.iter_mut().enumerate() {
-            gd.files = files(n);
-            for i in crate::formation::assign_slots(units, g as u32, gd) {
-                let i = i as usize;
-                let at = gd.anchor + units.home[i];
-                let y = terrain.height_at(at.x, at.y)
-                    + crate::unit_types::half_height(units.kind[i] as usize);
-                units.pos[i] = Vec3::new(at.x, y, at.y);
-                units.pos_prev[i] = units.pos[i];
-            }
+    // A small held enemy far off the pass, so the battle does not end
+    // with no enemy on the field (ai.rs `check_victory`) and freeze it.
+    spawn_regiment(units, terrain, &mut list, 1, KIND_LIGHT, Vec2::new(150.0, 0.0), 16, -1.0);
+    list[2].hold = true;
+    list[2].steadfast = true;
+    // FL_ROUTPASS_FLANKS=1: two more holding regiments like A, 10 m to
+    // each side of it, as in the default battle's rows.
+    if std::env::var("FL_ROUTPASS_FLANKS").is_ok_and(|v| v == "1") {
+        for x in [-1.0f32, 1.0] {
+            let at = Vec2::new(x * (width + REG_GAP), 0.0);
+            spawn_regiment(units, terrain, &mut list, 0, holder_kind, at, n, -1.0);
+            list.last_mut().unwrap().hold = true;
         }
     }
-    // FL_ROUTPASS_OPEN=1: A stands in the open order from the start.
-    if std::env::var("FL_ROUTPASS_OPEN").is_ok_and(|v| v == "1") {
-        let a = &mut list[0];
-        a.close_to = a.spacing;
-        a.spacing = crate::formation::FormSpacing::Open;
-        for i in crate::formation::assign_slots(units, 0, a) {
+    // FL_ROUTPASS_FRONT=<m>: a held enemy regiment like A that far in
+    // front of A's front rank, and the passer ordered through A to
+    // attack it, as a second line sent through the first.
+    if let Some(d) = std::env::var("FL_ROUTPASS_FRONT").ok().and_then(|v| v.parse::<f32>().ok()) {
+        let at = Vec2::new(0.0, -(holder_depth + d + holder_depth));
+        spawn_regiment(units, terrain, &mut list, 1, holder_kind, at, n, 1.0);
+        let e = list.len() - 1;
+        list[e].hold = true;
+        list[e].steadfast = true;
+        list[1].order = Some(crate::orders::Order::Attack(e as u32));
+    }
+    for (g, gd) in list.iter_mut().enumerate() {
+        if g == 2 {
+            continue;
+        }
+        gd.facing = if gd.team == 0 { std::f32::consts::PI } else { 0.0 };
+        if size.is_some() {
+            gd.files = files(n);
+        }
+        // FL_ROUTPASS_OPEN=1: A stands in the open order from the start.
+        if g == 0 && std::env::var("FL_ROUTPASS_OPEN").is_ok_and(|v| v == "1") {
+            gd.close_to = gd.spacing;
+            gd.spacing = crate::formation::FormSpacing::Open;
+        }
+        for i in crate::formation::assign_slots(units, g as u32, gd) {
             let i = i as usize;
-            let at = a.anchor + units.home[i];
+            let at = gd.anchor + units.home[i];
             let y = terrain.height_at(at.x, at.y) + crate::unit_types::half_height(units.kind[i] as usize);
             units.pos[i] = Vec3::new(at.x, y, at.y);
             units.pos_prev[i] = units.pos[i];
@@ -1206,11 +1235,6 @@ fn spawn_routpass_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups
             }
         }
     }
-    // A small held enemy far off the pass, so the battle does not end
-    // with no enemy on the field (ai.rs `check_victory`) and freeze it.
-    spawn_regiment(units, terrain, &mut list, 1, KIND_LIGHT, Vec2::new(150.0, 0.0), 16, -1.0);
-    list[2].hold = true;
-    list[2].steadfast = true;
     groups.list = list;
     info!(
         "[routpass-test] passer of {n} Move-ordered straight through A's held line of {n}, {} files, from z {z:.1}",
