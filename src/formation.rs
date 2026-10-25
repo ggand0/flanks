@@ -143,7 +143,7 @@ impl FormSpacing {
 /// The groups the open order `o` lays across the frontage of `files`
 /// files at `closed` spacing: they span that width within half a group
 /// pitch, never more files than men.
-fn open_groups(files: usize, n: usize, closed: FormSpacing, kind: u8, o: &OpenOrder) -> usize {
+pub(crate) fn open_groups(files: usize, n: usize, closed: FormSpacing, kind: u8, o: &OpenOrder) -> usize {
     let width = (files.max(1) - 1) as f32 * closed.pitch(kind).x;
     let a = o.files.max(1) as usize;
     ((width / o.pitch).round() as usize + 1).clamp(1, n.max(1).div_ceil(a))
@@ -151,7 +151,7 @@ fn open_groups(files: usize, n: usize, closed: FormSpacing, kind: u8, o: &OpenOr
 
 /// Across the open order: each file's lateral offset from the block's
 /// middle, files of a group `sep` apart, groups `pitch` apart.
-fn open_file_x(groups: usize, o: &OpenOrder) -> Vec<f32> {
+pub(crate) fn open_file_x(groups: usize, o: &OpenOrder) -> Vec<f32> {
     let a = o.files.max(1) as usize;
     let span = (groups - 1) as f32 * o.pitch + (a - 1) as f32 * o.sep;
     (0..groups * a).map(|f| (f / a) as f32 * o.pitch + (f % a) as f32 * o.sep - 0.5 * span).collect()

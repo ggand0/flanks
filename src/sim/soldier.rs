@@ -57,7 +57,7 @@ pub(crate) fn crowd_brake() -> (f32, f32) {
 /// 0.2 m over the body (`Width`). FL_BODY_EASE=<metres> sets it, up to
 /// the body in the ready stance.
 const BODY_EASE: f32 = 0.9;
-fn body_ease() -> f32 {
+pub(crate) fn body_ease() -> f32 {
     static D: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
     *D.get_or_init(|| crate::util::env_or("FL_BODY_EASE", BODY_EASE).clamp(0.5, body_distance()))
 }
@@ -130,7 +130,7 @@ const MAX_ACCEL: f32 = 50.0;
 /// every start and stop, and a lane behind an opening gap would surge
 /// and stop as one body. The spring's push and the contact are not legs
 /// and keep MAX_ACCEL.
-const LEG_ACCEL: f32 = 4.0;
+pub(crate) const LEG_ACCEL: f32 = 4.0;
 /// Facing turn smoothing (fraction/s of the remaining angle) — the
 /// settle behavior for SMALL corrections.
 const YAW_RATE: f32 = 10.0;
@@ -167,8 +167,8 @@ pub(crate) const HOLD_DEADZONE: f32 = 0.3;
 /// walks back at this pace at least, and keeps going until he is within
 /// STEP_STOP of it: a real step, never a creep. M2TW's slowest
 /// locomotion is its shuffle, 0.75 to 0.9 m/s.
-const STEP_PACE: f32 = 0.8;
-const STEP_STOP: f32 = 0.35;
+pub(crate) const STEP_PACE: f32 = 0.8;
+pub(crate) const STEP_STOP: f32 = 0.35;
 /// Below this ground speed a standing formation's soldier keeps his
 /// facing while he moves: he steps sideways or back, he does not turn
 /// to walk (M2TW's shuffle keeps facing). The renderer plays a skinned
@@ -177,7 +177,7 @@ pub(crate) const STEP_FACE_SPEED: f32 = 1.05;
 /// Going to an enemy he can see: M2TW's ready-stance `advance`
 /// (1.06 m/s) for the last few meters or with a comrade close ahead,
 /// its `combat_jog` (2.87 m/s) from further out over open ground.
-const ADVANCE_PACE: f32 = 1.06;
+pub(crate) const ADVANCE_PACE: f32 = 1.06;
 const COMBAT_JOG_PACE: f32 = 2.87;
 const JOG_BEYOND: f32 = 3.0;
 /// A man blocked by a comrade on the way to his enemy sidesteps toward
@@ -211,7 +211,7 @@ fn sidestep_chance() -> f32 {
 /// passer stays in his file instead of being carried off. Running men
 /// are unaffected, a charge's shove is far above it, and true overlap is
 /// still corrected.
-const STAND_GRIP: f32 = 6.0;
+pub(crate) const STAND_GRIP: f32 = 6.0;
 /// The soft wall (FL_CONTACT=wall): a man's legs carry him this far into
 /// the body he runs into (his own give, 0.7 to 1.3 of it), losing their
 /// closing speed on the way, and nothing of his speed is handed to the
@@ -260,8 +260,8 @@ const LOOK_TICKS: u32 = 8;
 /// by running to the fight; one further out (far look); a man close
 /// behind him.
 const SIGHT_WAY: u16 = 1;
-const SIGHT_LEFT: u16 = 1 << 1;
-const SIGHT_RIGHT: u16 = 1 << 2;
+pub(crate) const SIGHT_LEFT: u16 = 1 << 1;
+pub(crate) const SIGHT_RIGHT: u16 = 1 << 2;
 const SIGHT_AHEAD: u16 = 1 << 3;
 const SIGHT_MARK: u16 = 1 << 4;
 const SIGHT_GO: u16 = 1 << 5;
@@ -275,7 +275,7 @@ pub(crate) const SIGHT_FOE: u16 = 1 << 8;
 /// (`passing`), a man of it stands ahead of him in his way: he walks up
 /// to him at ADVANCE_PACE, and steps toward the lane on the side
 /// SIGHT_LEFT and SIGHT_RIGHT leave open (`find_the_lane`).
-const SIGHT_PASS: u16 = 1 << 9;
+pub(crate) const SIGHT_PASS: u16 = 1 << 9;
 /// An archer's knife: bits 10 to 14 count down (one every fourth tick)
 /// from the last tick an enemy came close to him (`KNIFE_HOLD`), and
 /// `SIGHT_KNIFE` is set while the knife is out, by that count or by his

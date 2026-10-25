@@ -113,8 +113,11 @@ fn update_rings_active(
     hover: Res<crate::orders::Hover>,
     groups: Res<crate::orders::Groups>,
     settings: Res<crate::settings::Settings>,
+    viz: Res<crate::sim::DebugViz>,
     mut active: ResMut<RingsActive>,
 ) {
+    // The contact overlay draws its own circles under the men.
+    let contact_viz = viz.0 && crate::sim::contact_viz::contact_viz_on(&settings);
     let hovered =
         settings.interface.hover_rings && (hover.enemy.is_some() || hover.own.is_some());
     let selected = selection
@@ -123,7 +126,8 @@ fn update_rings_active(
         .zip(&groups.list)
         .any(|(s, gd)| *s && !gd.state.is_broken());
     let on = *state.get() == crate::game_state::GameState::Battle
-        && (selected || hovered);
+        && (selected || hovered)
+        && !contact_viz;
     if active.0 != on {
         active.0 = on;
     }
