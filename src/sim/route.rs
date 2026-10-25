@@ -24,9 +24,10 @@
 //! - Each man keeps walking to his own slot around the frame while his
 //!   straight way there is open. When it is not, he follows the route
 //!   from his own place on it, never past his regiment's frame: the
-//!   farthest point along it he can walk to straight; failing any, he
-//!   steps round what stands in front of him. He knows his slot, his
-//!   regiment's route and the ground ahead of him, nothing else.
+//!   farthest point along it he can walk to straight, or else the nearest
+//!   point behind; failing any, he steps round what stands in front of
+//!   him. He knows his slot, his regiment's route and the ground ahead of
+//!   him, nothing else.
 //! - A regiment that has arrived keeps its route while it holds at the
 //!   route's end, so a man still behind an obstacle finds his way to his
 //!   slot after the order is done, and its slots are re-sorted by where
@@ -542,8 +543,9 @@ pub(crate) fn plan_all(nav: &NavGrid, jobs: &mut Vec<PlanJob>, out: &mut Vec<Pla
 /// Otherwise he follows the route: from his place on it (the nearest
 /// point of its legs up to the frame), the farthest of a few points ahead
 /// he can walk to straight. Failing any, a point behind his place he can
-/// walk to. Failing that too, he steps round what stands in front of him,
-/// to the side his place on the route lies.
+/// walk to, or else the nearest waypoint behind it he can. Failing that
+/// too, he steps round what stands in front of him, to the side his place
+/// on the route lies.
 #[inline]
 pub(crate) fn man_target(
     nav: &NavGrid,
@@ -589,7 +591,10 @@ pub(crate) fn man_target(
             return (q, true);
         }
     }
-    // Back along the route from his place.
+    // Back along the route from his place, then the waypoints behind it,
+    // the nearest first. His place is the nearest point in plan, which on
+    // a wall is the walk above a man at its foot: the stair's foot, a
+    // waypoint behind, is where he can go.
     let start = point(leg);
     let back = at.distance(start);
     for &b in &FOLLOW_BACK {
@@ -599,6 +604,11 @@ pub(crate) fn man_target(
         let q = at.lerp(start, b / back);
         if nav.walk_line(p, q) {
             return (q, true);
+        }
+    }
+    for j in (0..=leg).rev() {
+        if nav.walk_line(p, point(j)) {
+            return (point(j), true);
         }
     }
     // Nothing on the route in reach: step round what is in front of him,
