@@ -3,8 +3,8 @@
 //! gizmos on (G), for every regiment that is selected, open or passing a
 //! friend: each man's body distance and spring rest at his present pose
 //! as two circles, a tick from him to his slot with the hold deadzone
-//! round the slot of a holding man, his pace, and the lane look's verdict
-//! (a man who saw a friend's man in his way); each regiment's block as it
+//! round the slot of a holding man, his pace, and whether he is stuck and
+//! trying a side (`try_a_side`); each regiment's block as it
 //! stands, its closed ground when open, its anchor with its facing, and
 //! the lanes of its open order. The selection rings hide while it shows
 //! (selection_rings.rs). The numbers behind the circles are on the
@@ -16,7 +16,7 @@ use crate::orders::{Groups, Order, Selection};
 use crate::terrain::Terrain;
 use crate::units::Units;
 
-use super::soldier::{pose_level, widths, HOLD_DEADZONE, SIGHT_LEFT, SIGHT_PASS};
+use super::soldier::{pose_level, widths, HOLD_DEADZONE, SIGHT_TRY_LEFT};
 
 /// Whether the contact overlay shows: the full debug overlay, or
 /// FL_CONTACT_VIZ=1 for a scene run without input.
@@ -69,7 +69,7 @@ pub fn draw_contact_viz(
     const SLOT: Color = Color::srgb(1.0, 0.9, 0.2);
     const DEADZONE: Color = Color::srgba(1.0, 0.9, 0.2, 0.35);
     const PACE: Color = Color::srgb(1.0, 1.0, 1.0);
-    const LANE_LOOK: Color = Color::srgb(1.0, 0.2, 0.9);
+    const TRY: Color = Color::srgb(1.0, 0.2, 0.9);
     let w = widths();
     for i in 0..units.len() {
         let g = units.group[i] as usize;
@@ -108,17 +108,19 @@ pub fn draw_contact_viz(
         if v2.length_squared() > 0.01 {
             gizmos.line(lift(p2, 0.4), lift(p2 + v2 * 0.33, 0.4), PACE);
         }
-        // The lane look: he saw a friend's man in his way and steps to the
-        // side the man is not on.
-        let sight = units.sight[i];
-        if sight & SIGHT_PASS != 0 {
-            gizmos.circle(Isometry3d::new(lift(p2, 0.5), flat), 0.2, LANE_LOOK).resolution(8);
+        // Stuck and trying a side: a small dot while he counts as stuck,
+        // a dot with a tick toward the side he tries while the try lasts.
+        let stuck = units.stuck[i];
+        if stuck >> 4 != 0 {
+            gizmos.circle(Isometry3d::new(lift(p2, 0.5), flat), 0.2, TRY).resolution(8);
             let dir = v2.normalize_or_zero();
             if dir != Vec2::ZERO {
                 let left = Vec2::new(-dir.y, dir.x);
-                let side = if sight & SIGHT_LEFT != 0 { -left } else { left };
-                gizmos.line(lift(p2, 0.5), lift(p2 + side * 0.8, 0.5), LANE_LOOK);
+                let side = if units.sight[i] & SIGHT_TRY_LEFT != 0 { left } else { -left };
+                gizmos.line(lift(p2, 0.5), lift(p2 + side * 0.8, 0.5), TRY);
             }
+        } else if stuck & 0x0f >= 8 {
+            gizmos.circle(Isometry3d::new(lift(p2, 0.5), flat), 0.12, TRY).resolution(6);
         }
     }
     const BLOCK: Color = Color::srgb(0.2, 0.9, 1.0);

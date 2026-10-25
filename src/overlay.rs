@@ -353,11 +353,15 @@ fn contact_text(groups: &Groups, selection: &Selection, units: &Units) -> String
     );
     let mut pose_sum = vec![0u32; groups.list.len()];
     let mut pose_n = vec![0u32; groups.list.len()];
+    let mut stuck_n = vec![0u32; groups.list.len()];
+    let mut trying_n = vec![0u32; groups.list.len()];
     for i in 0..units.len() {
         if units.death_t[i] == 0 {
             let g = units.group[i] as usize;
             pose_sum[g] += units.pose[i] as u32;
             pose_n[g] += 1;
+            stuck_n[g] += (units.stuck[i] & 0x0f >= 8) as u32;
+            trying_n[g] += (units.stuck[i] >> 4 != 0) as u32;
         }
     }
     for (g, gd) in groups.list.iter().enumerate() {
@@ -366,11 +370,13 @@ fn contact_text(groups: &Groups, selection: &Selection, units: &Units) -> String
         }
         let pose = pose_sum[g] as f32 / pose_n[g].max(1) as f32 / so::POSE_READY as f32;
         s.push_str(&format!(
-            "\nregiment {g}: {:?}, {} files x {} ranks, pose {:.2}, passing {}, inside {:?}",
+            "\nregiment {g}: {:?}, {} files x {} ranks, pose {:.2}, stuck {} trying a side {}, passing {}, inside {:?}",
             gd.spacing,
             crate::formation::grid(gd).0,
             crate::formation::grid(gd).1,
             pose,
+            stuck_n[g],
+            trying_n[g],
             gd.passing,
             gd.inside,
         ));
