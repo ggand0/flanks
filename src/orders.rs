@@ -84,12 +84,14 @@ pub struct GroupData {
     /// The spacing an open regiment (FormSpacing::Open) closes back to.
     pub close_to: crate::formation::FormSpacing,
     /// Walking through a friendly regiment that opened for it: its block
-    /// within OPEN_KEEP of an open friend's (sim/job.rs
-    /// `open_for_passers`). Its men look for the lanes.
+    /// within OPEN_KEEP of an open friend's, or any of its men still
+    /// inside one (sim/job.rs `open_for_passers`). Its men look for the
+    /// lanes.
     pub passing: bool,
-    /// While passing: the rectangle its men stand in (frontline.rs), what
-    /// the friend it passes reads to know when the last man is out.
-    pub men: Option<crate::formation::BlockRect>,
+    /// While passing: its living men inside each open friend's block, as
+    /// (friend, men) (frontline.rs), what the friend reads to know when
+    /// the last man is out. Empty for a regiment not passing.
+    pub inside: Vec<(u32, u32)>,
     /// Formation facing (unit yaw convention, 0 = +Z). Baked into the slot
     /// offsets on reform; meaningless for Blob.
     pub facing: f32,
@@ -285,7 +287,7 @@ impl GroupData {
             spacing: crate::formation::FormSpacing::Normal,
             close_to: crate::formation::FormSpacing::Normal,
             passing: false,
-            men: None,
+            inside: Vec::new(),
             facing: if team == 0 { 0.0 } else { std::f32::consts::PI },
             files: 0,
             hold: false,
