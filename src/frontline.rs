@@ -336,6 +336,8 @@ struct RegimentSums {
     count: usize,
     home: Vec2,
     r2: f32,
+    /// The farthest living man's squared distance from the centroid.
+    far2: f32,
     slot_err: f32,
     front_off: f32,
     back_off: f32,
@@ -381,6 +383,7 @@ fn regiment_sums(
         count: 0,
         home: Vec2::ZERO,
         r2: 0.0,
+        far2: 0.0,
         slot_err: 0.0,
         front_off: f32::MIN,
         back_off: f32::MAX,
@@ -413,7 +416,11 @@ fn regiment_sums(
                     a.inside[k] += u32::from(rect.distance(p) == 0.0);
                 }
             }
-            a.r2 += (p - pc).length_squared();
+            let d2 = (p - pc).length_squared();
+            a.r2 += d2;
+            if units.death_t[i] == 0 {
+                a.far2 = a.far2.max(d2);
+            }
             a.slot_err += (p - pc - units.home[i] + pb).length();
             // Ground-truth contact: a unit in WIND-UP has an enemy in reach
             // and is striking. TW rule: one soldier fighting engages the
@@ -479,20 +486,29 @@ fn update_groups(
         })
         .collect();
     let bows: Vec<bool> = groups.list.iter().map(|g| g.kind == crate::unit_types::KIND_ARCHER).collect();
-    // A passing regiment counts its men inside each open friend's block.
+    // Every regiment counts its men inside each open friend's block that
+    // one of them could be in: the friend within the regiment's reach
+    // (its farthest man last tick, plus a step). A regiment whose men are
+    // all far from every open friend lists none and tests nothing.
     let open: Vec<Vec<(u32, BlockRect)>> = groups
         .list
         .iter()
-        .map(|g| {
-            if !g.passing {
+        .enumerate()
+        .map(|(g, gd)| {
+            if gd.count == 0 {
                 return Vec::new();
             }
             groups
                 .list
                 .iter()
                 .enumerate()
-                .filter(|(_, h)| {
-                    h.team == g.team && h.count > 0 && h.spacing == crate::formation::FormSpacing::Open
+                .filter(|(h, hd)| {
+                    *h != g
+                        && hd.team == gd.team
+                        && hd.count > 0
+                        && hd.spacing == crate::formation::FormSpacing::Open
+                        && hd.centroid.distance(gd.centroid)
+                            <= gd.reach + 1.0 + crate::formation::block_bound(hd)
                 })
                 .map(|(h, hd)| (h as u32, crate::formation::block_rect(hd)))
                 .collect()
@@ -542,6 +558,7 @@ fn update_groups(
         // Measured against last tick's centroid, a step at most off.
         group.lead = if sums[g].lead > f32::MIN { sums[g].lead } else { 0.0 };
         group.vel = if sums[g].alive > 0 { sums[g].vel / sums[g].alive as f32 } else { Vec2::ZERO };
+        group.reach = sums[g].far2.sqrt();
         group.inside = open[g].iter().zip(&sums[g].inside).map(|(&(h, _), &c)| (h, c)).collect();
         // Formation disorder: how far the regiment stands from its slots,
         // smoothed ~2 s. Only Rect makes the discipline claim.
