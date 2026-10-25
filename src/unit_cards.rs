@@ -1198,10 +1198,10 @@ fn refresh_control_buttons(
             all_melee &= gd.melee;
         } else {
             any_wall = true;
-            all_wall &= gd.spacing == FormSpacing::Wall;
+            all_wall &= gd.chosen_spacing() == FormSpacing::Wall;
             all_spear &= is_spearwall_kind(gd.kind);
         }
-        all_loose &= gd.spacing == FormSpacing::Loose;
+        all_loose &= gd.chosen_spacing() == FormSpacing::Loose;
         all_hold &= gd.hold;
     }
     let archer_btn = |btn: ControlButton| {

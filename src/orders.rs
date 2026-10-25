@@ -81,6 +81,8 @@ pub struct GroupData {
     // --- formation (formation.rs consumes; slots land in `units.home`) ---
     pub shape: crate::formation::FormShape,
     pub spacing: crate::formation::FormSpacing,
+    /// The spacing an open regiment (FormSpacing::Open) closes back to.
+    pub close_to: crate::formation::FormSpacing,
     /// Formation facing (unit yaw convention, 0 = +Z). Baked into the slot
     /// offsets on reform; meaningless for Blob.
     pub facing: f32,
@@ -255,6 +257,12 @@ pub struct GroupData {
 }
 
 impl GroupData {
+    /// The spacing the player or the AI chose: an open regiment's is the
+    /// one it closes back to.
+    pub fn chosen_spacing(&self) -> crate::formation::FormSpacing {
+        if self.spacing == crate::formation::FormSpacing::Open { self.close_to } else { self.spacing }
+    }
+
     pub fn new(team: u8, kind: u8, anchor: Vec2, count: usize) -> Self {
         Self {
             team,
@@ -268,6 +276,7 @@ impl GroupData {
             // spawn switches to Rect and forms slots explicitly.
             shape: crate::formation::FormShape::Blob,
             spacing: crate::formation::FormSpacing::Normal,
+            close_to: crate::formation::FormSpacing::Normal,
             facing: if team == 0 { 0.0 } else { std::f32::consts::PI },
             files: 0,
             hold: false,
@@ -662,7 +671,7 @@ fn line_layout(
     for (g, _) in segs {
         let gd = &groups.list[g];
         let share = len * gd.count as f32 / total as f32;
-        let pitch = gd.spacing.pitch(gd.kind);
+        let pitch = gd.chosen_spacing().pitch(gd.kind);
         let files = (((share - LINE_REG_GAP) / pitch.x).floor() as u32)
             .clamp(1, gd.count as u32);
         let ranks = (gd.count as u32).div_ceil(files);
@@ -986,7 +995,7 @@ fn draw_order_preview(
         let gd = &groups.list[p.g];
         let fwd = facing_dir(p.facing);
         let right = Vec2::new(fwd.y, -fwd.x);
-        let pitch = gd.spacing.pitch(gd.kind);
+        let pitch = gd.chosen_spacing().pitch(gd.kind);
         let world = |off: Vec2| p.anchor + right * off.x + fwd * off.y;
 
         if total <= PREVIEW_CIRCLE_CAP {

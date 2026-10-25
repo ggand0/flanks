@@ -477,6 +477,7 @@ fn update_inspect_panel(
             1 => "  shieldwall",
             2 => "  spearwall",
             _ if gd.spacing == crate::formation::FormSpacing::Loose => "  loose order",
+            _ if gd.spacing == crate::formation::FormSpacing::Open => "  open order",
             _ => "",
         };
         let stance = if gd.hold { "  hold position" } else { "" };
