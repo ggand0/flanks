@@ -20,6 +20,11 @@ const PAN_SLOW: f32 = 0.25;
 const PAN_SLOW_RAMP: f32 = 1.5;
 /// Zoom smoothing time constant (seconds to ~2/3 of the way).
 const ZOOM_SMOOTH: f32 = 0.12;
+/// How far the eye looks around itself for walls and roofs to stay above
+/// (m), so it starts to rise before it reaches one.
+const LIFT_LOOK: f32 = 8.0;
+/// Time constant of the eye's lift over walls and roofs (s).
+const LIFT_SMOOTH: f32 = 0.2;
 
 fn max_distance(kind: crate::terrain::MapKind) -> f32 {
     if kind.is_large() { 2800.0 } else { 900.0 }
@@ -37,6 +42,9 @@ pub struct RtsCamera {
     pub distance: f32,
     /// Scroll adjusts this; `distance` chases it (smooth zoom).
     pub target_distance: f32,
+    /// How far the eye is raised over walls and roofs (m), eased so it
+    /// never jumps (`apply_camera_transform`).
+    pub lift: f32,
 }
 
 pub struct RtsCameraPlugin;
@@ -87,6 +95,7 @@ fn spawn_camera(mut commands: Commands) {
             pitch: crate::util::env_or("FL_CAM_PITCH", 0.9),
             distance: crate::util::env_or("FL_CAM_DIST", 280.0),
             target_distance: crate::util::env_or("FL_CAM_DIST", 280.0),
+            lift: 0.0,
         },
     ));
 }
@@ -262,8 +271,25 @@ pub fn apply_camera_transform(
     let max = terrain.max();
     cam.focus.x = cam.focus.x.clamp(min.x, max.x);
     cam.focus.z = cam.focus.z.clamp(min.y, max.y);
-    cam.focus.y = terrain.height_at(cam.focus.x, cam.focus.z);
-    *transform = Transform::from_translation(camera_eye(&cam, &terrain)).looking_at(cam.focus, Vec3::Y);
+    // The focus rides the drawn ground, so it glides over the walled
+    // town's walls and houses instead of jumping onto their tops.
+    cam.focus.y = terrain.ground_at(cam.focus.x, cam.focus.z);
+    let mut eye = camera_eye(&cam, &terrain);
+    // The eye stays above the walls and roofs around it (the sim's
+    // heights, where they stand above the ground), eased in and out.
+    let mut need = 0.0f32;
+    for k in 0..9 {
+        let p = if k == 0 {
+            eye.xz()
+        } else {
+            eye.xz() + Vec2::from_angle(k as f32 * std::f32::consts::TAU / 8.0) * LIFT_LOOK
+        };
+        need = need.max(terrain.height_at(p.x, p.y) + 1.5 - eye.y);
+    }
+    let blend = (time.delta_secs() / LIFT_SMOOTH).min(1.0);
+    cam.lift += (need.max(0.0) - cam.lift) * blend;
+    eye.y += cam.lift;
+    *transform = Transform::from_translation(eye).looking_at(cam.focus, Vec3::Y);
 }
 
 /// A camera path on disk: one line per sample, `t x z yaw pitch dist`,
@@ -354,11 +380,12 @@ impl CamPath {
     }
 }
 
+/// The eye on its orbit about the focus, kept 1.5 m above the drawn
+/// ground (the focus can sit downhill from the eye at low pitch).
 fn camera_eye(cam: &RtsCamera, terrain: &crate::terrain::Terrain) -> Vec3 {
     let rot = Quat::from_euler(EulerRot::YXZ, cam.yaw, -cam.pitch, 0.0);
     let mut eye = cam.focus + rot * Vec3::new(0.0, 0.0, cam.distance);
-    // The focus can sit downhill from the eye at low pitch.
-    eye.y = eye.y.max(terrain.height_at(eye.x, eye.z) + 1.5);
+    eye.y = eye.y.max(terrain.ground_at(eye.x, eye.z) + 1.5);
     eye
 }
 
@@ -374,12 +401,12 @@ mod tests {
             let mut lowest = f32::INFINITY;
             for z in (terrain.min().y as i32..=terrain.max().y as i32).step_by(16) {
                 for x in (terrain.min().x as i32..=terrain.max().x as i32).step_by(16) {
-                    let focus = Vec3::new(x as f32, terrain.height_at(x as f32, z as f32), z as f32);
+                    let focus = Vec3::new(x as f32, terrain.ground_at(x as f32, z as f32), z as f32);
                     for angle in 0..16 {
                         let yaw = angle as f32 * std::f32::consts::TAU / 16.0;
-                        let cam = RtsCamera { focus, yaw, pitch: 0.25, distance: 15.0, target_distance: 15.0 };
+                        let cam = RtsCamera { focus, yaw, pitch: 0.25, distance: 15.0, target_distance: 15.0, lift: 0.0 };
                         let eye = camera_eye(&cam, &terrain);
-                        lowest = lowest.min(eye.y - terrain.height_at(eye.x, eye.z));
+                        lowest = lowest.min(eye.y - terrain.ground_at(eye.x, eye.z));
                     }
                 }
             }
@@ -407,6 +434,7 @@ mod tests {
                     pitch: 1.45,
                     distance: 2800.0,
                     target_distance: 2800.0,
+                    lift: 0.0,
                 },
                 Transform::default(),
                 Projection::default(),
