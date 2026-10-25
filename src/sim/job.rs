@@ -107,7 +107,7 @@ pub struct TickJob {
     pub(crate) chain_in: Arc<Vec<u8>>,
     pub(crate) way_in: Arc<Vec<Vec2>>,
     pub(crate) pose_in: Arc<Vec<u8>>,
-    pub(crate) stuck_in: Arc<Vec<u8>>,
+    pub(crate) stuck_in: Arc<Vec<u16>>,
     pub(crate) quarry_in: Arc<Vec<u32>>,
     // Read only to pack the render snapshot.
     pub(crate) pos_prev_in: Arc<Vec<Vec3>>,
@@ -135,7 +135,7 @@ pub struct TickJob {
     pub(crate) chain: Vec<u8>,
     pub(crate) way: Vec<Vec2>,
     pub(crate) pose: Vec<u8>,
-    pub(crate) stuck: Vec<u8>,
+    pub(crate) stuck: Vec<u16>,
     pub(crate) quarry: Vec<u32>,
     // Per-regiment command snapshot, taken at prep.
     pub(crate) orders: Vec<Option<Vec2>>,

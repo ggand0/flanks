@@ -125,10 +125,11 @@ pub struct Units {
     /// How far he is into his ready stance, 0 at ease to POSE_READY
     /// (sim/soldier.rs): his body is wider in it.
     pub pose: Column<u8>,
-    /// Stuck on his way: the low nibble counts the ticks he has wanted to
-    /// walk and not moved while pressed from ahead, the high one the ticks
-    /// left of his try at a side, in pairs (sim/soldier.rs `try_a_side`).
-    pub stuck: Column<u8>,
+    /// Stuck on his way and trying a side (sim/soldier.rs `try_a_side`,
+    /// the STUCK_* fields): the ticks he has wanted to walk and not moved
+    /// while pressed from ahead, the ticks left of his try, how long he
+    /// remembers the side he tried, and that side.
+    pub stuck: Column<u16>,
     /// Bumped every time a battle rebuilds this world. A sim tick job
     /// computed from an older world carries indices that mean nothing
     /// here: sim/mod.rs drops it instead of installing it.

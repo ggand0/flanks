@@ -16,7 +16,7 @@ use crate::orders::{Groups, Order, Selection};
 use crate::terrain::Terrain;
 use crate::units::Units;
 
-use super::soldier::{pose_level, widths, HOLD_DEADZONE, SIGHT_TRY_LEFT};
+use super::soldier::{pose_level, stuck_count, stuck_trying, widths, HOLD_DEADZONE, STUCK_LEFT};
 
 /// Whether the contact overlay shows: the full debug overlay, or
 /// FL_CONTACT_VIZ=1 for a scene run without input.
@@ -111,15 +111,15 @@ pub fn draw_contact_viz(
         // Stuck and trying a side: a small dot while he counts as stuck,
         // a dot with a tick toward the side he tries while the try lasts.
         let stuck = units.stuck[i];
-        if stuck >> 4 != 0 {
+        if stuck_trying(stuck) != 0 {
             gizmos.circle(Isometry3d::new(lift(p2, 0.5), flat), 0.2, TRY).resolution(8);
             let dir = v2.normalize_or_zero();
             if dir != Vec2::ZERO {
                 let left = Vec2::new(-dir.y, dir.x);
-                let side = if units.sight[i] & SIGHT_TRY_LEFT != 0 { left } else { -left };
+                let side = if stuck & STUCK_LEFT != 0 { left } else { -left };
                 gizmos.line(lift(p2, 0.5), lift(p2 + side * 0.8, 0.5), TRY);
             }
-        } else if stuck & 0x0f >= 8 {
+        } else if stuck_count(stuck) >= 8 {
             gizmos.circle(Isometry3d::new(lift(p2, 0.5), flat), 0.12, TRY).resolution(6);
         }
     }
