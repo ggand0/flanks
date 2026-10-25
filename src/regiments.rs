@@ -610,19 +610,22 @@ fn spawn_archery_side(
 
 /// The blocked march's numbers for one archer regiment: the leading
 /// man's distance to the target block's edge and to the block in the
-/// way, the men swinging a weapon (in melee), and where the regiment
-/// is against its firing place.
+/// way, the men swinging a weapon (in melee), the men inside the
+/// friendly block (0), and where the regiment is against its firing
+/// place.
 fn blocked_march_report(groups: &Groups, units: &Units, g: u32) -> String {
     let gd = &groups.list[g as usize];
     let target = crate::formation::block_rect(&groups.list[5]);
     let way = crate::formation::block_rect(&groups.list[4]);
-    let (mut near_t, mut near_w, mut melee) = (f32::MAX, f32::MAX, 0usize);
+    let friend = crate::formation::block_rect(&groups.list[0]);
+    let (mut near_t, mut near_w, mut melee, mut inside) = (f32::MAX, f32::MAX, 0usize, 0usize);
     for i in 0..units.len() {
         if units.group[i] != g || units.death_t[i] != 0 {
             continue;
         }
         let p = Vec2::new(units.pos[i].x, units.pos[i].z);
         near_t = near_t.min(target.distance(p));
+        inside += usize::from(friend.distance(p) == 0.0);
         if groups.list[4].count > 0 {
             near_w = near_w.min(way.distance(p));
         }
@@ -637,7 +640,7 @@ fn blocked_march_report(groups: &Groups, units: &Units, g: u32) -> String {
     });
     format!(
         " | reg {g}: lead {:.0} m, nearest man {:.0} m from the target, {} from the block in \
-         the way, {melee} in melee, hold {:?}, place {place}",
+         the way, {melee} in melee, {inside} in the friend, hold {:?}, place {place}",
         gd.lead,
         near_t,
         if near_w < f32::MAX { format!("{near_w:.0} m") } else { "-".to_string() },
@@ -1132,15 +1135,74 @@ fn join_test_log(
 /// through A's ranks. Acceptance: the passer slips through the seams
 /// at body scale, A's disorder bumps briefly and re-dresses — no
 /// corridor excavated, no lasting raggedness.
+///
+/// Variants: FL_ROUTPASS_SIZE=<men> both regiments that size, at the
+/// 15 by 8 aspect of the reference's 120-man pass (500, the default, at
+/// the default layout); FL_ROUTPASS_KINDS=1 knights through spearmen;
+/// FL_ROUTPASS_GAP=<m> the passer that far behind A's rear rank instead
+/// of 35 m from its centre, room for A to open toward it;
+/// FL_ROUTPASS_SPEED=<m/s> the passer's men at about that speed.
 fn spawn_routpass_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
+    let size: Option<usize> = std::env::var("FL_ROUTPASS_SIZE").ok().and_then(|v| v.parse().ok());
+    let n = size.unwrap_or(500).max(1);
+    let (holder_kind, passer_kind) = if std::env::var("FL_ROUTPASS_KINDS").is_ok_and(|v| v == "1") {
+        (KIND_SPEAR, KIND_HEAVY)
+    } else {
+        (KIND_LIGHT, KIND_LIGHT)
+    };
     let mut list = Vec::new();
-    spawn_regiment(units, terrain, &mut list, 0, KIND_LIGHT, Vec2::new(0.0, 0.0), 500, 1.0);
+    spawn_regiment(units, terrain, &mut list, 0, holder_kind, Vec2::new(0.0, 0.0), n, 1.0);
     list[0].hold = true;
-    spawn_regiment(units, terrain, &mut list, 0, KIND_LIGHT, Vec2::new(0.0, 35.0), 500, -1.0);
+    let gap: Option<f32> = std::env::var("FL_ROUTPASS_GAP").ok().and_then(|v| v.parse().ok());
+    // The passer's centre: 35 m from A's, or `gap` behind A's rear rank.
+    let files = |n: usize| {
+        if size.is_some() {
+            ((n as f32 * 15.0 / 8.0).sqrt().round() as u32).max(1)
+        } else {
+            crate::formation::default_files(n)
+        }
+    };
+    let half_depth = |n: usize, kind: u8| {
+        (n.div_ceil(files(n) as usize) - 1) as f32 * 0.5 * crate::formation::gap(kind)
+    };
+    let z = match gap {
+        Some(gap) => half_depth(n, holder_kind) + gap + half_depth(n, passer_kind),
+        None => 35.0,
+    };
+    spawn_regiment(units, terrain, &mut list, 0, passer_kind, Vec2::new(0.0, z), n, -1.0);
     list[1].order = Some(crate::orders::Order::Move(Vec2::new(0.0, -60.0)));
     list[1].auto_order = true;
+    if size.is_some() {
+        for (g, gd) in list.iter_mut().enumerate() {
+            gd.files = files(n);
+            for i in crate::formation::assign_slots(units, g as u32, gd) {
+                let i = i as usize;
+                let at = gd.anchor + units.home[i];
+                let y = terrain.height_at(at.x, at.y)
+                    + crate::unit_types::half_height(units.kind[i] as usize);
+                units.pos[i] = Vec3::new(at.x, y, at.y);
+                units.pos_prev[i] = units.pos[i];
+            }
+        }
+    }
+    if let Some(v) = std::env::var("FL_ROUTPASS_SPEED").ok().and_then(|v| v.parse::<f32>().ok()) {
+        let scale = v / crate::unit_types::TYPES[passer_kind as usize].speed;
+        for i in 0..units.len() {
+            if units.group[i] == 1 {
+                units.speed[i] *= scale;
+            }
+        }
+    }
+    // A small held enemy far off the pass, so the battle does not end
+    // with no enemy on the field (ai.rs `check_victory`) and freeze it.
+    spawn_regiment(units, terrain, &mut list, 1, KIND_LIGHT, Vec2::new(150.0, 0.0), 16, -1.0);
+    list[2].hold = true;
+    list[2].steadfast = true;
     groups.list = list;
-    info!("[routpass-test] passer Move-ordered straight through A's held line");
+    info!(
+        "[routpass-test] passer of {n} Move-ordered straight through A's held line of {n}, {} files, from z {z:.1}",
+        files(n)
+    );
 }
 
 /// FL_TEST_PUSH=1: a lane behind a gap. Three deep orange regiments of
@@ -1226,24 +1288,60 @@ fn push_test_log(
 }
 
 /// FL_TEST_ROUTPASS bookkeeping every 2 s: A's shape while the passer
-/// walks through it, and the overlap floor.
+/// walks through it, the overlap floor, the passers inside A's
+/// rectangle (its frame about its anchor), and A's men off their file
+/// line (the mean lateral distance to their slots). Watched every
+/// frame: the time from the first passer in to the last out.
 fn routpass_test_log(
+    units: Res<Units>,
     groups: Res<crate::orders::Groups>,
     stats: Res<crate::sim::SimStats>,
     time: Res<Time>,
     mut next: Local<f32>,
+    mut pass: Local<(Option<f32>, Option<f32>)>,
 ) {
     if std::env::var("FL_TEST_ROUTPASS").is_err() || groups.list.len() < 2 {
         return;
     }
     let t = time.elapsed_secs();
+    let a = &groups.list[0];
+    let rect = crate::formation::block_rect_at(a, a.anchor);
+    let fwd = crate::formation::facing_dir(a.facing);
+    let right = Vec2::new(fwd.y, -fwd.x);
+    let (mut inside, mut off, mut held) = (0usize, 0.0f32, 0usize);
+    for i in 0..units.len() {
+        if units.death_t[i] != 0 {
+            continue;
+        }
+        let p = Vec2::new(units.pos[i].x, units.pos[i].z);
+        match units.group[i] {
+            0 => {
+                off += (p - a.anchor - units.home[i]).dot(right).abs();
+                held += 1;
+            }
+            1 if rect.distance(p) == 0.0 => inside += 1,
+            _ => {}
+        }
+    }
+    let (first_in, last_out) = &mut *pass;
+    if inside > 0 && first_in.is_none() {
+        *first_in = Some(t);
+    }
+    if inside == 0
+        && let Some(t0) = *first_in
+        && last_out.is_none()
+    {
+        *last_out = Some(t);
+        info!("[routpass-test] pass: first in t={t0:.1}s, last out t={t:.1}s, {:.1} s", t - t0);
+    }
     if t < *next {
         return;
     }
     *next = t + 2.0;
     info!(
-        "[routpass-test] t={t:.0}s A disorder {:.2} m, passer z {:.1}, nn min {:.2}",
-        groups.list[0].disorder,
+        "[routpass-test] t={t:.0}s A disorder {:.2} m, off file line {:.2} m, passer z {:.1}, {inside} inside, nn min {:.2}",
+        a.disorder,
+        if held > 0 { off / held as f32 } else { 0.0 },
         groups.list[1].centroid.y,
         stats.nn_min,
     );
