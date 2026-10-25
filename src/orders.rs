@@ -756,7 +756,9 @@ pub fn line_order(groups: &mut Groups, selected: &[usize], a: Vec2, b: Vec2) {
 /// land, inside the same margins the spawner keeps. Returned as
 /// (min, max) corners in ground coordinates.
 fn deploy_zone(terrain: &Terrain) -> (Vec2, Vec2) {
-    let (mut lo, mut hi) = deploy_zone_for(terrain, crate::regiments::army_gap());
+    let (centre, gap) = crate::regiments::army_lines(terrain.kind);
+    let (mut lo, mut hi) = deploy_zone_for(terrain, gap);
+    hi.y += centre;
     // A setup with open sides (the demo battle) deploys out to the map's
     // sides, so a line can close the corridors past its ends.
     if crate::battle_setup::from_env().is_some_and(|s| s.open_sides) {

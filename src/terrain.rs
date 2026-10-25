@@ -23,8 +23,8 @@ pub const CHUNK_CELLS: usize = 32;
 
 /// The battlefields in the menu's Map row. At launch a setup's map wins
 /// (an `FL_SETUP` file, or the Demo's with `FL_DEMO=1`), then
-/// `FL_MAP=big_grassland`, `hill`, `big_hill`, `classic`, `river`,
-/// `sandbox`, `obstacles` or `town`.
+/// `FL_MAP=big_grassland`, `hill`, `big_hill`, `walled_town`, `classic`,
+/// `river`, `sandbox`, `obstacles` or `town`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub enum MapKind {
     /// Broad pasture shoulders around an open lowland: the default.
@@ -36,6 +36,9 @@ pub enum MapKind {
     Hill,
     /// The hill layout at twice the ground dimensions and height.
     BigHill,
+    /// The hill's ground with a stone wall across the plateau and a town
+    /// behind it (town_layout.rs).
+    WalledTown,
     /// The 0.1.0 heightfield: rolling noise with ridged peaks, no river.
     Classic,
     /// Experimental: the same noise with terraces, a river and a bridge.
@@ -61,6 +64,7 @@ impl MapKind {
             Ok("big_grassland") => Self::BigGrassland,
             Ok("hill") => Self::Hill,
             Ok("big_hill") => Self::BigHill,
+            Ok("walled_town") => Self::WalledTown,
             Ok("river") => Self::River,
             Ok("classic") => Self::Classic,
             Ok("sandbox") => Self::Sandbox,
@@ -76,6 +80,7 @@ impl MapKind {
             Self::BigGrassland => "Big Grassland",
             Self::Hill => "Hill",
             Self::BigHill => "Big Hill",
+            Self::WalledTown => "Walled Town",
             Self::Classic => "Classic",
             Self::River => "River",
             Self::Sandbox => "Sandbox",
@@ -90,17 +95,24 @@ impl MapKind {
     }
 
     /// Maps whose steep faces are impassable: the river map's terraces and
-    /// gorges, and the obstacle map's blocks. The others never block.
+    /// gorges, and the obstacle and town maps' blocks and walls. The others
+    /// never block.
     pub const fn has_blocked_ground(self) -> bool {
-        matches!(self, Self::River | Self::Obstacles | Self::Town)
+        matches!(self, Self::River | Self::Obstacles | Self::Town | Self::WalledTown)
+    }
+
+    /// Maps on the hill's heightmap.
+    const fn on_hill(self) -> bool {
+        matches!(self, Self::Hill | Self::BigHill | Self::WalledTown)
     }
 
     /// Every map, in the menu's order.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Grassland,
         Self::BigGrassland,
         Self::Hill,
         Self::BigHill,
+        Self::WalledTown,
         Self::Classic,
         Self::River,
         Self::Sandbox,
@@ -137,8 +149,13 @@ pub struct MapRebuild;
 
 #[derive(Resource, Clone)]
 pub struct Terrain {
-    /// Vertex heights, row-major [z][x].
+    /// Vertex heights, row-major [z][x]: what the sim walks on, shoots
+    /// over and plans on.
     heights: Vec<f32>,
+    /// The drawn ground where it differs from `heights`: on the walled
+    /// town the ground under the wall and the houses, which the sim's
+    /// copy raises by the pieces. None on every other map.
+    ground: Option<Vec<f32>>,
     verts_x: usize,
     verts_z: usize,
     /// Impassable vertices (terrace risers, gorge walls, crater lips),
@@ -174,6 +191,11 @@ impl Terrain {
         &self.heights
     }
 
+    /// The drawn ground's vertex heights, laid out as `heights`.
+    pub fn ground_heights(&self) -> &[f32] {
+        self.ground.as_deref().unwrap_or(&self.heights)
+    }
+
     pub fn min(&self) -> Vec2 {
         self.origin
     }
@@ -186,6 +208,24 @@ impl Terrain {
     #[inline]
     fn h(&self, x: usize, z: usize) -> f32 {
         self.heights[z * self.verts_x + x]
+    }
+
+    /// The drawn ground's height at a vertex.
+    #[inline]
+    fn g(&self, x: usize, z: usize) -> f32 {
+        self.ground_heights()[z * self.verts_x + x]
+    }
+
+    /// Bilinear sample of the drawn ground: where the town's models stand.
+    pub fn ground_at(&self, x: f32, z: f32) -> f32 {
+        let g = (Vec2::new(x, z) - self.origin) / CELL;
+        let gx = g.x.clamp(0.0, (self.verts_x - 2) as f32);
+        let gz = g.y.clamp(0.0, (self.verts_z - 2) as f32);
+        let (x0, z0) = (gx as usize, gz as usize);
+        let (fx, fz) = (gx - x0 as f32, gz - z0 as f32);
+        let a = self.g(x0, z0) + (self.g(x0 + 1, z0) - self.g(x0, z0)) * fx;
+        let b = self.g(x0, z0 + 1) + (self.g(x0 + 1, z0 + 1) - self.g(x0, z0 + 1)) * fx;
+        a + (b - a) * fz
     }
 
     /// Bilinear height sample, clamped to the field. The bridge deck
@@ -276,6 +316,9 @@ impl Terrain {
                     continue;
                 };
                 self.heights[z * self.verts_x + x] += dh;
+                if let Some(ground) = &mut self.ground {
+                    ground[z * self.verts_x + x] += dh;
+                }
             }
         }
         // Refresh the blocked mask over the touched area (one vertex of
@@ -692,7 +735,7 @@ pub(crate) fn build_terrain(kind: MapKind) -> Terrain {
         -(verts_x as f32 - 1.0) * CELL * 0.5,
         -(verts_z as f32 - 1.0) * CELL * 0.5,
     );
-    let hill = if matches!(kind, MapKind::Hill | MapKind::BigHill) {
+    let hill = if kind.on_hill() {
         let path = crate::util::game_root().join("assets/terrain/hill.json");
         let source = FileHeightMap::load(&path).unwrap_or_else(|e| panic!("hill terrain: {e}"));
         assert_eq!((source.width, source.height), MapKind::Hill.grid_verts(),
@@ -775,6 +818,15 @@ pub(crate) fn build_terrain(kind: MapKind) -> Terrain {
     if kind == MapKind::Town {
         crate::obstacle_map::raise_blocks(&mut heights, origin, (verts_x, verts_z), &crate::obstacle_map::town_blocks());
     }
+    let ground = if kind == MapKind::WalledTown {
+        let pieces = crate::town_layout::pieces();
+        let level = crate::town_layout::level_ground(&mut heights, origin, (verts_x, verts_z), &pieces);
+        info!("terrain: the walled town's wall run stands at {level:.2} m");
+        let sim = crate::town_layout::sim_heights(&heights, origin, (verts_x, verts_z), &pieces);
+        Some(std::mem::replace(&mut heights, sim))
+    } else {
+        None
+    };
     let mut blocked = vec![false; verts_x * verts_z];
     if kind.has_blocked_ground() {
         for z in 0..verts_z {
@@ -793,6 +845,7 @@ pub(crate) fn build_terrain(kind: MapKind) -> Terrain {
     );
     Terrain {
         heights,
+        ground,
         verts_x,
         verts_z,
         blocked,
@@ -835,11 +888,9 @@ fn ground_base() -> StandardMaterial {
 /// Pasture maps use authored colour layouts and natural grass detail.
 /// The other maps derive coverage from their relief and stony slopes.
 fn ground_layers(assets: &AssetServer, images: &mut Assets<Image>, terrain: &Terrain) -> GroundLayers {
-    let hill = matches!(terrain.kind, MapKind::Hill | MapKind::BigHill);
-    let authored = matches!(
-        terrain.kind,
-        MapKind::Grassland | MapKind::BigGrassland | MapKind::Hill | MapKind::BigHill | MapKind::Sandbox | MapKind::Town
-    );
+    let hill = terrain.kind.on_hill();
+    let authored = hill
+        || matches!(terrain.kind, MapKind::Grassland | MapKind::BigGrassland | MapKind::Sandbox | MapKind::Town);
     GroundLayers {
         pasture: ground_texture(
             assets,
@@ -917,7 +968,7 @@ fn rebuild_map(
     }
     let t0 = Instant::now();
     *terrain = build_terrain(kind);
-    chunks.original_heights.clone_from(&terrain.heights);
+    chunks.original_heights = terrain.ground_heights().to_vec();
     let material = materials.add(GroundMaterial {
         base: ground_base(),
         extension: ground_layers(&assets, &mut images, &terrain),
@@ -965,7 +1016,7 @@ fn spawn_chunks(
         .copied()
         .map(|path| ground_texture(&assets, path))
         .collect();
-    chunks.original_heights.clone_from(&terrain.heights);
+    chunks.original_heights = terrain.ground_heights().to_vec();
     spawn_chunk_meshes(&mut commands, &terrain, &mut meshes, &mut chunks);
 }
 
@@ -1005,8 +1056,8 @@ fn ground_normal(terrain: &Terrain, x: usize, z: usize) -> Vec3 {
     let xp = (x + 1).min(terrain.verts_x - 1);
     let zm = z.saturating_sub(1);
     let zp = (z + 1).min(terrain.verts_z - 1);
-    let dx = (terrain.h(xp, z) - terrain.h(xm, z)) / ((xp - xm) as f32 * CELL);
-    let dz = (terrain.h(x, zp) - terrain.h(x, zm)) / ((zp - zm) as f32 * CELL);
+    let dx = (terrain.g(xp, z) - terrain.g(xm, z)) / ((xp - xm) as f32 * CELL);
+    let dz = (terrain.g(x, zp) - terrain.g(x, zm)) / ((zp - zm) as f32 * CELL);
     Vec3::new(-dx, 1.0, -dz).normalize()
 }
 
@@ -1047,11 +1098,11 @@ fn ground_coverage(terrain: &Terrain) -> Image {
             let broad = cover_noise(q / Vec2::new(145.0, 85.0) + Vec2::splat(7.3));
             let patches = cover_noise(q / 31.0 + Vec2::splat(37.8));
             let flecks = cover_noise(q / 7.0 + Vec2::splat(91.1));
-            let neighbors = terrain.h(x.saturating_sub(48), z)
-                + terrain.h((x + 48).min(terrain.verts_x - 1), z)
-                + terrain.h(x, z.saturating_sub(48))
-                + terrain.h(x, (z + 48).min(terrain.verts_z - 1));
-            let relief = terrain.h(x, z) - neighbors * 0.25;
+            let neighbors = terrain.g(x.saturating_sub(48), z)
+                + terrain.g((x + 48).min(terrain.verts_x - 1), z)
+                + terrain.g(x, z.saturating_sub(48))
+                + terrain.g(x, (z + 48).min(terrain.verts_z - 1));
+            let relief = terrain.g(x, z) - neighbors * 0.25;
             let dry = (0.52 + broad * 0.28 + patches * 0.08 + relief * 0.07).clamp(0.0, 1.0);
             let soil = smoothstep(0.52, 0.82, dry + patches * 0.16) * 0.5;
             let variation = (0.5 + flecks * 0.08 + patches * 0.06).clamp(0.0, 1.0);
@@ -1078,7 +1129,7 @@ fn ground_coverage(terrain: &Terrain) -> Image {
 /// RGBA carries an unused channel, crater exposure, stone and bank dampness.
 fn ground_weights(terrain: &Terrain, original: &[f32], x: usize, z: usize, n: Vec3) -> [f32; 4] {
     let p = terrain.origin + Vec2::new(x as f32, z as f32) * CELL;
-    let h = terrain.h(x, z);
+    let h = terrain.g(x, z);
     let slope = n.xz().length() / n.y.max(0.001);
     let disturbed = smoothstep(0.03, 0.65, (h - original[z * terrain.verts_x + x]).abs());
     let mut soil = disturbed;
@@ -1141,7 +1192,7 @@ fn build_band_mesh(terrain: &Terrain, cx: usize, cz: usize) -> Mesh {
             let (x, z) = (vx0 + dx, vz0 + dz);
             let wp = |xx: usize, zz: usize| -> Vec3 {
                 let w = terrain.origin + Vec2::new(xx as f32, zz as f32) * CELL;
-                Vec3::new(w.x, terrain.h(xx, zz), w.y)
+                Vec3::new(w.x, terrain.g(xx, zz), w.y)
             };
             let p00 = wp(x, z);
             let p10 = wp(x + 1, z);
@@ -1197,7 +1248,7 @@ fn build_chunk_mesh(terrain: &Terrain, original: &[f32], cx: usize, cz: usize) -
             let (x, z) = (vx0 + dx, vz0 + dz);
             let p = terrain.origin + Vec2::new(x as f32, z as f32) * CELL;
             let n = ground_normal(terrain, x, z);
-            positions.push([p.x, terrain.h(x, z), p.y]);
+            positions.push([p.x, terrain.g(x, z), p.y]);
             normals.push(n.to_array());
             weights.push(ground_weights(terrain, original, x, z, n));
         }
@@ -1378,6 +1429,7 @@ mod tests {
         }
         Terrain {
             heights,
+            ground: None,
             verts_x: VERTS_X,
             verts_z: VERTS_Z,
             blocked: vec![false; VERTS_X * VERTS_Z],
@@ -1678,7 +1730,7 @@ mod tests {
             let chunks = world.resource::<TerrainChunks>();
             let terrain = world.resource::<Terrain>();
             assert_eq!(chunks.meshes.len(), count);
-            assert_eq!(chunks.original_heights, terrain.heights);
+            assert_eq!(chunks.original_heights, terrain.ground_heights());
             let last = world
                 .resource::<Assets<Mesh>>()
                 .get(chunks.meshes.last().unwrap())

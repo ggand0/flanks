@@ -1147,6 +1147,76 @@ mod tests {
         assert!(g.clearance_at(cross) >= 12.0, "wide: crossed at {cross}");
     }
 
+    /// The walled town: the plain, the town's streets, the plateau behind
+    /// it and the wall walk are one region, the walk reached through the
+    /// stairs; the drum roofs and the house roofs are cut off; the gate is
+    /// closed, so the way from the plain into the town goes around an open
+    /// end of the wall. The lanes are as wide as the module docs of
+    /// town_layout.rs work out: 6 m on the walk, through a tower and over
+    /// the gatehouse's bridge, 2 m up a stair.
+    #[test]
+    fn the_walled_town_walk_is_reached_by_its_stairs_and_its_gate_is_closed() {
+        use crate::town_layout::{pieces, spots, Kind, STAIRS_X, TOWERS_X, WALL_Z};
+        let g = NavGrid::build(&build_terrain(MapKind::WalledTown)).expect("the walled town has a grid");
+        let region = |p: Vec2| g.cell_at(p).filter(|&i| g.walk[i]).map(|i| g.region[i]);
+        let main = Some(g.main_region);
+        for (name, p) in [
+            ("plain", spots::PLAIN),
+            ("outside the gate", spots::OUTSIDE_GATE),
+            ("plaza", spots::PLAZA),
+            ("behind the town", spots::BEHIND_TOWN),
+            ("west walk", spots::WALK_WEST),
+            ("east walk", spots::WALK_EAST),
+            ("bridge", spots::BRIDGE),
+        ] {
+            assert_eq!(region(p), main, "{name} at {p} is cut off");
+        }
+        for i in 0..STAIRS_X.len() {
+            assert_eq!(region(spots::stair_mid(i)), main, "stair {i} is cut off");
+        }
+        for &x in &TOWERS_X {
+            assert_eq!(region(Vec2::new(x, WALL_Z)), main, "the passage of the tower at {x}");
+            assert_ne!(region(Vec2::new(x, WALL_Z + 6.0)), main, "the roof of the tower at {x}");
+        }
+        for p in pieces().iter().filter(|p| matches!(p.kind, Kind::House(_))) {
+            assert_ne!(region(p.pos), main, "the roof of the house at {}", p.pos);
+        }
+        // Open vertices across a lane, along z.
+        let lane = |x: f32, z0: f32, z1: f32| {
+            let mut z = z0;
+            let mut n = 0;
+            while z <= z1 {
+                n += usize::from(region(Vec2::new(x, z)) == main);
+                z += CELL;
+            }
+            n
+        };
+        let w = WALL_Z;
+        println!(
+            "walled town lanes (open vertices): walk {}, tower passage {}, bridge {}, stair {}",
+            lane(130.0, w - 6.0, w + 6.0),
+            lane(TOWERS_X[2], w - 6.0, w + 6.0),
+            lane(0.0, w - 6.0, w + 6.0),
+            lane(STAIRS_X[2] + 6.0, w - 10.0, w - 4.0),
+        );
+        assert_eq!(lane(130.0, w - 6.0, w + 6.0), 3);
+        assert_eq!(lane(TOWERS_X[2], w - 6.0, w + 6.0), 3);
+        assert_eq!(lane(0.0, w - 6.0, w + 6.0), 3);
+        assert_eq!(lane(STAIRS_X[2] + 6.0, w - 10.0, w - 4.0), 1);
+        // From the plain to the plaza: around an end, never through the gate.
+        let plan = g.plan(&req(spots::OUTSIDE_GATE, spots::PLAZA));
+        assert!(plan.reached, "the plaza is out of reach");
+        assert_walkable(&g, &plan);
+        for s in plan.points.windows(2) {
+            let (a, b) = (s[0], s[1]);
+            if (a.y - w) * (b.y - w) <= 0.0 && a.y != b.y {
+                let x = a.x + (b.x - a.x) * (w - a.y) / (b.y - a.y);
+                assert!(x.abs() > TOWERS_X[3], "the route crosses the wall line at x {x}");
+            }
+        }
+        println!("plain to plaza: {:.0} m around the wall", plan.length());
+    }
+
     #[test]
     fn the_same_request_plans_the_same_route() {
         let g = grid();

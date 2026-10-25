@@ -13,6 +13,21 @@
 //! - `FL_TEST_PATH=river` with `FL_MAP=river`: one regiment ordered
 //!   across near the bridge and one far from it; logs whether each
 //!   route takes the bridge or the ford.
+//! - `FL_TEST_PATH=walls` with `FL_MAP=walled_town`: a regiment of 40 in
+//!   the plaza given a line along the walk west of the gatehouse, as a
+//!   player mans a wall, which it can reach only up a stair; after that
+//!   verdict a line along the walk east of the tower at x = 80, so it walks
+//!   over the gatehouse's bridge and through a tower; and a regiment of
+//!   200 on the plain ordered to the plaza, which the closed gate leaves
+//!   only the way around an open end of the wall. Logs which stair, which
+//!   end.
+//! - `FL_TEST_PATH=walls_archers` with `FL_MAP=walled_town`: a regiment of
+//!   60 archers in the plaza given a line along the walk east of the gate,
+//!   and 300 enemy men on the slope below it, in bow range of the walk,
+//!   ordered up to the wall's foot: the archers shoot down from the wall,
+//!   and the enemy's front rank stops where the blocked ground begins. The
+//!   archers' skirmish is off, as a player sets it to hold a wall: the run
+//!   measures the enemy's distance straight through the wall.
 //!
 //! Per regiment the log has the share of men within 5 m of their slots,
 //! the men stuck (slower than 0.1 m/s for 10 s while more than 5 m from
@@ -25,7 +40,8 @@ use bevy::prelude::*;
 use crate::obstacle_map::CASES;
 use crate::orders::{Groups, Order};
 use crate::terrain::Terrain;
-use crate::unit_types::KIND_HEAVY;
+use crate::town_layout::spots;
+use crate::unit_types::{KIND_ARCHER, KIND_HEAVY};
 use crate::units::Units;
 
 /// The sim tick the orders go out on (3 s in).
@@ -34,6 +50,9 @@ const ORDER_TICK: u32 = 90;
 const CASE_MEN: usize = 200;
 const MANY_MEN: usize = 40;
 const MANY_REGS: usize = 200;
+const WALK_MEN: usize = 40;
+/// Where the archers' target stands: on the slope 70 m out from the wall.
+const ARCHERS_TARGET: Vec2 = Vec2::new(60.0, crate::town_layout::WALL_Z + 70.0);
 /// Seconds after the order a regiment has to arrive before it fails.
 const TIMEOUT_S: f32 = 180.0;
 /// Within this of his slot a man has arrived; beyond it, slower than
@@ -50,6 +69,8 @@ pub fn scene() -> Option<String> {
 /// One regiment under watch.
 struct Subject {
     g: usize,
+    /// The sim tick of its order.
+    tick: u32,
     case: &'static str,
     goal: Vec2,
     straight: f32,
@@ -71,6 +92,9 @@ struct PathTest {
     summary_done: bool,
     /// The 200-regiment scene: when every regiment had its route.
     many_routed_tick: Option<u32>,
+    /// The walls scene's second order, given once its regiment's first
+    /// has its verdict: the regiment, the case and the line.
+    then: Option<(usize, &'static str, (Vec2, Vec2))>,
 }
 
 /// The longest frame in the current second and since the orders.
@@ -109,10 +133,10 @@ impl Plugin for PathTestPlugin {
 pub fn spawn(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
     let scene = scene().unwrap_or_default();
     let mut list = Vec::new();
-    let wanted_map = if scene == "river" {
-        crate::terrain::MapKind::River
-    } else {
-        crate::terrain::MapKind::Obstacles
+    let wanted_map = match scene.as_str() {
+        "river" => crate::terrain::MapKind::River,
+        "walls" | "walls_archers" => crate::terrain::MapKind::WalledTown,
+        _ => crate::terrain::MapKind::Obstacles,
     };
     if terrain.kind != wanted_map {
         warn!("[path-test] scene {scene} expects FL_MAP={:?}, the map is {:?}", wanted_map, terrain.kind);
@@ -134,6 +158,16 @@ pub fn spawn(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
             let (near, far) = river_starts();
             add(&mut list, near, CASE_MEN);
             add(&mut list, far, CASE_MEN);
+        }
+        "walls" => {
+            add(&mut list, spots::PLAZA - Vec2::new(0.0, 10.0), WALK_MEN);
+            add(&mut list, spots::PLAIN, CASE_MEN);
+        }
+        "walls_archers" => {
+            crate::regiments::spawn_regiment(units, terrain, &mut list, 0, KIND_ARCHER, spots::PLAZA, 60, -1.0);
+            crate::regiments::spawn_regiment(units, terrain, &mut list, 1, KIND_HEAVY, ARCHERS_TARGET, 300, 1.0);
+            list[0].skirmish = false;
+            list[1].hold = true;
         }
         _ => {
             for case in CASES.iter().filter(|c| scene == "all" || c.name == scene) {
@@ -170,6 +204,15 @@ fn give_orders(
     mut units: ResMut<Units>,
     mut test: ResMut<PathTest>,
 ) {
+    // The second order of a regiment whose first has its verdict.
+    if let Some((g, case, line)) = test.then
+        && test.subjects.iter().any(|s| s.g == g && s.reported)
+    {
+        test.then = None;
+        info!("[path-test] tick {}: {case} ordered", pipeline.tick);
+        crate::orders::line_order(&mut groups, &[g], line.0, line.1);
+        order(&mut groups, &mut units, &mut test, pipeline.tick, g, case, None);
+    }
     if test.ordered || pipeline.tick < ORDER_TICK || groups.list.is_empty() {
         return;
     }
@@ -187,6 +230,23 @@ fn give_orders(
             orders.push((0, "river-near", groups.list[0].centroid + Vec2::new(120.0, 0.0)));
             orders.push((1, "river-far", groups.list[1].centroid + Vec2::new(120.0, 0.0)));
         }
+        "walls_archers" => {
+            // 50 m: at the archers' spacing, three ranks, which the walk
+            // holds.
+            let c = spots::WALK_EAST - Vec2::new(80.0, -2.0);
+            crate::orders::line_order(&mut groups, &[0], c - Vec2::new(25.0, 0.0), c + Vec2::new(25.0, 0.0));
+            order(&mut groups, &mut units, &mut test, pipeline.tick, 0, "walls-archers", None);
+            orders.push((1, "walls-foot", ARCHERS_TARGET.with_y(crate::town_layout::WALL_Z + 12.0)));
+        }
+        "walls" => {
+            // The front rank 1 m off the parapet, facing out.
+            let line = |c: Vec2| (c + Vec2::new(-15.0, 2.0), c + Vec2::new(15.0, 2.0));
+            let (a, b) = line(spots::WALK_WEST);
+            crate::orders::line_order(&mut groups, &[0], a, b);
+            order(&mut groups, &mut units, &mut test, pipeline.tick, 0, "walls-climb", None);
+            orders.push((1, "walls-round", spots::PLAZA));
+            test.then = Some((0, "walls-walk", line(spots::WALK_EAST)));
+        }
         _ => {
             let mut g = 0;
             for case in CASES.iter().filter(|c| scene == "all" || c.name == scene) {
@@ -200,28 +260,44 @@ fn give_orders(
         }
     }
     for &(g, case, goal) in &orders {
-        crate::orders::order_regiments(&mut groups, &[g], goal);
-        // The new facing's slots, written now rather than at the next
-        // tick's reform pass, so both kinds of tick read them in the same
-        // job.
-        if groups.list[g].reform {
-            crate::formation::assign_slots(&mut units, g as u32, &mut groups.list[g]);
-        }
-        let start = groups.list[g].centroid;
-        test.subjects.push(Subject {
-            g,
-            case,
-            goal,
-            straight: start.distance(goal),
-            route_len: None,
-            route_note: String::new(),
-            done_s: None,
-            peak_stuck: 0,
-            reported: false,
-            settled_at: None,
-        });
+        order(&mut groups, &mut units, &mut test, pipeline.tick, g, case, Some(goal));
     }
-    info!("[path-test] tick {}: {} regiments ordered", pipeline.tick, orders.len());
+    info!("[path-test] tick {}: {} regiments ordered", pipeline.tick, test.subjects.len());
+}
+
+/// Order regiment `g` to `goal` as a click would and watch it as `case`;
+/// with no goal, watch the order it was just given.
+fn order(groups: &mut Groups, units: &mut Units, test: &mut PathTest, tick: u32, g: usize, case: &'static str, goal: Option<Vec2>) {
+    let goal = match goal {
+        Some(goal) => {
+            crate::orders::order_regiments(groups, &[g], goal);
+            goal
+        }
+        None => match groups.list[g].order {
+            Some(Order::Move(p)) => p,
+            _ => groups.list[g].centroid,
+        },
+    };
+    // The new facing's slots, written now rather than at the next
+    // tick's reform pass, so both kinds of tick read them in the same
+    // job.
+    if groups.list[g].reform {
+        crate::formation::assign_slots(units, g as u32, &mut groups.list[g]);
+    }
+    let start = groups.list[g].centroid;
+    test.subjects.push(Subject {
+        g,
+        tick,
+        case,
+        goal,
+        straight: start.distance(goal),
+        route_len: None,
+        route_note: String::new(),
+        done_s: None,
+        peak_stuck: 0,
+        reported: false,
+        settled_at: None,
+    });
 }
 
 /// Every two seconds: per regiment, the share arrived and the men stuck;
@@ -295,8 +371,10 @@ fn log_progress(
         return;
     }
     for s in test.subjects.iter_mut() {
+        let secs = (tick.saturating_sub(s.tick)) as f32 / 30.0;
         let gd = &groups.list[s.g];
-        if s.route_len.is_none() {
+        // From the tick after the order, once the route pass has seen it.
+        if s.route_len.is_none() && tick > s.tick && !routes.pending(s.g) {
             if let Some((points, _)) = routes.route_of(s.g) {
                 let len: f32 = points.windows(2).map(|w| w[0].distance(w[1])).sum();
                 s.route_len = Some(len);
@@ -412,9 +490,32 @@ fn regiment_pace(units: &Units, g: usize) -> f32 {
 }
 
 /// What the route does, for the log: on the river map whether it crosses
-/// on the bridge or wades the ford.
+/// on the bridge or wades the ford; on the walled town which stairs it
+/// climbs and where it crosses the wall's line.
 fn route_note(points: &[Vec2], scene: &str) -> String {
     let n = points.len().saturating_sub(1);
+    if scene == "walls" {
+        use crate::town_layout::{STAIRS_X, WALL_Z};
+        let along = |f: &dyn Fn(Vec2) -> bool| {
+            points.windows(2).any(|w| (0..=80).any(|k| f(w[0].lerp(w[1], k as f32 / 80.0))))
+        };
+        let stairs: Vec<String> = STAIRS_X
+            .iter()
+            .filter(|&&x| along(&|q| q.x > x + 2.0 && q.x < x + 10.0 && (q.y - (WALL_Z - 6.0)).abs() < 2.0))
+            .map(|x| format!("{x:.0}"))
+            .collect();
+        let crossings: Vec<String> = points
+            .windows(2)
+            .filter(|w| (w[0].y - WALL_Z) * (w[1].y - WALL_Z) < 0.0)
+            .map(|w| format!("{:.0}", w[0].x + (w[1].x - w[0].x) * (WALL_Z - w[0].y) / (w[1].y - w[0].y)))
+            .collect();
+        let bridge = along(&|q| q.x.abs() < 10.0 && (q.y - WALL_Z).abs() < 3.0);
+        return format!(
+            "{n} waypoints, stairs at x [{}], crosses the wall's line at x [{}], over the bridge: {bridge}",
+            stairs.join(", "),
+            crossings.join(", ")
+        );
+    }
     if scene != "river" {
         return format!("{n} waypoints");
     }
