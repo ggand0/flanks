@@ -100,8 +100,9 @@ const ARRIVE_RADIUS: f32 = 35.0;
 /// How close to his slot a parked man stands without stepping (metres):
 /// rigid slots sit exactly at the separation rest distance, so a dressed
 /// rank is force-free and can afford a tight tolerance; with 1.5 the
-/// ranks never finished dressing.
-pub(crate) const HOLD_DEADZONE: f32 = 0.7;
+/// ranks never finished dressing. At 0.7 a man brushed by a passer
+/// stayed wherever he landed and the next passer shoved him further.
+pub(crate) const HOLD_DEADZONE: f32 = 0.3;
 /// A holding soldier who leaves his mark by more than the hold deadzone
 /// walks back at this pace at least, and keeps going until he is within
 /// STEP_STOP of it: a real step, never a creep. M2TW's slowest
@@ -144,8 +145,12 @@ fn sidestep_chance() -> f32 {
 }
 /// A standing man plants his feet: a push must exceed this (m/s^2 of
 /// separation push) before it moves him. About a 10 cm squeeze from one
-/// neighbor. Stepping and running men, and charge knockback, are
-/// unaffected; true overlap is still corrected.
+/// neighbor. A man holding his place (`planted` in steer) keeps the grip
+/// while he steps back to it, and his feet take the first STAND_GRIP x dt
+/// of a shared shove too, each man 0.7 to 1.3 of it: a man brushed by a
+/// passer stays in his file instead of being carried off. Running men
+/// are unaffected, a charge's shove is far above it, and true overlap is
+/// still corrected.
 const STAND_GRIP: f32 = 6.0;
 /// The soft wall (FL_CONTACT=wall): a man's legs carry him this far into
 /// the body he runs into (his own give, 0.7 to 1.3 of it), losing their
@@ -158,7 +163,12 @@ const GIVE: f32 = 0.08;
 const STANCE: f32 = 0.10;
 #[inline]
 fn give(i: usize) -> f32 {
-    GIVE * (0.7 + 0.6 * crate::units::hash01((i as u32).wrapping_mul(0x51ED).wrapping_add(77)))
+    GIVE * own_spread(i)
+}
+/// His own 0.7 to 1.3 of a man-to-man quantity (his give, his grip).
+#[inline]
+fn own_spread(i: usize) -> f32 {
+    0.7 + 0.6 * crate::units::hash01((i as u32).wrapping_mul(0x51ED).wrapping_add(77))
 }
 
 /// A man of a regiment in melee who sees no enemy joins the fight when
@@ -1863,11 +1873,14 @@ fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
 /// give of his legs at a body he runs into.
 #[inline]
 fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
-    let Field { speed, wall, charging, fat_speed, fat_nocharge, dt, .. } = *f;
+    let Field { speed, orders, wall, charging, fat_speed, fat_nocharge, dt, .. } = *f;
     let i = s.i;
     let gi = st.gi;
     let dying = st.dying;
     let routed = st.routed;
+    // Holding his place: his regiment has no order and he is not broken,
+    // dying, in its melee or out of formation for a fight.
+    let planted = orders[gi].is_none() && !dying && !routed && !st.in_melee && !st.committed;
     let push = st.push;
     let jam = st.jam;
     let mut desired = st.desired;
@@ -1896,13 +1909,15 @@ fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
     // shoves do (less the grip). Without it any squeeze turned straight into
     // sliding, and a fight's jostle rippled back through packed ranks. His
     // stance takes the first STANCE of a net squeeze the same way: he gives
-    // ground only to what is beyond it.
-    if desired.length_squared() < 1e-6 {
+    // ground only to what is beyond it. A man holding his place keeps the
+    // grip while he steps back to it.
+    let standing = desired.length_squared() < 1e-6;
+    if standing || planted {
         let pl = push_a.length();
         push_a *= if pl > STAND_GRIP { (pl - STAND_GRIP) / pl } else { 0.0 };
-        if st.overlap_depth > 0.0 && *s.swing & crate::units::SWING_STAGGERED == 0 {
-            st.corr *= ((st.overlap_depth - STANCE) / st.overlap_depth).max(0.0);
-        }
+    }
+    if standing && st.overlap_depth > 0.0 && *s.swing & crate::units::SWING_STAGGERED == 0 {
+        st.corr *= ((st.overlap_depth - STANCE) / st.overlap_depth).max(0.0);
     }
     let mut legs = (desired - v) * STEER_GAIN;
     let l2 = legs.length_squared();
@@ -1938,7 +1953,13 @@ fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
     if dir != Vec2::ZERO && share_contact() {
         let into = (new_v - st.overlap_vel).dot(-dir);
         if into > 0.0 {
-            new_v += dir * (into * st.overlap_share);
+            // A man holding his place loses less of it: his feet take the
+            // first part of the shove.
+            let mut lost = into * st.overlap_share;
+            if planted {
+                lost = (lost - STAND_GRIP * dt * own_spread(i)).max(0.0);
+            }
+            new_v += dir * lost;
         }
     } else if dir != Vec2::ZERO {
         let own = new_v.dot(-dir);
