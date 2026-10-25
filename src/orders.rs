@@ -83,6 +83,8 @@ pub struct GroupData {
     pub spacing: crate::formation::FormSpacing,
     /// The spacing an open regiment (FormSpacing::Open) closes back to.
     pub close_to: crate::formation::FormSpacing,
+    /// How an open regiment stands (formation.rs `choose_open`).
+    pub open: crate::formation::OpenOrder,
     /// Walking through a friendly regiment that opened for it: its block
     /// within OPEN_KEEP of an open friend's, or any of its men still
     /// inside one (sim/job.rs `open_for_passers`). Its men look for the
@@ -286,6 +288,7 @@ impl GroupData {
             shape: crate::formation::FormShape::Blob,
             spacing: crate::formation::FormSpacing::Normal,
             close_to: crate::formation::FormSpacing::Normal,
+            open: crate::formation::OpenOrder::default(),
             passing: false,
             inside: Vec::new(),
             facing: if team == 0 { 0.0 } else { std::f32::consts::PI },

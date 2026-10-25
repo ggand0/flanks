@@ -1216,8 +1216,9 @@ fn spawn_routpass_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups
         }
         // FL_ROUTPASS_OPEN=1: A stands in the open order from the start.
         if g == 0 && std::env::var("FL_ROUTPASS_OPEN").is_ok_and(|v| v == "1") {
-            gd.close_to = gd.spacing;
-            gd.spacing = crate::formation::FormSpacing::Open;
+            let room = crate::formation::OPEN_ROOM_MAX;
+            let o = crate::formation::choose_open(gd, false, room, room);
+            crate::formation::open_order(gd, o);
         }
         for i in crate::formation::assign_slots(units, g as u32, gd) {
             let i = i as usize;

@@ -720,6 +720,34 @@ fn stance_of(g: &GroupData) -> u8 {
     }
 }
 
+/// The free ground before a holding regiment's front and behind its rear
+/// (metres): of every other regiment with men whose block reaches across
+/// its frontage, the nearest block's gap on each side, OPEN_ROOM_MAX
+/// when none is nearer. What `formation::choose_open` grows into.
+fn room_around(groups: &Groups, h: usize) -> (f32, f32) {
+    let rect = crate::formation::block_rect(&groups.list[h]);
+    let right = Vec2::new(rect.fwd.y, -rect.fwd.x);
+    let (mut front, mut back) = (crate::formation::OPEN_ROOM_MAX, crate::formation::OPEN_ROOM_MAX);
+    for (o, od) in groups.list.iter().enumerate() {
+        if o == h || od.count == 0 {
+            continue;
+        }
+        let other = crate::formation::block_rect(od);
+        let d = other.centre - rect.centre;
+        if d.dot(right).abs() - other.reach_along(right) >= rect.half_w {
+            continue;
+        }
+        let along = d.dot(rect.fwd);
+        let gap = (along.abs() - other.reach_along(rect.fwd) - rect.half_d).max(0.0);
+        if along >= 0.0 {
+            front = front.min(gap);
+        } else {
+            back = back.min(gap);
+        }
+    }
+    (front, back)
+}
+
 /// A regiment walking somewhere: a goal further than a metre off, not
 /// standing off its target, holding before a block or fighting on a
 /// contact frame. The friends a holding regiment opens for.
@@ -733,14 +761,15 @@ fn goes_to(groups: &Groups, m: usize) -> Option<Vec2> {
 
 /// Allies make space: every ARCHER_LOOK ticks, staggered, a regiment
 /// holding its ground (`formation::holds_ground`) looks at the friendly
-/// regiments walking somewhere. It opens into columns (FormSpacing::Open)
-/// when one's path to its goal, swept by its width, crosses its block
-/// within the walk the opening needs (the ground the block grows toward
-/// him plus OPEN_MARGIN at his speed, never less than OPEN_LEAD_S of it),
-/// or when one's block already overlaps its own. It closes when no
-/// friend's path crosses it, no walking friend's block is within
-/// OPEN_KEEP of it and no standing friend stands on its closed ground.
-/// An order, a fight or a rout closes it at once (formation.rs
+/// regiments walking somewhere. It opens (FormSpacing::Open, the layout
+/// `formation::choose_open` picks for the free ground around it,
+/// `room_around`) when one's path to its goal, swept by its width,
+/// crosses its block within the walk the opening needs (the ground the
+/// block grows toward him plus OPEN_MARGIN at his speed, never less than
+/// OPEN_LEAD_S of it), or when one's block already overlaps its own. It
+/// closes when no friend's path crosses it, no walking friend's block is
+/// within OPEN_KEEP of it and no standing friend stands on its closed
+/// ground. An order, a fight or a rout closes it at once (formation.rs
 /// `apply_reforms`). A walking regiment whose block is within OPEN_KEEP
 /// of an open friend's is passing it (`GroupData::passing`), on its own
 /// look. A passing regiment counts its men inside each open friend's
@@ -786,9 +815,12 @@ fn open_for_passers(groups: &mut Groups, tracks: &crate::arrows::RegTracks, tick
             continue;
         }
         let open = hd.spacing == crate::formation::FormSpacing::Open;
-        let growth = crate::formation::open_growth(hd);
         let rect = crate::formation::block_rect(hd);
         let bound = crate::formation::block_bound(hd);
+        let fwd = crate::formation::facing_dir(hd.facing);
+        // The open order it stands in, or the one it would take now,
+        // looked at only once a friend comes near enough.
+        let mut plan = open.then_some(hd.open);
         let mut opener: Option<usize> = None;
         let mut keep = false;
         for m in 0..n {
@@ -803,7 +835,7 @@ fn open_for_passers(groups: &mut Groups, tracks: &crate::arrows::RegTracks, tick
                 // A standing friend on its closed ground keeps it open:
                 // one ordered onto that ground stands there.
                 if open && !md.passing && md.order.is_none() {
-                    let ground = crate::formation::closed_rect_at(hd, hd.centroid);
+                    let ground = crate::formation::closed_rect_at(hd, hd.centroid - fwd * hd.open.shift());
                     keep |= rect_gap(&ground, &crate::formation::block_rect(md)) < 0.0;
                 }
                 continue;
@@ -814,12 +846,21 @@ fn open_for_passers(groups: &mut Groups, tracks: &crate::arrows::RegTracks, tick
             } else {
                 crate::unit_types::TYPES[md.kind as usize].speed
             };
-            let ahead = ((growth + OPEN_MARGIN) / speed).max(OPEN_LEAD_S) * speed;
             let to_goal = goal.distance(md.centroid);
+            let apart = hd.centroid.distance(md.centroid) - bound - crate::formation::block_bound(md);
+            let most = ((crate::formation::OPEN_ROOM_MAX + OPEN_MARGIN) / speed).max(OPEN_LEAD_S) * speed;
+            if apart > to_goal.min(most).max(OPEN_KEEP) {
+                continue;
+            }
+            // The ground the block grows toward him.
+            let o = *plan.get_or_insert_with(|| {
+                let (front, back) = room_around(gl, h);
+                crate::formation::choose_open(hd, ready_stance(hd), front, back)
+            });
+            let growth = if (md.centroid - hd.centroid).dot(fwd) > 0.0 { o.front } else { o.back };
+            let ahead = ((growth.max(0.0) + OPEN_MARGIN) / speed).max(OPEN_LEAD_S) * speed;
             let len = to_goal.min(ahead);
-            if hd.centroid.distance(md.centroid) - bound - crate::formation::block_bound(md)
-                > len.max(OPEN_KEEP)
-            {
+            if apart > len.max(OPEN_KEEP) {
                 continue;
             }
             let gap = rect_gap(&rect, &crate::formation::block_rect(md));
@@ -831,11 +872,12 @@ fn open_for_passers(groups: &mut Groups, tracks: &crate::arrows::RegTracks, tick
             keep |= crosses || gap <= OPEN_KEEP;
         }
         let gd = &mut groups.list[h];
-        if !open && let Some(m) = opener {
-            gd.close_to = gd.spacing;
-            gd.spacing = crate::formation::FormSpacing::Open;
-            gd.reform = true;
-            info!("regiment {h} opens for regiment {m}");
+        if !open && let (Some(m), Some(o)) = (opener, plan) {
+            crate::formation::open_order(gd, o);
+            info!(
+                "regiment {h} opens for regiment {m}: {} files to a group, {:.1} m ahead and {:.1} m behind",
+                o.files, o.front, o.back
+            );
         } else if open && !keep {
             crate::formation::close_order(gd);
             info!("regiment {h} closes");
