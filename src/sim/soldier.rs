@@ -211,6 +211,11 @@ const SIGHT_BACK: u16 = 1 << 7;
 /// tick): the archers' search never aims at him (sim/mod.rs
 /// `clear_members`).
 pub(crate) const SIGHT_FOE: u16 = 1 << 8;
+/// Walking through a friendly regiment that opened for his own
+/// (`passing`), a man of it stands ahead of him in his way: he walks up
+/// to him at ADVANCE_PACE, and steps toward the lane on the side
+/// SIGHT_LEFT and SIGHT_RIGHT leave open (`find_the_lane`).
+const SIGHT_PASS: u16 = 1 << 9;
 /// An archer's knife: bits 10 to 14 count down (one every fourth tick)
 /// from the last tick an enemy came close to him (`KNIFE_HOLD`), and
 /// `SIGHT_KNIFE` is set while the knife is out, by that count or by his
@@ -308,6 +313,9 @@ pub(crate) struct Field<'a> {
     pub press: &'a [bool],
     /// Per regiment: under a Move order (sim/job.rs `moving`).
     pub moving: &'a [bool],
+    /// Per regiment: walking through a friend that opened for it
+    /// (sim/job.rs `open_for_passers`).
+    pub passing: &'a [bool],
     /// Per regiment: the one enemy regiment its men fight (sim/job.rs
     /// `focus`), None for any.
     pub focus: &'a [Option<u32>],
@@ -471,6 +479,7 @@ pub(crate) fn tick_chunk(f: &Field, rows: Rows, out: &mut ChunkOut) {
         drive(f, &mut s, &mut st);
         scan(f, &mut s, &mut st, out);
         look_around(f, &mut s, &mut st);
+        find_the_lane(f, &mut s, &mut st);
         hold_the_frame(f, &mut st);
         acquire(f, &mut s, &mut st);
         decide_to_join(f, &mut s, &mut st);
@@ -879,7 +888,7 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
 /// look.
 #[inline]
 fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
-    let Field { grid, pos_prev, team, group, orders, engaged, focus, tick, .. } = *f;
+    let Field { grid, pos_prev, team, group, orders, engaged, focus, passing, tick, .. } = *f;
     let i = s.i;
     let p = st.p;
     let gi = st.gi;
@@ -947,9 +956,41 @@ fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
     let look_lanes = memo_dir != Vec2::ZERO && best_idx == u32::MAX && !dying && !routed;
     let watch_go = in_melee && !committed && !memo_valid;
     let slot_on = slot_dir != Vec2::ZERO;
+    // Walking through a friend that opened for his regiment, he looks at
+    // its men in his way instead (`find_the_lane`).
+    let pass_dir = if passing[gi] && !dying && !routed { desired.normalize_or_zero() } else { Vec2::ZERO };
     if (i as u32).wrapping_add(tick).is_multiple_of(LOOK_TICKS) {
         let mut seen = 0u16;
-        if look_lanes || watch_go || slot_on {
+        if pass_dir != Vec2::ZERO {
+            // Men of other regiments of his side within QUERY_RADIUS and
+            // within 45 degrees of his way, not walking off along it: he
+            // walks up to them and steps away from the side they are on,
+            // a side by his own coin for one dead ahead, and by his coin
+            // again when they stand on both sides equally.
+            let left_dir = Vec2::new(-pass_dir.y, pass_dir.x);
+            let coin = |salt: u32| crate::units::hash01((i as u32).wrapping_mul(0x2545).wrapping_add(salt)) > 0.5;
+            let (mut ahead, mut sides) = (false, 0i32);
+            grid.for_each_candidate_vel(p, QUERY_RADIUS, |o, ov| {
+                let d = o.xz() - p;
+                let d2 = d.length_squared();
+                if (o.meta & crate::spatial::META_TEAM) != my_team_bit
+                    || crate::spatial::meta_group(o.meta) == gi
+                    || d2 > QUERY_RADIUS * QUERY_RADIUS
+                    || d.dot(pass_dir) <= 0.707 * d2.sqrt()
+                    || ov.dot(pass_dir) > 0.5
+                {
+                    return;
+                }
+                ahead = true;
+                let lateral = d.dot(left_dir);
+                let on_left = if lateral.abs() > 0.05 { lateral > 0.0 } else { coin(9) };
+                sides += if on_left { 1 } else { -1 };
+            });
+            if ahead {
+                let left = if sides != 0 { sides > 0 } else { coin(3) };
+                seen = SIGHT_PASS | if left { SIGHT_LEFT } else { SIGHT_RIGHT };
+            }
+        } else if look_lanes || watch_go || slot_on {
             let (mut way, mut left, mut right, mut ahead_any, mut mark, mut go) =
                 (false, false, false, false, false, false);
             // Branch-free: neighbors of both teams interleave in a melee, and
@@ -989,7 +1030,7 @@ fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
                 | (mark as u16 * SIGHT_MARK)
                 | (go as u16 * SIGHT_GO);
         }
-        if fighter {
+        if fighter && pass_dir == Vec2::ZERO {
             // The room he has to fight the enemy in reach: a comrade close
             // to either side of his way to the enemy, and any man close
             // behind him.
@@ -1032,6 +1073,29 @@ fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
     st.right_blocked = right_blocked;
     st.comrade_ahead = comrade_ahead;
     st.slot_blocked = slot_blocked;
+}
+
+/// Walking through a friendly regiment that opened for his own
+/// (`passing`), with one of its men ahead in his way at his last look
+/// (SIGHT_PASS): he walks up to him at ADVANCE_PACE instead of leaning
+/// into him, and steps at STEP_PACE toward the lane on the side the man
+/// is not on. A man in a lane with nobody ahead walks on as he was. Both
+/// before the crowd's yield, which fades them in a packed crowd like any
+/// drive.
+#[inline]
+fn find_the_lane(f: &Field, s: &mut Soldier, st: &mut Step) {
+    let pass_dir = st.desired.normalize_or_zero();
+    if !f.passing[st.gi] || st.dying || st.routed || pass_dir == Vec2::ZERO || *s.sight & SIGHT_PASS == 0 {
+        return;
+    }
+    let mut desired = st.desired;
+    let want = desired.length();
+    if want > ADVANCE_PACE {
+        desired *= ADVANCE_PACE / want;
+    }
+    let left_dir = Vec2::new(-pass_dir.y, pass_dir.x);
+    let side = if *s.sight & SIGHT_LEFT != 0 { -left_dir } else { left_dir };
+    st.desired = desired + side * STEP_PACE;
 }
 
 /// Two things a man in melee does not do for his slot: step back away
