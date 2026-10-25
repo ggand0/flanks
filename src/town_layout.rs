@@ -541,6 +541,8 @@ pub mod spots {
     pub const WALK_EAST: Vec2 = Vec2::new(130.0, WALL_Z);
     /// On the walk of the western curtains, west of the gatehouse.
     pub const WALK_WEST: Vec2 = Vec2::new(-30.0, WALL_Z);
+    /// The foot of the stair east of the gate.
+    pub const STAIR_FOOT_EAST: Vec2 = Vec2::new(STAIRS_X[2], WALL_Z - 4.0 - STAIR_W * 0.5);
     /// On the gatehouse's bridge.
     #[cfg(test)]
     pub const BRIDGE: Vec2 = Vec2::new(0.0, WALL_Z);

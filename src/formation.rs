@@ -618,7 +618,10 @@ pub fn snap_to_slots(
 ) {
     for i in assign_slots(units, g, gd) {
         let i = i as usize;
+        // Off blocked ground (a block deployed over a wall's foot): a man
+        // whose centre is on a blocked vertex could never move again.
         let p = gd.anchor + units.home[i];
+        let p = terrain.nearest_open(p, 12.0).unwrap_or(p);
         let hh = crate::unit_types::half_height(units.kind[i] as usize);
         let pos = Vec3::new(p.x, terrain.height_at(p.x, p.y) + hh, p.y);
         units.pos[i] = pos;

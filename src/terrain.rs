@@ -339,6 +339,67 @@ impl Terrain {
                 && (dz == 0.0 || !self.blocked_at(x, z + r.copysign(dz))))
     }
 
+    /// How far a body of radius `r` at `(x, z)` overlaps blocked ground
+    /// across either axis, as the shift that takes it off: an edge over a
+    /// blocked vertex moves back to the boundary half a cell before that
+    /// vertex. Zero where both edges of an axis are clear, or both
+    /// blocked (nothing to move toward). Four mask reads.
+    #[inline]
+    pub fn body_overlap(&self, x: f32, z: f32, r: f32) -> Vec2 {
+        let mut out = Vec2::ZERO;
+        for axis in 0..2 {
+            let (hi, lo) = if axis == 0 { (x + r, x - r) } else { (z + r, z - r) };
+            let o = if axis == 0 { self.origin.x } else { self.origin.y };
+            let at = |e: f32| if axis == 0 { self.blocked_at(e, z) } else { self.blocked_at(x, e) };
+            match (at(hi), at(lo)) {
+                (true, false) => {
+                    let v = ((hi - o) / CELL).round();
+                    let shift = o + (v - 0.5) * CELL - hi;
+                    if axis == 0 { out.x = shift } else { out.y = shift }
+                }
+                (false, true) => {
+                    let v = ((lo - o) / CELL).round();
+                    let shift = o + (v + 0.5) * CELL - lo;
+                    if axis == 0 { out.x = shift } else { out.y = shift }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// The nearest open vertex to `p` within `max_r` metres, `p` itself
+    /// when its own vertex is open; None with no open vertex that near.
+    /// A man placed on blocked ground (a spawn or a deployment whose
+    /// block overlaps a wall's foot) stands there instead, since a man
+    /// whose centre is on a blocked vertex could never move again.
+    pub fn nearest_open(&self, p: Vec2, max_r: f32) -> Option<Vec2> {
+        if !self.blocked_at(p.x, p.y) {
+            return Some(p);
+        }
+        let g = ((p - self.origin) / CELL).round();
+        let (cx, cz) = (g.x as i64, g.y as i64);
+        let reach = (max_r / CELL).ceil() as i64;
+        let mut best: Option<(f32, Vec2)> = None;
+        for dz in -reach..=reach {
+            for dx in -reach..=reach {
+                let (x, z) = (cx + dx, cz + dz);
+                if x < 0 || z < 0 || x >= self.verts_x as i64 || z >= self.verts_z as i64 {
+                    continue;
+                }
+                if self.blocked[z as usize * self.verts_x + x as usize] {
+                    continue;
+                }
+                let v = self.origin + Vec2::new(x as f32, z as f32) * CELL;
+                let d = v.distance_squared(p);
+                if d <= max_r * max_r && best.is_none_or(|b| d < b.0) {
+                    best = Some((d, v));
+                }
+            }
+        }
+        best.map(|b| b.1)
+    }
+
     /// The radius a soldier's body keeps off blocked ground on this map
     /// (`body_free`): half his distance from his neighbours, or nothing
     /// where no ground blocks.

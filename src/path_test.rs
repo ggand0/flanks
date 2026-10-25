@@ -34,6 +34,10 @@
 //!   men the same line, who must stand beside the archers; 200 more
 //!   clicked onto the walk west of the gate. Logs each one's places: how
 //!   many files, and how many places on ground a man cannot stand on.
+//! - `FL_TEST_PATH=walls_under` with `FL_MAP=walled_town`: 200 archers at
+//!   the wall's inner foot east of a stair, where the defenders deploy,
+//!   given a line along the walk above and west of them, so the whole
+//!   regiment has to walk back along the foot to the stair.
 //!
 //! Per regiment the log has the share of men within 5 m of their slots,
 //! the men stuck (slower than 0.1 m/s for 10 s while more than 5 m from
@@ -141,7 +145,7 @@ pub fn spawn(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
     let mut list = Vec::new();
     let wanted_map = match scene.as_str() {
         "river" => crate::terrain::MapKind::River,
-        "walls" | "walls_archers" | "walls_place" => crate::terrain::MapKind::WalledTown,
+        "walls" | "walls_archers" | "walls_place" | "walls_under" => crate::terrain::MapKind::WalledTown,
         _ => crate::terrain::MapKind::Obstacles,
     };
     if terrain.kind != wanted_map {
@@ -177,6 +181,11 @@ pub fn spawn(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
                 let at = spots::BEHIND_TOWN + Vec2::new(x, 0.0);
                 crate::regiments::spawn_regiment(units, terrain, &mut list, 0, KIND_HEAVY, at, CASE_MEN, -1.0);
             }
+            list[0].skirmish = false;
+        }
+        "walls_under" => {
+            let at = Vec2::new(spots::STAIR_FOOT_EAST.x + 36.0, crate::town_layout::WALL_Z - 12.0);
+            crate::regiments::spawn_regiment(units, terrain, &mut list, 0, KIND_ARCHER, at, CASE_MEN, -1.0);
             list[0].skirmish = false;
         }
         "walls_archers" => {
@@ -254,6 +263,11 @@ fn give_orders(
                 order(&mut groups, &mut units, &terrain, &mut test, pipeline.tick, g, case, None);
             }
             orders.push((2, "place-click", spots::WALK_WEST - Vec2::new(30.0, 0.0)));
+        }
+        "walls_under" => {
+            let c = Vec2::new(spots::STAIR_FOOT_EAST.x - 30.0, crate::town_layout::WALL_Z);
+            crate::orders::line_order(&mut groups, &terrain, &[0], c - Vec2::new(20.0, 0.0), c + Vec2::new(20.0, 0.0));
+            order(&mut groups, &mut units, &terrain, &mut test, pipeline.tick, 0, "walls-under", None);
         }
         "walls_archers" => {
             // 50 m: at the archers' spacing, three ranks, which the walk
@@ -449,12 +463,18 @@ fn log_progress(
             use crate::town_layout::{STAIRS_X, STAIR_W, WALL_Z};
             let lane = crate::town_layout::walk_lane(terrain.body_radius());
             let (mut walk, mut stair, mut foot, mut placed) = (0, 0, 0, 0);
+            // Where the men on a flight stand across it: their mean offset
+            // from the tread's middle toward the wall (m), and the widest.
+            let tread_mid = WALL_Z - 4.0 - (STAIR_W - 0.5) * 0.5;
+            let (mut across, mut across_max) = (0.0f32, f32::NEG_INFINITY);
             for i in (0..units.len()).filter(|&i| units.group[i] as usize == s.g && units.death_t[i] == 0) {
                 let p = Vec2::new(units.pos[i].x, units.pos[i].z);
                 if lane.contains(p) {
                     walk += 1;
-                } else if STAIRS_X.iter().any(|&x| p.x >= x && p.x <= x + 16.0 && p.y >= WALL_Z - 4.0 - STAIR_W && p.y <= WALL_Z - 4.0) {
+                } else if STAIRS_X.iter().any(|&x| p.x >= x && p.x <= x + 12.0 && p.y >= WALL_Z - 4.0 - STAIR_W && p.y <= WALL_Z - 4.0) {
                     stair += 1;
+                    across += p.y - tread_mid;
+                    across_max = across_max.max(p.y - tread_mid);
                 } else if STAIRS_X.iter().any(|&x| p.distance(Vec2::new(x, WALL_Z - 4.0 - STAIR_W * 0.5)) <= 6.0) {
                     foot += 1;
                 }
@@ -466,8 +486,11 @@ fn log_progress(
                 None => 0,
             };
             info!(
-                "[path-test] {} reg {} t={secs:.0}s: on the walk {walk}, on a stair {stair}, at a foot {foot}, in place {placed}, places not yet taken {pending}",
-                s.case, s.g
+                "[path-test] {} reg {} t={secs:.0}s: on the walk {walk}, on a stair {stair} (toward the wall {:+.2} m mean, {:+.2} m most), at a foot {foot}, in place {placed}, places not yet taken {pending}",
+                s.case,
+                s.g,
+                if stair > 0 { across / stair as f32 } else { 0.0 },
+                if stair > 0 { across_max } else { 0.0 }
             );
         }
         // Where the men still out stand, every ten seconds once most are

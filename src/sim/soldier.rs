@@ -3061,6 +3061,17 @@ fn integrate(f: &Field, s: &mut Soldier, st: &mut Step) {
             nz = pz;
         }
     }
+    // An edge across his motion over blocked ground (a crowd pushed him
+    // into the metre at a wall's face, then he walked along it): the step
+    // takes him off it, so he climbs a stair down its middle instead of
+    // with his shoulder on the wall.
+    if r > 0.0 {
+        let off = terrain.body_overlap(nx, nz, r);
+        if off != Vec2::ZERO && !terrain.blocked_at(nx + off.x, nz + off.y) {
+            nx = (nx + off.x).clamp(bounds_min.x, bounds_max.x);
+            nz = (nz + off.y).clamp(bounds_min.y, bounds_max.y);
+        }
+    }
     *s.pos = Vec3::new(
         nx,
         terrain.height_at(nx, nz) + crate::unit_types::half_height(kind[i] as usize),
