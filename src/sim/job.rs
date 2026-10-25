@@ -322,6 +322,8 @@ pub(crate) fn prepare_tick(
     let t1 = std::time::Instant::now();
     skirmish_reactions(groups, tracks, terrain, tick);
     let t2 = std::time::Instant::now();
+    open_for_passers(groups, tracks, tick);
+    let t2b = std::time::Instant::now();
     let kept_clear_blocks = std::mem::take(&mut job.clear_blocks);
     let fire = archer_fire_solutions(
         groups,
@@ -362,17 +364,18 @@ pub(crate) fn prepare_tick(
     job.sidearm = sidearm_reasons(groups, tracks, terrain, &last, tick);
     job.field.size_to(terrain.min(), terrain.max());
     let t5 = std::time::Instant::now();
-    log_prep([t1 - t0, t2 - t1, t3 - t2, t4 - t3, t5 - t4, t5 - t0]);
+    log_prep([t1 - t0, t2 - t1, t2b - t2, t3 - t2b, t4 - t3, t5 - t4, t5 - t0]);
 }
 
 /// FL_LOG_STEP=1: the mean time of each part of the prep over 150 ticks
 /// (5 s), beside the `[step]` line (sim/diag.rs): the column share, the
-/// skirmish reactions, the fire solutions, the orders and the regiment
-/// snapshot, the sidearm reasons, and the whole prep.
-fn log_prep(parts: [std::time::Duration; 6]) {
+/// skirmish reactions, the opening for passers, the fire solutions, the
+/// orders and the regiment snapshot, the sidearm reasons, and the whole
+/// prep.
+fn log_prep(parts: [std::time::Duration; 7]) {
     use std::sync::{Mutex, OnceLock};
     static ON: OnceLock<bool> = OnceLock::new();
-    static ACC: Mutex<([f64; 6], u32)> = Mutex::new(([0.0; 6], 0));
+    static ACC: Mutex<([f64; 7], u32)> = Mutex::new(([0.0; 7], 0));
     if !*ON.get_or_init(|| std::env::var("FL_LOG_STEP").is_ok()) {
         return;
     }
@@ -384,11 +387,11 @@ fn log_prep(parts: [std::time::Duration; 6]) {
     if acc.1 == 150 {
         let m = acc.0.map(|v| v / 150.0);
         info!(
-            "[prep] share {:.3}, skirmish {:.3}, fire {:.3}, orders and snapshot {:.3}, \
+            "[prep] share {:.3}, skirmish {:.3}, make space {:.4}, fire {:.3}, orders and snapshot {:.3}, \
              sidearm {:.3}, whole prep {:.3} ms",
-            m[0], m[1], m[2], m[3], m[4], m[5]
+            m[0], m[1], m[2], m[3], m[4], m[5], m[6]
         );
-        *acc = ([0.0; 6], 0);
+        *acc = ([0.0; 7], 0);
     }
 }
 
@@ -675,6 +678,106 @@ pub(crate) fn approach_hits(
             && (before(ed.centroid, f)
                 || (before(ed.centroid + side, f) && before(ed.centroid - side, f)))
     })
+}
+
+/// A holding regiment opens this far ahead of a friend coming through it,
+/// beyond the ground its opening grows toward him (metres).
+const OPEN_MARGIN: f32 = 5.0;
+/// ...and never less than this much of the friend's walk ahead (seconds).
+const OPEN_LEAD_S: f32 = 8.0;
+/// A friend's block this close to an open regiment's keeps it open
+/// (metres).
+const OPEN_KEEP: f32 = 3.0;
+
+/// A regiment walking somewhere: a goal further than a metre off, not
+/// standing off its target, holding before a block or fighting on a
+/// contact frame. The friends a holding regiment opens for.
+fn goes_to(groups: &Groups, m: usize) -> Option<Vec2> {
+    let md = &groups.list[m];
+    if md.count == 0 || md.state.is_broken() || md.standoff || md.skirmish_hold.is_some() || md.contact {
+        return None;
+    }
+    groups.goal(m).filter(|goal| goal.distance_squared(md.centroid) > 1.0)
+}
+
+/// Allies make space: every ARCHER_LOOK ticks, staggered, a regiment
+/// holding its ground (`formation::holds_ground`) looks at the friendly
+/// regiments walking somewhere. It opens into columns (FormSpacing::Open)
+/// when one's path to its goal, swept by its width, crosses its block
+/// within the walk the opening needs (the ground the block grows toward
+/// him plus OPEN_MARGIN at his speed, never less than OPEN_LEAD_S of it),
+/// or when one's block already overlaps its own. It closes when no
+/// friend's path crosses it, no walking friend's block is within
+/// OPEN_KEEP of it and no standing friend stands on its closed ground.
+/// An order, a fight or a rout closes it at once (formation.rs
+/// `apply_reforms`).
+fn open_for_passers(groups: &mut Groups, tracks: &crate::arrows::RegTracks, tick: u32) {
+    let n = groups.list.len();
+    for h in 0..n {
+        if !tick.wrapping_add(h as u32).is_multiple_of(ARCHER_LOOK) {
+            continue;
+        }
+        let gl: &Groups = &*groups;
+        let hd = &gl.list[h];
+        if !crate::formation::holds_ground(hd)
+            || hd.shape != crate::formation::FormShape::Rect
+            || hd.files == 0
+        {
+            continue;
+        }
+        let open = hd.spacing == crate::formation::FormSpacing::Open;
+        let growth = crate::formation::open_growth(hd);
+        let rect = crate::formation::block_rect(hd);
+        let bound = crate::formation::block_bound(hd);
+        let mut opener: Option<usize> = None;
+        let mut keep = false;
+        for m in 0..n {
+            let md = &gl.list[m];
+            if m == h || md.team != hd.team || md.count == 0 || md.state.is_broken() {
+                continue;
+            }
+            let Some(goal) = goes_to(gl, m) else {
+                // A standing friend on its closed ground keeps it open:
+                // one ordered onto that ground stands there now.
+                if open && md.order.is_none() {
+                    let ground = crate::formation::closed_rect_at(hd, hd.centroid);
+                    keep |= rect_gap(&ground, &crate::formation::block_rect(md)) < 0.0;
+                }
+                continue;
+            };
+            let track = tracks.vel.get(m).copied().unwrap_or(Vec2::ZERO);
+            let speed = if track.length() >= 0.3 {
+                track.length()
+            } else {
+                crate::unit_types::TYPES[md.kind as usize].speed
+            };
+            let ahead = ((growth + OPEN_MARGIN) / speed).max(OPEN_LEAD_S) * speed;
+            let to_goal = goal.distance(md.centroid);
+            let len = to_goal.min(ahead);
+            if hd.centroid.distance(md.centroid) - bound - crate::formation::block_bound(md)
+                > len.max(OPEN_KEEP)
+            {
+                continue;
+            }
+            let gap = rect_gap(&rect, &crate::formation::block_rect(md));
+            let dir = (goal - md.centroid) / to_goal;
+            let crosses = path_hit(gl, m, dir, len, h).is_some();
+            if crosses || gap < 0.0 {
+                opener.get_or_insert(m);
+            }
+            keep |= crosses || gap <= OPEN_KEEP;
+        }
+        let gd = &mut groups.list[h];
+        if !open && let Some(m) = opener {
+            gd.close_to = gd.spacing;
+            gd.spacing = crate::formation::FormSpacing::Open;
+            gd.reform = true;
+            info!("regiment {h} opens for regiment {m}");
+        } else if open && !keep {
+            crate::formation::close_order(gd);
+            info!("regiment {h} closes");
+        }
+    }
 }
 
 /// An enemy block's edge this close to the regiment's: run (the first

@@ -136,6 +136,36 @@ pub fn grid(gd: &GroupData) -> (usize, usize, Vec2) {
     (files, n.div_ceil(files), gd.spacing.pitch(gd.kind))
 }
 
+/// How far the open order's front stands ahead of the closed order's
+/// (metres): half the depth the columns add, the ground the block grows
+/// toward a friend coming at it, and away on the other side.
+pub fn open_growth(gd: &GroupData) -> f32 {
+    let n = gd.count.max(1);
+    let files = (gd.files.max(1) as usize).min(n);
+    let closed = gd.chosen_spacing();
+    let cols = open_columns(files, n, closed, gd.kind);
+    let open = (n.div_ceil(cols) - 1) as f32 * 0.5 * FormSpacing::Open.pitch(gd.kind).y;
+    let shut = (n.div_ceil(files) - 1) as f32 * 0.5 * closed.pitch(gd.kind).y;
+    (open - shut).max(0.0)
+}
+
+/// The block of a regiment about `centre` as it stands closed: an open
+/// regiment's ground when it is not letting anyone through.
+pub fn closed_rect_at(gd: &GroupData, centre: Vec2) -> BlockRect {
+    if gd.spacing != FormSpacing::Open || gd.shape == FormShape::Blob || gd.files == 0 {
+        return block_rect_at(gd, centre);
+    }
+    let n = gd.count.max(1);
+    let files = (gd.files as usize).min(n);
+    let pitch = gd.close_to.pitch(gd.kind);
+    BlockRect {
+        centre,
+        fwd: facing_dir(gd.facing),
+        half_w: (files - 1) as f32 * 0.5 * pitch.x + 1.0,
+        half_d: (n.div_ceil(files) - 1) as f32 * 0.5 * pitch.y + 1.0,
+    }
+}
+
 /// A regiment holding its ground, the kind that opens for a friend
 /// passing through: no order to go anywhere (none, or archers standing
 /// off their target or holding before a block), not in a fight and not
