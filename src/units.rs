@@ -122,6 +122,9 @@ pub struct Units {
     /// his way to his slot was clear. He reads his route every few ticks,
     /// not every tick, and walks on what he chose.
     pub way: Column<Vec2>,
+    /// How far he is into his ready stance, 0 at ease to POSE_READY
+    /// (sim/soldier.rs): his body is wider in it.
+    pub pose: Column<u8>,
     /// Bumped every time a battle rebuilds this world. A sim tick job
     /// computed from an older world carries indices that mean nothing
     /// here: sim/mod.rs drops it instead of installing it.
@@ -305,6 +308,7 @@ pub fn push_unit(
     units.sight.push(0);
     units.chain.push(0);
     units.way.push(Vec2::NAN);
+    units.pose.push(0);
 }
 
 /// FL_TEST_SURROUND: two equal blue detachments of light infantry, one

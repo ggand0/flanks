@@ -18,10 +18,11 @@ const SEP_STRENGTH: f32 = 60.0;
 const QUERY_RADIUS: f32 = 2.0;
 /// Cap on summed separation push to avoid explosive forces deep in a crowd.
 const SEP_PUSH_MAX: f32 = 2.5;
-/// Below this distance overlap is resolved positionally. A soldier is
-/// 0.75 to 1.1 m across with his arms, shield and weapon. Never more than
-/// a pair's own rest distance, so the men of a wall keep their 1.05 m
-/// files. FL_BODY=<metres> sets it, up to the separation distance.
+/// Below this distance overlap is resolved positionally, for a man in
+/// his ready stance (at ease `body_ease`). A soldier is 0.75 to 1.1 m
+/// across with his arms, shield and weapon. Never more than a pair's own
+/// rest distance, so the men of a wall keep their 1.05 m files.
+/// FL_BODY=<metres> sets it, up to the separation distance.
 const BODY_DISTANCE: f32 = 1.2;
 pub(crate) fn body_distance() -> f32 {
     static D: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
@@ -36,8 +37,8 @@ pub(crate) fn body_distance() -> f32 {
 /// 1.12 m, is the crowd above which a pressing man with nobody in reach
 /// stops looking for a far enemy (`acquire`).
 const CROWD_SLOW: f32 = 1.2;
-/// The fade is set by the men's real size, not by the body distance: a
-/// man's drive eases from six neighbours at arm's length, BRAKE_FAR of
+/// The fade is set by the men's real size, not by the body distance: in
+/// his ready stance a man's drive eases from six neighbours at arm's length, BRAKE_FAR of
 /// the 1.70 m man, to nothing when six are pressed against him at
 /// BRAKE_NEAR, his width with arms and shield. Both scale with the unit
 /// scale. A band set from the body distance would be 11 cm of squeeze at
@@ -45,12 +46,71 @@ const CROWD_SLOW: f32 = 1.2;
 /// whenever a gap opened at its front.
 const BRAKE_FAR: f32 = 1.3;
 const BRAKE_NEAR: f32 = 0.9;
+/// The crowd brake of a man in his ready stance.
 pub(crate) fn crowd_brake() -> (f32, f32) {
-    static B: std::sync::OnceLock<(f32, f32)> = std::sync::OnceLock::new();
-    *B.get_or_init(|| {
+    let w = &widths()[3];
+    (w.slow, w.stop)
+}
+/// The body distance at ease: a man standing, walking or running with
+/// his arms down is narrower than one in his ready stance with weapon
+/// and shield up (BODY_DISTANCE). The spring rest at ease stays the same
+/// 0.2 m over the body (`Width`). FL_BODY_EASE=<metres> sets it, up to
+/// the body in the ready stance.
+const BODY_EASE: f32 = 0.9;
+fn body_ease() -> f32 {
+    static D: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *D.get_or_init(|| crate::util::env_or("FL_BODY_EASE", BODY_EASE).clamp(0.5, body_distance()))
+}
+/// The spring rest at ease (metres).
+pub(crate) fn sep_ease() -> f32 {
+    body_ease() + SEP_RADIUS - BODY_DISTANCE
+}
+/// Ticks a man takes from at ease into his ready stance and back, the
+/// change of his width: half a second, the length of the stance clip,
+/// so a block that turns to fight widens as a step and not a jolt.
+pub(crate) const POSE_READY: u8 = 15;
+/// A regiment's stance (sim/job.rs `stance_of`), as the pose pass draws
+/// its men: at ease; in the ready stance while a man stands (an enemy
+/// near, an attack, a charge); in it whatever he does (fighting, a
+/// wall).
+pub(crate) const STANCE_EASE: u8 = 0;
+pub(crate) const STANCE_READY: u8 = 1;
+pub(crate) const STANCE_FIGHT: u8 = 2;
+/// His pose as the grid carries it (spatial.rs META_POSE): 0 at ease to
+/// 3 ready, the ramp in thirds. Both men of a pair read each other's
+/// width from it and their own from the same rounding, so the pair's
+/// distances are the same from either side.
+pub(crate) fn pose_level(pose: u8) -> usize {
+    (pose as usize * 3 + POSE_READY as usize / 2) / POSE_READY as usize
+}
+/// A man's size at one pose level: his body distance and spring rest
+/// (a pair's are the mean of the two men's), and the crowd at which his
+/// drive starts to fade and is gone, from six men at his body plus
+/// 0.1 m to six at his body less 0.2 m at ease, and BRAKE_FAR to
+/// BRAKE_NEAR in his ready stance, each against his own spring rest.
+pub(crate) struct Width {
+    pub body: f32,
+    pub sep: f32,
+    pub slow: f32,
+    pub stop: f32,
+}
+pub(crate) fn widths() -> &'static [Width; 4] {
+    static W: std::sync::OnceLock<[Width; 4]> = std::sync::OnceLock::new();
+    W.get_or_init(|| {
         let scale = crate::unit_types::unit_scale();
-        let at = |d: f32| 6.0 * (1.0 - (d * scale).min(SEP_RADIUS) / SEP_RADIUS);
-        (at(BRAKE_FAR), at(BRAKE_NEAR))
+        std::array::from_fn(|level| {
+            let t = level as f32 / 3.0;
+            let mix = |ease: f32, ready: f32| ease * (1.0 - t) + ready * t;
+            let body = mix(body_ease(), body_distance());
+            let sep = mix(sep_ease(), SEP_RADIUS);
+            let at = |d: f32| 6.0 * (1.0 - (d * scale).min(sep) / sep);
+            Width {
+                body,
+                sep,
+                slow: at(mix(body_ease() + 0.1, BRAKE_FAR)),
+                stop: at(mix(body_ease() - 0.2, BRAKE_NEAR)),
+            }
+        })
     })
 }
 /// The contact between a man and the body he runs into. By default the
@@ -316,6 +376,8 @@ pub(crate) struct Field<'a> {
     /// Per regiment: walking through a friend that opened for it
     /// (sim/job.rs `open_for_passers`).
     pub passing: &'a [bool],
+    /// Per regiment: the stance its men are drawn in (STANCE_*).
+    pub stance: &'a [u8],
     /// Per regiment: the one enemy regiment its men fight (sim/job.rs
     /// `focus`), None for any.
     pub focus: &'a [Option<u32>],
@@ -371,6 +433,7 @@ pub(crate) struct Soldier<'a> {
     pub sight: &'a mut u16,
     pub way: &'a mut Vec2,
     pub chain: &'a mut u8,
+    pub pose: &'a mut u8,
     pub quarry: &'a mut u32,
 }
 
@@ -391,6 +454,7 @@ pub(crate) struct Rows<'a> {
     pub sight: &'a mut [u16],
     pub way: &'a mut [Vec2],
     pub chain: &'a mut [u8],
+    pub pose: &'a mut [u8],
     pub quarry: &'a mut [u32],
 }
 
@@ -424,6 +488,9 @@ struct Step {
     /// His share by weight of a closing speed on them (the shared speed).
     overlap_share: f32,
     crowd: f32,
+    /// The crowd at which his drive starts to fade and is gone, for his
+    /// width (`Width`).
+    brake: (f32, f32),
     best_idx: u32,
     sticky: bool,
     prev_target: u32,
@@ -473,6 +540,7 @@ pub(crate) fn tick_chunk(f: &Field, rows: Rows, out: &mut ChunkOut) {
             sight: &mut rows.sight[j],
             way: &mut rows.way[j],
             chain: &mut rows.chain[j],
+            pose: &mut rows.pose[j],
             quarry: &mut rows.quarry[j],
         };
         let mut st = begin(f, &mut s);
@@ -556,6 +624,7 @@ fn begin(f: &Field, s: &mut Soldier) -> Step {
         overlap_vel: Vec2::ZERO,
         overlap_share: 0.0,
         crowd: 0.0,
+        brake: (0.0, 0.0),
         best_idx: u32::MAX,
         sticky: false,
         prev_target: u32::MAX,
@@ -688,7 +757,7 @@ fn drive(f: &Field, s: &mut Soldier, st: &mut Step) {
 /// body runs onto, which is a damage event from the spearman.
 #[inline]
 fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
-    let Field { grid, speed, team, yaw_snap, wall, faces_spearwall, tick_seed, .. } = *f;
+    let Field { grid, speed, team, yaw_snap, wall, stance, faces_spearwall, tick_seed, .. } = *f;
     let i = s.i;
     let params = &TYPES[st.my_kind];
     let p = st.p;
@@ -707,7 +776,9 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
     let my_team_bit = (team[i] as u32) * crate::spatial::META_TEAM;
     let my_wall = wall[gi] != 0;
     let my_mass = params.mass;
-    let body = body_distance();
+    // His width and each neighbour's by their poses at the tick's start.
+    let widths = widths();
+    let mine = &widths[pose_level(*s.pose)];
     let gain = CORR_GAIN;
     let reach2 = params.reach * params.reach;
     let prev_target = *s.target;
@@ -784,10 +855,11 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
         // seams the intermix needs: a pressed front's gaps shrank to about
         // 1.05 m against 0.95 m bodies and symmetric fights collapsed to a
         // two-rank duel line. It must not come back.
+        let theirs = &widths[crate::spatial::meta_pose(o.meta)];
         let sep_r = if !cross && my_wall && (o.meta & crate::spatial::META_WALL) != 0 {
             WALL_SEP_RADIUS
         } else {
-            SEP_RADIUS
+            0.5 * (mine.sep + theirs.sep)
         };
         if d2 < sep_r * sep_r && d2 > 1e-8 {
             // Mass-weighted: heavies shove lights aside.
@@ -795,7 +867,7 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
             let mw = 2.0 * o_mass / (my_mass + o_mass);
             let len = d2.sqrt();
             let w = 1.0 - len / sep_r;
-            let hard = body.min(sep_r);
+            let hard = (0.5 * (mine.body + theirs.body)).min(sep_r);
             if len < hard {
                 // Overlap is resolved POSITIONALLY only. A hard force boost
                 // here as well made packed crowds oscillate at the
@@ -845,6 +917,22 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
             *s.sight &= !SIGHT_FOE;
         }
     }
+    // His stance for the next tick, as he is drawn: into the ready stance
+    // while his regiment fights, while it stands ready and he stands (the
+    // pose pass's guard, below the speed of his steps), or with an enemy
+    // in his reach; else back at ease, walking or running. A step of the
+    // ramp a tick.
+    let ready = match stance[gi] {
+        STANCE_FIGHT => true,
+        STANCE_READY => s.vel.xz().length_squared() < STEP_FACE_SPEED * STEP_FACE_SPEED,
+        _ => false,
+    };
+    *s.pose = if ready || best_idx != u32::MAX {
+        (*s.pose + 1).min(POSE_READY)
+    } else {
+        s.pose.saturating_sub(1)
+    };
+    st.brake = (mine.slow, mine.stop);
     // An archer's knife: out while his regiment has its swords out, and
     // for a few seconds after an enemy came close to him, one in his
     // reach, an enemy block's edge within KNIFE_EDGE of him, or with his
@@ -1745,7 +1833,7 @@ fn yield_to_crowd(st: &mut Step) {
     // Yield in dense crowds: goal drive fades out entirely so the mass can't
     // keep compressing itself; `jam` (0 = free, 1 = packed) also damps the
     // response below.
-    let (slow, stop) = crowd_brake();
+    let (slow, stop) = st.brake;
     let jam = ((crowd - slow) / (stop - slow)).clamp(0.0, 1.0);
     desired *= 1.0 - jam;
     st.corr = corr;
@@ -1824,7 +1912,7 @@ fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
         (*s.target, false)
     } else if best_idx != u32::MAX {
         (best_idx, false)
-    } else if crowd < crowd_brake().0 && committed {
+    } else if crowd < st.brake.0 && committed {
         (*s.target, true)
     } else {
         (u32::MAX, false)

@@ -32,6 +32,10 @@ pub const META_DYING: u32 = 1 << 3;
 /// tighter separation rest distance (a shieldwall the physics would
 /// otherwise push back out to normal spacing).
 pub const META_WALL: u32 = 1 << 4;
+/// How far the unit is into his ready stance, a 2-bit FIELD (0 at ease
+/// to 3 ready, sim/soldier.rs `pose_level`): read it with `meta_pose`.
+pub const META_POSE_SHIFT: u32 = 5;
+pub const META_POSE: u32 = 0b11 << META_POSE_SHIFT;
 /// The unit's regiment (index into `Groups::list`) fills the bits above
 /// the flags: read it with `meta_group`.
 pub const META_GROUP_SHIFT: u32 = 7;
@@ -40,6 +44,12 @@ pub const META_GROUP_SHIFT: u32 = 7;
 #[inline]
 pub fn meta_kind(meta: u32) -> usize {
     ((meta & META_KIND) >> META_KIND_SHIFT) as usize
+}
+
+/// The pose field of a `SortedUnit::meta`.
+#[inline]
+pub fn meta_pose(meta: u32) -> usize {
+    ((meta & META_POSE) >> META_POSE_SHIFT) as usize
 }
 
 /// The regiment field of a `SortedUnit::meta`.
@@ -104,6 +114,7 @@ impl SpatialGrid {
         kinds: &[u8],
         groups: &[u32],
         death_t: &[u8],
+        poses: &[u8],
         group_wall: &[bool],
     ) {
         let n = positions.len();
@@ -192,6 +203,7 @@ impl SpatialGrid {
                             | ((kinds[i] as u32) << META_KIND_SHIFT)
                             | (((death_t[i] > 0) as u32) * META_DYING)
                             | ((group_wall[groups[i] as usize] as u32) * META_WALL)
+                            | ((crate::sim::soldier::pose_level(poses[i]) as u32) << META_POSE_SHIFT)
                             | (groups[i] << META_GROUP_SHIFT);
                         unsafe {
                             *out.0.add(k) = SortedUnit {
