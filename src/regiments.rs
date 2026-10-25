@@ -1185,6 +1185,19 @@ fn spawn_routpass_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups
             }
         }
     }
+    // FL_ROUTPASS_OPEN=1: A stands in the open order from the start.
+    if std::env::var("FL_ROUTPASS_OPEN").is_ok_and(|v| v == "1") {
+        let a = &mut list[0];
+        a.close_to = a.spacing;
+        a.spacing = crate::formation::FormSpacing::Open;
+        for i in crate::formation::assign_slots(units, 0, a) {
+            let i = i as usize;
+            let at = a.anchor + units.home[i];
+            let y = terrain.height_at(at.x, at.y) + crate::unit_types::half_height(units.kind[i] as usize);
+            units.pos[i] = Vec3::new(at.x, y, at.y);
+            units.pos_prev[i] = units.pos[i];
+        }
+    }
     if let Some(v) = std::env::var("FL_ROUTPASS_SPEED").ok().and_then(|v| v.parse::<f32>().ok()) {
         let scale = v / crate::unit_types::TYPES[passer_kind as usize].speed;
         for i in 0..units.len() {
@@ -1460,7 +1473,7 @@ fn melee_diag_log(
         return;
     };
     let fwd = crate::formation::facing_dir(gd.facing);
-    let pitch = gd.spacing.pitch(gd.kind).y;
+    let pitch = crate::formation::grid(gd).2.y;
     let mut members: Vec<(usize, f32)> = Vec::new();
     let mut max_fwd = f32::MIN;
     for i in 0..units.len() {

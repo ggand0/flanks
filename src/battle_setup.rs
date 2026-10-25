@@ -110,7 +110,7 @@ impl BattleSetup {
                     facing: g.facing,
                     files: g.files,
                     shape: g.shape,
-                    spacing: g.spacing,
+                    spacing: g.chosen_spacing(),
                     hold: g.hold,
                     fire_at_will: g.fire_at_will,
                     skirmish: g.skirmish,
@@ -464,9 +464,8 @@ fn run_setup_script(
 
 /// The middle of a unit's front rank.
 fn front_of(gd: &crate::orders::GroupData) -> Vec2 {
-    let files = gd.files.max(1) as usize;
-    let ranks = gd.count.max(1).div_ceil(files);
-    let half_depth = (ranks - 1) as f32 * gd.spacing.pitch(gd.kind).y * 0.5;
+    let (_, ranks, pitch) = crate::formation::grid(gd);
+    let half_depth = (ranks - 1) as f32 * pitch.y * 0.5;
     gd.centroid + crate::formation::facing_dir(gd.facing) * half_depth
 }
 
