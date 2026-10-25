@@ -94,6 +94,10 @@ pub struct GroupData {
     /// (friend, men) (frontline.rs), what the friend reads to know when
     /// the last man is out. Empty for a regiment not passing.
     pub inside: Vec<(u32, u32)>,
+    /// How far its farthest living man stands from its centroid (metres,
+    /// frontline.rs): the stragglers' reach, so an open friend counts this
+    /// regiment's men only when one could be inside it.
+    pub reach: f32,
     /// Formation facing (unit yaw convention, 0 = +Z). Baked into the slot
     /// offsets on reform; meaningless for Blob.
     pub facing: f32,
@@ -291,6 +295,7 @@ impl GroupData {
             open: crate::formation::OpenOrder::default(),
             passing: false,
             inside: Vec::new(),
+            reach: 0.0,
             facing: if team == 0 { 0.0 } else { std::f32::consts::PI },
             files: 0,
             hold: false,

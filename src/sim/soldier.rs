@@ -1152,6 +1152,11 @@ const SIDE_MEMORY: u16 = 15;
 /// side over his memory and his coin.
 const AHEAD_MIN: f32 = 0.1;
 const LEAN_MIN: f32 = 0.05;
+/// A holding man this far from his slot is walking somewhere too, and
+/// tries a side when stuck: a man left inside a friend that closed, or
+/// carried off by a friend walking through, works his way out instead of
+/// standing against the gripping men for good.
+const TRY_FROM_SLOT: f32 = 5.0;
 /// The `stuck` column: the stuck ticks (bits 0 to 3), the try's ticks
 /// left (4 to 8), the side memory in eighths of a second (9 to 12), and
 /// the remembered side (13, set for his left).
@@ -1183,18 +1188,20 @@ pub(crate) fn stuck_trying(v: u16) -> u16 {
 /// into the next man (that was the pinball between the columns). Pressed
 /// forward and free to slide sideways, he slides into the gap beside the
 /// man in his way, and the man behind him does the same a moment later.
-/// Only a man walking under his regiment's order with no enemy in mind
-/// and his regiment not yet fighting: men walking to a fight and the
-/// rear ranks of a fighting regiment keep their own rules (`close_in`),
-/// so the melee is as it was. His state rides the `stuck` column
-/// (STUCK_*).
+/// Only a man walking somewhere, under his regiment's order or back to a
+/// slot more than TRY_FROM_SLOT off, with no enemy in mind and his
+/// regiment not fighting: men walking to a fight and the rear ranks of a
+/// fighting regiment keep their own rules (`close_in`), so the melee is
+/// as it was. His state rides the `stuck` column (STUCK_*).
 #[inline]
 fn try_a_side(f: &Field, s: &mut Soldier, st: &mut Step) {
-    let Field { orders, engaged, tick, .. } = *f;
+    let Field { orders, engaged, anchors, home, tick, .. } = *f;
     let i = s.i;
     let wish = st.wish;
     let want = wish.length();
-    let going = orders[st.gi].is_some()
+    let walking = orders[st.gi].is_some()
+        || (anchors[st.gi] + home[i]).distance_squared(st.p) > TRY_FROM_SLOT * TRY_FROM_SLOT;
+    let going = walking
         && !engaged[st.gi]
         && !st.dying
         && !st.routed

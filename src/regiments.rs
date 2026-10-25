@@ -1179,7 +1179,12 @@ fn spawn_routpass_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups
     let holder_depth = half_depth(n, holder_kind);
     let width = (holder_files - 1) as f32 * crate::formation::gap(holder_kind);
     spawn_regiment(units, terrain, &mut list, 0, passer_kind, Vec2::new(0.0, z), n, -1.0);
-    list[1].order = Some(crate::orders::Order::Move(Vec2::new(0.0, -60.0)));
+    // FL_ROUTPASS_STOP=1: the passer's destination is A's own ground, so
+    // it stops inside A; at 30 s `routpass_test_log` sends it on past A.
+    // The men it leaves behind, and the men of A carried along, are the
+    // stragglers seen in play (devlog 0318).
+    let goal = if std::env::var("FL_ROUTPASS_STOP").is_ok() { Vec2::ZERO } else { Vec2::new(0.0, -60.0) };
+    list[1].order = Some(crate::orders::Order::Move(goal));
     list[1].auto_order = true;
     // A small held enemy far off the pass, so the battle does not end
     // with no enemy on the field (ai.rs `check_victory`) and freeze it.
@@ -1332,16 +1337,25 @@ fn push_test_log(
 /// frame: the time from the first passer in to the last out.
 fn routpass_test_log(
     units: Res<Units>,
-    groups: Res<crate::orders::Groups>,
+    mut groups: ResMut<crate::orders::Groups>,
     stats: Res<crate::sim::SimStats>,
     time: Res<Time>,
     mut next: Local<f32>,
     mut pass: Local<(Option<f32>, Option<f32>)>,
+    mut sent_on: Local<bool>,
 ) {
     if std::env::var("FL_TEST_ROUTPASS").is_err() || groups.list.len() < 2 {
         return;
     }
     let t = time.elapsed_secs();
+    if std::env::var("FL_ROUTPASS_STOP").is_ok() && t >= 30.0 && !*sent_on {
+        *sent_on = true;
+        let p = &mut groups.list[1];
+        p.order = Some(crate::orders::Order::Move(Vec2::new(0.0, -60.0)));
+        p.auto_order = true;
+        p.reform = true;
+        info!("[routpass-test] t={t:.0}s the passer is sent on past A");
+    }
     let a = &groups.list[0];
     let rect = crate::formation::block_rect_at(a, a.anchor);
     let fwd = crate::formation::facing_dir(a.facing);
