@@ -87,8 +87,8 @@ pub struct GroupData {
     pub open: crate::formation::OpenOrder,
     /// Walking through a friendly regiment that opened for it: its block
     /// within OPEN_KEEP of an open friend's, or any of its men still
-    /// inside one (sim/job.rs `open_for_passers`). Its men look for the
-    /// lanes.
+    /// inside one (sim/job.rs `open_for_passers`). The friend's
+    /// bookkeeping: it counts this regiment's men inside it.
     pub passing: bool,
     /// While passing: its living men inside each open friend's block, as
     /// (friend, men) (frontline.rs), what the friend reads to know when

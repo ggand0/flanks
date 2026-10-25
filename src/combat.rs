@@ -136,6 +136,7 @@ pub fn process_deaths(
             units.chain.swap_remove(i);
             units.way.swap_remove(i);
             units.pose.swap_remove(i);
+            units.stuck.swap_remove(i);
             moves.swap_remove(i, units.len() + 1);
             // The hole took the last man; a popped tail took nobody.
             if i >= units.len() {

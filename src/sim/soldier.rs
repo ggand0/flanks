@@ -271,11 +271,9 @@ const SIGHT_BACK: u16 = 1 << 7;
 /// tick): the archers' search never aims at him (sim/mod.rs
 /// `clear_members`).
 pub(crate) const SIGHT_FOE: u16 = 1 << 8;
-/// Walking through a friendly regiment that opened for his own
-/// (`passing`), a man of it stands ahead of him in his way: he walks up
-/// to him at ADVANCE_PACE, and steps toward the lane on the side
-/// SIGHT_LEFT and SIGHT_RIGHT leave open (`find_the_lane`).
-pub(crate) const SIGHT_PASS: u16 = 1 << 9;
+/// The side a stuck man tries while his try lasts (`try_a_side`): set,
+/// his left; clear, his right.
+pub(crate) const SIGHT_TRY_LEFT: u16 = 1 << 9;
 /// An archer's knife: bits 10 to 14 count down (one every fourth tick)
 /// from the last tick an enemy came close to him (`KNIFE_HOLD`), and
 /// `SIGHT_KNIFE` is set while the knife is out, by that count or by his
@@ -373,9 +371,6 @@ pub(crate) struct Field<'a> {
     pub press: &'a [bool],
     /// Per regiment: under a Move order (sim/job.rs `moving`).
     pub moving: &'a [bool],
-    /// Per regiment: walking through a friend that opened for it
-    /// (sim/job.rs `open_for_passers`).
-    pub passing: &'a [bool],
     /// Per regiment: the stance its men are drawn in (STANCE_*).
     pub stance: &'a [u8],
     /// Per regiment: the one enemy regiment its men fight (sim/job.rs
@@ -435,6 +430,7 @@ pub(crate) struct Soldier<'a> {
     pub chain: &'a mut u8,
     pub pose: &'a mut u8,
     pub quarry: &'a mut u32,
+    pub stuck: &'a mut u8,
 }
 
 /// The rows of one chunk of soldiers, in index order.
@@ -456,6 +452,7 @@ pub(crate) struct Rows<'a> {
     pub chain: &'a mut [u8],
     pub pose: &'a mut [u8],
     pub quarry: &'a mut [u32],
+    pub stuck: &'a mut [u8],
 }
 
 /// What a chunk emits beside its rows: landed swings and loosed arrows.
@@ -488,6 +485,10 @@ struct Step {
     /// His share by weight of a closing speed on them (the shared speed).
     overlap_share: f32,
     crowd: f32,
+    /// The crowd ahead of him on his way: the neighbours within the
+    /// spring whose direction is within 60 degrees of his wish, by their
+    /// closeness (`try_a_side`).
+    ahead: f32,
     /// The crowd at which his drive starts to fade and is gone, for his
     /// width (`Width`).
     brake: (f32, f32),
@@ -517,6 +518,8 @@ struct Step {
     back_blocked: bool,
     // The swing and the steering.
     face_target: Option<Vec2>,
+    /// His drive before the crowd's brake faded it (`try_a_side`).
+    wish: Vec2,
     jam: f32,
     new_v: Vec2,
 }
@@ -542,17 +545,18 @@ pub(crate) fn tick_chunk(f: &Field, rows: Rows, out: &mut ChunkOut) {
             chain: &mut rows.chain[j],
             pose: &mut rows.pose[j],
             quarry: &mut rows.quarry[j],
+            stuck: &mut rows.stuck[j],
         };
         let mut st = begin(f, &mut s);
         drive(f, &mut s, &mut st);
         scan(f, &mut s, &mut st, out);
         look_around(f, &mut s, &mut st);
-        find_the_lane(f, &mut s, &mut st);
         hold_the_frame(f, &mut st);
         acquire(f, &mut s, &mut st);
         decide_to_join(f, &mut s, &mut st);
         swing(f, &mut s, &mut st, out);
         yield_to_crowd(&mut st);
+        try_a_side(f, &mut s, &mut st);
         close_in(f, &mut s, &mut st);
         steer(f, &mut s, &mut st);
         face(f, &mut s, &mut st);
@@ -624,6 +628,7 @@ fn begin(f: &Field, s: &mut Soldier) -> Step {
         overlap_vel: Vec2::ZERO,
         overlap_share: 0.0,
         crowd: 0.0,
+        ahead: 0.0,
         brake: (0.0, 0.0),
         best_idx: u32::MAX,
         sticky: false,
@@ -648,6 +653,7 @@ fn begin(f: &Field, s: &mut Soldier) -> Step {
         slot_blocked: false,
         back_blocked: false,
         face_target: None,
+        wish: Vec2::ZERO,
         jam: 0.0,
         new_v: Vec2::ZERO,
     }
@@ -773,6 +779,8 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
     let mut overlap_share = 0.0f32;
     let mut overlap = 0.0f32;
     let mut crowd = 0.0f32;
+    let mut ahead = 0.0f32;
+    let wish_dir = st.desired.normalize_or_zero();
     let my_team_bit = (team[i] as u32) * crate::spatial::META_TEAM;
     let my_wall = wall[gi] != 0;
     let my_mass = params.mass;
@@ -880,6 +888,7 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
                 overlap += back;
             }
             push += d * (w * mw / len);
+            ahead += w * (d.dot(wish_dir) < -0.5 * len) as u32 as f32;
             // Jam density: COMPRESSED pairs only — a neighbor resting AT his
             // pair's rest distance contests nothing, so a formed man's
             // slot-keeping is never faded by the settled enemies one stride
@@ -958,6 +967,7 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
         st.overlap_share = overlap_share / overlap;
     }
     st.crowd = crowd;
+    st.ahead = ahead;
     st.best_idx = best_idx;
     st.sticky = sticky;
     st.prev_target = prev_target;
@@ -976,7 +986,7 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
 /// look.
 #[inline]
 fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
-    let Field { grid, pos_prev, team, group, orders, engaged, focus, passing, tick, .. } = *f;
+    let Field { grid, pos_prev, team, group, orders, engaged, focus, tick, .. } = *f;
     let i = s.i;
     let p = st.p;
     let gi = st.gi;
@@ -1044,41 +1054,9 @@ fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
     let look_lanes = memo_dir != Vec2::ZERO && best_idx == u32::MAX && !dying && !routed;
     let watch_go = in_melee && !committed && !memo_valid;
     let slot_on = slot_dir != Vec2::ZERO;
-    // Walking through a friend that opened for his regiment, he looks at
-    // its men in his way instead (`find_the_lane`).
-    let pass_dir = if passing[gi] && !dying && !routed { desired.normalize_or_zero() } else { Vec2::ZERO };
     if (i as u32).wrapping_add(tick).is_multiple_of(LOOK_TICKS) {
         let mut seen = 0u16;
-        if pass_dir != Vec2::ZERO {
-            // Men of other regiments of his side within QUERY_RADIUS and
-            // within 45 degrees of his way, not walking off along it: he
-            // walks up to them and steps away from the side they are on,
-            // a side by his own coin for one dead ahead, and by his coin
-            // again when they stand on both sides equally.
-            let left_dir = Vec2::new(-pass_dir.y, pass_dir.x);
-            let coin = |salt: u32| crate::units::hash01((i as u32).wrapping_mul(0x2545).wrapping_add(salt)) > 0.5;
-            let (mut ahead, mut sides) = (false, 0i32);
-            grid.for_each_candidate_vel(p, QUERY_RADIUS, |o, ov| {
-                let d = o.xz() - p;
-                let d2 = d.length_squared();
-                if (o.meta & crate::spatial::META_TEAM) != my_team_bit
-                    || crate::spatial::meta_group(o.meta) == gi
-                    || d2 > QUERY_RADIUS * QUERY_RADIUS
-                    || d.dot(pass_dir) <= 0.707 * d2.sqrt()
-                    || ov.dot(pass_dir) > 0.5
-                {
-                    return;
-                }
-                ahead = true;
-                let lateral = d.dot(left_dir);
-                let on_left = if lateral.abs() > 0.05 { lateral > 0.0 } else { coin(9) };
-                sides += if on_left { 1 } else { -1 };
-            });
-            if ahead {
-                let left = if sides != 0 { sides > 0 } else { coin(3) };
-                seen = SIGHT_PASS | if left { SIGHT_LEFT } else { SIGHT_RIGHT };
-            }
-        } else if look_lanes || watch_go || slot_on {
+        if look_lanes || watch_go || slot_on {
             let (mut way, mut left, mut right, mut ahead_any, mut mark, mut go) =
                 (false, false, false, false, false, false);
             // Branch-free: neighbors of both teams interleave in a melee, and
@@ -1118,7 +1096,7 @@ fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
                 | (mark as u16 * SIGHT_MARK)
                 | (go as u16 * SIGHT_GO);
         }
-        if fighter && pass_dir == Vec2::ZERO {
+        if fighter {
             // The room he has to fight the enemy in reach: a comrade close
             // to either side of his way to the enemy, and any man close
             // behind him.
@@ -1163,27 +1141,80 @@ fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
     st.slot_blocked = slot_blocked;
 }
 
-/// Walking through a friendly regiment that opened for his own
-/// (`passing`), with one of its men ahead in his way at his last look
-/// (SIGHT_PASS): he walks up to him at ADVANCE_PACE instead of leaning
-/// into him, and steps at STEP_PACE toward the lane on the side the man
-/// is not on. A man in a lane with nobody ahead walks on as he was. Both
-/// before the crowd's yield, which fades them in a packed crowd like any
-/// drive.
+/// Stuck ticks before a man tries a side (half a second), and how long a
+/// try lasts (a second).
+const STUCK_TICKS: u8 = 15;
+const TRY_TICKS: u8 = 30;
+/// The crowd ahead of him (`Step::ahead`) that counts as someone in his
+/// way, and the sideways lean of his separation push that picks his
+/// side over his coin.
+const AHEAD_MIN: f32 = 0.1;
+const LEAN_MIN: f32 = 0.05;
+
+/// A man going somewhere who finds himself stuck tries a side. Stuck is
+/// felt, not seen: he wants to walk and has moved at under half his wish
+/// for STUCK_TICKS with bodies pressed against him ahead (the net push
+/// would not do: in a press the men behind cancel the men in front). He tries the
+/// side his separation push leans to, the side with more room, or his own
+/// coin when it leans nowhere: a sidestep at STEP_PACE for TRY_TICKS on
+/// top of whatever the crowd leaves of his drive, not faded by the crowd's
+/// brake, so a man packed in still shuffles sideways. Pressed forward and
+/// free to slide sideways, he slides into the gap beside the man in his
+/// way, and the man behind him does the same a moment later. Only a man
+/// walking under his regiment's order with no enemy in mind and his
+/// regiment not yet fighting: men walking to a fight and the rear ranks
+/// of a fighting regiment keep their own rules (`close_in`), so the
+/// melee is as it was. His state rides the
+/// `stuck` column (the low nibble the stuck ticks, the high one the try's
+/// ticks left in pairs) and SIGHT_TRY_LEFT holds the side.
 #[inline]
-fn find_the_lane(f: &Field, s: &mut Soldier, st: &mut Step) {
-    let pass_dir = st.desired.normalize_or_zero();
-    if !f.passing[st.gi] || st.dying || st.routed || pass_dir == Vec2::ZERO || *s.sight & SIGHT_PASS == 0 {
+fn try_a_side(f: &Field, s: &mut Soldier, st: &mut Step) {
+    let Field { orders, engaged, tick, .. } = *f;
+    let i = s.i;
+    let wish = st.wish;
+    let want = wish.length();
+    let going = orders[st.gi].is_some()
+        && !engaged[st.gi]
+        && !st.dying
+        && !st.routed
+        && !st.in_melee
+        && !st.committed
+        && st.best_idx == u32::MAX
+        && !st.memo_valid
+        && st.join_fp.is_none()
+        && want > 0.5;
+    if !going {
+        *s.stuck = 0;
+        *s.sight &= !SIGHT_TRY_LEFT;
         return;
     }
-    let mut desired = st.desired;
-    let want = desired.length();
-    if want > ADVANCE_PACE {
-        desired *= ADVANCE_PACE / want;
+    let dir = wish / want;
+    let left_dir = Vec2::new(-dir.y, dir.x);
+    let mut count = *s.stuck & 0x0f;
+    let mut trying = *s.stuck >> 4;
+    if trying == 0 {
+        let pressed = st.ahead > AHEAD_MIN;
+        let stuck = pressed && s.vel.xz().dot(dir) < 0.5 * want;
+        count = if stuck { (count + 1).min(STUCK_TICKS) } else { count.saturating_sub(1) };
+        if count >= STUCK_TICKS {
+            let lean = st.push.dot(left_dir);
+            let left = if lean.abs() > LEAN_MIN {
+                lean > 0.0
+            } else {
+                crate::units::hash01((i as u32).wrapping_mul(0x2545).wrapping_add(tick)) > 0.5
+            };
+            *s.sight = (*s.sight & !SIGHT_TRY_LEFT) | (left as u16 * SIGHT_TRY_LEFT);
+            trying = TRY_TICKS / 2;
+            count = 0;
+        }
+    } else {
+        let side = if *s.sight & SIGHT_TRY_LEFT != 0 { left_dir } else { -left_dir };
+        st.desired += side * STEP_PACE;
+        if tick.is_multiple_of(2) {
+            trying -= 1;
+        }
     }
-    let left_dir = Vec2::new(-pass_dir.y, pass_dir.x);
-    let side = if *s.sight & SIGHT_LEFT != 0 { -left_dir } else { left_dir };
-    st.desired = desired + side * STEP_PACE;
+    *s.stuck = (trying << 4) | count;
 }
 
 /// Two things a man in melee does not do for his slot: step back away
@@ -1835,6 +1866,7 @@ fn yield_to_crowd(st: &mut Step) {
     // response below.
     let (slow, stop) = st.brake;
     let jam = ((crowd - slow) / (stop - slow)).clamp(0.0, 1.0);
+    st.wish = desired;
     desired *= 1.0 - jam;
     st.corr = corr;
     st.push = push;

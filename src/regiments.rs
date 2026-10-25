@@ -1810,12 +1810,15 @@ fn shake_log(
     let (mut alive, mut hard, mut turns_sum, mut step_sum) = (0u32, 0u32, 0u32, 0.0f32);
     let (mut by_state, mut by_touch) = ([0u32; 3], [0u32; 3]);
     let (mut out_form, mut near_enemy, mut thin) = (0u32, 0u32, 0u32);
+    // Men trying a side right now (sim/soldier.rs `try_a_side`).
+    let mut trying = 0u32;
     let mut shakers: Vec<(u8, usize, f32, u32)> = Vec::new();
     for i in 0..n {
         if units.death_t[i] != 0 {
             continue;
         }
         alive += 1;
+        trying += (units.stuck[i] >> 4 != 0) as u32;
         let turns = sh.turns[i];
         if turns < SHAKE_TURNS {
             continue;
@@ -1859,7 +1862,7 @@ fn shake_log(
         ));
     }
     info!(
-        "[shake] t={t:.0}s {} of {alive} men shake ({hard} hard), mean step {:.1} cm | regiment fighting {} moving {} standing {} | out of formation {out_form} | enemy within 3 m {near_enemy} | crowd under the brake's start {thin} | touching none {} one or two {} more {}{listed}",
+        "[shake] t={t:.0}s {} of {alive} men shake ({hard} hard), mean step {:.1} cm | regiment fighting {} moving {} standing {} | out of formation {out_form} | enemy within 3 m {near_enemy} | crowd under the brake's start {thin} | touching none {} one or two {} more {} | trying a side {trying}{listed}",
         shakers.len(),
         step_sum * 100.0 / turns_sum.max(1) as f32,
         by_state[0],
