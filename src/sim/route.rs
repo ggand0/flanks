@@ -351,7 +351,14 @@ pub fn update_routes(
                 // take the nearest places in them. Done here, between the
                 // install and the next job, so the next job reads the new
                 // slots whether the tick is pipelined or inline.
-                if kept.is_some() && groups.list[g].count > 0 && !groups.list[g].state.is_broken() {
+                // Not while its men are still filing onto a lane: their
+                // places are handed out as they arrive (formation.rs
+                // `fill_lane_slots`).
+                if kept.is_some()
+                    && groups.list[g].count > 0
+                    && !groups.list[g].state.is_broken()
+                    && groups.list[g].lane_fill.is_none()
+                {
                     crate::formation::assign_slots(&mut units, g as u32, &mut groups.list[g]);
                 }
                 routes.per[g].state = kept.map_or(State::None, State::Ready);

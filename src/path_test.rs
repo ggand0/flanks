@@ -28,6 +28,12 @@
 //!   and the enemy's front rank stops where the blocked ground begins. The
 //!   archers' skirmish is off, as a player sets it to hold a wall: the run
 //!   measures the enemy's distance straight through the wall.
+//! - `FL_TEST_PATH=walls_place` with `FL_MAP=walled_town`: placing units
+//!   on the walk from the plateau behind the town, through its streets.
+//!   200 archers given a 40 m line along the walk east of the gate; 200
+//!   men the same line, who must stand beside the archers; 200 more
+//!   clicked onto the walk west of the gate. Logs each one's places: how
+//!   many files, and how many places on ground a man cannot stand on.
 //!
 //! Per regiment the log has the share of men within 5 m of their slots,
 //! the men stuck (slower than 0.1 m/s for 10 s while more than 5 m from
@@ -135,7 +141,7 @@ pub fn spawn(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
     let mut list = Vec::new();
     let wanted_map = match scene.as_str() {
         "river" => crate::terrain::MapKind::River,
-        "walls" | "walls_archers" => crate::terrain::MapKind::WalledTown,
+        "walls" | "walls_archers" | "walls_place" => crate::terrain::MapKind::WalledTown,
         _ => crate::terrain::MapKind::Obstacles,
     };
     if terrain.kind != wanted_map {
@@ -162,6 +168,16 @@ pub fn spawn(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
         "walls" => {
             add(&mut list, spots::PLAZA - Vec2::new(0.0, 10.0), WALK_MEN);
             add(&mut list, spots::PLAIN, CASE_MEN);
+        }
+        "walls_place" => {
+            // On the open plateau behind the town, so all three march
+            // through its streets to the wall.
+            crate::regiments::spawn_regiment(units, terrain, &mut list, 0, KIND_ARCHER, spots::BEHIND_TOWN, CASE_MEN, -1.0);
+            for x in [90.0, -90.0] {
+                let at = spots::BEHIND_TOWN + Vec2::new(x, 0.0);
+                crate::regiments::spawn_regiment(units, terrain, &mut list, 0, KIND_HEAVY, at, CASE_MEN, -1.0);
+            }
+            list[0].skirmish = false;
         }
         "walls_archers" => {
             crate::regiments::spawn_regiment(units, terrain, &mut list, 0, KIND_ARCHER, spots::PLAZA, 60, -1.0);
@@ -203,6 +219,7 @@ fn give_orders(
     mut groups: ResMut<Groups>,
     mut units: ResMut<Units>,
     mut test: ResMut<PathTest>,
+    terrain: Res<Terrain>,
 ) {
     // The second order of a regiment whose first has its verdict.
     if let Some((g, case, line)) = test.then
@@ -210,8 +227,8 @@ fn give_orders(
     {
         test.then = None;
         info!("[path-test] tick {}: {case} ordered", pipeline.tick);
-        crate::orders::line_order(&mut groups, &[g], line.0, line.1);
-        order(&mut groups, &mut units, &mut test, pipeline.tick, g, case, None);
+        crate::orders::line_order(&mut groups, &terrain, &[g], line.0, line.1);
+        order(&mut groups, &mut units, &terrain, &mut test, pipeline.tick, g, case, None);
     }
     if test.ordered || pipeline.tick < ORDER_TICK || groups.list.is_empty() {
         return;
@@ -230,20 +247,28 @@ fn give_orders(
             orders.push((0, "river-near", groups.list[0].centroid + Vec2::new(120.0, 0.0)));
             orders.push((1, "river-far", groups.list[1].centroid + Vec2::new(120.0, 0.0)));
         }
+        "walls_place" => {
+            let line = (spots::WALK_EAST - Vec2::new(110.0, 0.0), spots::WALK_EAST - Vec2::new(70.0, 0.0));
+            for (g, case) in [(0, "place-archers"), (1, "place-beside")] {
+                crate::orders::line_order(&mut groups, &terrain, &[g], line.0, line.1);
+                order(&mut groups, &mut units, &terrain, &mut test, pipeline.tick, g, case, None);
+            }
+            orders.push((2, "place-click", spots::WALK_WEST - Vec2::new(30.0, 0.0)));
+        }
         "walls_archers" => {
             // 50 m: at the archers' spacing, three ranks, which the walk
             // holds.
-            let c = spots::WALK_EAST - Vec2::new(80.0, -2.0);
-            crate::orders::line_order(&mut groups, &[0], c - Vec2::new(25.0, 0.0), c + Vec2::new(25.0, 0.0));
-            order(&mut groups, &mut units, &mut test, pipeline.tick, 0, "walls-archers", None);
+            let c = spots::WALK_EAST - Vec2::new(80.0, 0.0);
+            crate::orders::line_order(&mut groups, &terrain, &[0], c - Vec2::new(25.0, 0.0), c + Vec2::new(25.0, 0.0));
+            order(&mut groups, &mut units, &terrain, &mut test, pipeline.tick, 0, "walls-archers", None);
             orders.push((1, "walls-foot", ARCHERS_TARGET.with_y(crate::town_layout::WALL_Z + 12.0)));
         }
         "walls" => {
-            // The front rank 1 m off the parapet, facing out.
-            let line = |c: Vec2| (c + Vec2::new(-15.0, 2.0), c + Vec2::new(15.0, 2.0));
+            // A drag along the walk: the walk's own places, facing out.
+            let line = |c: Vec2| (c + Vec2::new(-15.0, 0.0), c + Vec2::new(15.0, 0.0));
             let (a, b) = line(spots::WALK_WEST);
-            crate::orders::line_order(&mut groups, &[0], a, b);
-            order(&mut groups, &mut units, &mut test, pipeline.tick, 0, "walls-climb", None);
+            crate::orders::line_order(&mut groups, &terrain, &[0], a, b);
+            order(&mut groups, &mut units, &terrain, &mut test, pipeline.tick, 0, "walls-climb", None);
             orders.push((1, "walls-round", spots::PLAZA));
             test.then = Some((0, "walls-walk", line(spots::WALK_EAST)));
         }
@@ -260,29 +285,45 @@ fn give_orders(
         }
     }
     for &(g, case, goal) in &orders {
-        order(&mut groups, &mut units, &mut test, pipeline.tick, g, case, Some(goal));
+        order(&mut groups, &mut units, &terrain, &mut test, pipeline.tick, g, case, Some(goal));
     }
     info!("[path-test] tick {}: {} regiments ordered", pipeline.tick, test.subjects.len());
 }
 
 /// Order regiment `g` to `goal` as a click would and watch it as `case`;
 /// with no goal, watch the order it was just given.
-fn order(groups: &mut Groups, units: &mut Units, test: &mut PathTest, tick: u32, g: usize, case: &'static str, goal: Option<Vec2>) {
-    let goal = match goal {
-        Some(goal) => {
-            crate::orders::order_regiments(groups, &[g], goal);
-            goal
-        }
-        None => match groups.list[g].order {
-            Some(Order::Move(p)) => p,
-            _ => groups.list[g].centroid,
-        },
+#[allow(clippy::too_many_arguments)]
+fn order(
+    groups: &mut Groups,
+    units: &mut Units,
+    terrain: &Terrain,
+    test: &mut PathTest,
+    tick: u32,
+    g: usize,
+    case: &'static str,
+    goal: Option<Vec2>,
+) {
+    if let Some(goal) = goal {
+        crate::orders::click_order(groups, terrain, &[g], goal);
+    }
+    let goal = match groups.list[g].order {
+        Some(Order::Move(p)) => p,
+        _ => groups.list[g].centroid,
     };
     // The new facing's slots, written now rather than at the next
     // tick's reform pass, so both kinds of tick read them in the same
     // job.
     if groups.list[g].reform {
         crate::formation::assign_slots(units, g as u32, &mut groups.list[g]);
+        let gd = &groups.list[g];
+        let off = (0..units.len())
+            .filter(|&i| units.group[i] == g as u32 && units.death_t[i] == 0)
+            .filter(|&i| {
+                let p = goal + units.home[i];
+                terrain.blocked_at(p.x, p.y)
+            })
+            .count();
+        info!("[path-test] {case}: {} men in {} files, {off} places on blocked ground", gd.count, gd.files);
     }
     let start = groups.list[g].centroid;
     test.subjects.push(Subject {
@@ -401,8 +442,40 @@ fn log_progress(
                 if gd.order.is_some() { "on" } else { "done" }
             );
         }
-        // Where the men still out stand, every ten seconds once most are in.
-        if (0.9..0.99).contains(&share) && tick.is_multiple_of(300) && !s.reported {
+        // On the walled town, where the men are on the way up: on the
+        // walk, on a stair (flight or platform), on the ground within
+        // 6 m of a stair's foot, and within a metre of their place.
+        if scene.starts_with("walls") && tick.is_multiple_of(300) && !s.reported {
+            use crate::town_layout::{STAIRS_X, STAIR_W, WALL_Z};
+            let lane = crate::town_layout::walk_lane(terrain.body_radius());
+            let (mut walk, mut stair, mut foot, mut placed) = (0, 0, 0, 0);
+            for i in (0..units.len()).filter(|&i| units.group[i] as usize == s.g && units.death_t[i] == 0) {
+                let p = Vec2::new(units.pos[i].x, units.pos[i].z);
+                if lane.contains(p) {
+                    walk += 1;
+                } else if STAIRS_X.iter().any(|&x| p.x >= x && p.x <= x + 16.0 && p.y >= WALL_Z - 4.0 - STAIR_W && p.y <= WALL_Z - 4.0) {
+                    stair += 1;
+                } else if STAIRS_X.iter().any(|&x| p.distance(Vec2::new(x, WALL_Z - 4.0 - STAIR_W * 0.5)) <= 6.0) {
+                    foot += 1;
+                }
+                placed += usize::from(p.distance(target(s.g) + units.home[i]) <= 1.0);
+            }
+            let pending = match &gd.lane_fill {
+                Some(crate::formation::LaneFill::Pending(v)) => v.len(),
+                Some(_) => alive,
+                None => 0,
+            };
+            info!(
+                "[path-test] {} reg {} t={secs:.0}s: on the walk {walk}, on a stair {stair}, at a foot {foot}, in place {placed}, places not yet taken {pending}",
+                s.case, s.g
+            );
+        }
+        // Where the men still out stand, every ten seconds once most are
+        // in (on the walled town, from the start).
+        if ((0.9..0.99).contains(&share) || scene.starts_with("walls"))
+            && tick.is_multiple_of(300)
+            && !s.reported
+        {
             let mut out: Vec<(f32, Vec2, usize)> = (0..units.len())
                 .filter(|&i| units.group[i] as usize == s.g && units.death_t[i] == 0)
                 .map(|i| {

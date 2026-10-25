@@ -79,6 +79,21 @@ pub enum FormShape {
     Blob,
 }
 
+/// Two men on a lane whose places cross by more than this (m) along it
+/// trade places (`fill_lane_slots`).
+const LANE_CROSS: f32 = 2.0;
+
+/// A regiment coming onto a lane (town_layout.rs `Lane`) fills its run
+/// from the far end as its men arrive: `fill_lane_slots`.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum LaneFill {
+    /// Ordered onto the lane; its slots are not written yet.
+    Fresh,
+    /// The men (unit indices) still on their way to the lane, each holding
+    /// a place another arrival may take over.
+    Pending(Vec<u32>),
+}
+
 /// Slot density of a Rect formation.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum FormSpacing {
@@ -663,7 +678,8 @@ impl Plugin for FormationPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(
             FixedUpdate,
-            apply_reforms
+            (apply_reforms, fill_lane_slots)
+                .chain()
                 .after(crate::sim::take_tick)
                 .before(crate::sim::step_sim)
                 .in_set(crate::game_state::SimSet),
@@ -733,6 +749,7 @@ fn regiment_nn(units: &Units, g: usize) -> f32 {
 fn test_form_script(
     time: Res<Time>,
     units: Res<Units>,
+    terrain: Res<crate::terrain::Terrain>,
     mut groups: ResMut<Groups>,
     mut stage: Local<u32>,
     mut watch: Local<Vec<usize>>,
@@ -766,9 +783,9 @@ fn test_form_script(
             // opposite hand must face the same way (facing follows the
             // enemy side of the line, not the drag direction). The
             // reversed order is immediately overwritten by the real one.
-            crate::orders::line_order(&mut groups, &picked, b, a);
+            crate::orders::line_order(&mut groups, &terrain, &picked, b, a);
             let rev_facing = groups.list[picked[0]].facing;
-            crate::orders::line_order(&mut groups, &picked, a, b);
+            crate::orders::line_order(&mut groups, &terrain, &picked, a, b);
             let fwd_facing = groups.list[picked[0]].facing;
             if (rev_facing - fwd_facing).abs() < 0.01 {
                 info!(
@@ -1064,9 +1081,12 @@ fn apply_reforms(mut units: ResMut<Units>, mut groups: ResMut<Groups>, mut tick:
             continue;
         }
         let mut do_reform = gd.reform;
+        // No dressing while the men are still filing onto a lane: the
+        // places are handed out as they arrive.
         if !do_reform
             && gd.shape == FormShape::Rect
             && !gd.engaged
+            && gd.lane_fill.is_none()
             && (*tick).wrapping_add(g as u32).is_multiple_of(CLOSE_RANKS_PERIOD)
         {
             let lost = gd.count_at_reform.saturating_sub(gd.count);
@@ -1083,6 +1103,100 @@ fn apply_reforms(mut units: ResMut<Units>, mut groups: ResMut<Groups>, mut tick:
         if do_reform {
             let gd = &mut groups.list[g];
             assign_slots(&mut units, g as u32, gd);
+        }
+    }
+}
+
+/// A regiment coming onto a lane (orders.rs `lane_layout`) hands out its
+/// places in arrival order: the man who steps onto the lane takes the
+/// farthest place still held by a man behind him, and that man takes the
+/// place he had. The men already standing then always hold the far
+/// places, and nobody has to pass anybody along a walk too narrow to
+/// pass on, and the men on the lane keep their order along it. One test
+/// per man still on his way and one pass over the men there per tick,
+/// nothing once they are all there; a new order or a fight ends it.
+fn fill_lane_slots(mut units: ResMut<Units>, mut groups: ResMut<Groups>, terrain: Res<crate::terrain::Terrain>) {
+    if terrain.kind != crate::terrain::MapKind::WalledTown {
+        return;
+    }
+    let lane = crate::town_layout::walk_lane(terrain.body_radius());
+    for g in 0..groups.list.len() {
+        let gd = &mut groups.list[g];
+        if gd.lane_fill.is_none() {
+            continue;
+        }
+        if gd.count == 0 || gd.state.is_broken() || gd.engaged || gd.shape != FormShape::Rect {
+            gd.lane_fill = None;
+            continue;
+        }
+        if gd.lane_fill == Some(LaneFill::Fresh) {
+            if gd.reform {
+                continue;
+            }
+            let members: Vec<u32> = (0..units.len())
+                .filter(|&i| units.group[i] == g as u32 && units.death_t[i] == 0)
+                .map(|i| i as u32)
+                .collect();
+            gd.lane_fill = Some(LaneFill::Pending(members));
+        }
+        let at = match gd.order {
+            Some(crate::orders::Order::Move(p)) => p,
+            _ => gd.anchor,
+        };
+        let Some(LaneFill::Pending(pending)) = &mut gd.lane_fill else { continue };
+        let mut k = 0;
+        while k < pending.len() {
+            let i = pending[k] as usize;
+            if units.death_t[i] != 0 {
+                pending.swap_remove(k);
+                continue;
+            }
+            let p = Vec2::new(units.pos[i].x, units.pos[i].z);
+            if !lane.contains(p) {
+                k += 1;
+                continue;
+            }
+            // The farthest place a man still on his way holds, his own
+            // among them.
+            let far = pending
+                .iter()
+                .map(|&j| j as usize)
+                .max_by(|&a, &b| {
+                    let d = |j: usize| (at + units.home[j]).distance_squared(p);
+                    d(a).total_cmp(&d(b))
+                })
+                .unwrap_or(i);
+            if far != i {
+                let (a, b) = (units.home[i], units.home[far]);
+                units.home[i] = b;
+                units.home[far] = a;
+            }
+            pending.swap_remove(k);
+        }
+        // The men on the lane keep their order along it: the stream at a
+        // stair's doorway shoves a man past it, and the place he took on
+        // the far side would have him pass every man standing between.
+        // Two neighbours in that order whose places cross by more than a
+        // pace swap them, one pass a tick, so the order settles without
+        // two men side by side trading places every tick.
+        pending.sort_unstable();
+        let mut on: Vec<(f32, usize)> = (0..units.len())
+            .filter(|&i| units.group[i] == g as u32 && units.death_t[i] == 0)
+            .filter(|&i| pending.binary_search(&(i as u32)).is_err())
+            .map(|i| (units.pos[i].x, i))
+            .collect();
+        on.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+        for w in on.windows(2) {
+            let (a, b) = (w[0].1, w[1].1);
+            if units.home[a].x > units.home[b].x + LANE_CROSS {
+                let (ha, hb) = (units.home[a], units.home[b]);
+                units.home[a] = hb;
+                units.home[b] = ha;
+            }
+        }
+        if pending.is_empty() {
+            info!("regiment {g}: its men have all taken their places on the lane");
+            gd.lane_fill = None;
         }
     }
 }
