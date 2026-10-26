@@ -1183,7 +1183,23 @@ fn spawn_routpass_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups
     // it stops inside A; at 30 s `routpass_test_log` sends it on past A.
     // The men it leaves behind, and the men of A carried along, are the
     // stragglers seen in play (devlog 0318).
-    let goal = if std::env::var("FL_ROUTPASS_STOP").is_ok() { Vec2::ZERO } else { Vec2::new(0.0, -60.0) };
+    // FL_ROUTPASS_SIDE=1: the passer starts to A's right, `gap` (10 m by
+    // default) off its flank, facing and walking across A's facing, so A
+    // opens its lanes across (devlog 0318).
+    let side = std::env::var("FL_ROUTPASS_SIDE").is_ok_and(|v| v == "1");
+    let goal = if std::env::var("FL_ROUTPASS_STOP").is_ok() {
+        Vec2::ZERO
+    } else if side {
+        Vec2::new(-70.0, 0.0)
+    } else {
+        Vec2::new(0.0, -60.0)
+    };
+    if side {
+        let x = 0.5 * width + gap.unwrap_or(10.0) + half_depth(n, passer_kind);
+        let p = &mut list[1];
+        p.anchor = Vec2::new(x, 0.0);
+        p.centroid = p.anchor;
+    }
     list[1].order = Some(crate::orders::Order::Move(goal));
     list[1].auto_order = true;
     // A small held enemy far off the pass, so the battle does not end
@@ -1216,13 +1232,16 @@ fn spawn_routpass_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups
             continue;
         }
         gd.facing = if gd.team == 0 { std::f32::consts::PI } else { 0.0 };
+        if g == 1 && side {
+            gd.facing = -std::f32::consts::FRAC_PI_2;
+        }
         if size.is_some() {
             gd.files = files(n);
         }
         // FL_ROUTPASS_OPEN=1: A stands in the open order from the start.
         if g == 0 && std::env::var("FL_ROUTPASS_OPEN").is_ok_and(|v| v == "1") {
             let room = crate::formation::OPEN_ROOM_MAX;
-            let o = crate::formation::choose_open(gd, false, room, room);
+            let o = crate::formation::choose_open(gd, false, false, room, room);
             crate::formation::open_order(gd, o);
         }
         for i in crate::formation::assign_slots(units, g as u32, gd) {

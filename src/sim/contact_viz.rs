@@ -152,25 +152,30 @@ pub fn draw_contact_viz(
         if gd.spacing != crate::formation::FormSpacing::Open || gd.files == 0 {
             continue;
         }
-        let closed_centre = gd.centroid - fwd * gd.open.shift();
-        let closed = crate::formation::closed_rect_at(gd, closed_centre);
+        let closed = crate::formation::closed_rect_at(gd, crate::formation::closed_centre(gd));
         rect_lines(&mut gizmos, &closed, 0.2, CLOSED);
-        // The lanes: between the last file of a group and the first of the
-        // next, down the block's depth about the anchor.
+        // The lanes: between the last line of a group and the first of the
+        // next, along the lane axis through the block about the anchor.
         let n = gd.count.max(1);
         let files = (gd.files.max(1) as usize).min(n);
         let a = gd.open.files.max(1) as usize;
         let groups_n = crate::formation::open_groups(files, n, gd.close_to, gd.kind, &gd.open);
-        let x = crate::formation::open_file_x(groups_n, &gd.open);
-        let half_d = crate::formation::front_offset(gd) + 1.0;
+        let lines = crate::formation::open_lines(files, n, groups_n, &gd.open);
+        let at = crate::formation::open_lane_offsets(groups_n, lines, &gd.open);
+        let (gf, gr, gp) = crate::formation::grid(gd);
+        let (span_axis, lane_axis, half) = if gd.open.across {
+            (fwd, right, (gf.max(1) - 1) as f32 * 0.5 * gp.x + 1.0)
+        } else {
+            (right, fwd, (gr.max(1) - 1) as f32 * 0.5 * gp.y + 1.0)
+        };
         for k in 0..groups_n.saturating_sub(1) {
             let (last, first) = ((k + 1) * a - 1, (k + 1) * a);
-            if first >= x.len() {
+            if first >= at.len() {
                 break;
             }
-            let lane_x = 0.5 * (x[last] + x[first]);
-            let mid = gd.anchor + right * lane_x;
-            gizmos.line(lift(mid - fwd * half_d, 0.25), lift(mid + fwd * half_d, 0.25), LANE);
+            let lane_at = 0.5 * (at[last] + at[first]);
+            let mid = gd.anchor + span_axis * lane_at;
+            gizmos.line(lift(mid - lane_axis * half, 0.25), lift(mid + lane_axis * half, 0.25), LANE);
         }
     }
 }

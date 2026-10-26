@@ -383,8 +383,9 @@ fn contact_text(groups: &Groups, selection: &Selection, units: &Units) -> String
         if gd.spacing == crate::formation::FormSpacing::Open {
             let o = &gd.open;
             let lane = o.pitch - (o.files.max(1) - 1) as f32 * o.sep - w[0].body;
+            let what = if o.across { "ranks" } else { "files" };
             s.push_str(&format!(
-                "\n  open: {} files to a group {:.2} m apart, groups every {:.2} m, lane {:.2} m of air between bodies, grown {:+.1} m ahead {:+.1} m behind, closes to {:?}",
+                "\n  open: {} {what} to a group {:.2} m apart, groups every {:.2} m, lane {:.2} m of air between bodies, grown {:+.1} m ahead {:+.1} m behind, closes to {:?}",
                 o.files, o.sep, o.pitch, lane, o.front, o.back, gd.close_to
             ));
         }
