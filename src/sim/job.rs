@@ -838,7 +838,7 @@ fn open_for_passers(groups: &mut Groups, tracks: &crate::arrows::RegTracks, tick
                 // A standing friend on its closed ground keeps it open:
                 // one ordered onto that ground stands there.
                 if open && !md.passing && md.order.is_none() {
-                    let ground = crate::formation::closed_rect_at(hd, hd.centroid - fwd * hd.open.shift());
+                    let ground = crate::formation::closed_rect_at(hd, crate::formation::closed_centre(hd));
                     keep |= rect_gap(&ground, &crate::formation::block_rect(md)) < 0.0;
                 }
                 continue;
@@ -855,19 +855,30 @@ fn open_for_passers(groups: &mut Groups, tracks: &crate::arrows::RegTracks, tick
             if apart > to_goal.min(most).max(OPEN_KEEP) {
                 continue;
             }
-            // The ground the block grows toward him.
+            // The ground the block grows toward him. The lanes run his
+            // way: along the facing, or across it for a friend coming
+            // from the side.
+            let dir = (goal - md.centroid) / to_goal;
             let o = *plan.get_or_insert_with(|| {
+                let across = dir.dot(fwd).abs() < dir.dot(Vec2::new(fwd.y, -fwd.x)).abs();
                 let (front, back) = room_around(gl, h);
-                crate::formation::choose_open(hd, ready_stance(hd), front, back)
+                crate::formation::choose_open(hd, ready_stance(hd), across, front, back)
             });
-            let growth = if (md.centroid - hd.centroid).dot(fwd) > 0.0 { o.front } else { o.back };
+            // A friend from the side meets the block's flank, which does
+            // not move.
+            let growth = if o.across {
+                0.0
+            } else if (md.centroid - hd.centroid).dot(fwd) > 0.0 {
+                o.front
+            } else {
+                o.back
+            };
             let ahead = ((growth.max(0.0) + OPEN_MARGIN) / speed).max(OPEN_LEAD_S) * speed;
             let len = to_goal.min(ahead);
             if apart > len.max(OPEN_KEEP) {
                 continue;
             }
             let gap = rect_gap(&rect, &crate::formation::block_rect(md));
-            let dir = (goal - md.centroid) / to_goal;
             let crosses = path_hit(gl, m, dir, len, h).is_some();
             if crosses || gap < 0.0 {
                 opener.get_or_insert(m);
@@ -877,10 +888,17 @@ fn open_for_passers(groups: &mut Groups, tracks: &crate::arrows::RegTracks, tick
         let gd = &mut groups.list[h];
         if !open && let (Some(m), Some(o)) = (opener, plan) {
             crate::formation::open_order(gd, o);
-            info!(
-                "regiment {h} opens for regiment {m}: {} files to a group, {:.1} m ahead and {:.1} m behind",
-                o.files, o.front, o.back
-            );
+            if o.across {
+                info!(
+                    "regiment {h} opens for regiment {m} from the side: {} ranks to a group, {:.1} m ahead and {:.1} m behind",
+                    o.files, o.front, o.back
+                );
+            } else {
+                info!(
+                    "regiment {h} opens for regiment {m}: {} files to a group, {:.1} m ahead and {:.1} m behind",
+                    o.files, o.front, o.back
+                );
+            }
         } else if open && !keep {
             crate::formation::close_order(gd);
             info!("regiment {h} closes");
