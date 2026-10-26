@@ -48,7 +48,7 @@ impl Plugin for RegimentsPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(
             Update,
-            (rout_test_log, dir_test_log, arena_log, charge_test_log, pile_test_log, melee_diag_log, join_test_log, routpass_test_log, push_test_log, archery_log, room_log, shake_log),
+            (rout_test_log, dir_test_log, arena_log, charge_test_log, pile_test_log, melee_diag_log, join_test_log, routpass_test_log, pass_line_script, push_test_log, archery_log, room_log, shake_log),
         );
     }
 }
@@ -1354,6 +1354,47 @@ fn push_test_log(
 /// rectangle (its frame about its anchor), and A's men off their file
 /// line (the mean lateral distance to their slots). Watched every
 /// frame: the time from the first passer in to the last out.
+/// FL_PASS_LINE=1: in the normal battle, at 10 s, every player regiment
+/// standing behind its army's median line gets a Move order 120 m toward
+/// the enemy, through the regiments in front of it: the second line
+/// passing the first, at the battle's full size, for the cost
+/// measurement of allies make space (devlog 0318).
+fn pass_line_script(
+    mut groups: ResMut<crate::orders::Groups>,
+    time: Res<Time>,
+    mut sent: Local<bool>,
+) {
+    if *sent || std::env::var("FL_PASS_LINE").is_err() || time.elapsed_secs() < 10.0 {
+        return;
+    }
+    *sent = true;
+    let enemy: Vec<Vec2> = groups.list.iter().filter(|g| g.team == 1 && g.count > 0).map(|g| g.centroid).collect();
+    if enemy.is_empty() {
+        return;
+    }
+    let enemy_mid = enemy.iter().copied().sum::<Vec2>() / enemy.len() as f32;
+    let mut dists: Vec<f32> = groups
+        .list
+        .iter()
+        .filter(|g| g.team == 0 && g.count > 0)
+        .map(|g| g.centroid.distance(enemy_mid))
+        .collect();
+    dists.sort_by(|a, b| a.total_cmp(b));
+    let Some(&median) = dists.get(dists.len() / 2) else { return };
+    let mut n = 0;
+    for g in groups.list.iter_mut() {
+        if g.team != 0 || g.count == 0 || g.centroid.distance(enemy_mid) <= median {
+            continue;
+        }
+        let dir = (enemy_mid - g.centroid).normalize_or_zero();
+        g.order = Some(crate::orders::Order::Move(g.centroid + dir * 120.0));
+        g.auto_order = true;
+        g.reform = true;
+        n += 1;
+    }
+    info!("[pass-line] {n} rear regiments ordered 120 m through the line in front");
+}
+
 fn routpass_test_log(
     units: Res<Units>,
     mut groups: ResMut<crate::orders::Groups>,
