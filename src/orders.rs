@@ -615,13 +615,14 @@ pub fn click_order(groups: &mut Groups, terrain: &Terrain, selected: &[usize], t
     order_regiments(groups, selected, target);
 }
 
-/// The map's lane under `p`, if `p` is on one: the walled town's walk.
+/// The map's lane an order at `p` is meant for, if any: the walled
+/// town's walk, for `p` anywhere on the wall (`Lane::catches`).
 fn lane_at(terrain: &Terrain, p: Vec2) -> Option<Lane> {
     if terrain.kind != crate::terrain::MapKind::WalledTown {
         return None;
     }
     let lane = crate::town_layout::walk_lane(terrain.body_radius());
-    lane.contains(p).then_some(lane)
+    lane.catches(p).then_some(lane)
 }
 
 /// Attack-order `selected` regiments at one enemy regiment: everyone hunts
@@ -683,7 +684,8 @@ fn line_layout(
     if picked.is_empty() {
         return Vec::new();
     }
-    if let Some(lane) = lane_at(terrain, a).filter(|lane| lane.contains(b)) {
+    // A drag with either end on the wall is a drag along it.
+    if let Some(lane) = lane_at(terrain, a).or_else(|| lane_at(terrain, b)) {
         return lane_layout(groups, &lane, &picked, a, b);
     }
     let len = a.distance(b);

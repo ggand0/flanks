@@ -513,6 +513,15 @@ impl Lane {
         (p.y - WALL_Z).abs() <= 3.0 && p.x >= self.along.0 && p.x <= self.along.1
     }
 
+    /// An order at `p` means the lane: anywhere on the wall, its strips
+    /// and faces included, since a click or a drag end on the parapet,
+    /// the kerb or a face is meant for the walk. The picked point of a
+    /// click on a face lies on the cell beside it, a cell further out
+    /// than the wall's 8 m.
+    pub fn catches(&self, p: Vec2) -> bool {
+        (p.y - WALL_Z).abs() <= 6.0 && p.x >= self.along.0 && p.x <= self.along.1
+    }
+
     /// The lane's direction and its facing (yaw).
     pub fn facing(&self) -> f32 {
         crate::formation::facing_of(Vec2::Y)
