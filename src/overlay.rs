@@ -591,11 +591,11 @@ fn update_overlay(
     mut log_timer: Local<f32>,
     mut pacing: ResMut<FramePacing>,
     mut phases: ResMut<FramePhases>,
-    settings: Res<crate::settings::Settings>,
     viz: Res<crate::sim::DebugViz>,
+    contact_on: Res<crate::sim::contact_viz::ContactViz>,
 ) {
     let (frame_ms, fps) = frame_rate(&diagnostics);
-    let contact = if viz.0 && crate::sim::contact_viz::contact_viz_on(&settings) {
+    let contact = if crate::sim::contact_viz::contact_viz_on(&contact_on, &viz) {
         contact_text(&groups, &selection, &units)
     } else {
         String::new()
