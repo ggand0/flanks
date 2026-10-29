@@ -490,27 +490,30 @@ fn update_groups(
     // one of them could be in: the friend within the regiment's reach
     // (its farthest man last tick, plus a step). A regiment whose men are
     // all far from every open friend lists none and tests nothing.
+    // The open regiments first, usually none: then nothing below runs.
+    let open_regs: Vec<(u32, &crate::orders::GroupData, BlockRect, f32)> = groups
+        .list
+        .iter()
+        .enumerate()
+        .filter(|(_, hd)| hd.count > 0 && hd.spacing == crate::formation::FormSpacing::Open)
+        .map(|(h, hd)| (h as u32, hd, crate::formation::block_rect(hd), crate::formation::block_bound(hd)))
+        .collect();
     let open: Vec<Vec<(u32, BlockRect)>> = groups
         .list
         .iter()
         .enumerate()
         .map(|(g, gd)| {
-            if gd.count == 0 {
+            if gd.count == 0 || open_regs.is_empty() {
                 return Vec::new();
             }
-            groups
-                .list
+            open_regs
                 .iter()
-                .enumerate()
-                .filter(|(h, hd)| {
-                    *h != g
+                .filter(|(h, hd, _, bound)| {
+                    *h as usize != g
                         && hd.team == gd.team
-                        && hd.count > 0
-                        && hd.spacing == crate::formation::FormSpacing::Open
-                        && hd.centroid.distance(gd.centroid)
-                            <= gd.reach + 1.0 + crate::formation::block_bound(hd)
+                        && hd.centroid.distance(gd.centroid) <= gd.reach + 1.0 + bound
                 })
-                .map(|(h, hd)| (h as u32, crate::formation::block_rect(hd)))
+                .map(|(h, _, rect, _)| (*h, *rect))
                 .collect()
         })
         .collect();
