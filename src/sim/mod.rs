@@ -107,7 +107,17 @@ impl Plugin for SimPlugin {
                 )
                     .in_set(crate::game_state::SimSet),
             )
-            .add_systems(Update, (toggle_debug_viz, route::draw_routes, contact_viz::draw_contact_viz));
+            .init_resource::<contact_viz::ContactViz>()
+            .add_systems(
+                Update,
+                (
+                    toggle_debug_viz,
+                    route::draw_routes,
+                    contact_viz::toggle_contact_viz
+                        .run_if(in_state(crate::game_state::GameState::Battle)),
+                    contact_viz::draw_contact_viz,
+                ),
+            );
     }
 }
 

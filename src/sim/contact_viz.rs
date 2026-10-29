@@ -1,7 +1,8 @@
 //! The contact overlay: what the contact rules see, drawn on the ground.
-//! Under the full debug overlay (F3) or FL_CONTACT_VIZ=1, with the
-//! gizmos on (G), for every regiment that is selected, open or passing a
-//! friend: each man's body distance and spring rest at his present pose
+//! On its own key, F5 (or FL_CONTACT_VIZ=1 from the start), with the
+//! gizmos on (G), never tied to the F3 overlay: it is heavy, about
+//! seventy line segments per man shown, and it draws for every regiment
+//! that is selected, open or passing a friend: each man's body distance and spring rest at his present pose
 //! as two circles, a tick from him to his slot with the hold deadzone
 //! round the slot of a holding man, his pace, and whether he is stuck and
 //! trying a side (`try_a_side`); each regiment's block as it
@@ -18,12 +19,29 @@ use crate::units::Units;
 
 use super::soldier::{pose_level, stuck_count, stuck_trying, widths, HOLD_DEADZONE, STUCK_LEFT};
 
-/// Whether the contact overlay shows: the full debug overlay, or
-/// FL_CONTACT_VIZ=1 for a scene run without input.
-pub fn contact_viz_on(settings: &crate::settings::Settings) -> bool {
-    static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    settings.interface.debug_overlay()
-        || *ENV.get_or_init(|| std::env::var("FL_CONTACT_VIZ").is_ok())
+/// The contact overlay's switch: F5 in battle flips it, FL_CONTACT_VIZ=1
+/// starts it on for a scene run without input. Not a saved setting: it
+/// is off at every launch.
+#[derive(Resource)]
+pub struct ContactViz(pub bool);
+
+impl Default for ContactViz {
+    fn default() -> Self {
+        Self(std::env::var("FL_CONTACT_VIZ").is_ok())
+    }
+}
+
+/// F5 flips the contact overlay.
+pub fn toggle_contact_viz(keys: Res<ButtonInput<KeyCode>>, mut on: ResMut<ContactViz>) {
+    if keys.just_pressed(KeyCode::F5) {
+        on.0 = !on.0;
+        info!("contact overlay {}", if on.0 { "on" } else { "off" });
+    }
+}
+
+/// Whether the contact overlay shows: its own switch, with the gizmos on.
+pub fn contact_viz_on(on: &ContactViz, viz: &super::DebugViz) -> bool {
+    on.0 && viz.0
 }
 
 /// The regiments the overlay draws: selected, open, or passing a friend.
@@ -48,7 +66,7 @@ fn pose_colour(level: usize, alpha: f32) -> Color {
 }
 
 pub fn draw_contact_viz(
-    settings: Res<crate::settings::Settings>,
+    on: Res<ContactViz>,
     viz: Res<super::DebugViz>,
     selection: Res<Selection>,
     groups: Res<Groups>,
@@ -56,7 +74,7 @@ pub fn draw_contact_viz(
     terrain: Res<Terrain>,
     mut gizmos: Gizmos,
 ) {
-    if !viz.0 || !contact_viz_on(&settings) {
+    if !contact_viz_on(&on, &viz) {
         return;
     }
     let shown = shown(&selection, &groups);

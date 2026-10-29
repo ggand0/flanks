@@ -107,6 +107,7 @@ struct RingTerrain {
     verts: UVec2,
 }
 
+#[allow(clippy::too_many_arguments)] // every switch the rings answer to
 fn update_rings_active(
     state: Res<State<crate::game_state::GameState>>,
     selection: Res<crate::orders::Selection>,
@@ -114,10 +115,11 @@ fn update_rings_active(
     groups: Res<crate::orders::Groups>,
     settings: Res<crate::settings::Settings>,
     viz: Res<crate::sim::DebugViz>,
+    contact: Res<crate::sim::contact_viz::ContactViz>,
     mut active: ResMut<RingsActive>,
 ) {
     // The contact overlay draws its own circles under the men.
-    let contact_viz = viz.0 && crate::sim::contact_viz::contact_viz_on(&settings);
+    let contact_viz = crate::sim::contact_viz::contact_viz_on(&contact, &viz);
     let hovered =
         settings.interface.hover_rings && (hover.enemy.is_some() || hover.own.is_some());
     let selected = selection
