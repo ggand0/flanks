@@ -81,7 +81,10 @@ pub(crate) const STANCE_FIGHT: u8 = 2;
 /// width from it and their own from the same rounding, so the pair's
 /// distances are the same from either side.
 pub(crate) fn pose_level(pose: u8) -> usize {
-    (pose as usize * 3 + POSE_READY as usize / 2) / POSE_READY as usize
+    // A table, not a division: the grid rebuild reads it for every man
+    // every tick.
+    const LEVELS: [u8; 16] = [0, 0, 0, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 3, 3, 3];
+    LEVELS[(pose as usize).min(15)] as usize
 }
 /// A man's size at one pose level: his body distance and spring rest
 /// (a pair's are the mean of the two men's), and the crowd at which his
@@ -110,6 +113,42 @@ pub(crate) fn widths() -> &'static [Width; 4] {
                 slow: at(mix(body_ease() + 0.1, BRAKE_FAR)),
                 stop: at(mix(body_ease() - 0.2, BRAKE_NEAR)),
             }
+        })
+    })
+}
+/// A pair of men by their pose levels: their spring rest, its inverse,
+/// and the distance under which their bodies overlap (`scan`). Looked
+/// up per neighbour instead of averaged and divided per neighbour: the
+/// scan is the kernel's cost and the divisions were a third of it.
+pub(crate) struct PairWidth {
+    pub sep: f32,
+    pub inv_sep: f32,
+    pub hard: f32,
+}
+pub(crate) fn pair_widths() -> &'static [[PairWidth; 4]; 4] {
+    static T: std::sync::OnceLock<[[PairWidth; 4]; 4]> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        let w = widths();
+        std::array::from_fn(|a| {
+            std::array::from_fn(|b| {
+                let sep = 0.5 * (w[a].sep + w[b].sep);
+                PairWidth { sep, inv_sep: 1.0 / sep, hard: (0.5 * (w[a].body + w[b].body)).min(sep) }
+            })
+        })
+    })
+}
+/// A pair of men by their kinds: the mass weight of the push on the
+/// first (2 m_o / (m_i + m_o)) and the other's share of a closing speed
+/// (m_o / (m_i + m_o)).
+pub(crate) fn mass_pairs() -> &'static [[(f32, f32); crate::unit_types::NUM_KINDS]; crate::unit_types::NUM_KINDS] {
+    static T: std::sync::OnceLock<[[(f32, f32); crate::unit_types::NUM_KINDS]; crate::unit_types::NUM_KINDS]> =
+        std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        std::array::from_fn(|a| {
+            std::array::from_fn(|b| {
+                let (mi, mo) = (TYPES[a].mass, TYPES[b].mass);
+                (2.0 * mo / (mi + mo), mo / (mi + mo))
+            })
         })
     })
 }
@@ -781,10 +820,14 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
     let wish_dir = st.desired.normalize_or_zero();
     let my_team_bit = (team[i] as u32) * crate::spatial::META_TEAM;
     let my_wall = wall[gi] != 0;
-    let my_mass = params.mass;
-    // His width and each neighbour's by their poses at the tick's start.
+    // His width and each neighbour's by their poses at the tick's start,
+    // the pair's rest, its inverse and its overlap distance from a table,
+    // and the pair's mass weights by kind.
     let widths = widths();
-    let mine = &widths[pose_level(*s.pose)];
+    let my_level = pose_level(*s.pose);
+    let mine = &widths[my_level];
+    let pairs = &pair_widths()[my_level];
+    let masses = &mass_pairs()[st.my_kind];
     let gain = CORR_GAIN;
     let reach2 = params.reach * params.reach;
     let prev_target = *s.target;
@@ -816,8 +859,14 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
         }
         let d = p - o.xz();
         let d2 = d.length_squared();
-        let enemy = (o.meta & crate::spatial::META_TEAM) != my_team_bit
-            && (o.meta & crate::spatial::META_DYING) == 0;
+        // A friend beyond the widest spring rest can touch nothing of his:
+        // out before any of the pair's work. Most of a scan's candidates
+        // in a press are such men (the cells span more than the circle).
+        let same = (o.meta & crate::spatial::META_TEAM) == my_team_bit;
+        if same && d2 >= SEP_RADIUS * SEP_RADIUS {
+            return;
+        }
+        let enemy = !same && (o.meta & crate::spatial::META_DYING) == 0;
         if enemy && d2 < reach2 {
             sticky |= o.idx == prev_target;
             if d2 < best_d2 {
@@ -861,31 +910,30 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
         // seams the intermix needs: a pressed front's gaps shrank to about
         // 1.05 m against 0.95 m bodies and symmetric fights collapsed to a
         // two-rank duel line. It must not come back.
-        let theirs = &widths[crate::spatial::meta_pose(o.meta)];
-        let sep_r = if !cross && my_wall && (o.meta & crate::spatial::META_WALL) != 0 {
-            WALL_SEP_RADIUS
+        let pair = &pairs[crate::spatial::meta_pose(o.meta)];
+        let (sep_r, inv_sep, hard) = if !cross && my_wall && (o.meta & crate::spatial::META_WALL) != 0 {
+            (WALL_SEP_RADIUS, 1.0 / WALL_SEP_RADIUS, pair.hard.min(WALL_SEP_RADIUS))
         } else {
-            0.5 * (mine.sep + theirs.sep)
+            (pair.sep, pair.inv_sep, pair.hard)
         };
         if d2 < sep_r * sep_r && d2 > 1e-8 {
             // Mass-weighted: heavies shove lights aside.
-            let o_mass = TYPES[crate::spatial::meta_kind(o.meta)].mass;
-            let mw = 2.0 * o_mass / (my_mass + o_mass);
+            let (mw, share) = masses[crate::spatial::meta_kind(o.meta)];
             let len = d2.sqrt();
-            let w = 1.0 - len / sep_r;
-            let hard = (0.5 * (mine.body + theirs.body)).min(sep_r);
+            let inv_len = 1.0 / len;
+            let w = 1.0 - len * inv_sep;
             if len < hard {
                 // Overlap is resolved POSITIONALLY only. A hard force boost
                 // here as well made packed crowds oscillate at the
                 // acceleration cap, two solvers fighting over the same
                 // overlap, every frame.
                 let back = (hard - len) * gain * mw;
-                corr += d * (back / len);
+                corr += d * (back * inv_len);
                 overlap_vel += o_vel * back;
-                overlap_share += o_mass / (my_mass + o_mass) * back;
+                overlap_share += share * back;
                 overlap += back;
             }
-            push += d * (w * mw / len);
+            push += d * (w * mw * inv_len);
             ahead += w * (d.dot(wish_dir) < -0.5 * len) as u32 as f32;
             // Jam density: COMPRESSED pairs only — a neighbor resting AT his
             // pair's rest distance contests nothing, so a formed man's
