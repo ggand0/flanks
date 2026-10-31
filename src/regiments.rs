@@ -1144,7 +1144,9 @@ fn join_test_log(
 /// FL_ROUTPASS_SPEED=<m/s> the passer's men at about that speed;
 /// FL_ROUTPASS_FLANKS=1 two more holders like A 10 m to its sides;
 /// FL_ROUTPASS_FRONT=<m> a held enemy like A that far in front of A,
-/// the passer ordered to attack it.
+/// the passer ordered to attack it; FL_ROUTPASS_CROSS=<m> a third
+/// friendly regiment like the passer that far off A's right flank,
+/// walking across A's facing while the passer walks through A.
 fn spawn_routpass_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
     let size: Option<usize> = std::env::var("FL_ROUTPASS_SIZE").ok().and_then(|v| v.parse().ok());
     let n = size.unwrap_or(500).max(1);
@@ -1227,12 +1229,27 @@ fn spawn_routpass_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups
         list[e].steadfast = true;
         list[1].order = Some(crate::orders::Order::Attack(e as u32));
     }
+    // FL_ROUTPASS_CROSS=<m>: a third friendly regiment like the passer,
+    // that far off A's right flank, facing and walking across A's
+    // facing. It reaches A once the passer has A open along its facing
+    // and meets the files from the side, as in the play of 2026-10-31
+    // (refs/formation/debug8.png): two units through one block at right
+    // angles.
+    let cross: Option<f32> = std::env::var("FL_ROUTPASS_CROSS").ok().and_then(|v| v.parse().ok());
+    if let Some(off) = cross {
+        let x = 0.5 * width + off + half_depth(n, passer_kind);
+        spawn_regiment(units, terrain, &mut list, 0, passer_kind, Vec2::new(x, 0.0), n, -1.0);
+        let c = list.len() - 1;
+        list[c].order = Some(crate::orders::Order::Move(Vec2::new(-70.0, 0.0)));
+        list[c].auto_order = true;
+    }
+    let cross_g = cross.map(|_| list.len() - 1);
     for (g, gd) in list.iter_mut().enumerate() {
         if g == 2 {
             continue;
         }
         gd.facing = if gd.team == 0 { std::f32::consts::PI } else { 0.0 };
-        if g == 1 && side {
+        if (g == 1 && side) || Some(g) == cross_g {
             gd.facing = -std::f32::consts::FRAC_PI_2;
         }
         if size.is_some() {
@@ -1255,7 +1272,7 @@ fn spawn_routpass_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups
     if let Some(v) = std::env::var("FL_ROUTPASS_SPEED").ok().and_then(|v| v.parse::<f32>().ok()) {
         let scale = v / crate::unit_types::TYPES[passer_kind as usize].speed;
         for i in 0..units.len() {
-            if units.group[i] == 1 {
+            if units.group[i] == 1 || Some(units.group[i] as usize) == cross_g {
                 units.speed[i] *= scale;
             }
         }
@@ -1401,12 +1418,17 @@ fn routpass_test_log(
     stats: Res<crate::sim::SimStats>,
     time: Res<Time>,
     mut next: Local<f32>,
-    mut pass: Local<(Option<f32>, Option<f32>)>,
+    mut passes: Local<[(Option<f32>, Option<f32>); 2]>,
     mut sent_on: Local<bool>,
 ) {
     if std::env::var("FL_TEST_ROUTPASS").is_err() || groups.list.len() < 2 {
         return;
     }
+    // The crossing regiment (FL_ROUTPASS_CROSS): the last friendly one.
+    let cross_g = std::env::var("FL_ROUTPASS_CROSS")
+        .ok()
+        .and_then(|_| groups.list.iter().rposition(|gd| gd.team == 0))
+        .filter(|&g| g > 1);
     let t = time.elapsed_secs();
     if std::env::var("FL_ROUTPASS_STOP").is_ok() && t >= 30.0 && !*sent_on {
         *sent_on = true;
@@ -1420,38 +1442,49 @@ fn routpass_test_log(
     let rect = crate::formation::block_rect_at(a, a.anchor);
     let fwd = crate::formation::facing_dir(a.facing);
     let right = Vec2::new(fwd.y, -fwd.x);
-    let (mut inside, mut off, mut held) = (0usize, 0.0f32, 0usize);
+    let (mut inside, mut cross_in, mut off, mut held) = (0usize, 0usize, 0.0f32, 0usize);
     for i in 0..units.len() {
         if units.death_t[i] != 0 {
             continue;
         }
         let p = Vec2::new(units.pos[i].x, units.pos[i].z);
-        match units.group[i] {
+        match units.group[i] as usize {
             0 => {
                 off += (p - a.anchor - units.home[i]).dot(right).abs();
                 held += 1;
             }
             1 if rect.distance(p) == 0.0 => inside += 1,
+            g if Some(g) == cross_g && rect.distance(p) == 0.0 => cross_in += 1,
             _ => {}
         }
     }
-    let (first_in, last_out) = &mut *pass;
-    if inside > 0 && first_in.is_none() {
-        *first_in = Some(t);
-    }
-    if inside == 0
-        && let Some(t0) = *first_in
-        && last_out.is_none()
-    {
-        *last_out = Some(t);
-        info!("[routpass-test] pass: first in t={t0:.1}s, last out t={t:.1}s, {:.1} s", t - t0);
+    // The time from the first man of a passing regiment inside A to the
+    // last one out, for the passer and for the crossing regiment
+    // (`passes`, one each).
+    let time_the_pass = |pass: &mut (Option<f32>, Option<f32>), inside: usize, name: &str| {
+        let (first_in, last_out) = pass;
+        if inside > 0 && first_in.is_none() {
+            *first_in = Some(t);
+        }
+        if inside == 0
+            && let Some(t0) = *first_in
+            && last_out.is_none()
+        {
+            *last_out = Some(t);
+            info!("[routpass-test] {name}: first in t={t0:.1}s, last out t={t:.1}s, {:.1} s", t - t0);
+        }
+    };
+    let [pass, cross_pass] = &mut *passes;
+    time_the_pass(pass, inside, "pass");
+    if cross_g.is_some() {
+        time_the_pass(cross_pass, cross_in, "cross pass");
     }
     if t < *next {
         return;
     }
     *next = t + 2.0;
     info!(
-        "[routpass-test] t={t:.0}s A disorder {:.2} m, off file line {:.2} m, passer z {:.1}, {inside} inside, nn min {:.2}",
+        "[routpass-test] t={t:.0}s A disorder {:.2} m, off file line {:.2} m, passer z {:.1}, {inside} inside, cross {cross_in} inside, nn min {:.2}",
         a.disorder,
         if held > 0 { off / held as f32 } else { 0.0 },
         groups.list[1].centroid.y,
