@@ -1229,6 +1229,15 @@ fn spawn_routpass_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups
         list[e].steadfast = true;
         list[1].order = Some(crate::orders::Order::Attack(e as u32));
     }
+    // FL_ROUTPASS_FRIEND=<m>: a friendly holder like A that far in front
+    // of A's front rank, the second row's geometry of the default
+    // battle: with blocks 10 m in front and behind, A opens in pairs of
+    // files (refs/formation/debug5.png).
+    if let Some(d) = std::env::var("FL_ROUTPASS_FRIEND").ok().and_then(|v| v.parse::<f32>().ok()) {
+        let at = Vec2::new(0.0, -(holder_depth + d + holder_depth));
+        spawn_regiment(units, terrain, &mut list, 0, holder_kind, at, n, -1.0);
+        list.last_mut().unwrap().hold = true;
+    }
     // FL_ROUTPASS_CROSS=<m>: a third friendly regiment like the passer,
     // that far off A's right flank, facing and walking across A's
     // facing. It reaches A once the passer has A open along its facing
