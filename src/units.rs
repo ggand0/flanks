@@ -130,6 +130,10 @@ pub struct Units {
     /// while pressed from ahead, the ticks left of his try, how long he
     /// remembers the side he tried, and that side.
     pub stuck: Column<u16>,
+    /// The opening he saw on his last wide look and walks for (sim/soldier.rs
+    /// `choose_opening`), a point on the ground; NaN when he has none. He
+    /// looks wide only every few ticks and keeps what he found between.
+    pub aim: Column<Vec2>,
     /// Bumped every time a battle rebuilds this world. A sim tick job
     /// computed from an older world carries indices that mean nothing
     /// here: sim/mod.rs drops it instead of installing it.
@@ -315,6 +319,7 @@ pub fn push_unit(
     units.way.push(Vec2::NAN);
     units.pose.push(0);
     units.stuck.push(0);
+    units.aim.push(Vec2::NAN);
 }
 
 /// FL_TEST_SURROUND: two equal blue detachments of light infantry, one
