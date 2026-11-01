@@ -122,8 +122,11 @@ pub struct Units {
     /// his way to his slot was clear. He reads his route every few ticks,
     /// not every tick, and walks on what he chose.
     pub way: Column<Vec2>,
-    /// How far he is into his ready stance, 0 at ease to POSE_READY
-    /// (sim/soldier.rs): his body is wider in it.
+    /// How far he is into his ready stance, 0 at ease to POSE_READY (the
+    /// low four bits), and how far he has turned his shoulders to squeeze
+    /// through a crack, 0 square to POSE_READY (the high four bits;
+    /// sim/soldier.rs `pose_level`, `turn_level`): his body is wider in
+    /// the stance and narrower turned.
     pub pose: Column<u8>,
     /// Stuck on his way and trying a side (sim/soldier.rs `try_a_side`,
     /// the STUCK_* fields): the ticks he has wanted to walk and not moved

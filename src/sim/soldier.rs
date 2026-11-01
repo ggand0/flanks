@@ -79,13 +79,28 @@ pub(crate) const STANCE_FIGHT: u8 = 2;
 /// His pose as the grid carries it (spatial.rs META_POSE): 0 at ease to
 /// 3 ready, the ramp in thirds. Both men of a pair read each other's
 /// width from it and their own from the same rounding, so the pair's
-/// distances are the same from either side. A man squeezing through a
-/// crack (`try_a_side`) is at SQUEEZE_LEVEL instead, whatever his pose.
+/// distances are the same from either side. The pose byte carries the
+/// stance's ramp in its low four bits and the turn of his shoulders in its
+/// high four (`turn_level`).
 pub(crate) fn pose_level(pose: u8) -> usize {
-    // A table, not a division: the grid rebuild reads it for every man
-    // every tick.
-    const LEVELS: [u8; 16] = [0, 0, 0, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 3, 3, 3];
-    LEVELS[(pose as usize).min(15)] as usize
+    RAMP_LEVELS[(pose & POSE_STANCE) as usize] as usize
+}
+/// A ramp of POSE_READY ticks in thirds. A table, not a division: the grid
+/// rebuild reads it for every man every tick.
+const RAMP_LEVELS: [u8; 16] = [0, 0, 0, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 3, 3, 3];
+const POSE_STANCE: u8 = 0x0f;
+const POSE_TURN_SHIFT: u8 = 4;
+/// How far he has turned his shoulders to squeeze through a crack
+/// (`try_a_side`): 0 square to 3 turned. He turns over the stance's half
+/// second and turns back square over the same, so a man narrows as he
+/// reaches a crack and widens as he comes out, and a block whose squeezes
+/// end together does not jump wider in one tick.
+pub(crate) fn turn_level(pose: u8) -> usize {
+    RAMP_LEVELS[(pose >> POSE_TURN_SHIFT) as usize] as usize
+}
+/// His width level (`widths`): his pose level and his turn level together.
+pub(crate) fn width_level(pose: u8) -> usize {
+    pose_level(pose) + 4 * turn_level(pose)
 }
 /// A man's size at one pose level: his body distance and spring rest
 /// (a pair's are the mean of the two men's), and the crowd at which his
@@ -98,11 +113,11 @@ pub(crate) struct Width {
     pub slow: f32,
     pub stop: f32,
 }
-/// The width level of a man squeezing through a crack, after the four
-/// pose levels: turned sideways he is his depth across, SQUEEZE_DEPTH,
-/// body and spring alike, with the brake band of a man at ease.
-pub(crate) const SQUEEZE_LEVEL: usize = 4;
-pub(crate) const WIDTH_LEVELS: usize = 5;
+/// The width levels: his pose level (0 at ease to 3 ready) plus four times
+/// his turn level (0 square to 3 turned). Turned, he narrows across his
+/// way toward his depth, SQUEEZE_DEPTH, body and spring alike, and his
+/// brake band toward a man's at ease, a third at each level.
+pub(crate) const WIDTH_LEVELS: usize = 16;
 pub(crate) const SQUEEZE_DEPTH: f32 = 0.5;
 pub(crate) fn widths() -> &'static [Width; WIDTH_LEVELS] {
     static W: std::sync::OnceLock<[Width; WIDTH_LEVELS]> = std::sync::OnceLock::new();
@@ -122,11 +137,17 @@ pub(crate) fn widths() -> &'static [Width; WIDTH_LEVELS] {
             }
         };
         std::array::from_fn(|level| {
-            if level == SQUEEZE_LEVEL {
-                let ease = pose(0);
-                Width { body: SQUEEZE_DEPTH, sep: SQUEEZE_DEPTH, slow: ease.slow, stop: ease.stop }
-            } else {
-                pose(level)
+            let (w, turn) = (pose(level % 4), level / 4);
+            if turn == 0 {
+                return w;
+            }
+            let (t, ease) = (turn as f32 / 3.0, pose(0));
+            let mix = |square: f32, turned: f32| square + (turned - square) * t;
+            Width {
+                body: mix(w.body, SQUEEZE_DEPTH),
+                sep: mix(w.sep, SQUEEZE_DEPTH),
+                slow: mix(w.slow, ease.slow),
+                stop: mix(w.stop, ease.stop),
             }
         })
     })
@@ -135,11 +156,12 @@ pub(crate) fn widths() -> &'static [Width; WIDTH_LEVELS] {
 /// and the distance under which their bodies overlap (`scan`). Looked
 /// up per neighbour instead of averaged and divided per neighbour: the
 /// scan is the kernel's cost and the divisions were a third of it. A
-/// pair with a squeezing man in it rests at the touch: turned sideways
-/// and pressing into a crack he has no air between his shoulder and the
-/// men beside him, and with the other man's spring reaching past the
-/// touch a crack narrowed by earlier passers held every squeezer short
-/// of it for good (toy devlog 011).
+/// pair with a turned man in it rests nearer the touch, at it when he is
+/// fully turned (by the more turned of the two): turned sideways and
+/// pressing into a crack he has no air between his shoulder and the men
+/// beside him, and with the other man's spring reaching past the touch a
+/// crack narrowed by earlier passers held every squeezer short of it for
+/// good (toy devlog 011).
 pub(crate) struct PairWidth {
     pub sep: f32,
     pub inv_sep: f32,
@@ -153,9 +175,7 @@ pub(crate) fn pair_widths() -> &'static [[PairWidth; WIDTH_LEVELS]; WIDTH_LEVELS
             std::array::from_fn(|b| {
                 let mut sep = 0.5 * (w[a].sep + w[b].sep);
                 let hard = (0.5 * (w[a].body + w[b].body)).min(sep);
-                if a == SQUEEZE_LEVEL || b == SQUEEZE_LEVEL {
-                    sep = hard;
-                }
+                sep += (hard - sep) * ((a / 4).max(b / 4) as f32 / 3.0);
                 PairWidth { sep, inv_sep: 1.0 / sep, hard }
             })
         })
@@ -879,14 +899,13 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
     let wish_dir = st.desired.normalize_or_zero();
     let my_team_bit = (team[i] as u32) * crate::spatial::META_TEAM;
     let my_wall = wall[gi] != 0;
-    // His width and each neighbour's by their poses at the tick's start
-    // (the squeeze's level for a man squeezing), the pair's rest, its
-    // inverse and its overlap distance from a table, and the pair's mass
-    // weights by kind.
+    // His width and each neighbour's by their poses and the turn of their
+    // shoulders at the tick's start, the pair's rest, its inverse and its
+    // overlap distance from a table, and the pair's mass weights by kind.
     let widths = widths();
     let squeeze_on = squeezing(*s.stuck);
     let pose_lv = pose_level(*s.pose);
-    let my_level = if squeeze_on { SQUEEZE_LEVEL } else { pose_lv };
+    let my_level = width_level(*s.pose);
     let mine = &widths[my_level];
     // The choice of opening's read (`choose_opening`): only a man walking
     // somewhere, not fighting, reads the comrades ahead; a man squeezing
@@ -1017,12 +1036,7 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
                 }
             }
         }
-        let o_level = if (o.meta & crate::spatial::META_SQUEEZE) != 0 {
-            SQUEEZE_LEVEL
-        } else {
-            crate::spatial::meta_pose(o.meta)
-        };
-        let pair = &pairs[o_level];
+        let pair = &pairs[crate::spatial::meta_width(o.meta)];
         let (sep_r, inv_sep, hard) = if !cross && my_wall && (o.meta & crate::spatial::META_WALL) != 0 {
             (WALL_SEP_RADIUS, 1.0 / WALL_SEP_RADIUS, pair.hard.min(WALL_SEP_RADIUS))
         } else {
@@ -1094,11 +1108,13 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
         STANCE_READY => s.vel.xz().length_squared() < STEP_FACE_SPEED * STEP_FACE_SPEED,
         _ => false,
     };
-    *s.pose = if ready || best_idx != u32::MAX {
-        (*s.pose + 1).min(POSE_READY)
+    let stance_ramp = *s.pose & POSE_STANCE;
+    let stance_ramp = if ready || best_idx != u32::MAX {
+        (stance_ramp + 1).min(POSE_READY)
     } else {
-        s.pose.saturating_sub(1)
+        stance_ramp.saturating_sub(1)
     };
+    *s.pose = (*s.pose & !POSE_STANCE) | stance_ramp;
     st.brake = (mine.slow, mine.stop);
     // An archer's knife: out while his regiment has its swords out, and
     // for a few seconds after an enemy came close to him, one in his
@@ -1495,7 +1511,7 @@ fn squeeze_ticks(v: u16) -> u16 {
 
 /// The squeeze (docs/plans/032): a man going through a crack narrower
 /// than he is wide turns his shoulders and is SQUEEZE_DEPTH across
-/// (SQUEEZE_LEVEL). It lasts from the crack's mouth until he is through:
+/// (`turn_level`). It lasts from the crack's mouth until he is through:
 /// it ends once he has no body within his normal width at each side
 /// (less BETWEEN_SLACK, within a metre along his way) and either he aims
 /// at no crack or he moves freely at nine tenths of the advance pace with
@@ -1668,7 +1684,7 @@ fn openings(
 /// The blind sidestep is only for a man with no opening to aim at
 /// (`choose_opening`): reaching a crack he aims at that fits only his
 /// depth, he turns his shoulders at once and squeezes through
-/// (SQUEEZE_LEVEL). Only a man walking somewhere, under his regiment's
+/// (`turn_level`). Only a man walking somewhere, under his regiment's
 /// order or back to a slot more than TRY_FROM_SLOT off, with no enemy in
 /// mind and his regiment not fighting: men walking to a fight and the
 /// rear ranks of a fighting regiment keep their own rules (`close_in`),
@@ -1694,6 +1710,7 @@ fn try_a_side(f: &Field, s: &mut Soldier, st: &mut Step) {
         && want > 0.5;
     if !going {
         *s.stuck = 0;
+        turn_shoulders(s);
         return;
     }
     let dir = wish / want;
@@ -1764,6 +1781,17 @@ fn try_a_side(f: &Field, s: &mut Soldier, st: &mut Step) {
     }
     let low = if squeeze > 0 { STUCK_SQUEEZE | squeeze } else { count | (trying << STUCK_TRY_SHIFT) };
     *s.stuck = low | (mem << STUCK_MEM_SHIFT) | (left as u16 * STUCK_LEFT) | (v & STUCK_WIDE_DEPTH);
+    turn_shoulders(s);
+}
+
+/// The turn of his shoulders follows his squeeze a step a tick
+/// (`turn_level`): toward turned while he squeezes, back toward square
+/// once he does not.
+#[inline]
+fn turn_shoulders(s: &mut Soldier) {
+    let turn = *s.pose >> POSE_TURN_SHIFT;
+    let turn = if squeezing(*s.stuck) { (turn + 1).min(POSE_READY) } else { turn.saturating_sub(1) };
+    *s.pose = (*s.pose & POSE_STANCE) | (turn << POSE_TURN_SHIFT);
 }
 
 /// Two things a man in melee does not do for his slot: step back away

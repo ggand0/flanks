@@ -36,12 +36,15 @@ pub const META_WALL: u32 = 1 << 4;
 /// to 3 ready, sim/soldier.rs `pose_level`): read it with `meta_pose`.
 pub const META_POSE_SHIFT: u32 = 5;
 pub const META_POSE: u32 = 0b11 << META_POSE_SHIFT;
-/// The unit is squeezing through a crack, turned sideways (sim/soldier.rs
-/// `try_a_side`): his width is SQUEEZE_LEVEL's, whatever his pose.
-pub const META_SQUEEZE: u32 = 1 << 7;
+/// How far the unit has turned his shoulders to squeeze through a crack,
+/// a 2-bit FIELD (0 square to 3 turned, sim/soldier.rs `turn_level`), right
+/// above the pose so the two read together as his width level
+/// (`meta_width`).
+pub const META_TURN_SHIFT: u32 = 7;
+pub const META_TURN: u32 = 0b11 << META_TURN_SHIFT;
 /// The unit's regiment (index into `Groups::list`) fills the bits above
 /// the flags: read it with `meta_group`.
-pub const META_GROUP_SHIFT: u32 = 8;
+pub const META_GROUP_SHIFT: u32 = 9;
 
 /// The kind field of a `SortedUnit::meta` (index into `unit_types::TYPES`).
 #[inline]
@@ -53,6 +56,13 @@ pub fn meta_kind(meta: u32) -> usize {
 #[inline]
 pub fn meta_pose(meta: u32) -> usize {
     ((meta & META_POSE) >> META_POSE_SHIFT) as usize
+}
+
+/// His width level, the pose and the turn of his shoulders together
+/// (sim/soldier.rs `widths`: pose level + 4 x turn level).
+#[inline]
+pub fn meta_width(meta: u32) -> usize {
+    ((meta & (META_POSE | META_TURN)) >> META_POSE_SHIFT) as usize
 }
 
 /// The regiment field of a `SortedUnit::meta`.
@@ -118,7 +128,6 @@ impl SpatialGrid {
         groups: &[u32],
         death_t: &[u8],
         poses: &[u8],
-        stuck: &[u16],
         group_wall: &[bool],
     ) {
         let n = positions.len();
@@ -208,7 +217,7 @@ impl SpatialGrid {
                             | (((death_t[i] > 0) as u32) * META_DYING)
                             | ((group_wall[groups[i] as usize] as u32) * META_WALL)
                             | ((crate::sim::soldier::pose_level(poses[i]) as u32) << META_POSE_SHIFT)
-                            | ((crate::sim::soldier::squeezing(stuck[i]) as u32) * META_SQUEEZE)
+                            | ((crate::sim::soldier::turn_level(poses[i]) as u32) << META_TURN_SHIFT)
                             | (groups[i] << META_GROUP_SHIFT);
                         unsafe {
                             *out.0.add(k) = SortedUnit {
