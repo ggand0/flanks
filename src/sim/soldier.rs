@@ -1223,9 +1223,10 @@ pub(crate) fn stuck_trying(v: u16) -> u16 {
 }
 
 /// A man going somewhere who finds himself stuck tries a side. Stuck is
-/// felt, not seen: he wants to walk and has moved at under half his wish
-/// for STUCK_TICKS with bodies pressed against him ahead (the net push
-/// would not do: in a press the men behind cancel the men in front). He
+/// felt, not seen: he wants to walk and has moved at under half his wish,
+/// and slower than a step, for STUCK_TICKS with bodies pressed against
+/// him ahead (the net push would not do: in a press the men behind cancel
+/// the men in front). He
 /// tries the side his separation push leans to, the side with more room;
 /// when it leans nowhere, the side he tried within the last SIDE_MEMORY,
 /// else his own coin: a sidestep at STEP_PACE on top of whatever the
@@ -1281,8 +1282,11 @@ fn try_a_side(f: &Field, s: &mut Soldier, st: &mut Step) {
         st.desired += side * STEP_PACE;
         mem = SIDE_MEMORY;
     } else {
+        // Stuck: pressed, and not even stepping. Under half his wish
+        // alone, a lane walker at the sprint behind a slower man counted
+        // stuck at a jog and zigzagged down the lane.
         let pressed = st.ahead > AHEAD_MIN;
-        let stuck = pressed && s.vel.xz().dot(dir) < 0.5 * want;
+        let stuck = pressed && s.vel.xz().dot(dir) < (0.5 * want).min(STEP_PACE);
         count = if stuck { (count + 1).min(STUCK_TICKS) } else { count.saturating_sub(1) };
         if count >= STUCK_TICKS {
             let lean = st.push.dot(left_dir);
