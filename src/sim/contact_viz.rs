@@ -99,7 +99,7 @@ pub fn draw_contact_viz(
         let p2 = Vec2::new(p.x, p.z);
         let at = lift(p2, 0.12);
         let level = pose_level(units.pose[i]);
-        let width = &w[level];
+        let width = &w[crate::sim::soldier::width_level(units.pose[i])];
         gizmos.circle(Isometry3d::new(at, flat), 0.5 * width.body, pose_colour(level, 1.0));
         gizmos.circle(Isometry3d::new(at, flat), 0.5 * width.sep, SPRING).resolution(16);
         // His slot: where his regiment holds, or where its Move order

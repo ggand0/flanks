@@ -358,7 +358,7 @@ fn contact_text(groups: &Groups, selection: &Selection, units: &Units) -> String
     for i in 0..units.len() {
         if units.death_t[i] == 0 {
             let g = units.group[i] as usize;
-            pose_sum[g] += units.pose[i] as u32;
+            pose_sum[g] += (units.pose[i] & 0x0f) as u32;
             pose_n[g] += 1;
             stuck_n[g] += (so::stuck_count(units.stuck[i]) >= 8) as u32;
             trying_n[g] += (so::stuck_trying(units.stuck[i]) != 0) as u32;

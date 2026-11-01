@@ -439,7 +439,7 @@ fn run_tick_job(job: &mut TickJob) {
     let t0 = Instant::now();
     {
         let _span = info_span!("grid_rebuild").entered();
-        grid.rebuild(pos_prev, &vel_in[..], team, kind, group, death_t_in, &pose_in[..], &stuck_in[..], group_wall);
+        grid.rebuild(pos_prev, &vel_in[..], team, kind, group, death_t_in, &pose_in[..], group_wall);
     }
     let t1 = Instant::now();
     *grid_ms = (t1 - t0).as_secs_f32() * 1000.0;
