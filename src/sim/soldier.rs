@@ -598,6 +598,9 @@ struct Step {
     sep0: f32,
     saw: bool,
     near: (f32, f32, u8),
+    /// The near opening's air across his way and the far side of its
+    /// passage along it (`choose_opening`'s taken crack).
+    near_span: (f32, f32, f32),
     between: bool,
     aim_fit: u8,
     gap: bool,
@@ -743,6 +746,7 @@ fn begin(f: &Field, s: &mut Soldier) -> Step {
         sep0: 0.0,
         saw: false,
         near: (0.0, 0.0, 0),
+        near_span: (0.0, 0.0, 0.0),
         between: false,
         aim_fit: 0,
         gap: false,
@@ -990,8 +994,8 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
         // 1.05 m against 0.95 m bodies and symmetric fights collapsed to a
         // two-rank duel line. It must not come back.
         // The comrades ahead for the choice of opening: a queue (a man of
-        // a regiment under an order moving his way, or squeezing) is not
-        // an obstacle; a holding man always is.
+        // a regiment under an order moving his way) is not an obstacle; a
+        // holding man always is.
         if same && (o.meta & crate::spatial::META_DYING) == 0 && (open_on | squeeze_on) {
             let to = -d;
             let along = to.dot(wish_dir);
@@ -999,10 +1003,9 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
             let o_body = widths[crate::spatial::meta_pose(o.meta)].body;
             if open_on && along > OPEN_AHEAD {
                 let holding = orders[crate::spatial::meta_group(o.meta)].is_none();
-                let queue = !holding
-                    && (o_vel.dot(wish_dir) > QUEUE_SPEED || (o.meta & crate::spatial::META_SQUEEZE) != 0);
+                let queue = !holding && o_vel.dot(wish_dir) > QUEUE_SPEED;
                 if !queue {
-                    row.add(lat, 0.5 * o_body);
+                    row.add(lat, 0.5 * o_body, along);
                     row_at = row_at.min(along);
                 }
             }
@@ -1136,7 +1139,9 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
     st.saw = row_at.is_finite();
     if open_on && st.saw {
         let (pref, coin) = side_pref(i, *s.stuck);
-        st.near = openings(&row, row_at, OPEN_SEE, body0, SQUEEZE_DEPTH, false, pref, coin);
+        let (aim_lat, aim_along, fit, span) = openings(&row, row_at, OPEN_SEE, body0, SQUEEZE_DEPTH, false, pref, coin);
+        st.near = (aim_lat, aim_along, fit);
+        st.near_span = span;
     }
     st.between = side_left && side_right;
 }
@@ -1175,6 +1180,35 @@ fn choose_opening(f: &Field, s: &mut Soldier, st: &mut Step) {
     if fit > 0 {
         *s.aim = Vec2::NAN;
     }
+    // A man he follows still takes up his space: a near crack that fits
+    // only his depth is taken by any comrade ahead of him, one he follows
+    // or not, whose body overlaps its air short of its passage's far side.
+    // He may still aim at a taken crack, which is following, but never
+    // turns his shoulders for it. Only for a man with such a crack in his
+    // aim, so a second look at the comrades within the scan's box.
+    let mut taken = false;
+    if fit == 1 {
+        let (lo, hi, far) = st.near_span;
+        let my_team_bit = st.my_team_bit;
+        let widths = widths();
+        grid.for_each_candidate(p, QUERY_RADIUS, |o| {
+            if taken
+                || o.idx as usize == i
+                || (o.meta & crate::spatial::META_TEAM) != my_team_bit
+                || (o.meta & crate::spatial::META_DYING) != 0
+            {
+                return;
+            }
+            let to = o.xz() - p;
+            let along = to.dot(wd);
+            if along <= OPEN_AHEAD || to.length_squared() >= QUERY_RADIUS * QUERY_RADIUS {
+                return;
+            }
+            let lat = wd.x * to.y - wd.y * to.x;
+            let r = 0.5 * widths[crate::spatial::meta_pose(o.meta)].body;
+            taken = along - r < far && lat + r > lo && lat - r < hi;
+        });
+    }
     // The wide look: nothing near fits and he saw somebody in his way.
     if fit == 0 && st.saw && tick.wrapping_add((i as u32).wrapping_mul(7)).is_multiple_of(OPEN_LOOK_TICKS) {
         let (pref, coin) = side_pref(i, v);
@@ -1193,7 +1227,7 @@ fn choose_opening(f: &Field, s: &mut Soldier, st: &mut Step) {
                 return None;
             }
             let holding = orders[crate::spatial::meta_group(o.meta)].is_none();
-            if !holding && (o_vel.dot(wd) > QUEUE_SPEED || (o.meta & crate::spatial::META_SQUEEZE) != 0) {
+            if !holding && o_vel.dot(wd) > QUEUE_SPEED {
                 return None;
             }
             let lat = wd.x * to.y - wd.y * to.x;
@@ -1210,10 +1244,10 @@ fn choose_opening(f: &Field, s: &mut Soldier, st: &mut Step) {
             if let Some((along, lat, half)) = read(o, o_vel)
                 && along < wide_at + OPEN_BAND
             {
-                wide.add(lat, half);
+                wide.add(lat, half, along);
             }
         });
-        let (w_lat, w_along, w_fit) = openings(&wide, wide_at, OPEN_FAR, st.body0, SQUEEZE_DEPTH, true, pref, coin);
+        let (w_lat, w_along, w_fit, _) = openings(&wide, wide_at, OPEN_FAR, st.body0, SQUEEZE_DEPTH, true, pref, coin);
         *s.aim = if w_fit > 0 { p + wd * w_along + perp * w_lat } else { Vec2::NAN };
         v = (v & !STUCK_WIDE_DEPTH) | ((w_fit == 1) as u16 * STUCK_WIDE_DEPTH);
     }
@@ -1230,7 +1264,7 @@ fn choose_opening(f: &Field, s: &mut Soldier, st: &mut Step) {
         }
     }
     st.aim_fit = fit;
-    st.gap = fit == 1;
+    st.gap = fit == 1 && !taken;
     st.gap_near = st.gap && aim_along < st.sep0;
     if fit > 0 {
         // The side he chose, remembered as the try remembers its side.
@@ -1466,7 +1500,8 @@ fn squeeze_ticks(v: u16) -> u16 {
 /// (less BETWEEN_SLACK, within a metre along his way) and either he aims
 /// at no crack or he moves freely at nine tenths of the advance pace with
 /// no crack within his spring, after TRY_MIN ticks, or after
-/// SQUEEZE_STALL ticks with no progress at a mouth he cannot enter. While
+/// SQUEEZE_STALL ticks with no progress, whatever is beside him: a man
+/// wedged in a press turns back square (toy devlog 015). While
 /// it lasts his legs push along his wish with their full effort, not
 /// faded by the crowd's brake, and his speed is capped at SQUEEZE_CAP,
 /// a walk.
@@ -1478,9 +1513,9 @@ const SQUEEZE_CAP: f32 = 2.0;
 /// reads the comrades ahead of him within OPEN_SEE (the scan's same-team
 /// reach) and aims at an opening between them that fits him, before he
 /// reaches them. A comrade of a regiment under an order who moves his way
-/// faster than QUEUE_SPEED, or who is squeezing, is a queue he follows,
-/// not an obstacle; a holding man is an obstacle whatever a shove does to
-/// him. Of the obstacles he takes the row nearest him (the men within
+/// faster than QUEUE_SPEED is a queue he follows, not an obstacle; a
+/// holding man is an obstacle whatever a shove does to him, and a man
+/// squeezing who has stopped is a body like any other. Of the obstacles he takes the row nearest him (the men within
 /// OPEN_BAND along of the nearest one, a rank's pitch and a bit, so the
 /// two files of a pair offset by a rank read as one row) and in it the
 /// nearest two on each side of his way. The air between neighbouring men
@@ -1495,7 +1530,11 @@ const SQUEEZE_CAP: f32 = 2.0;
 /// OPEN_LOOK_TICKS, in his own rhythm, where the open ground beyond the
 /// last man on each side counts too, and keeps what he found (`aim`)
 /// until his next look, until it is behind him or until his near read
-/// fits. Measured in the toy first (toy devlogs 012 and 013).
+/// fits. A man he follows still takes up his space: a crack that fits
+/// only his depth with any comrade inside its passage is taken, and he
+/// does not turn his shoulders for it, though he may aim at it, which is
+/// following (toy devlog 015). Measured in the toy first (toy devlogs 012,
+/// 013 and 015).
 const OPEN_SEE: f32 = SEP_RADIUS;
 const OPEN_FAR: f32 = 4.0;
 const OPEN_BAND: f32 = 1.5;
@@ -1514,28 +1553,30 @@ fn opening_on() -> bool {
 
 /// The row nearest a man: the nearest two obstacles on each side of his
 /// way by their offset across it (left positive), each with his half
-/// body.
+/// body and his far side along the way (his offset along it plus his half
+/// body).
 #[derive(Default)]
 struct Row {
-    left: [(f32, f32); 2],
-    right: [(f32, f32); 2],
+    left: [(f32, f32, f32); 2],
+    right: [(f32, f32, f32); 2],
     n_left: u8,
     n_right: u8,
 }
 impl Row {
     #[inline]
-    fn add(&mut self, lat: f32, half: f32) {
+    fn add(&mut self, lat: f32, half: f32, along: f32) {
         let (side, n, key) = if lat >= 0.0 {
             (&mut self.left, &mut self.n_left, lat)
         } else {
             (&mut self.right, &mut self.n_right, -lat)
         };
+        let man = (key, half, along + half);
         if *n == 0 || key < side[0].0 {
             side[1] = side[0];
-            side[0] = (key, half);
+            side[0] = man;
             *n = (*n + 1).min(2);
         } else if *n == 1 || key < side[1].0 {
-            side[1] = (key, half);
+            side[1] = man;
             *n = 2;
         }
     }
@@ -1546,29 +1587,43 @@ impl Row {
 /// two nearest on his left, right between the two on his right, and, when
 /// `beyond` (the wide look), the open ground past the last man seen on a
 /// side up to the edge of his sight at that distance. Returns the aim
-/// across and along his way and its fit (0 none, 1 his depth, 2 his
-/// width).
+/// across and along his way, its fit (0 none, 1 his depth, 2 his width),
+/// and the picked opening's air across his way with the far side of its
+/// passage along it (the farther of its two men's far sides).
 #[allow(clippy::too_many_arguments)]
-fn openings(row: &Row, row_at: f32, see: f32, body: f32, depth: f32, beyond: bool, pref: f32, coin: f32) -> (f32, f32, u8) {
+fn openings(
+    row: &Row,
+    row_at: f32,
+    see: f32,
+    body: f32,
+    depth: f32,
+    beyond: bool,
+    pref: f32,
+    coin: f32,
+) -> (f32, f32, u8, (f32, f32, f32)) {
+    let none = (f32::NAN, f32::NAN, f32::NAN);
     if row.n_left == 0 && row.n_right == 0 {
-        return (0.0, 0.0, 0);
+        return (0.0, 0.0, 0, none);
     }
     let edge = (see * see - row_at.min(see) * row_at.min(see)).max(0.0).sqrt();
     let far = if beyond { edge } else { f32::NAN };
-    let (l1, l1r) = if row.n_left >= 1 { row.left[0] } else { (f32::NAN, f32::NAN) };
-    let (r1, r1r) = if row.n_right >= 1 { row.right[0] } else { (f32::NAN, f32::NAN) };
-    let hi_l = if row.n_left >= 2 { row.left[1].0 - row.left[1].1 } else { far };
-    let lo_r = if row.n_right >= 2 { -(row.right[1].0 - row.right[1].1) } else { -far };
+    let (l1, l1r, l1f) = if row.n_left >= 1 { row.left[0] } else { none };
+    let (r1, r1r, r1f) = if row.n_right >= 1 { row.right[0] } else { none };
+    let (hi_l, l2f) = if row.n_left >= 2 { (row.left[1].0 - row.left[1].1, row.left[1].2) } else { (far, f32::NAN) };
+    let (lo_r, r2f) = if row.n_right >= 2 { (-(row.right[1].0 - row.right[1].1), row.right[1].2) } else { (-far, f32::NAN) };
+    // f32::max takes the number over a NaN: a side with one man seen has
+    // his far side.
     let ahead = (
         if row.n_right >= 1 { -(r1 - r1r) } else { -far },
         if row.n_left >= 1 { l1 - l1r } else { far },
         true,
+        l1f.max(r1f),
     );
-    let left = (l1 + l1r, hi_l, row.n_left >= 1);
-    let right = (lo_r, -(r1 + r1r), row.n_right >= 1);
+    let left = (l1 + l1r, hi_l, row.n_left >= 1, l1f.max(l2f));
+    let right = (lo_r, -(r1 + r1r), row.n_right >= 1, r1f.max(r2f));
     let sign = |x: f32| if x > 0.0 { 1.0 } else if x < 0.0 { -1.0 } else { 0.0 };
-    let (mut best, mut aim_lat, mut fit) = (f32::INFINITY, 0.0, 0u8);
-    for (lo, hi, ok) in [ahead, left, right] {
+    let (mut best, mut aim_lat, mut fit, mut span) = (f32::INFINITY, 0.0, 0u8, none);
+    for (lo, hi, ok, pass) in [ahead, left, right] {
         if !ok {
             continue;
         }
@@ -1589,9 +1644,10 @@ fn openings(row: &Row, row_at: f32, see: f32, body: f32, depth: f32, beyond: boo
             best = cost;
             aim_lat = aim;
             fit = if fw { 2 } else { 1 };
+            span = (lo, hi, pass);
         }
     }
-    (aim_lat, if fit > 0 { row_at.min(see) } else { 0.0 }, fit)
+    (aim_lat, if fit > 0 { row_at.min(see) } else { 0.0 }, fit, span)
 }
 
 /// A man going somewhere who finds himself stuck tries a side. Stuck is
@@ -1649,13 +1705,15 @@ fn try_a_side(f: &Field, s: &mut Soldier, st: &mut Step) {
     let mut mem = (v & STUCK_MEM) >> STUCK_MEM_SHIFT;
     let mut left = v & STUCK_LEFT != 0;
     let v_along = s.vel.xz().dot(dir);
-    // The squeeze (SQUEEZE_LEVEL above): it ends once no body is at each
+    // The squeeze (SQUEEZE_STALL above): it ends once no body is at each
     // of his sides and either no crack is ahead or he walks freely, or
-    // at a mouth he cannot enter; wedged between two bodies he keeps on.
+    // once he has made no progress for SQUEEZE_STALL ticks, whatever is
+    // beside him: a man wedged in a press turns back square.
     if squeeze > 0 {
         let free = v_along >= 0.9 * ADVANCE_PACE && !st.gap_near;
-        let through = (squeeze >= TRY_MIN && (!st.gap || free)) || (squeeze >= SQUEEZE_STALL && v_along < 0.1);
-        squeeze = if !st.between && through { 0 } else { (squeeze + 1).min(STUCK_SQUEEZE_TICKS) };
+        let stalled = squeeze >= SQUEEZE_STALL && v_along < 0.1;
+        let through = !st.between && squeeze >= TRY_MIN && (!st.gap || free);
+        squeeze = if through || stalled { 0 } else { (squeeze + 1).min(STUCK_SQUEEZE_TICKS) };
     }
     if squeeze > 0 {
         // His legs at their full effort along his wish: he pushes with
