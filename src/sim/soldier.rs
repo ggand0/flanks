@@ -79,7 +79,8 @@ pub(crate) const STANCE_FIGHT: u8 = 2;
 /// His pose as the grid carries it (spatial.rs META_POSE): 0 at ease to
 /// 3 ready, the ramp in thirds. Both men of a pair read each other's
 /// width from it and their own from the same rounding, so the pair's
-/// distances are the same from either side.
+/// distances are the same from either side. A man squeezing through a
+/// crack (`try_a_side`) is at SQUEEZE_LEVEL instead, whatever his pose.
 pub(crate) fn pose_level(pose: u8) -> usize {
     // A table, not a division: the grid rebuild reads it for every man
     // every tick.
@@ -97,11 +98,17 @@ pub(crate) struct Width {
     pub slow: f32,
     pub stop: f32,
 }
-pub(crate) fn widths() -> &'static [Width; 4] {
-    static W: std::sync::OnceLock<[Width; 4]> = std::sync::OnceLock::new();
+/// The width level of a man squeezing through a crack, after the four
+/// pose levels: turned sideways he is his depth across, SQUEEZE_DEPTH,
+/// body and spring alike, with the brake band of a man at ease.
+pub(crate) const SQUEEZE_LEVEL: usize = 4;
+pub(crate) const WIDTH_LEVELS: usize = 5;
+pub(crate) const SQUEEZE_DEPTH: f32 = 0.5;
+pub(crate) fn widths() -> &'static [Width; WIDTH_LEVELS] {
+    static W: std::sync::OnceLock<[Width; WIDTH_LEVELS]> = std::sync::OnceLock::new();
     W.get_or_init(|| {
         let scale = crate::unit_types::unit_scale();
-        std::array::from_fn(|level| {
+        let pose = |level: usize| {
             let t = level as f32 / 3.0;
             let mix = |ease: f32, ready: f32| ease * (1.0 - t) + ready * t;
             let body = mix(body_ease(), body_distance());
@@ -113,26 +120,43 @@ pub(crate) fn widths() -> &'static [Width; 4] {
                 slow: at(mix(body_ease() + 0.1, BRAKE_FAR)),
                 stop: at(mix(body_ease() - 0.2, BRAKE_NEAR)),
             }
+        };
+        std::array::from_fn(|level| {
+            if level == SQUEEZE_LEVEL {
+                let ease = pose(0);
+                Width { body: SQUEEZE_DEPTH, sep: SQUEEZE_DEPTH, slow: ease.slow, stop: ease.stop }
+            } else {
+                pose(level)
+            }
         })
     })
 }
-/// A pair of men by their pose levels: their spring rest, its inverse,
+/// A pair of men by their width levels: their spring rest, its inverse,
 /// and the distance under which their bodies overlap (`scan`). Looked
 /// up per neighbour instead of averaged and divided per neighbour: the
-/// scan is the kernel's cost and the divisions were a third of it.
+/// scan is the kernel's cost and the divisions were a third of it. A
+/// pair with a squeezing man in it rests at the touch: turned sideways
+/// and pressing into a crack he has no air between his shoulder and the
+/// men beside him, and with the other man's spring reaching past the
+/// touch a crack narrowed by earlier passers held every squeezer short
+/// of it for good (toy devlog 011).
 pub(crate) struct PairWidth {
     pub sep: f32,
     pub inv_sep: f32,
     pub hard: f32,
 }
-pub(crate) fn pair_widths() -> &'static [[PairWidth; 4]; 4] {
-    static T: std::sync::OnceLock<[[PairWidth; 4]; 4]> = std::sync::OnceLock::new();
+pub(crate) fn pair_widths() -> &'static [[PairWidth; WIDTH_LEVELS]; WIDTH_LEVELS] {
+    static T: std::sync::OnceLock<[[PairWidth; WIDTH_LEVELS]; WIDTH_LEVELS]> = std::sync::OnceLock::new();
     T.get_or_init(|| {
         let w = widths();
         std::array::from_fn(|a| {
             std::array::from_fn(|b| {
-                let sep = 0.5 * (w[a].sep + w[b].sep);
-                PairWidth { sep, inv_sep: 1.0 / sep, hard: (0.5 * (w[a].body + w[b].body)).min(sep) }
+                let mut sep = 0.5 * (w[a].sep + w[b].sep);
+                let hard = (0.5 * (w[a].body + w[b].body)).min(sep);
+                if a == SQUEEZE_LEVEL || b == SQUEEZE_LEVEL {
+                    sep = hard;
+                }
+                PairWidth { sep, inv_sep: 1.0 / sep, hard }
             })
         })
     })
@@ -468,6 +492,7 @@ pub(crate) struct Soldier<'a> {
     pub pose: &'a mut u8,
     pub quarry: &'a mut u32,
     pub stuck: &'a mut u16,
+    pub aim: &'a mut Vec2,
 }
 
 /// The rows of one chunk of soldiers, in index order.
@@ -490,6 +515,7 @@ pub(crate) struct Rows<'a> {
     pub pose: &'a mut [u8],
     pub quarry: &'a mut [u32],
     pub stuck: &'a mut [u16],
+    pub aim: &'a mut [Vec2],
 }
 
 /// What a chunk emits beside its rows: landed swings and loosed arrows.
@@ -559,6 +585,23 @@ struct Step {
     wish: Vec2,
     jam: f32,
     new_v: Vec2,
+    // The choice of opening and the squeeze (`choose_opening`,
+    // `try_a_side`): whether he reads the comrades ahead this tick, his
+    // normal body and spring (not squeezed), whether the scan saw an
+    // obstacle ahead and the opening it found among them (across and
+    // along his way, its fit), a body at each of his sides, and the
+    // opening he aims at (its fit: 0 none, 1 his depth, 2 his width;
+    // `gap`: it fits his depth only; `gap_near`: that crack within his
+    // spring).
+    open_on: bool,
+    body0: f32,
+    sep0: f32,
+    saw: bool,
+    near: (f32, f32, u8),
+    between: bool,
+    aim_fit: u8,
+    gap: bool,
+    gap_near: bool,
 }
 
 /// Run every soldier of a chunk through his tick.
@@ -583,11 +626,13 @@ pub(crate) fn tick_chunk(f: &Field, rows: Rows, out: &mut ChunkOut) {
             pose: &mut rows.pose[j],
             quarry: &mut rows.quarry[j],
             stuck: &mut rows.stuck[j],
+            aim: &mut rows.aim[j],
         };
         let mut st = begin(f, &mut s);
         drive(f, &mut s, &mut st);
         scan(f, &mut s, &mut st, out);
         look_around(f, &mut s, &mut st);
+        choose_opening(f, &mut s, &mut st);
         hold_the_frame(f, &mut st);
         acquire(f, &mut s, &mut st);
         decide_to_join(f, &mut s, &mut st);
@@ -693,6 +738,15 @@ fn begin(f: &Field, s: &mut Soldier) -> Step {
         wish: Vec2::ZERO,
         jam: 0.0,
         new_v: Vec2::ZERO,
+        open_on: false,
+        body0: 0.0,
+        sep0: 0.0,
+        saw: false,
+        near: (0.0, 0.0, 0),
+        between: false,
+        aim_fit: 0,
+        gap: false,
+        gap_near: false,
     }
 }
 
@@ -800,7 +854,8 @@ fn drive(f: &Field, s: &mut Soldier, st: &mut Step) {
 /// body runs onto, which is a damage event from the spearman.
 #[inline]
 fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
-    let Field { grid, speed, team, yaw_snap, wall, stance, faces_spearwall, tick_seed, .. } = *f;
+    let Field { grid, speed, team, yaw_snap, wall, stance, faces_spearwall, tick_seed, orders, engaged, anchors, home, .. } =
+        *f;
     let i = s.i;
     let params = &TYPES[st.my_kind];
     let p = st.p;
@@ -820,12 +875,36 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
     let wish_dir = st.desired.normalize_or_zero();
     let my_team_bit = (team[i] as u32) * crate::spatial::META_TEAM;
     let my_wall = wall[gi] != 0;
-    // His width and each neighbour's by their poses at the tick's start,
-    // the pair's rest, its inverse and its overlap distance from a table,
-    // and the pair's mass weights by kind.
+    // His width and each neighbour's by their poses at the tick's start
+    // (the squeeze's level for a man squeezing), the pair's rest, its
+    // inverse and its overlap distance from a table, and the pair's mass
+    // weights by kind.
     let widths = widths();
-    let my_level = pose_level(*s.pose);
+    let squeeze_on = squeezing(*s.stuck);
+    let pose_lv = pose_level(*s.pose);
+    let my_level = if squeeze_on { SQUEEZE_LEVEL } else { pose_lv };
     let mine = &widths[my_level];
+    // The choice of opening's read (`choose_opening`): only a man walking
+    // somewhere, not fighting, reads the comrades ahead; a man squeezing
+    // feels the bodies at his sides.
+    let body0 = widths[pose_lv].body;
+    let walking = orders[gi].is_some()
+        || (anchors[gi] + home[i]).distance_squared(p) > TRY_FROM_SLOT * TRY_FROM_SLOT;
+    let open_on = opening_on()
+        && walking
+        && !engaged[gi]
+        && !dying
+        && !st.routed
+        && !st.in_melee
+        && !st.committed
+        && st.join_fp.is_none()
+        && st.desired.length_squared() > 0.25;
+    // Every obstacle within his reach is in the row nearest him (the band
+    // reaches past OPEN_SEE), so the scan keeps the nearest two on each
+    // side as it goes.
+    let mut row = Row::default();
+    let mut row_at = f32::INFINITY;
+    let (mut side_left, mut side_right) = (false, false);
     let pairs = &pair_widths()[my_level];
     let masses = &mass_pairs()[st.my_kind];
     let gain = CORR_GAIN;
@@ -910,7 +989,37 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
         // seams the intermix needs: a pressed front's gaps shrank to about
         // 1.05 m against 0.95 m bodies and symmetric fights collapsed to a
         // two-rank duel line. It must not come back.
-        let pair = &pairs[crate::spatial::meta_pose(o.meta)];
+        // The comrades ahead for the choice of opening: a queue (a man of
+        // a regiment under an order moving his way, or squeezing) is not
+        // an obstacle; a holding man always is.
+        if same && (o.meta & crate::spatial::META_DYING) == 0 && (open_on | squeeze_on) {
+            let to = -d;
+            let along = to.dot(wish_dir);
+            let lat = wish_dir.x * to.y - wish_dir.y * to.x;
+            let o_body = widths[crate::spatial::meta_pose(o.meta)].body;
+            if open_on && along > OPEN_AHEAD {
+                let holding = orders[crate::spatial::meta_group(o.meta)].is_none();
+                let queue = !holding
+                    && (o_vel.dot(wish_dir) > QUEUE_SPEED || (o.meta & crate::spatial::META_SQUEEZE) != 0);
+                if !queue {
+                    row.add(lat, 0.5 * o_body);
+                    row_at = row_at.min(along);
+                }
+            }
+            if squeeze_on {
+                let near = 0.5 * (body0 + o_body) - BETWEEN_SLACK;
+                if d2 < near * near && along.abs() < 1.0 {
+                    side_left |= lat > 0.0;
+                    side_right |= lat < 0.0;
+                }
+            }
+        }
+        let o_level = if (o.meta & crate::spatial::META_SQUEEZE) != 0 {
+            SQUEEZE_LEVEL
+        } else {
+            crate::spatial::meta_pose(o.meta)
+        };
+        let pair = &pairs[o_level];
         let (sep_r, inv_sep, hard) = if !cross && my_wall && (o.meta & crate::spatial::META_WALL) != 0 {
             (WALL_SEP_RADIUS, 1.0 / WALL_SEP_RADIUS, pair.hard.min(WALL_SEP_RADIUS))
         } else {
@@ -1021,6 +1130,121 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
     st.at_charge_speed = at_charge_speed;
     st.scan_r = scan_r;
     st.my_team_bit = my_team_bit;
+    st.open_on = open_on;
+    st.body0 = body0;
+    st.sep0 = widths[pose_lv].sep;
+    st.saw = row_at.is_finite();
+    if open_on && st.saw {
+        let (pref, coin) = side_pref(i, *s.stuck);
+        st.near = openings(&row, row_at, OPEN_SEE, body0, SQUEEZE_DEPTH, false, pref, coin);
+    }
+    st.between = side_left && side_right;
+}
+
+/// The side a man leans to among equal openings: the side he chose last
+/// while he remembers it, and his own coin, the same every tick.
+#[inline]
+fn side_pref(i: usize, stuck: u16) -> (f32, f32) {
+    let pref = if (stuck & STUCK_MEM) != 0 { if stuck & STUCK_LEFT != 0 { 1.0 } else { -1.0 } } else { 0.0 };
+    let coin = if crate::units::hash01((i as u32).wrapping_mul(0x7A31).wrapping_add(13)) > 0.5 { 1.0 } else { -1.0 };
+    (pref, coin)
+}
+
+/// The choice of opening (OPEN_SEE above): from the obstacles ahead his
+/// scan saw, and on his look tick from a wider look, the opening he aims
+/// at; his drive turned toward it at its pace; the side he chose
+/// remembered as the try remembers its side. Only a man walking somewhere
+/// with no enemy in mind and his regiment not fighting (the try's test):
+/// fighting men keep their own footwork.
+#[inline]
+fn choose_opening(f: &Field, s: &mut Soldier, st: &mut Step) {
+    let Field { grid, orders, tick, .. } = *f;
+    let i = s.i;
+    let going = st.open_on && st.best_idx == u32::MAX && !st.memo_valid;
+    if !going {
+        *s.aim = Vec2::NAN;
+        return;
+    }
+    let p = st.p;
+    let want = st.desired.length();
+    let wd = st.desired / want;
+    let perp = Vec2::new(-wd.y, wd.x);
+    let mut v = *s.stuck;
+    // The near read, from the scan.
+    let (mut aim_lat, mut aim_along, mut fit) = st.near;
+    if fit > 0 {
+        *s.aim = Vec2::NAN;
+    }
+    // The wide look: nothing near fits and he saw somebody in his way.
+    if fit == 0 && st.saw && tick.wrapping_add((i as u32).wrapping_mul(7)).is_multiple_of(OPEN_LOOK_TICKS) {
+        let (pref, coin) = side_pref(i, v);
+        let my_team_bit = st.my_team_bit;
+        let widths = widths();
+        let read = |o: &crate::spatial::SortedUnit, o_vel: Vec2| -> Option<(f32, f32, f32)> {
+            if o.idx as usize == i
+                || (o.meta & crate::spatial::META_TEAM) != my_team_bit
+                || (o.meta & crate::spatial::META_DYING) != 0
+            {
+                return None;
+            }
+            let to = o.xz() - p;
+            let along = to.dot(wd);
+            if along <= OPEN_AHEAD || to.length_squared() >= OPEN_FAR * OPEN_FAR {
+                return None;
+            }
+            let holding = orders[crate::spatial::meta_group(o.meta)].is_none();
+            if !holding && (o_vel.dot(wd) > QUEUE_SPEED || (o.meta & crate::spatial::META_SQUEEZE) != 0) {
+                return None;
+            }
+            let lat = wd.x * to.y - wd.y * to.x;
+            Some((along, lat, 0.5 * widths[crate::spatial::meta_pose(o.meta)].body))
+        };
+        let mut wide_at = f32::INFINITY;
+        grid.for_each_candidate_vel(p, OPEN_FAR, |o, o_vel| {
+            if let Some((along, _, _)) = read(o, o_vel) {
+                wide_at = wide_at.min(along);
+            }
+        });
+        let mut wide = Row::default();
+        grid.for_each_candidate_vel(p, OPEN_FAR, |o, o_vel| {
+            if let Some((along, lat, half)) = read(o, o_vel)
+                && along < wide_at + OPEN_BAND
+            {
+                wide.add(lat, half);
+            }
+        });
+        let (w_lat, w_along, w_fit) = openings(&wide, wide_at, OPEN_FAR, st.body0, SQUEEZE_DEPTH, true, pref, coin);
+        *s.aim = if w_fit > 0 { p + wd * w_along + perp * w_lat } else { Vec2::NAN };
+        v = (v & !STUCK_WIDE_DEPTH) | ((w_fit == 1) as u16 * STUCK_WIDE_DEPTH);
+    }
+    // A near fit wins; else the wide aim while it is still ahead of him.
+    if fit == 0 && s.aim.x.is_finite() {
+        let rel = *s.aim - p;
+        let r_along = rel.dot(wd);
+        if r_along > OPEN_AHEAD {
+            aim_lat = rel.dot(perp);
+            aim_along = r_along;
+            fit = if v & STUCK_WIDE_DEPTH != 0 { 1 } else { 2 };
+        } else {
+            *s.aim = Vec2::NAN;
+        }
+    }
+    st.aim_fit = fit;
+    st.gap = fit == 1;
+    st.gap_near = st.gap && aim_along < st.sep0;
+    if fit > 0 {
+        // The side he chose, remembered as the try remembers its side.
+        if aim_lat.abs() > 0.1 {
+            v = (v & !(STUCK_MEM | STUCK_LEFT)) | (SIDE_MEMORY << STUCK_MEM_SHIFT) | ((aim_lat > 0.0) as u16 * STUCK_LEFT);
+        }
+        // His drive turned toward the aim, at its pace.
+        let to = wd * aim_along.max(OPEN_MIN_AHEAD) + perp * aim_lat;
+        let len = to.length();
+        if len > 1e-6 {
+            st.desired = to * (want / len);
+        }
+    }
+    *s.stuck = v;
 }
 
 /// What he remembers and what he sees of his comrades: the enemy he
@@ -1206,20 +1430,168 @@ const LEAN_MIN: f32 = 0.05;
 /// standing against the gripping men for good.
 const TRY_FROM_SLOT: f32 = 5.0;
 /// The `stuck` column: the stuck ticks (bits 0 to 3), the try's ticks
-/// left (4 to 8), the side memory in eighths of a second (9 to 12), and
-/// the remembered side (13, set for his left).
+/// left (4 to 8), the side memory in eighths of a second (9 to 12), the
+/// remembered side (13, set for his left), squeezing (14; then bits 0 to
+/// 8 count his ticks in the squeeze instead, since a squeezing man is
+/// neither counting nor trying), and whether the opening of his last wide
+/// look fits only his depth (15, `choose_opening`).
 const STUCK_COUNT: u16 = 0x000f;
 const STUCK_TRY_SHIFT: u16 = 4;
 const STUCK_TRY: u16 = 0x1f << STUCK_TRY_SHIFT;
 const STUCK_MEM_SHIFT: u16 = 9;
 const STUCK_MEM: u16 = 0x0f << STUCK_MEM_SHIFT;
 pub(crate) const STUCK_LEFT: u16 = 1 << 13;
+const STUCK_SQUEEZE: u16 = 1 << 14;
+const STUCK_SQUEEZE_TICKS: u16 = 0x01ff;
+const STUCK_WIDE_DEPTH: u16 = 1 << 15;
 /// The stuck ticks and the try's ticks left packed in `stuck`.
 pub(crate) fn stuck_count(v: u16) -> u16 {
-    v & STUCK_COUNT
+    if squeezing(v) { 0 } else { v & STUCK_COUNT }
 }
 pub(crate) fn stuck_trying(v: u16) -> u16 {
-    (v & STUCK_TRY) >> STUCK_TRY_SHIFT
+    if squeezing(v) { 0 } else { (v & STUCK_TRY) >> STUCK_TRY_SHIFT }
+}
+/// Whether he is squeezing through a crack, and for how many ticks.
+pub(crate) fn squeezing(v: u16) -> bool {
+    v & STUCK_SQUEEZE != 0
+}
+fn squeeze_ticks(v: u16) -> u16 {
+    if squeezing(v) { v & STUCK_SQUEEZE_TICKS } else { 0 }
+}
+
+/// The squeeze (docs/plans/032): a man going through a crack narrower
+/// than he is wide turns his shoulders and is SQUEEZE_DEPTH across
+/// (SQUEEZE_LEVEL). It lasts from the crack's mouth until he is through:
+/// it ends once he has no body within his normal width at each side
+/// (less BETWEEN_SLACK, within a metre along his way) and either he aims
+/// at no crack or he moves freely at nine tenths of the advance pace with
+/// no crack within his spring, after TRY_MIN ticks, or after
+/// SQUEEZE_STALL ticks with no progress at a mouth he cannot enter. While
+/// it lasts his legs push along his wish with their full effort, not
+/// faded by the crowd's brake, and his speed is capped at SQUEEZE_CAP,
+/// a walk.
+const BETWEEN_SLACK: f32 = 0.05;
+const SQUEEZE_STALL: u16 = 60;
+const SQUEEZE_CAP: f32 = 2.0;
+/// The choice of opening (docs/plans/033): a man going somewhere, with no
+/// enemy in his reach and his regiment not fighting (the try's own test),
+/// reads the comrades ahead of him within OPEN_SEE (the scan's same-team
+/// reach) and aims at an opening between them that fits him, before he
+/// reaches them. A comrade of a regiment under an order who moves his way
+/// faster than QUEUE_SPEED, or who is squeezing, is a queue he follows,
+/// not an obstacle; a holding man is an obstacle whatever a shove does to
+/// him. Of the obstacles he takes the row nearest him (the men within
+/// OPEN_BAND along of the nearest one, a rank's pitch and a bit, so the
+/// two files of a pair offset by a rank read as one row) and in it the
+/// nearest two on each side of his way. The air between neighbouring men
+/// of the row fits his width (his normal body, less OPEN_SLACK), else his
+/// depth (the squeeze), else nothing. For each fitting opening his centre
+/// goes to its point nearest his way; the nearest wins, a squeeze counting
+/// as SQUEEZE_DETOUR metres of detour, the side he chose last worth
+/// OPEN_SIDE_KEEP, his own coin breaking a tie. His drive keeps its pace
+/// and turns toward that point, OPEN_MIN_AHEAD ahead at least. The near
+/// read takes only openings between two men it has seen. When nothing
+/// near fits and he saw an obstacle, he looks out to OPEN_FAR once in
+/// OPEN_LOOK_TICKS, in his own rhythm, where the open ground beyond the
+/// last man on each side counts too, and keeps what he found (`aim`)
+/// until his next look, until it is behind him or until his near read
+/// fits. Measured in the toy first (toy devlogs 012 and 013).
+const OPEN_SEE: f32 = SEP_RADIUS;
+const OPEN_FAR: f32 = 4.0;
+const OPEN_BAND: f32 = 1.5;
+const OPEN_AHEAD: f32 = 0.05;
+const QUEUE_SPEED: f32 = 0.3;
+const SQUEEZE_DETOUR: f32 = 1.0;
+const OPEN_LOOK_TICKS: u32 = 8;
+const OPEN_SLACK: f32 = 0.02;
+const OPEN_SIDE_KEEP: f32 = 0.2;
+const OPEN_MIN_AHEAD: f32 = 0.3;
+/// FL_OPENING=0 turns the choice of opening and the squeeze off.
+fn opening_on() -> bool {
+    static O: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *O.get_or_init(|| crate::util::env_or("FL_OPENING", 1u32) != 0)
+}
+
+/// The row nearest a man: the nearest two obstacles on each side of his
+/// way by their offset across it (left positive), each with his half
+/// body.
+#[derive(Default)]
+struct Row {
+    left: [(f32, f32); 2],
+    right: [(f32, f32); 2],
+    n_left: u8,
+    n_right: u8,
+}
+impl Row {
+    #[inline]
+    fn add(&mut self, lat: f32, half: f32) {
+        let (side, n, key) = if lat >= 0.0 {
+            (&mut self.left, &mut self.n_left, lat)
+        } else {
+            (&mut self.right, &mut self.n_right, -lat)
+        };
+        if *n == 0 || key < side[0].0 {
+            side[1] = side[0];
+            side[0] = (key, half);
+            *n = (*n + 1).min(2);
+        } else if *n == 1 || key < side[1].0 {
+            side[1] = (key, half);
+            *n = 2;
+        }
+    }
+}
+
+/// The openings a man sees in a row at `row_at` along his way, out to
+/// `see`: ahead between the nearest man on each side, left between the
+/// two nearest on his left, right between the two on his right, and, when
+/// `beyond` (the wide look), the open ground past the last man seen on a
+/// side up to the edge of his sight at that distance. Returns the aim
+/// across and along his way and its fit (0 none, 1 his depth, 2 his
+/// width).
+#[allow(clippy::too_many_arguments)]
+fn openings(row: &Row, row_at: f32, see: f32, body: f32, depth: f32, beyond: bool, pref: f32, coin: f32) -> (f32, f32, u8) {
+    if row.n_left == 0 && row.n_right == 0 {
+        return (0.0, 0.0, 0);
+    }
+    let edge = (see * see - row_at.min(see) * row_at.min(see)).max(0.0).sqrt();
+    let far = if beyond { edge } else { f32::NAN };
+    let (l1, l1r) = if row.n_left >= 1 { row.left[0] } else { (f32::NAN, f32::NAN) };
+    let (r1, r1r) = if row.n_right >= 1 { row.right[0] } else { (f32::NAN, f32::NAN) };
+    let hi_l = if row.n_left >= 2 { row.left[1].0 - row.left[1].1 } else { far };
+    let lo_r = if row.n_right >= 2 { -(row.right[1].0 - row.right[1].1) } else { -far };
+    let ahead = (
+        if row.n_right >= 1 { -(r1 - r1r) } else { -far },
+        if row.n_left >= 1 { l1 - l1r } else { far },
+        true,
+    );
+    let left = (l1 + l1r, hi_l, row.n_left >= 1);
+    let right = (lo_r, -(r1 + r1r), row.n_right >= 1);
+    let sign = |x: f32| if x > 0.0 { 1.0 } else if x < 0.0 { -1.0 } else { 0.0 };
+    let (mut best, mut aim_lat, mut fit) = (f32::INFINITY, 0.0, 0u8);
+    for (lo, hi, ok) in [ahead, left, right] {
+        if !ok {
+            continue;
+        }
+        // NaN air (an edge the near read does not see) fits nothing.
+        let air = hi - lo;
+        let fw = air >= body - OPEN_SLACK;
+        let fd = !fw && air >= depth - OPEN_SLACK;
+        if !(fw || fd) {
+            continue;
+        }
+        let r = 0.5 * if fw { body } else { depth };
+        let aim = (lo + r).max(0.0).min(hi - r);
+        let aim = if aim.is_finite() { aim } else { 0.0 };
+        let cost = aim.abs() + if fd { SQUEEZE_DETOUR } else { 0.0 }
+            - if pref != 0.0 && sign(aim) == pref { OPEN_SIDE_KEEP } else { 0.0 }
+            - if sign(aim) == coin { 0.01 } else { 0.0 };
+        if cost < best {
+            best = cost;
+            aim_lat = aim;
+            fit = if fw { 2 } else { 1 };
+        }
+    }
+    (aim_lat, if fit > 0 { row_at.min(see) } else { 0.0 }, fit)
 }
 
 /// A man going somewhere who finds himself stuck tries a side. Stuck is
@@ -1237,11 +1609,15 @@ pub(crate) fn stuck_trying(v: u16) -> u16 {
 /// into the next man (that was the pinball between the columns). Pressed
 /// forward and free to slide sideways, he slides into the gap beside the
 /// man in his way, and the man behind him does the same a moment later.
-/// Only a man walking somewhere, under his regiment's order or back to a
-/// slot more than TRY_FROM_SLOT off, with no enemy in mind and his
-/// regiment not fighting: men walking to a fight and the rear ranks of a
-/// fighting regiment keep their own rules (`close_in`), so the melee is
-/// as it was. His state rides the `stuck` column (STUCK_*).
+/// The blind sidestep is only for a man with no opening to aim at
+/// (`choose_opening`): reaching a crack he aims at that fits only his
+/// depth, he turns his shoulders at once and squeezes through
+/// (SQUEEZE_LEVEL). Only a man walking somewhere, under his regiment's
+/// order or back to a slot more than TRY_FROM_SLOT off, with no enemy in
+/// mind and his regiment not fighting: men walking to a fight and the
+/// rear ranks of a fighting regiment keep their own rules (`close_in`),
+/// so the melee is as it was, and a squeeze ends when the fight reaches
+/// him. His state rides the `stuck` column (STUCK_*).
 #[inline]
 fn try_a_side(f: &Field, s: &mut Soldier, st: &mut Step) {
     let Field { orders, engaged, anchors, home, tick, .. } = *f;
@@ -1267,11 +1643,25 @@ fn try_a_side(f: &Field, s: &mut Soldier, st: &mut Step) {
     let dir = wish / want;
     let left_dir = Vec2::new(-dir.y, dir.x);
     let v = *s.stuck;
+    let mut squeeze = squeeze_ticks(v);
     let mut count = stuck_count(v);
     let mut trying = stuck_trying(v);
     let mut mem = (v & STUCK_MEM) >> STUCK_MEM_SHIFT;
     let mut left = v & STUCK_LEFT != 0;
-    if trying > 0 {
+    let v_along = s.vel.xz().dot(dir);
+    // The squeeze (SQUEEZE_LEVEL above): it ends once no body is at each
+    // of his sides and either no crack is ahead or he walks freely, or
+    // at a mouth he cannot enter; wedged between two bodies he keeps on.
+    if squeeze > 0 {
+        let free = v_along >= 0.9 * ADVANCE_PACE && !st.gap_near;
+        let through = (squeeze >= TRY_MIN && (!st.gap || free)) || (squeeze >= SQUEEZE_STALL && v_along < 0.1);
+        squeeze = if !st.between && through { 0 } else { (squeeze + 1).min(STUCK_SQUEEZE_TICKS) };
+    }
+    if squeeze > 0 {
+        // His legs at their full effort along his wish: he pushes with
+        // all he has, at a walk at most (`steer`).
+        st.desired = wish;
+    } else if trying > 0 {
         trying -= 1;
         // The way ahead clear after the first TRY_MIN ticks: the step is
         // done, he walks.
@@ -1284,11 +1674,15 @@ fn try_a_side(f: &Field, s: &mut Soldier, st: &mut Step) {
     } else {
         // Stuck: pressed, and not even stepping. Under half his wish
         // alone, a lane walker at the sprint behind a slower man counted
-        // stuck at a jog and zigzagged down the lane.
-        let pressed = st.ahead > AHEAD_MIN;
-        let stuck = pressed && s.vel.xz().dot(dir) < (0.5 * want).min(STEP_PACE);
+        // stuck at a jog and zigzagged down the lane. A crack he aims at
+        // that fits only his depth presses him too.
+        let pressed = st.ahead > AHEAD_MIN || st.gap;
+        let stuck = pressed && v_along < (0.5 * want).min(STEP_PACE);
         count = if stuck { (count + 1).min(STUCK_TICKS) } else { count.saturating_sub(1) };
-        if count >= STUCK_TICKS {
+        // He turns his shoulders as he reaches the crack he aims at, no
+        // stuck wait; the blind sidestep only with no opening to aim at.
+        let start = count >= STUCK_TICKS && !st.gap_near && st.aim_fit == 0;
+        if start {
             let lean = st.push.dot(left_dir);
             left = if lean.abs() > LEAN_MIN {
                 lean > 0.0
@@ -1300,11 +1694,18 @@ fn try_a_side(f: &Field, s: &mut Soldier, st: &mut Step) {
             trying = TRY_TICKS;
             count = 0;
             mem = SIDE_MEMORY;
-        } else if mem > 0 && tick.is_multiple_of(8) {
-            mem -= 1;
+        } else {
+            if st.gap_near {
+                squeeze = 1;
+                count = 0;
+            }
+            if mem > 0 && tick.is_multiple_of(8) {
+                mem -= 1;
+            }
         }
     }
-    *s.stuck = count | (trying << STUCK_TRY_SHIFT) | (mem << STUCK_MEM_SHIFT) | (left as u16 * STUCK_LEFT);
+    let low = if squeeze > 0 { STUCK_SQUEEZE | squeeze } else { count | (trying << STUCK_TRY_SHIFT) };
+    *s.stuck = low | (mem << STUCK_MEM_SHIFT) | (left as u16 * STUCK_LEFT) | (v & STUCK_WIDE_DEPTH);
 }
 
 /// Two things a man in melee does not do for his slot: step back away
@@ -2208,7 +2609,9 @@ fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
     // Viscous damping in the press: bleeds the spring energy that otherwise
     // ping-pongs between neighbors every tick.
     new_v *= 1.0 - 0.4 * jam;
-    let vmax = speed[i] * 1.15; // slight overspeed under crowd pressure
+    // Slight overspeed under crowd pressure; a man squeezing through a
+    // crack goes at a walk at most.
+    let vmax = if squeezing(*s.stuck) { SQUEEZE_CAP } else { speed[i] * 1.15 };
     let v2 = new_v.length_squared();
     if v2 > vmax * vmax {
         new_v *= vmax / v2.sqrt();
