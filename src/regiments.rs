@@ -71,6 +71,10 @@ fn straggler_log(units: Res<Units>, groups: Res<crate::orders::Groups>, time: Re
         return;
     }
     *next = t + 2.0;
+    let ring_aims = crate::sim::soldier::RING_AIMS.swap(0, std::sync::atomic::Ordering::Relaxed);
+    if ring_aims > 0 {
+        info!("[straggler] t={t:.0}s {ring_aims} ring aims in the last 2 s");
+    }
     // The held blocks: regiments with no order and living men.
     let mut blocks: Vec<(usize, u8, crate::formation::BlockRect)> = Vec::new();
     for (h, gd) in groups.list.iter().enumerate() {
