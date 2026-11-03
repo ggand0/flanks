@@ -455,6 +455,8 @@ pub(crate) struct Field<'a> {
     pub anchors: &'a [Vec2],
     pub broken: &'a [bool],
     pub press: &'a [bool],
+    /// Per regiment: walking through a friend that opened for it.
+    pub passing: &'a [bool],
     /// Per regiment: under a Move order (sim/job.rs `moving`).
     pub moving: &'a [bool],
     /// Per regiment: the stance its men are drawn in (STANCE_*).
@@ -883,8 +885,22 @@ fn drive(f: &Field, s: &mut Soldier, st: &mut Step) {
 /// body runs onto, which is a damage event from the spearman.
 #[inline]
 fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
-    let Field { grid, speed, team, yaw_snap, wall, stance, faces_spearwall, tick_seed, orders, engaged, anchors, home, .. } =
-        *f;
+    let Field {
+        grid,
+        speed,
+        team,
+        yaw_snap,
+        wall,
+        stance,
+        faces_spearwall,
+        tick_seed,
+        orders,
+        engaged,
+        anchors,
+        home,
+        passing,
+        ..
+    } = *f;
     let i = s.i;
     let params = &TYPES[st.my_kind];
     let p = st.p;
@@ -916,10 +932,16 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
     // somewhere, not fighting, reads the comrades ahead; a man squeezing
     // feels the bodies at his sides.
     let body0 = widths[pose_lv].body;
-    let walking = orders[gi].is_some()
-        || (anchors[gi] + home[i]).distance_squared(p) > TRY_FROM_SLOT * TRY_FROM_SLOT;
+    let far = (anchors[gi] + home[i]).distance_squared(p) > TRY_FROM_SLOT * TRY_FROM_SLOT;
+    let walking = orders[gi].is_some() || far;
+    // Only a man with a reason to pick an opening: his regiment walking
+    // through a friend that opened for it, or himself a straggler of a
+    // holding regiment. Read for every walking man, it cost 5.6 ms of
+    // the 200k step in a front battle where nobody passes anyone.
+    let reason = passing[gi] || (orders[gi].is_none() && far);
     let open_on = opening_on()
         && walking
+        && reason
         && !engaged[gi]
         && !dying
         && !st.routed
@@ -1371,20 +1393,41 @@ fn choose_opening(f: &Field, s: &mut Soldier, st: &mut Step) {
             let lat = wd.x * to.y - wd.y * to.x;
             Some((along, lat, 0.5 * widths[crate::spatial::meta_pose(o.meta)].body))
         };
+        // One pass over the grid: the comrades in his sight into a buffer,
+        // then the nearest and the row from it. Two passes cost 3.0 ms of
+        // the 200k step; the buffer overflowing (a press denser than
+        // WIDE_SEEN men in 4 m) falls back to the second pass.
         let mut wide_at = f32::INFINITY;
+        let mut seen: [(f32, f32, f32); WIDE_SEEN] = [(0.0, 0.0, 0.0); WIDE_SEEN];
+        let mut n_seen = 0usize;
+        let mut overflow = false;
         grid.for_each_candidate_vel(p, OPEN_FAR, |o, o_vel| {
-            if let Some((along, _, _)) = read(o, o_vel) {
-                wide_at = wide_at.min(along);
+            if let Some(m) = read(o, o_vel) {
+                wide_at = wide_at.min(m.0);
+                if n_seen < WIDE_SEEN {
+                    seen[n_seen] = m;
+                    n_seen += 1;
+                } else {
+                    overflow = true;
+                }
             }
         });
         let mut wide = Row::default();
-        grid.for_each_candidate_vel(p, OPEN_FAR, |o, o_vel| {
-            if let Some((along, lat, half)) = read(o, o_vel)
-                && along < wide_at + OPEN_BAND
-            {
-                wide.add(lat, half, along);
+        if overflow {
+            grid.for_each_candidate_vel(p, OPEN_FAR, |o, o_vel| {
+                if let Some((along, lat, half)) = read(o, o_vel)
+                    && along < wide_at + OPEN_BAND
+                {
+                    wide.add(lat, half, along);
+                }
+            });
+        } else {
+            for &(along, lat, half) in &seen[..n_seen] {
+                if along < wide_at + OPEN_BAND {
+                    wide.add(lat, half, along);
+                }
             }
-        });
+        }
         let (w_lat, w_along, w_fit, _) = openings(&wide, wide_at, OPEN_FAR, st.body0, SQUEEZE_DEPTH, true, pref, coin);
         *s.aim = if w_fit > 0 { p + wd * w_along + perp * w_lat } else { Vec2::NAN };
         v = (v & !STUCK_WIDE_DEPTH) | ((w_fit == 1) as u16 * STUCK_WIDE_DEPTH);
@@ -1690,10 +1733,12 @@ const OPEN_AHEAD: f32 = 0.05;
 const QUEUE_SPEED: f32 = 0.3;
 const SQUEEZE_DETOUR: f32 = 1.0;
 const OPEN_LOOK_TICKS: u32 = 8;
+/// The comrades the wide look keeps from its one pass over the grid.
+const WIDE_SEEN: usize = 96;
 const OPEN_SLACK: f32 = 0.02;
 const OPEN_SIDE_KEEP: f32 = 0.2;
 const OPEN_MIN_AHEAD: f32 = 0.3;
-/// FL_OPENING=0 turns the choice of opening and the squeeze off.
+
 fn opening_on() -> bool {
     static O: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *O.get_or_init(|| crate::util::env_or("FL_OPENING", 1u32) != 0)
@@ -1888,8 +1933,19 @@ fn try_a_side(f: &Field, s: &mut Soldier, st: &mut Step) {
         count = if stuck { (count + 1).min(STUCK_TICKS) } else { count.saturating_sub(1) };
         // He turns his shoulders as he reaches the crack he aims at, no
         // stuck wait; the blind sidestep only with no opening to aim at.
-        let start = count >= STUCK_TICKS && !st.gap_near && st.aim_fit == 0;
+        // A straggler of a holding regiment whose aim has not moved him
+        // (stuck at its top, a ring or wide aim into a standing man's
+        // spring) drops it and tries a side; the ring reads again after
+        // the step. Passers keep their aims: a lane queue stands still too.
+        let dead_aim = st.aim_fit != 0
+            && orders[st.gi].is_none()
+            && (anchors[st.gi] + home[i]).distance_squared(st.p) > TRY_FROM_SLOT * TRY_FROM_SLOT;
+        let start = count >= STUCK_TICKS && !st.gap_near && (st.aim_fit == 0 || dead_aim);
         if start {
+            if dead_aim {
+                *s.aim = Vec2::NAN;
+                *s.sight &= !SIGHT_RING;
+            }
             let lean = st.push.dot(left_dir);
             left = if lean.abs() > LEAN_MIN {
                 lean > 0.0

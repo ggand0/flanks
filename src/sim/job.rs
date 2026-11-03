@@ -145,6 +145,9 @@ pub struct TickJob {
     pub(crate) reg_broken: Vec<bool>,
     pub(crate) press: Vec<bool>,
     pub(crate) moving: Vec<bool>,
+    /// Per regiment: walking through a friend that opened for it
+    /// (`GroupData::passing`), the choice of opening's reason to run.
+    pub(crate) passing: Vec<bool>,
     /// Per regiment: the stance its men are drawn in, which sets their
     /// width (sim/soldier.rs STANCE_*).
     pub(crate) stance: Vec<u8>,
@@ -1726,6 +1729,7 @@ fn snapshot_regiments(job: &mut TickJob, groups: &Groups, terrain: &Terrain) {
     job.reg_broken = group_broken;
     job.press = press;
     job.moving = moving;
+    job.passing = groups.list.iter().map(|g| g.passing).collect();
     job.stance = groups.list.iter().map(stance_of).collect();
     job.focus = focus;
     job.engaged = engaged;
