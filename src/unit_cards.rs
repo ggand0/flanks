@@ -1157,13 +1157,14 @@ fn control_buttons(
     query: Query<(&Interaction, &ControlButton), Changed<Interaction>>,
     selection: Res<Selection>,
     mut groups: ResMut<Groups>,
+    time: Res<Time>,
 ) {
     for (interaction, btn) in &query {
         if *interaction != Interaction::Pressed || selection.count_units == 0 {
             continue;
         }
         match btn {
-            ControlButton::Halt => halt_selected(&selection, &mut groups),
+            ControlButton::Halt => halt_selected(&selection, &mut groups, time.elapsed_secs()),
             ControlButton::Form(cmd) => {
                 apply_formation_cmd(*cmd, &selection, &mut groups)
             }

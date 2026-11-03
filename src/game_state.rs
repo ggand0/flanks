@@ -983,6 +983,7 @@ fn spawn_deploy_ui(commands: &mut Commands) {
 
 /// Begin Battle button or Enter: release the sim and drop the deploy UI.
 /// The setup it releases is written to `last_setup.yaml` for `FL_SETUP`.
+#[allow(clippy::too_many_arguments)] // bevy system params
 fn begin_battle(
     mut commands: Commands,
     mut deploy: ResMut<Deployment>,
@@ -991,6 +992,7 @@ fn begin_battle(
     roots: Query<Entity, With<DeployRoot>>,
     config: Res<BattleConfig>,
     groups: Res<Groups>,
+    time: Res<Time>,
 ) {
     let clicked = buttons.iter().any(|i| *i == Interaction::Pressed);
     if !clicked && !keys.just_pressed(KeyCode::Enter) {
@@ -1001,7 +1003,23 @@ fn begin_battle(
         commands.entity(e).despawn();
     }
     crate::battle_setup::save_last(&crate::battle_setup::BattleSetup::capture(&config, &groups));
-    info!("deployment done: battle begins");
+    // The placement in the log too, one line a regiment, so a play's log
+    // holds its whole set-up beside its orders (`[order]`, orders.rs).
+    for (g, gd) in groups.list.iter().enumerate() {
+        info!(
+            "[setup] g{g} team {} {} {} men at ({:.1}, {:.1}) facing {:.3} files {} {:?} hold {}",
+            gd.team,
+            crate::unit_types::kind_name(gd.kind),
+            gd.count,
+            gd.anchor.x,
+            gd.anchor.y,
+            gd.facing,
+            gd.files,
+            gd.chosen_spacing(),
+            gd.hold
+        );
+    }
+    info!("deployment done: battle begins at t={:.1}s", time.elapsed_secs());
 }
 
 fn transition_to_results(
