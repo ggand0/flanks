@@ -48,8 +48,118 @@ impl Plugin for RegimentsPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(
             Update,
-            (rout_test_log, dir_test_log, arena_log, charge_test_log, pile_test_log, melee_diag_log, join_test_log, routpass_test_log, pass_line_script, push_test_log, archery_log, room_log, shake_log),
+            (rout_test_log, dir_test_log, arena_log, charge_test_log, pile_test_log, melee_diag_log, join_test_log, routpass_test_log, pass_line_script, push_test_log, archery_log, room_log, shake_log, straggler_log),
         );
+    }
+}
+
+/// FL_LOG_STRAGGLER=1: every 2 s, every man standing inside another
+/// friendly regiment's held block more than 5 m from his own place (the
+/// straggler of refs/formation/debug13.png and debug17.png), with his
+/// state: his regiment's order, the host block open or closed and how
+/// many of its men stand within half a metre of their places, his
+/// speed, his stuck count, his try, his squeeze, his aim, his pose and
+/// turn levels, and his six nearest neighbours with their regiments,
+/// distances and how far each stands from his own place. For play: the
+/// man seen left behind is read off the log instead of guessed.
+fn straggler_log(units: Res<Units>, groups: Res<crate::orders::Groups>, time: Res<Time>, mut next: Local<f32>) {
+    if std::env::var("FL_LOG_STRAGGLER").is_err() {
+        return;
+    }
+    let t = time.elapsed_secs();
+    if t < *next {
+        return;
+    }
+    *next = t + 2.0;
+    // The held blocks: regiments with no order and living men.
+    let mut blocks: Vec<(usize, u8, crate::formation::BlockRect)> = Vec::new();
+    for (h, gd) in groups.list.iter().enumerate() {
+        if gd.order.is_none() && gd.count > 0 {
+            blocks.push((h, gd.team, crate::formation::block_rect_at(gd, gd.anchor)));
+        }
+    }
+    if blocks.is_empty() {
+        return;
+    }
+    let mut found = 0usize;
+    for i in 0..units.len() {
+        if units.death_t[i] != 0 {
+            continue;
+        }
+        let g = units.group[i] as usize;
+        let gd = &groups.list[g];
+        let p = Vec2::new(units.pos[i].x, units.pos[i].z);
+        let slot = gd.anchor + units.home[i];
+        if slot.distance_squared(p) < 25.0 {
+            continue;
+        }
+        let Some(&(h, _, _)) = blocks.iter().find(|(h, team, rect)| *h != g && *team == gd.team && rect.distance(p) == 0.0) else {
+            continue;
+        };
+        found += 1;
+        if found > 12 {
+            continue;
+        }
+        // His six nearest neighbours within 2.5 m, by brute force (a
+        // handful of men): each one's regiment, whether it holds, his
+        // distance, and how far he stands from his own place (a dressed
+        // block reads near zero, a heap reads a metre or more). Then the
+        // host block's own dressing: the share of its men within half a
+        // metre of their places.
+        let mut near: Vec<(f32, usize)> = Vec::new();
+        for j in 0..units.len() {
+            if j == i || units.death_t[j] != 0 {
+                continue;
+            }
+            let q = Vec2::new(units.pos[j].x, units.pos[j].z);
+            let d = p.distance(q);
+            if d < 2.5 {
+                near.push((d, j));
+            }
+        }
+        near.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let nb: Vec<String> = near
+            .iter()
+            .take(6)
+            .map(|(d, j)| {
+                let jg = units.group[*j] as usize;
+                let q = Vec2::new(units.pos[*j].x, units.pos[*j].z);
+                let off = (groups.list[jg].anchor + units.home[*j]).distance(q);
+                format!("g{jg}{}@{d:.2}s{off:.1}", if groups.list[jg].order.is_none() { "h" } else { "" })
+            })
+            .collect();
+        let hd = &groups.list[h];
+        let (mut host_n, mut host_near) = (0u32, 0u32);
+        for j in 0..units.len() {
+            if units.group[j] as usize == h && units.death_t[j] == 0 {
+                host_n += 1;
+                let q = Vec2::new(units.pos[j].x, units.pos[j].z);
+                host_near += u32::from((hd.anchor + units.home[j]).distance(q) < 0.5);
+            }
+        }
+        let v = units.stuck[i];
+        let aim = units.aim[i];
+        info!(
+            "[straggler] t={t:.0}s man {i} of g{g} ({}) inside g{h}'s {} block ({} of {} men within 0.5 m of their places) at ({:.1},{:.1}): slot {:.1} m off, v {:.2} m/s, stuck {} try {} squeeze {} aim {} pose {} turn {} | {}",
+            if gd.order.is_some() { "ordered" } else { "arrived" },
+            if hd.spacing == crate::formation::FormSpacing::Open { "open" } else { "closed" },
+            host_near,
+            host_n,
+            p.x,
+            p.y,
+            slot.distance(p),
+            units.vel[i].xz().length(),
+            crate::sim::soldier::stuck_count(v),
+            crate::sim::soldier::stuck_trying(v),
+            crate::sim::soldier::squeezing(v),
+            if aim.x.is_finite() { "yes" } else { "no" },
+            crate::sim::soldier::pose_level(units.pose[i]),
+            crate::sim::soldier::turn_level(units.pose[i]),
+            nb.join(" ")
+        );
+    }
+    if found > 0 {
+        info!("[straggler] t={t:.0}s {found} men inside a friend's held block more than 5 m from their places");
     }
 }
 
