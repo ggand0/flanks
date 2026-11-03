@@ -706,6 +706,15 @@ const OPEN_LEAD_S: f32 = 8.0;
 /// A friend's block this close to an open regiment's keeps it open
 /// (metres).
 const OPEN_KEEP: f32 = 3.0;
+/// FL_KEEP_INSIDE=0 turns off the keep by men inside: a holder then
+/// closes once no friend's block crosses it or stands near it, whoever
+/// is still inside, and a passer stops passing when its block has moved
+/// on. A switch for reproducing the man a block closes on (the
+/// straggler log, regiments.rs).
+fn keep_inside() -> bool {
+    static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *K.get_or_init(|| crate::util::env_or("FL_KEEP_INSIDE", 1u32) != 0)
+}
 
 /// A regiment's men standing still are drawn in their ready stance
 /// (render_units.rs `stance_tier` above zero, the guard of the pose
@@ -807,7 +816,7 @@ fn open_for_passers(groups: &mut Groups, tracks: &crate::arrows::RegTracks, tick
                     && rect_gap(&rect, &crate::formation::block_rect(hd)) <= OPEN_KEEP
             })
         };
-        let passing = near || md.passing && md.inside.iter().any(|&(_, c)| c > 0);
+        let passing = near || keep_inside() && md.passing && md.inside.iter().any(|&(_, c)| c > 0);
         groups.list[m].passing = passing;
     }
     for h in 0..n {
@@ -838,7 +847,7 @@ fn open_for_passers(groups: &mut Groups, tracks: &crate::arrows::RegTracks, tick
             }
             // A friend passing keeps it open while one of its men is
             // inside.
-            keep |= md.inside.iter().any(|&(o, c)| o as usize == h && c > 0);
+            keep |= keep_inside() && md.inside.iter().any(|&(o, c)| o as usize == h && c > 0);
             let Some(goal) = goes_to(gl, m) else {
                 // A standing friend on its closed ground keeps it open:
                 // one ordered onto that ground stands there.
