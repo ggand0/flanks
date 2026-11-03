@@ -5,8 +5,10 @@
 //! picker is skipped, and every unit stands as saved while the deployment
 //! waits for Begin Battle. The Demo scenario (`FL_DEMO=1`) does the same
 //! with a built-in setup (`demo_setup`) for the player's side only. A unit
-//! may carry one scripted order, which `run_setup_script` gives once the
-//! battle has begun and its cue comes.
+//! may carry one scripted order, and the setup a list of timed orders
+//! (`orders`, the player's orders of a play as the order log recorded
+//! them), which `run_setup_script` gives once the battle has begun and
+//! their cues come.
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -34,6 +36,20 @@ pub struct BattleSetup {
     #[serde(default)]
     pub open_sides: bool,
     pub units: Vec<Placement>,
+    /// Orders given at their times after the battle begins, to units by
+    /// their index in `units`: a play's orders, written from its log by
+    /// `work/scripts/play-to-setup.py`, so the play reruns itself.
+    #[serde(default)]
+    pub orders: Vec<TimedOrder>,
+}
+
+/// One timed order of a setup: `after` seconds into the battle, the
+/// unit at index `unit` of the setup's list is told `then`.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
+pub struct TimedOrder {
+    pub after: f32,
+    pub unit: usize,
+    pub then: Then,
 }
 
 /// Metres between the map's side and the deployment zone of a setup with
@@ -89,6 +105,16 @@ pub enum Then {
     Charge,
     /// March straight ahead this many metres.
     Advance(f32),
+    /// March to this point (the block's centre), turning to face the way
+    /// there, as a right-click does.
+    Move { x: f32, z: f32 },
+    /// A drawn line: the block re-dressed `files` wide facing `facing`
+    /// (radians), its centre marching to (x, z).
+    Line { x: f32, z: f32, facing: f32, files: u32 },
+    /// Attack the unit at this index in the setup's list.
+    Attack { unit: usize },
+    /// Drop the order and hold where the block stands.
+    Halt,
 }
 
 impl BattleSetup {
@@ -117,6 +143,7 @@ impl BattleSetup {
                     script: None,
                 })
                 .collect(),
+            orders: Vec::new(),
         }
     }
 
@@ -393,22 +420,32 @@ fn demo_setup() -> BattleSetup {
         ai_enabled: true,
         open_sides: true,
         units,
+        orders: Vec::new(),
     }
 }
 
-/// The scripted orders of the battle's setup still to give, by unit
-/// index, and the time the battle began on the game clock.
+/// The scripted orders of the battle's setup still to give, by regiment
+/// index, the regiment each saved unit went to (for an attack's target),
+/// and the time the battle began on the game clock.
 #[derive(Resource, Default)]
 pub struct SetupScript {
     pending: Vec<(usize, Scripted)>,
+    placed: Vec<usize>,
     begun: Option<f32>,
 }
 
 impl SetupScript {
-    /// The scripted orders of `setup`'s units, placed as `place` returned.
+    /// The scripted orders of `setup`'s units and its timed orders, the
+    /// units placed as `place` returned; a timed order to a unit the
+    /// setup does not list is dropped.
     pub fn new(setup: &BattleSetup, placed: &[usize]) -> Self {
-        let pending = setup.units.iter().zip(placed).filter_map(|(p, &g)| Some((g, p.script?))).collect();
-        Self { pending, begun: None }
+        let mut pending: Vec<(usize, Scripted)> =
+            setup.units.iter().zip(placed).filter_map(|(p, &g)| Some((g, p.script?))).collect();
+        pending.extend(setup.orders.iter().filter_map(|o| {
+            let g = *placed.get(o.unit)?;
+            Some((g, Scripted { when: When::After(o.after), then: o.then }))
+        }));
+        Self { pending, placed: placed.to_vec(), begun: None }
     }
 }
 
@@ -457,6 +494,32 @@ fn run_setup_script(
             Then::Advance(metres) => {
                 let dest = gd.centroid + crate::formation::facing_dir(gd.facing) * metres;
                 crate::orders::order_regiments(&mut groups, &[g], dest);
+            }
+            Then::Move { x, z } => {
+                crate::orders::order_regiments(&mut groups, &[g], Vec2::new(x, z));
+                let gd = &groups.list[g];
+                crate::orders::log_order(now, g, gd, &format!("move to ({x:.1}, {z:.1}) facing {:.3}", gd.facing));
+            }
+            Then::Line { x, z, facing, files } => {
+                let gd = &mut groups.list[g];
+                if gd.state.is_broken() {
+                    continue;
+                }
+                crate::orders::line_place(gd, Vec2::new(x, z), facing, files);
+                crate::orders::log_order(now, g, gd, &format!("line to ({x:.1}, {z:.1}) facing {facing:.3} files {files}"));
+            }
+            Then::Attack { unit } => {
+                let Some(&target) = script.placed.get(unit) else { continue };
+                if groups.list[target].count == 0 {
+                    continue;
+                }
+                crate::orders::attack_regiments(&mut groups, &[g], target as u32);
+                crate::orders::log_order(now, g, &groups.list[g], &format!("attack g{target}"));
+            }
+            Then::Halt => {
+                let gd = &mut groups.list[g];
+                crate::orders::halt_regiment(gd);
+                crate::orders::log_order(now, g, gd, &format!("halt at ({:.1}, {:.1})", gd.anchor.x, gd.anchor.y));
             }
         }
     }
@@ -696,7 +759,8 @@ mod tests {
         }
         world.insert_resource(groups);
         world.insert_resource(Deployment { active: false });
-        world.insert_resource(SetupScript { pending: vec![(0, order)], begun: None });
+        let placed = (0..=enemies.len()).collect();
+        world.insert_resource(SetupScript { pending: vec![(0, order)], placed, begun: None });
         world.insert_resource(Time::<()>::default());
         let mut system = IntoSystem::into_system(run_setup_script);
         system.initialize(&mut world);
@@ -753,5 +817,76 @@ mod tests {
         run(&mut world, 0.1);
         let Some(Order::Move(dest)) = order_of(&world) else { panic!("no move order") };
         assert!(dest.distance(Vec2::new(0.0, 5.0)) < 1e-3, "moved to {dest}");
+    }
+
+    /// A setup's timed orders reach the unit in turn at their times: a
+    /// move to a point, a drawn line that re-dresses the block, a halt
+    /// where it stands, an attack on a listed unit.
+    #[test]
+    fn timed_orders_fire_in_turn() {
+        use crate::orders::Order;
+        let setup = BattleSetup {
+            map: MapKind::Grassland,
+            units_per_team: 200,
+            reg_size: 100,
+            ai_enabled: false,
+            open_sides: false,
+            units: Vec::new(),
+            orders: vec![
+                TimedOrder { after: 1.0, unit: 0, then: Then::Move { x: 30.0, z: -50.0 } },
+                TimedOrder { after: 2.0, unit: 0, then: Then::Line { x: 10.0, z: -40.0, facing: 1.5, files: 7 } },
+                TimedOrder { after: 3.0, unit: 0, then: Then::Halt },
+                TimedOrder { after: 4.0, unit: 0, then: Then::Attack { unit: 1 } },
+                TimedOrder { after: 5.0, unit: 9, then: Then::Halt },
+            ],
+        };
+        let script = SetupScript::new(&setup, &[0, 1]);
+        assert_eq!(script.pending.len(), 4, "the order to an unlisted unit is dropped");
+        let never = Scripted { when: When::After(1e9), then: Then::Charge };
+        let (mut world, mut run) = scripted_world(&[Vec2::new(0.0, 300.0)], never);
+        world.insert_resource(script);
+        world.resource_mut::<Groups>().list[0].shape = FormShape::Rect;
+        run(&mut world, 0.0);
+        assert!(order_of(&world).is_none(), "the clock starts");
+        run(&mut world, 1.1);
+        let Some(Order::Move(dest)) = order_of(&world) else { panic!("no move order") };
+        assert!(dest.distance(Vec2::new(30.0, -50.0)) < 1e-3, "moved to {dest}");
+        let facing = world.resource::<Groups>().list[0].facing;
+        assert!((facing - crate::formation::facing_of(Vec2::new(30.0, 0.0))).abs() < 1e-3, "faces the way there");
+        run(&mut world, 1.0);
+        let Some(Order::Move(dest)) = order_of(&world) else { panic!("no line order") };
+        assert!(dest.distance(Vec2::new(10.0, -40.0)) < 1e-3, "the line's centre, {dest}");
+        let gd = &world.resource::<Groups>().list[0];
+        assert_eq!((gd.files, gd.facing), (7, 1.5), "re-dressed as drawn");
+        run(&mut world, 1.0);
+        assert!(order_of(&world).is_none(), "halted");
+        run(&mut world, 1.0);
+        assert!(matches!(order_of(&world), Some(Order::Attack(1))), "attacks the listed unit");
+    }
+
+    /// Timed orders survive the file.
+    #[test]
+    fn timed_orders_reload_from_yaml() {
+        let orders = vec![
+            TimedOrder { after: 0.9, unit: 6, then: Then::Move { x: -80.0, z: -284.0 } },
+            TimedOrder { after: 4.1, unit: 6, then: Then::Line { x: -95.0, z: -267.0, facing: 0.0, files: 30 } },
+            TimedOrder { after: 5.0, unit: 6, then: Then::Attack { unit: 23 } },
+            TimedOrder { after: 6.0, unit: 6, then: Then::Halt },
+        ];
+        let setup = BattleSetup {
+            map: MapKind::Grassland,
+            units_per_team: 200,
+            reg_size: 100,
+            ai_enabled: false,
+            open_sides: false,
+            units: Vec::new(),
+            orders,
+        };
+        let text = serde_yaml_ng::to_string(&setup).unwrap();
+        println!("{text}");
+        let loaded: BattleSetup = serde_yaml_ng::from_str(&text).unwrap();
+        assert_eq!(loaded, setup);
+        let old: BattleSetup = serde_yaml_ng::from_str("map: Grassland\nunits_per_team: 1\nreg_size: 1\nai_enabled: false\nunits: []\n").unwrap();
+        assert!(old.orders.is_empty(), "a file without orders reads");
     }
 }
