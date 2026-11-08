@@ -255,14 +255,57 @@ fn pair_cuts() -> (f32, f32) {
     })
 }
 /// One neighbour a man may touch this tick (`set_apart`, `collide`): his
-/// index, the pair's body distance, and the other man's share of the
-/// pair's mass, m_o / (m_i + m_o).
+/// index, and the pair's body distance and the other man's share of the
+/// pair's mass, m_o / (m_i + m_o), as a row of `touch_table` (`code`):
+/// eight bytes a pair instead of twelve, the passes' stream over the
+/// pairs being their cost in a crush.
 #[derive(Clone, Copy)]
 pub(crate) struct Touch {
     pub b: u32,
-    pub hard: f32,
-    pub share: f32,
+    code: u16,
 }
+/// The touching pairs' body distances, by the man's width level, the
+/// neighbour's and whether both stand in a wall, and their mass shares,
+/// by the two men's kinds (`Touch::code`): the values `scan` computes for
+/// the pair, looked up.
+pub(crate) struct TouchTable {
+    hard: [f32; 2 * WIDTH_LEVELS * WIDTH_LEVELS],
+    share: [f32; crate::unit_types::NUM_KINDS * crate::unit_types::NUM_KINDS],
+}
+pub(crate) fn touch_table() -> &'static TouchTable {
+    static T: std::sync::OnceLock<TouchTable> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        let (pairs, masses) = (pair_widths(), mass_pairs());
+        let k = crate::unit_types::NUM_KINDS;
+        TouchTable {
+            hard: std::array::from_fn(|c| {
+                let hard = pairs[c / (2 * WIDTH_LEVELS)][(c / 2) % WIDTH_LEVELS].hard;
+                if c % 2 == 1 { hard.min(WALL_SEP_RADIUS) } else { hard }
+            }),
+            share: std::array::from_fn(|c| masses[c / k][c % k].1),
+        }
+    })
+}
+impl Touch {
+    #[inline]
+    fn new(b: u32, my_level: usize, o_width: usize, both_wall: bool, my_kind: usize, o_kind: usize) -> Touch {
+        let hard = (my_level * WIDTH_LEVELS + o_width) * 2 + both_wall as usize;
+        let share = my_kind * crate::unit_types::NUM_KINDS + o_kind;
+        Touch { b, code: ((hard << 4) | share) as u16 }
+    }
+}
+impl TouchTable {
+    #[inline]
+    fn hard(&self, t: &Touch) -> f32 {
+        self.hard[(t.code >> 4) as usize & (2 * WIDTH_LEVELS * WIDTH_LEVELS - 1)]
+    }
+    #[inline]
+    fn share(&self, t: &Touch) -> f32 {
+        self.share[(t.code & 15) as usize]
+    }
+}
+const _: () = assert!(crate::unit_types::NUM_KINDS * crate::unit_types::NUM_KINDS == 16);
+const _: () = assert!((2 * WIDTH_LEVELS * WIDTH_LEVELS).is_power_of_two() && 2 * WIDTH_LEVELS * WIDTH_LEVELS <= 1 << 12);
 const STEER_GAIN: f32 = 3.0;
 const MAX_ACCEL: f32 = 50.0;
 /// What a man's legs can do: the steering toward his wish is capped at
@@ -1087,8 +1130,8 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
             let hard = if both_wall { w.hard.min(WALL_SEP_RADIUS) } else { w.hard };
             let reach = hard + TOUCH_SLACK;
             if (my_step - (o.xz() + o_vel * dt)).length_squared() < reach * reach {
-                let share = masses[crate::spatial::meta_kind(o.meta)].1;
-                out.touch.push(Touch { b: o.idx, hard, share });
+                let (o_width, o_kind) = (crate::spatial::meta_width(o.meta), crate::spatial::meta_kind(o.meta));
+                out.touch.push(Touch::new(o.idx, my_level, o_width, both_wall, st.my_kind, o_kind));
             }
         }
         // A friend beyond the widest spring rest can touch nothing of his:
@@ -3273,6 +3316,7 @@ pub(crate) fn set_apart_start(f: &Field, rows: &TouchRows, vel: &[Vec3], pos: &[
 /// the last pass left him. A man touching nobody is skipped: both
 /// buffers already hold his place (`set_apart_start`).
 pub(crate) fn set_apart(f: &Field, rows: &TouchRows, first: bool, cur: &[Vec2], next: &mut [Vec2]) {
+    let tab = touch_table();
     for (j, n) in next.iter_mut().enumerate() {
         let run = rows.run(j);
         if run.is_empty() {
@@ -3285,9 +3329,10 @@ pub(crate) fn set_apart(f: &Field, rows: &TouchRows, first: bool, cur: &[Vec2], 
         for t in run {
             let dq = me - cur[t.b as usize];
             let l2 = dq.length_squared();
-            if l2 < t.hard * t.hard && l2 > 1e-12 {
+            let hard = tab.hard(t);
+            if l2 < hard * hard && l2 > 1e-12 {
                 let l = l2.sqrt();
-                corr += dq * ((t.hard - l) * t.share / l);
+                corr += dq * ((hard - l) * tab.share(t) / l);
                 count += 1;
             }
         }
@@ -3311,6 +3356,7 @@ pub(crate) fn set_apart(f: &Field, rows: &TouchRows, first: bool, cur: &[Vec2], 
 /// there, each counted from the man's side.
 pub(crate) fn collide(f: &Field, rows: &TouchRows, cur: &[Vec2], vel: &mut [Vec3], pos: &mut [Vec3]) -> u32 {
     let inv_dt = 1.0 / f.dt;
+    let tab = touch_table();
     let mut overlapping = 0;
     for j in 0..vel.len() {
         let i = rows.start + j;
@@ -3325,13 +3371,14 @@ pub(crate) fn collide(f: &Field, rows: &TouchRows, cur: &[Vec2], vel: &mut [Vec3
             let b = t.b as usize;
             let dq = me - cur[b];
             let l2 = dq.length_squared();
-            if l2 < t.hard * t.hard && l2 > 1e-12 {
+            let hard = tab.hard(t);
+            if l2 < hard * hard && l2 > 1e-12 {
                 overlapping += 1;
                 let n = dq / l2.sqrt();
                 let u_b = (cur[b] - f.pos_prev[b].xz()) * inv_dt;
                 let c = (u_b - u).dot(n);
                 if c > 0.0 {
-                    dv += n * (c * t.share);
+                    dv += n * (c * tab.share(t));
                 }
             }
         }
