@@ -308,11 +308,13 @@ impl SpatialGrid {
     /// cells cut to the cells the disc of `disc` reaches: the same
     /// candidates in the same order, less the cells wholly outside the
     /// disc. A man in a skipped cell is farther than `disc` from `center`.
+    ///
+    /// The candidates are visited from one call site only, so the
+    /// caller's closure is inlined into the loop (a second call site, for
+    /// a clamped grid, made LLVM keep it as a function called per
+    /// candidate).
     #[inline]
     pub fn for_each_candidate_vel_disc(&self, center: Vec2, radius: f32, disc: f32, mut f: impl FnMut(&SortedUnit, Vec2)) {
-        if self.clamped {
-            return self.for_each_candidate_vel(center, radius, f);
-        }
         if self.dims.0 == 0 {
             return;
         }
@@ -320,12 +322,18 @@ impl SpatialGrid {
         let (cx1, cy1) = self.cell_coords(center + radius);
         let r2 = disc * disc;
         for cy in cy0..=cy1 {
-            // The row's nearest edge to the centre across the rows.
-            let lo = self.origin.y + cy as f32 * CELL_SIZE;
-            let gy = (lo - center.y).max(center.y - (lo + CELL_SIZE)).max(0.0);
-            let half = (r2 - gy * gy).max(0.0).sqrt();
-            let a = self.cell_coords(Vec2::new(center.x - half, center.y)).0.max(cx0);
-            let b = self.cell_coords(Vec2::new(center.x + half, center.y)).0.min(cx1);
+            let (a, b) = if self.clamped {
+                (cx0, cx1)
+            } else {
+                // The row's nearest edge to the centre across the rows.
+                let lo = self.origin.y + cy as f32 * CELL_SIZE;
+                let gy = (lo - center.y).max(center.y - (lo + CELL_SIZE)).max(0.0);
+                let half = (r2 - gy * gy).max(0.0).sqrt();
+                (
+                    self.cell_coords(Vec2::new(center.x - half, center.y)).0.max(cx0),
+                    self.cell_coords(Vec2::new(center.x + half, center.y)).0.min(cx1),
+                )
+            };
             let row = cy * self.dims.0;
             let s = self.starts[row + a] as usize;
             let e = self.starts[row + b + 1] as usize;
