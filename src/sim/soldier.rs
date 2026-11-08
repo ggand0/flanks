@@ -3496,8 +3496,41 @@ pub(crate) unsafe fn set_apart(f: &Field, rows: &TouchRows, first: bool, cur: &[
         // overlaps and 0 for any other, without a branch: a 0 added to
         // the sums changes nothing, since neither is ever -0. The distance
         // is held off 0 so the numbers stay finite; an overlapping pair is
-        // farther than that already.
-        for t in run {
+        // farther than that already. Four pairs at a time, with the same
+        // arithmetic, summed one after the other in their order.
+        #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
+        let mut k = 0;
+        #[cfg(target_arch = "x86_64")]
+        while k + 4 <= run.len() {
+            let t = &run[k..k + 4];
+            let q = [cur[t[0].b as usize], cur[t[1].b as usize], cur[t[2].b as usize], cur[t[3].b as usize]];
+            let (mut px, mut pz) = ([0.0f32; 4], [0.0f32; 4]);
+            // SAFETY: SSE2 is part of every x86_64; the stores write the
+            // two local arrays.
+            let on = unsafe {
+                use std::arch::x86_64::*;
+                let qx = _mm_set_ps(q[3].x, q[2].x, q[1].x, q[0].x);
+                let qz = _mm_set_ps(q[3].y, q[2].y, q[1].y, q[0].y);
+                let hard = _mm_set_ps(tab.hard(&t[3]), tab.hard(&t[2]), tab.hard(&t[1]), tab.hard(&t[0]));
+                let share = _mm_set_ps(tab.share(&t[3]), tab.share(&t[2]), tab.share(&t[1]), tab.share(&t[0]));
+                let (dx, dz) = (_mm_sub_ps(_mm_set1_ps(me.x), qx), _mm_sub_ps(_mm_set1_ps(me.y), qz));
+                let l2 = _mm_add_ps(_mm_mul_ps(dx, dx), _mm_mul_ps(dz, dz));
+                let tiny = _mm_set1_ps(1e-12);
+                let m = _mm_and_ps(_mm_cmplt_ps(l2, _mm_mul_ps(hard, hard)), _mm_cmpgt_ps(l2, tiny));
+                let l = _mm_sqrt_ps(_mm_max_ps(l2, tiny));
+                let w = _mm_mul_ps(_mm_div_ps(_mm_mul_ps(_mm_sub_ps(hard, l), share), l), _mm_and_ps(m, _mm_set1_ps(1.0)));
+                _mm_storeu_ps(px.as_mut_ptr(), _mm_mul_ps(dx, w));
+                _mm_storeu_ps(pz.as_mut_ptr(), _mm_mul_ps(dz, w));
+                _mm_movemask_ps(m)
+            };
+            for lane in 0..4 {
+                corr.x += px[lane];
+                corr.y += pz[lane];
+            }
+            count += on.count_ones();
+            k += 4;
+        }
+        for t in &run[k..] {
             let dq = me - cur[t.b as usize];
             let l2 = dq.length_squared();
             let hard = tab.hard(t);
@@ -3542,8 +3575,53 @@ pub(crate) fn collide(f: &Field, rows: &TouchRows, cur: &[Vec2], vel: &mut [Vec3
         let u = (me - f.pos_prev[i].xz()) * inv_dt;
         let mut dv = Vec2::ZERO;
         // Weighed by `on` without a branch, as in `set_apart`: 1 for a
-        // pair that overlaps and closes, 0 for any other.
-        for t in run {
+        // pair that overlaps and closes, 0 for any other. Four pairs at a
+        // time, as there.
+        #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
+        let mut k = 0;
+        #[cfg(target_arch = "x86_64")]
+        while k + 4 <= run.len() {
+            let t = &run[k..k + 4];
+            let bs = [t[0].b as usize, t[1].b as usize, t[2].b as usize, t[3].b as usize];
+            let q = [cur[bs[0]], cur[bs[1]], cur[bs[2]], cur[bs[3]]];
+            let o = [&sorted[bs[0]], &sorted[bs[1]], &sorted[bs[2]], &sorted[bs[3]]];
+            let (mut nvx, mut nvz) = ([0.0f32; 4], [0.0f32; 4]);
+            // SAFETY: SSE2 is part of every x86_64; the stores write the
+            // two local arrays.
+            let hit = unsafe {
+                use std::arch::x86_64::*;
+                let qx = _mm_set_ps(q[3].x, q[2].x, q[1].x, q[0].x);
+                let qz = _mm_set_ps(q[3].y, q[2].y, q[1].y, q[0].y);
+                let sx = _mm_set_ps(o[3].x, o[2].x, o[1].x, o[0].x);
+                let sz = _mm_set_ps(o[3].z, o[2].z, o[1].z, o[0].z);
+                let hard = _mm_set_ps(tab.hard(&t[3]), tab.hard(&t[2]), tab.hard(&t[1]), tab.hard(&t[0]));
+                let share = _mm_set_ps(tab.share(&t[3]), tab.share(&t[2]), tab.share(&t[1]), tab.share(&t[0]));
+                let (dx, dz) = (_mm_sub_ps(_mm_set1_ps(me.x), qx), _mm_sub_ps(_mm_set1_ps(me.y), qz));
+                let l2 = _mm_add_ps(_mm_mul_ps(dx, dx), _mm_mul_ps(dz, dz));
+                let tiny = _mm_set1_ps(1e-12);
+                let overlaps = _mm_and_ps(_mm_cmplt_ps(l2, _mm_mul_ps(hard, hard)), _mm_cmpgt_ps(l2, tiny));
+                let l = _mm_sqrt_ps(_mm_max_ps(l2, tiny));
+                let (nx, nz) = (_mm_div_ps(dx, l), _mm_div_ps(dz, l));
+                let idt = _mm_set1_ps(inv_dt);
+                let (ubx, ubz) = (_mm_mul_ps(_mm_sub_ps(qx, sx), idt), _mm_mul_ps(_mm_sub_ps(qz, sz), idt));
+                let c = _mm_add_ps(
+                    _mm_mul_ps(_mm_sub_ps(ubx, _mm_set1_ps(u.x)), nx),
+                    _mm_mul_ps(_mm_sub_ps(ubz, _mm_set1_ps(u.y)), nz),
+                );
+                let on = _mm_and_ps(overlaps, _mm_cmpgt_ps(c, _mm_setzero_ps()));
+                let w = _mm_mul_ps(_mm_mul_ps(c, share), _mm_and_ps(on, _mm_set1_ps(1.0)));
+                _mm_storeu_ps(nvx.as_mut_ptr(), _mm_mul_ps(nx, w));
+                _mm_storeu_ps(nvz.as_mut_ptr(), _mm_mul_ps(nz, w));
+                _mm_movemask_ps(overlaps)
+            };
+            for lane in 0..4 {
+                dv.x += nvx[lane];
+                dv.y += nvz[lane];
+            }
+            overlapping += hit.count_ones();
+            k += 4;
+        }
+        for t in &run[k..] {
             let b = t.b as usize;
             let dq = me - cur[b];
             let l2 = dq.length_squared();

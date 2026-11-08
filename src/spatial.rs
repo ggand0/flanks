@@ -495,6 +495,7 @@ pub struct KeepCut {
 /// `out` has room for `n` plus every man of the run.
 #[inline]
 unsafe fn keep_run(units: &[SortedUnit], vels: &[Vec2], start: u32, center: Vec2, cut: &KeepCut, out: *mut u32, mut n: usize) -> usize {
+    #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
     let mut k = 0;
     #[cfg(target_arch = "x86_64")]
     {
