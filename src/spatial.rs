@@ -114,6 +114,9 @@ pub struct SpatialGrid {
     /// The largest of `sorted_vel`'s speeds: no neighbour moves faster
     /// (the scan's cut of its candidates, sim/soldier.rs `scan`).
     vel_max: f32,
+    /// The field spans more than MAX_DIM cells on an axis, so the last
+    /// cells hold men beyond their bounds (`for_each_candidate_vel_disc`).
+    clamped: bool,
     /// Scratch: per-unit cell index from the count pass.
     cell_of: Vec<u32>,
     /// Scratch: per-chunk histogram / write cursors.
@@ -150,6 +153,7 @@ impl SpatialGrid {
         }
         self.origin = min - CELL_SIZE;
         let span = max - self.origin + CELL_SIZE;
+        self.clamped = (span.x / CELL_SIZE) as usize + 1 > MAX_DIM || (span.y / CELL_SIZE) as usize + 1 > MAX_DIM;
         self.dims = (
             ((span.x / CELL_SIZE) as usize + 1).min(MAX_DIM),
             ((span.y / CELL_SIZE) as usize + 1).min(MAX_DIM),
@@ -294,6 +298,37 @@ impl SpatialGrid {
             let row = cy * self.dims.0;
             let s = self.starts[row + cx0] as usize;
             let e = self.starts[row + cx1 + 1] as usize;
+            for (u, v) in self.sorted[s..e].iter().zip(&self.sorted_vel[s..e]) {
+                f(u, *v);
+            }
+        }
+    }
+
+    /// `for_each_candidate_vel` over the box of `radius` with each row of
+    /// cells cut to the cells the disc of `disc` reaches: the same
+    /// candidates in the same order, less the cells wholly outside the
+    /// disc. A man in a skipped cell is farther than `disc` from `center`.
+    #[inline]
+    pub fn for_each_candidate_vel_disc(&self, center: Vec2, radius: f32, disc: f32, mut f: impl FnMut(&SortedUnit, Vec2)) {
+        if self.clamped {
+            return self.for_each_candidate_vel(center, radius, f);
+        }
+        if self.dims.0 == 0 {
+            return;
+        }
+        let (cx0, cy0) = self.cell_coords(center - radius);
+        let (cx1, cy1) = self.cell_coords(center + radius);
+        let r2 = disc * disc;
+        for cy in cy0..=cy1 {
+            // The row's nearest edge to the centre across the rows.
+            let lo = self.origin.y + cy as f32 * CELL_SIZE;
+            let gy = (lo - center.y).max(center.y - (lo + CELL_SIZE)).max(0.0);
+            let half = (r2 - gy * gy).max(0.0).sqrt();
+            let a = self.cell_coords(Vec2::new(center.x - half, center.y)).0.max(cx0);
+            let b = self.cell_coords(Vec2::new(center.x + half, center.y)).0.min(cx1);
+            let row = cy * self.dims.0;
+            let s = self.starts[row + a] as usize;
+            let e = self.starts[row + b + 1] as usize;
             for (u, v) in self.sorted[s..e].iter().zip(&self.sorted_vel[s..e]) {
                 f(u, *v);
             }

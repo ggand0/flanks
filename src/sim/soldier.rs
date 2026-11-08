@@ -239,6 +239,9 @@ const TOUCH_SLACK: f32 = 0.10;
 /// The scan's cut of its candidates (`scan`): metres past the farthest a
 /// neighbour can be and still count.
 const CUT_MARGIN: f32 = 0.01;
+/// The speed (m/s) the scan's cut is drawn for (`scan`): over a man's
+/// run at 1.15 times the fastest kind's speed.
+const CUT_FAST: f32 = 12.0;
 /// The widest pair's body distance and spring rest over the pair table
 /// (`pair_widths`), for the scan's cut.
 fn pair_cuts() -> (f32, f32) {
@@ -1104,22 +1107,42 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
     // within the widest pair's spring rest, his weapon's reach, or a
     // braced spear's point. Every test below needs the neighbour nearer
     // than that, so a man farther off is out before any of them, and the
-    // box of cells shrinks to it. CUT_MARGIN is far above the rounding of
-    // a place on the map.
+    // box of cells shrinks to it, each row of the box to the cells the
+    // disc of it reaches (a fast pair may touch from beyond the old
+    // radius: the box never grows past it). CUT_MARGIN is far above the
+    // rounding of a place on the map.
+    //
+    // A few men thrown out of a crush run far faster than anyone walks,
+    // and the fastest sets the touching pair's reach for every man: the
+    // cut is drawn for neighbours no faster than CUT_FAST, and a man
+    // beyond it goes on to the tests only when he is faster.
     let (cut_hard, cut_sep) = pair_cuts();
-    let touch_cut = if touching { cut_hard + TOUCH_SLACK + (s.vel.xz().length() + grid.vel_max()) * dt } else { 0.0 };
+    let my_speed = s.vel.xz().length();
+    let fast = grid.vel_max().min(CUT_FAST);
+    let touch_at = |v: f32| if touching { cut_hard + TOUCH_SLACK + (my_speed + v) * dt } else { 0.0 };
     let spear_cut = if at_charge_speed { (spear_reach * spear_reach + SPEAR_LINE_HALF_W * SPEAR_LINE_HALF_W).sqrt() } else { 0.0 };
+    let foe_at = cut_sep.max(params.reach).max(spear_cut);
+    let (touch_cut, touch_near) = (touch_at(grid.vel_max()), touch_at(fast));
     let same_cut = SEP_RADIUS.max(touch_cut) + CUT_MARGIN;
-    let foe_cut = cut_sep.max(params.reach).max(spear_cut).max(touch_cut) + CUT_MARGIN;
+    let foe_cut = foe_at.max(touch_cut) + CUT_MARGIN;
+    let same_near = SEP_RADIUS.max(touch_near) + CUT_MARGIN;
+    let foe_near = foe_at.max(touch_near) + CUT_MARGIN;
     let (same_cut2, foe_cut2) = (same_cut * same_cut, foe_cut * foe_cut);
-    let scan_r = scan_r.min(same_cut.max(foe_cut));
-    grid.for_each_candidate_vel(p, scan_r, |o, o_vel| {
+    let (same_near2, foe_near2, fast2) = (same_near * same_near, foe_near * foe_near, fast * fast);
+    let disc_r = same_cut.max(foe_cut);
+    let scan_r = scan_r.min(disc_r);
+    grid.for_each_candidate_vel_disc(p, scan_r, disc_r, |o, o_vel| {
         if o.idx as usize == i {
             return;
         }
         let d = p - o.xz();
         let d2 = d.length_squared();
-        if d2 >= if (o.meta & crate::spatial::META_TEAM) == my_team_bit { same_cut2 } else { foe_cut2 } {
+        let (near2, cut2) = if (o.meta & crate::spatial::META_TEAM) == my_team_bit {
+            (same_near2, same_cut2)
+        } else {
+            (foe_near2, foe_cut2)
+        };
+        if d2 >= near2 && (d2 >= cut2 || o_vel.length_squared() <= fast2) {
             return;
         }
         if touching {
