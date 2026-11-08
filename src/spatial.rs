@@ -21,11 +21,8 @@ pub const CELL_SIZE: f32 = 1.5;
 const MAX_DIM: usize = 2048;
 /// Units per parallel rebuild chunk.
 const REBUILD_CHUNK: usize = 32_768;
-// The count pass keeps a chunk's men of a cell in a histogram entry's low
-// 16 bits and its men of team 1 in the high 16 (`rebuild`).
-const _: () = assert!(REBUILD_CHUNK < 1 << 16);
-/// Cells per task of the rebuild's pass over the cells (`cell_vel2`).
-const CELL_CHUNK: usize = 65_536;
+/// Cells per task of the rebuild's pass over the cells (`cell_box`).
+const CELL_CHUNK: usize = 4096;
 
 /// Meta bits carried by each sorted unit. Kind is a 2-bit FIELD (up to 4
 /// unit kinds), not a flag — read it with `meta_kind`, never as a mask test.
@@ -110,12 +107,9 @@ pub struct SpatialGrid {
     dims: (usize, usize),
     /// Prefix sums: units of cell c are sorted[starts[c]..starts[c + 1]].
     starts: Vec<u32>,
-    /// The same prefix sums over the men of team 1 only: cells a..b hold
-    /// starts_t1[b] - starts_t1[a] of them (`box_foes_vel2`).
-    starts_t1: Vec<u32>,
-    /// The largest squared speed of `sorted_vel` in each cell, 0 for an
-    /// empty one (`box_foes_vel2`).
-    cell_vel2: Vec<f32>,
+    /// Each cell's men of team 1 and the largest squared speed of
+    /// `sorted_vel` among its men, 0 for an empty one (`box_foes_vel2`).
+    cell_box: Vec<(u32, f32)>,
     /// Units in cell order (the counting-sort payload).
     sorted: Vec<SortedUnit>,
     /// Tick-start ground velocity of `sorted[k]`, in the same order: a
@@ -188,12 +182,9 @@ impl SpatialGrid {
         self.hists.resize(n_chunks, Vec::new());
 
         // Count pass: per-chunk histograms + cached per-unit cell index.
-        // An entry counts the chunk's men of the cell in its low 16 bits
-        // and those of team 1 in its high 16.
         crate::util::sim_scope(|scope| {
-            for ((pos_chunk, team_chunk), (cell_chunk, hist)) in positions
+            for (pos_chunk, (cell_chunk, hist)) in positions
                 .chunks(REBUILD_CHUNK)
-                .zip(teams.chunks(REBUILD_CHUNK))
                 .zip(self.cell_of.chunks_mut(REBUILD_CHUNK).zip(&mut self.hists))
             {
                 scope.spawn(async move {
@@ -202,7 +193,7 @@ impl SpatialGrid {
                     for (j, p) in pos_chunk.iter().enumerate() {
                         let c = cell_index_for(origin, dims, Vec2::new(p.x, p.z));
                         cell_chunk[j] = c as u32;
-                        hist[c] += 1 + ((team_chunk[j] as u32) << 16);
+                        hist[c] += 1;
                     }
                 });
             }
@@ -213,18 +204,14 @@ impl SpatialGrid {
         // cell-major, chunk order within a cell.
         self.starts.clear();
         self.starts.resize(cells + 1, 0);
-        self.starts_t1.clear();
-        self.starts_t1.resize(cells + 1, 0);
-        let (mut acc, mut acc_t1) = (0u32, 0u32);
+        let mut acc = 0u32;
         for c in 0..cells {
             for hist in &mut self.hists {
                 let cnt = hist[c];
                 hist[c] = acc;
-                acc += cnt & 0xFFFF;
-                acc_t1 += cnt >> 16;
+                acc += cnt;
             }
             self.starts[c + 1] = acc;
-            self.starts_t1[c + 1] = acc_t1;
         }
 
         // Scatter pass: chunks write their units to precomputed disjoint
@@ -284,16 +271,20 @@ impl SpatialGrid {
         });
         self.vel_max = vel_max2.into_iter().fold(0.0, f32::max).sqrt();
 
-        // Each cell's fastest man, from the sorted column.
-        self.cell_vel2.resize(cells, 0.0);
-        let (starts, sorted_vel) = (&self.starts[..], &self.sorted_vel[..]);
+        // Each cell's fastest man and its men of team 1, from the sorted
+        // columns.
+        self.cell_box.resize(cells, (0, 0.0));
+        let (starts, sorted, sorted_vel) = (&self.starts[..], &self.sorted[..], &self.sorted_vel[..]);
         crate::util::sim_scope(|scope| {
-            for (k, out) in self.cell_vel2.chunks_mut(CELL_CHUNK).enumerate() {
+            for (k, cell) in self.cell_box.chunks_mut(CELL_CHUNK).enumerate() {
                 scope.spawn(async move {
                     let c0 = k * CELL_CHUNK;
-                    for (j, o) in out.iter_mut().enumerate() {
+                    for (j, cell) in cell.iter_mut().enumerate() {
                         let (s, e) = (starts[c0 + j] as usize, starts[c0 + j + 1] as usize);
-                        *o = sorted_vel[s..e].iter().fold(0.0f32, |m, v| m.max(v.length_squared()));
+                        *cell = (
+                            sorted[s..e].iter().map(|u| u.meta & META_TEAM).sum(),
+                            sorted_vel[s..e].iter().fold(0.0f32, |m, v| m.max(v.length_squared())),
+                        );
                     }
                 });
             }
@@ -318,12 +309,13 @@ impl SpatialGrid {
             let row = cy * self.dims.0;
             let (a, b) = (row + cx0, row + cx1 + 1);
             let all = self.starts[b] - self.starts[a];
-            let t1 = self.starts_t1[b] - self.starts_t1[a];
+            let mut t1 = 0;
+            for &(t, v) in &self.cell_box[a..b] {
+                t1 += t;
+                vel2 = vel2.max(v);
+            }
             foes |= if team1 { all - t1 } else { t1 };
             men += all as usize;
-            for v in &self.cell_vel2[a..b] {
-                vel2 = vel2.max(*v);
-            }
         }
         (foes != 0, vel2, men)
     }
@@ -426,6 +418,7 @@ impl SpatialGrid {
         let (cx0, cy0) = self.cell_coords(center - radius);
         let (cx1, cy1) = self.cell_coords(center + radius);
         let r2 = disc * disc;
+        let lanes = KeepLanes::new(center, cut);
         let mut n = 0;
         for cy in cy0..=cy1 {
             let (a, b) = if self.clamped {
@@ -444,7 +437,7 @@ impl SpatialGrid {
             let s = self.starts[row + a] as usize;
             let e = self.starts[row + b + 1] as usize;
             // SAFETY: the caller's.
-            n = unsafe { keep_run(&self.sorted[s..e], &self.sorted_vel[s..e], s as u32, center, cut, out, n) };
+            n = unsafe { keep_run(&self.sorted[s..e], &self.sorted_vel[s..e], s as u32, center, cut, &lanes, out, n) };
         }
         n
     }
@@ -488,28 +481,70 @@ pub struct KeepCut {
     pub fast2: f32,
 }
 
+/// `KeepCut` in all four lanes, set once for a man's walk.
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy)]
+struct KeepLanes {
+    px: std::arch::x86_64::__m128,
+    pz: std::arch::x86_64::__m128,
+    team: std::arch::x86_64::__m128i,
+    me: std::arch::x86_64::__m128i,
+    sn2: std::arch::x86_64::__m128,
+    sc2: std::arch::x86_64::__m128,
+    fn2: std::arch::x86_64::__m128,
+    fc2: std::arch::x86_64::__m128,
+    fast2: std::arch::x86_64::__m128,
+}
+#[cfg(not(target_arch = "x86_64"))]
+struct KeepLanes;
+
+impl KeepLanes {
+    #[inline]
+    fn new(center: Vec2, cut: &KeepCut) -> KeepLanes {
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: SSE2 is part of every x86_64.
+        unsafe {
+            use std::arch::x86_64::*;
+            KeepLanes {
+                px: _mm_set1_ps(center.x),
+                pz: _mm_set1_ps(center.y),
+                team: _mm_set1_epi32(cut.team_bit as i32),
+                me: _mm_set1_epi32(cut.me as i32),
+                sn2: _mm_set1_ps(cut.same_near2),
+                sc2: _mm_set1_ps(cut.same_cut2),
+                fn2: _mm_set1_ps(cut.foe_near2),
+                fc2: _mm_set1_ps(cut.foe_cut2),
+                fast2: _mm_set1_ps(cut.fast2),
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = (center, cut);
+            KeepLanes
+        }
+    }
+}
+
 /// `kept_in_disc` over one run of `sorted` from rank `start`, writing
 /// from `out[n]` on; returns the new count.
 ///
 /// # Safety
 /// `out` has room for `n` plus every man of the run.
+#[allow(clippy::too_many_arguments)] // the run and the man's cut
 #[inline]
-unsafe fn keep_run(units: &[SortedUnit], vels: &[Vec2], start: u32, center: Vec2, cut: &KeepCut, out: *mut u32, mut n: usize) -> usize {
+unsafe fn keep_run(units: &[SortedUnit], vels: &[Vec2], start: u32, center: Vec2, cut: &KeepCut, lanes: &KeepLanes, out: *mut u32, mut n: usize) -> usize {
     #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
     let mut k = 0;
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = lanes;
     #[cfg(target_arch = "x86_64")]
     {
         use std::arch::x86_64::*;
         // SAFETY: SSE2 is part of every x86_64; the loads read units
         // k..k + 4 and their velocities, within the run.
         unsafe {
-            let (px, pz) = (_mm_set1_ps(center.x), _mm_set1_ps(center.y));
-            let team = _mm_set1_epi32(cut.team_bit as i32);
+            let KeepLanes { px, pz, team, me, sn2, sc2, fn2, fc2, fast2 } = *lanes;
             let one = _mm_set1_epi32(META_TEAM as i32);
-            let me = _mm_set1_epi32(cut.me as i32);
-            let (sn2, sc2) = (_mm_set1_ps(cut.same_near2), _mm_set1_ps(cut.same_cut2));
-            let (fn2, fc2) = (_mm_set1_ps(cut.foe_near2), _mm_set1_ps(cut.foe_cut2));
-            let fast2 = _mm_set1_ps(cut.fast2);
             let (ub, vb) = (units.as_ptr() as *const f32, vels.as_ptr() as *const f32);
             while k + 4 <= units.len() {
                 // Four men's x, z, index and meta, and their velocities.

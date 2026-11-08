@@ -1216,8 +1216,10 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
     // registers: the list's length is set once after it.
     let (touch_at_end, mut n_touch) = (out.touch.as_mut_ptr(), out.touch.len());
     let my_kind = st.my_kind;
-    let mut n_on = 0usize;
-    for j in 0..n_kept {
+    // The old contact lists no pairs, and the few friends past the
+    // spring's rest within its cut are left to a branch below.
+    let mut n_on = if touching { 0 } else { n_kept };
+    for j in 0..if touching { n_kept } else { 0 } {
         // SAFETY: j < n_kept, the list's length.
         let o_rank = unsafe { *kept.add(j) };
         let o = &sorted[o_rank as usize];
@@ -1252,6 +1254,9 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
         let d = p - o.xz();
         let d2 = d.length_squared();
         let same = (o.meta & crate::spatial::META_TEAM) == my_team_bit;
+        if !touching && same && d2 >= SEP_RADIUS * SEP_RADIUS {
+            continue;
+        }
         let enemy = !same && (o.meta & crate::spatial::META_DYING) == 0;
         if enemy && d2 < reach2 {
             sticky |= o.idx == prev_target;
