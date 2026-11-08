@@ -72,8 +72,9 @@ pub(crate) struct Sidearm {
 }
 
 /// One tick of the yield-and-collide contact in parts (the overlay's
-/// 2 s log line): the kernel (scan, steer, integrate), the start pass,
-/// the SET_APART_PASSES passes together and the collision pass, in ms;
+/// 2 s log line): the kernel (scan, steer, integrate and the start
+/// places), the cut of the phase's work into runs, the
+/// SET_APART_PASSES passes together and the collision pass, in ms;
 /// the men with a touching pair, the pairs listed (each once) and the
 /// pairs still overlapping at the final places (each once).
 #[derive(Clone, Copy, Default)]
@@ -235,6 +236,10 @@ pub struct TickJob {
     pub(crate) touch_end: Vec<u32>,
     pub(crate) touch_q: Vec<Vec2>,
     pub(crate) touch_next: Vec<Vec2>,
+    /// Each chunk's first pair among all the tick's listed pairs, and the
+    /// cut of the contact phase's men into runs of equal work.
+    pub(crate) touch_base: Vec<u64>,
+    pub(crate) touch_bounds: Vec<usize>,
     pub(crate) terrain: Option<std::sync::Arc<Terrain>>,
     pub(crate) dt: f32,
     pub(crate) combat_scale: f32,

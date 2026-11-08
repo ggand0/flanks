@@ -3184,38 +3184,42 @@ fn ground_step(terrain: &Terrain, bounds_min: Vec2, bounds_max: Vec2, from: Vec2
     Vec2::new(nx, nz)
 }
 
-/// The rows of one chunk for the yield-and-collide contact's passes: the
-/// chunk's men's touching pairs (`ChunkOut::touch`) and the end of each
-/// man's run in them.
+/// A run of rows of one kernel chunk for the yield-and-collide
+/// contact's passes: the chunk's men's touching pairs
+/// (`ChunkOut::touch`), the end of each row's run in them, and where the
+/// first row's run begins.
 pub(crate) struct TouchRows<'a> {
     pub start: usize,
     pub touch: &'a [Touch],
     pub touch_end: &'a [u32],
+    pub from0: u32,
 }
 
 impl TouchRows<'_> {
     #[inline]
     fn run(&self, j: usize) -> &[Touch] {
-        let from = if j == 0 { 0 } else { self.touch_end[j - 1] as usize };
+        let from = if j == 0 { self.from0 } else { self.touch_end[j - 1] } as usize;
         &self.touch[from..self.touch_end[j] as usize]
     }
 }
 
 /// Where each man of a chunk stands before the first pass of the setting
-/// apart: a man with a touching pair at his legs' step from the tick's
-/// start, unclamped, as the step asks; any other man where the kernel
-/// set him down, since no pass moves him. Returns how many men of the
-/// chunk have a touching pair.
-pub(crate) fn set_apart_start(f: &Field, rows: &TouchRows, vel: &[Vec3], pos: &[Vec3], q: &mut [Vec2]) -> u32 {
+/// apart, in both place buffers: a man with a touching pair at his legs'
+/// step from the tick's start, unclamped, as the step asks (`q` only;
+/// the first pass writes his `next`); any other man where the kernel set
+/// him down, in both, since no pass moves him or writes his place again.
+/// Returns how many men of the chunk have a touching pair.
+pub(crate) fn set_apart_start(f: &Field, rows: &TouchRows, vel: &[Vec3], pos: &[Vec3], q: &mut [Vec2], next: &mut [Vec2]) -> u32 {
     let mut listed = 0;
-    for (j, q) in q.iter_mut().enumerate() {
+    for (j, (q, next)) in q.iter_mut().zip(next.iter_mut()).enumerate() {
         let i = rows.start + j;
-        *q = if rows.run(j).is_empty() {
-            pos[j].xz()
+        if rows.run(j).is_empty() {
+            *q = pos[j].xz();
+            *next = *q;
         } else {
             listed += 1;
-            f.pos_prev[i].xz() + vel[j].xz() * f.dt
-        };
+            *q = f.pos_prev[i].xz() + vel[j].xz() * f.dt;
+        }
     }
     listed
 }
@@ -3227,16 +3231,16 @@ pub(crate) fn set_apart_start(f: &Field, rows: &TouchRows, vel: &[Vec3], pos: &[
 /// over the men he touches, multiplies them by SET_APART_WEIGHT and
 /// steps by them on the ground (`next`). All men move together after the
 /// pass. The first pass steps from the tick's start, the rest from where
-/// the last pass left him.
+/// the last pass left him. A man touching nobody is skipped: both
+/// buffers already hold his place (`set_apart_start`).
 pub(crate) fn set_apart(f: &Field, rows: &TouchRows, first: bool, cur: &[Vec2], next: &mut [Vec2]) {
     for (j, n) in next.iter_mut().enumerate() {
-        let i = rows.start + j;
-        let me = cur[i];
         let run = rows.run(j);
         if run.is_empty() {
-            *n = me;
             continue;
         }
+        let i = rows.start + j;
+        let me = cur[i];
         let mut corr = Vec2::ZERO;
         let mut count = 0u32;
         for t in run {

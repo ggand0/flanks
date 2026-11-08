@@ -13,7 +13,6 @@
 //! the job computes on the pool and hands over as a product.
 
 use bevy::prelude::*;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
 use crate::frontline::InfluenceField;
@@ -415,6 +414,8 @@ fn run_tick_job(job: &mut TickJob) {
         touch_end,
         touch_q,
         touch_next,
+        touch_base,
+        touch_bounds,
         grid_ms,
         step_ms,
         field_ms,
@@ -584,7 +585,9 @@ fn run_tick_job(job: &mut TickJob) {
     let n = pos_out.len();
     touch.resize_with(n.div_ceil(CHUNK), Vec::new);
     touch_end.resize(n, 0);
-    let mut lists: Vec<(Vec<u32>, Vec<u32>)> = crate::util::sim_scope(|scope| {
+    touch_q.resize(n, Vec2::ZERO);
+    touch_next.resize(n, Vec2::ZERO);
+    let kernel_out: Vec<(Vec<u32>, Vec<u32>, u32)> = crate::util::sim_scope(|scope| {
         for (ci, chunk) in pos_out
             .chunks_mut(CHUNK)
             .zip(vel.chunks_mut(CHUNK))
@@ -608,11 +611,13 @@ fn run_tick_job(job: &mut TickJob) {
             .zip(aim.chunks_mut(CHUNK))
             .zip(touch.iter_mut())
             .zip(touch_end.chunks_mut(CHUNK))
+            .zip(touch_q.chunks_mut(CHUNK))
+            .zip(touch_next.chunks_mut(CHUNK))
             .enumerate()
         {
-            let (((((((((((((((((((((pos, vel), yaw), yaw_prev), target), swing), swing_t), flash),
+            let (((((((((((((((((((((((pos, vel), yaw), yaw_prev), target), swing), swing_t), flash),
                 death_t), events), ammo), arrows), out_form), sight), way), chain), pose), quarry), stuck), aim),
-                touch), touch_end) = chunk;
+                touch), touch_end), touch_q), touch_next) = chunk;
             let start = ci * CHUNK;
             let end = start + pos.len();
             scope.spawn(async move {
@@ -659,17 +664,23 @@ fn run_tick_job(job: &mut TickJob) {
                 touch.clear();
                 let mut out = soldier::ChunkOut { events, arrows, touch, touch_end };
                 soldier::tick_chunk(f, rows, &mut out);
-                // The sweep's candidates from this chunk, once its men
-                // stand where the tick leaves them.
                 if old_contact {
-                    edge_lists(start, pos, death_t, team, edge_lo, edge_hi)
+                    // The sweep's candidates from this chunk, once its men
+                    // stand where the tick leaves them.
+                    let (dead, at_edge) = edge_lists(start, pos, death_t, team, edge_lo, edge_hi);
+                    (dead, at_edge, 0)
                 } else {
-                    (Vec::new(), Vec::new())
+                    // The yield-and-collide contact's start places, while
+                    // the chunk's rows are hot.
+                    let rows = soldier::TouchRows { start, touch: out.touch, touch_end: out.touch_end, from0: 0 };
+                    let listed = soldier::set_apart_start(f, &rows, vel, pos, touch_q, touch_next);
+                    (Vec::new(), Vec::new(), listed)
                 }
             });
         }
     });
     drop(integrate_span);
+    let mut lists: Vec<(Vec<u32>, Vec<u32>)> = Vec::new();
     *contact_split = job::ContactSplit::default();
     // The yield-and-collide contact: the men set apart on their stepped
     // places, SET_APART_PASSES passes over the tick's touching pairs, each
@@ -678,65 +689,109 @@ fn run_tick_job(job: &mut TickJob) {
     if !old_contact {
         let _span = info_span!("set_apart").entered();
         let t_kernel = Instant::now();
+        let men: u32 = kernel_out.iter().map(|k| k.2).sum();
+        // The phase runs over runs of men cut to equal work, a listed pair
+        // weighing PAIR_WEIGHT men, so the few chunks at a crush's front
+        // that hold nearly all the pairs are shared out across the
+        // threads. A man touching nobody is never written; his place sits
+        // in both buffers from the start.
+        touch_base.clear();
+        let mut listed = 0u64;
+        for t in touch.iter() {
+            touch_base.push(listed);
+            listed += t.len() as u64;
+        }
         let touch = &touch[..];
         let touch_end = &touch_end[..];
-        let rows = |ci: usize, len: usize| {
-            let start = ci * CHUNK;
-            soldier::TouchRows { start, touch: &touch[ci], touch_end: &touch_end[start..start + len] }
-        };
-        touch_q.resize(n, Vec2::ZERO);
-        touch_next.resize(n, Vec2::ZERO);
-        // The counts summed once per chunk, for the overlay's log line.
-        let men = AtomicU32::new(0);
-        let overlap = AtomicU32::new(0);
-        let (men_n, overlap_n) = (&men, &overlap);
-        crate::util::sim_scope(|scope| {
-            for (ci, ((q, vel), pos)) in
-                touch_q.chunks_mut(CHUNK).zip(vel.chunks(CHUNK)).zip(pos_out.chunks(CHUNK)).enumerate()
-            {
-                let rows = rows(ci, q.len());
-                scope.spawn(async move {
-                    men_n.fetch_add(soldier::set_apart_start(f, &rows, vel, pos, q), Ordering::Relaxed);
-                });
+        let touch_base = &touch_base[..];
+        let key = |i: usize| PAIR_WEIGHT * (touch_base[i / CHUNK] + touch_end[i] as u64) + i as u64 + 1;
+        let total = PAIR_WEIGHT * listed + n as u64;
+        let tasks = (crate::util::sim_threads() * TASKS_PER_THREAD) as u64;
+        touch_bounds.clear();
+        touch_bounds.push(0);
+        for t in 1..tasks {
+            let goal = total * t / tasks;
+            let (mut lo, mut hi) = (0, n);
+            while lo < hi {
+                let mid = (lo + hi) / 2;
+                if key(mid) < goal {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
             }
-        });
+            if lo > *touch_bounds.last().unwrap() && lo < n {
+                touch_bounds.push(lo);
+            }
+        }
+        touch_bounds.push(n);
+        let bounds = &touch_bounds[..];
         let t_start = Instant::now();
         for pass in 0..soldier::SET_APART_PASSES {
             let cur = &touch_q[..];
+            let next_all = &mut touch_next[..];
             crate::util::sim_scope(|scope| {
-                for (ci, next) in touch_next.chunks_mut(CHUNK).enumerate() {
-                    let rows = rows(ci, next.len());
-                    scope.spawn(async move { soldier::set_apart(f, &rows, pass == 0, cur, next) });
+                let mut rest = next_all;
+                for w in bounds.windows(2) {
+                    let (a, b) = (w[0], w[1]);
+                    let (next, tail) = rest.split_at_mut(b - a);
+                    rest = tail;
+                    scope.spawn(async move {
+                        for rows in touch_runs(touch, touch_end, a, b) {
+                            let off = rows.start - a;
+                            let len = rows.touch_end.len();
+                            soldier::set_apart(f, &rows, pass == 0, cur, &mut next[off..off + len]);
+                        }
+                    });
                 }
             });
             std::mem::swap(touch_q, touch_next);
         }
         let t_passes = Instant::now();
         let cur = &touch_q[..];
-        lists = crate::util::sim_scope(|scope| {
-            for (ci, ((vel, pos), death_t)) in
-                vel.chunks_mut(CHUNK).zip(pos_out.chunks_mut(CHUNK)).zip(death_t.chunks(CHUNK)).enumerate()
-            {
-                let rows = rows(ci, vel.len());
+        let death_t = &death_t[..];
+        let vel_all = &mut vel[..];
+        let pos_all = &mut pos_out[..];
+        let collided: Vec<(u32, Vec<u32>, Vec<u32>)> = crate::util::sim_scope(|scope| {
+            let (mut vel_rest, mut pos_rest) = (vel_all, pos_all);
+            for w in bounds.windows(2) {
+                let (a, b) = (w[0], w[1]);
+                let (vel, vel_tail) = vel_rest.split_at_mut(b - a);
+                let (pos, pos_tail) = pos_rest.split_at_mut(b - a);
+                (vel_rest, pos_rest) = (vel_tail, pos_tail);
+                let death_t = &death_t[a..b];
                 scope.spawn(async move {
-                    overlap_n.fetch_add(soldier::collide(f, &rows, cur, vel, pos), Ordering::Relaxed);
-                    edge_lists(rows.start, pos, death_t, team, edge_lo, edge_hi)
+                    let mut overlap = 0;
+                    for rows in touch_runs(touch, touch_end, a, b) {
+                        let off = rows.start - a;
+                        let len = rows.touch_end.len();
+                        overlap += soldier::collide(f, &rows, cur, &mut vel[off..off + len], &mut pos[off..off + len]);
+                    }
+                    let (dead, at_edge) = edge_lists(a, pos, death_t, team, edge_lo, edge_hi);
+                    (overlap, dead, at_edge)
                 });
             }
         });
         let t_collide = Instant::now();
+        let mut overlap = 0;
+        lists.reserve(collided.len());
+        for (o, d, e) in collided {
+            overlap += o;
+            lists.push((d, e));
+        }
         let ms = |a: Instant, b: Instant| (b - a).as_secs_f32() * 1000.0;
-        // Every pair is on both men's lists.
-        let listed: usize = touch.iter().map(Vec::len).sum();
         *contact_split = job::ContactSplit {
             kernel_ms: ms(t2, t_kernel),
             start_ms: ms(t_kernel, t_start),
             passes_ms: ms(t_start, t_passes),
             collide_ms: ms(t_passes, t_collide),
-            men: men.into_inner(),
+            men,
+            // Every pair is on both men's lists.
             pairs: (listed / 2) as u32,
-            overlap: overlap.into_inner() / 2,
+            overlap: overlap / 2,
         };
+    } else {
+        lists.extend(kernel_out.into_iter().map(|(d, e, _)| (d, e)));
     }
     dead.clear();
     at_edge.clear();
@@ -754,6 +809,35 @@ fn run_tick_job(job: &mut TickJob) {
         }
         None => plans.clear(),
     }
+}
+
+/// A listed pair's weight against a man's in the cut of the contact
+/// phase's work (`run_tick_job`): the passes visit every pair and only
+/// look at a man touching nobody.
+const PAIR_WEIGHT: u64 = 4;
+/// Runs of the contact phase's work per sim thread.
+const TASKS_PER_THREAD: usize = 3;
+
+/// The men `a..b` for the contact phase's passes, cut at the kernel's
+/// chunks: each piece's rows and touching pairs.
+fn touch_runs<'a>(
+    touch: &'a [Vec<soldier::Touch>],
+    touch_end: &'a [u32],
+    a: usize,
+    b: usize,
+) -> impl Iterator<Item = soldier::TouchRows<'a>> {
+    let mut s = a;
+    std::iter::from_fn(move || {
+        if s >= b {
+            return None;
+        }
+        let ci = s / CHUNK;
+        let e = b.min((ci + 1) * CHUNK);
+        let from0 = if s.is_multiple_of(CHUNK) { 0 } else { touch_end[s - 1] };
+        let rows = soldier::TouchRows { start: s, touch: &touch[ci], touch_end: &touch_end[s..e], from0 };
+        s = e;
+        Some(rows)
+    })
 }
 
 /// The sweep's candidates from one chunk: countdowns that just ran out,

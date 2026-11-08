@@ -93,6 +93,16 @@ where
     pool.scope_with_executor(!on_sim_worker(), None, f)
 }
 
+/// The threads of the pool `sim_scope` runs on.
+pub fn sim_threads() -> usize {
+    if sim_on_async_pool() {
+        bevy::tasks::AsyncComputeTaskPool::get().thread_num()
+    } else {
+        bevy::tasks::ComputeTaskPool::get().thread_num()
+    }
+    .max(1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::packaged_root;
