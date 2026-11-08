@@ -93,6 +93,16 @@ where
     pool.scope_with_executor(!on_sim_worker(), None, f)
 }
 
+/// The simulation's eight-wide paths run where the CPU has AVX2, unless
+/// FL_SIMD=sse2 keeps it on the four-wide ones (the same numbers either
+/// way; the switch is for checking that).
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub fn simd_avx2() -> bool {
+    static A: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *A.get_or_init(|| std::arch::is_x86_feature_detected!("avx2") && !std::env::var("FL_SIMD").is_ok_and(|v| v == "sse2"))
+}
+
 /// The threads of the pool `sim_scope` runs on.
 pub fn sim_threads() -> usize {
     if sim_on_async_pool() {
