@@ -136,6 +136,8 @@ pub struct SpatialGrid {
     clamped: bool,
     /// Scratch: per-unit cell index from the count pass.
     cell_of: Vec<u32>,
+    /// Each unit's rank, his slot in `sorted`, by his index.
+    rank_of: Vec<u32>,
     /// Scratch: per-chunk histogram / write cursors.
     hists: Vec<Vec<u32>>,
 }
@@ -231,6 +233,7 @@ impl SpatialGrid {
         self.sorted.resize(n, SortedUnit::default());
         self.sorted_vel.resize(n, Vec2::ZERO);
         self.sorted_move.resize(n, Vec2::ZERO);
+        self.rank_of.resize(n, 0);
         // A column of a tick before that does not match (none yet) reads
         // as no move.
         let prev = if prev_positions.len() == n { prev_positions } else { positions };
@@ -241,8 +244,9 @@ impl SpatialGrid {
         let out_move = SharedVel(self.sorted_move.as_mut_ptr());
         let out_move = &out_move;
         let vel_max2: Vec<f32> = crate::util::sim_scope(|scope| {
-            for (t, (pos_chunk, (cell_chunk, hist))) in positions
+            for (t, ((pos_chunk, rank_chunk), (cell_chunk, hist))) in positions
                 .chunks(REBUILD_CHUNK)
+                .zip(self.rank_of.chunks_mut(REBUILD_CHUNK))
                 .zip(self.cell_of.chunks(REBUILD_CHUNK).zip(&mut self.hists))
                 .enumerate()
             {
@@ -254,6 +258,7 @@ impl SpatialGrid {
                         let c = cell_chunk[j] as usize;
                         let k = hist[c] as usize;
                         hist[c] += 1;
+                        rank_chunk[j] = k as u32;
                         let meta = ((teams[i] as u32) * META_TEAM)
                             | ((kinds[i] as u32) << META_KIND_SHIFT)
                             | (((death_t[i] > 0) as u32) * META_DYING)
@@ -320,6 +325,18 @@ impl SpatialGrid {
         (foes != 0, vel2)
     }
 
+    /// Every unit in grid order: his rank is his slot here.
+    #[inline]
+    pub fn sorted(&self) -> &[SortedUnit] {
+        &self.sorted
+    }
+
+    /// Each unit's rank in `sorted`, by his index.
+    #[inline]
+    pub fn rank_of(&self) -> &[u32] {
+        &self.rank_of
+    }
+
     /// The fastest neighbour's speed at the tick's start (`sorted_vel`).
     #[inline]
     pub fn vel_max(&self) -> f32 {
@@ -380,16 +397,17 @@ impl SpatialGrid {
 
     /// `for_each_candidate_vel` over the box of `radius` with each row of
     /// cells cut to the cells the disc of `disc` reaches, handing each
-    /// unit's actual move over the last tick as well (`sorted_move`): the same
-    /// candidates in the same order, less the cells wholly outside the
-    /// disc. A man in a skipped cell is farther than `disc` from `center`.
+    /// unit's rank in `sorted` first and his actual move over the last
+    /// tick as well (`sorted_move`): the same candidates in the same order,
+    /// less the cells wholly outside the disc. A man in a skipped cell is
+    /// farther than `disc` from `center`.
     ///
     /// The candidates are visited from one call site only, so the
     /// caller's closure is inlined into the loop (a second call site, for
     /// a clamped grid, made LLVM keep it as a function called per
     /// candidate).
     #[inline]
-    pub fn for_each_candidate_vel_disc(&self, center: Vec2, radius: f32, disc: f32, mut f: impl FnMut(&SortedUnit, Vec2, Vec2)) {
+    pub fn for_each_candidate_vel_disc(&self, center: Vec2, radius: f32, disc: f32, mut f: impl FnMut(u32, &SortedUnit, Vec2, Vec2)) {
         if self.dims.0 == 0 {
             return;
         }
@@ -412,8 +430,8 @@ impl SpatialGrid {
             let row = cy * self.dims.0;
             let s = self.starts[row + a] as usize;
             let e = self.starts[row + b + 1] as usize;
-            for ((u, v), m) in self.sorted[s..e].iter().zip(&self.sorted_vel[s..e]).zip(&self.sorted_move[s..e]) {
-                f(u, *v, *m);
+            for (k, ((u, v), m)) in self.sorted[s..e].iter().zip(&self.sorted_vel[s..e]).zip(&self.sorted_move[s..e]).enumerate() {
+                f((s + k) as u32, u, *v, *m);
             }
         }
     }

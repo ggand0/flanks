@@ -589,6 +589,8 @@ fn run_tick_job(job: &mut TickJob) {
     touch_end.resize(n, 0);
     touch_q.resize(n, Vec2::ZERO);
     touch_next.resize(n, Vec2::ZERO);
+    // The places by rank, written at each chunk's men's ranks.
+    let (q_all, next_all) = (soldier::Places(touch_q.as_mut_ptr()), soldier::Places(touch_next.as_mut_ptr()));
     let kernel_out: Vec<(Vec<u32>, Vec<u32>, [u32; 3])> = crate::util::sim_scope(|scope| {
         for (ci, chunk) in pos_out
             .chunks_mut(CHUNK)
@@ -613,13 +615,11 @@ fn run_tick_job(job: &mut TickJob) {
             .zip(aim.chunks_mut(CHUNK))
             .zip(touch.iter_mut())
             .zip(touch_end.chunks_mut(CHUNK))
-            .zip(touch_q.chunks_mut(CHUNK))
-            .zip(touch_next.chunks_mut(CHUNK))
             .enumerate()
         {
-            let (((((((((((((((((((((((pos, vel), yaw), yaw_prev), target), swing), swing_t), flash),
+            let (((((((((((((((((((((pos, vel), yaw), yaw_prev), target), swing), swing_t), flash),
                 death_t), events), ammo), arrows), out_form), sight), way), chain), pose), quarry), stuck), aim),
-                touch), touch_end), touch_q), touch_next) = chunk;
+                touch), touch_end) = chunk;
             let start = ci * CHUNK;
             let end = start + pos.len();
             scope.spawn(async move {
@@ -676,7 +676,9 @@ fn run_tick_job(job: &mut TickJob) {
                     // the chunk's rows are hot.
                     let (braked, held) = (out.braked, out.held);
                     let rows = soldier::TouchRows { start, touch: out.touch, touch_end: out.touch_end, from0: 0 };
-                    let listed = soldier::set_apart_start(f, &rows, vel, pos, touch_q, touch_next);
+                    // SAFETY: both buffers hold n slots, a man's rank is
+                    // his alone, and the chunks hold disjoint men.
+                    let listed = unsafe { soldier::set_apart_start(f, &rows, vel, pos, q_all, next_all) };
                     (Vec::new(), Vec::new(), [listed, braked, held])
                 }
             });
@@ -733,19 +735,17 @@ fn run_tick_job(job: &mut TickJob) {
         let bounds = &touch_bounds[..];
         let t_start = Instant::now();
         for pass in 0..soldier::set_apart_passes() {
+            let next = soldier::Places(touch_next.as_mut_ptr());
             let cur = &touch_q[..];
-            let next_all = &mut touch_next[..];
             crate::util::sim_scope(|scope| {
-                let mut rest = next_all;
                 for w in bounds.windows(2) {
                     let (a, b) = (w[0], w[1]);
-                    let (next, tail) = rest.split_at_mut(b - a);
-                    rest = tail;
                     scope.spawn(async move {
                         for rows in touch_runs(touch, touch_end, a, b) {
-                            let off = rows.start - a;
-                            let len = rows.touch_end.len();
-                            soldier::set_apart(f, &rows, pass == 0, cur, &mut next[off..off + len]);
+                            // SAFETY: `next` holds n slots, apart from
+                            // `cur`, and the runs hold disjoint men, each
+                            // writing his rank's slot only.
+                            unsafe { soldier::set_apart(f, &rows, pass == 0, cur, next) };
                         }
                     });
                 }

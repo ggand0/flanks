@@ -278,10 +278,11 @@ fn pair_cuts() -> (f32, f32) {
     })
 }
 /// One neighbour a man may touch this tick (`set_apart`, `collide`): his
-/// index, and the pair's body distance and the other man's share of the
-/// pair's mass, m_o / (m_i + m_o), as a row of `touch_table` (`code`):
-/// eight bytes a pair instead of twelve, the passes' stream over the
-/// pairs being their cost in a crush.
+/// rank in the grid's order (`SpatialGrid::sorted`), and the pair's body
+/// distance and the other man's share of the pair's mass, m_o / (m_i +
+/// m_o), as a row of `touch_table` (`code`): eight bytes a pair instead
+/// of twelve, the passes' stream over the pairs being their cost in a
+/// crush.
 #[derive(Clone, Copy)]
 pub(crate) struct Touch {
     pub b: u32,
@@ -1181,7 +1182,7 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
     let same_box = SEP_RADIUS.max(touch_box) + CUT_MARGIN;
     let disc_r = if foes { same_box.max(foe_at.max(touch_box) + CUT_MARGIN) } else { same_box };
     let walk_r = scan_r.min(disc_r);
-    grid.for_each_candidate_vel_disc(p, walk_r, disc_r, |o, o_vel, o_move| {
+    grid.for_each_candidate_vel_disc(p, walk_r, disc_r, |o_rank, o, o_vel, o_move| {
         if o.idx as usize == i {
             return;
         }
@@ -1204,7 +1205,7 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
             let reach = hard + TOUCH_SLACK;
             if (my_step - (o.xz() + o_vel * dt)).length_squared() < reach * reach {
                 let (o_width, o_kind) = (crate::spatial::meta_width(o.meta), crate::spatial::meta_kind(o.meta));
-                out.touch.push(Touch::new(o.idx, my_level, o_width, both_wall, st.my_kind, o_kind));
+                out.touch.push(Touch::new(o_rank, my_level, o_width, both_wall, st.my_kind, o_kind));
             }
         }
         // A friend beyond the widest spring rest can touch nothing of his:
@@ -3386,22 +3387,39 @@ impl TouchRows<'_> {
     }
 }
 
+/// A place buffer of the contact phase, by rank in the grid's order
+/// (`SpatialGrid::sorted`), which its tasks write at scattered slots: a
+/// man's slot is his rank, and only the task that holds the man writes it.
+#[derive(Clone, Copy)]
+pub(crate) struct Places(pub *mut Vec2);
+unsafe impl Send for Places {}
+unsafe impl Sync for Places {}
+
 /// Where each man of a chunk stands before the first pass of the setting
-/// apart, in both place buffers: a man with a touching pair at his legs'
-/// step from the tick's start, unclamped, as the step asks (`q` only;
-/// the first pass writes his `next`); any other man where the kernel set
-/// him down, in both, since no pass moves him or writes his place again.
-/// Returns how many men of the chunk have a touching pair.
-pub(crate) fn set_apart_start(f: &Field, rows: &TouchRows, vel: &[Vec3], pos: &[Vec3], q: &mut [Vec2], next: &mut [Vec2]) -> u32 {
+/// apart, in both place buffers, at his rank: a man with a touching pair
+/// at his legs' step from the tick's start, unclamped, as the step asks
+/// (`q` only; the first pass writes his `next`); any other man where the
+/// kernel set him down, in both, since no pass moves him or writes his
+/// place again. Returns how many men of the chunk have a touching pair.
+///
+/// # Safety
+/// `q` and `next` hold a slot for every rank, and no one else reads or
+/// writes the chunk's men's slots meanwhile.
+pub(crate) unsafe fn set_apart_start(f: &Field, rows: &TouchRows, vel: &[Vec3], pos: &[Vec3], q: Places, next: Places) -> u32 {
+    let rank_of = f.grid.rank_of();
     let mut listed = 0;
-    for (j, (q, next)) in q.iter_mut().zip(next.iter_mut()).enumerate() {
+    for j in 0..pos.len() {
         let i = rows.start + j;
-        if rows.run(j).is_empty() {
-            *q = pos[j].xz();
-            *next = *q;
-        } else {
-            listed += 1;
-            *q = f.pos_prev[i].xz() + vel[j].xz() * f.dt;
+        let r = rank_of[i] as usize;
+        // SAFETY: the caller's.
+        unsafe {
+            if rows.run(j).is_empty() {
+                *q.0.add(r) = pos[j].xz();
+                *next.0.add(r) = pos[j].xz();
+            } else {
+                listed += 1;
+                *q.0.add(r) = f.pos_prev[i].xz() + vel[j].xz() * f.dt;
+            }
         }
     }
     listed
@@ -3409,22 +3427,28 @@ pub(crate) fn set_apart_start(f: &Field, rows: &TouchRows, vel: &[Vec3], pos: &[
 
 /// One pass of the setting apart, for one chunk (`set_apart_passes`):
 /// every man reads the overlaps with the men of his touching pairs where
-/// the last pass left everyone (`cur`), removes each whole, moving the
+/// the last pass left everyone (`cur`, by rank), removes each whole, moving the
 /// other man's mass share of it away from him, averages his corrections
 /// over the men he touches, multiplies them by SET_APART_WEIGHT and
 /// steps by them on the ground (`next`). All men move together after the
 /// pass. The first pass steps from the tick's start, the rest from where
 /// the last pass left him. A man touching nobody is skipped: both
 /// buffers already hold his place (`set_apart_start`).
-pub(crate) fn set_apart(f: &Field, rows: &TouchRows, first: bool, cur: &[Vec2], next: &mut [Vec2]) {
+///
+/// # Safety
+/// `next` holds a slot for every rank, and no one else reads or writes
+/// the chunk's men's slots meanwhile.
+pub(crate) unsafe fn set_apart(f: &Field, rows: &TouchRows, first: bool, cur: &[Vec2], next: Places) {
     let tab = touch_table();
-    for (j, n) in next.iter_mut().enumerate() {
+    let rank_of = f.grid.rank_of();
+    for j in 0..rows.touch_end.len() {
         let run = rows.run(j);
         if run.is_empty() {
             continue;
         }
         let i = rows.start + j;
-        let me = cur[i];
+        let r = rank_of[i] as usize;
+        let me = cur[r];
         let mut corr = Vec2::ZERO;
         let mut count = 0u32;
         for t in run {
@@ -3438,16 +3462,19 @@ pub(crate) fn set_apart(f: &Field, rows: &TouchRows, first: bool, cur: &[Vec2], 
             }
         }
         let from = if first { f.pos_prev[i].xz() } else { me };
-        *n = if count == 0 && !first {
+        let n = if count == 0 && !first {
             me
         } else {
             let corr = corr * (SET_APART_WEIGHT / count.max(1) as f32);
             ground_step(f.terrain, f.bounds_min, f.bounds_max, from, me + corr)
         };
+        // SAFETY: the caller's.
+        unsafe { *next.0.add(r) = n };
     }
 }
 
-/// The collision after the setting apart, for one chunk: each man's move
+/// The collision after the setting apart, for one chunk (places by rank,
+/// the columns by index): each man's move
 /// over the tick, from the tick's start to where the last pass left him;
 /// for every pair still touching there and closing on those moves, he
 /// takes the other man's mass share of the closing speed along the
@@ -3458,6 +3485,7 @@ pub(crate) fn set_apart(f: &Field, rows: &TouchRows, first: bool, cur: &[Vec2], 
 pub(crate) fn collide(f: &Field, rows: &TouchRows, cur: &[Vec2], vel: &mut [Vec3], pos: &mut [Vec3]) -> u32 {
     let inv_dt = 1.0 / f.dt;
     let tab = touch_table();
+    let (sorted, rank_of) = (f.grid.sorted(), f.grid.rank_of());
     let mut overlapping = 0;
     for j in 0..vel.len() {
         let i = rows.start + j;
@@ -3465,7 +3493,7 @@ pub(crate) fn collide(f: &Field, rows: &TouchRows, cur: &[Vec2], vel: &mut [Vec3
         if run.is_empty() {
             continue;
         }
-        let me = cur[i];
+        let me = cur[rank_of[i] as usize];
         let u = (me - f.pos_prev[i].xz()) * inv_dt;
         let mut dv = Vec2::ZERO;
         for t in run {
@@ -3476,7 +3504,7 @@ pub(crate) fn collide(f: &Field, rows: &TouchRows, cur: &[Vec2], vel: &mut [Vec3
             if l2 < hard * hard && l2 > 1e-12 {
                 overlapping += 1;
                 let n = dq / l2.sqrt();
-                let u_b = (cur[b] - f.pos_prev[b].xz()) * inv_dt;
+                let u_b = (cur[b] - sorted[b].xz()) * inv_dt;
                 let c = (u_b - u).dot(n);
                 if c > 0.0 {
                     dv += n * (c * tab.share(t));

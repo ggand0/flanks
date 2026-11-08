@@ -235,7 +235,8 @@ pub struct TickJob {
     pub(crate) arrow_spawns: Vec<Vec<crate::arrows::ArrowSpawn>>,
     /// The yield-and-collide contact (sim/soldier.rs `set_apart`): each
     /// chunk's touching pairs, each man's end of his run in his chunk's,
-    /// and the men's places between the passes, read and written by turns.
+    /// and the men's places between the passes by rank in the grid's
+    /// order, read and written by turns.
     pub(crate) touch: Vec<Vec<crate::sim::soldier::Touch>>,
     pub(crate) touch_end: Vec<u32>,
     pub(crate) touch_q: Vec<Vec2>,
