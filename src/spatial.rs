@@ -303,32 +303,42 @@ impl SpatialGrid {
     /// Over the box of cells `for_each_candidate_vel_disc` reads for
     /// `center` and `radius` (before it trims the rows to its disc):
     /// whether any man of the other team than `team1` stands in them,
-    /// dying or not, and the largest squared speed of `sorted_vel` among
-    /// all the men in them (the scan's cut, sim/soldier.rs `scan`).
+    /// dying or not, the largest squared speed of `sorted_vel` among all
+    /// the men in them, and how many men they hold (the scan's cut,
+    /// sim/soldier.rs `scan`).
     #[inline]
-    pub fn box_foes_vel2(&self, center: Vec2, radius: f32, team1: bool) -> (bool, f32) {
+    pub fn box_foes_vel2(&self, center: Vec2, radius: f32, team1: bool) -> (bool, f32, usize) {
         if self.dims.0 == 0 {
-            return (false, 0.0);
+            return (false, 0.0, 0);
         }
         let (cx0, cy0) = self.cell_coords(center - radius);
         let (cx1, cy1) = self.cell_coords(center + radius);
-        let (mut foes, mut vel2) = (0u32, 0.0f32);
+        let (mut foes, mut vel2, mut men) = (0u32, 0.0f32, 0usize);
         for cy in cy0..=cy1 {
             let row = cy * self.dims.0;
             let (a, b) = (row + cx0, row + cx1 + 1);
+            let all = self.starts[b] - self.starts[a];
             let t1 = self.starts_t1[b] - self.starts_t1[a];
-            foes |= if team1 { (self.starts[b] - self.starts[a]) - t1 } else { t1 };
+            foes |= if team1 { all - t1 } else { t1 };
+            men += all as usize;
             for v in &self.cell_vel2[a..b] {
                 vel2 = vel2.max(*v);
             }
         }
-        (foes != 0, vel2)
+        (foes != 0, vel2, men)
     }
 
     /// Every unit in grid order: his rank is his slot here.
     #[inline]
     pub fn sorted(&self) -> &[SortedUnit] {
         &self.sorted
+    }
+
+    /// The tick-start ground velocity and the last tick's move of the
+    /// unit at rank `r` (`sorted_vel`, `sorted_move`).
+    #[inline]
+    pub fn vel_move(&self, r: usize) -> (Vec2, Vec2) {
+        (self.sorted_vel[r], self.sorted_move[r])
     }
 
     /// Each unit's rank in `sorted`, by his index.

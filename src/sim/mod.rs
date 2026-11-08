@@ -664,7 +664,7 @@ fn run_tick_job(job: &mut TickJob) {
                 };
                 events.clear();
                 touch.clear();
-                let mut out = soldier::ChunkOut { events, arrows, touch, touch_end, braked: 0, held: 0 };
+                let mut out = soldier::ChunkOut { events, arrows, touch, touch_end, braked: 0, held: 0, cands: Vec::new() };
                 soldier::tick_chunk(f, rows, &mut out);
                 if old_contact {
                     // The sweep's candidates from this chunk, once its men

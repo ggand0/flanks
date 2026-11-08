@@ -682,6 +682,8 @@ pub(crate) struct ChunkOut<'a> {
     /// held up at the step pace by the brake's floor.
     pub braked: u32,
     pub held: u32,
+    /// Scratch for the scan: the ranks of a man's candidates past its cut.
+    pub cands: Vec<u32>,
 }
 
 /// What one stage of a soldier's tick hands the next.
@@ -1171,7 +1173,7 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
     // faster than its fastest, so the cut and the box are drawn for the
     // friends alone and for that speed: the walk lists fewer men and every
     // one who counts.
-    let (foes, box_vel2) = grid.box_foes_vel2(p, scan_r, my_team_bit != 0);
+    let (foes, box_vel2, box_men) = grid.box_foes_vel2(p, scan_r, my_team_bit != 0);
     let box_vel = box_vel2.sqrt();
     let fast = box_vel.min(CUT_FAST);
     let (touch_box, touch_near) = (touch_at(box_vel), touch_at(fast));
@@ -1182,20 +1184,32 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
     let same_box = SEP_RADIUS.max(touch_box) + CUT_MARGIN;
     let disc_r = if foes { same_box.max(foe_at.max(touch_box) + CUT_MARGIN) } else { same_box };
     let walk_r = scan_r.min(disc_r);
-    grid.for_each_candidate_vel_disc(p, walk_r, disc_r, |o_rank, o, o_vel, o_move| {
-        if o.idx as usize == i {
-            return;
-        }
+    // First the candidates past the cut, by rank, in the walk's order:
+    // which of them pass is a coin toss in a press, so each is written
+    // and kept by the test's outcome instead of by a branch on it. The
+    // box holds every man the walk visits.
+    out.cands.clear();
+    out.cands.reserve(box_men);
+    let kept = out.cands.as_mut_ptr();
+    let mut n_kept = 0usize;
+    grid.for_each_candidate_vel_disc(p, walk_r, disc_r, |o_rank, o, o_vel, _| {
+        let d2 = (p - o.xz()).length_squared();
+        let same = (o.meta & crate::spatial::META_TEAM) == my_team_bit;
+        let (near2, cut2) = if same { (same_near2, same_cut2) } else { (foe_near2, foe_cut2) };
+        let out_of_reach = (d2 >= near2) & ((d2 >= cut2) | (o_vel.length_squared() <= fast2));
+        // SAFETY: the walk visits at most `box_men` men, so the slot is
+        // within the capacity reserved above.
+        unsafe { *kept.add(n_kept) = o_rank };
+        n_kept += ((o.idx as usize != i) & !out_of_reach) as usize;
+    });
+    // SAFETY: the first `n_kept` slots are written.
+    unsafe { out.cands.set_len(n_kept) };
+    let sorted = grid.sorted();
+    for &o_rank in out.cands.iter() {
+        let o = &sorted[o_rank as usize];
+        let (o_vel, o_move) = grid.vel_move(o_rank as usize);
         let d = p - o.xz();
         let d2 = d.length_squared();
-        let (near2, cut2) = if (o.meta & crate::spatial::META_TEAM) == my_team_bit {
-            (same_near2, same_cut2)
-        } else {
-            (foe_near2, foe_cut2)
-        };
-        if d2 >= near2 && (d2 >= cut2 || o_vel.length_squared() <= fast2) {
-            return;
-        }
         if touching {
             let w = &pairs[crate::spatial::meta_width(o.meta)];
             let both_wall = my_wall
@@ -1213,7 +1227,7 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
         // in a press are such men (the cells span more than the circle).
         let same = (o.meta & crate::spatial::META_TEAM) == my_team_bit;
         if same && d2 >= SEP_RADIUS * SEP_RADIUS {
-            return;
+            continue;
         }
         let enemy = !same && (o.meta & crate::spatial::META_DYING) == 0;
         if enemy && d2 < reach2 {
@@ -1322,7 +1336,7 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
                 crowd_still += w * (1.0 - o_move.dot(wish_dir) / CRAWL).clamp(0.0, 1.0);
             }
         }
-    });
+    }
 
     // Ran onto a braced spear: the collision is a damage event from the
     // SPEARMAN, resolved with everything else in the serial apply (which also
