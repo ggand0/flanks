@@ -1202,33 +1202,51 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
         unsafe { *kept.add(n_kept) = o_rank };
         n_kept += ((o.idx as usize != i) & !out_of_reach) as usize;
     });
-    // SAFETY: the first `n_kept` slots are written.
-    unsafe { out.cands.set_len(n_kept) };
     let sorted = grid.sorted();
+    // Then the touching pairs, written and kept by the test's outcome as
+    // well, and the candidates kept again for the rest of the tests: a
+    // friend beyond the widest spring rest counts for nothing in them.
+    // Most of a scan's candidates in a press are such men (the cells span
+    // more than the circle).
+    if touching {
+        out.touch.reserve(n_kept);
+    }
+    let mut n_on = 0usize;
+    for j in 0..n_kept {
+        // SAFETY: j < n_kept, the list's length.
+        let o_rank = unsafe { *kept.add(j) };
+        let o = &sorted[o_rank as usize];
+        let (o_vel, _) = grid.vel_move(o_rank as usize);
+        let same = (o.meta & crate::spatial::META_TEAM) == my_team_bit;
+        if touching {
+            let w = &pairs[crate::spatial::meta_width(o.meta)];
+            let both_wall = my_wall && same && (o.meta & crate::spatial::META_WALL) != 0;
+            let hard = if both_wall { w.hard.min(WALL_SEP_RADIUS) } else { w.hard };
+            let reach = hard + TOUCH_SLACK;
+            let touches = (my_step - (o.xz() + o_vel * dt)).length_squared() < reach * reach;
+            let (o_width, o_kind) = (crate::spatial::meta_width(o.meta), crate::spatial::meta_kind(o.meta));
+            let len = out.touch.len();
+            // SAFETY: the slot at `len` is within the capacity reserved
+            // above (one for each kept candidate), and the length takes it
+            // only once it is written.
+            unsafe {
+                out.touch.as_mut_ptr().add(len).write(Touch::new(o_rank, my_level, o_width, both_wall, st.my_kind, o_kind));
+                out.touch.set_len(len + touches as usize);
+            }
+        }
+        let d2 = (p - o.xz()).length_squared();
+        // SAFETY: n_on <= j, a slot already read.
+        unsafe { *kept.add(n_on) = o_rank };
+        n_on += !(same & (d2 >= SEP_RADIUS * SEP_RADIUS)) as usize;
+    }
+    // SAFETY: the first `n_on` slots are written.
+    unsafe { out.cands.set_len(n_on) };
     for &o_rank in out.cands.iter() {
         let o = &sorted[o_rank as usize];
         let (o_vel, o_move) = grid.vel_move(o_rank as usize);
         let d = p - o.xz();
         let d2 = d.length_squared();
-        if touching {
-            let w = &pairs[crate::spatial::meta_width(o.meta)];
-            let both_wall = my_wall
-                && (o.meta & crate::spatial::META_TEAM) == my_team_bit
-                && (o.meta & crate::spatial::META_WALL) != 0;
-            let hard = if both_wall { w.hard.min(WALL_SEP_RADIUS) } else { w.hard };
-            let reach = hard + TOUCH_SLACK;
-            if (my_step - (o.xz() + o_vel * dt)).length_squared() < reach * reach {
-                let (o_width, o_kind) = (crate::spatial::meta_width(o.meta), crate::spatial::meta_kind(o.meta));
-                out.touch.push(Touch::new(o_rank, my_level, o_width, both_wall, st.my_kind, o_kind));
-            }
-        }
-        // A friend beyond the widest spring rest can touch nothing of his:
-        // out before any of the pair's work. Most of a scan's candidates
-        // in a press are such men (the cells span more than the circle).
         let same = (o.meta & crate::spatial::META_TEAM) == my_team_bit;
-        if same && d2 >= SEP_RADIUS * SEP_RADIUS {
-            continue;
-        }
         let enemy = !same && (o.meta & crate::spatial::META_DYING) == 0;
         if enemy && d2 < reach2 {
             sticky |= o.idx == prev_target;
@@ -1332,8 +1350,12 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
             // The still-man crowd: a neighbour on the half-plane ahead of
             // his wish (`d` points from the neighbour to him), by how
             // little he moved along it last tick.
-            if touching && d.dot(wish_dir) < 0.0 {
-                crowd_still += w * (1.0 - o_move.dot(wish_dir) / CRAWL).clamp(0.0, 1.0);
+            // Weighed by 1 or 0 without a branch (ahead of him or not is a
+            // coin toss): a 0 added changes nothing, since the sum is never
+            // -0.
+            if touching {
+                let on = (d.dot(wish_dir) < 0.0) as u32 as f32;
+                crowd_still += w * on * (1.0 - o_move.dot(wish_dir) / CRAWL).clamp(0.0, 1.0);
             }
         }
     }
@@ -3465,15 +3487,19 @@ pub(crate) unsafe fn set_apart(f: &Field, rows: &TouchRows, first: bool, cur: &[
         let me = cur[r];
         let mut corr = Vec2::ZERO;
         let mut count = 0u32;
+        // Every pair worked out and weighed by `on`, 1 for a pair that
+        // overlaps and 0 for any other, without a branch: a 0 added to
+        // the sums changes nothing, since neither is ever -0. The distance
+        // is held off 0 so the numbers stay finite; an overlapping pair is
+        // farther than that already.
         for t in run {
             let dq = me - cur[t.b as usize];
             let l2 = dq.length_squared();
             let hard = tab.hard(t);
-            if l2 < hard * hard && l2 > 1e-12 {
-                let l = l2.sqrt();
-                corr += dq * ((hard - l) * tab.share(t) / l);
-                count += 1;
-            }
+            let on = (l2 < hard * hard) & (l2 > 1e-12);
+            let l = l2.max(1e-12).sqrt();
+            corr += dq * ((hard - l) * tab.share(t) / l * on as u32 as f32);
+            count += on as u32;
         }
         let from = if first { f.pos_prev[i].xz() } else { me };
         let n = if count == 0 && !first {
@@ -3510,20 +3536,20 @@ pub(crate) fn collide(f: &Field, rows: &TouchRows, cur: &[Vec2], vel: &mut [Vec3
         let me = cur[rank_of[i] as usize];
         let u = (me - f.pos_prev[i].xz()) * inv_dt;
         let mut dv = Vec2::ZERO;
+        // Weighed by `on` without a branch, as in `set_apart`: 1 for a
+        // pair that overlaps and closes, 0 for any other.
         for t in run {
             let b = t.b as usize;
             let dq = me - cur[b];
             let l2 = dq.length_squared();
             let hard = tab.hard(t);
-            if l2 < hard * hard && l2 > 1e-12 {
-                overlapping += 1;
-                let n = dq / l2.sqrt();
-                let u_b = (cur[b] - sorted[b].xz()) * inv_dt;
-                let c = (u_b - u).dot(n);
-                if c > 0.0 {
-                    dv += n * (c * tab.share(t));
-                }
-            }
+            let overlaps = (l2 < hard * hard) & (l2 > 1e-12);
+            overlapping += overlaps as u32;
+            let n = dq / l2.max(1e-12).sqrt();
+            let u_b = (cur[b] - sorted[b].xz()) * inv_dt;
+            let c = (u_b - u).dot(n);
+            let on = overlaps & (c > 0.0);
+            dv += n * (c * tab.share(t) * on as u32 as f32);
         }
         vel[j].x += dv.x;
         vel[j].z += dv.y;
