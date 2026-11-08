@@ -1191,17 +1191,18 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
     out.cands.clear();
     out.cands.reserve(box_men);
     let kept = out.cands.as_mut_ptr();
-    let mut n_kept = 0usize;
-    grid.for_each_candidate_vel_disc(p, walk_r, disc_r, |o_rank, o, o_vel| {
-        let d2 = (p - o.xz()).length_squared();
-        let same = (o.meta & crate::spatial::META_TEAM) == my_team_bit;
-        let (near2, cut2) = if same { (same_near2, same_cut2) } else { (foe_near2, foe_cut2) };
-        let out_of_reach = (d2 >= near2) & ((d2 >= cut2) | (o_vel.length_squared() <= fast2));
-        // SAFETY: the walk visits at most `box_men` men, so the slot is
-        // within the capacity reserved above.
-        unsafe { *kept.add(n_kept) = o_rank };
-        n_kept += ((o.idx as usize != i) & !out_of_reach) as usize;
-    });
+    let cut = crate::spatial::KeepCut {
+        team_bit: my_team_bit,
+        me: i as u32,
+        same_near2,
+        same_cut2,
+        foe_near2,
+        foe_cut2,
+        fast2,
+    };
+    // SAFETY: the box holds every man the walk visits, and the list has
+    // room for all of them.
+    let n_kept = unsafe { grid.kept_in_disc(p, walk_r, disc_r, &cut, kept) };
     let sorted = grid.sorted();
     // Then the touching pairs, written and kept by the test's outcome as
     // well, and the candidates kept again for the rest of the tests: a

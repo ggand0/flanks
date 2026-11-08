@@ -132,7 +132,7 @@ pub struct SpatialGrid {
     /// (the scan's cut of its candidates, sim/soldier.rs `scan`).
     vel_max: f32,
     /// The field spans more than MAX_DIM cells on an axis, so the last
-    /// cells hold men beyond their bounds (`for_each_candidate_vel_disc`).
+    /// cells hold men beyond their bounds (`kept_in_disc`).
     clamped: bool,
     /// Scratch: per-unit cell index from the count pass.
     cell_of: Vec<u32>,
@@ -300,7 +300,7 @@ impl SpatialGrid {
         });
     }
 
-    /// Over the box of cells `for_each_candidate_vel_disc` reads for
+    /// Over the box of cells `kept_in_disc` reads for
     /// `center` and `radius` (before it trims the rows to its disc):
     /// whether any man of the other team than `team1` stands in them,
     /// dying or not, the largest squared speed of `sorted_vel` among all
@@ -405,24 +405,28 @@ impl SpatialGrid {
         }
     }
 
-    /// `for_each_candidate_vel` over the box of `radius` with each row of
-    /// cells cut to the cells the disc of `disc` reaches, handing each
-    /// unit's rank in `sorted` first: the same candidates in the same
-    /// order, less the cells wholly outside the disc. A man in a skipped
-    /// cell is farther than `disc` from `center`.
+    /// The scan's cut over its walk (sim/soldier.rs `scan`): the walk
+    /// visits the units of the box of `radius` with each row of cells cut
+    /// to the cells the disc of `disc` reaches, in `sorted`'s order (a man
+    /// in a skipped cell is farther than `disc` from `center`), and the
+    /// rank of every man it visits who is not `cut.me` and is within reach
+    /// is written to `out`, in that order, and the count returned. A man
+    /// is out of reach when d2 >= near2 and (d2 >= cut2 or his squared
+    /// speed <= fast2), (near2, cut2) being the friends' or the foes' by
+    /// his team. Four men at a time, with the same arithmetic as one at a
+    /// time.
     ///
-    /// The candidates are visited from one call site only, so the
-    /// caller's closure is inlined into the loop (a second call site, for
-    /// a clamped grid, made LLVM keep it as a function called per
-    /// candidate).
+    /// # Safety
+    /// `out` has room for every man in the cells of the box of `radius`.
     #[inline]
-    pub fn for_each_candidate_vel_disc(&self, center: Vec2, radius: f32, disc: f32, mut f: impl FnMut(u32, &SortedUnit, Vec2)) {
+    pub unsafe fn kept_in_disc(&self, center: Vec2, radius: f32, disc: f32, cut: &KeepCut, out: *mut u32) -> usize {
         if self.dims.0 == 0 {
-            return;
+            return 0;
         }
         let (cx0, cy0) = self.cell_coords(center - radius);
         let (cx1, cy1) = self.cell_coords(center + radius);
         let r2 = disc * disc;
+        let mut n = 0;
         for cy in cy0..=cy1 {
             let (a, b) = if self.clamped {
                 (cx0, cx1)
@@ -439,10 +443,10 @@ impl SpatialGrid {
             let row = cy * self.dims.0;
             let s = self.starts[row + a] as usize;
             let e = self.starts[row + b + 1] as usize;
-            for (k, (u, v)) in self.sorted[s..e].iter().zip(&self.sorted_vel[s..e]).enumerate() {
-                f((s + k) as u32, u, *v);
-            }
+            // SAFETY: the caller's.
+            n = unsafe { keep_run(&self.sorted[s..e], &self.sorted_vel[s..e], s as u32, center, cut, out, n) };
         }
+        n
     }
 
     /// Does any candidate satisfy `f`? Stops at the first that does.
@@ -470,6 +474,84 @@ impl SpatialGrid {
         }
         false
     }
+}
+
+/// The scan's cut for `SpatialGrid::kept_in_disc`: the man's own team
+/// bit and index, and the squared reaches.
+pub struct KeepCut {
+    pub team_bit: u32,
+    pub me: u32,
+    pub same_near2: f32,
+    pub same_cut2: f32,
+    pub foe_near2: f32,
+    pub foe_cut2: f32,
+    pub fast2: f32,
+}
+
+/// `kept_in_disc` over one run of `sorted` from rank `start`, writing
+/// from `out[n]` on; returns the new count.
+///
+/// # Safety
+/// `out` has room for `n` plus every man of the run.
+#[inline]
+unsafe fn keep_run(units: &[SortedUnit], vels: &[Vec2], start: u32, center: Vec2, cut: &KeepCut, out: *mut u32, mut n: usize) -> usize {
+    let mut k = 0;
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::x86_64::*;
+        // SAFETY: SSE2 is part of every x86_64; the loads read units
+        // k..k + 4 and their velocities, within the run.
+        unsafe {
+            let (px, pz) = (_mm_set1_ps(center.x), _mm_set1_ps(center.y));
+            let team = _mm_set1_epi32(cut.team_bit as i32);
+            let one = _mm_set1_epi32(META_TEAM as i32);
+            let me = _mm_set1_epi32(cut.me as i32);
+            let (sn2, sc2) = (_mm_set1_ps(cut.same_near2), _mm_set1_ps(cut.same_cut2));
+            let (fn2, fc2) = (_mm_set1_ps(cut.foe_near2), _mm_set1_ps(cut.foe_cut2));
+            let fast2 = _mm_set1_ps(cut.fast2);
+            let (ub, vb) = (units.as_ptr() as *const f32, vels.as_ptr() as *const f32);
+            while k + 4 <= units.len() {
+                // Four men's x, z, index and meta, and their velocities.
+                let p0 = _mm_loadu_ps(ub.add(4 * k));
+                let p1 = _mm_loadu_ps(ub.add(4 * k + 4));
+                let p2 = _mm_loadu_ps(ub.add(4 * k + 8));
+                let p3 = _mm_loadu_ps(ub.add(4 * k + 12));
+                let (t0, t1) = (_mm_unpacklo_ps(p0, p1), _mm_unpacklo_ps(p2, p3));
+                let (t2, t3) = (_mm_unpackhi_ps(p0, p1), _mm_unpackhi_ps(p2, p3));
+                let (x, z) = (_mm_movelh_ps(t0, t1), _mm_movehl_ps(t1, t0));
+                let idx = _mm_castps_si128(_mm_movelh_ps(t2, t3));
+                let meta = _mm_castps_si128(_mm_movehl_ps(t3, t2));
+                let v01 = _mm_loadu_ps(vb.add(2 * k));
+                let v23 = _mm_loadu_ps(vb.add(2 * k + 4));
+                let vx = _mm_shuffle_ps::<0b10_00_10_00>(v01, v23);
+                let vz = _mm_shuffle_ps::<0b11_01_11_01>(v01, v23);
+                let (dx, dz) = (_mm_sub_ps(px, x), _mm_sub_ps(pz, z));
+                let d2 = _mm_add_ps(_mm_mul_ps(dx, dx), _mm_mul_ps(dz, dz));
+                let v2 = _mm_add_ps(_mm_mul_ps(vx, vx), _mm_mul_ps(vz, vz));
+                let same = _mm_castsi128_ps(_mm_cmpeq_epi32(_mm_and_si128(meta, one), team));
+                let near2 = _mm_or_ps(_mm_and_ps(same, sn2), _mm_andnot_ps(same, fn2));
+                let cut2 = _mm_or_ps(_mm_and_ps(same, sc2), _mm_andnot_ps(same, fc2));
+                let out_of_reach = _mm_and_ps(_mm_cmpge_ps(d2, near2), _mm_or_ps(_mm_cmpge_ps(d2, cut2), _mm_cmple_ps(v2, fast2)));
+                let is_me = _mm_castsi128_ps(_mm_cmpeq_epi32(idx, me));
+                let keep = _mm_movemask_ps(_mm_or_ps(out_of_reach, is_me)) ^ 0b1111;
+                for lane in 0..4 {
+                    *out.add(n) = start + (k + lane) as u32;
+                    n += (keep >> lane) as usize & 1;
+                }
+                k += 4;
+            }
+        }
+    }
+    for (j, (u, v)) in units.iter().zip(vels).enumerate().skip(k) {
+        let d2 = (center - u.xz()).length_squared();
+        let same = (u.meta & META_TEAM) == cut.team_bit;
+        let (near2, cut2) = if same { (cut.same_near2, cut.same_cut2) } else { (cut.foe_near2, cut.foe_cut2) };
+        let out_of_reach = (d2 >= near2) & ((d2 >= cut2) | (v.length_squared() <= cut.fast2));
+        // SAFETY: the caller's.
+        unsafe { *out.add(n) = start + j as u32 };
+        n += ((u.idx != cut.me) & !out_of_reach) as usize;
+    }
+    n
 }
 
 #[inline]
