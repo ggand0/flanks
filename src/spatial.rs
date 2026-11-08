@@ -407,17 +407,16 @@ impl SpatialGrid {
 
     /// `for_each_candidate_vel` over the box of `radius` with each row of
     /// cells cut to the cells the disc of `disc` reaches, handing each
-    /// unit's rank in `sorted` first and his actual move over the last
-    /// tick as well (`sorted_move`): the same candidates in the same order,
-    /// less the cells wholly outside the disc. A man in a skipped cell is
-    /// farther than `disc` from `center`.
+    /// unit's rank in `sorted` first: the same candidates in the same
+    /// order, less the cells wholly outside the disc. A man in a skipped
+    /// cell is farther than `disc` from `center`.
     ///
     /// The candidates are visited from one call site only, so the
     /// caller's closure is inlined into the loop (a second call site, for
     /// a clamped grid, made LLVM keep it as a function called per
     /// candidate).
     #[inline]
-    pub fn for_each_candidate_vel_disc(&self, center: Vec2, radius: f32, disc: f32, mut f: impl FnMut(u32, &SortedUnit, Vec2, Vec2)) {
+    pub fn for_each_candidate_vel_disc(&self, center: Vec2, radius: f32, disc: f32, mut f: impl FnMut(u32, &SortedUnit, Vec2)) {
         if self.dims.0 == 0 {
             return;
         }
@@ -440,8 +439,8 @@ impl SpatialGrid {
             let row = cy * self.dims.0;
             let s = self.starts[row + a] as usize;
             let e = self.starts[row + b + 1] as usize;
-            for (k, ((u, v), m)) in self.sorted[s..e].iter().zip(&self.sorted_vel[s..e]).zip(&self.sorted_move[s..e]).enumerate() {
-                f((s + k) as u32, u, *v, *m);
+            for (k, (u, v)) in self.sorted[s..e].iter().zip(&self.sorted_vel[s..e]).enumerate() {
+                f((s + k) as u32, u, *v);
             }
         }
     }

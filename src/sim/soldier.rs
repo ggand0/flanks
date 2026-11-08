@@ -1192,7 +1192,7 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
     out.cands.reserve(box_men);
     let kept = out.cands.as_mut_ptr();
     let mut n_kept = 0usize;
-    grid.for_each_candidate_vel_disc(p, walk_r, disc_r, |o_rank, o, o_vel, _| {
+    grid.for_each_candidate_vel_disc(p, walk_r, disc_r, |o_rank, o, o_vel| {
         let d2 = (p - o.xz()).length_squared();
         let same = (o.meta & crate::spatial::META_TEAM) == my_team_bit;
         let (near2, cut2) = if same { (same_near2, same_cut2) } else { (foe_near2, foe_cut2) };
@@ -1211,6 +1211,10 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
     if touching {
         out.touch.reserve(n_kept);
     }
+    // The list's end held in locals over the loop, so it stays in
+    // registers: the list's length is set once after it.
+    let (touch_at_end, mut n_touch) = (out.touch.as_mut_ptr(), out.touch.len());
+    let my_kind = st.my_kind;
     let mut n_on = 0usize;
     for j in 0..n_kept {
         // SAFETY: j < n_kept, the list's length.
@@ -1225,22 +1229,22 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
             let reach = hard + TOUCH_SLACK;
             let touches = (my_step - (o.xz() + o_vel * dt)).length_squared() < reach * reach;
             let (o_width, o_kind) = (crate::spatial::meta_width(o.meta), crate::spatial::meta_kind(o.meta));
-            let len = out.touch.len();
-            // SAFETY: the slot at `len` is within the capacity reserved
-            // above (one for each kept candidate), and the length takes it
-            // only once it is written.
-            unsafe {
-                out.touch.as_mut_ptr().add(len).write(Touch::new(o_rank, my_level, o_width, both_wall, st.my_kind, o_kind));
-                out.touch.set_len(len + touches as usize);
-            }
+            // SAFETY: the slot at `n_touch` is within the capacity
+            // reserved above (one for each kept candidate), and the length
+            // takes it only once it is written.
+            unsafe { touch_at_end.add(n_touch).write(Touch::new(o_rank, my_level, o_width, both_wall, my_kind, o_kind)) };
+            n_touch += touches as usize;
         }
         let d2 = (p - o.xz()).length_squared();
         // SAFETY: n_on <= j, a slot already read.
         unsafe { *kept.add(n_on) = o_rank };
         n_on += !(same & (d2 >= SEP_RADIUS * SEP_RADIUS)) as usize;
     }
-    // SAFETY: the first `n_on` slots are written.
-    unsafe { out.cands.set_len(n_on) };
+    // SAFETY: the slots up to `n_touch` and the first `n_on` are written.
+    unsafe {
+        out.touch.set_len(n_touch);
+        out.cands.set_len(n_on);
+    }
     for &o_rank in out.cands.iter() {
         let o = &sorted[o_rank as usize];
         let (o_vel, o_move) = grid.vel_move(o_rank as usize);
