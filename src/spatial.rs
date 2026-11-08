@@ -21,6 +21,11 @@ pub const CELL_SIZE: f32 = 1.5;
 const MAX_DIM: usize = 2048;
 /// Units per parallel rebuild chunk.
 const REBUILD_CHUNK: usize = 32_768;
+// The count pass keeps a chunk's men of a cell in a histogram entry's low
+// 16 bits and its men of team 1 in the high 16 (`rebuild`).
+const _: () = assert!(REBUILD_CHUNK < 1 << 16);
+/// Cells per task of the rebuild's pass over the cells (`cell_vel2`).
+const CELL_CHUNK: usize = 65_536;
 
 /// Meta bits carried by each sorted unit. Kind is a 2-bit FIELD (up to 4
 /// unit kinds), not a flag — read it with `meta_kind`, never as a mask test.
@@ -105,6 +110,12 @@ pub struct SpatialGrid {
     dims: (usize, usize),
     /// Prefix sums: units of cell c are sorted[starts[c]..starts[c + 1]].
     starts: Vec<u32>,
+    /// The same prefix sums over the men of team 1 only: cells a..b hold
+    /// starts_t1[b] - starts_t1[a] of them (`box_foes_vel2`).
+    starts_t1: Vec<u32>,
+    /// The largest squared speed of `sorted_vel` in each cell, 0 for an
+    /// empty one (`box_foes_vel2`).
+    cell_vel2: Vec<f32>,
     /// Units in cell order (the counting-sort payload).
     sorted: Vec<SortedUnit>,
     /// Tick-start ground velocity of `sorted[k]`, in the same order: a
@@ -175,9 +186,12 @@ impl SpatialGrid {
         self.hists.resize(n_chunks, Vec::new());
 
         // Count pass: per-chunk histograms + cached per-unit cell index.
+        // An entry counts the chunk's men of the cell in its low 16 bits
+        // and those of team 1 in its high 16.
         crate::util::sim_scope(|scope| {
-            for (pos_chunk, (cell_chunk, hist)) in positions
+            for ((pos_chunk, team_chunk), (cell_chunk, hist)) in positions
                 .chunks(REBUILD_CHUNK)
+                .zip(teams.chunks(REBUILD_CHUNK))
                 .zip(self.cell_of.chunks_mut(REBUILD_CHUNK).zip(&mut self.hists))
             {
                 scope.spawn(async move {
@@ -186,7 +200,7 @@ impl SpatialGrid {
                     for (j, p) in pos_chunk.iter().enumerate() {
                         let c = cell_index_for(origin, dims, Vec2::new(p.x, p.z));
                         cell_chunk[j] = c as u32;
-                        hist[c] += 1;
+                        hist[c] += 1 + ((team_chunk[j] as u32) << 16);
                     }
                 });
             }
@@ -197,14 +211,18 @@ impl SpatialGrid {
         // cell-major, chunk order within a cell.
         self.starts.clear();
         self.starts.resize(cells + 1, 0);
-        let mut acc = 0u32;
+        self.starts_t1.clear();
+        self.starts_t1.resize(cells + 1, 0);
+        let (mut acc, mut acc_t1) = (0u32, 0u32);
         for c in 0..cells {
             for hist in &mut self.hists {
                 let cnt = hist[c];
                 hist[c] = acc;
-                acc += cnt;
+                acc += cnt & 0xFFFF;
+                acc_t1 += cnt >> 16;
             }
             self.starts[c + 1] = acc;
+            self.starts_t1[c + 1] = acc_t1;
         }
 
         // Scatter pass: chunks write their units to precomputed disjoint
@@ -260,6 +278,46 @@ impl SpatialGrid {
             }
         });
         self.vel_max = vel_max2.into_iter().fold(0.0, f32::max).sqrt();
+
+        // Each cell's fastest man, from the sorted column.
+        self.cell_vel2.resize(cells, 0.0);
+        let (starts, sorted_vel) = (&self.starts[..], &self.sorted_vel[..]);
+        crate::util::sim_scope(|scope| {
+            for (k, out) in self.cell_vel2.chunks_mut(CELL_CHUNK).enumerate() {
+                scope.spawn(async move {
+                    let c0 = k * CELL_CHUNK;
+                    for (j, o) in out.iter_mut().enumerate() {
+                        let (s, e) = (starts[c0 + j] as usize, starts[c0 + j + 1] as usize);
+                        *o = sorted_vel[s..e].iter().fold(0.0f32, |m, v| m.max(v.length_squared()));
+                    }
+                });
+            }
+        });
+    }
+
+    /// Over the box of cells `for_each_candidate_vel_disc` reads for
+    /// `center` and `radius` (before it trims the rows to its disc):
+    /// whether any man of the other team than `team1` stands in them,
+    /// dying or not, and the largest squared speed of `sorted_vel` among
+    /// all the men in them (the scan's cut, sim/soldier.rs `scan`).
+    #[inline]
+    pub fn box_foes_vel2(&self, center: Vec2, radius: f32, team1: bool) -> (bool, f32) {
+        if self.dims.0 == 0 {
+            return (false, 0.0);
+        }
+        let (cx0, cy0) = self.cell_coords(center - radius);
+        let (cx1, cy1) = self.cell_coords(center + radius);
+        let (mut foes, mut vel2) = (0u32, 0.0f32);
+        for cy in cy0..=cy1 {
+            let row = cy * self.dims.0;
+            let (a, b) = (row + cx0, row + cx1 + 1);
+            let t1 = self.starts_t1[b] - self.starts_t1[a];
+            foes |= if team1 { (self.starts[b] - self.starts[a]) - t1 } else { t1 };
+            for v in &self.cell_vel2[a..b] {
+                vel2 = vel2.max(*v);
+            }
+        }
+        (foes != 0, vel2)
     }
 
     /// The fastest neighbour's speed at the tick's start (`sorted_vel`).

@@ -1155,20 +1155,33 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
     // beyond it goes on to the tests only when he is faster.
     let (cut_hard, cut_sep) = pair_cuts();
     let my_speed = s.vel.xz().length();
-    let fast = grid.vel_max().min(CUT_FAST);
     let touch_at = |v: f32| if touching { cut_hard + TOUCH_SLACK + (my_speed + v) * dt } else { 0.0 };
     let spear_cut = if at_charge_speed { (spear_reach * spear_reach + SPEAR_LINE_HALF_W * SPEAR_LINE_HALF_W).sqrt() } else { 0.0 };
     let foe_at = cut_sep.max(params.reach).max(spear_cut);
-    let (touch_cut, touch_near) = (touch_at(grid.vel_max()), touch_at(fast));
+    let touch_cut = touch_at(grid.vel_max());
     let same_cut = SEP_RADIUS.max(touch_cut) + CUT_MARGIN;
     let foe_cut = foe_at.max(touch_cut) + CUT_MARGIN;
+    // The box drawn for the fastest man on the field: the look round him
+    // reads it (`look_around`).
+    let scan_r = scan_r.min(same_cut.max(foe_cut));
+    // His own neighbourhood, the cells of that box: whether any man of
+    // the other side stands in them, and the fastest man in them. With no
+    // enemy there every enemy test below fails, and no man there is
+    // faster than its fastest, so the cut and the box are drawn for the
+    // friends alone and for that speed: the walk lists fewer men and every
+    // one who counts.
+    let (foes, box_vel2) = grid.box_foes_vel2(p, scan_r, my_team_bit != 0);
+    let box_vel = box_vel2.sqrt();
+    let fast = box_vel.min(CUT_FAST);
+    let (touch_box, touch_near) = (touch_at(box_vel), touch_at(fast));
     let same_near = SEP_RADIUS.max(touch_near) + CUT_MARGIN;
     let foe_near = foe_at.max(touch_near) + CUT_MARGIN;
     let (same_cut2, foe_cut2) = (same_cut * same_cut, foe_cut * foe_cut);
     let (same_near2, foe_near2, fast2) = (same_near * same_near, foe_near * foe_near, fast * fast);
-    let disc_r = same_cut.max(foe_cut);
-    let scan_r = scan_r.min(disc_r);
-    grid.for_each_candidate_vel_disc(p, scan_r, disc_r, |o, o_vel, o_move| {
+    let same_box = SEP_RADIUS.max(touch_box) + CUT_MARGIN;
+    let disc_r = if foes { same_box.max(foe_at.max(touch_box) + CUT_MARGIN) } else { same_box };
+    let walk_r = scan_r.min(disc_r);
+    grid.for_each_candidate_vel_disc(p, walk_r, disc_r, |o, o_vel, o_move| {
         if o.idx as usize == i {
             return;
         }
