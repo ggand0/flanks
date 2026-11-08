@@ -236,6 +236,24 @@ const SET_APART_WEIGHT: f32 = 1.5;
 /// for the legs' change of speed and the passes' moves (metres). Men
 /// walking side by side farther apart than that list nothing.
 const TOUCH_SLACK: f32 = 0.10;
+/// The scan's cut of its candidates (`scan`): metres past the farthest a
+/// neighbour can be and still count.
+const CUT_MARGIN: f32 = 0.01;
+/// The widest pair's body distance and spring rest over the pair table
+/// (`pair_widths`), for the scan's cut.
+fn pair_cuts() -> (f32, f32) {
+    static C: std::sync::OnceLock<(f32, f32)> = std::sync::OnceLock::new();
+    *C.get_or_init(|| {
+        let (mut hard, mut sep) = (0.0f32, 0.0f32);
+        for row in pair_widths() {
+            for w in row {
+                hard = hard.max(w.hard);
+                sep = sep.max(w.sep);
+            }
+        }
+        (hard, sep)
+    })
+}
 /// One neighbour a man may touch this tick (`set_apart`, `collide`): his
 /// index, the pair's body distance, and the other man's share of the
 /// pair's mass, m_o / (m_i + m_o).
@@ -1036,12 +1054,31 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
     } else {
         QUERY_RADIUS.max(params.reach)
     };
+    // The farthest a neighbour can be and still count for anything below,
+    // a friend and a foe: the touching pair at the widest pair's body
+    // distance with both men closing at full speed (no neighbour is
+    // faster than the grid's fastest), a friend within SEP_RADIUS, a foe
+    // within the widest pair's spring rest, his weapon's reach, or a
+    // braced spear's point. Every test below needs the neighbour nearer
+    // than that, so a man farther off is out before any of them, and the
+    // box of cells shrinks to it. CUT_MARGIN is far above the rounding of
+    // a place on the map.
+    let (cut_hard, cut_sep) = pair_cuts();
+    let touch_cut = if touching { cut_hard + TOUCH_SLACK + (s.vel.xz().length() + grid.vel_max()) * dt } else { 0.0 };
+    let spear_cut = if at_charge_speed { (spear_reach * spear_reach + SPEAR_LINE_HALF_W * SPEAR_LINE_HALF_W).sqrt() } else { 0.0 };
+    let same_cut = SEP_RADIUS.max(touch_cut) + CUT_MARGIN;
+    let foe_cut = cut_sep.max(params.reach).max(spear_cut).max(touch_cut) + CUT_MARGIN;
+    let (same_cut2, foe_cut2) = (same_cut * same_cut, foe_cut * foe_cut);
+    let scan_r = scan_r.min(same_cut.max(foe_cut));
     grid.for_each_candidate_vel(p, scan_r, |o, o_vel| {
         if o.idx as usize == i {
             return;
         }
         let d = p - o.xz();
         let d2 = d.length_squared();
+        if d2 >= if (o.meta & crate::spatial::META_TEAM) == my_team_bit { same_cut2 } else { foe_cut2 } {
+            return;
+        }
         if touching {
             let w = &pairs[crate::spatial::meta_width(o.meta)];
             let both_wall = my_wall
@@ -1141,7 +1178,9 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
             let len = d2.sqrt();
             let inv_len = 1.0 / len;
             let w = 1.0 - len * inv_sep;
-            if len < hard {
+            // The yield-and-collide contact reads none of the overlap's
+            // correction (`steer`).
+            if !touching && len < hard {
                 // Overlap is resolved POSITIONALLY only. A hard force boost
                 // here as well made packed crowds oscillate at the
                 // acceleration cap, two solvers fighting over the same

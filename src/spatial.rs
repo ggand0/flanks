@@ -111,6 +111,9 @@ pub struct SpatialGrid {
     /// separate column, so the separation scan's 16-byte stride stays
     /// as it is and only the queries that look at motion pay for it.
     sorted_vel: Vec<Vec2>,
+    /// The largest of `sorted_vel`'s speeds: no neighbour moves faster
+    /// (the scan's cut of its candidates, sim/soldier.rs `scan`).
+    vel_max: f32,
     /// Scratch: per-unit cell index from the count pass.
     cell_of: Vec<u32>,
     /// Scratch: per-chunk histogram / write cursors.
@@ -135,6 +138,7 @@ impl SpatialGrid {
             self.dims = (0, 0);
             self.sorted.clear();
             self.sorted_vel.clear();
+            self.vel_max = 0.0;
             return;
         }
 
@@ -199,7 +203,7 @@ impl SpatialGrid {
         let out = &out;
         let out_vel = SharedVel(self.sorted_vel.as_mut_ptr());
         let out_vel = &out_vel;
-        crate::util::sim_scope(|scope| {
+        let vel_max2: Vec<f32> = crate::util::sim_scope(|scope| {
             for (t, (pos_chunk, (cell_chunk, hist))) in positions
                 .chunks(REBUILD_CHUNK)
                 .zip(self.cell_of.chunks(REBUILD_CHUNK).zip(&mut self.hists))
@@ -207,6 +211,7 @@ impl SpatialGrid {
             {
                 let start = t * REBUILD_CHUNK;
                 scope.spawn(async move {
+                    let mut vel_max2 = 0.0f32;
                     for (j, p) in pos_chunk.iter().enumerate() {
                         let i = start + j;
                         let c = cell_chunk[j] as usize;
@@ -228,10 +233,19 @@ impl SpatialGrid {
                             };
                             *out_vel.0.add(k) = Vec2::new(vels[i].x, vels[i].z);
                         }
+                        vel_max2 = vel_max2.max(Vec2::new(vels[i].x, vels[i].z).length_squared());
                     }
+                    vel_max2
                 });
             }
         });
+        self.vel_max = vel_max2.into_iter().fold(0.0, f32::max).sqrt();
+    }
+
+    /// The fastest neighbour's speed at the tick's start (`sorted_vel`).
+    #[inline]
+    pub fn vel_max(&self) -> f32 {
+        self.vel_max
     }
 
     #[inline]
