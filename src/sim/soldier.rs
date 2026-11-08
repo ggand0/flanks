@@ -230,11 +230,12 @@ const FEET: f32 = 7.0;
 /// pass crawls; eight at 1.5 carry a crush about eight ranks a tick.
 pub(crate) const SET_APART_PASSES: usize = 8;
 const SET_APART_WEIGHT: f32 = 1.5;
-/// A neighbour is on his list of the tick's touching pairs when he
-/// stands within the pair's body distance, plus how far the two can
-/// close in the tick at their speeds, plus TOUCH_SLACK for the legs'
-/// change of speed and the passes' moves (metres).
-const TOUCH_SLACK: f32 = 0.15;
+/// A neighbour is on his list of the tick's touching pairs when the two
+/// would stand within the pair's body distance plus TOUCH_SLACK after
+/// each steps a tick at his velocity of the tick's start: the slack is
+/// for the legs' change of speed and the passes' moves (metres). Men
+/// walking side by side farther apart than that list nothing.
+const TOUCH_SLACK: f32 = 0.10;
 /// One neighbour a man may touch this tick (`set_apart`, `collide`): his
 /// index, the pair's body distance, and the other man's share of the
 /// pair's mass, m_o / (m_i + m_o).
@@ -1022,12 +1023,14 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
     let mut impale_idx = u32::MAX;
     let mut impale_d = f32::MAX;
     // The yield-and-collide contact's touching pairs: every neighbour
-    // whose body he can reach this tick at the two men's speeds.
+    // whose body he would touch at their stepped places, both men a tick
+    // on at their velocities of the tick's start.
     let touching = !contact_old();
-    // The same sums from either side of a pair, so both men list it or
-    // neither does.
-    let my_speed = s.vel.xz().length();
+    // His stepped place from the same numbers the grid hands his
+    // neighbours for him (his place and velocity at the tick's start), so
+    // both men of a pair compute the same distance and list it or not.
     let dt = f.dt;
+    let my_step = p + s.vel.xz() * dt;
     let scan_r = if at_charge_speed {
         QUERY_RADIUS.max(params.reach).max(spear_reach)
     } else {
@@ -1045,8 +1048,8 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
                 && (o.meta & crate::spatial::META_TEAM) == my_team_bit
                 && (o.meta & crate::spatial::META_WALL) != 0;
             let hard = if both_wall { w.hard.min(WALL_SEP_RADIUS) } else { w.hard };
-            let reach = hard + TOUCH_SLACK + (my_speed + o_vel.length()) * dt;
-            if d2 < reach * reach {
+            let reach = hard + TOUCH_SLACK;
+            if (my_step - (o.xz() + o_vel * dt)).length_squared() < reach * reach {
                 let share = masses[crate::spatial::meta_kind(o.meta)].1;
                 out.touch.push(Touch { b: o.idx, hard, share });
             }
