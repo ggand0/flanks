@@ -74,9 +74,11 @@ pub(crate) struct Sidearm {
 /// One tick of the yield-and-collide contact in parts (the overlay's
 /// 2 s log line): the kernel (scan, steer, integrate and the start
 /// places), the cut of the phase's work into runs, the
-/// SET_APART_PASSES passes together and the collision pass, in ms;
-/// the men with a touching pair, the pairs listed (each once) and the
-/// pairs still overlapping at the final places (each once).
+/// `set_apart_passes` passes together and the collision pass, in ms;
+/// the men with a touching pair, the pairs listed (each once), the
+/// pairs still overlapping at the final places (each once), the men
+/// braked by the still-man crowd (jam over 0) and the men its floor held
+/// up at the step pace.
 #[derive(Clone, Copy, Default)]
 pub struct ContactSplit {
     pub kernel_ms: f32,
@@ -86,6 +88,8 @@ pub struct ContactSplit {
     pub men: u32,
     pub pairs: u32,
     pub overlap: u32,
+    pub braked: u32,
+    pub held: u32,
 }
 
 /// Everything one kinematic tick owns: the shared columns it reads, the

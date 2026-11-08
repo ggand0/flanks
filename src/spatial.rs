@@ -111,6 +111,12 @@ pub struct SpatialGrid {
     /// separate column, so the separation scan's 16-byte stride stays
     /// as it is and only the queries that look at motion pay for it.
     sorted_vel: Vec<Vec2>,
+    /// The ground velocity of `sorted[k]`'s actual move over the last
+    /// tick, (position - position a tick before) / dt, in the same order:
+    /// the still-man brake's read (sim/soldier.rs `scan`). Under the
+    /// yield-and-collide contact a pressed man's kept velocity is his
+    /// legs', not his move.
+    sorted_move: Vec<Vec2>,
     /// The largest of `sorted_vel`'s speeds: no neighbour moves faster
     /// (the scan's cut of its candidates, sim/soldier.rs `scan`).
     vel_max: f32,
@@ -128,6 +134,8 @@ impl SpatialGrid {
     pub fn rebuild(
         &mut self,
         positions: &[Vec3],
+        prev_positions: &[Vec3],
+        dt: f32,
         vels: &[Vec3],
         teams: &[u8],
         kinds: &[u8],
@@ -141,6 +149,7 @@ impl SpatialGrid {
             self.dims = (0, 0);
             self.sorted.clear();
             self.sorted_vel.clear();
+            self.sorted_move.clear();
             self.vel_max = 0.0;
             return;
         }
@@ -203,10 +212,16 @@ impl SpatialGrid {
         // so every slot of `sorted` is written exactly once, by one task.
         self.sorted.resize(n, SortedUnit::default());
         self.sorted_vel.resize(n, Vec2::ZERO);
+        self.sorted_move.resize(n, Vec2::ZERO);
+        // A column of a tick before that does not match (none yet) reads
+        // as no move.
+        let prev = if prev_positions.len() == n { prev_positions } else { positions };
         let out = SharedOut(self.sorted.as_mut_ptr());
         let out = &out;
         let out_vel = SharedVel(self.sorted_vel.as_mut_ptr());
         let out_vel = &out_vel;
+        let out_move = SharedVel(self.sorted_move.as_mut_ptr());
+        let out_move = &out_move;
         let vel_max2: Vec<f32> = crate::util::sim_scope(|scope| {
             for (t, (pos_chunk, (cell_chunk, hist))) in positions
                 .chunks(REBUILD_CHUNK)
@@ -236,6 +251,7 @@ impl SpatialGrid {
                                 meta,
                             };
                             *out_vel.0.add(k) = Vec2::new(vels[i].x, vels[i].z);
+                            *out_move.0.add(k) = Vec2::new(p.x - prev[i].x, p.z - prev[i].z) / dt;
                         }
                         vel_max2 = vel_max2.max(Vec2::new(vels[i].x, vels[i].z).length_squared());
                     }
@@ -305,7 +321,8 @@ impl SpatialGrid {
     }
 
     /// `for_each_candidate_vel` over the box of `radius` with each row of
-    /// cells cut to the cells the disc of `disc` reaches: the same
+    /// cells cut to the cells the disc of `disc` reaches, handing each
+    /// unit's actual move over the last tick as well (`sorted_move`): the same
     /// candidates in the same order, less the cells wholly outside the
     /// disc. A man in a skipped cell is farther than `disc` from `center`.
     ///
@@ -314,7 +331,7 @@ impl SpatialGrid {
     /// a clamped grid, made LLVM keep it as a function called per
     /// candidate).
     #[inline]
-    pub fn for_each_candidate_vel_disc(&self, center: Vec2, radius: f32, disc: f32, mut f: impl FnMut(&SortedUnit, Vec2)) {
+    pub fn for_each_candidate_vel_disc(&self, center: Vec2, radius: f32, disc: f32, mut f: impl FnMut(&SortedUnit, Vec2, Vec2)) {
         if self.dims.0 == 0 {
             return;
         }
@@ -337,8 +354,8 @@ impl SpatialGrid {
             let row = cy * self.dims.0;
             let s = self.starts[row + a] as usize;
             let e = self.starts[row + b + 1] as usize;
-            for (u, v) in self.sorted[s..e].iter().zip(&self.sorted_vel[s..e]) {
-                f(u, *v);
+            for ((u, v), m) in self.sorted[s..e].iter().zip(&self.sorted_vel[s..e]).zip(&self.sorted_move[s..e]) {
+                f(u, *v, *m);
             }
         }
     }

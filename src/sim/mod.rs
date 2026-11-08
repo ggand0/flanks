@@ -77,7 +77,7 @@ pub struct SimStats {
     /// The yield-and-collide contact's split summed over the ticks since
     /// the overlay's last log line, which takes the means and clears it
     /// (`take_contact`).
-    contact_sum: [f64; 7],
+    contact_sum: [f64; 9],
     contact_ticks: u32,
     /// FL_LOG_STEP accumulators over the current 150-tick window.
     log_step_sum: f64,
@@ -91,7 +91,7 @@ impl SimStats {
         for (sum, v) in self.contact_sum.iter_mut().zip(parts) {
             *sum += v as f64;
         }
-        for (sum, v) in self.contact_sum[4..].iter_mut().zip([c.men, c.pairs, c.overlap]) {
+        for (sum, v) in self.contact_sum[4..].iter_mut().zip([c.men, c.pairs, c.overlap, c.braked, c.held]) {
             *sum += v as f64;
         }
         self.contact_ticks += 1;
@@ -99,11 +99,12 @@ impl SimStats {
 
     /// The means of the contact's split over the ticks since the last
     /// call: kernel, start, passes and collision ms, men listed, pairs
-    /// listed, pairs overlapping. Clears the sums.
-    pub fn take_contact(&mut self) -> [f64; 7] {
+    /// listed, pairs overlapping, men braked by the still-man crowd, men
+    /// held up at the brake's floor. Clears the sums.
+    pub fn take_contact(&mut self) -> [f64; 9] {
         let n = self.contact_ticks.max(1) as f64;
         let means = self.contact_sum.map(|v| v / n);
-        self.contact_sum = [0.0; 7];
+        self.contact_sum = [0.0; 9];
         self.contact_ticks = 0;
         means
     }
@@ -333,6 +334,7 @@ fn run_tick_job(job: &mut TickJob) {
     let faces_spearwall = job.faces_spearwall;
     let TickJob {
         pos_in,
+        pos_prev_in,
         speed,
         team,
         kind,
@@ -476,7 +478,7 @@ fn run_tick_job(job: &mut TickJob) {
     let t0 = Instant::now();
     {
         let _span = info_span!("grid_rebuild").entered();
-        grid.rebuild(pos_prev, &vel_in[..], team, kind, group, death_t_in, &pose_in[..], group_wall);
+        grid.rebuild(pos_prev, &pos_prev_in[..], dt, &vel_in[..], team, kind, group, death_t_in, &pose_in[..], group_wall);
     }
     let t1 = Instant::now();
     *grid_ms = (t1 - t0).as_secs_f32() * 1000.0;
@@ -587,7 +589,7 @@ fn run_tick_job(job: &mut TickJob) {
     touch_end.resize(n, 0);
     touch_q.resize(n, Vec2::ZERO);
     touch_next.resize(n, Vec2::ZERO);
-    let kernel_out: Vec<(Vec<u32>, Vec<u32>, u32)> = crate::util::sim_scope(|scope| {
+    let kernel_out: Vec<(Vec<u32>, Vec<u32>, [u32; 3])> = crate::util::sim_scope(|scope| {
         for (ci, chunk) in pos_out
             .chunks_mut(CHUNK)
             .zip(vel.chunks_mut(CHUNK))
@@ -662,19 +664,20 @@ fn run_tick_job(job: &mut TickJob) {
                 };
                 events.clear();
                 touch.clear();
-                let mut out = soldier::ChunkOut { events, arrows, touch, touch_end };
+                let mut out = soldier::ChunkOut { events, arrows, touch, touch_end, braked: 0, held: 0 };
                 soldier::tick_chunk(f, rows, &mut out);
                 if old_contact {
                     // The sweep's candidates from this chunk, once its men
                     // stand where the tick leaves them.
                     let (dead, at_edge) = edge_lists(start, pos, death_t, team, edge_lo, edge_hi);
-                    (dead, at_edge, 0)
+                    (dead, at_edge, [0; 3])
                 } else {
                     // The yield-and-collide contact's start places, while
                     // the chunk's rows are hot.
+                    let (braked, held) = (out.braked, out.held);
                     let rows = soldier::TouchRows { start, touch: out.touch, touch_end: out.touch_end, from0: 0 };
                     let listed = soldier::set_apart_start(f, &rows, vel, pos, touch_q, touch_next);
-                    (Vec::new(), Vec::new(), listed)
+                    (Vec::new(), Vec::new(), [listed, braked, held])
                 }
             });
         }
@@ -683,13 +686,15 @@ fn run_tick_job(job: &mut TickJob) {
     let mut lists: Vec<(Vec<u32>, Vec<u32>)> = Vec::new();
     *contact_split = job::ContactSplit::default();
     // The yield-and-collide contact: the men set apart on their stepped
-    // places, SET_APART_PASSES passes over the tick's touching pairs, each
+    // places, `set_apart_passes` passes over the tick's touching pairs, each
     // pass every man reading where the last left everyone and all moving
     // together after it; then the collision on the tick's moves.
     if !old_contact {
         let _span = info_span!("set_apart").entered();
         let t_kernel = Instant::now();
-        let men: u32 = kernel_out.iter().map(|k| k.2).sum();
+        let men: u32 = kernel_out.iter().map(|k| k.2[0]).sum();
+        let braked: u32 = kernel_out.iter().map(|k| k.2[1]).sum();
+        let held: u32 = kernel_out.iter().map(|k| k.2[2]).sum();
         // The phase runs over runs of men cut to equal work, a listed pair
         // weighing PAIR_WEIGHT men, so the few chunks at a crush's front
         // that hold nearly all the pairs are shared out across the
@@ -727,7 +732,7 @@ fn run_tick_job(job: &mut TickJob) {
         touch_bounds.push(n);
         let bounds = &touch_bounds[..];
         let t_start = Instant::now();
-        for pass in 0..soldier::SET_APART_PASSES {
+        for pass in 0..soldier::set_apart_passes() {
             let cur = &touch_q[..];
             let next_all = &mut touch_next[..];
             crate::util::sim_scope(|scope| {
@@ -789,6 +794,8 @@ fn run_tick_job(job: &mut TickJob) {
             // Every pair is on both men's lists.
             pairs: (listed / 2) as u32,
             overlap: overlap / 2,
+            braked,
+            held,
         };
     } else {
         lists.extend(kernel_out.into_iter().map(|(d, e, _)| (d, e)));

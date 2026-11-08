@@ -228,7 +228,27 @@ const FEET: f32 = 7.0;
 /// his corrections averaged over the men he touches and multiplied by
 /// SET_APART_WEIGHT. One summed pass overshoots in a chain; one averaged
 /// pass crawls; eight at 1.5 carry a crush about eight ranks a tick.
-pub(crate) const SET_APART_PASSES: usize = 8;
+/// FL_PASSES=<n> sets the passes, 1 to 16; two by default, the toy's
+/// hard2 (round 50), with the still-man brake keeping the press from
+/// crushing.
+const SET_APART_PASSES: usize = 2;
+pub(crate) fn set_apart_passes() -> usize {
+    static P: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *P.get_or_init(|| crate::util::env_or("FL_PASSES", SET_APART_PASSES).clamp(1, 16))
+}
+/// The still-man brake of the yield-and-collide contact (`scan`,
+/// `yield_to_crowd`): his drive fades for the crowd of standing men ahead
+/// of his wish, by the old brake's band, and never under the step pace.
+/// FL_BRAKE=0 turns it off (no brake, as before it).
+pub(crate) fn still_brake() -> bool {
+    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *S.get_or_init(|| !std::env::var("FL_BRAKE").is_ok_and(|v| v == "0"))
+}
+/// The still-man crowd's crawl (m/s): a neighbour ahead who actually
+/// moved along a man's way over the last tick at CRAWL or faster counts
+/// nothing in it; one who stood, or came at him, counts in full; between,
+/// by the share of the crawl he did not make.
+const CRAWL: f32 = 0.3;
 const SET_APART_WEIGHT: f32 = 1.5;
 /// A neighbour is on his list of the tick's touching pairs when the two
 /// would stand within the pair's body distance plus TOUCH_SLACK after
@@ -657,6 +677,10 @@ pub(crate) struct ChunkOut<'a> {
     /// contact, man after man, and for each row the end of his run in it.
     pub touch: &'a mut Vec<Touch>,
     pub touch_end: &'a mut [u32],
+    /// The chunk's men braked by the still-man crowd (jam over 0) and
+    /// held up at the step pace by the brake's floor.
+    pub braked: u32,
+    pub held: u32,
 }
 
 /// What one stage of a soldier's tick hands the next.
@@ -683,6 +707,14 @@ struct Step {
     /// His share by weight of a closing speed on them (the shared speed).
     overlap_share: f32,
     crowd: f32,
+    /// The still-man crowd (the yield-and-collide contact's brake): the
+    /// neighbours within the spring on the half-plane ahead of his wish,
+    /// by their closeness, each times how little he actually moved along
+    /// the wish last tick against CRAWL. 0 for a man with no wish.
+    crowd_still: f32,
+    /// The still-man brake's floor held his drive up at the step pace
+    /// (`yield_to_crowd`).
+    held: bool,
     /// The crowd ahead of him on his way: the neighbours within the
     /// spring whose direction is within 60 degrees of his wish, by their
     /// closeness (`try_a_side`).
@@ -777,6 +809,8 @@ pub(crate) fn tick_chunk(f: &Field, rows: Rows, out: &mut ChunkOut) {
         decide_to_join(f, &mut s, &mut st);
         swing(f, &mut s, &mut st, out);
         yield_to_crowd(&mut st);
+        out.braked += (st.jam > 0.0) as u32;
+        out.held += st.held as u32;
         try_a_side(f, &mut s, &mut st);
         close_in(f, &mut s, &mut st);
         steer(f, &mut s, &mut st);
@@ -849,6 +883,8 @@ fn begin(f: &Field, s: &mut Soldier) -> Step {
         overlap_vel: Vec2::ZERO,
         overlap_share: 0.0,
         crowd: 0.0,
+        crowd_still: 0.0,
+        held: false,
         ahead: 0.0,
         brake: (0.0, 0.0),
         best_idx: u32::MAX,
@@ -1025,6 +1061,7 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
     let mut overlap_share = 0.0f32;
     let mut overlap = 0.0f32;
     let mut crowd = 0.0f32;
+    let mut crowd_still = 0.0f32;
     let mut ahead = 0.0f32;
     let wish_dir = st.desired.normalize_or_zero();
     let my_team_bit = (team[i] as u32) * crate::spatial::META_TEAM;
@@ -1131,7 +1168,7 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
     let (same_near2, foe_near2, fast2) = (same_near * same_near, foe_near * foe_near, fast * fast);
     let disc_r = same_cut.max(foe_cut);
     let scan_r = scan_r.min(disc_r);
-    grid.for_each_candidate_vel_disc(p, scan_r, disc_r, |o, o_vel| {
+    grid.for_each_candidate_vel_disc(p, scan_r, disc_r, |o, o_vel, o_move| {
         if o.idx as usize == i {
             return;
         }
@@ -1264,6 +1301,12 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
             // slot-keeping is never faded by the settled enemies one stride
             // away, which made a line yield and stay ragged.
             crowd += w;
+            // The still-man crowd: a neighbour on the half-plane ahead of
+            // his wish (`d` points from the neighbour to him), by how
+            // little he moved along it last tick.
+            if touching && d.dot(wish_dir) < 0.0 {
+                crowd_still += w * (1.0 - o_move.dot(wish_dir) / CRAWL).clamp(0.0, 1.0);
+            }
         }
     });
 
@@ -1339,6 +1382,7 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
         st.overlap_share = overlap_share / overlap;
     }
     st.crowd = crowd;
+    st.crowd_still = crowd_still;
     st.ahead = ahead;
     st.best_idx = best_idx;
     st.sticky = sticky;
@@ -2800,12 +2844,33 @@ fn yield_to_crowd(st: &mut Step) {
     // Yield in dense crowds: goal drive fades out entirely so the mass can't
     // keep compressing itself; `jam` (0 = free, 1 = packed) also damps the
     // response below.
-    // The yield-and-collide contact has no brake: nothing slows a man for
-    // the crowd ahead of him but the bodies themselves.
+    // The yield-and-collide contact brakes for the still-man crowd
+    // (`crowd_still`) by the same band, and its fade never takes his drive
+    // under the step pace: a wish already slower is left as it is. `jam`
+    // still fades close_in's step toward a remembered enemy and its jog to
+    // the fight point. FL_BRAKE=0: no brake, nothing slows a man for the
+    // crowd ahead of him but the bodies themselves.
     let (slow, stop) = st.brake;
-    let jam = if contact_old() { ((crowd - slow) / (stop - slow)).clamp(0.0, 1.0) } else { 0.0 };
+    let old = contact_old();
+    let jam = if old {
+        ((crowd - slow) / (stop - slow)).clamp(0.0, 1.0)
+    } else if still_brake() {
+        ((st.crowd_still - slow) / (stop - slow)).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
     st.wish = desired;
-    desired *= 1.0 - jam;
+    if old {
+        desired *= 1.0 - jam;
+    } else if jam > 0.0 {
+        let wl = desired.length();
+        if wl > 1e-6 {
+            let faded = wl * (1.0 - jam);
+            let held = wl.min(STEP_PACE);
+            st.held = held > faded;
+            desired = desired / wl * faded.max(held);
+        }
+    }
     st.corr = corr;
     st.push = push;
     st.jam = jam;
@@ -3329,7 +3394,7 @@ pub(crate) fn set_apart_start(f: &Field, rows: &TouchRows, vel: &[Vec3], pos: &[
     listed
 }
 
-/// One pass of the setting apart, for one chunk (`SET_APART_PASSES`):
+/// One pass of the setting apart, for one chunk (`set_apart_passes`):
 /// every man reads the overlaps with the men of his touching pairs where
 /// the last pass left everyone (`cur`), removes each whole, moving the
 /// other man's mass share of it away from him, averages his corrections

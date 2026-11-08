@@ -648,7 +648,7 @@ fn update_overlay(
         // this log period (all zero under FL_CONTACT_OLD=1).
         let c = stats.take_contact();
         info!(
-            "fps: {fps:.0} ({frame_ms:.2} ms), units: {} (blue {} / orange {}), sim: grid {:.2} step {:.2} field {:.2} audit {:.2} sync {:.2}, contact: kernel {:.2} start {:.2} passes {:.2} collide {:.2} ms, men listed {:.0}, pairs listed {:.0}, pairs overlapping {:.0}, hits/tick: {}, arrows: {} (update {:.3} ms/frame, pack {:.3} ms/frame), drawn: {} [{}], nn min/avg: {:.2}/{:.2}, move avg: {:.3} m/tick, lod: {:?}, fallen drawn: {}",
+            "fps: {fps:.0} ({frame_ms:.2} ms), units: {} (blue {} / orange {}), sim: grid {:.2} step {:.2} field {:.2} audit {:.2} sync {:.2}, contact: kernel {:.2} start {:.2} passes {:.2} collide {:.2} ms, men listed {:.0}, pairs listed {:.0}, pairs overlapping {:.0}, men braked {:.0}, floor-held {:.0}, hits/tick: {}, arrows: {} (update {:.3} ms/frame, pack {:.3} ms/frame), drawn: {} [{}], nn min/avg: {:.2}/{:.2}, move avg: {:.3} m/tick, lod: {:?}, fallen drawn: {}",
             units.len(),
             combat.alive[0],
             combat.alive[1],
@@ -664,6 +664,8 @@ fn update_overlay(
             c[4],
             c[5],
             c[6],
+            c[7],
+            c[8],
             stats.events,
             arrows.len(),
             crate::arrows::ARROW_UPDATE_NS.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 * 1e-6 / (fps * 2.0).max(1.0),
