@@ -205,6 +205,45 @@ fn share_contact() -> bool {
     static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *S.get_or_init(|| !std::env::var("FL_CONTACT").is_ok_and(|v| v == "wall"))
 }
+/// The contact between men: yield and collide by default. A man's legs
+/// alone set his velocity (no spring, no grip, no stance, no shared
+/// speed, no density brake); his feet take back what his legs do not
+/// want; the bodies are set apart by position after the step
+/// (`set_apart`), and what the setting apart could not take away of a
+/// closing is a collision (`collide`). FL_CONTACT_OLD=1 plays the old
+/// contact: the spring, the grip, the stance, the shared speed or the
+/// soft wall, the brake and the CORR_GAIN set-apart.
+pub(crate) fn contact_old() -> bool {
+    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *S.get_or_init(|| std::env::var("FL_CONTACT_OLD").is_ok_and(|v| v == "1"))
+}
+/// His feet (m/s^2): each tick they take back up to FEET x dt of the
+/// velocity his legs do not want, the part across his drive and the
+/// excess along it, with no memory. A thrown man is stopped by his feet;
+/// a man walking as he intends feels nothing.
+const FEET: f32 = 7.0;
+/// The setting apart of the yield-and-collide contact: SET_APART_PASSES
+/// passes over the tick's touching pairs, each removing every overlap
+/// whole, each man of a pair moving the other man's mass share of it,
+/// his corrections averaged over the men he touches and multiplied by
+/// SET_APART_WEIGHT. One summed pass overshoots in a chain; one averaged
+/// pass crawls; eight at 1.5 carry a crush about eight ranks a tick.
+pub(crate) const SET_APART_PASSES: usize = 8;
+const SET_APART_WEIGHT: f32 = 1.5;
+/// A neighbour is on his list of the tick's touching pairs when he
+/// stands within the pair's body distance, plus how far the two can
+/// close in the tick at their speeds, plus TOUCH_SLACK for the legs'
+/// change of speed and the passes' moves (metres).
+const TOUCH_SLACK: f32 = 0.15;
+/// One neighbour a man may touch this tick (`set_apart`, `collide`): his
+/// index, the pair's body distance, and the other man's share of the
+/// pair's mass, m_o / (m_i + m_o).
+#[derive(Clone, Copy)]
+pub(crate) struct Touch {
+    pub b: u32,
+    pub hard: f32,
+    pub share: f32,
+}
 const STEER_GAIN: f32 = 3.0;
 const MAX_ACCEL: f32 = 50.0;
 /// What a man's legs can do: the steering toward his wish is capped at
@@ -549,6 +588,10 @@ pub(crate) struct Rows<'a> {
 pub(crate) struct ChunkOut<'a> {
     pub events: &'a mut Vec<DamageEvent>,
     pub arrows: &'a mut Vec<crate::arrows::ArrowSpawn>,
+    /// The chunk's men's touching pairs for the yield-and-collide
+    /// contact, man after man, and for each row the end of his run in it.
+    pub touch: &'a mut Vec<Touch>,
+    pub touch_end: &'a mut [u32],
 }
 
 /// What one stage of a soldier's tick hands the next.
@@ -661,6 +704,7 @@ pub(crate) fn tick_chunk(f: &Field, rows: Rows, out: &mut ChunkOut) {
         let mut st = begin(f, &mut s);
         drive(f, &mut s, &mut st);
         scan(f, &mut s, &mut st, out);
+        out.touch_end[j] = out.touch.len() as u32;
         look_around(f, &mut s, &mut st);
         choose_opening(f, &mut s, &mut st);
         hold_the_frame(f, &mut st);
@@ -977,6 +1021,13 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
         && s.vel.xz().length_squared() > cs * cs;
     let mut impale_idx = u32::MAX;
     let mut impale_d = f32::MAX;
+    // The yield-and-collide contact's touching pairs: every neighbour
+    // whose body he can reach this tick at the two men's speeds.
+    let touching = !contact_old();
+    // The same sums from either side of a pair, so both men list it or
+    // neither does.
+    let my_speed = s.vel.xz().length();
+    let dt = f.dt;
     let scan_r = if at_charge_speed {
         QUERY_RADIUS.max(params.reach).max(spear_reach)
     } else {
@@ -988,6 +1039,18 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
         }
         let d = p - o.xz();
         let d2 = d.length_squared();
+        if touching {
+            let w = &pairs[crate::spatial::meta_width(o.meta)];
+            let both_wall = my_wall
+                && (o.meta & crate::spatial::META_TEAM) == my_team_bit
+                && (o.meta & crate::spatial::META_WALL) != 0;
+            let hard = if both_wall { w.hard.min(WALL_SEP_RADIUS) } else { w.hard };
+            let reach = hard + TOUCH_SLACK + (my_speed + o_vel.length()) * dt;
+            if d2 < reach * reach {
+                let share = masses[crate::spatial::meta_kind(o.meta)].1;
+                out.touch.push(Touch { b: o.idx, hard, share });
+            }
+        }
         // A friend beyond the widest spring rest can touch nothing of his:
         // out before any of the pair's work. Most of a scan's candidates
         // in a press are such men (the cells span more than the circle).
@@ -2629,8 +2692,10 @@ fn yield_to_crowd(st: &mut Step) {
     // Yield in dense crowds: goal drive fades out entirely so the mass can't
     // keep compressing itself; `jam` (0 = free, 1 = packed) also damps the
     // response below.
+    // The yield-and-collide contact has no brake: nothing slows a man for
+    // the crowd ahead of him but the bodies themselves.
     let (slow, stop) = st.brake;
-    let jam = ((crowd - slow) / (stop - slow)).clamp(0.0, 1.0);
+    let jam = if contact_old() { ((crowd - slow) / (stop - slow)).clamp(0.0, 1.0) } else { 0.0 };
     st.wish = desired;
     desired *= 1.0 - jam;
     st.corr = corr;
@@ -2850,6 +2915,11 @@ fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
     }
 
     let v = s.vel.xz();
+    if !contact_old() {
+        st.new_v = legs_and_feet(desired, v, if squeezing(*s.stuck) { SQUEEZE_CAP } else { speed[i] * 1.15 }, dt);
+        st.corr = Vec2::ZERO;
+        return;
+    }
     // Jammed units stop shoving entirely: at full jam the crowd is
     // quasi-static and overlap resolution is purely positional — force-based
     // separation in a wedged mass only produces bang-bang oscillation.
@@ -2924,6 +2994,43 @@ fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
         }
     }
     st.new_v = new_v;
+}
+
+/// The yield-and-collide contact's velocity: his legs toward his drive at
+/// their acceleration, his feet taking back up to FEET x dt of what his
+/// legs do not want (his velocity across his drive and the excess along
+/// it), under the acceleration cap and his speed cap. No spring, no grip,
+/// no stance, no shared speed: the bodies are settled by position after
+/// the step (`set_apart`, `collide`).
+#[inline]
+fn legs_and_feet(desired: Vec2, v: Vec2, vmax: f32, dt: f32) -> Vec2 {
+    let mut legs = (desired - v) * STEER_GAIN;
+    let l2 = legs.length_squared();
+    if l2 > LEG_ACCEL * LEG_ACCEL {
+        legs *= LEG_ACCEL / l2.sqrt();
+    }
+    let want = desired.length();
+    let unwanted = if want < 1e-6 {
+        v
+    } else {
+        let d_hat = desired / want;
+        v - d_hat * v.dot(d_hat).clamp(0.0, want)
+    };
+    let ul = unwanted.length();
+    if ul > 1e-12 {
+        let bleed = ul.min(FEET * dt);
+        legs -= unwanted * (bleed / ul / dt);
+    }
+    let a2 = legs.length_squared();
+    if a2 > MAX_ACCEL * MAX_ACCEL {
+        legs *= MAX_ACCEL / a2.sqrt();
+    }
+    let mut new_v = v + legs * dt;
+    let v2 = new_v.length_squared();
+    if v2 > vmax * vmax {
+        new_v *= vmax / v2.sqrt();
+    }
+    new_v
 }
 
 /// Which way he looks: the man he swings at, the enemy in reach when he
@@ -3042,15 +3149,26 @@ fn integrate(f: &Field, s: &mut Soldier, st: &mut Step) {
     let new_v = st.new_v;
     let corr = st.corr;
     *s.vel = Vec3::new(new_v.x, 0.0, new_v.y);
-    let mut nx = (pos_prev[i].x + new_v.x * dt + corr.x)
-        .clamp(bounds_min.x, bounds_max.x);
-    let mut nz = (pos_prev[i].z + new_v.y * dt + corr.y)
-        .clamp(bounds_min.y, bounds_max.y);
+    let to = Vec2::new(pos_prev[i].x + new_v.x * dt + corr.x, pos_prev[i].z + new_v.y * dt + corr.y);
+    let n = ground_step(terrain, bounds_min, bounds_max, pos_prev[i].xz(), to);
+    *s.pos = Vec3::new(
+        n.x,
+        terrain.height_at(n.x, n.y) + crate::unit_types::half_height(kind[i] as usize),
+        n.y,
+    );
+}
+
+/// A move from `from` to `to` on the ground plane, clamped to the field,
+/// sliding along impassable ground.
+#[inline]
+fn ground_step(terrain: &Terrain, bounds_min: Vec2, bounds_max: Vec2, from: Vec2, to: Vec2) -> Vec2 {
+    let mut nx = to.x.clamp(bounds_min.x, bounds_max.x);
+    let mut nz = to.y.clamp(bounds_min.y, bounds_max.y);
     // Impassable ground (terrace risers, gorge walls, crater lips):
     // wall-slide — keep the axis that stays on walkable ground, drop the one
     // that doesn't, so crowds flow along the obstacle.
     if terrain.blocked_at(nx, nz) {
-        let (px, pz) = (pos_prev[i].x, pos_prev[i].z);
+        let (px, pz) = (from.x, from.y);
         if !terrain.blocked_at(nx, pz) {
             nz = pz;
         } else if !terrain.blocked_at(px, nz) {
@@ -3060,10 +3178,117 @@ fn integrate(f: &Field, s: &mut Soldier, st: &mut Step) {
             nz = pz;
         }
     }
-    *s.pos = Vec3::new(
-        nx,
-        terrain.height_at(nx, nz) + crate::unit_types::half_height(kind[i] as usize),
-        nz,
-    );
+    Vec2::new(nx, nz)
+}
+
+/// The rows of one chunk for the yield-and-collide contact's passes: the
+/// chunk's men's touching pairs (`ChunkOut::touch`) and the end of each
+/// man's run in them.
+pub(crate) struct TouchRows<'a> {
+    pub start: usize,
+    pub touch: &'a [Touch],
+    pub touch_end: &'a [u32],
+}
+
+impl TouchRows<'_> {
+    #[inline]
+    fn run(&self, j: usize) -> &[Touch] {
+        let from = if j == 0 { 0 } else { self.touch_end[j - 1] as usize };
+        &self.touch[from..self.touch_end[j] as usize]
+    }
+}
+
+/// Where each man of a chunk stands before the first pass of the setting
+/// apart: a man with a touching pair at his legs' step from the tick's
+/// start, unclamped, as the step asks; any other man where the kernel
+/// set him down, since no pass moves him.
+pub(crate) fn set_apart_start(f: &Field, rows: &TouchRows, vel: &[Vec3], pos: &[Vec3], q: &mut [Vec2]) {
+    for (j, q) in q.iter_mut().enumerate() {
+        let i = rows.start + j;
+        *q = if rows.run(j).is_empty() {
+            pos[j].xz()
+        } else {
+            f.pos_prev[i].xz() + vel[j].xz() * f.dt
+        };
+    }
+}
+
+/// One pass of the setting apart, for one chunk (`SET_APART_PASSES`):
+/// every man reads the overlaps with the men of his touching pairs where
+/// the last pass left everyone (`cur`), removes each whole, moving the
+/// other man's mass share of it away from him, averages his corrections
+/// over the men he touches, multiplies them by SET_APART_WEIGHT and
+/// steps by them on the ground (`next`). All men move together after the
+/// pass. The first pass steps from the tick's start, the rest from where
+/// the last pass left him.
+pub(crate) fn set_apart(f: &Field, rows: &TouchRows, first: bool, cur: &[Vec2], next: &mut [Vec2]) {
+    for (j, n) in next.iter_mut().enumerate() {
+        let i = rows.start + j;
+        let me = cur[i];
+        let run = rows.run(j);
+        if run.is_empty() {
+            *n = me;
+            continue;
+        }
+        let mut corr = Vec2::ZERO;
+        let mut count = 0u32;
+        for t in run {
+            let dq = me - cur[t.b as usize];
+            let l2 = dq.length_squared();
+            if l2 < t.hard * t.hard && l2 > 1e-12 {
+                let l = l2.sqrt();
+                corr += dq * ((t.hard - l) * t.share / l);
+                count += 1;
+            }
+        }
+        let from = if first { f.pos_prev[i].xz() } else { me };
+        *n = if count == 0 && !first {
+            me
+        } else {
+            let corr = corr * (SET_APART_WEIGHT / count.max(1) as f32);
+            ground_step(f.terrain, f.bounds_min, f.bounds_max, from, me + corr)
+        };
+    }
+}
+
+/// The collision after the setting apart, for one chunk: each man's move
+/// over the tick, from the tick's start to where the last pass left him;
+/// for every pair still touching there and closing on those moves, he
+/// takes the other man's mass share of the closing speed along the
+/// line between them, summed over his pairs and added to his legs'
+/// velocity. Parting or sliding pairs give nothing. His position is set
+/// down on the ground.
+pub(crate) fn collide(f: &Field, rows: &TouchRows, cur: &[Vec2], vel: &mut [Vec3], pos: &mut [Vec3]) {
+    let inv_dt = 1.0 / f.dt;
+    for j in 0..vel.len() {
+        let i = rows.start + j;
+        let run = rows.run(j);
+        if run.is_empty() {
+            continue;
+        }
+        let me = cur[i];
+        let u = (me - f.pos_prev[i].xz()) * inv_dt;
+        let mut dv = Vec2::ZERO;
+        for t in run {
+            let b = t.b as usize;
+            let dq = me - cur[b];
+            let l2 = dq.length_squared();
+            if l2 < t.hard * t.hard && l2 > 1e-12 {
+                let n = dq / l2.sqrt();
+                let u_b = (cur[b] - f.pos_prev[b].xz()) * inv_dt;
+                let c = (u_b - u).dot(n);
+                if c > 0.0 {
+                    dv += n * (c * t.share);
+                }
+            }
+        }
+        vel[j].x += dv.x;
+        vel[j].z += dv.y;
+        pos[j] = Vec3::new(
+            me.x,
+            f.terrain.height_at(me.x, me.y) + crate::unit_types::half_height(f.kind[i] as usize),
+            me.y,
+        );
+    }
 }
 

@@ -381,6 +381,10 @@ fn run_tick_job(job: &mut TickJob) {
         grid,
         events,
         arrow_spawns,
+        touch,
+        touch_end,
+        touch_q,
+        touch_next,
         grid_ms,
         step_ms,
         field_ms,
@@ -545,7 +549,11 @@ fn run_tick_job(job: &mut TickJob) {
     let edge_lo = terrain.min().y + 8.0 + damage::KNOCKBACK_MARGIN;
     let edge_hi = terrain.max().y - 8.0 - damage::KNOCKBACK_MARGIN;
     let integrate_span = info_span!("integrate").entered();
-    let lists: Vec<(Vec<u32>, Vec<u32>)> = crate::util::sim_scope(|scope| {
+    let old_contact = soldier::contact_old();
+    let n = pos_out.len();
+    touch.resize_with(n.div_ceil(CHUNK), Vec::new);
+    touch_end.resize(n, 0);
+    let mut lists: Vec<(Vec<u32>, Vec<u32>)> = crate::util::sim_scope(|scope| {
         for (ci, chunk) in pos_out
             .chunks_mut(CHUNK)
             .zip(vel.chunks_mut(CHUNK))
@@ -567,11 +575,13 @@ fn run_tick_job(job: &mut TickJob) {
             .zip(quarry.chunks_mut(CHUNK))
             .zip(stuck.chunks_mut(CHUNK))
             .zip(aim.chunks_mut(CHUNK))
+            .zip(touch.iter_mut())
+            .zip(touch_end.chunks_mut(CHUNK))
             .enumerate()
         {
-            let (((((((((((((((((((pos, vel), yaw), yaw_prev), target), swing), swing_t), flash),
-                death_t), events), ammo), arrows), out_form), sight), way), chain), pose), quarry), stuck), aim) =
-                chunk;
+            let (((((((((((((((((((((pos, vel), yaw), yaw_prev), target), swing), swing_t), flash),
+                death_t), events), ammo), arrows), out_form), sight), way), chain), pose), quarry), stuck), aim),
+                touch), touch_end) = chunk;
             let start = ci * CHUNK;
             let end = start + pos.len();
             scope.spawn(async move {
@@ -615,29 +625,65 @@ fn run_tick_job(job: &mut TickJob) {
                     aim,
                 };
                 events.clear();
-                let mut out = soldier::ChunkOut { events, arrows };
+                touch.clear();
+                let mut out = soldier::ChunkOut { events, arrows, touch, touch_end };
                 soldier::tick_chunk(f, rows, &mut out);
-                // The sweep's candidates from this chunk: countdowns that
-                // just ran out, and living men near their own map edge.
-                let mut dead = Vec::new();
-                let mut at_edge = Vec::new();
-                for j in 0..pos.len() {
-                    let i = start + j;
-                    if death_t[j] == 1 {
-                        dead.push(i as u32);
-                    } else if death_t[j] == 0 {
-                        let z = pos[j].z;
-                        let out = if team[i] == 0 { z < edge_lo } else { z > edge_hi };
-                        if out {
-                            at_edge.push(i as u32);
-                        }
-                    }
+                // The sweep's candidates from this chunk, once its men
+                // stand where the tick leaves them.
+                if old_contact {
+                    edge_lists(start, pos, death_t, team, edge_lo, edge_hi)
+                } else {
+                    (Vec::new(), Vec::new())
                 }
-                (dead, at_edge)
             });
         }
     });
     drop(integrate_span);
+    // The yield-and-collide contact: the men set apart on their stepped
+    // places, SET_APART_PASSES passes over the tick's touching pairs, each
+    // pass every man reading where the last left everyone and all moving
+    // together after it; then the collision on the tick's moves.
+    if !old_contact {
+        let _span = info_span!("set_apart").entered();
+        let touch = &touch[..];
+        let touch_end = &touch_end[..];
+        let rows = |ci: usize, len: usize| {
+            let start = ci * CHUNK;
+            soldier::TouchRows { start, touch: &touch[ci], touch_end: &touch_end[start..start + len] }
+        };
+        touch_q.resize(n, Vec2::ZERO);
+        touch_next.resize(n, Vec2::ZERO);
+        crate::util::sim_scope(|scope| {
+            for (ci, ((q, vel), pos)) in
+                touch_q.chunks_mut(CHUNK).zip(vel.chunks(CHUNK)).zip(pos_out.chunks(CHUNK)).enumerate()
+            {
+                let rows = rows(ci, q.len());
+                scope.spawn(async move { soldier::set_apart_start(f, &rows, vel, pos, q) });
+            }
+        });
+        for pass in 0..soldier::SET_APART_PASSES {
+            let cur = &touch_q[..];
+            crate::util::sim_scope(|scope| {
+                for (ci, next) in touch_next.chunks_mut(CHUNK).enumerate() {
+                    let rows = rows(ci, next.len());
+                    scope.spawn(async move { soldier::set_apart(f, &rows, pass == 0, cur, next) });
+                }
+            });
+            std::mem::swap(touch_q, touch_next);
+        }
+        let cur = &touch_q[..];
+        lists = crate::util::sim_scope(|scope| {
+            for (ci, ((vel, pos), death_t)) in
+                vel.chunks_mut(CHUNK).zip(pos_out.chunks_mut(CHUNK)).zip(death_t.chunks(CHUNK)).enumerate()
+            {
+                let rows = rows(ci, vel.len());
+                scope.spawn(async move {
+                    soldier::collide(f, &rows, cur, vel, pos);
+                    edge_lists(rows.start, pos, death_t, team, edge_lo, edge_hi)
+                });
+            }
+        });
+    }
     dead.clear();
     at_edge.clear();
     for (d, e) in lists {
@@ -654,6 +700,26 @@ fn run_tick_job(job: &mut TickJob) {
         }
         None => plans.clear(),
     }
+}
+
+/// The sweep's candidates from one chunk: countdowns that just ran out,
+/// and living men near their own map edge.
+fn edge_lists(start: usize, pos: &[Vec3], death_t: &[u8], team: &[u8], edge_lo: f32, edge_hi: f32) -> (Vec<u32>, Vec<u32>) {
+    let mut dead = Vec::new();
+    let mut at_edge = Vec::new();
+    for j in 0..pos.len() {
+        let i = start + j;
+        if death_t[j] == 1 {
+            dead.push(i as u32);
+        } else if death_t[j] == 0 {
+            let z = pos[j].z;
+            let out = if team[i] == 0 { z < edge_lo } else { z > edge_hi };
+            if out {
+                at_edge.push(i as u32);
+            }
+        }
+    }
+    (dead, at_edge)
 }
 
 #[allow(clippy::too_many_arguments)] // bevy system params

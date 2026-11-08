@@ -212,6 +212,13 @@ pub struct TickJob {
     pub(crate) grid: SpatialGrid,
     pub(crate) events: Vec<Vec<DamageEvent>>,
     pub(crate) arrow_spawns: Vec<Vec<crate::arrows::ArrowSpawn>>,
+    /// The yield-and-collide contact (sim/soldier.rs `set_apart`): each
+    /// chunk's touching pairs, each man's end of his run in his chunk's,
+    /// and the men's places between the passes, read and written by turns.
+    pub(crate) touch: Vec<Vec<crate::sim::soldier::Touch>>,
+    pub(crate) touch_end: Vec<u32>,
+    pub(crate) touch_q: Vec<Vec2>,
+    pub(crate) touch_next: Vec<Vec2>,
     pub(crate) terrain: Option<std::sync::Arc<Terrain>>,
     pub(crate) dt: f32,
     pub(crate) combat_scale: f32,
