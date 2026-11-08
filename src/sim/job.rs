@@ -71,6 +71,22 @@ pub(crate) struct Sidearm {
     pub(crate) blocks: Vec<crate::formation::BlockRect>,
 }
 
+/// One tick of the yield-and-collide contact in parts (the overlay's
+/// 2 s log line): the kernel (scan, steer, integrate), the start pass,
+/// the SET_APART_PASSES passes together and the collision pass, in ms;
+/// the men with a touching pair, the pairs listed (each once) and the
+/// pairs still overlapping at the final places (each once).
+#[derive(Clone, Copy, Default)]
+pub struct ContactSplit {
+    pub kernel_ms: f32,
+    pub start_ms: f32,
+    pub passes_ms: f32,
+    pub collide_ms: f32,
+    pub men: u32,
+    pub pairs: u32,
+    pub overlap: u32,
+}
+
 /// Everything one kinematic tick owns: the shared columns it reads, the
 /// per-regiment command snapshot, and the buffers it fills. Fully
 /// self-contained, so the tick can run on a worker thread while the main
@@ -231,6 +247,9 @@ pub struct TickJob {
     pub(crate) grid_ms: f32,
     pub(crate) step_ms: f32,
     pub(crate) field_ms: f32,
+    /// The yield-and-collide contact's parts of `step_ms` and its pair
+    /// counts this tick; all zero under FL_CONTACT_OLD=1.
+    pub(crate) contact_split: ContactSplit,
     // Routes (sim/route.rs): the plans asked for at prep, planned after
     // the kernel, and each regiment's route with the grid its men read.
     pub(crate) plan_requests: Vec<crate::sim::route::PlanJob>,

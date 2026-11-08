@@ -13,6 +13,7 @@
 //! the job computes on the pool and hands over as a product.
 
 use bevy::prelude::*;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
 use crate::frontline::InfluenceField;
@@ -74,10 +75,39 @@ pub struct SimStats {
     /// couple of seconds). Cube width is 0.62 — below that means overlap.
     pub nn_min: f32,
     pub nn_avg: f32,
+    /// The yield-and-collide contact's split summed over the ticks since
+    /// the overlay's last log line, which takes the means and clears it
+    /// (`take_contact`).
+    contact_sum: [f64; 7],
+    contact_ticks: u32,
     /// FL_LOG_STEP accumulators over the current 150-tick window.
     log_step_sum: f64,
     log_grid_sum: f64,
     log_step_n: u32,
+}
+
+impl SimStats {
+    fn add_contact(&mut self, c: &job::ContactSplit) {
+        let parts = [c.kernel_ms, c.start_ms, c.passes_ms, c.collide_ms];
+        for (sum, v) in self.contact_sum.iter_mut().zip(parts) {
+            *sum += v as f64;
+        }
+        for (sum, v) in self.contact_sum[4..].iter_mut().zip([c.men, c.pairs, c.overlap]) {
+            *sum += v as f64;
+        }
+        self.contact_ticks += 1;
+    }
+
+    /// The means of the contact's split over the ticks since the last
+    /// call: kernel, start, passes and collision ms, men listed, pairs
+    /// listed, pairs overlapping. Clears the sums.
+    pub fn take_contact(&mut self) -> [f64; 7] {
+        let n = self.contact_ticks.max(1) as f64;
+        let means = self.contact_sum.map(|v| v / n);
+        self.contact_sum = [0.0; 7];
+        self.contact_ticks = 0;
+        means
+    }
 }
 
 /// Debug gizmo master toggle (G).
@@ -388,6 +418,7 @@ fn run_tick_job(job: &mut TickJob) {
         grid_ms,
         step_ms,
         field_ms,
+        contact_split,
         plan_requests,
         plans,
         routes,
@@ -639,12 +670,14 @@ fn run_tick_job(job: &mut TickJob) {
         }
     });
     drop(integrate_span);
+    *contact_split = job::ContactSplit::default();
     // The yield-and-collide contact: the men set apart on their stepped
     // places, SET_APART_PASSES passes over the tick's touching pairs, each
     // pass every man reading where the last left everyone and all moving
     // together after it; then the collision on the tick's moves.
     if !old_contact {
         let _span = info_span!("set_apart").entered();
+        let t_kernel = Instant::now();
         let touch = &touch[..];
         let touch_end = &touch_end[..];
         let rows = |ci: usize, len: usize| {
@@ -653,14 +686,21 @@ fn run_tick_job(job: &mut TickJob) {
         };
         touch_q.resize(n, Vec2::ZERO);
         touch_next.resize(n, Vec2::ZERO);
+        // The counts summed once per chunk, for the overlay's log line.
+        let men = AtomicU32::new(0);
+        let overlap = AtomicU32::new(0);
+        let (men_n, overlap_n) = (&men, &overlap);
         crate::util::sim_scope(|scope| {
             for (ci, ((q, vel), pos)) in
                 touch_q.chunks_mut(CHUNK).zip(vel.chunks(CHUNK)).zip(pos_out.chunks(CHUNK)).enumerate()
             {
                 let rows = rows(ci, q.len());
-                scope.spawn(async move { soldier::set_apart_start(f, &rows, vel, pos, q) });
+                scope.spawn(async move {
+                    men_n.fetch_add(soldier::set_apart_start(f, &rows, vel, pos, q), Ordering::Relaxed);
+                });
             }
         });
+        let t_start = Instant::now();
         for pass in 0..soldier::SET_APART_PASSES {
             let cur = &touch_q[..];
             crate::util::sim_scope(|scope| {
@@ -671,6 +711,7 @@ fn run_tick_job(job: &mut TickJob) {
             });
             std::mem::swap(touch_q, touch_next);
         }
+        let t_passes = Instant::now();
         let cur = &touch_q[..];
         lists = crate::util::sim_scope(|scope| {
             for (ci, ((vel, pos), death_t)) in
@@ -678,11 +719,24 @@ fn run_tick_job(job: &mut TickJob) {
             {
                 let rows = rows(ci, vel.len());
                 scope.spawn(async move {
-                    soldier::collide(f, &rows, cur, vel, pos);
+                    overlap_n.fetch_add(soldier::collide(f, &rows, cur, vel, pos), Ordering::Relaxed);
                     edge_lists(rows.start, pos, death_t, team, edge_lo, edge_hi)
                 });
             }
         });
+        let t_collide = Instant::now();
+        let ms = |a: Instant, b: Instant| (b - a).as_secs_f32() * 1000.0;
+        // Every pair is on both men's lists.
+        let listed: usize = touch.iter().map(Vec::len).sum();
+        *contact_split = job::ContactSplit {
+            kernel_ms: ms(t2, t_kernel),
+            start_ms: ms(t_kernel, t_start),
+            passes_ms: ms(t_start, t_passes),
+            collide_ms: ms(t_passes, t_collide),
+            men: men.into_inner(),
+            pairs: (listed / 2) as u32,
+            overlap: overlap.into_inner() / 2,
+        };
     }
     dead.clear();
     at_edge.clear();
@@ -811,6 +865,7 @@ pub fn step_sim(
     std::mem::swap(&mut arrow_spawns.0, &mut job.arrow_spawns);
     stats.grid_ms = job.grid_ms;
     stats.step_ms = job.step_ms;
+    stats.add_contact(&job.contact_split);
     diag::log_step(&mut stats, job.step_ms, job.grid_ms, units.pos.len());
     stats.events = damage::apply_damage(
         &mut damage.0,

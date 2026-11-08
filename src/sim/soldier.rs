@@ -3201,16 +3201,20 @@ impl TouchRows<'_> {
 /// Where each man of a chunk stands before the first pass of the setting
 /// apart: a man with a touching pair at his legs' step from the tick's
 /// start, unclamped, as the step asks; any other man where the kernel
-/// set him down, since no pass moves him.
-pub(crate) fn set_apart_start(f: &Field, rows: &TouchRows, vel: &[Vec3], pos: &[Vec3], q: &mut [Vec2]) {
+/// set him down, since no pass moves him. Returns how many men of the
+/// chunk have a touching pair.
+pub(crate) fn set_apart_start(f: &Field, rows: &TouchRows, vel: &[Vec3], pos: &[Vec3], q: &mut [Vec2]) -> u32 {
+    let mut listed = 0;
     for (j, q) in q.iter_mut().enumerate() {
         let i = rows.start + j;
         *q = if rows.run(j).is_empty() {
             pos[j].xz()
         } else {
+            listed += 1;
             f.pos_prev[i].xz() + vel[j].xz() * f.dt
         };
     }
+    listed
 }
 
 /// One pass of the setting apart, for one chunk (`SET_APART_PASSES`):
@@ -3257,9 +3261,11 @@ pub(crate) fn set_apart(f: &Field, rows: &TouchRows, first: bool, cur: &[Vec2], 
 /// takes the other man's mass share of the closing speed along the
 /// line between them, summed over his pairs and added to his legs'
 /// velocity. Parting or sliding pairs give nothing. His position is set
-/// down on the ground.
-pub(crate) fn collide(f: &Field, rows: &TouchRows, cur: &[Vec2], vel: &mut [Vec3], pos: &mut [Vec3]) {
+/// down on the ground. Returns the chunk's men's pairs still overlapping
+/// there, each counted from the man's side.
+pub(crate) fn collide(f: &Field, rows: &TouchRows, cur: &[Vec2], vel: &mut [Vec3], pos: &mut [Vec3]) -> u32 {
     let inv_dt = 1.0 / f.dt;
+    let mut overlapping = 0;
     for j in 0..vel.len() {
         let i = rows.start + j;
         let run = rows.run(j);
@@ -3274,6 +3280,7 @@ pub(crate) fn collide(f: &Field, rows: &TouchRows, cur: &[Vec2], vel: &mut [Vec3
             let dq = me - cur[b];
             let l2 = dq.length_squared();
             if l2 < t.hard * t.hard && l2 > 1e-12 {
+                overlapping += 1;
                 let n = dq / l2.sqrt();
                 let u_b = (cur[b] - f.pos_prev[b].xz()) * inv_dt;
                 let c = (u_b - u).dot(n);
@@ -3290,5 +3297,6 @@ pub(crate) fn collide(f: &Field, rows: &TouchRows, cur: &[Vec2], vel: &mut [Vec3
             me.y,
         );
     }
+    overlapping
 }
 
