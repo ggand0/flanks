@@ -19,9 +19,12 @@ use bevy::prelude::*;
 pub const CELL_SIZE: f32 = 1.5;
 /// Grid never exceeds this many cells per axis (memory guard).
 const MAX_DIM: usize = 2048;
-/// Units per parallel rebuild chunk.
-const REBUILD_CHUNK: usize = 32_768;
-/// Cells per task of the rebuild's pass over the cells (`cell_box`).
+/// Units per parallel rebuild chunk. A man's slot in his cell is his
+/// place among its men in index order whatever the chunks, so their size
+/// changes nothing but the work's share across the threads.
+const REBUILD_CHUNK: usize = 16_384;
+/// Cells per task of the rebuild's passes over the cells (the merge and
+/// `cell_box`).
 const CELL_CHUNK: usize = 4096;
 
 /// Meta bits carried by each sorted unit. Kind is a 2-bit FIELD (up to 4
@@ -100,6 +103,11 @@ unsafe impl Sync for SharedOut {}
 struct SharedVel(*mut Vec2);
 unsafe impl Send for SharedVel {}
 unsafe impl Sync for SharedVel {}
+/// The same for a chunk's histogram in the merge, whose tasks each read
+/// and write their own run of cells of every chunk's histogram.
+struct SharedHist(*mut u32);
+unsafe impl Send for SharedHist {}
+unsafe impl Sync for SharedHist {}
 
 #[derive(Resource, Default)]
 pub struct SpatialGrid {
@@ -161,12 +169,24 @@ impl SpatialGrid {
             return;
         }
 
-        let mut min = Vec2::splat(f32::MAX);
-        let mut max = Vec2::splat(f32::MIN);
-        for p in positions {
-            min = min.min(Vec2::new(p.x, p.z));
-            max = max.max(Vec2::new(p.x, p.z));
-        }
+        // The field's bounds, chunk by chunk in parallel: the smallest and
+        // the largest place on each axis are the same in any order.
+        let bounds: Vec<(Vec2, Vec2)> = crate::util::sim_scope(|scope| {
+            for pos_chunk in positions.chunks(REBUILD_CHUNK) {
+                scope.spawn(async move {
+                    let mut min = Vec2::splat(f32::MAX);
+                    let mut max = Vec2::splat(f32::MIN);
+                    for p in pos_chunk {
+                        min = min.min(Vec2::new(p.x, p.z));
+                        max = max.max(Vec2::new(p.x, p.z));
+                    }
+                    (min, max)
+                });
+            }
+        });
+        let (min, max) = bounds
+            .into_iter()
+            .fold((Vec2::splat(f32::MAX), Vec2::splat(f32::MIN)), |(min, max), (lo, hi)| (min.min(lo), max.max(hi)));
         self.origin = min - CELL_SIZE;
         let span = max - self.origin + CELL_SIZE;
         self.clamped = (span.x / CELL_SIZE) as usize + 1 > MAX_DIM || (span.y / CELL_SIZE) as usize + 1 > MAX_DIM;
@@ -201,18 +221,54 @@ impl SpatialGrid {
 
         // Merge: rewrite each chunk histogram into that chunk's write
         // cursors, and build the cell prefix sums. Deterministic layout:
-        // cell-major, chunk order within a cell.
+        // cell-major, chunk order within a cell. In parallel over runs of
+        // cells: each run's men first, then the runs' offsets one after the
+        // other, then each run's prefix sums and cursors from its offset,
+        // the same numbers one pass over the cells gives.
+        // SAFETY (SharedHist): every histogram holds `cells` slots, and
+        // each task reads and writes only its own run of them.
         self.starts.clear();
         self.starts.resize(cells + 1, 0);
-        let mut acc = 0u32;
-        for c in 0..cells {
-            for hist in &mut self.hists {
-                let cnt = hist[c];
-                hist[c] = acc;
-                acc += cnt;
+        let hist_at: Vec<SharedHist> = self.hists.iter_mut().map(|h| SharedHist(h.as_mut_ptr())).collect();
+        let hist_at = &hist_at[..];
+        let run_men: Vec<u32> = crate::util::sim_scope(|scope| {
+            for c0 in (0..cells).step_by(CELL_CHUNK) {
+                scope.spawn(async move {
+                    let c1 = (c0 + CELL_CHUNK).min(cells);
+                    let mut men = 0u32;
+                    for h in hist_at {
+                        men += (c0..c1).map(|c| unsafe { *h.0.add(c) }).sum::<u32>();
+                    }
+                    men
+                });
             }
-            self.starts[c + 1] = acc;
-        }
+        });
+        let mut acc = 0u32;
+        let run_from: Vec<u32> = run_men
+            .into_iter()
+            .map(|men| {
+                let from = acc;
+                acc += men;
+                from
+            })
+            .collect();
+        crate::util::sim_scope(|scope| {
+            for ((k, starts), &from) in self.starts[1..].chunks_mut(CELL_CHUNK).enumerate().zip(&run_from) {
+                scope.spawn(async move {
+                    let c0 = k * CELL_CHUNK;
+                    let mut acc = from;
+                    for (j, start) in starts.iter_mut().enumerate() {
+                        for h in hist_at {
+                            let at = unsafe { h.0.add(c0 + j) };
+                            let cnt = unsafe { *at };
+                            unsafe { *at = acc };
+                            acc += cnt;
+                        }
+                        *start = acc;
+                    }
+                });
+            }
+        });
 
         // Scatter pass: chunks write their units to precomputed disjoint
         // offsets. SAFETY (SharedOut): the merged cursors partition [0, n),
