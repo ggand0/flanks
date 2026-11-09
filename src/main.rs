@@ -36,6 +36,7 @@ mod settings;
 mod sim;
 mod spatial;
 mod terrain;
+mod thread_layout;
 mod unit_cards;
 mod unit_glb;
 mod unit_meshes;
@@ -73,19 +74,43 @@ fn wgpu_settings() -> WgpuSettings {
 /// system of the frame runs, the rest: 12, 2 and 10 of 24. Together they
 /// hold as many threads as the hardware has. `FL_SIM_ASYNC=0` keeps Bevy's
 /// default sizes (16 compute, 4 async compute, 4 file loading of 24).
-/// `FL_THREADS` sets the total either way.
+/// `FL_THREADS` sets the total either way. `FL_SIM_THREADS` and
+/// `FL_FRAME_THREADS` size the sim pool and the compute pool on their own,
+/// the other pools keeping the size the total gives them. The sim pool's
+/// threads place themselves as they start (thread_layout.rs).
 fn task_pool_options() -> bevy::app::TaskPoolOptions {
     let mut options = bevy::app::TaskPoolOptions::default();
-    let threads = crate::util::env_or("FL_THREADS", 0_usize);
-    if threads > 0 {
-        options.min_total_threads = threads;
-        options.max_total_threads = threads;
-    }
+    // The total from the machine as it started, before FL_MAIN_CPUS
+    // narrows what Bevy would read (thread_layout.rs `machine_threads`).
+    let threads = match crate::util::env_or("FL_THREADS", 0_usize) {
+        0 => thread_layout::machine_threads(),
+        n => n,
+    };
+    options.min_total_threads = threads;
+    options.max_total_threads = threads;
     if crate::util::sim_on_async_pool() {
         options.io.max_threads = 2;
         options.io.percent = 0.1;
         options.async_compute.max_threads = usize::MAX;
         options.async_compute.percent = 0.5;
+        options.async_compute.on_thread_spawn = Some(std::sync::Arc::new(thread_layout::sim_thread_start));
+        let sim = crate::util::env_or("FL_SIM_THREADS", 0_usize);
+        let frame = crate::util::env_or("FL_FRAME_THREADS", 0_usize);
+        if sim > 0 || frame > 0 {
+            // Bevy's split of the total as above (a share rounded, then
+            // capped by what is left), with the named pools replaced.
+            let share = |p: f32| (threads as f32 * p + 0.5) as usize;
+            let io = share(0.1).min(threads).clamp(1, 2);
+            let sim_default = share(0.5).min(threads.saturating_sub(io)).max(1);
+            let frame_default = threads.saturating_sub(io + sim_default).max(1);
+            let (sim, frame) = (if sim > 0 { sim } else { sim_default }, if frame > 0 { frame } else { frame_default });
+            for (policy, n) in [(&mut options.io, io), (&mut options.async_compute, sim), (&mut options.compute, frame)] {
+                policy.min_threads = n;
+                policy.max_threads = n;
+            }
+            options.min_total_threads = io + sim + frame;
+            options.max_total_threads = io + sim + frame;
+        }
     }
     options
 }
@@ -121,6 +146,8 @@ fn window_position() -> bevy::window::WindowPosition {
 }
 
 fn main() {
+    // Before Bevy spawns any thread, so each one starts where main is.
+    thread_layout::pin_main_thread();
     // Load before the App so the window opens with the saved video
     // settings instead of switching modes one frame in.
     let user_settings = settings::Settings::load();
@@ -230,6 +257,7 @@ fn log_task_pools() {
         if crate::util::sim_on_async_pool() { "" } else { " runs on the compute pool" },
         IoTaskPool::get().thread_num(),
     );
+    info!("thread layout: {}", thread_layout::describe());
 }
 
 /// Sun; terrain chunks come from TerrainPlugin.

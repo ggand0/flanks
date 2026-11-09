@@ -173,6 +173,7 @@ impl Default for TickWorker {
             .name("sim tick worker".into())
             .spawn(move || {
                 crate::util::mark_sim_worker();
+                crate::thread_layout::sim_thread_start();
                 while let Ok(mut job) = jobs.recv() {
                     run_tick_job(&mut job);
                     if results.send(job).is_err() {
