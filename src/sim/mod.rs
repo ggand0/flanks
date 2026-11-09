@@ -868,7 +868,7 @@ fn run_tick_job(job: &mut TickJob) {
 /// look at a man touching nobody.
 const PAIR_WEIGHT: u64 = 4;
 /// Runs of the contact phase's work per sim thread.
-const TASKS_PER_THREAD: usize = 3;
+const TASKS_PER_THREAD: usize = 8;
 
 /// The men `a..b` for the contact phase's passes, cut at the kernel's
 /// chunks: each piece's rows and touching pairs.
