@@ -2,7 +2,6 @@
 //! audit, the FL_HASH fingerprint that gates refactors, and the spike
 //! line that names a slow tick.
 
-use bevy::math::Vec3Swizzles;
 use bevy::prelude::*;
 use bevy::tasks::ComputeTaskPool;
 use std::time::Instant;
@@ -36,8 +35,10 @@ pub(super) fn log_step(stats: &mut SimStats, step_ms: f32, grid_ms: f32, units: 
 
 /// The overlap and movement audit over the full population: the
 /// smallest and mean nearest-neighbour distance and the mean per-tick
-/// displacement, for the overlay. Parallel over chunks.
-pub(super) fn neighbour_audit(stats: &mut SimStats, grid: &SpatialGrid, pos: &[Vec3], pos_prev: &[Vec3]) {
+/// displacement, for the overlay, from each man's place at the tick's
+/// start (`pos_prev`) and after it (`pos`) on the ground plane. Parallel
+/// over chunks.
+pub(super) fn neighbour_audit(stats: &mut SimStats, grid: &SpatialGrid, pos: &[Vec2], pos_prev: &[Vec2]) {
 {
     let _span = info_span!("nn_audit").entered();
     let audit_t0 = Instant::now();
@@ -52,8 +53,8 @@ pub(super) fn neighbour_audit(stats: &mut SimStats, grid: &SpatialGrid, pos: &[V
                 let mut sum_disp = 0.0f64;
                 for (j, p) in chunk.iter().enumerate() {
                     let i = start + j;
-                    let p2 = p.xz();
-                    sum_disp += p2.distance(pos_now[i].xz()) as f64;
+                    let p2 = *p;
+                    sum_disp += p2.distance(pos_now[i]) as f64;
                     let mut best = f32::MAX;
                     grid.for_each_candidate(p2, crate::sim::soldier::SEP_RADIUS, |o| {
                         if o.idx as usize != i {

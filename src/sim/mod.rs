@@ -134,6 +134,7 @@ impl Plugin for SimPlugin {
                     (refresh_shared_terrain, take_tick, step_sim).chain(),
                     route::update_routes.after(crate::orders::clear_arrived_orders),
                     kick_tick.after(route::update_routes),
+                    audit_tick.after(kick_tick),
                 )
                     .in_set(crate::game_state::SimSet),
             )
@@ -209,6 +210,22 @@ pub struct TickPipeline {
     /// living men near their own map edge. Every other man is neither
     /// dead nor fled, so the sweep visits only these.
     pub sweep_candidates: Vec<u32>,
+    /// The neighbour audit's input (`audit_tick`).
+    audit: AuditInput,
+}
+
+/// The neighbour audit's input, taken at the install of every 60th tick
+/// (`step_sim`): each man's place at the tick's start and where the
+/// install and the landed swings left him, on the ground plane, the tick
+/// and the army's size then. `audit_tick` reads it once the next job is
+/// kicked.
+#[derive(Default)]
+struct AuditInput {
+    due: bool,
+    tick: u32,
+    n: usize,
+    prev: Vec<Vec2>,
+    now: Vec<Vec2>,
 }
 
 impl TickPipeline {
@@ -1007,12 +1024,36 @@ pub fn step_sim(
     pipeline.tick = pipeline.tick.wrapping_add(1);
     let tick = pipeline.tick;
     if tick.is_multiple_of(60) {
-        diag::neighbour_audit(&mut stats, &grid, &units.pos[..], &units.pos_prev[..]);
+        // The audit's places as they stand now; the audit itself runs
+        // once the next job is kicked (`audit_tick`), and so does the
+        // spike line, which names its cost.
+        let a = &mut pipeline.audit;
+        a.prev.clear();
+        a.prev.extend(units.pos_prev.iter().map(|p| p.xz()));
+        a.now.clear();
+        a.now.extend(units.pos.iter().map(|p| p.xz()));
+        (a.due, a.tick, a.n) = (true, tick, units.pos.len());
+    } else {
+        diag::spike_line(&stats, tick, units.pos.len());
     }
     diag::fingerprint(tick, &units);
-    diag::spike_line(&stats, tick, units.pos.len());
 
     pipeline.scratch = Some(job);
+}
+
+/// The neighbour audit of the 60th tick's install (`step_sim`), after the
+/// kick: its numbers are the overlay's and the logs', read by no rule, so
+/// the next job computes beside it instead of starting after it. The grid
+/// is still the one the audited tick was computed on: only `step_sim`
+/// replaces it.
+fn audit_tick(mut pipeline: ResMut<TickPipeline>, grid: Res<SpatialGrid>, mut stats: ResMut<SimStats>) {
+    let a = &mut pipeline.audit;
+    if !a.due {
+        return;
+    }
+    a.due = false;
+    diag::neighbour_audit(&mut stats, &grid, &a.now, &a.prev);
+    diag::spike_line(&stats, a.tick, a.n);
 }
 
 /// Kick the next tick's job once this tick is completely over: after the
