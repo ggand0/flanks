@@ -307,23 +307,7 @@ pub fn refresh_shared_terrain(terrain: Res<Terrain>, mut shared: ResMut<SharedTe
 /// became a job. Every scope in here, the grid rebuild's and the field's
 /// included, goes through `util::sim_scope`.
 fn run_tick_job(job: &mut TickJob) {
-    if let Some(slot) = &job.pack {
-        let columns = crate::render_units_gpu::PackColumns {
-            pos: &job.pos_in,
-            pos_prev: &job.pos_prev_in,
-            yaw: &job.yaw_in,
-            yaw_prev: &job.yaw_prev_in,
-            kind: &job.kind,
-            swing: &job.swing_in,
-            swing_t: &job.swing_t_in,
-            flash: &job.flash_in,
-            group: &job.group,
-            death_t: &job.death_t_in,
-            sight: &job.sight_in,
-            color: &job.color_in,
-        };
-        slot.pack((job.generation, job.tick), &columns, job.hit_flash);
-    }
+    let (generation, hit_flash) = (job.generation, job.hit_flash);
     let terrain_arc = job.terrain.clone().expect("terrain snapshot set at prep");
     let terrain: &Terrain = &terrain_arc;
     let dt = job.dt;
@@ -427,6 +411,8 @@ fn run_tick_job(job: &mut TickJob) {
         plans,
         routes,
         nav,
+        pack,
+        color_in,
         ..
     } = job;
 
@@ -440,55 +426,92 @@ fn run_tick_job(job: &mut TickJob) {
     let death_t_in = &death_t_in[..];
     let n_groups = orders.len();
 
-    // The regiment runs, and from them the living members of every
-    // regiment under fire, in index order.
-    regiment_runs(group, n_groups, reg_runs);
-    target_members.resize_with(n_groups, Vec::new);
-    for (g, members) in target_members.iter_mut().enumerate() {
-        members.clear();
-        if targeted[g] {
-            for &(s, e) in &reg_runs[g] {
-                members.extend((s..e).filter(|&i| death_t_in[i as usize] == 0));
-            }
-        }
-    }
-    // And of every regiment under search, its clear men: no enemy in
-    // his reach (soldier.rs SIGHT_FOE, as of the last tick) and farther
-    // than a shaft's reach from every block of the shooters' side that
-    // stands near his (job.rs `clear_blocks`). Ascending, so a kept pick
-    // is found by a binary search (soldier.rs `quarry_ok`).
-    let clear_r = job::clear_reach();
-    clear_members.resize_with(n_groups, Vec::new);
-    for (g, members) in clear_members.iter_mut().enumerate() {
-        members.clear();
-        if searched[g] {
-            let near = &clear_blocks[g];
-            for &(s, e) in &reg_runs[g] {
-                members.extend((s..e).filter(|&i| {
-                    let i = i as usize;
-                    if death_t_in[i] != 0 || sight_in[i] & soldier::SIGHT_FOE != 0 {
-                        return false;
-                    }
-                    let p = Vec2::new(pos_prev[i].x, pos_prev[i].z);
-                    near.iter().all(|b| b.distance(p) > clear_r)
-                }));
-            }
-        }
-    }
-
+    // The grid rebuild, and beside it, as tasks of the same pool that fill
+    // the gaps between the rebuild's passes: the render snapshot (first,
+    // the frame asks for it soonest), the regiment runs and members, and
+    // the density field. None reads what another writes. The rebuild and
+    // the field are timed on their own.
     let t0 = Instant::now();
-    {
+    let field_wanted = *field_wanted;
+    let (targeted, searched, clear_blocks) = (&targeted[..], &searched[..], &clear_blocks[..]);
+    let (sight_snap, pos_prev_snap, vel_snap, pose_snap) = (&sight_in[..], &pos_prev_in[..], &vel_in[..], &pose_in[..]);
+    let slot = pack.as_ref();
+    let (runs_out, target_out, clear_out, field_out) = (&mut *reg_runs, &mut *target_members, &mut *clear_members, &mut *field);
+    let field_took: Vec<f32> = crate::util::sim_scope(|scope| {
+        if let Some(slot) = slot {
+            let columns = crate::render_units_gpu::PackColumns {
+                pos: pos_prev,
+                pos_prev: pos_prev_snap,
+                yaw: yaw_snap,
+                yaw_prev: &yaw_prev_in[..],
+                kind,
+                swing: &swing_in[..],
+                swing_t: &swing_t_in[..],
+                flash: &flash_in[..],
+                group,
+                death_t: death_t_in,
+                sight: sight_snap,
+                color: &color_in[..],
+            };
+            scope.spawn(async move {
+                slot.pack((generation, tick), &columns, hit_flash);
+                -1.0
+            });
+        }
+        let (reg_runs, target_members, clear_members) = (runs_out, target_out, clear_out);
+        scope.spawn(async move {
+            // The regiment runs, and from them the living members of every
+            // regiment under fire, in index order.
+            regiment_runs(group, n_groups, reg_runs);
+            target_members.resize_with(n_groups, Vec::new);
+            for (g, members) in target_members.iter_mut().enumerate() {
+                members.clear();
+                if targeted[g] {
+                    for &(s, e) in &reg_runs[g] {
+                        members.extend((s..e).filter(|&i| death_t_in[i as usize] == 0));
+                    }
+                }
+            }
+            // And of every regiment under search, its clear men: no enemy in
+            // his reach (soldier.rs SIGHT_FOE, as of the last tick) and farther
+            // than a shaft's reach from every block of the shooters' side that
+            // stands near his (job.rs `clear_blocks`). Ascending, so a kept pick
+            // is found by a binary search (soldier.rs `quarry_ok`).
+            let clear_r = job::clear_reach();
+            clear_members.resize_with(n_groups, Vec::new);
+            for (g, members) in clear_members.iter_mut().enumerate() {
+                members.clear();
+                if searched[g] {
+                    let near = &clear_blocks[g];
+                    for &(s, e) in &reg_runs[g] {
+                        members.extend((s..e).filter(|&i| {
+                            let i = i as usize;
+                            if death_t_in[i] != 0 || sight_snap[i] & soldier::SIGHT_FOE != 0 {
+                                return false;
+                            }
+                            let p = Vec2::new(pos_prev[i].x, pos_prev[i].z);
+                            near.iter().all(|b| b.distance(p) > clear_r)
+                        }));
+                    }
+                }
+            }
+            -1.0
+        });
+        if field_wanted {
+            let field = field_out;
+            scope.spawn(async move {
+                let _span = info_span!("density_field").entered();
+                let t = Instant::now();
+                field.rebuild(pos_prev, team);
+                t.elapsed().as_secs_f32() * 1000.0
+            });
+        }
         let _span = info_span!("grid_rebuild").entered();
-        grid.rebuild(pos_prev, &pos_prev_in[..], dt, &vel_in[..], team, kind, group, death_t_in, &pose_in[..], group_wall);
-    }
-    let t1 = Instant::now();
-    *grid_ms = (t1 - t0).as_secs_f32() * 1000.0;
-    if *field_wanted {
-        let _span = info_span!("density_field").entered();
-        field.rebuild(pos_prev, team);
-    }
+        grid.rebuild(pos_prev, pos_prev_snap, dt, vel_snap, team, kind, group, death_t_in, pose_snap, group_wall);
+        *grid_ms = t0.elapsed().as_secs_f32() * 1000.0;
+    });
     let t2 = Instant::now();
-    *field_ms = (t2 - t1).as_secs_f32() * 1000.0;
+    *field_ms = field_took.iter().copied().fold(0.0, f32::max);
 
     let grid = &*grid;
     let orders = &orders[..];
