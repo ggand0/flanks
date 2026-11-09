@@ -209,11 +209,11 @@ fn share_contact() -> bool {
 /// alone set his velocity (no spring, no grip, no stance, no shared
 /// speed, no density brake); his feet take back what his legs do not
 /// want; the bodies are set apart by position after the step
-/// (`set_apart`), and a pair still overlapping after it whose legs closed
-/// on each other is a collision (`collide`), traded on the legs' closing
-/// and never on the setting apart's moves. FL_CONTACT_OLD=1 plays the old
-/// contact: the spring, the grip, the stance, the shared speed or the
-/// soft wall, the brake and the CORR_GAIN set-apart.
+/// (`set_apart`), and what the setting apart could not take away of a
+/// closing is a collision (`collide`, by the law `collide_law` picks).
+/// FL_CONTACT_OLD=1 plays the old contact: the spring, the grip, the
+/// stance, the shared speed or the soft wall, the brake and the
+/// CORR_GAIN set-apart.
 pub(crate) fn contact_old() -> bool {
     static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *S.get_or_init(|| std::env::var("FL_CONTACT_OLD").is_ok_and(|v| v == "1"))
@@ -245,18 +245,34 @@ pub(crate) fn still_brake() -> bool {
     static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *S.get_or_init(|| !std::env::var("FL_BRAKE").is_ok_and(|v| v == "0"))
 }
-/// What the collision reads a pair's closing on (`collide`). By default
-/// on the two men's legs, the velocity their legs set this tick before
-/// the setting apart: what the legs closed is a collision, what the
-/// setting apart moved is not. FL_COLLIDE=move reads it on their actual
-/// moves over the tick, the setting apart's corrections included, as
-/// before. In the 200k crush that law fed itself: the corrections read
-/// as closings, summed over a man's dozen pairs, gave him 3.2 to 3.5 m/s
-/// a tick against the 0.23 his feet take back, the next tick's jostle.
-pub(crate) fn collide_on_legs() -> bool {
-    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *S.get_or_init(|| !std::env::var("FL_COLLIDE").is_ok_and(|v| v == "move"))
+/// The collision's law (`collide`), FL_COLLIDE:
+/// - `sum`, the default: the closing read on the two men's actual moves
+///   over the tick, the setting apart's corrections included, and a
+///   man's trades summed over his pairs. Summed trades between men of
+///   equal mass leave (1 - k/2) of his own closing speed on a man with k
+///   closing pairs: none at two, reversed at four, reversed fivefold at
+///   twelve, the 200k crush's count, where it gave 3.2 to 3.5 m/s a tick
+///   against the 0.23 his feet take back.
+/// - `legs`: the same sum on the closing of the two men's legs'
+///   velocities of the tick. It measured worse in the crush (5.7 m/s a
+///   tick, twice the shaking men): a man's legs start from his kept
+///   velocity, which holds the last tick's collision.
+/// - `avg`: the `sum` law's read with a man's trades averaged over his
+///   pairs that overlap and close this tick, as the setting apart
+///   averages its corrections.
+///
+/// Any other value plays `sum`.
+pub(crate) fn collide_law() -> u8 {
+    static S: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *S.get_or_init(|| match std::env::var("FL_COLLIDE").as_deref() {
+        Ok("legs") => COLLIDE_LEGS,
+        Ok("avg") => COLLIDE_AVG,
+        _ => COLLIDE_SUM,
+    })
 }
+const COLLIDE_SUM: u8 = 0;
+const COLLIDE_LEGS: u8 = 1;
+const COLLIDE_AVG: u8 = 2;
 /// The still-man crowd's crawl (m/s): a neighbour ahead who actually
 /// moved along a man's way over the last tick at CRAWL or faster counts
 /// nothing in it; one who stood, or came at him, counts in full; between,
@@ -3582,29 +3598,28 @@ pub(crate) unsafe fn set_apart(f: &Field, rows: &TouchRows, first: bool, cur: &[
 }
 
 /// The collision after the setting apart, for one chunk (places by rank,
-/// the columns by index): for every pair still overlapping where the
-/// last pass left the two men and closing on their legs' velocities of
-/// the tick (`legs`, by rank, from `set_apart_start`) along the line
-/// between them there, he takes the other man's mass share of the
-/// closing speed along that line, summed over his pairs and added to his
-/// legs' velocity. Parting or sliding pairs give nothing, and the
-/// setting apart's corrections are never read as closings
-/// (`collide_on_legs`). FL_COLLIDE=move reads the closing on each man's
-/// move over the tick instead, from the tick's start to where the last
-/// pass left him. His position is set down on the ground. Returns the
-/// chunk's men's pairs still overlapping there, each counted from the
-/// man's side.
+/// the columns by index): each man's move over the tick, from the tick's
+/// start to where the last pass left him; for every pair still touching
+/// there and closing on those moves, he takes the other man's mass share
+/// of the closing speed along the line between them, summed over his
+/// pairs and added to his legs' velocity. Parting or sliding pairs give
+/// nothing. FL_COLLIDE=avg divides his sum by the number of his pairs
+/// that overlap and close; FL_COLLIDE=legs reads the closing on the two
+/// men's legs' velocities of the tick instead, from `legs` by rank
+/// (`set_apart_start`); the laws are `collide_law`'s. His position is
+/// set down on the ground. Returns the chunk's men's pairs still
+/// overlapping there, each counted from the man's side.
 pub(crate) fn collide(f: &Field, rows: &TouchRows, cur: &[Vec2], legs: &[Vec2], vel: &mut [Vec3], pos: &mut [Vec3]) -> u32 {
-    if collide_on_legs() {
-        collide_on::<true>(f, rows, cur, legs, vel, pos)
-    } else {
-        collide_on::<false>(f, rows, cur, legs, vel, pos)
+    match collide_law() {
+        COLLIDE_LEGS => collide_by::<COLLIDE_LEGS>(f, rows, cur, legs, vel, pos),
+        COLLIDE_AVG => collide_by::<COLLIDE_AVG>(f, rows, cur, legs, vel, pos),
+        _ => collide_by::<COLLIDE_SUM>(f, rows, cur, legs, vel, pos),
     }
 }
 
-/// `collide` on the legs' closing (`LEGS`) or on the moves'.
+/// `collide` by the law `LAW` (`collide_law`).
 #[inline(always)]
-fn collide_on<const LEGS: bool>(
+fn collide_by<const LAW: u8>(
     f: &Field,
     rows: &TouchRows,
     cur: &[Vec2],
@@ -3624,8 +3639,10 @@ fn collide_on<const LEGS: bool>(
         }
         let r = rank_of[i] as usize;
         let me = cur[r];
-        let u = if LEGS { legs[r] } else { (me - f.pos_prev[i].xz()) * inv_dt };
+        let on_legs = LAW == COLLIDE_LEGS;
+        let u = if on_legs { legs[r] } else { (me - f.pos_prev[i].xz()) * inv_dt };
         let mut dv = Vec2::ZERO;
+        let mut closing = 0u32;
         // Weighed by `on` without a branch, as in `set_apart`: 1 for a
         // pair that overlaps and closes, 0 for any other. Four pairs at a
         // time, as there.
@@ -3638,7 +3655,7 @@ fn collide_on<const LEGS: bool>(
             let q = [cur[bs[0]], cur[bs[1]], cur[bs[2]], cur[bs[3]]];
             // The neighbours' velocities the closing is read on: their
             // legs', or their places at the tick's start for their moves.
-            let o = if LEGS {
+            let o = if on_legs {
                 [legs[bs[0]], legs[bs[1]], legs[bs[2]], legs[bs[3]]]
             } else {
                 [sorted[bs[0]].xz(), sorted[bs[1]].xz(), sorted[bs[2]].xz(), sorted[bs[3]].xz()]
@@ -3646,7 +3663,7 @@ fn collide_on<const LEGS: bool>(
             let (mut nvx, mut nvz) = ([0.0f32; 4], [0.0f32; 4]);
             // SAFETY: SSE2 is part of every x86_64; the stores write the
             // two local arrays.
-            let hit = unsafe {
+            let (hit, hit_on) = unsafe {
                 use std::arch::x86_64::*;
                 let qx = _mm_set_ps(q[3].x, q[2].x, q[1].x, q[0].x);
                 let qz = _mm_set_ps(q[3].y, q[2].y, q[1].y, q[0].y);
@@ -3660,7 +3677,7 @@ fn collide_on<const LEGS: bool>(
                 let overlaps = _mm_and_ps(_mm_cmplt_ps(l2, _mm_mul_ps(hard, hard)), _mm_cmpgt_ps(l2, tiny));
                 let l = _mm_sqrt_ps(_mm_max_ps(l2, tiny));
                 let (nx, nz) = (_mm_div_ps(dx, l), _mm_div_ps(dz, l));
-                let (ubx, ubz) = if LEGS {
+                let (ubx, ubz) = if on_legs {
                     (sx, sz)
                 } else {
                     let idt = _mm_set1_ps(inv_dt);
@@ -3674,13 +3691,14 @@ fn collide_on<const LEGS: bool>(
                 let w = _mm_mul_ps(_mm_mul_ps(c, share), _mm_and_ps(on, _mm_set1_ps(1.0)));
                 _mm_storeu_ps(nvx.as_mut_ptr(), _mm_mul_ps(nx, w));
                 _mm_storeu_ps(nvz.as_mut_ptr(), _mm_mul_ps(nz, w));
-                _mm_movemask_ps(overlaps)
+                (_mm_movemask_ps(overlaps), _mm_movemask_ps(on))
             };
             for lane in 0..4 {
                 dv.x += nvx[lane];
                 dv.y += nvz[lane];
             }
             overlapping += hit.count_ones();
+            closing += hit_on.count_ones();
             k += 4;
         }
         for t in &run[k..] {
@@ -3691,10 +3709,16 @@ fn collide_on<const LEGS: bool>(
             let overlaps = (l2 < hard * hard) & (l2 > 1e-12);
             overlapping += overlaps as u32;
             let n = dq / l2.max(1e-12).sqrt();
-            let u_b = if LEGS { legs[b] } else { (cur[b] - sorted[b].xz()) * inv_dt };
+            let u_b = if on_legs { legs[b] } else { (cur[b] - sorted[b].xz()) * inv_dt };
             let c = (u_b - u).dot(n);
             let on = overlaps & (c > 0.0);
+            closing += on as u32;
             dv += n * (c * tab.share(t) * on as u32 as f32);
+        }
+        // The average over his closing pairs, as the setting apart
+        // averages its corrections over the men he touches.
+        if LAW == COLLIDE_AVG {
+            dv /= closing.max(1) as f32;
         }
         vel[j].x += dv.x;
         vel[j].z += dv.y;

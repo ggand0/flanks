@@ -694,7 +694,7 @@ fn run_tick_job(job: &mut TickJob) {
     // The yield-and-collide contact: the men set apart on their stepped
     // places, `set_apart_passes` passes over the tick's touching pairs, each
     // pass every man reading where the last left everyone and all moving
-    // together after it; then the collision on the legs' closing.
+    // together after it; then the collision (`collide_law`).
     if !old_contact {
         let _span = info_span!("set_apart").entered();
         let t_kernel = Instant::now();
