@@ -416,6 +416,7 @@ fn run_tick_job(job: &mut TickJob) {
         touch_end,
         touch_q,
         touch_next,
+        touch_legs,
         touch_base,
         touch_bounds,
         grid_ms,
@@ -589,8 +590,11 @@ fn run_tick_job(job: &mut TickJob) {
     touch_end.resize(n, 0);
     touch_q.resize(n, Vec2::ZERO);
     touch_next.resize(n, Vec2::ZERO);
-    // The places by rank, written at each chunk's men's ranks.
+    touch_legs.resize(n, Vec2::ZERO);
+    // The places and the legs' velocities by rank, written at each
+    // chunk's men's ranks.
     let (q_all, next_all) = (soldier::Places(touch_q.as_mut_ptr()), soldier::Places(touch_next.as_mut_ptr()));
+    let legs_all = soldier::Places(touch_legs.as_mut_ptr());
     let kernel_out: Vec<(Vec<u32>, Vec<u32>, [u32; 3])> = crate::util::sim_scope(|scope| {
         for (ci, chunk) in pos_out
             .chunks_mut(CHUNK)
@@ -676,9 +680,9 @@ fn run_tick_job(job: &mut TickJob) {
                     // the chunk's rows are hot.
                     let (braked, held) = (out.braked, out.held);
                     let rows = soldier::TouchRows { start, touch: out.touch, touch_end: out.touch_end, from0: 0 };
-                    // SAFETY: both buffers hold n slots, a man's rank is
-                    // his alone, and the chunks hold disjoint men.
-                    let listed = unsafe { soldier::set_apart_start(f, &rows, vel, pos, q_all, next_all) };
+                    // SAFETY: the three buffers hold n slots, a man's rank
+                    // is his alone, and the chunks hold disjoint men.
+                    let listed = unsafe { soldier::set_apart_start(f, &rows, vel, pos, q_all, next_all, legs_all) };
                     (Vec::new(), Vec::new(), [listed, braked, held])
                 }
             });
@@ -690,7 +694,7 @@ fn run_tick_job(job: &mut TickJob) {
     // The yield-and-collide contact: the men set apart on their stepped
     // places, `set_apart_passes` passes over the tick's touching pairs, each
     // pass every man reading where the last left everyone and all moving
-    // together after it; then the collision on the tick's moves.
+    // together after it; then the collision on the legs' closing.
     if !old_contact {
         let _span = info_span!("set_apart").entered();
         let t_kernel = Instant::now();
@@ -754,6 +758,7 @@ fn run_tick_job(job: &mut TickJob) {
         }
         let t_passes = Instant::now();
         let cur = &touch_q[..];
+        let legs = &touch_legs[..];
         let death_t = &death_t[..];
         let vel_all = &mut vel[..];
         let pos_all = &mut pos_out[..];
@@ -770,7 +775,7 @@ fn run_tick_job(job: &mut TickJob) {
                     for rows in touch_runs(touch, touch_end, a, b) {
                         let off = rows.start - a;
                         let len = rows.touch_end.len();
-                        overlap += soldier::collide(f, &rows, cur, &mut vel[off..off + len], &mut pos[off..off + len]);
+                        overlap += soldier::collide(f, &rows, cur, legs, &mut vel[off..off + len], &mut pos[off..off + len]);
                     }
                     let (dead, at_edge) = edge_lists(a, pos, death_t, team, edge_lo, edge_hi);
                     (overlap, dead, at_edge)

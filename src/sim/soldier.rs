@@ -209,8 +209,9 @@ fn share_contact() -> bool {
 /// alone set his velocity (no spring, no grip, no stance, no shared
 /// speed, no density brake); his feet take back what his legs do not
 /// want; the bodies are set apart by position after the step
-/// (`set_apart`), and what the setting apart could not take away of a
-/// closing is a collision (`collide`). FL_CONTACT_OLD=1 plays the old
+/// (`set_apart`), and a pair still overlapping after it whose legs closed
+/// on each other is a collision (`collide`), traded on the legs' closing
+/// and never on the setting apart's moves. FL_CONTACT_OLD=1 plays the old
 /// contact: the spring, the grip, the stance, the shared speed or the
 /// soft wall, the brake and the CORR_GAIN set-apart.
 pub(crate) fn contact_old() -> bool {
@@ -243,6 +244,18 @@ pub(crate) fn set_apart_passes() -> usize {
 pub(crate) fn still_brake() -> bool {
     static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *S.get_or_init(|| !std::env::var("FL_BRAKE").is_ok_and(|v| v == "0"))
+}
+/// What the collision reads a pair's closing on (`collide`). By default
+/// on the two men's legs, the velocity their legs set this tick before
+/// the setting apart: what the legs closed is a collision, what the
+/// setting apart moved is not. FL_COLLIDE=move reads it on their actual
+/// moves over the tick, the setting apart's corrections included, as
+/// before. In the 200k crush that law fed itself: the corrections read
+/// as closings, summed over a man's dozen pairs, gave him 3.2 to 3.5 m/s
+/// a tick against the 0.23 his feet take back, the next tick's jostle.
+pub(crate) fn collide_on_legs() -> bool {
+    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *S.get_or_init(|| !std::env::var("FL_COLLIDE").is_ok_and(|v| v == "move"))
 }
 /// The still-man crowd's crawl (m/s): a neighbour ahead who actually
 /// moved along a man's way over the last tick at CRAWL or faster counts
@@ -3446,12 +3459,23 @@ unsafe impl Sync for Places {}
 /// at his legs' step from the tick's start, unclamped, as the step asks
 /// (`q` only; the first pass writes his `next`); any other man where the
 /// kernel set him down, in both, since no pass moves him or writes his
-/// place again. Returns how many men of the chunk have a touching pair.
+/// place again. A man with a touching pair also leaves his legs'
+/// velocity at his rank in `legs`, for the collision; a pair lists both
+/// men or neither, so no one reads the slot of a man without one.
+/// Returns how many men of the chunk have a touching pair.
 ///
 /// # Safety
-/// `q` and `next` hold a slot for every rank, and no one else reads or
-/// writes the chunk's men's slots meanwhile.
-pub(crate) unsafe fn set_apart_start(f: &Field, rows: &TouchRows, vel: &[Vec3], pos: &[Vec3], q: Places, next: Places) -> u32 {
+/// `q`, `next` and `legs` hold a slot for every rank, and no one else
+/// reads or writes the chunk's men's slots meanwhile.
+pub(crate) unsafe fn set_apart_start(
+    f: &Field,
+    rows: &TouchRows,
+    vel: &[Vec3],
+    pos: &[Vec3],
+    q: Places,
+    next: Places,
+    legs: Places,
+) -> u32 {
     let rank_of = f.grid.rank_of();
     let mut listed = 0;
     for j in 0..pos.len() {
@@ -3465,6 +3489,7 @@ pub(crate) unsafe fn set_apart_start(f: &Field, rows: &TouchRows, vel: &[Vec3], 
             } else {
                 listed += 1;
                 *q.0.add(r) = f.pos_prev[i].xz() + vel[j].xz() * f.dt;
+                *legs.0.add(r) = vel[j].xz();
             }
         }
     }
@@ -3557,15 +3582,36 @@ pub(crate) unsafe fn set_apart(f: &Field, rows: &TouchRows, first: bool, cur: &[
 }
 
 /// The collision after the setting apart, for one chunk (places by rank,
-/// the columns by index): each man's move
-/// over the tick, from the tick's start to where the last pass left him;
-/// for every pair still touching there and closing on those moves, he
-/// takes the other man's mass share of the closing speed along the
-/// line between them, summed over his pairs and added to his legs'
-/// velocity. Parting or sliding pairs give nothing. His position is set
-/// down on the ground. Returns the chunk's men's pairs still overlapping
-/// there, each counted from the man's side.
-pub(crate) fn collide(f: &Field, rows: &TouchRows, cur: &[Vec2], vel: &mut [Vec3], pos: &mut [Vec3]) -> u32 {
+/// the columns by index): for every pair still overlapping where the
+/// last pass left the two men and closing on their legs' velocities of
+/// the tick (`legs`, by rank, from `set_apart_start`) along the line
+/// between them there, he takes the other man's mass share of the
+/// closing speed along that line, summed over his pairs and added to his
+/// legs' velocity. Parting or sliding pairs give nothing, and the
+/// setting apart's corrections are never read as closings
+/// (`collide_on_legs`). FL_COLLIDE=move reads the closing on each man's
+/// move over the tick instead, from the tick's start to where the last
+/// pass left him. His position is set down on the ground. Returns the
+/// chunk's men's pairs still overlapping there, each counted from the
+/// man's side.
+pub(crate) fn collide(f: &Field, rows: &TouchRows, cur: &[Vec2], legs: &[Vec2], vel: &mut [Vec3], pos: &mut [Vec3]) -> u32 {
+    if collide_on_legs() {
+        collide_on::<true>(f, rows, cur, legs, vel, pos)
+    } else {
+        collide_on::<false>(f, rows, cur, legs, vel, pos)
+    }
+}
+
+/// `collide` on the legs' closing (`LEGS`) or on the moves'.
+#[inline(always)]
+fn collide_on<const LEGS: bool>(
+    f: &Field,
+    rows: &TouchRows,
+    cur: &[Vec2],
+    legs: &[Vec2],
+    vel: &mut [Vec3],
+    pos: &mut [Vec3],
+) -> u32 {
     let inv_dt = 1.0 / f.dt;
     let tab = touch_table();
     let (sorted, rank_of) = (f.grid.sorted(), f.grid.rank_of());
@@ -3576,8 +3622,9 @@ pub(crate) fn collide(f: &Field, rows: &TouchRows, cur: &[Vec2], vel: &mut [Vec3
         if run.is_empty() {
             continue;
         }
-        let me = cur[rank_of[i] as usize];
-        let u = (me - f.pos_prev[i].xz()) * inv_dt;
+        let r = rank_of[i] as usize;
+        let me = cur[r];
+        let u = if LEGS { legs[r] } else { (me - f.pos_prev[i].xz()) * inv_dt };
         let mut dv = Vec2::ZERO;
         // Weighed by `on` without a branch, as in `set_apart`: 1 for a
         // pair that overlaps and closes, 0 for any other. Four pairs at a
@@ -3589,7 +3636,13 @@ pub(crate) fn collide(f: &Field, rows: &TouchRows, cur: &[Vec2], vel: &mut [Vec3
             let t = &run[k..k + 4];
             let bs = [t[0].b as usize, t[1].b as usize, t[2].b as usize, t[3].b as usize];
             let q = [cur[bs[0]], cur[bs[1]], cur[bs[2]], cur[bs[3]]];
-            let o = [&sorted[bs[0]], &sorted[bs[1]], &sorted[bs[2]], &sorted[bs[3]]];
+            // The neighbours' velocities the closing is read on: their
+            // legs', or their places at the tick's start for their moves.
+            let o = if LEGS {
+                [legs[bs[0]], legs[bs[1]], legs[bs[2]], legs[bs[3]]]
+            } else {
+                [sorted[bs[0]].xz(), sorted[bs[1]].xz(), sorted[bs[2]].xz(), sorted[bs[3]].xz()]
+            };
             let (mut nvx, mut nvz) = ([0.0f32; 4], [0.0f32; 4]);
             // SAFETY: SSE2 is part of every x86_64; the stores write the
             // two local arrays.
@@ -3598,7 +3651,7 @@ pub(crate) fn collide(f: &Field, rows: &TouchRows, cur: &[Vec2], vel: &mut [Vec3
                 let qx = _mm_set_ps(q[3].x, q[2].x, q[1].x, q[0].x);
                 let qz = _mm_set_ps(q[3].y, q[2].y, q[1].y, q[0].y);
                 let sx = _mm_set_ps(o[3].x, o[2].x, o[1].x, o[0].x);
-                let sz = _mm_set_ps(o[3].z, o[2].z, o[1].z, o[0].z);
+                let sz = _mm_set_ps(o[3].y, o[2].y, o[1].y, o[0].y);
                 let hard = _mm_set_ps(tab.hard(&t[3]), tab.hard(&t[2]), tab.hard(&t[1]), tab.hard(&t[0]));
                 let share = _mm_set_ps(tab.share(&t[3]), tab.share(&t[2]), tab.share(&t[1]), tab.share(&t[0]));
                 let (dx, dz) = (_mm_sub_ps(_mm_set1_ps(me.x), qx), _mm_sub_ps(_mm_set1_ps(me.y), qz));
@@ -3607,8 +3660,12 @@ pub(crate) fn collide(f: &Field, rows: &TouchRows, cur: &[Vec2], vel: &mut [Vec3
                 let overlaps = _mm_and_ps(_mm_cmplt_ps(l2, _mm_mul_ps(hard, hard)), _mm_cmpgt_ps(l2, tiny));
                 let l = _mm_sqrt_ps(_mm_max_ps(l2, tiny));
                 let (nx, nz) = (_mm_div_ps(dx, l), _mm_div_ps(dz, l));
-                let idt = _mm_set1_ps(inv_dt);
-                let (ubx, ubz) = (_mm_mul_ps(_mm_sub_ps(qx, sx), idt), _mm_mul_ps(_mm_sub_ps(qz, sz), idt));
+                let (ubx, ubz) = if LEGS {
+                    (sx, sz)
+                } else {
+                    let idt = _mm_set1_ps(inv_dt);
+                    (_mm_mul_ps(_mm_sub_ps(qx, sx), idt), _mm_mul_ps(_mm_sub_ps(qz, sz), idt))
+                };
                 let c = _mm_add_ps(
                     _mm_mul_ps(_mm_sub_ps(ubx, _mm_set1_ps(u.x)), nx),
                     _mm_mul_ps(_mm_sub_ps(ubz, _mm_set1_ps(u.y)), nz),
@@ -3634,7 +3691,7 @@ pub(crate) fn collide(f: &Field, rows: &TouchRows, cur: &[Vec2], vel: &mut [Vec3
             let overlaps = (l2 < hard * hard) & (l2 > 1e-12);
             overlapping += overlaps as u32;
             let n = dq / l2.max(1e-12).sqrt();
-            let u_b = (cur[b] - sorted[b].xz()) * inv_dt;
+            let u_b = if LEGS { legs[b] } else { (cur[b] - sorted[b].xz()) * inv_dt };
             let c = (u_b - u).dot(n);
             let on = overlaps & (c > 0.0);
             dv += n * (c * tab.share(t) * on as u32 as f32);
