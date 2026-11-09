@@ -11,8 +11,13 @@ use crate::spatial::SpatialGrid;
 use crate::terrain::Terrain;
 use crate::units::Units;
 
-/// Soldiers per parallel kernel task.
-pub(crate) const CHUNK: usize = 2048;
+/// Soldiers per parallel kernel task. Every man's tick is his own and
+/// the chunks' lists (landed swings, arrows, touching pairs, the sweep's
+/// candidates) are read back in chunk order, which is index order
+/// whatever the size, so the size changes nothing but the share of the
+/// work: chunks this small leave the threads little to wait for at the
+/// kernel's end, when the last chunks of a crush are still running.
+pub(crate) const CHUNK: usize = 512;
 
 /// What an archer regiment's bows shoot at this tick (regiment-level
 /// fire solution, resolved in `prepare_tick`).
