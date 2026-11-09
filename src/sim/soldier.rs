@@ -832,8 +832,10 @@ pub(crate) fn tick_chunk(f: &Field, rows: Rows, out: &mut ChunkOut) {
         };
         let mut st = begin(f, &mut s);
         drive(f, &mut s, &mut st);
+        let listed_from = out.touch.len();
         scan(f, &mut s, &mut st, out);
         out.touch_end[j] = out.touch.len() as u32;
+        let listed = out.touch.len() > listed_from;
         look_around(f, &mut s, &mut st);
         choose_opening(f, &mut s, &mut st);
         hold_the_frame(f, &mut st);
@@ -847,7 +849,7 @@ pub(crate) fn tick_chunk(f: &Field, rows: Rows, out: &mut ChunkOut) {
         close_in(f, &mut s, &mut st);
         steer(f, &mut s, &mut st);
         face(f, &mut s, &mut st);
-        integrate(f, &mut s, &mut st);
+        integrate(f, &mut s, &mut st, listed);
     }
 }
 
@@ -3403,14 +3405,21 @@ fn face(f: &Field, s: &mut Soldier, st: &mut Step) {
 }
 
 /// The step: velocity into position, clamped to the field, sliding along
-/// impassable ground, set down on the terrain.
+/// impassable ground, set down on the terrain. A man with a touching pair
+/// (`listed`) keeps only his velocity here: the yield-and-collide
+/// contact starts him from his legs' step (`set_apart_start`) and the
+/// collision sets him down where the setting apart left him (`collide`),
+/// and nothing reads his place between, so the step is not taken.
 #[inline]
-fn integrate(f: &Field, s: &mut Soldier, st: &mut Step) {
+fn integrate(f: &Field, s: &mut Soldier, st: &mut Step, listed: bool) {
     let Field { terrain, pos_prev, kind, dt, bounds_min, bounds_max, .. } = *f;
     let i = s.i;
     let new_v = st.new_v;
     let corr = st.corr;
     *s.vel = Vec3::new(new_v.x, 0.0, new_v.y);
+    if listed {
+        return;
+    }
     let to = Vec2::new(pos_prev[i].x + new_v.x * dt + corr.x, pos_prev[i].z + new_v.y * dt + corr.y);
     let n = ground_step(terrain, bounds_min, bounds_max, pos_prev[i].xz(), to);
     *s.pos = Vec3::new(
