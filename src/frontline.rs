@@ -348,9 +348,8 @@ struct RegimentSums {
     /// (`GroupData::vel`).
     vel: Vec2,
     alive: u32,
-    /// For a regiment passing through friends: its living men inside
-    /// each open friend's block, in the order of the friends given
-    /// (`GroupData::inside`).
+    /// Its living men inside each open friend's block within its reach,
+    /// in the order of the friends given (`GroupData::inside`).
     inside: Vec<u32>,
     line_sum: f32,
     line_n: u32,
@@ -370,8 +369,8 @@ const REGIMENTS_PER_TASK: usize = 16;
 /// and `pb` are its centroid and home bias from the last tick, `f` its
 /// forward vector, `tg` its attack target, `bows` whether it is an archer
 /// regiment, the only kind whose lead and velocity anything reads, and
-/// `open` the blocks of the open friends it passes through, empty for a
-/// regiment not passing.
+/// `open` the blocks of the open friends within its reach, empty when
+/// there is none.
 fn regiment_sums(
     units: &Units,
     runs: &[(u32, u32)],

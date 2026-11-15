@@ -90,9 +90,9 @@ pub struct GroupData {
     /// inside one (sim/job.rs `open_for_passers`). The friend's
     /// bookkeeping: it counts this regiment's men inside it.
     pub passing: bool,
-    /// While passing: its living men inside each open friend's block, as
-    /// (friend, men) (frontline.rs), what the friend reads to know when
-    /// the last man is out. Empty for a regiment not passing.
+    /// Its living men inside each open friend's block within its reach,
+    /// as (friend, men) (frontline.rs), what the friend reads to know
+    /// when the last man is out. Empty with no open friend in reach.
     pub inside: Vec<(u32, u32)>,
     /// How far its farthest living man stands from its centroid (metres,
     /// frontline.rs): the stragglers' reach, so an open friend counts this

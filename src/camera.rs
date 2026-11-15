@@ -267,11 +267,12 @@ pub fn apply_camera_transform(
 }
 
 /// A camera path on disk: one line per sample, `t x z yaw pitch dist`,
-/// `t` in seconds from the battle's start. FL_CAM_REC=<file> records one
-/// every CAM_REC_STEP seconds; FL_CAM_PLAY=<file> plays one back, the
-/// camera set to the sample for the battle's time (the last one held
-/// once the path ends), over any input. With both set, the
-/// recording shows what the playback did, which checks the player.
+/// `t` in seconds from the first frame of the run's first battle, its
+/// deployment included. FL_CAM_REC=<file> records one every
+/// CAM_REC_STEP seconds; FL_CAM_PLAY=<file> plays one back, the camera
+/// set to the sample for that time (the last one held once the path
+/// ends), over any input. With both set, the recording shows what the
+/// playback did, which checks the player.
 /// FL_CAM_LOCK is applied after and overrides the playback, so do not
 /// set it with FL_CAM_PLAY.
 pub struct CamPath {

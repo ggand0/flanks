@@ -354,7 +354,6 @@ const SIGHT_BACK: u16 = 1 << 7;
 /// tick): the archers' search never aims at him (sim/mod.rs
 /// `clear_members`).
 pub(crate) const SIGHT_FOE: u16 = 1 << 8;
-/// Bit 9 is free.
 /// An archer's knife: bits 10 to 14 count down (one every fourth tick)
 /// from the last tick an enemy came close to him (`KNIFE_HOLD`), and
 /// `SIGHT_KNIFE` is set while the knife is out, by that count or by his
