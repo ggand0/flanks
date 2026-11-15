@@ -137,6 +137,10 @@ pub struct Units {
     /// `choose_opening`), a point on the ground; NaN when he has none. He
     /// looks wide only every few ticks and keeps what he found between.
     pub aim: Column<Vec2>,
+    /// Under the friction contact (FL_CONTACT=friction, sim/soldier.rs
+    /// `steer`, `integrate`): the speed the contacts have put into him
+    /// that his feet have not yet taken back. Zero otherwise.
+    pub imposed: Column<Vec2>,
     /// Bumped every time a battle rebuilds this world. A sim tick job
     /// computed from an older world carries indices that mean nothing
     /// here: sim/mod.rs drops it instead of installing it.
@@ -323,6 +327,7 @@ pub fn push_unit(
     units.pose.push(0);
     units.stuck.push(0);
     units.aim.push(Vec2::NAN);
+    units.imposed.push(Vec2::ZERO);
 }
 
 /// FL_TEST_SURROUND: two equal blue detachments of light infantry, one
