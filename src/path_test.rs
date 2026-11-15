@@ -50,6 +50,17 @@
 //!   waypoint its route has reached, so a route stalled at the stair's
 //!   foot, men who never got up and men up but not at their places read
 //!   apart. It has 300 s to arrive.
+//! - `FL_TEST_PATH=walls_long` with `FL_MAP=walled_town` or
+//!   `FL_MAP=wall_debug`: one regiment of 500 archers deployed as one long
+//!   line at the wall's inner foot, across both stairs east of the gate,
+//!   given a short line on the walk above it, so its men come to one stair
+//!   from both sides and fill a run of the walk on both sides of that
+//!   stair's head. It has 300 s to arrive.
+//! - `FL_TEST_PATH=walls_two_long` with `FL_MAP=walled_town` or
+//!   `FL_MAP=wall_debug`: the long scene's regiment, and a second of 500
+//!   archers 50 m behind the wall, given a short line on the walk west of
+//!   the gate right after the first. A regiment the walk has no room for
+//!   gets no order, and the log states it.
 //!
 //! Per regiment the log has the share of men within 5 m of their slots,
 //! the men stuck (slower than 0.1 m/s for 10 s while more than 5 m from
@@ -113,6 +124,18 @@ const CROSS_EAST_START: Vec2 = Vec2::new(spots::STAIR_FOOT_EAST.x + 32.0, crate:
 /// x = -14 to 26.
 const CROSS_EAST_LINE: (f32, f32) = (spots::STAIR_FOOT_EAST.x + 26.0, spots::STAIR_FOOT_EAST.x + 66.0);
 const CROSS_WEST_LINE: (f32, f32) = (spots::STAIR_FOOT_EAST.x - 50.0, spots::STAIR_FOOT_EAST.x - 10.0);
+/// The long scene: 500 men in 125 files, the line's middle 13 m behind
+/// the wall's line and 19 m east of the stair's foot, and its order, a
+/// drag of 8 m on the walk near the stair east of that one.
+const LONG_MEN: usize = 500;
+const LONG_FILES: u32 = 125;
+const LONG_START: Vec2 = Vec2::new(spots::STAIR_FOOT_EAST.x + 19.0, crate::town_layout::WALL_Z - 13.1);
+const LONG_LINE: (f32, f32) = (spots::STAIR_FOOT_EAST.x + 64.0, spots::STAIR_FOOT_EAST.x + 72.0);
+/// The second regiment of the two long ones: 50 m east of the first's
+/// stair and 51.5 m behind the wall's line, and its order, a drag of 38 m
+/// westward on the walk from 39.3 m west of the gate.
+const LONG2_START: Vec2 = Vec2::new(spots::STAIR_FOOT_EAST.x + 50.4, crate::town_layout::WALL_Z - 51.5);
+const LONG2_LINE: (f32, f32) = (-39.3, -77.3);
 /// Within this of his slot a man has arrived; beyond it, slower than
 /// `STUCK_SPEED` for `STUCK_S`, he is stuck.
 const ARRIVED_M: f32 = 5.0;
@@ -206,7 +229,7 @@ pub fn spawn(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
     // The wall scenes run on either map with the wall.
     let wanted_map = match scene.as_str() {
         "river" => Some(crate::terrain::MapKind::River),
-        "walls" | "walls_archers" | "walls_place" | "walls_under" | "walls_cross" => None,
+        "walls" | "walls_archers" | "walls_place" | "walls_under" | "walls_cross" | "walls_long" | "walls_two_long" => None,
         _ => Some(crate::terrain::MapKind::Obstacles),
     };
     match wanted_map {
@@ -261,6 +284,16 @@ pub fn spawn(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
             }
             list[0].skirmish = false;
             list[1].skirmish = false;
+        }
+        "walls_long" | "walls_two_long" => {
+            crate::regiments::spawn_regiment(units, terrain, &mut list, 0, KIND_ARCHER, LONG_START, LONG_MEN, -1.0);
+            list[0].files = LONG_FILES;
+            crate::formation::snap_to_slots(units, terrain, 0, &mut list[0]);
+            list[0].skirmish = false;
+            if scene == "walls_two_long" {
+                crate::regiments::spawn_regiment(units, terrain, &mut list, 0, KIND_ARCHER, LONG2_START, LONG_MEN, -1.0);
+                list[1].skirmish = false;
+            }
         }
         "walls_archers" => {
             crate::regiments::spawn_regiment(units, terrain, &mut list, 0, KIND_ARCHER, spots::PLAZA, 60, -1.0);
@@ -348,6 +381,21 @@ fn give_orders(
             for (g, case, (a, b)) in [(0, "cross-east", CROSS_EAST_LINE), (1, "cross-west", CROSS_WEST_LINE)] {
                 crate::orders::line_order(&mut groups, &terrain, &[g], Vec2::new(a, z), Vec2::new(b, z));
                 order(&mut groups, &mut units, &terrain, &mut test, pipeline.tick, g, case, None);
+            }
+        }
+        "walls_long" | "walls_two_long" => {
+            let z = crate::town_layout::WALL_Z;
+            let mut lines = vec![(0, "walls-long", LONG_LINE)];
+            if scene == "walls_two_long" {
+                lines.push((1, "walls-long-second", LONG2_LINE));
+            }
+            for (g, case, (a, b)) in lines {
+                crate::orders::line_order(&mut groups, &terrain, &[g], Vec2::new(a, z), Vec2::new(b, z));
+                if groups.list[g].order.is_some() {
+                    order(&mut groups, &mut units, &terrain, &mut test, pipeline.tick, g, case, None);
+                } else {
+                    info!("[path-test] {case}: no order given, the walk has no room for regiment {g}");
+                }
             }
         }
         "walls_archers" => {
@@ -758,7 +806,7 @@ struct Tally {
 /// The seconds a regiment of `scene` has to arrive, unless its route is
 /// so long that three times its length at the men's pace is longer.
 fn timeout_s(scene: &str) -> f32 {
-    if scene == "walls_cross" { CROSS_TIMEOUT_S } else { TIMEOUT_S }
+    if matches!(scene, "walls_cross" | "walls_long" | "walls_two_long") { CROSS_TIMEOUT_S } else { TIMEOUT_S }
 }
 
 /// Where regiment `g`'s route frame is, for the log: the waypoint it is
