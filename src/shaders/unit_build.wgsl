@@ -194,10 +194,10 @@ struct Params {
     // Per kind, half the standing height: his feet lie that far below his
     // record position.
     half_height: vec4<f32>,
-    // Per kind, the box of a settled body (a corpse record), as
-    // `bound_live`, and how far down it reaches.
-    bound_settled: array<vec4<f32>, 4>,
-    bound_down_settled: vec4<f32>,
+    // The box of a settled body (a corpse record), two entries per kind
+    // and way he fell ((kind * 4 + fall) * 2): forward, back, right, left,
+    // then up and down (`fall_way`).
+    bound_settled: array<vec4<f32>, 32>,
 };
 
 struct DrawArgs {
@@ -372,28 +372,42 @@ fn culled(p: vec3<f32>) -> bool {
 // projected with last frame's camera, his nearest point behind the farthest
 // depth of every pixel the box covers. A box partly off last frame's
 // screen, or reaching past the camera's near plane, is never hidden.
-// `state`: STANDING, FALLING (dying) or SETTLED (a corpse record).
+// `state`: STANDING, FALLING (dying), or SETTLED plus the way a corpse
+// record fell (`fall_way`).
 fn occluded(p: vec3<f32>, yaw: f32, kind: u32, state: u32) -> bool {
+    if state >= SETTLED {
+        let k = (kind * 4u + state - SETTLED) * 2u;
+        let v = params.bound_settled[k + 1u];
+        return box_hidden(p, yaw, params.bound_settled[k], v.x, v.y);
+    }
     var b = params.bound_live[kind];
     var down = params.bound_down_live[kind];
     if state == FALLING {
         b = params.bound_fall[kind];
         down = params.bound_down_fall[kind];
-    } else if state == SETTLED {
-        b = params.bound_settled[kind];
-        down = params.bound_down_settled[kind];
     }
-    return box_hidden(p, yaw, b, down);
+    return box_hidden(p, yaw, b.xyzz, b.w, down);
 }
 
 const STANDING: u32 = 0u;
 const FALLING: u32 = 1u;
 const SETTLED: u32 = 2u;
 
+// The way a man falls, from his seed, as unit_pose.wgsl `put_common` picks
+// it: 0 forward, 1 back, 2 and 3 to either side (2 the side its topple
+// angle turns negative toward). A corpse record keeps his seed.
+fn fall_way(seed: f32) -> u32 {
+    let dvar = fract(seed * 13.73);
+    if dvar < 0.62 {
+        return select(0u, 1u, dvar > 0.45);
+    }
+    return select(3u, 2u, dvar < 0.81);
+}
+
 // Whether a box around `p` in the frame of `yaw` was hidden last frame:
-// `b` its reach forward, back, sideways either way and up, `down` its
-// reach down, all from `p`.
-fn box_hidden(p: vec3<f32>, yaw: f32, b: vec4<f32>, down: f32) -> bool {
+// `b` its reach forward, back, right and left, then `up` and `down`, all
+// from `p`.
+fn box_hidden(p: vec3<f32>, yaw: f32, b: vec4<f32>, up: f32, down: f32) -> bool {
     // The world directions of his forward (+z) and his right (+x), as
     // unit_pose.wgsl `rot_y` turns them.
     let f = vec2<f32>(sin(yaw), cos(yaw));
@@ -403,8 +417,8 @@ fn box_hidden(p: vec3<f32>, yaw: f32, b: vec4<f32>, down: f32) -> bool {
     var near = 0.0;
     for (var k = 0u; k < 8u; k++) {
         let lz = select(-b.y, b.x, (k & 1u) != 0u);
-        let lx = select(-b.z, b.z, (k & 2u) != 0u);
-        let ly = select(-down, b.w, (k & 4u) != 0u);
+        let lx = select(-b.w, b.z, (k & 2u) != 0u);
+        let ly = select(-down, up, (k & 4u) != 0u);
         let w = p + vec3<f32>(r.x * lx + f.x * lz, ly, r.y * lx + f.y * lz);
         let c = params.occlude_clip * vec4<f32>(w, 1.0);
         // Reversed depth: z over w grows toward the camera and passes 1
@@ -493,7 +507,7 @@ fn body_state(prev: u32, lod: u32, p: vec3<f32>, yaw: f32, kind: u32, occl: u32,
     if !hidden {
         let bb = params.body_box;
         let feet = params.half_height[kind];
-        hidden = box_hidden(p, yaw, vec4<f32>(bb.x, bb.x, bb.x, bb.y - feet), feet - bb.z);
+        hidden = box_hidden(p, yaw, vec4<f32>(bb.x), bb.y - feet, feet - bb.z);
     }
     let hold = params.lod_hidden.y;
     var count = prev & BODY_MASK;
@@ -977,7 +991,7 @@ fn build_corpse(j: u32, t: u32) {
     let in_view = !culled(position);
     var occl = DRAWN;
     if in_view {
-        occl = occlusion(kind * NUM_LODS + lod, position, rec.anim.x, kind, SETTLED);
+        occl = occlusion(kind * NUM_LODS + lod, position, rec.anim.x, kind, SETTLED + fall_way(rec.color.a));
     }
     let visible = in_view && occl != HIDDEN;
     var casts = 0u;

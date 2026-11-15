@@ -299,10 +299,10 @@ pub struct BuildParams {
     /// Per kind, half the standing height: the feet lie that far below the
     /// record position (unit_glb.rs drops the model so).
     half_height: Vec4,
-    /// Per kind, the box a settled body is tested with
-    /// (render_units_occlusion.rs `SETTLED`), as `bound_live`.
-    bound_settled: [Vec4; NUM_KINDS],
-    bound_down_settled: Vec4,
+    /// The box a settled body is tested with (render_units_occlusion.rs
+    /// `SETTLED`), two entries per kind and way he fell: forward, back,
+    /// right, left, then up and down.
+    bound_settled: [Vec4; NUM_KINDS * 4 * 2],
 }
 
 /// The pose pass uniform (`Params` in unit_pose_pass.wgsl).
@@ -857,9 +857,16 @@ fn occlusion_params(
         p.bound_down_live[kind] = live.down;
         p.bound_down_fall[kind] = fall.down;
         // `FL_SETTLED_BOX=0` tests a settled body with the falling box.
-        let settled = if settled_box() { SETTLED[kind] } else { *fall };
-        p.bound_settled[kind] = Vec4::new(settled.fwd, settled.back, settled.side, settled.up);
-        p.bound_down_settled[kind] = settled.down;
+        for (way, s) in SETTLED[kind].iter().enumerate() {
+            let k = (kind * 4 + way) * 2;
+            if settled_box() {
+                p.bound_settled[k] = Vec4::new(s.fwd, s.back, s.right, s.left);
+                p.bound_settled[k + 1] = Vec4::new(s.up, s.down, 0.0, 0.0);
+            } else {
+                p.bound_settled[k] = Vec4::new(fall.fwd, fall.back, fall.side, fall.side);
+                p.bound_settled[k + 1] = Vec4::new(fall.up, fall.down, 0.0, 0.0);
+            }
+        }
     }
 }
 
@@ -890,9 +897,9 @@ pub struct ReachReadback {
     handle: Handle<ShaderBuffer>,
 }
 
-/// Words of the reach buffer: per kind, standing, dying, then settled, five
-/// reaches.
-const REACH_WORDS: usize = NUM_KINDS * 3 * 5;
+/// Words of the reach buffer: per kind, standing, dying, then settled by
+/// the way he fell, six reaches each.
+const REACH_WORDS: usize = NUM_KINDS * 6 * 6;
 
 fn setup_reach_readback(mut commands: Commands, mut buffers: ResMut<Assets<ShaderBuffer>>) {
     if !crate::render_units_occlusion::bound_check() {
@@ -927,17 +934,23 @@ fn on_reach_readback(event: On<ReadbackComplete>, mut since: Local<u32>) {
         return;
     }
     for kind in 0..NUM_KINDS {
-        for (state, name) in ["standing", "dying", "settled"].into_iter().enumerate() {
-            let r = &reach[(kind * 3 + state) * 5..][..5];
-            let b = match state {
-                2 => crate::render_units_occlusion::SETTLED[kind],
-                _ => crate::render_units_occlusion::BOUNDS[kind][state],
+        let names = ["standing", "dying", "settled forward", "settled back", "settled side 2", "settled side 3"];
+        for (state, name) in names.into_iter().enumerate() {
+            let r = &reach[(kind * 6 + state) * 6..][..6];
+            let bound = match state {
+                0 | 1 => {
+                    let b = crate::render_units_occlusion::BOUNDS[kind][state];
+                    [b.fwd, b.back, b.side, b.side, b.up, b.down]
+                }
+                _ => {
+                    let s = crate::render_units_occlusion::SETTLED[kind][state - 2];
+                    [s.fwd, s.back, s.right, s.left, s.up, s.down]
+                }
             };
-            let bound = [b.fwd, b.back, b.side, b.up, b.down];
             let out = r.iter().zip(bound).any(|(r, b)| *r > b);
             info!(
-                "  [occlude check] kind {kind} {name}: reach fwd {:.2} back {:.2} side {:.2} up {:.2} down {:.2} | box {:.2} {:.2} {:.2} {:.2} {:.2}{}",
-                r[0], r[1], r[2], r[3], r[4], bound[0], bound[1], bound[2], bound[3], bound[4],
+                "  [occlude check] kind {kind} {name}: reach fwd {:.2} back {:.2} right {:.2} left {:.2} up {:.2} down {:.2} | box {:.2} {:.2} {:.2} {:.2} {:.2} {:.2}{}",
+                r[0], r[1], r[2], r[3], r[4], r[5], bound[0], bound[1], bound[2], bound[3], bound[4], bound[5],
                 if out { " OUTSIDE THE BOX" } else { "" }
             );
         }

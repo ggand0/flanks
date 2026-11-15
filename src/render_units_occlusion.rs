@@ -166,24 +166,61 @@ pub const BOUNDS: [[Bound; 2]; NUM_KINDS] = {
 };
 
 /// The box a settled body (a corpse record, his fall played out) is tested
-/// with, per kind, as `BOUNDS` and measured the same way: the farthest any
-/// drawn corner of a corpse record reached under `FL_OCCLUDE_CHECK`, plus
-/// 15 cm, rounded up to 5 cm. A body lies on the ground, so its box is
-/// flat: under a packed crowd seen low it hides behind the standing men.
-/// Measured 2026-11-16 under `FL_OCCLUDE_CHECK`: the 200k clash for four
-/// minutes in the low flank view on both contact paths and in the mid-air
-/// spot view (knights, men-at-arms, spearmen), and the archer sandbox with
-/// the men-at-arms and then the archers as its target (490 archer bodies).
-/// The reach across lies near the falling box's, a body flat on the ground
-/// in any direction; up is 0.14 to 0.17 m, where the falling box has 1.65
-/// to 2.10. Down reaches up to 2.01 m below the record position, more than
-/// a body on flat ground needs; why was not looked into.
-pub const SETTLED: [Bound; NUM_KINDS] = [
-    Bound { fwd: 1.85, back: 1.85, side: 1.85, up: 0.3, down: 2.15 },
-    Bound { fwd: 1.85, back: 1.8, side: 1.85, up: 0.35, down: 2.2 },
-    Bound { fwd: 2.95, back: 2.8, side: 2.95, up: 0.15, down: 1.6 },
-    Bound { fwd: 1.85, back: 1.8, side: 1.9, up: 0.15, down: 1.6 },
+/// with, per kind and way he fell (`Flat`), measured as `BOUNDS` is: the
+/// farthest any drawn corner of a corpse record reached under
+/// `FL_OCCLUDE_CHECK`, plus 15 cm, rounded up to 5 cm. A body lies on the
+/// ground along the way he fell, so its box is flat and reaches out on one
+/// side only: under a packed crowd seen low it hides behind the standing
+/// men. Measured 2026-11-16 over the 200k clash for four minutes on the
+/// friction contact in the mid-air view from the west and in the low flank
+/// view on both contact paths, the charge test, and the archer sandbox with
+/// the archers in melee, with their swords out, and as the target. Down
+/// reaches up to 2.01 m below the record position, more than a body on
+/// flat ground needs; why was not looked into.
+pub const SETTLED: [[Flat; 4]; NUM_KINDS] = [
+    // knight: forward, back, side 2, side 3
+    [
+        Flat { fwd: 1.85, back: 0.2, right: 0.8, left: 0.65, up: 0.15, down: 2.15 },
+        Flat { fwd: 0.25, back: 1.85, right: 0.8, left: 0.65, up: 0.3, down: 1.4 },
+        Flat { fwd: 1.2, back: 0.3, right: 0.2, left: 1.85, up: 0.15, down: 1.6 },
+        Flat { fwd: 1.2, back: 0.3, right: 1.85, left: 0.2, up: 0.15, down: 1.7 },
+    ],
+    // man-at-arms: forward, back, side 2, side 3
+    [
+        Flat { fwd: 1.85, back: 0.2, right: 0.75, left: 0.65, up: 0.15, down: 2.2 },
+        Flat { fwd: 0.2, back: 1.8, right: 0.75, left: 0.65, up: 0.35, down: 1.35 },
+        Flat { fwd: 1.2, back: 0.35, right: 0.2, left: 1.85, up: 0.15, down: 1.55 },
+        Flat { fwd: 1.2, back: 0.35, right: 1.85, left: 0.2, up: 0.15, down: 1.65 },
+    ],
+    // spearman: forward, back, side 2, side 3
+    [
+        Flat { fwd: 2.95, back: 0.2, right: 0.75, left: 0.55, up: 0.15, down: 1.5 },
+        Flat { fwd: 0.2, back: 2.8, right: 0.75, left: 0.55, up: 0.15, down: 1.35 },
+        Flat { fwd: 0.55, back: 0.35, right: 0.2, left: 2.95, up: 0.15, down: 1.55 },
+        Flat { fwd: 0.5, back: 0.35, right: 2.85, left: 0.2, up: 0.15, down: 1.65 },
+    ],
+    // archer: forward, back, side 2, side 3
+    [
+        Flat { fwd: 1.85, back: 0.2, right: 0.55, left: 0.55, up: 0.15, down: 1.5 },
+        Flat { fwd: 0.25, back: 1.8, right: 0.55, left: 0.55, up: 0.15, down: 1.35 },
+        Flat { fwd: 0.4, back: 0.45, right: 0.2, left: 1.85, up: 0.15, down: 1.5 },
+        Flat { fwd: 0.4, back: 0.45, right: 1.9, left: 0.2, up: 0.15, down: 1.6 },
+    ],
 ];
+
+/// A settled body's box in his facing frame, from his record position:
+/// forward, back, right (+x), left, up, down, in metres. The four of a kind
+/// are the ways he fell: forward, back, and to either side
+/// (unit_build.wgsl `fall_way`).
+#[derive(Clone, Copy, Debug)]
+pub struct Flat {
+    pub fwd: f32,
+    pub back: f32,
+    pub right: f32,
+    pub left: f32,
+    pub up: f32,
+    pub down: f32,
+}
 
 /// `FL_SETTLED_BOX=0`: a settled body is tested with the falling box
 /// instead, for A/B runs. Read once.
