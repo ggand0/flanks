@@ -205,6 +205,47 @@ fn share_contact() -> bool {
     static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *S.get_or_init(|| !std::env::var("FL_CONTACT").is_ok_and(|v| v == "wall"))
 }
+/// FL_CONTACT=friction plays the friction contact instead: no spring
+/// between men, no grip, no stance and no contact speed. The setting apart
+/// moves him, his kept speed is where he ended up, and what the contacts
+/// put into that speed his feet take back at FEET (`steer`, `integrate`).
+fn friction_contact() -> bool {
+    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *S.get_or_init(|| std::env::var("FL_CONTACT").is_ok_and(|v| v == "friction"))
+}
+/// Under the friction contact the crowd's brake reads the still men ahead
+/// of his wish (`crowd_still`), against a band half as wide. FL_BRAKE=density
+/// keeps the brake on every neighbour's closeness, as without it.
+fn still_brake() -> bool {
+    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *S.get_or_init(|| friction_contact() && !std::env::var("FL_BRAKE").is_ok_and(|v| v == "density"))
+}
+/// The friction contact's feet: each tick they take back up to this much
+/// (m/s^2) of the speed the contacts have put into him.
+const FEET: f32 = 7.0;
+/// The still-man brake's crawl (m/s): a man ahead who moved along the
+/// reader's way at this speed or faster last tick counts nothing.
+const CRAWL: f32 = 0.3;
+/// The feet's take this tick: up to FEET x dt along what the contacts put
+/// into his speed.
+#[inline]
+fn feet_take(imposed: Vec2, dt: f32) -> Vec2 {
+    let il = imposed.length();
+    if il > 1e-12 { imposed * (il.min(FEET * dt) / il) } else { Vec2::ZERO }
+}
+/// How still a man ahead stands for the brake: 1 when he stood or came at
+/// the reader, nothing when he moved along the reader's way at CRAWL.
+#[inline]
+fn still_weight(o_vel: Vec2, wish_dir: Vec2) -> f32 {
+    (1.0 - o_vel.dot(wish_dir) / CRAWL).clamp(0.0, 1.0)
+}
+/// What the contacts have put into his speed and his feet have not taken
+/// back, after this tick's step: the old total plus the kept speed less
+/// the legs' speed, never more than a step's pace.
+#[inline]
+fn held_total(imposed: Vec2, kept: Vec2, legs_v: Vec2) -> Vec2 {
+    (imposed + (kept - legs_v)).clamp_length_max(STEP_PACE)
+}
 const STEER_GAIN: f32 = 3.0;
 const MAX_ACCEL: f32 = 50.0;
 /// What a man's legs can do: the steering toward his wish is capped at
@@ -519,6 +560,7 @@ pub(crate) struct Soldier<'a> {
     pub quarry: &'a mut u32,
     pub stuck: &'a mut u16,
     pub aim: &'a mut Vec2,
+    pub imposed: &'a mut Vec2,
 }
 
 /// The rows of one chunk of soldiers, in index order.
@@ -542,6 +584,7 @@ pub(crate) struct Rows<'a> {
     pub quarry: &'a mut [u32],
     pub stuck: &'a mut [u16],
     pub aim: &'a mut [Vec2],
+    pub imposed: &'a mut [Vec2],
 }
 
 /// What a chunk emits beside its rows: landed swings and loosed arrows.
@@ -574,6 +617,10 @@ struct Step {
     /// His share by weight of a closing speed on them (the shared speed).
     overlap_share: f32,
     crowd: f32,
+    /// The still men ahead of him (the friction contact's brake): the
+    /// neighbours within the spring on the half-plane ahead of his wish,
+    /// by their closeness and by how little they moved along his way.
+    crowd_still: f32,
     /// The crowd ahead of him on his way: the neighbours within the
     /// spring whose direction is within 60 degrees of his wish, by their
     /// closeness (`try_a_side`).
@@ -656,6 +703,7 @@ pub(crate) fn tick_chunk(f: &Field, rows: Rows, out: &mut ChunkOut) {
             quarry: &mut rows.quarry[j],
             stuck: &mut rows.stuck[j],
             aim: &mut rows.aim[j],
+            imposed: &mut rows.imposed[j],
         };
         let mut st = begin(f, &mut s);
         drive(f, &mut s, &mut st);
@@ -739,6 +787,7 @@ fn begin(f: &Field, s: &mut Soldier) -> Step {
         overlap_vel: Vec2::ZERO,
         overlap_share: 0.0,
         crowd: 0.0,
+        crowd_still: 0.0,
         ahead: 0.0,
         brake: (0.0, 0.0),
         best_idx: u32::MAX,
@@ -915,8 +964,12 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
     let mut overlap_share = 0.0f32;
     let mut overlap = 0.0f32;
     let mut crowd = 0.0f32;
+    let mut crowd_still = 0.0f32;
     let mut ahead = 0.0f32;
     let wish_dir = st.desired.normalize_or_zero();
+    // The still men ahead are read only for the friction contact's brake,
+    // and only by a man who wishes to go somewhere.
+    let still_on = still_brake() && st.desired.length_squared() >= 1e-12;
     let my_team_bit = (team[i] as u32) * crate::spatial::META_TEAM;
     let my_wall = wall[gi] != 0;
     // His width and each neighbour's by their poses and the turn of their
@@ -1092,6 +1145,13 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
             // slot-keeping is never faded by the settled enemies one stride
             // away, which made a line yield and stay ragged.
             crowd += w;
+            // The still men ahead: a neighbour on the half-plane ahead of
+            // his wish (`d` points from the neighbour to him), by how little
+            // he moved along it last tick.
+            if still_on {
+                let on = (d.dot(wish_dir) < 0.0) as u32 as f32;
+                crowd_still += w * on * still_weight(o_vel, wish_dir);
+            }
         }
     });
 
@@ -1167,6 +1227,7 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
         st.overlap_share = overlap_share / overlap;
     }
     st.crowd = crowd;
+    st.crowd_still = crowd_still;
     st.ahead = ahead;
     st.best_idx = best_idx;
     st.sticky = sticky;
@@ -2628,7 +2689,14 @@ fn yield_to_crowd(st: &mut Step) {
     // keep compressing itself; `jam` (0 = free, 1 = packed) also damps the
     // response below.
     let (slow, stop) = st.brake;
-    let jam = ((crowd - slow) / (stop - slow)).clamp(0.0, 1.0);
+    let jam = if still_brake() {
+        // The friction contact's brake: the still men ahead of him against
+        // a band half as wide, for that smaller count.
+        let (slow, stop) = (0.5 * slow, 0.5 * stop);
+        ((st.crowd_still - slow) / (stop - slow)).clamp(0.0, 1.0)
+    } else {
+        ((crowd - slow) / (stop - slow)).clamp(0.0, 1.0)
+    };
     st.wish = desired;
     desired *= 1.0 - jam;
     st.corr = corr;
@@ -2817,7 +2885,8 @@ fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
 /// From drive to velocity: the wall and charge paces, fatigue, the
 /// stagger, the crowd's damping, a standing man's grip on the ground and
 /// his stance against a squeeze, the acceleration and speed caps, and the
-/// give of his legs at a body he runs into.
+/// give of his legs at a body he runs into. Under the friction contact:
+/// the feet's take and his legs alone, the damping and the speed cap.
 #[inline]
 fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
     let Field { speed, orders, wall, charging, fat_speed, fat_nocharge, dt, .. } = *f;
@@ -2847,7 +2916,15 @@ fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
         desired = Vec2::ZERO;
     }
 
-    let v = s.vel.xz();
+    let friction = friction_contact();
+    let mut v = s.vel.xz();
+    if friction {
+        // His feet take back part of what the contacts put into his speed,
+        // off his speed and off the total alike, before his legs act.
+        let cut = feet_take(*s.imposed, dt);
+        v -= cut;
+        *s.imposed -= cut;
+    }
     // Jammed units stop shoving entirely: at full jam the crowd is
     // quasi-static and overlap resolution is purely positional — force-based
     // separation in a wedged mass only produces bang-bang oscillation.
@@ -2858,12 +2935,14 @@ fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
     // stance takes the first STANCE of a net squeeze the same way: he gives
     // ground only to what is beyond it. A man holding his place keeps the
     // grip while he steps back to it.
+    // Under the friction contact there is no spring, grip or stance: his
+    // legs alone move him, and the setting apart is applied in full.
     let standing = desired.length_squared() < 1e-6;
-    if standing || planted {
+    if !friction && (standing || planted) {
         let pl = push_a.length();
         push_a *= if pl > STAND_GRIP { (pl - STAND_GRIP) / pl } else { 0.0 };
     }
-    if standing && st.overlap_depth > 0.0 && *s.swing & crate::units::SWING_STAGGERED == 0 {
+    if !friction && standing && st.overlap_depth > 0.0 && *s.swing & crate::units::SWING_STAGGERED == 0 {
         st.corr *= ((st.overlap_depth - STANCE) / st.overlap_depth).max(0.0);
     }
     let mut legs = (desired - v) * STEER_GAIN;
@@ -2871,7 +2950,7 @@ fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
     if l2 > LEG_ACCEL * LEG_ACCEL {
         legs *= LEG_ACCEL / l2.sqrt();
     }
-    let mut accel = legs + push_a;
+    let mut accel = if friction { legs } else { legs + push_a };
     let a2 = accel.length_squared();
     if a2 > MAX_ACCEL * MAX_ACCEL {
         accel *= MAX_ACCEL / a2.sqrt();
@@ -2897,8 +2976,8 @@ fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
     // none at the give, never carrying him past it in one tick, and never
     // more than his own speed into them, so a column on the march is not
     // held up; the man he hits is handed nothing and is moved by the
-    // setting apart alone, as pressure.
-    let dir = st.overlap_dir;
+    // setting apart alone, as pressure. The friction contact has neither.
+    let dir = if friction { Vec2::ZERO } else { st.overlap_dir };
     if dir != Vec2::ZERO && share_contact() {
         let into = (new_v - st.overlap_vel).dot(-dir);
         if into > 0.0 {
@@ -3063,5 +3142,55 @@ fn integrate(f: &Field, s: &mut Soldier, st: &mut Step) {
         terrain.height_at(nx, nz) + crate::unit_types::half_height(kind[i] as usize),
         nz,
     );
+    // The friction contact: his kept speed is the move he made, and what
+    // the setting apart, the field's edge and the blocked ground did to his
+    // legs' speed is added to the total his feet take back.
+    if friction_contact() && dt > 0.0 {
+        let kept = Vec2::new(nx - pos_prev[i].x, nz - pos_prev[i].z) / dt;
+        *s.vel = Vec3::new(kept.x, 0.0, kept.y);
+        *s.imposed = held_total(*s.imposed, kept, new_v);
+    }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The feet take FEET x dt along the total, or the whole of a smaller
+    /// total, and nothing of none.
+    #[test]
+    fn feet_take_is_capped_along_the_total() {
+        let dt = 1.0 / 30.0;
+        let big = Vec2::new(0.6, -0.8);
+        let cut = feet_take(big, dt);
+        assert!((cut.length() - FEET * dt).abs() < 1e-6);
+        assert!((cut.normalize() - big.normalize()).length() < 1e-6);
+        let small = Vec2::new(0.05, 0.0);
+        assert_eq!(feet_take(small, dt), small);
+        assert_eq!(feet_take(Vec2::ZERO, dt), Vec2::ZERO);
+    }
+
+    /// A man ahead who stood or came at the reader counts in full, one who
+    /// moved along the reader's way at CRAWL or faster not at all, one at
+    /// half the crawl half.
+    #[test]
+    fn still_weight_reads_the_move_along_the_way() {
+        let wish = Vec2::new(0.0, 1.0);
+        assert_eq!(still_weight(Vec2::ZERO, wish), 1.0);
+        assert_eq!(still_weight(Vec2::new(0.0, -1.0), wish), 1.0);
+        assert_eq!(still_weight(Vec2::new(0.0, CRAWL), wish), 0.0);
+        assert_eq!(still_weight(Vec2::new(0.0, 2.0), wish), 0.0);
+        assert!((still_weight(Vec2::new(5.0, 0.5 * CRAWL), wish) - 0.5).abs() < 1e-6);
+    }
+
+    /// The total gains the kept speed less the legs' speed and stops at a
+    /// step's pace.
+    #[test]
+    fn held_total_adds_the_contact_and_caps_it() {
+        let t = held_total(Vec2::new(0.1, 0.0), Vec2::new(1.0, 0.2), Vec2::new(1.0, 0.0));
+        assert!((t - Vec2::new(0.1, 0.2)).length() < 1e-6);
+        let t = held_total(Vec2::new(0.7, 0.0), Vec2::new(0.0, 0.0), Vec2::new(-1.0, 0.0));
+        assert!((t.length() - STEP_PACE).abs() < 1e-6);
+        assert!(t.x > 0.0 && t.y == 0.0);
+    }
+}
