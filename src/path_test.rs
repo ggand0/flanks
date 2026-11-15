@@ -71,6 +71,10 @@
 //!   slots round, and how many of the places round it are off the walk;
 //! - the men out, each with the slot and the aim the sim gives him.
 //!
+//! `FL_TEST_DUMP=<file>` writes every watched man's position, height
+//! included, with his place and the ground under him, every five seconds
+//! (`dump_men`).
+//!
 //! `FL_LOG_ROUTE=1` adds the route events from sim/route.rs: an order's end
 //! and whether its route stays, a holding regiment's route dropped, and
 //! each move of a frame to a later waypoint.
@@ -147,6 +151,9 @@ struct PathTest {
     stuck_ticks: Vec<u32>,
     /// Per unit, whether he has stood on the wall's walk (wall scenes).
     been_on_walk: Vec<bool>,
+    /// The file of `FL_TEST_DUMP`, once opened, and whether it was tried.
+    dump: Option<std::fs::File>,
+    dump_tried: bool,
     /// Per unit, where he stood at the last ten-second line (wall scenes),
     /// to count the men who really moved: a man pressing on a wall keeps
     /// a velocity while he stays where he is.
@@ -723,6 +730,9 @@ fn log_progress(
             *at = flat(i);
         }
     }
+    if tick.is_multiple_of(150) {
+        dump_men(test, &units, &groups, &terrain, &routes, tick);
+    }
     if !test.summary_done && !test.subjects.is_empty() && test.subjects.iter().all(|s| s.reported) {
         test.summary_done = true;
         let ok = test.subjects.iter().filter(|s| s.done_s.is_some()).count();
@@ -757,6 +767,72 @@ fn frame_text(routes: &crate::sim::route::Routes, g: usize) -> String {
     match routes.route_of(g) {
         Some((points, k)) => format!("frame at waypoint {k} of {}", points.len().saturating_sub(1)),
         None => "no route".into(),
+    }
+}
+
+/// `FL_TEST_DUMP=<file>`: every five seconds, every living man of the
+/// regiments under watch, one line each, for checking each man against
+/// where he should stand, away from the game: the seconds since the first
+/// order, his regiment and his index, his position (x, height, z), his
+/// place at the order's end (x, z), the slot the sim gives him now
+/// (x, z), the sim's ground height under him and the drawn ground's,
+/// whether the ground under him is blocked, and his velocity (x, z).
+fn dump_men(
+    test: &mut PathTest,
+    units: &Units,
+    groups: &Groups,
+    terrain: &Terrain,
+    routes: &crate::sim::route::Routes,
+    tick: u32,
+) {
+    use std::io::Write;
+    if !test.dump_tried {
+        test.dump_tried = true;
+        let Ok(path) = std::env::var("FL_TEST_DUMP") else { return };
+        match std::fs::File::create(&path) {
+            Ok(mut file) => {
+                let _ = writeln!(file, "t g i x y z place_x place_z slot_x slot_z sim_h ground_h blocked vx vz");
+                info!("[path-test] every man's position goes to {path} every 5 s");
+                test.dump = Some(file);
+            }
+            Err(e) => warn!("[path-test] FL_TEST_DUMP: cannot write {path}: {e}"),
+        }
+    }
+    let Some(file) = &mut test.dump else { return };
+    let secs = tick.saturating_sub(ORDER_TICK) as f32 / 30.0;
+    let watched: Vec<usize> = {
+        let mut g: Vec<usize> = test.subjects.iter().map(|s| s.g).collect();
+        g.sort_unstable();
+        g.dedup();
+        g
+    };
+    for &g in &watched {
+        let gd = &groups.list[g];
+        let place_at = match gd.order {
+            Some(Order::Move(p)) => p,
+            _ => gd.anchor,
+        };
+        let slot_at = sim_frame(groups, routes, g);
+        for i in (0..units.len()).filter(|&i| units.group[i] as usize == g && units.death_t[i] == 0) {
+            let p = units.pos[i];
+            let (place, slot) = (place_at + units.home[i], slot_at + units.home[i]);
+            let _ = writeln!(
+                file,
+                "{secs:.1} {g} {i} {:.2} {:.2} {:.2} {:.2} {:.2} {:.2} {:.2} {:.2} {:.2} {} {:.2} {:.2}",
+                p.x,
+                p.y,
+                p.z,
+                place.x,
+                place.y,
+                slot.x,
+                slot.y,
+                terrain.height_at(p.x, p.z),
+                terrain.ground_at(p.x, p.z),
+                u8::from(terrain.blocked_at(p.x, p.z)),
+                units.vel[i].x,
+                units.vel[i].z
+            );
+        }
     }
 }
 
