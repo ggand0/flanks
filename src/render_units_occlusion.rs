@@ -135,26 +135,32 @@ pub struct Bound {
 
 /// The farthest any drawn corner reached under `FL_OCCLUDE_CHECK`, plus
 /// 15 cm, rounded up to 5 cm. Measured 2026-10-13 over three battles in the
-/// low flank view: 40k for four minutes with the clips and again with
-/// `FL_CLIPS=0`, and 8k for five and a half minutes. The man-at-arms plays
-/// the knight's clips and takes the knight's box. The spearman's spear
-/// reaches 3 m ahead, and a fallen one's spear into the ground. The
-/// standing reach down passes the feet: a crouch lowers the whole figure.
+/// low flank view (40k for four minutes with the clips and again with
+/// `FL_CLIPS=0`, and 8k for five and a half minutes), and 2026-11-16 over
+/// the 200k clash for four minutes on the friction contact in the mid-air
+/// view from the west and in the low flank view on both contact paths, the
+/// charge test, and the archer sandbox with the archers in melee, with their
+/// swords out, and as the target. A box holds the farthest reach of all of
+/// them. The man-at-arms plays the knight's clips and takes the knight's
+/// box. The spearman's spear reaches 3 m ahead, 1.55 m to the side when a
+/// twitch turns him, and a fallen one's spear into the ground. The standing
+/// reach down passes the feet: a crouch lowers the whole figure. The second
+/// box of a kind also holds a body (`FL_SETTLED_BOX=0` tests one with it).
 pub const BOUNDS: [[Bound; 2]; NUM_KINDS] = {
     const KNIGHT: [Bound; 2] = [
-        Bound { fwd: 1.85, back: 2.0, side: 1.55, up: 1.85, down: 1.45 },
+        Bound { fwd: 2.0, back: 2.05, side: 1.55, up: 1.85, down: 1.45 },
         Bound { fwd: 2.05, back: 1.85, side: 2.25, up: 1.75, down: 2.2 },
     ];
     [
         KNIGHT,
         KNIGHT,
         [
-            Bound { fwd: 3.2, back: 1.6, side: 0.8, up: 2.25, down: 1.45 },
+            Bound { fwd: 3.2, back: 1.6, side: 1.7, up: 2.25, down: 1.5 },
             Bound { fwd: 3.25, back: 2.8, side: 2.95, up: 2.1, down: 3.5 },
         ],
         [
-            Bound { fwd: 1.65, back: 1.5, side: 0.8, up: 1.7, down: 1.45 },
-            Bound { fwd: 1.85, back: 1.8, side: 1.9, up: 1.65, down: 1.8 },
+            Bound { fwd: 1.65, back: 1.55, side: 1.0, up: 1.7, down: 1.45 },
+            Bound { fwd: 1.85, back: 1.8, side: 1.9, up: 1.7, down: 1.8 },
         ],
     ]
 };
