@@ -83,8 +83,12 @@ pub fn bound_check() -> bool {
 /// men in front have hidden for `hold` frames in a row, draws one level
 /// coarser than his held level (unit_build.wgsl `body_count`). His body box
 /// runs from just above his feet to `top` metres above them, `half` metres
-/// either side of him. Mode 0 off, 1 for the held levels 1 and 2, 2 for
-/// level 0 too. His held level and his shadow do not change.
+/// either side of him. Mode 0 off, 1 for the held level 2 only (the far men,
+/// of whom a helmet of a few pixels shows), 2 for level 1 too, 3 for level 0
+/// too. Hidden frames raise his count by one, up to twice `hold`, and
+/// showing frames take one off; he goes coarse when it reaches `hold` and
+/// back when it is at 0, so a frame of a gap does not flip him. His held
+/// level and his shadow do not change.
 /// `FL_LOD_HIDDEN_TOP`, `FL_LOD_HIDDEN_HALF` and `FL_LOD_HIDDEN_HOLD` tune it.
 #[derive(Clone, Copy, Debug)]
 pub struct LodHidden {
@@ -99,9 +103,9 @@ pub fn lod_hidden() -> LodHidden {
     static CFG: std::sync::OnceLock<LodHidden> = std::sync::OnceLock::new();
     *CFG.get_or_init(|| {
         let cfg = LodHidden {
-            mode: crate::util::env_or("FL_LOD_HIDDEN", 0_u32).min(2),
-            top: crate::util::env_or("FL_LOD_HIDDEN_TOP", 1.4_f32).max(0.2),
-            half: crate::util::env_or("FL_LOD_HIDDEN_HALF", 0.25_f32).max(0.01),
+            mode: crate::util::env_or("FL_LOD_HIDDEN", 0_u32).min(3),
+            top: crate::util::env_or("FL_LOD_HIDDEN_TOP", 1.0_f32).max(0.2),
+            half: crate::util::env_or("FL_LOD_HIDDEN_HALF", 0.15_f32).max(0.01),
             hold: crate::util::env_or("FL_LOD_HIDDEN_HOLD", 12_u32).clamp(1, 255),
         };
         if cfg.mode != 0 {

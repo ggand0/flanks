@@ -74,8 +74,9 @@ pub fn cpu_sweep(cfg: Res<GpuSyncConfig>) -> bool {
 /// the frame stamp, the soldier count, 1 if the occlusion test ran, one
 /// spare, the 16 caster list counts (cascade * 4 + kind), the 16 bucket
 /// counts of soldiers the occlusion test hid, then per held level the
-/// soldiers drawn a level coarser (`FL_LOD_HIDDEN`).
-const READBACK_WORDS: usize = 72;
+/// soldiers drawn a level coarser (`FL_LOD_HIDDEN`), then the soldiers the
+/// rule sent coarser or back that frame.
+const READBACK_WORDS: usize = 73;
 
 /// Sun shadow cascades the build fills caster lists for, Bevy's maximum.
 pub const MAX_CASCADES: usize = bevy::pbr::MAX_CASCADES_PER_LIGHT;
@@ -108,7 +109,7 @@ const DEPTH_BIN_SPAN: f32 = 24.0;
 /// lists, the ring count, the pose slots taken per kind, per bucket its
 /// depth bins, the far levels' pose slots per kind, then per bucket the
 /// soldiers the occlusion test hid, then per held level the soldiers drawn
-/// a level coarser.
+/// a level coarser, then the soldiers the rule sent coarser or back.
 const COUNTERS: usize = 2 * NUM_BUCKETS
     + CASTER_LISTS
     + 1
@@ -116,7 +117,8 @@ const COUNTERS: usize = 2 * NUM_BUCKETS
     + NUM_BUCKETS * DEPTH_BINS
     + NUM_KINDS
     + NUM_BUCKETS
-    + NUM_LODS;
+    + NUM_LODS
+    + 1;
 
 /// Storage buffers the build pass binds (`init_gpu_unit_pipelines`), more
 /// than any other unit pass. A device that allows fewer per stage keeps the
@@ -308,7 +310,7 @@ struct PoseParams {
 }
 
 const _: () = assert!(NUM_KINDS == 4, "BuildParams and PoseParams pack per-kind values in vec4s");
-const _: () = assert!(COUNTERS == 2125, "unit_build.wgsl sizes `counts` for 2125");
+const _: () = assert!(COUNTERS == 2126, "unit_build.wgsl sizes `counts` for 2126");
 const _: () = assert!(DEPTH_BINS == 128, "unit_build.wgsl has 128 depth bins per bucket");
 const _: () = assert!(NUM_BUCKETS == 16, "unit_build.wgsl sizes its counters for 16 buckets");
 const _: () = assert!(MAX_CASCADES == 4, "unit_build.wgsl sizes its cascades for 4");
@@ -977,6 +979,8 @@ fn on_counts_readback(
         words[52..68].iter().skip(lod).step_by(NUM_LODS).map(|&n| n as usize).sum()
     });
     counts.coarser = std::array::from_fn(|lod| words[68 + lod] as usize);
+    counts.flips += words[72] as usize;
+    counts.flip_frames += 1;
     // A frame the test ran on: the vertex runs it saved, at least one per
     // vertex of each hidden soldier's level, decide the next probe.
     if words[34] != 0 {
