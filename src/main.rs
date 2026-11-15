@@ -12,6 +12,7 @@ mod camera;
 mod combat;
 mod fatigue;
 mod formation;
+mod frame_log;
 mod gait;
 mod frontline;
 mod game_files;
@@ -192,6 +193,7 @@ fn main() {
             unit_cards::UnitCardsPlugin,
             balance::BalancePlugin,
             picker::PickerPlugin,
+            frame_log::FrameLogPlugin,
         ))
         .insert_resource(Time::<Fixed>::from_hz(30.0))
         // A frame that overruns makes the fixed clock owe catch-up sim

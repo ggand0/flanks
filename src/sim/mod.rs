@@ -143,7 +143,9 @@ impl Default for TickWorker {
             .spawn(move || {
                 crate::util::mark_sim_worker();
                 while let Ok(mut job) = jobs.recv() {
+                    let start = crate::frame_log::job_start();
                     run_tick_job(&mut job);
+                    crate::frame_log::job_end(start);
                     if results.send(job).is_err() {
                         return;
                     }
@@ -197,7 +199,10 @@ impl TickPipeline {
         );
         self.in_flight = false;
         let worker = self.worker.as_ref().expect("worker exists while a job is in flight");
-        Some(worker.from_worker.lock().unwrap().recv().expect("sim tick worker alive"))
+        let start = crate::frame_log::take_start();
+        let job = worker.from_worker.lock().unwrap().recv().expect("sim tick worker alive");
+        crate::frame_log::take_end(start);
+        Some(job)
     }
 }
 
@@ -682,6 +687,7 @@ pub fn step_sim(
     mut sounds: Option<ResMut<crate::audio::SoundEvents>>,
     mut routes: ResMut<route::Routes>,
 ) {
+    let _frame_log = crate::frame_log::time_step();
     let finished = pipeline.taken.take();
     if units.pos.is_empty() {
         return;
@@ -774,6 +780,7 @@ pub fn step_sim(
     pipeline.tick = pipeline.tick.wrapping_add(1);
     let tick = pipeline.tick;
     if tick.is_multiple_of(60) {
+        let _frame_log = crate::frame_log::time_audit();
         diag::neighbour_audit(&mut stats, &grid, &units.pos[..], &units.pos_prev[..]);
     }
     diag::fingerprint(tick, &units);
@@ -806,6 +813,7 @@ pub fn kick_tick(
     ),
     mut routes: ResMut<route::Routes>,
 ) {
+    let _frame_log = crate::frame_log::time_kick();
     if !pipeline_enabled() || units.pos.is_empty() || pipeline.in_flight {
         return;
     }
