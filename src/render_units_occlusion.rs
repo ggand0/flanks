@@ -93,7 +93,10 @@ pub fn bound_check() -> bool {
 /// man every 18 s or so in the 200k clash seen from the west flank (27 a frame
 /// against 238 at a hold of 12, for the same men drawn coarser and the
 /// same frame rate). One who comes into view is back within 192 frames.
-/// His held level and his shadow do not change.
+/// His held level and his shadow do not change. The rule reads the depth
+/// pyramid, which the probe (render_units_gpu.rs `OcclusionProbe`) builds
+/// every frame only while the vertex runs it and the occlusion test save
+/// pay for it; between the probes every man holds his count and his mesh.
 /// `FL_LOD_HIDDEN_TOP`, `FL_LOD_HIDDEN_HALF` and `FL_LOD_HIDDEN_HOLD` tune it.
 #[derive(Clone, Copy, Debug)]
 pub struct LodHidden {

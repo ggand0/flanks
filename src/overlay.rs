@@ -688,9 +688,12 @@ fn update_overlay(
         let occlude = crate::render_units_occlusion::mode();
         if occlude != crate::render_units_occlusion::OccludeMode::Off {
             // In count mode the hidden are drawn all the same.
+            let built = crate::render_units_gpu::PYRAMID_FRAMES
+                .each_ref()
+                .map(|n| n.swap(0, std::sync::atomic::Ordering::Relaxed));
             info!(
-                "  unit occlusion ({occlude:?}): hidden per level {:?}, the living and the fallen",
-                render_counts.hidden
+                "  unit occlusion ({occlude:?}): hidden per level {:?}, the living and the fallen; pyramid on {} of {} frames",
+                render_counts.hidden, built[0], built[1]
             );
         }
         if crate::render_units_occlusion::lod_hidden().mode != 0 {

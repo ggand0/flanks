@@ -185,8 +185,8 @@ struct Params {
     bound_down_live: vec4<f32>,
     bound_down_fall: vec4<f32>,
     // FL_LOD_HIDDEN (render_units_occlusion.rs): x the mode (0 off, 1 the
-    // held levels 1 and 2, 2 also level 0), y the frames his body box must
-    // stay hidden before he draws a level coarser.
+    // held level 2, 2 also level 1, 3 also level 0), y the hold
+    // (`body_state`).
     lod_hidden: vec4<u32>,
     // The body box: x its half-width, y its top above his feet, z its
     // bottom above his feet, in metres.
@@ -219,18 +219,19 @@ struct DrawArgs {
 // and depth bin (`BIN_COUNTER`) the soldiers in it, which `finalize` turns
 // into the bin's first slot in the bucket's list, then the far levels'
 // pose slots per kind, then per bucket the soldiers the occlusion test hid
-// (`HIDDEN_COUNTER`), then per held level the soldiers drawn a level
-// coarser because his body was hidden (`COARSER_COUNTER`), then the drawn
-// soldiers the rule sent coarser or back this frame (`FLIP_COUNTER`).
-@group(0) @binding(6) var<storage, read_write> counts: array<atomic<u32>, 2126>;
+// (`HIDDEN_COUNTER`), then per bucket of his held level the soldiers drawn
+// a level coarser because his body was hidden (`COARSER_COUNTER`), then the
+// drawn soldiers the rule sent coarser or back this frame (`FLIP_COUNTER`).
+@group(0) @binding(6) var<storage, read_write> counts: array<atomic<u32>, 2138>;
 // 0..16 the camera's buckets, 16..32 the casters as in `counts`, 32 the
 // selection rings, 33..37 the pose pass's dispatch per kind (x, y, z).
 @group(0) @binding(7) var<storage, read_write> args: array<DrawArgs, 37>;
 // Copied back to the CPU by Bevy's readback plugin: the 32 counts, the
 // frame stamp and the soldier count, 1 if the occlusion test ran, one
-// spare, the 16 caster counts, the 16 hidden counts, the 4 counts of the
-// soldiers drawn a level coarser per held level, the rule's flips.
-@group(0) @binding(8) var<storage, read_write> readback: array<u32, 73>;
+// spare, the 16 caster counts, the 16 hidden counts, the 16 counts of the
+// soldiers drawn a level coarser per bucket of their held level, the
+// rule's flips.
+@group(0) @binding(8) var<storage, read_write> readback: array<u32, 85>;
 // Per pose slot, the record it poses, in one region per kind.
 @group(0) @binding(9) var<storage, read_write> pose_src: array<u32>;
 // Five words per list, 0..16 the camera's buckets and 16..32 the casters as
@@ -310,7 +311,8 @@ const BIN_COUNTER: u32 = 53u;
 const POSE_FAR_COUNTER: u32 = BIN_COUNTER + 16u * DEPTH_BINS;
 // Per bucket, the soldiers in the frustum the occlusion test hid.
 const HIDDEN_COUNTER: u32 = POSE_FAR_COUNTER + 4u;
-// Per held level, the soldiers drawn a level coarser (`body_state`).
+// Per bucket of his held level, the soldiers drawn a level coarser
+// (`body_state`).
 const COARSER_COUNTER: u32 = HIDDEN_COUNTER + 16u;
 // `Smooth::lod` holds the held level in its low byte and, under
 // FL_LOD_HIDDEN, his body count in the ten bits above it and his coarse
@@ -321,7 +323,7 @@ const BODY_MASK: u32 = 0x3ffu;
 const BODY_COARSE: u32 = 0x400u;
 const COARSER_BIT: u32 = BODY_COARSE << BODY_SHIFT;
 // The soldiers whose drawn level the rule changed this frame, either way.
-const FLIP_COUNTER: u32 = COARSER_COUNTER + 4u;
+const FLIP_COUNTER: u32 = COARSER_COUNTER + 16u;
 // Texels per axis the occlusion test reads at most: it reads the finest
 // level where the box spans this many.
 const OCCLUDE_SPAN: u32 = 8u;
@@ -495,13 +497,17 @@ fn occlusion(bucket: u32, p: vec3<f32>, yaw: f32, kind: u32, state: u32) -> u32 
 // a man whose body is hidden most of the time keeps his coarse mesh, and one
 // who comes into view is back at his held level within twice the hold. A
 // soldier the whole-man test hid has his body hidden too: every kind's
-// whole-man box holds the body box. Both clear on a frame without a pyramid
-// to read (a camera cut, the first frame), at a level the mode leaves alone
-// (mode 1 the held level 2 only, 2 also level 1, 3 also level 0), and while
-// he dies.
+// whole-man box holds the body box. Both clear on a camera cut, at a level
+// the mode leaves alone (mode 1 the held level 2 only, 2 also level 1, 3
+// also level 0), and while he dies. On a frame without last frame's pyramid
+// (between the probes of render_units_gpu.rs `OcclusionProbe`, the first
+// frame) both hold.
 fn body_state(prev: u32, lod: u32, p: vec3<f32>, yaw: f32, kind: u32, occl: u32, dying: bool) -> u32 {
-    if dying || lod >= NUM_LODS - 1u || lod + params.lod_hidden.x < NUM_LODS - 1u || params.occlude.y == 0u {
+    if dying || lod >= NUM_LODS - 1u || lod + params.lod_hidden.x < NUM_LODS - 1u || params.occlude.z != 0u {
         return 0u;
+    }
+    if params.occlude.y == 0u {
+        return prev & (BODY_MASK | BODY_COARSE);
     }
     var hidden = occl == HIDDEN;
     if !hidden {
@@ -946,7 +952,7 @@ fn build_soldier(i: u32) {
     if visible {
         queue_draw(i, kind * NUM_LODS + draw_lod, entry, draw_lod, dot(d, d), occl == MARKED);
         if draw_lod != lod {
-            atomicAdd(&counts[COARSER_COUNTER + lod], 1u);
+            atomicAdd(&counts[COARSER_COUNTER + kind * NUM_LODS + lod], 1u);
         }
     }
     append_casters(casts, kind, entry);
@@ -1095,8 +1101,8 @@ fn finalize(@builtin(local_invocation_index) b: u32) {
     readback[b] = count;
     readback[16u + b] = fallen;
     readback[52u + b] = atomicLoad(&counts[HIDDEN_COUNTER + b]);
+    readback[68u + b] = atomicLoad(&counts[COARSER_COUNTER + b]);
     if b < 4u {
-        readback[68u + b] = atomicLoad(&counts[COARSER_COUNTER + b]);
         let posed = atomicLoad(&counts[POSE_COUNTER + b]) + atomicLoad(&counts[POSE_FAR_COUNTER + b]);
         args[POSE_ARG + b] = DrawArgs((posed + 63u) / 64u, 1u, 1u, 0u);
     }
@@ -1105,7 +1111,7 @@ fn finalize(@builtin(local_invocation_index) b: u32) {
         readback[33u] = params.n;
         // Whether the occlusion test ran this frame.
         readback[34u] = select(0u, 1u, params.occlude.y != 0u);
-        readback[72u] = atomicLoad(&counts[FLIP_COUNTER]);
+        readback[84u] = atomicLoad(&counts[FLIP_COUNTER]);
         // Six corners per ring (two triangles).
         args[RING_ARG] = DrawArgs(atomicLoad(&counts[RING_COUNTER]) * 6u, 1u, 0u, 0u);
     }
