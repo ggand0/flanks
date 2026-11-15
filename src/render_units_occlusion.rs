@@ -154,6 +154,33 @@ pub const BOUNDS: [[Bound; 2]; NUM_KINDS] = {
     ]
 };
 
+/// The box a settled body (a corpse record, his fall played out) is tested
+/// with, per kind, as `BOUNDS` and measured the same way: the farthest any
+/// drawn corner of a corpse record reached under `FL_OCCLUDE_CHECK`, plus
+/// 15 cm, rounded up to 5 cm. A body lies on the ground, so its box is
+/// flat: under a packed crowd seen low it hides behind the standing men.
+/// Measured 2026-11-16 under `FL_OCCLUDE_CHECK`: the 200k clash for four
+/// minutes in the low flank view on both contact paths and in the mid-air
+/// spot view (knights, men-at-arms, spearmen), and the archer sandbox with
+/// the men-at-arms and then the archers as its target (490 archer bodies).
+/// The reach across lies near the falling box's, a body flat on the ground
+/// in any direction; up is 0.14 to 0.17 m, where the falling box has 1.65
+/// to 2.10. Down reaches up to 2.01 m below the record position, more than
+/// a body on flat ground needs; why was not looked into.
+pub const SETTLED: [Bound; NUM_KINDS] = [
+    Bound { fwd: 1.85, back: 1.85, side: 1.85, up: 0.3, down: 2.15 },
+    Bound { fwd: 1.85, back: 1.8, side: 1.85, up: 0.35, down: 2.2 },
+    Bound { fwd: 2.95, back: 2.8, side: 2.95, up: 0.15, down: 1.6 },
+    Bound { fwd: 1.85, back: 1.8, side: 1.9, up: 0.15, down: 1.6 },
+];
+
+/// `FL_SETTLED_BOX=0`: a settled body is tested with the falling box
+/// instead, for A/B runs. Read once.
+pub fn settled_box() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::util::env_or("FL_SETTLED_BOX", 1_u32) != 0)
+}
+
 /// The most levels the pyramid keeps: level k's texel covers 2^(k+1)
 /// pixels, 4096 at the last.
 const MAX_LEVELS: u32 = 12;

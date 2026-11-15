@@ -194,6 +194,10 @@ struct Params {
     // Per kind, half the standing height: his feet lie that far below his
     // record position.
     half_height: vec4<f32>,
+    // Per kind, the box of a settled body (a corpse record), as
+    // `bound_live`, and how far down it reaches.
+    bound_settled: array<vec4<f32>, 4>,
+    bound_down_settled: vec4<f32>,
 };
 
 struct DrawArgs {
@@ -368,15 +372,23 @@ fn culled(p: vec3<f32>) -> bool {
 // projected with last frame's camera, his nearest point behind the farthest
 // depth of every pixel the box covers. A box partly off last frame's
 // screen, or reaching past the camera's near plane, is never hidden.
-fn occluded(p: vec3<f32>, yaw: f32, kind: u32, fallen: bool) -> bool {
+// `state`: STANDING, FALLING (dying) or SETTLED (a corpse record).
+fn occluded(p: vec3<f32>, yaw: f32, kind: u32, state: u32) -> bool {
     var b = params.bound_live[kind];
     var down = params.bound_down_live[kind];
-    if fallen {
+    if state == FALLING {
         b = params.bound_fall[kind];
         down = params.bound_down_fall[kind];
+    } else if state == SETTLED {
+        b = params.bound_settled[kind];
+        down = params.bound_down_settled[kind];
     }
     return box_hidden(p, yaw, b, down);
 }
+
+const STANDING: u32 = 0u;
+const FALLING: u32 = 1u;
+const SETTLED: u32 = 2u;
 
 // Whether a box around `p` in the frame of `yaw` was hidden last frame:
 // `b` its reach forward, back, sideways either way and up, `down` its
@@ -444,13 +456,13 @@ fn box_hidden(p: vec3<f32>, yaw: f32, b: vec4<f32>, down: f32) -> bool {
 const DRAWN: u32 = 0u;
 const HIDDEN: u32 = 1u;
 const MARKED: u32 = 2u;
-fn occlusion(bucket: u32, p: vec3<f32>, yaw: f32, kind: u32, fallen: bool) -> u32 {
+fn occlusion(bucket: u32, p: vec3<f32>, yaw: f32, kind: u32, state: u32) -> u32 {
     // FL_OCCLUDE_CHECK=2 marks every soldier the test reads, to show the
     // mark works.
     if params.occlude.w == 2u && params.occlude.y != 0u {
         return MARKED;
     }
-    if params.occlude.y == 0u || !occluded(p, yaw, kind, fallen) {
+    if params.occlude.y == 0u || !occluded(p, yaw, kind, state) {
         return DRAWN;
     }
     atomicAdd(&counts[HIDDEN_COUNTER + bucket], 1u);
@@ -823,7 +835,7 @@ fn build_soldier(i: u32) {
         let coarse = level(params.bands[kind * 3u + 1u], d2);
         lod = clamp(sm.lod & LOD_MASK, fine, coarse);
         draw_lod = lod;
-        occl = occlusion(kind * NUM_LODS + lod, position, yaw, kind, death_t > 0.0);
+        occl = occlusion(kind * NUM_LODS + lod, position, yaw, kind, select(STANDING, FALLING, death_t > 0.0));
         var body = 0u;
         if params.lod_hidden.x != 0u {
             body = body_state(sm.lod >> BODY_SHIFT, lod, position, yaw, kind, occl, death_t > 0.0);
@@ -965,7 +977,7 @@ fn build_corpse(j: u32, t: u32) {
     let in_view = !culled(position);
     var occl = DRAWN;
     if in_view {
-        occl = occlusion(kind * NUM_LODS + lod, position, rec.anim.x, kind, true);
+        occl = occlusion(kind * NUM_LODS + lod, position, rec.anim.x, kind, SETTLED);
     }
     let visible = in_view && occl != HIDDEN;
     var casts = 0u;

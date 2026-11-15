@@ -132,10 +132,11 @@ struct PullVertex {
 @group(3) @binding(3) var<storage, read> pull_buckets: array<vec4<u32>>;
 
 #ifdef UNIT_BOUND_CHECK
-// FL_OCCLUDE_CHECK (render_units_occlusion.rs): per kind, standing then
-// dying or fallen, how far any drawn corner reached from his position in
-// his facing frame: forward, back, sideways, up, down, as float bits.
-@group(3) @binding(10) var<storage, read_write> bound_reach: array<atomic<u32>, 40>;
+// FL_OCCLUDE_CHECK (render_units_occlusion.rs): per kind, standing, dying,
+// then settled (a corpse record, his death played out), how far any drawn
+// corner reached from his position in his facing frame: forward, back,
+// sideways, up, down, as float bits.
+@group(3) @binding(10) var<storage, read_write> bound_reach: array<atomic<u32>, 60>;
 
 fn measure_reach(placed: vec3<f32>) {
     let d = placed - pose_at(P_POS).xyz;
@@ -143,8 +144,11 @@ fn measure_reach(placed: vec3<f32>) {
     // unit_pose.wgsl `rot_y` turned his frame by cos, sin: turn it back.
     let x = d.x * yaw.x - d.z * yaw.y;
     let z = d.x * yaw.y + d.z * yaw.x;
-    let fallen = select(0u, 1u, pose_at(P_DEATH).w > 0.0);
-    let base = ((#{PULL_BUCKET}u / 4u) * 2u + fallen) * 5u;
+    // A corpse record's death has played out to 1; a dying man's stops
+    // a tick short of it (combat.rs freezes him at his last tick).
+    let death = pose_at(P_DEATH).w;
+    let state = select(select(0u, 1u, death > 0.0), 2u, death > 0.999);
+    let base = ((#{PULL_BUCKET}u / 4u) * 3u + state) * 5u;
     atomicMax(&bound_reach[base], bitcast<u32>(max(z, 0.0)));
     atomicMax(&bound_reach[base + 1u], bitcast<u32>(max(-z, 0.0)));
     atomicMax(&bound_reach[base + 2u], bitcast<u32>(abs(x)));
