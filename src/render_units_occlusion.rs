@@ -80,15 +80,20 @@ pub fn bound_check() -> bool {
 }
 
 /// `FL_LOD_HIDDEN`: a living soldier the test did not hide, whose body the
-/// men in front have hidden for `hold` frames in a row, draws one level
-/// coarser than his held level (unit_build.wgsl `body_count`). His body box
+/// men in front keep hidden, draws one level coarser than his held level
+/// (unit_build.wgsl `body_state`). His body box
 /// runs from just above his feet to `top` metres above them, `half` metres
 /// either side of him. Mode 0 off, 1 for the held level 2 only (the far men,
 /// of whom a helmet of a few pixels shows), 2 for level 1 too, 3 for level 0
 /// too. Hidden frames raise his count by one, up to twice `hold`, and
 /// showing frames take one off; he goes coarse when it reaches `hold` and
-/// back when it is at 0, so a frame of a gap does not flip him. His held
-/// level and his shadow do not change.
+/// back when it is at 0, so a frame of a gap does not flip him. A man
+/// whose body shows about half the time walks the count up and down; the
+/// hold of 96 frames brings the changes of mesh down to one per coarse
+/// man every 18 s or so in the 200k clash seen from the west flank (27 a frame
+/// against 238 at a hold of 12, for the same men drawn coarser and the
+/// same frame rate). One who comes into view is back within 192 frames.
+/// His held level and his shadow do not change.
 /// `FL_LOD_HIDDEN_TOP`, `FL_LOD_HIDDEN_HALF` and `FL_LOD_HIDDEN_HOLD` tune it.
 #[derive(Clone, Copy, Debug)]
 pub struct LodHidden {
@@ -106,7 +111,7 @@ pub fn lod_hidden() -> LodHidden {
             mode: crate::util::env_or("FL_LOD_HIDDEN", 0_u32).min(3),
             top: crate::util::env_or("FL_LOD_HIDDEN_TOP", 1.0_f32).max(0.2),
             half: crate::util::env_or("FL_LOD_HIDDEN_HALF", 0.15_f32).max(0.01),
-            hold: crate::util::env_or("FL_LOD_HIDDEN_HOLD", 12_u32).clamp(1, 255),
+            hold: crate::util::env_or("FL_LOD_HIDDEN_HOLD", 96_u32).clamp(1, 255),
         };
         if cfg.mode != 0 {
             info!("FL_LOD_HIDDEN: {cfg:?}");

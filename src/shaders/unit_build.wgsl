@@ -310,7 +310,7 @@ const BIN_COUNTER: u32 = 53u;
 const POSE_FAR_COUNTER: u32 = BIN_COUNTER + 16u * DEPTH_BINS;
 // Per bucket, the soldiers in the frustum the occlusion test hid.
 const HIDDEN_COUNTER: u32 = POSE_FAR_COUNTER + 4u;
-// Per held level, the soldiers drawn a level coarser (`body_count`).
+// Per held level, the soldiers drawn a level coarser (`body_state`).
 const COARSER_COUNTER: u32 = HIDDEN_COUNTER + 16u;
 // `Smooth::lod` holds the held level in its low byte and, under
 // FL_LOD_HIDDEN, his body count in the ten bits above it and his coarse
