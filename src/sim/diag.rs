@@ -7,7 +7,6 @@ use bevy::prelude::*;
 use bevy::tasks::ComputeTaskPool;
 use std::time::Instant;
 
-use super::job::CHUNK;
 use super::SimStats;
 use crate::spatial::SpatialGrid;
 use crate::units::Units;
@@ -34,6 +33,10 @@ pub(super) fn log_step(stats: &mut SimStats, step_ms: f32, grid_ms: f32, units: 
     }
 }
 
+/// Men per task of the neighbour audit. Its sums are taken per task and
+/// then added, so the size is part of its numbers and stays as it is.
+const AUDIT_CHUNK: usize = 16_384;
+
 /// The overlap and movement audit over the full population: the
 /// smallest and mean nearest-neighbour distance and the mean per-tick
 /// displacement, for the overlay. Parallel over chunks.
@@ -43,8 +46,8 @@ pub(super) fn neighbour_audit(stats: &mut SimStats, grid: &SpatialGrid, pos: &[V
     let audit_t0 = Instant::now();
     let pos_now = pos;
     let partials: Vec<(f32, f64, u64, f64)> = ComputeTaskPool::get().scope(|scope| {
-        for (ci, chunk) in pos_prev.chunks(CHUNK * 8).enumerate() {
-            let start = ci * CHUNK * 8;
+        for (ci, chunk) in pos_prev.chunks(AUDIT_CHUNK).enumerate() {
+            let start = ci * AUDIT_CHUNK;
             scope.spawn(async move {
                 let mut min_d2 = f32::MAX;
                 let mut sum_d = 0.0f64;
