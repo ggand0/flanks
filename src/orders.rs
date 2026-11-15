@@ -12,7 +12,7 @@
 //! regiment order by their own `home` offset (block moves, never
 //! converges).
 //!
-//! A click or a drag on a lane (the walled town's wall walk,
+//! A click or a drag on a lane (the stone wall's walk,
 //! town_layout.rs `Lane`) takes the lane's own places instead
 //! (`lane_layout`): the ranks are as deep as the lane holds, the files
 //! run along it from the drag's start as far as the drag or the men need,
@@ -615,10 +615,10 @@ pub fn click_order(groups: &mut Groups, terrain: &Terrain, selected: &[usize], t
     order_regiments(groups, selected, target);
 }
 
-/// The map's lane an order at `p` is meant for, if any: the walled
-/// town's walk, for `p` anywhere on the wall (`Lane::catches`).
+/// The map's lane an order at `p` is meant for, if any: the stone wall's
+/// walk, for `p` anywhere on the wall (`Lane::catches`).
 fn lane_at(terrain: &Terrain, p: Vec2) -> Option<Lane> {
-    if terrain.kind != crate::terrain::MapKind::WalledTown {
+    if !terrain.kind.has_wall() {
         return None;
     }
     let lane = crate::town_layout::walk_lane(terrain.body_radius());

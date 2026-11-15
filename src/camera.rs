@@ -271,8 +271,8 @@ pub fn apply_camera_transform(
     let max = terrain.max();
     cam.focus.x = cam.focus.x.clamp(min.x, max.x);
     cam.focus.z = cam.focus.z.clamp(min.y, max.y);
-    // The focus rides the drawn ground, so it glides over the walled
-    // town's walls and houses instead of jumping onto their tops.
+    // The focus rides the drawn ground, so it glides over the stone wall
+    // and the houses instead of jumping onto their tops.
     cam.focus.y = terrain.ground_at(cam.focus.x, cam.focus.z);
     let mut eye = camera_eye(&cam, &terrain);
     // The eye stays above the walls and roofs around it (the sim's

@@ -23,8 +23,8 @@ pub const CHUNK_CELLS: usize = 32;
 
 /// The battlefields in the menu's Map row. At launch a setup's map wins
 /// (an `FL_SETUP` file, or the Demo's with `FL_DEMO=1`), then
-/// `FL_MAP=big_grassland`, `hill`, `big_hill`, `walled_town`, `classic`,
-/// `river`, `sandbox`, `obstacles` or `town`.
+/// `FL_MAP=big_grassland`, `hill`, `big_hill`, `walled_town`, `wall_debug`,
+/// `classic`, `river`, `sandbox`, `obstacles` or `town`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub enum MapKind {
     /// Broad pasture shoulders around an open lowland: the default.
@@ -39,6 +39,9 @@ pub enum MapKind {
     /// The hill's ground with a stone wall across the plateau and a town
     /// behind it (town_layout.rs).
     WalledTown,
+    /// The walled town's wall on the same ground, with no houses: a field
+    /// for watching units on the wall, its stairs and its walk.
+    WallDebug,
     /// The 0.1.0 heightfield: rolling noise with ridged peaks, no river.
     Classic,
     /// Experimental: the same noise with terraces, a river and a bridge.
@@ -65,6 +68,7 @@ impl MapKind {
             Ok("hill") => Self::Hill,
             Ok("big_hill") => Self::BigHill,
             Ok("walled_town") => Self::WalledTown,
+            Ok("wall_debug") => Self::WallDebug,
             Ok("river") => Self::River,
             Ok("classic") => Self::Classic,
             Ok("sandbox") => Self::Sandbox,
@@ -81,6 +85,7 @@ impl MapKind {
             Self::Hill => "Hill",
             Self::BigHill => "Big Hill",
             Self::WalledTown => "Walled Town",
+            Self::WallDebug => "Wall Debug",
             Self::Classic => "Classic",
             Self::River => "River",
             Self::Sandbox => "Sandbox",
@@ -95,24 +100,32 @@ impl MapKind {
     }
 
     /// Maps whose steep faces are impassable: the river map's terraces and
-    /// gorges, and the obstacle and town maps' blocks and walls. The others
-    /// never block.
+    /// gorges, the obstacle and town maps' blocks and walls, and the stone
+    /// wall's pieces. The others never block.
     pub const fn has_blocked_ground(self) -> bool {
-        matches!(self, Self::River | Self::Obstacles | Self::Town | Self::WalledTown)
+        matches!(self, Self::River | Self::Obstacles | Self::Town) || self.has_wall()
+    }
+
+    /// Maps with the stone wall of town_layout.rs across the hill's
+    /// plateau: its pieces make the sim's ground, its walk is a lane for
+    /// orders and the defenders stand behind it.
+    pub const fn has_wall(self) -> bool {
+        matches!(self, Self::WalledTown | Self::WallDebug)
     }
 
     /// Maps on the hill's heightmap.
     const fn on_hill(self) -> bool {
-        matches!(self, Self::Hill | Self::BigHill | Self::WalledTown)
+        matches!(self, Self::Hill | Self::BigHill) || self.has_wall()
     }
 
     /// Every map, in the menu's order.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Grassland,
         Self::BigGrassland,
         Self::Hill,
         Self::BigHill,
         Self::WalledTown,
+        Self::WallDebug,
         Self::Classic,
         Self::River,
         Self::Sandbox,
@@ -152,9 +165,10 @@ pub struct Terrain {
     /// Vertex heights, row-major [z][x]: what the sim walks on, shoots
     /// over and plans on.
     heights: Vec<f32>,
-    /// The drawn ground where it differs from `heights`: on the walled
-    /// town the ground under the wall and the houses, which the sim's
-    /// copy raises by the pieces. None on every other map.
+    /// The drawn ground where it differs from `heights`: on the maps with
+    /// the wall (`MapKind::has_wall`) the ground under the wall and the
+    /// houses, which the sim's copy raises by the pieces. None on every
+    /// other map.
     ground: Option<Vec<f32>>,
     verts_x: usize,
     verts_z: usize,
@@ -163,9 +177,9 @@ pub struct Terrain {
     /// ground (`MapKind::has_blocked_ground`).
     blocked: Vec<bool>,
     /// Vertices whose open or blocked state a structure decides instead
-    /// of the step rule: the walled town's pieces (town_layout.rs
-    /// `sim_ground`). None on every other map, and None per vertex where
-    /// the step rule holds.
+    /// of the step rule: the wall's and the houses' pieces (town_layout.rs
+    /// `sim_ground`). None on the maps without the wall, and None per
+    /// vertex where the step rule holds.
     open: Option<Vec<Option<bool>>>,
     pub kind: MapKind,
     /// True on maps without a river:
@@ -964,10 +978,10 @@ pub(crate) fn build_terrain(kind: MapKind) -> Terrain {
     if kind == MapKind::Town {
         crate::obstacle_map::raise_blocks(&mut heights, origin, (verts_x, verts_z), &crate::obstacle_map::town_blocks());
     }
-    let (ground, open) = if kind == MapKind::WalledTown {
-        let pieces = crate::town_layout::pieces();
+    let (ground, open) = if kind.has_wall() {
+        let pieces = crate::town_layout::pieces(kind);
         let level = crate::town_layout::level_ground(&mut heights, origin, (verts_x, verts_z), &pieces);
-        info!("terrain: the walled town's wall run stands at {level:.2} m");
+        info!("terrain: the {} map's wall run stands at {level:.2} m", kind.label());
         let sim = crate::town_layout::sim_ground(&heights, origin, (verts_x, verts_z), &pieces);
         (Some(std::mem::replace(&mut heights, sim.heights)), Some(sim.open))
     } else {

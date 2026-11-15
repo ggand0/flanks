@@ -13,31 +13,34 @@
 //! - `FL_TEST_PATH=river` with `FL_MAP=river`: one regiment ordered
 //!   across near the bridge and one far from it; logs whether each
 //!   route takes the bridge or the ford.
-//! - `FL_TEST_PATH=walls` with `FL_MAP=walled_town`: a regiment of 40 in
-//!   the plaza given a line along the walk west of the gatehouse, as a
-//!   player mans a wall, which it can reach only up a stair; after that
-//!   verdict a line along the walk east of the tower at x = 80, so it walks
-//!   over the gatehouse's bridge and through a tower; and a regiment of
-//!   200 on the plain ordered to the plaza, which the closed gate leaves
-//!   only the way around an open end of the wall. Logs which stair, which
-//!   end.
-//! - `FL_TEST_PATH=walls_archers` with `FL_MAP=walled_town`: a regiment of
-//!   60 archers in the plaza given a line along the walk east of the gate,
-//!   and 300 enemy men on the slope below it, in bow range of the walk,
-//!   ordered up to the wall's foot: the archers shoot down from the wall,
-//!   and the enemy's front rank stops where the blocked ground begins. The
-//!   archers' skirmish is off, as a player sets it to hold a wall: the run
-//!   measures the enemy's distance straight through the wall.
-//! - `FL_TEST_PATH=walls_place` with `FL_MAP=walled_town`: placing units
-//!   on the walk from the plateau behind the town, through its streets.
-//!   200 archers given a 40 m line along the walk east of the gate; 200
-//!   men the same line, who must stand beside the archers; 200 more
-//!   clicked onto the walk west of the gate. Logs each one's places: how
-//!   many files, and how many places on ground a man cannot stand on.
-//! - `FL_TEST_PATH=walls_under` with `FL_MAP=walled_town`: 200 archers at
-//!   the wall's inner foot east of a stair, where the defenders deploy,
-//!   given a line along the walk above and west of them, so the whole
-//!   regiment has to walk back along the foot to the stair.
+//! - `FL_TEST_PATH=walls` with `FL_MAP=walled_town` or `FL_MAP=wall_debug`:
+//!   a regiment of 40 in the plaza given a line along the walk west of the
+//!   gatehouse, as a player mans a wall, which it can reach only up a
+//!   stair; after that verdict a line along the walk east of the tower at
+//!   x = 80, so it walks over the gatehouse's bridge and through a tower;
+//!   and a regiment of 200 on the plain ordered to the plaza, which the
+//!   closed gate leaves only the way around an open end of the wall. Logs
+//!   which stair, which end.
+//! - `FL_TEST_PATH=walls_archers` with `FL_MAP=walled_town` or
+//!   `FL_MAP=wall_debug`: a regiment of 60 archers in the plaza given a
+//!   line along the walk east of the gate, and 300 enemy men on the slope
+//!   below it, in bow range of the walk, ordered up to the wall's foot: the
+//!   archers shoot down from the wall, and the enemy's front rank stops
+//!   where the blocked ground begins. The archers' skirmish is off, as a
+//!   player sets it to hold a wall: the run measures the enemy's distance
+//!   straight through the wall.
+//! - `FL_TEST_PATH=walls_place` with `FL_MAP=walled_town` or
+//!   `FL_MAP=wall_debug`: placing units on the walk from the plateau behind
+//!   the wall (through the town's streets on the walled town). 200 archers
+//!   given a 40 m line along the walk east of the gate; 200 men the same
+//!   line, who must stand beside the archers; 200 more clicked onto the
+//!   walk west of the gate. Logs each one's places: how many files, and how
+//!   many places on ground a man cannot stand on.
+//! - `FL_TEST_PATH=walls_under` with `FL_MAP=walled_town` or
+//!   `FL_MAP=wall_debug`: 200 archers at the wall's inner foot east of a
+//!   stair, where the defenders deploy, given a line along the walk above
+//!   and west of them, so the whole regiment has to walk back along the
+//!   foot to the stair.
 //!
 //! Per regiment the log has the share of men within 5 m of their slots,
 //! the men stuck (slower than 0.1 m/s for 10 s while more than 5 m from
@@ -143,13 +146,20 @@ impl Plugin for PathTestPlugin {
 pub fn spawn(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
     let scene = scene().unwrap_or_default();
     let mut list = Vec::new();
+    // The wall scenes run on either map with the wall.
     let wanted_map = match scene.as_str() {
-        "river" => crate::terrain::MapKind::River,
-        "walls" | "walls_archers" | "walls_place" | "walls_under" => crate::terrain::MapKind::WalledTown,
-        _ => crate::terrain::MapKind::Obstacles,
+        "river" => Some(crate::terrain::MapKind::River),
+        "walls" | "walls_archers" | "walls_place" | "walls_under" => None,
+        _ => Some(crate::terrain::MapKind::Obstacles),
     };
-    if terrain.kind != wanted_map {
-        warn!("[path-test] scene {scene} expects FL_MAP={:?}, the map is {:?}", wanted_map, terrain.kind);
+    match wanted_map {
+        Some(wanted) if terrain.kind != wanted => {
+            warn!("[path-test] scene {scene} expects FL_MAP={:?}, the map is {:?}", wanted, terrain.kind);
+        }
+        None if !terrain.kind.has_wall() => {
+            warn!("[path-test] scene {scene} expects FL_MAP=walled_town or wall_debug, the map is {:?}", terrain.kind);
+        }
+        _ => {}
     }
     let mut add = |list: &mut Vec<_>, at: Vec2, men: usize| {
         crate::regiments::spawn_regiment(units, terrain, list, 0, KIND_HEAVY, at, men, -1.0);

@@ -88,7 +88,7 @@ fn respawn_vegetation(
             let groups = RIVER_ZONES.map(|zone| (zone, None));
             planting.log(&specs, "river", &groups);
         }
-        MapKind::Hill | MapKind::BigHill | MapKind::WalledTown => {
+        MapKind::Hill | MapKind::BigHill | MapKind::WalledTown | MapKind::WallDebug => {
             let specs: Vec<_> = trees.0.iter().map(|tree| (tree.name, tree.reach)).collect();
             let stands = hill_stands(terrain.kind);
             let planting = hill_planting(&specs, &terrain, &stands);
@@ -99,6 +99,7 @@ fn respawn_vegetation(
             let map = match terrain.kind {
                 MapKind::BigHill => "big_hill",
                 MapKind::WalledTown => "walled_town",
+                MapKind::WallDebug => "wall_debug",
                 _ => "hill",
             };
             planting.log(&specs, map, &groups);

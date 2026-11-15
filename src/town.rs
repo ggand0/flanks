@@ -3,7 +3,8 @@
 //! The nine GLBs reference three shared atlases by file name
 //! (tools/blender/town/promote_assets.py), so each atlas is decoded once
 //! and one material per atlas serves every instance, which Bevy batches.
-//! Loaded the first time the map is shown, so other maps pay nothing.
+//! Loaded the first time a map with the wall is shown, so other maps pay
+//! nothing.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -58,8 +59,8 @@ const FILES: [(Kind, &str); 9] = [
     (Kind::House(House::Merchant), "merchant_house.glb"),
 ];
 
-/// The pieces follow the terrain's map: shown on the walled town, gone
-/// on every other.
+/// The pieces follow the terrain's map: shown on the maps with the wall
+/// (the walled town's houses only there), gone on every other.
 #[allow(clippy::too_many_arguments)]
 fn respawn_town(
     mut seen: Local<Option<MapKind>>,
@@ -78,7 +79,7 @@ fn respawn_town(
     for e in &old {
         commands.entity(e).despawn();
     }
-    if terrain.kind != MapKind::WalledTown {
+    if !terrain.kind.has_wall() {
         return;
     }
     if models.0.is_empty() {
@@ -92,7 +93,7 @@ fn respawn_town(
         }
         info!("town: models loaded in {:.0} ms", t0.elapsed().as_secs_f32() * 1000.0);
     }
-    let pieces = crate::town_layout::pieces();
+    let pieces = crate::town_layout::pieces(terrain.kind);
     for piece in &pieces {
         let Some(parts) = models.0.get(&piece.kind) else { continue };
         let ground = terrain.ground_at(piece.pos.x, piece.pos.y);

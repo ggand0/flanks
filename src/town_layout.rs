@@ -1,8 +1,9 @@
-//! The walled town (`FL_MAP=walled_town`): the hill map's ground with a
-//! stone wall across the plateau and a town of houses behind it. Every
-//! piece is listed once here (`pieces`), and both the drawn models
-//! (town.rs) and the sim's ground (`sim_ground`) come from that list, so
-//! the two cannot drift.
+//! The stone wall across the hill map's plateau, on two maps: the walled
+//! town (`FL_MAP=walled_town`), with a town of houses behind the wall, and
+//! Wall Debug (`FL_MAP=wall_debug`), the same wall with no houses. Every
+//! piece is listed once here (`pieces`, per map), and both the drawn
+//! models (town.rs) and the sim's ground (`sim_ground`) come from that
+//! list, so the two cannot drift.
 //!
 //! The sim reads the ground on a 2 m vertex grid: a soldier stands on
 //! the vertex nearest him, and a vertex is open or blocked
@@ -49,7 +50,7 @@
 
 use bevy::math::Vec2;
 
-use crate::terrain::CELL;
+use crate::terrain::{MapKind, CELL};
 
 /// The wall's centre line (z, m): its outer face at +4 looks south down
 /// the climb, the town lies north of its inner face at -4.
@@ -264,9 +265,9 @@ fn curtain(out: &mut Vec<Piece>, a: f32, b: f32) {
     }
 }
 
-/// Every piece of the map: the wall run west to east, the stairs, then
-/// the houses row by row.
-pub fn pieces() -> Vec<Piece> {
+/// Every piece of the map `kind`, one with the wall: the wall run west to
+/// east, the stairs, then on the walled town the houses row by row.
+pub fn pieces(kind: MapKind) -> Vec<Piece> {
     let mut out = Vec::new();
     // The first wall centres sit 7 m from a tower's centre and 15 m from
     // the gatehouse's, as the models join.
@@ -285,7 +286,9 @@ pub fn pieces() -> Vec<Piece> {
     for &x in &STAIRS_X {
         out.push(Piece { kind: Kind::Stair, pos: Vec2::new(x, WALL_Z - 4.0), turns: 0 });
     }
-    houses(&mut out);
+    if kind == MapKind::WalledTown {
+        houses(&mut out);
+    }
     out
 }
 
@@ -562,5 +565,46 @@ pub mod spots {
     #[cfg(test)]
     pub fn stair_mid(i: usize) -> Vec2 {
         Vec2::new(STAIRS_X[i] + 6.0, WALL_Z - 6.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::terrain::build_terrain;
+
+    /// Wall Debug is the walled town less its houses: the same wall pieces
+    /// in the same order, so its ground and models are the town's wall.
+    #[test]
+    fn the_wall_debug_pieces_are_the_walled_town_less_its_houses() {
+        let key = |p: &Piece| (p.kind, p.pos.x.to_bits(), p.pos.y.to_bits(), p.turns);
+        let town: Vec<_> = pieces(MapKind::WalledTown)
+            .iter()
+            .filter(|p| !matches!(p.kind, Kind::House(_)))
+            .map(key)
+            .collect();
+        let debug = pieces(MapKind::WallDebug);
+        assert_eq!(debug.iter().map(key).collect::<Vec<_>>(), town);
+        let count = |k: Kind| debug.iter().filter(|p| p.kind == k).count();
+        assert!(!debug.iter().any(|p| matches!(p.kind, Kind::House(_))));
+        assert_eq!(count(Kind::Tower), 4);
+        assert_eq!(count(Kind::Stair), 4);
+        assert_eq!(count(Kind::Gatehouse), 1);
+    }
+
+    /// The wall's terrace is levelled before the house pads, so the wall
+    /// stands at the same height on both maps: the walk, the bridge, a
+    /// tower's passage and the stairs, in the sim's ground and the drawn.
+    #[test]
+    fn the_wall_stands_at_the_same_height_on_both_maps() {
+        let (town, debug) = (build_terrain(MapKind::WalledTown), build_terrain(MapKind::WallDebug));
+        let mut points = vec![spots::WALK_WEST, spots::WALK_EAST, spots::BRIDGE, Vec2::new(TOWERS_X[1], WALL_Z)];
+        points.extend((0..STAIRS_X.len()).map(spots::stair_mid));
+        points.push(spots::STAIR_FOOT_EAST);
+        for p in points {
+            assert_eq!(town.height_at(p.x, p.y), debug.height_at(p.x, p.y), "the sim's height at {p}");
+            assert_eq!(town.ground_at(p.x, p.y), debug.ground_at(p.x, p.y), "the drawn ground at {p}");
+            assert_eq!(town.blocked_at(p.x, p.y), debug.blocked_at(p.x, p.y), "blocked at {p}");
+        }
     }
 }

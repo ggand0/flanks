@@ -1119,7 +1119,7 @@ fn apply_reforms(mut units: ResMut<Units>, mut groups: ResMut<Groups>, mut tick:
 /// per man still on his way and one pass over the men there per tick,
 /// nothing once they are all there; a new order or a fight ends it.
 fn fill_lane_slots(mut units: ResMut<Units>, mut groups: ResMut<Groups>, terrain: Res<crate::terrain::Terrain>) {
-    if terrain.kind != crate::terrain::MapKind::WalledTown {
+    if !terrain.kind.has_wall() {
         return;
     }
     let lane = crate::town_layout::walk_lane(terrain.body_radius());

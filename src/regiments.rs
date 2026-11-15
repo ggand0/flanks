@@ -28,13 +28,14 @@ pub fn army_gap() -> f32 {
 }
 
 /// The z the no-man's land is centred on and its depth, on the map
-/// `kind`. The walled town puts the player's army (team 0) on the plateau
-/// behind its wall, its front 10 m north of the wall's line so the first
-/// ranks stand in the town, and the enemy on the plain south of z = 150;
-/// FL_ARMY_GAP still sets the depth there, about the same centre. Every
-/// other map centres the gap on the field.
+/// `kind`. A map with the stone wall puts the player's army (team 0) on
+/// the plateau behind it, its front 10 m north of the wall's line so the
+/// first ranks stand at the wall's inner foot (in the town, on the walled
+/// town), and the enemy on the plain south of z = 150; FL_ARMY_GAP still
+/// sets the depth there, about the same centre. Every other map centres
+/// the gap on the field.
 pub fn army_lines(kind: crate::terrain::MapKind) -> (f32, f32) {
-    if kind == crate::terrain::MapKind::WalledTown {
+    if kind.has_wall() {
         let (north, south) = (crate::town_layout::WALL_Z - 10.0, 150.0);
         ((north + south) * 0.5, crate::util::env_or("FL_ARMY_GAP", south - north))
     } else {
