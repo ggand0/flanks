@@ -186,7 +186,8 @@ struct Params {
     bound_down_fall: vec4<f32>,
     // FL_LOD_HIDDEN (render_units_occlusion.rs): x the mode (0 off, 1 the
     // held level 2, 2 also level 1, 3 also level 0), y the hold
-    // (`body_state`).
+    // (`body_state`). z 1 under FL_FALLEN_FAR (render_units.rs `fallen_far`):
+    // a body at level 2 draws at level 3.
     lod_hidden: vec4<u32>,
     // The body box: x its half-width, y its top above his feet, z its
     // bottom above his feet, in metres.
@@ -994,10 +995,16 @@ fn build_corpse(j: u32, t: u32) {
     let d = position - params.cam_pos;
     let d2 = dot(d, d) * jitter * jitter;
     let lod = level(params.bands[kind * 3u + 2u], d2);
+    // FL_FALLEN_FAR: a far body draws at the last level. He casts by his
+    // plain level, and level 2 casts nothing.
+    var draw_lod = lod;
+    if params.lod_hidden.z != 0u && lod == NUM_LODS - 2u {
+        draw_lod = NUM_LODS - 1u;
+    }
     let in_view = !culled(position);
     var occl = DRAWN;
     if in_view {
-        occl = occlusion(kind * NUM_LODS + lod, position, rec.anim.x, kind, SETTLED + fall_way(rec.color.a));
+        occl = occlusion(kind * NUM_LODS + draw_lod, position, rec.anim.x, kind, SETTLED + fall_way(rec.color.a));
     }
     let visible = in_view && occl != HIDDEN;
     var casts = 0u;
@@ -1007,11 +1014,11 @@ fn build_corpse(j: u32, t: u32) {
     if !visible && casts == 0u {
         return;
     }
-    let entry = list_entry(kind, ridx, lod);
+    let entry = list_entry(kind, ridx, draw_lod);
     if visible {
-        let bucket = kind * NUM_LODS + lod;
+        let bucket = kind * NUM_LODS + draw_lod;
         atomicAdd(&counts[16u + bucket], 1u);
-        queue_draw(t, bucket, entry, lod, dot(d, d), occl == MARKED);
+        queue_draw(t, bucket, entry, draw_lod, dot(d, d), occl == MARKED);
     }
     append_casters(casts, kind, entry);
 }
