@@ -72,9 +72,10 @@ pub fn cpu_sweep(cfg: Res<GpuSyncConfig>) -> bool {
 
 /// Words of the counts readback: 16 bucket totals, 16 fallen per bucket,
 /// the frame stamp, the soldier count, 1 if the occlusion test ran, one
-/// spare, the 16 caster list counts (cascade * 4 + kind), then the 16
-/// bucket counts of soldiers the occlusion test hid.
-const READBACK_WORDS: usize = 68;
+/// spare, the 16 caster list counts (cascade * 4 + kind), the 16 bucket
+/// counts of soldiers the occlusion test hid, then per held level the
+/// soldiers drawn a level coarser (`FL_LOD_HIDDEN`).
+const READBACK_WORDS: usize = 72;
 
 /// Sun shadow cascades the build fills caster lists for, Bevy's maximum.
 pub const MAX_CASCADES: usize = bevy::pbr::MAX_CASCADES_PER_LIGHT;
@@ -106,9 +107,16 @@ const DEPTH_BIN_SPAN: f32 = 24.0;
 /// Build counters: per bucket the soldiers and the fallen, the caster
 /// lists, the ring count, the pose slots taken per kind, per bucket its
 /// depth bins, the far levels' pose slots per kind, then per bucket the
-/// soldiers the occlusion test hid.
-const COUNTERS: usize =
-    2 * NUM_BUCKETS + CASTER_LISTS + 1 + NUM_KINDS + NUM_BUCKETS * DEPTH_BINS + NUM_KINDS + NUM_BUCKETS;
+/// soldiers the occlusion test hid, then per held level the soldiers drawn
+/// a level coarser.
+const COUNTERS: usize = 2 * NUM_BUCKETS
+    + CASTER_LISTS
+    + 1
+    + NUM_KINDS
+    + NUM_BUCKETS * DEPTH_BINS
+    + NUM_KINDS
+    + NUM_BUCKETS
+    + NUM_LODS;
 
 /// Storage buffers the build pass binds (`init_gpu_unit_pipelines`), more
 /// than any other unit pass. A device that allows fewer per stage keeps the
@@ -279,6 +287,16 @@ pub struct BuildParams {
     bound_fall: [Vec4; NUM_KINDS],
     bound_down_live: Vec4,
     bound_down_fall: Vec4,
+    /// `FL_LOD_HIDDEN` (render_units_occlusion.rs): x the mode, y the
+    /// frames a soldier's body box must stay hidden before he draws a level
+    /// coarser.
+    lod_hidden: UVec4,
+    /// The body box: x its half-width, y its top above his feet, z its
+    /// bottom above his feet, in metres.
+    body_box: Vec4,
+    /// Per kind, half the standing height: the feet lie that far below the
+    /// record position (unit_glb.rs drops the model so).
+    half_height: Vec4,
 }
 
 /// The pose pass uniform (`Params` in unit_pose_pass.wgsl).
@@ -290,7 +308,7 @@ struct PoseParams {
 }
 
 const _: () = assert!(NUM_KINDS == 4, "BuildParams and PoseParams pack per-kind values in vec4s");
-const _: () = assert!(COUNTERS == 2121, "unit_build.wgsl sizes `counts` for 2121");
+const _: () = assert!(COUNTERS == 2125, "unit_build.wgsl sizes `counts` for 2125");
 const _: () = assert!(DEPTH_BINS == 128, "unit_build.wgsl has 128 depth bins per bucket");
 const _: () = assert!(NUM_BUCKETS == 16, "unit_build.wgsl sizes its counters for 16 buckets");
 const _: () = assert!(MAX_CASCADES == 4, "unit_build.wgsl sizes its cascades for 4");
@@ -726,7 +744,11 @@ fn build_frame_params(
     if p.occlude.x != 0 {
         use crate::render_units_occlusion::{OccludeMode, mode};
         probe.since += 1;
-        let every_frame = mode() != OccludeMode::Cull || p.occlude.w != 0;
+        // The coarser draw of a soldier whose body is hidden reads the
+        // pyramid every frame.
+        let every_frame = mode() != OccludeMode::Cull
+            || p.occlude.w != 0
+            || crate::render_units_occlusion::lod_hidden().mode != 0;
         if every_frame || probe.active || probe.since >= PROBE_EVERY {
             probe.since = 0;
             frame.build_pyramid = true;
@@ -817,6 +839,12 @@ fn occlusion_params(
         p.occlude.z = 1;
     }
     *last = cam.cloned();
+    let hidden = crate::render_units_occlusion::lod_hidden();
+    if hidden.mode != 0 {
+        p.lod_hidden = UVec4::new(hidden.mode, hidden.hold, 0, 0);
+        p.body_box = Vec4::new(hidden.half, hidden.top, BODY_CLEAR, 0.0);
+        p.half_height = Vec4::from_array(std::array::from_fn(crate::unit_types::half_height));
+    }
     for (kind, [live, fall]) in BOUNDS.iter().enumerate() {
         p.bound_live[kind] = Vec4::new(live.fwd, live.back, live.side, live.up);
         p.bound_fall[kind] = Vec4::new(fall.fwd, fall.back, fall.side, fall.up);
@@ -824,6 +852,10 @@ fn occlusion_params(
         p.bound_down_fall[kind] = fall.down;
     }
 }
+
+/// How far above his feet a soldier's body box starts, in metres: clear of
+/// the ground and the grass between the feet of the man in front.
+const BODY_CLEAR: f32 = 0.1;
 
 /// A camera cut, for the occlusion test: the focus or the distance moved
 /// more than this share of the distance in a frame. The fastest pan, with
@@ -944,6 +976,7 @@ fn on_counts_readback(
     counts.hidden = std::array::from_fn(|lod| {
         words[52..68].iter().skip(lod).step_by(NUM_LODS).map(|&n| n as usize).sum()
     });
+    counts.coarser = std::array::from_fn(|lod| words[68 + lod] as usize);
     // A frame the test ran on: the vertex runs it saved, at least one per
     // vertex of each hidden soldier's level, decide the next probe.
     if words[34] != 0 {

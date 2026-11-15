@@ -79,6 +79,38 @@ pub fn bound_check() -> bool {
     check_level() > 0
 }
 
+/// `FL_LOD_HIDDEN`: a living soldier the test did not hide, whose body the
+/// men in front have hidden for `hold` frames in a row, draws one level
+/// coarser than his held level (unit_build.wgsl `body_count`). His body box
+/// runs from just above his feet to `top` metres above them, `half` metres
+/// either side of him. Mode 0 off, 1 for the held levels 1 and 2, 2 for
+/// level 0 too. His held level and his shadow do not change.
+/// `FL_LOD_HIDDEN_TOP`, `FL_LOD_HIDDEN_HALF` and `FL_LOD_HIDDEN_HOLD` tune it.
+#[derive(Clone, Copy, Debug)]
+pub struct LodHidden {
+    pub mode: u32,
+    pub top: f32,
+    pub half: f32,
+    pub hold: u32,
+}
+
+/// Read once.
+pub fn lod_hidden() -> LodHidden {
+    static CFG: std::sync::OnceLock<LodHidden> = std::sync::OnceLock::new();
+    *CFG.get_or_init(|| {
+        let cfg = LodHidden {
+            mode: crate::util::env_or("FL_LOD_HIDDEN", 0_u32).min(2),
+            top: crate::util::env_or("FL_LOD_HIDDEN_TOP", 1.4_f32).max(0.2),
+            half: crate::util::env_or("FL_LOD_HIDDEN_HALF", 0.25_f32).max(0.01),
+            hold: crate::util::env_or("FL_LOD_HIDDEN_HOLD", 12_u32).clamp(1, 255),
+        };
+        if cfg.mode != 0 {
+            info!("FL_LOD_HIDDEN: {cfg:?}");
+        }
+        cfg
+    })
+}
+
 /// The box the test projects, per kind, in the soldier's facing frame
 /// from his record position (half his height above his feet): forward,
 /// back, sideways either way, up, down, in metres. One for the standing,
