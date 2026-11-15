@@ -73,10 +73,10 @@ pub fn cpu_sweep(cfg: Res<GpuSyncConfig>) -> bool {
 /// Words of the counts readback: 16 bucket totals, 16 fallen per bucket,
 /// the frame stamp, the soldier count, 1 if the occlusion test ran, one
 /// spare, the 16 caster list counts (cascade * 4 + kind), the 16 bucket
-/// counts of soldiers the occlusion test hid, then per held level the
-/// soldiers drawn a level coarser (`FL_LOD_HIDDEN`), then the soldiers the
-/// rule sent coarser or back that frame.
-const READBACK_WORDS: usize = 73;
+/// counts of soldiers the occlusion test hid, then per bucket of their held
+/// level the soldiers drawn a level coarser (`FL_LOD_HIDDEN`), then the
+/// soldiers the rule sent coarser or back that frame.
+const READBACK_WORDS: usize = 85;
 
 /// Sun shadow cascades the build fills caster lists for, Bevy's maximum.
 pub const MAX_CASCADES: usize = bevy::pbr::MAX_CASCADES_PER_LIGHT;
@@ -117,7 +117,7 @@ const COUNTERS: usize = 2 * NUM_BUCKETS
     + NUM_BUCKETS * DEPTH_BINS
     + NUM_KINDS
     + NUM_BUCKETS
-    + NUM_LODS
+    + NUM_BUCKETS
     + 1;
 
 /// Storage buffers the build pass binds (`init_gpu_unit_pipelines`), more
@@ -314,7 +314,7 @@ struct PoseParams {
 }
 
 const _: () = assert!(NUM_KINDS == 4, "BuildParams and PoseParams pack per-kind values in vec4s");
-const _: () = assert!(COUNTERS == 2126, "unit_build.wgsl sizes `counts` for 2126");
+const _: () = assert!(COUNTERS == 2138, "unit_build.wgsl sizes `counts` for 2138");
 const _: () = assert!(DEPTH_BINS == 128, "unit_build.wgsl has 128 depth bins per bucket");
 const _: () = assert!(NUM_BUCKETS == 16, "unit_build.wgsl sizes its counters for 16 buckets");
 const _: () = assert!(MAX_CASCADES == 4, "unit_build.wgsl sizes its cascades for 4");
@@ -350,9 +350,10 @@ pub struct GpuFrameInput {
 }
 
 /// Whether the occlusion test pays for its depth pyramid, main world side.
-/// While the last test hid fewer vertex runs than the pyramid costs, the
+/// While the last test saved fewer vertex runs than the pyramid costs (the
+/// soldiers it hid, and those `FL_LOD_HIDDEN` drew a level coarser), the
 /// pyramid is built only every `PROBE_EVERY` frames and the test runs on
-/// the frame after: a probe. Once a probe hides more, it is built every
+/// the frame after: a probe. Once a probe saves more, it is built every
 /// frame. Seen from above, each rank's heads stand higher on screen than
 /// the rank in front, so an army hides almost none of itself, and there the
 /// probes cost a sixteenth of the pass. Cull mode only: count mode and the
@@ -364,6 +365,11 @@ pub struct OcclusionProbe {
     /// Frames since the pyramid was last built.
     since: u32,
 }
+
+/// Frames the main world asked for the depth pyramid and frames it built
+/// the frame parameters, since the overlay's last log line.
+pub static PYRAMID_FRAMES: [std::sync::atomic::AtomicU32; 2] =
+    [std::sync::atomic::AtomicU32::new(0), std::sync::atomic::AtomicU32::new(0)];
 
 /// Frames between probes.
 const PROBE_EVERY: u32 = 16;
@@ -750,15 +756,13 @@ fn build_frame_params(
     if p.occlude.x != 0 {
         use crate::render_units_occlusion::{OccludeMode, mode};
         probe.since += 1;
-        // The coarser draw of a soldier whose body is hidden reads the
-        // pyramid every frame.
-        let every_frame = mode() != OccludeMode::Cull
-            || p.occlude.w != 0
-            || crate::render_units_occlusion::lod_hidden().mode != 0;
+        let every_frame = mode() != OccludeMode::Cull || p.occlude.w != 0;
         if every_frame || probe.active || probe.since >= PROBE_EVERY {
             probe.since = 0;
             frame.build_pyramid = true;
+            PYRAMID_FRAMES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+        PYRAMID_FRAMES[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     crate::frame_log::set_frame_params(p.alpha, p.occlude.z != 0, frame.build_pyramid);
     // The sun's cascades for this camera, as the shadow pass draws them
@@ -1003,20 +1007,26 @@ fn on_counts_readback(
     counts.hidden = std::array::from_fn(|lod| {
         words[52..68].iter().skip(lod).step_by(NUM_LODS).map(|&n| n as usize).sum()
     });
-    counts.coarser = std::array::from_fn(|lod| words[68 + lod] as usize);
-    counts.flips += words[72] as usize;
+    counts.coarser = std::array::from_fn(|lod| {
+        words[68..84].iter().skip(lod).step_by(NUM_LODS).map(|&n| n as usize).sum()
+    });
+    counts.flips += words[84] as usize;
     counts.flip_frames += 1;
-    // A frame the test ran on: the vertex runs it saved, at least one per
-    // vertex of each hidden soldier's level, decide the next probe.
+    // A frame the test ran on: the vertex runs it saved decide the next
+    // probe, at least one per vertex of each hidden soldier's level, and for
+    // each soldier `FL_LOD_HIDDEN` drew a level coarser the vertices his held
+    // level has over the one he was drawn at.
     if words[34] != 0 {
-        let runs: f32 = meshes
-            .iter()
-            .map(|m| {
-                let verts = m.indexed.as_ref().map_or(m.corners.len(), |i| i.vertices.len());
-                words[52 + m.bucket] as f32 * verts as f32
-            })
+        let mut verts = [0.0f32; NUM_BUCKETS];
+        for m in &meshes {
+            verts[m.bucket] = m.indexed.as_ref().map_or(m.corners.len(), |i| i.vertices.len()) as f32;
+        }
+        let hidden: f32 = (0..NUM_BUCKETS).map(|b| words[52 + b] as f32 * verts[b]).sum();
+        let coarser: f32 = (0..NUM_BUCKETS)
+            .filter(|b| b % NUM_LODS < NUM_LODS - 1)
+            .map(|b| words[68 + b] as f32 * (verts[b] - verts[b + 1]).max(0.0))
             .sum();
-        probe.active = runs >= PROBE_RUNS;
+        probe.active = hidden + coarser >= PROBE_RUNS;
     }
     // The sun shadow casters per cascade, one count per kind, about every
     // two seconds next to the periodic log.
