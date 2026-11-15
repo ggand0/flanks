@@ -398,13 +398,13 @@ pub fn update_routes(
                 let kept = match &routes.per[g].state {
                     State::Ready(r) | State::Pending { old: Some(r), .. } => {
                         let last = r.points.len() - 1;
-                        (r.points[last].distance(gd.anchor) < 1.0)
+                        (r.points[last].distance(crate::formation::hold_point(gd)) < 1.0)
                             .then(|| Arc::new(Route { points: r.points.clone(), k: last }))
                     }
                     _ => None,
                 };
                 if log_route() {
-                    let a = gd.anchor;
+                    let a = crate::formation::hold_point(gd);
                     let what = match &routes.per[g].state {
                         State::Ready(r) | State::Pending { old: Some(r), .. } => {
                             let end = r.points[r.points.len() - 1];
@@ -412,7 +412,7 @@ pub fn update_routes(
                                 format!("route kept at its end ({:.1}, {:.1})", end.x, end.y)
                             } else {
                                 format!(
-                                    "route dropped: its end ({:.1}, {:.1}) is {:.2} m from the anchor",
+                                    "route dropped: its end ({:.1}, {:.1}) is {:.2} m from where it holds",
                                     end.x,
                                     end.y,
                                     end.distance(a)
@@ -421,7 +421,7 @@ pub fn update_routes(
                         }
                         _ => "it had no route".to_string(),
                     };
-                    info!("[route] tick {tick} regiment {g}: order ended, anchor ({:.1}, {:.1}); {what}", a.x, a.y);
+                    info!("[route] tick {tick} regiment {g}: order ended, it holds at ({:.1}, {:.1}); {what}", a.x, a.y);
                 }
                 // Coming round obstacles has mixed up the ranks: the men
                 // take the nearest places in them. Done here, between the
@@ -478,17 +478,18 @@ pub fn update_routes(
     // regiment's centre is within its half width of this one, or the
     // straight way to the next is clear at that width, or a share of its
     // men are past this one (`frame_share`). A holding regiment's route
-    // goes once it holds elsewhere.
+    // goes once it holds elsewhere; opening its ranks is not that
+    // (`formation::hold_point`).
     for g in 0..n {
         let gd = &groups.list[g];
         let Some(goal) = groups.goal(g) else {
             if let State::Ready(r) = &routes.per[g].state
-                && r.points[r.points.len() - 1].distance(gd.anchor) >= 1.0
+                && r.points[r.points.len() - 1].distance(crate::formation::hold_point(gd)) >= 1.0
             {
                 if log_route() {
-                    let (a, end) = (gd.anchor, r.points[r.points.len() - 1]);
+                    let (a, end) = (crate::formation::hold_point(gd), r.points[r.points.len() - 1]);
                     info!(
-                        "[route] tick {tick} regiment {g}: holding at anchor ({:.1}, {:.1}), {:.2} m from its route's end ({:.1}, {:.1}): route dropped",
+                        "[route] tick {tick} regiment {g}: it holds at ({:.1}, {:.1}), {:.2} m from its route's end ({:.1}, {:.1}): route dropped",
                         a.x,
                         a.y,
                         end.distance(a),

@@ -354,6 +354,19 @@ fn open_anchor(gd: &GroupData) -> Vec2 {
     gd.open.closed_anchor + facing_dir(gd.facing) * gd.open.shift()
 }
 
+/// Where a regiment holds its ground: its anchor, or while it stands in
+/// the open order the anchor it had closed. Opening moves the anchor
+/// along the facing so the block grows where it has room; the regiment
+/// has not gone anywhere. An order given since it opened has moved the
+/// anchor for good (`close_order`), and it then holds there.
+pub fn hold_point(gd: &GroupData) -> Vec2 {
+    if gd.spacing == FormSpacing::Open && gd.anchor == open_anchor(gd) {
+        gd.open.closed_anchor
+    } else {
+        gd.anchor
+    }
+}
+
 /// Default file count for a regiment of `n` (the ~2.2:1 block the armies
 /// have always spawned with).
 pub fn default_files(n: usize) -> u32 {
@@ -1253,6 +1266,31 @@ mod tests {
         assert_eq!(o.files, 3);
         assert!((o.front + o.back - least).abs() < 1e-4);
         assert!((o.front - least * front / (front + back)).abs() < 1e-4);
+    }
+
+    /// A block that opens 3.9 m behind and nothing ahead moves its anchor
+    /// 1.95 m back, but it still holds where it stood closed: a route that
+    /// ended there still ends where the regiment holds.
+    #[test]
+    fn an_open_regiment_holds_where_it_stood_closed() {
+        let mut gd = holder();
+        gd.anchor = Vec2::new(20.9, -129.7);
+        let route_end = gd.anchor;
+        assert_eq!(hold_point(&gd), route_end);
+        let o = choose_open(&gd, false, true, OPEN_ROOM_MARGIN, OPEN_ROOM_MAX).expect("a plan across");
+        assert!(o.front.abs() < 1e-4 && (o.back - 3.9).abs() < 0.05, "grows {} ahead, {} behind", o.front, o.back);
+        open_order(&mut gd, o);
+        assert!((route_end.distance(gd.anchor) - 1.95).abs() < 0.03);
+        assert_eq!(hold_point(&gd), route_end);
+        // An order since it opened moves the anchor for good.
+        let elsewhere = Vec2::new(60.0, -129.7);
+        gd.anchor = elsewhere;
+        assert_eq!(hold_point(&gd), elsewhere);
+        // Closed again where it opened, it holds at its anchor as before.
+        gd.anchor = open_anchor(&gd);
+        close_order(&mut gd);
+        assert_eq!(gd.anchor, route_end);
+        assert_eq!(hold_point(&gd), route_end);
     }
 
     /// Lanes across the facing of a block four ranks deep: all four ranks
