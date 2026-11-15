@@ -59,7 +59,21 @@
 //! men's pace. A regiment fails when it has not arrived by its scene's
 //! timeout (`timeout_s`) or three times the route's length at its pace,
 //! whichever is longer. On the wall scenes the log also counts the men on
-//! the walk and the men who have never stood on it.
+//! the walk and the men who have never stood on it, and every ten seconds,
+//! after the verdict too, per regiment:
+//!
+//! - where its men stand (on the walk, a stair, a stair's foot, the wall's
+//!   inner face) and how many moved under a metre in those ten seconds;
+//! - where its route's frame waits, and the two tests that would move it
+//!   on: the centre within the regiment's half width of the waypoint, or
+//!   the straight way to the next point clear at that width;
+//! - its order, anchor, facing and spacing, the point the sim lays its
+//!   slots round, and how many of the places round it are off the walk;
+//! - the men out, each with the slot and the aim the sim gives him.
+//!
+//! `FL_LOG_ROUTE=1` adds the route events from sim/route.rs: an order's end
+//! and whether its route stays, a holding regiment's route dropped, and
+//! each move of a frame to a later waypoint.
 
 use bevy::prelude::*;
 
@@ -133,6 +147,10 @@ struct PathTest {
     stuck_ticks: Vec<u32>,
     /// Per unit, whether he has stood on the wall's walk (wall scenes).
     been_on_walk: Vec<bool>,
+    /// Per unit, where he stood at the last ten-second line (wall scenes),
+    /// to count the men who really moved: a man pressing on a wall keeps
+    /// a velocity while he stays where he is.
+    pos_10s: Vec<Vec2>,
     ordered: bool,
     summary_done: bool,
     /// The 200-regiment scene: when every regiment had its route.
@@ -438,9 +456,20 @@ fn log_progress(
     if test.been_on_walk.len() != units.len() {
         test.been_on_walk = vec![false; units.len()];
     }
+    let flat = |i: usize| Vec2::new(units.pos[i].x, units.pos[i].z);
+    if test.pos_10s.len() != units.len() {
+        test.pos_10s = (0..units.len()).map(flat).collect();
+    }
     let scene = scene().unwrap_or_default();
     let walls = scene.starts_with("walls");
     let walk_lane = walls.then(|| crate::town_layout::walk_lane(terrain.body_radius()));
+    let ten_s = tick.is_multiple_of(300);
+    // On the wall scenes the ten-second lines go on after the verdict, for
+    // the latest subject of each regiment only (the walls scene orders its
+    // first regiment twice).
+    let latest: Vec<bool> = (0..test.subjects.len())
+        .map(|j| !test.subjects[j + 1..].iter().any(|t| t.g == test.subjects[j].g))
+        .collect();
     // The slot each man is going to: his regiment's ordered point (or the
     // anchor once it arrived) plus his offset.
     let target = |g: usize| match groups.list[g].order {
@@ -496,8 +525,9 @@ fn log_progress(
         }
         return;
     }
-    for s in test.subjects.iter_mut() {
+    for (j, s) in test.subjects.iter_mut().enumerate() {
         let secs = (tick.saturating_sub(s.tick)) as f32 / 30.0;
+        let watch = !s.reported || (walls && latest[j]);
         let gd = &groups.list[s.g];
         // From the tick after the order, once the route pass has seen it.
         if s.route_len.is_none() && tick > s.tick && !routes.pending(s.g) {
@@ -533,21 +563,29 @@ fn log_progress(
                 frame()
             );
         }
-        // On the walled town, where the men are on the way up: on the
+        // The point the sim lays this regiment's slots round now.
+        let slots_at = sim_frame(&groups, &routes, s.g);
+        // On the wall scenes, where the men are on the way up: on the
         // walk, on a stair (flight or platform), on the ground within
-        // 6 m of a stair's foot, and within a metre of their place.
+        // 6 m of a stair's foot or within 4 m of the wall's inner face, and
+        // within a metre of their place; then the frame and the slots.
         if let Some(lane) = &walk_lane
-            && tick.is_multiple_of(300)
-            && !s.reported
+            && ten_s
+            && watch
         {
             use crate::town_layout::{STAIRS_X, STAIR_W, WALL_Z};
-            let (mut walk, mut stair, mut foot, mut placed) = (0, 0, 0, 0);
+            let (mut walk, mut stair, mut foot, mut face, mut placed) = (0, 0, 0, 0, 0);
+            // Men who moved under a metre since the last line, and of them
+            // the ones more than `ARRIVED_M` from their places.
+            let (mut still, mut still_out) = (0, 0);
+            // The places round the sim's point, and how many are off the walk.
+            let (mut lo, mut hi, mut off_walk) = (Vec2::splat(f32::INFINITY), Vec2::splat(f32::NEG_INFINITY), 0);
             // Where the men on a flight stand across it: their mean offset
             // from the tread's middle toward the wall (m), and the widest.
             let tread_mid = WALL_Z - 4.0 - (STAIR_W - 0.5) * 0.5;
             let (mut across, mut across_max) = (0.0f32, f32::NEG_INFINITY);
             for i in (0..units.len()).filter(|&i| units.group[i] as usize == s.g && units.death_t[i] == 0) {
-                let p = Vec2::new(units.pos[i].x, units.pos[i].z);
+                let p = flat(i);
                 if lane.contains(p) {
                     walk += 1;
                 } else if STAIRS_X.iter().any(|&x| p.x >= x && p.x <= x + 12.0 && p.y >= WALL_Z - 4.0 - STAIR_W && p.y <= WALL_Z - 4.0) {
@@ -556,8 +594,19 @@ fn log_progress(
                     across_max = across_max.max(p.y - tread_mid);
                 } else if STAIRS_X.iter().any(|&x| p.distance(Vec2::new(x, WALL_Z - 4.0 - STAIR_W * 0.5)) <= 6.0) {
                     foot += 1;
+                } else if p.y >= WALL_Z - 8.0 && p.y <= WALL_Z - 4.0 {
+                    face += 1;
                 }
-                placed += usize::from(p.distance(target(s.g) + units.home[i]) <= 1.0);
+                let d = p.distance(target(s.g) + units.home[i]);
+                placed += usize::from(d <= 1.0);
+                if p.distance(test.pos_10s[i]) < 1.0 {
+                    still += 1;
+                    still_out += usize::from(d > ARRIVED_M);
+                }
+                let place = slots_at + units.home[i];
+                lo = lo.min(place);
+                hi = hi.max(place);
+                off_walk += usize::from(!lane.contains(place));
             }
             let pending = match &gd.lane_fill {
                 Some(crate::formation::LaneFill::Pending(v)) => v.len(),
@@ -565,18 +614,36 @@ fn log_progress(
                 None => 0,
             };
             info!(
-                "[path-test] {} reg {} t={secs:.0}s: on the walk {walk}, on a stair {stair} (toward the wall {:+.2} m mean, {:+.2} m most), at a foot {foot}, in place {placed}, places not yet taken {pending}, never on the walk {never}",
+                "[path-test] {} reg {} t={secs:.0}s: on the walk {walk}, on a stair {stair} (toward the wall {:+.2} m mean, {:+.2} m most), at a foot {foot}, at the wall's inner face {face}, in place {placed}, places not yet taken {pending}, never on the walk {never}, moved under 1 m in 10 s: {still} ({still_out} of them over 5 m from their places)",
                 s.case,
                 s.g,
                 if stair > 0 { across / stair as f32 } else { 0.0 },
                 if stair > 0 { across_max } else { 0.0 }
             );
+            info!("[path-test] {} reg {} t={secs:.0}s: {}", s.case, s.g, frame_wait_text(&groups, &routes, s.g));
+            info!(
+                "[path-test] {} reg {} t={secs:.0}s: order {}, anchor ({:.1}, {:.1}), facing {:.2} rad, spacing {:?}, slots laid round ({:.1}, {:.1}); places x {:.1} to {:.1}, z {:.1} to {:.1}, {off_walk} of {alive} places off the walk",
+                s.case,
+                s.g,
+                if gd.order.is_some() { "on" } else { "done" },
+                gd.anchor.x,
+                gd.anchor.y,
+                gd.facing,
+                gd.spacing,
+                slots_at.x,
+                slots_at.y,
+                lo.x,
+                hi.x,
+                lo.y,
+                hi.y
+            );
         }
         // Where the men still out stand, every ten seconds once most are
-        // in (on the walled town, from the start).
+        // in (on the wall scenes, from the start). Each man's slot and aim
+        // are the sim's: round the point it lays the slots round now.
         if ((0.9..0.99).contains(&share) || walls)
-            && tick.is_multiple_of(300)
-            && !s.reported
+            && ten_s
+            && watch
         {
             let mut out: Vec<(f32, Vec2, usize)> = (0..units.len())
                 .filter(|&i| units.group[i] as usize == s.g && units.death_t[i] == 0)
@@ -593,17 +660,19 @@ fn log_progress(
                 .take(6)
                 .map(|&(d, p, i)| {
                     let v = Vec2::new(units.vel[i].x, units.vel[i].z);
+                    let slot = slots_at + units.home[i];
                     let aim = match (&view, routes.nav()) {
                         (Some(r), Some(nav)) => {
-                            let frame = target(s.g);
-                            let (t, through) = crate::sim::route::man_target(
-                                nav, &terrain, r, frame, p, frame + units.home[i], i,
-                            );
-                            format!(" aims ({:.1}, {:.1}){}", t.x, t.y, if through { " fast" } else { "" })
+                            let (t, through) =
+                                crate::sim::route::man_target(nav, &terrain, r, slots_at, p, slot, i);
+                            format!("aims ({:.1}, {:.1}){}", t.x, t.y, if through { " fast" } else { "" })
                         }
-                        _ => " no route".into(),
+                        _ => "no route".into(),
                     };
-                    format!("({:.1}, {:.1}) {d:.0} m out, v ({:.2}, {:.2}){aim}", p.x, p.y, v.x, v.y)
+                    format!(
+                        "({:.1}, {:.1}) {d:.0} m out, v ({:.2}, {:.2}), slot ({:.1}, {:.1}), {aim}",
+                        p.x, p.y, v.x, v.y, slot.x, slot.y
+                    )
                 })
                 .collect();
             info!("[path-test] {} reg {} t={secs:.0}s: men out: {}", s.case, s.g, list.join(", "));
@@ -649,6 +718,11 @@ fn log_progress(
             );
         }
     }
+    if walls && ten_s {
+        for (i, at) in test.pos_10s.iter_mut().enumerate() {
+            *at = flat(i);
+        }
+    }
     if !test.summary_done && !test.subjects.is_empty() && test.subjects.iter().all(|s| s.reported) {
         test.summary_done = true;
         let ok = test.subjects.iter().filter(|s| s.done_s.is_some()).count();
@@ -684,6 +758,50 @@ fn frame_text(routes: &crate::sim::route::Routes, g: usize) -> String {
         Some((points, k)) => format!("frame at waypoint {k} of {}", points.len().saturating_sub(1)),
         None => "no route".into(),
     }
+}
+
+/// The point the sim lays regiment `g`'s slots round this tick, as
+/// sim/job.rs `resolve_orders` hands it to the soldiers' kernel: none for
+/// a regiment standing to shoot or holding a contact frame, else the
+/// route's frame for its goal; the anchor where there is none
+/// (sim/soldier.rs).
+fn sim_frame(groups: &Groups, routes: &crate::sim::route::Routes, g: usize) -> Vec2 {
+    let gd = &groups.list[g];
+    let order = if gd.standoff || gd.skirmish_hold.is_some() || gd.contact {
+        None
+    } else {
+        groups.goal(g).map(|goal| routes.frame(g, goal))
+    };
+    order.unwrap_or(gd.anchor)
+}
+
+/// Where regiment `g`'s frame waits and what would move it on, from the
+/// route's advance tests (sim/route.rs `frame_test`).
+fn frame_wait_text(groups: &Groups, routes: &crate::sim::route::Routes, g: usize) -> String {
+    let Some((points, k)) = routes.route_of(g) else {
+        return "no route: the men walk straight at their places".into();
+    };
+    let last = points.len() - 1;
+    if k >= last {
+        return "frame at its last waypoint".into();
+    }
+    let here = points[k];
+    let (Some(goal), Some(nav)) = (groups.goal(g), routes.nav()) else {
+        return format!("frame waits at waypoint {k} of {last} ({:.1}, {:.1}), with no goal", here.x, here.y);
+    };
+    let Some(t) = crate::sim::route::frame_test(nav, &groups.list[g], points, k, goal) else {
+        return "frame at its last waypoint".into();
+    };
+    format!(
+        "frame waits at waypoint {k} of {last} ({:.1}, {:.1}), next ({:.1}, {:.1}): centre {:.1} m from it, moves on within {:.1} m, or when the way to the next is clear at that half width: clear {}",
+        t.here.x,
+        t.here.y,
+        t.next.x,
+        t.next.y,
+        t.dist,
+        t.w,
+        if t.clear { "yes" } else { "no" }
+    )
 }
 
 /// The men's mean speed (m/s), the pace the bound is taken at.

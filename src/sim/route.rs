@@ -38,7 +38,9 @@
 //!   cannot be reached becomes a move to the nearest reachable ground
 //!   with room for the regiment, and the log states it.
 //!
-//! `FL_PATH=0` turns routes off.
+//! `FL_PATH=0` turns routes off. `FL_LOG_ROUTE=1` logs each route event
+//! (`log_route`): an order's end and whether its route stays, a holding
+//! regiment's route dropped, and each move of a frame to a later waypoint.
 
 use bevy::prelude::*;
 use std::collections::VecDeque;
@@ -141,6 +143,13 @@ pub struct Routes {
 pub fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| !std::env::var("FL_PATH").is_ok_and(|v| v == "0"))
+}
+
+/// `FL_LOG_ROUTE=1`: log the route events, each a `[route]` line with the
+/// sim tick. Off by default; it changes no decision, only what is logged.
+fn log_route() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FL_LOG_ROUTE").is_ok())
 }
 
 impl Routes {
@@ -347,6 +356,26 @@ pub fn update_routes(
                     }
                     _ => None,
                 };
+                if log_route() {
+                    let a = gd.anchor;
+                    let what = match &routes.per[g].state {
+                        State::Ready(r) | State::Pending { old: Some(r), .. } => {
+                            let end = r.points[r.points.len() - 1];
+                            if kept.is_some() {
+                                format!("route kept at its end ({:.1}, {:.1})", end.x, end.y)
+                            } else {
+                                format!(
+                                    "route dropped: its end ({:.1}, {:.1}) is {:.2} m from the anchor",
+                                    end.x,
+                                    end.y,
+                                    end.distance(a)
+                                )
+                            }
+                        }
+                        _ => "it had no route".to_string(),
+                    };
+                    info!("[route] tick {tick} regiment {g}: order ended, anchor ({:.1}, {:.1}); {what}", a.x, a.y);
+                }
                 // Coming round obstacles has mixed up the ranks: the men
                 // take the nearest places in them. Done here, between the
                 // install and the next job, so the next job reads the new
@@ -406,6 +435,17 @@ pub fn update_routes(
             if let State::Ready(r) = &routes.per[g].state
                 && r.points[r.points.len() - 1].distance(gd.anchor) >= 1.0
             {
+                if log_route() {
+                    let (a, end) = (gd.anchor, r.points[r.points.len() - 1]);
+                    info!(
+                        "[route] tick {tick} regiment {g}: holding at anchor ({:.1}, {:.1}), {:.2} m from its route's end ({:.1}, {:.1}): route dropped",
+                        a.x,
+                        a.y,
+                        end.distance(a),
+                        end.x,
+                        end.y
+                    );
+                }
                 routes.per[g].state = State::None;
             }
             continue;
@@ -414,16 +454,29 @@ pub fn update_routes(
         let mut k = route.k;
         let last = route.points.len() - 1;
         let w = half_width(gd, goal - gd.centroid);
+        // How the last step was passed, for the log.
+        let mut passed = "";
         while k < last {
-            let next = if k + 1 == last { goal } else { route.points[k + 1] };
+            let next = next_point(&route.points, k, goal);
             let here = route.points[k];
-            if gd.centroid.distance(here) <= w || nav.straight_ok(gd.centroid, next, w) {
+            let near = gd.centroid.distance(here) <= w;
+            if near || nav.straight_ok(gd.centroid, next, w) {
+                passed = if near { "near" } else { "clear" };
                 k += 1;
             } else {
                 break;
             }
         }
         if k != route.k {
+            if log_route() {
+                let c = gd.centroid;
+                info!(
+                    "[route] tick {tick} regiment {g}: frame from waypoint {} to {k} of {last}; centre ({:.1}, {:.1}), half width {w:.2} m; passed by: {passed}",
+                    route.k,
+                    c.x,
+                    c.y
+                );
+            }
             let points = route.points.clone();
             routes.per[g].state = State::Ready(Arc::new(Route { points, k }));
         }
@@ -435,6 +488,40 @@ pub fn update_routes(
         let Some(req) = routes.queue.pop_front() else { break };
         routes.outgoing.push(PlanJob { req, search: None });
     }
+}
+
+/// The point after waypoint `k` the frame moves on toward: the next
+/// waypoint, or the live goal on the last leg.
+#[inline]
+fn next_point(points: &[Vec2], k: usize, goal: Vec2) -> Vec2 {
+    if k + 2 == points.len() { goal } else { points[k + 1] }
+}
+
+/// What the frame's advance loop in `update_routes` tests right now, for
+/// a regiment at waypoint `k` of `points` going to `goal`.
+pub(crate) struct FrameTest {
+    /// The waypoint the frame waits at, and the point after it.
+    pub here: Vec2,
+    pub next: Vec2,
+    /// The regiment's centre's distance to `here` (m).
+    pub dist: f32,
+    /// The half width both tests use (m): the frame moves on when the
+    /// centre is within it of `here`, or when the straight way to `next`
+    /// is clear for it.
+    pub w: f32,
+    pub clear: bool,
+}
+
+/// The advance loop's two tests for the log, mirrored: the same `here`,
+/// `next` and half width, and the straight check from the centre. None
+/// once the frame is at the route's last waypoint.
+pub(crate) fn frame_test(nav: &NavGrid, gd: &GroupData, points: &[Vec2], k: usize, goal: Vec2) -> Option<FrameTest> {
+    if k + 1 >= points.len() {
+        return None;
+    }
+    let (here, next) = (points[k], next_point(points, k, goal));
+    let w = half_width(gd, goal - gd.centroid);
+    Some(FrameTest { here, next, dist: gd.centroid.distance(here), w, clear: nav.straight_ok(gd.centroid, next, w) })
 }
 
 /// Queue a plan for regiment `g`, superseding any it waits for.
