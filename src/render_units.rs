@@ -372,13 +372,15 @@ pub static PREPARE_US: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU
 pub static RENDER_US: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 #[derive(Resource, Default)]
-struct RenderFrameClock(Option<std::time::Instant>);
+pub(crate) struct RenderFrameClock(Option<std::time::Instant>);
 
 fn render_frame_begin(mut clock: ResMut<RenderFrameClock>) {
     clock.0 = Some(std::time::Instant::now());
+    crate::frame_log::render_begin();
 }
 
-fn render_frame_end(clock: Res<RenderFrameClock>) {
+pub(crate) fn render_frame_end(clock: Res<RenderFrameClock>) {
+    crate::frame_log::render_end();
     if let Some(t0) = clock.0 {
         RENDER_US.store(
             t0.elapsed().as_micros() as u32,

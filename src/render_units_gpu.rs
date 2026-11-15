@@ -475,6 +475,7 @@ fn pack_soldier_snapshot(
     if !units.is_changed() {
         return;
     }
+    let _frame_log = crate::frame_log::time_pack();
     let t0 = std::time::Instant::now();
     if let Some(((key, columns), slot)) = due
         && units.last_changed() == columns
@@ -731,6 +732,7 @@ fn build_frame_params(
             frame.build_pyramid = true;
         }
     }
+    crate::frame_log::set_frame_params(p.alpha, p.occlude.z != 0, frame.build_pyramid);
     // The sun's cascades for this camera, as the shadow pass draws them
     // this frame. A soldier casts into a cascade when the ground his shadow
     // can fall on is in view at depths the cascade serves, with the level
@@ -1815,6 +1817,7 @@ pub(crate) fn prepare_gpu_units(
     if !input.enabled {
         return;
     }
+    let _frame_log = crate::frame_log::time_prepare(input.fresh);
     let t0 = std::time::Instant::now();
     let n = input.n as usize;
     let kind_needed = input.kind_counts.map(|c| c as usize);
