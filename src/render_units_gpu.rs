@@ -299,6 +299,10 @@ pub struct BuildParams {
     /// Per kind, half the standing height: the feet lie that far below the
     /// record position (unit_glb.rs drops the model so).
     half_height: Vec4,
+    /// Per kind, the box a settled body is tested with
+    /// (render_units_occlusion.rs `SETTLED`), as `bound_live`.
+    bound_settled: [Vec4; NUM_KINDS],
+    bound_down_settled: Vec4,
 }
 
 /// The pose pass uniform (`Params` in unit_pose_pass.wgsl).
@@ -820,7 +824,7 @@ fn occlusion_params(
     last: &mut Option<crate::camera::RtsCamera>,
     new_terrain: bool,
 ) {
-    use crate::render_units_occlusion::{BOUNDS, OccludeMode, mode};
+    use crate::render_units_occlusion::{BOUNDS, OccludeMode, SETTLED, mode, settled_box};
     if mode() == OccludeMode::Off || p.cull == 0 {
         return;
     }
@@ -852,6 +856,10 @@ fn occlusion_params(
         p.bound_fall[kind] = Vec4::new(fall.fwd, fall.back, fall.side, fall.up);
         p.bound_down_live[kind] = live.down;
         p.bound_down_fall[kind] = fall.down;
+        // `FL_SETTLED_BOX=0` tests a settled body with the falling box.
+        let settled = if settled_box() { SETTLED[kind] } else { *fall };
+        p.bound_settled[kind] = Vec4::new(settled.fwd, settled.back, settled.side, settled.up);
+        p.bound_down_settled[kind] = settled.down;
     }
 }
 
@@ -882,8 +890,9 @@ pub struct ReachReadback {
     handle: Handle<ShaderBuffer>,
 }
 
-/// Words of the reach buffer: per kind, standing then fallen, five reaches.
-const REACH_WORDS: usize = NUM_KINDS * 2 * 5;
+/// Words of the reach buffer: per kind, standing, dying, then settled, five
+/// reaches.
+const REACH_WORDS: usize = NUM_KINDS * 3 * 5;
 
 fn setup_reach_readback(mut commands: Commands, mut buffers: ResMut<Assets<ShaderBuffer>>) {
     if !crate::render_units_occlusion::bound_check() {
@@ -918,9 +927,12 @@ fn on_reach_readback(event: On<ReadbackComplete>, mut since: Local<u32>) {
         return;
     }
     for kind in 0..NUM_KINDS {
-        for (state, name) in ["standing", "fallen"].into_iter().enumerate() {
-            let r = &reach[(kind * 2 + state) * 5..][..5];
-            let b = crate::render_units_occlusion::BOUNDS[kind][state];
+        for (state, name) in ["standing", "dying", "settled"].into_iter().enumerate() {
+            let r = &reach[(kind * 3 + state) * 5..][..5];
+            let b = match state {
+                2 => crate::render_units_occlusion::SETTLED[kind],
+                _ => crate::render_units_occlusion::BOUNDS[kind][state],
+            };
             let bound = [b.fwd, b.back, b.side, b.up, b.down];
             let out = r.iter().zip(bound).any(|(r, b)| *r > b);
             info!(
