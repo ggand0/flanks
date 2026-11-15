@@ -7,7 +7,9 @@
 //! (the pre-formations look: spawn-captured or regenerated loose cluster —
 //! kept for low-morale levies later and for the FL_TEST_* geometry).
 //! Spacing modes: Normal, Loose (missile dispersion later), Wall
-//! (shieldwall for sword kinds, spearwall for spears — tight files).
+//! (shieldwall for sword kinds, spearwall for spears: tight files),
+//! Open (columns with lanes between them while a friend passes through;
+//! the officer's order, never the player's).
 //!
 //! Slots are recomputed on EVENTS (new order, mode toggle, rally, close
 //! ranks), never per tick: `reform` on `GroupData` requests it, and
@@ -25,8 +27,8 @@ pub const BASE_SPACING: f32 = 1.4;
 
 /// A kind's slot pitch in normal order: how far apart its men stand.
 /// FL_GAP=k,m,s,a sets it per kind in metres (knights, men-at-arms,
-/// spearmen, bowmen). Never under the separation rest distance
-/// (sim/soldier.rs SEP_RADIUS): the physics pushes closer slots apart.
+/// spearmen, bowmen). Never under the separation rest distance at ease
+/// (sim/soldier.rs `sep_ease`): the physics pushes closer slots apart.
 pub fn gap(kind: u8) -> f32 {
     static GAPS: std::sync::OnceLock<[f32; crate::unit_types::NUM_KINDS]> =
         std::sync::OnceLock::new();
@@ -36,7 +38,7 @@ pub fn gap(kind: u8) -> f32 {
             let parsed: Vec<f32> = v.split(',').filter_map(|t| t.trim().parse().ok()).collect();
             match <[f32; crate::unit_types::NUM_KINDS]>::try_from(parsed) {
                 Ok(given) => {
-                    let floor = crate::sim::soldier::SEP_RADIUS;
+                    let floor = crate::sim::soldier::sep_ease();
                     if given.iter().any(|g| *g < floor) {
                         warn!("FL_GAP: a gap under {floor} m cannot be held, raised to it");
                     }
@@ -85,6 +87,50 @@ pub enum FormSpacing {
     Loose,
     /// Shieldwall (sword kinds) / spearwall (spears): tight files, braced.
     Wall,
+    /// Groups of files shoulder to shoulder with a lane between groups,
+    /// across the block's frontage, the men stacked front to back in each
+    /// file, so a friendly regiment can walk through the lanes
+    /// (`OpenOrder`, sim/job.rs `open_for_passers`). The spacing to go
+    /// back to is `GroupData::close_to`.
+    Open,
+}
+
+/// The most files a group of the open order stands.
+const OPEN_FILES_MAX: u8 = 4;
+/// Free ground the open order leaves before a block in front or behind
+/// (metres).
+const OPEN_ROOM_MARGIN: f32 = 3.0;
+/// Ground further than this counts as all the room there is (metres).
+pub const OPEN_ROOM_MAX: f32 = 60.0;
+
+/// How an open regiment stands: `files` files to a group, the men of a
+/// group `sep` apart (their spring rest), the groups `pitch` apart from
+/// the first man of one to the first of the next, the block grown
+/// `front` metres ahead of its closed front and `back` behind its closed
+/// rear (negative when it stands shorter), and the anchor it had closed.
+#[derive(Clone, Copy, Default)]
+pub struct OpenOrder {
+    pub files: u8,
+    pub sep: f32,
+    pub pitch: f32,
+    /// The lanes run across the facing, not along it: for a friend
+    /// crossing the block from the side. The groups are then groups of
+    /// ranks, each rank keeps the closed frontage, and the block grows
+    /// deeper as it does for lanes along the facing.
+    pub across: bool,
+    /// Metres grown past the closed front and behind the closed rear,
+    /// negative when the block stands shorter.
+    pub front: f32,
+    pub back: f32,
+    pub closed_anchor: Vec2,
+}
+
+impl OpenOrder {
+    /// How far the anchor stands ahead of the closed one: half the
+    /// difference between the growth in front and behind.
+    pub fn shift(&self) -> f32 {
+        0.5 * (self.front - self.back)
+    }
 }
 
 impl FormSpacing {
@@ -96,8 +142,181 @@ impl FormSpacing {
             FormSpacing::Normal => Vec2::splat(gap(kind)),
             FormSpacing::Loose => Vec2::splat(gap(kind) * 1.9),
             FormSpacing::Wall => Vec2::new(1.05, 1.15),
+            FormSpacing::Open => Vec2::splat(gap(kind)),
         }
     }
+}
+
+/// The groups the open order `o` lays: for lanes along the facing, the
+/// groups of files that cover the closed frontage of `files` files at
+/// `closed` spacing within half a group pitch, never more files than
+/// men; for lanes across it, the closed ranks in groups of `o.files`.
+pub(crate) fn open_groups(files: usize, n: usize, closed: FormSpacing, kind: u8, o: &OpenOrder) -> usize {
+    let a = o.files.max(1) as usize;
+    if o.across {
+        return n.max(1).div_ceil(files.max(1)).div_ceil(a);
+    }
+    let width = (files.max(1) - 1) as f32 * closed.pitch(kind).x;
+    ((width / o.pitch).round() as usize + 1).clamp(1, n.max(1).div_ceil(a))
+}
+
+/// Each line's offset from the block's middle along the open order's
+/// span: a file's lateral offset, or a rank's forward offset for lanes
+/// across the facing. Lines of a group `sep` apart, groups `pitch`
+/// apart; `lines` of them, centred.
+pub(crate) fn open_lane_offsets(groups: usize, lines: usize, o: &OpenOrder) -> Vec<f32> {
+    let a = o.files.max(1) as usize;
+    let lines = lines.clamp(1, groups * a);
+    let at = |f: usize| (f / a) as f32 * o.pitch + (f % a) as f32 * o.sep;
+    let mid = 0.5 * at(lines - 1);
+    (0..lines).map(|f| at(f) - mid).collect()
+}
+
+/// The lines of an open order: its files, or its ranks for lanes across
+/// the facing (one line per closed rank, each keeping the closed
+/// frontage).
+pub(crate) fn open_lines(files: usize, n: usize, groups: usize, o: &OpenOrder) -> usize {
+    let a = o.files.max(1) as usize;
+    let lines = if o.across { n.max(1).div_ceil(files.max(1)) } else { groups * a };
+    lines.clamp(1, n.max(1))
+}
+
+/// A Rect regiment's grid as it stands: files, ranks and slot pitch. In
+/// the open order the lines of every group (files, or ranks for lanes
+/// across the facing) and the mean pitch along the span, so the block's
+/// extent comes out right. Every reader of the block's extent goes
+/// through here.
+pub fn grid(gd: &GroupData) -> (usize, usize, Vec2) {
+    let n = gd.count.max(1);
+    let files = (gd.files.max(1) as usize).min(n);
+    if gd.spacing != FormSpacing::Open {
+        return (files, n.div_ceil(files), gd.spacing.pitch(gd.kind));
+    }
+    let groups = open_groups(files, n, gd.close_to, gd.kind, &gd.open);
+    let lines = open_lines(files, n, groups, &gd.open);
+    let at = open_lane_offsets(groups, lines, &gd.open);
+    let span = at.last().copied().unwrap_or(0.0) - at[0];
+    let mean = if lines > 1 { span / (lines - 1) as f32 } else { 0.0 };
+    let closed = gd.spacing.pitch(gd.kind);
+    if gd.open.across {
+        (files, lines, Vec2::new(closed.x, mean))
+    } else {
+        (lines, n.div_ceil(lines), Vec2::new(mean, closed.y))
+    }
+}
+
+/// The open order a holding regiment takes to let a friend through
+/// (sim/job.rs `open_for_passers`), with `room_front` and `room_back`
+/// metres of free ground before its closed front and behind its closed
+/// rear. Lanes `across` the facing, for a friend coming from the side,
+/// are the ranks in groups at the same pitch, each rank keeping the
+/// closed frontage, so the block grows deeper either way. Its men stand at their spring rest at their present width (the
+/// ready stance's when `ready`), the lane the air for two men at ease
+/// abreast (a lane narrower than two men abreast slows a pass
+/// steeply). It takes the fewest files to a group whose
+/// added depth fits the room on both sides together, less a margin on
+/// each, else the most files. The added depth goes to the two sides in
+/// proportion to their room, so the block backs up only into free
+/// ground.
+pub fn choose_open(gd: &GroupData, ready: bool, across: bool, room_front: f32, room_back: f32) -> OpenOrder {
+    let n = gd.count.max(1);
+    let files = (gd.files.max(1) as usize).min(n);
+    let closed = gd.chosen_spacing();
+    let width = &crate::sim::soldier::widths()[if ready { 3 } else { 0 }];
+    let ease = &crate::sim::soldier::widths()[0];
+    let shut = (n.div_ceil(files) - 1) as f32 * closed.pitch(gd.kind).y;
+    let front = (room_front - OPEN_ROOM_MARGIN).max(0.0);
+    let back = (room_back - OPEN_ROOM_MARGIN).max(0.0);
+    let layout = |a: u8| {
+        let o = OpenOrder {
+            files: a,
+            sep: width.sep,
+            pitch: (a - 1) as f32 * width.sep + width.body + 2.0 * ease.body,
+            across,
+            ..OpenOrder::default()
+        };
+        let groups = open_groups(files, n, closed, gd.kind, &o);
+        let lines = open_lines(files, n, groups, &o);
+        let depth = if across {
+            // The ranks at their lane offsets.
+            let at = open_lane_offsets(groups, lines, &o);
+            at.last().copied().unwrap_or(0.0) - at[0]
+        } else {
+            (n.div_ceil(lines) - 1) as f32 * gap(gd.kind)
+        };
+        (o, depth - shut)
+    };
+    let a = (1..=OPEN_FILES_MAX).find(|&a| layout(a).1 <= front + back).unwrap_or(OPEN_FILES_MAX);
+    let (mut o, added) = layout(a);
+    let share = if added > 0.0 && front + back > 0.0 { front / (front + back) } else { 0.5 };
+    o.front = added * share;
+    o.back = added - o.front;
+    o.closed_anchor = gd.anchor;
+    o
+}
+
+/// Where an open regiment's closed block is centred: its centroid less
+/// the anchor's shift along the facing.
+pub fn closed_centre(gd: &GroupData) -> Vec2 {
+    gd.centroid - facing_dir(gd.facing) * gd.open.shift()
+}
+
+/// The block of a regiment about `centre` as it stands closed: an open
+/// regiment's ground when it is not letting anyone through, `centre`
+/// its closed centre.
+pub fn closed_rect_at(gd: &GroupData, centre: Vec2) -> BlockRect {
+    if gd.spacing != FormSpacing::Open || gd.shape == FormShape::Blob || gd.files == 0 {
+        return block_rect_at(gd, centre);
+    }
+    let n = gd.count.max(1);
+    let files = (gd.files as usize).min(n);
+    let pitch = gd.close_to.pitch(gd.kind);
+    BlockRect {
+        centre,
+        fwd: facing_dir(gd.facing),
+        half_w: (files - 1) as f32 * 0.5 * pitch.x + 1.0,
+        half_d: (n.div_ceil(files) - 1) as f32 * 0.5 * pitch.y + 1.0,
+    }
+}
+
+/// A regiment holding its ground, the kind that opens for a friend
+/// passing through: no order to go anywhere (none, or archers standing
+/// off their target or holding before a block), not in a fight and not
+/// broken.
+pub fn holds_ground(gd: &GroupData) -> bool {
+    (gd.order.is_none() || gd.standoff || gd.skirmish_hold.is_some())
+        && !gd.engaged
+        && gd.melee_ticks == 0
+        && !gd.state.is_broken()
+        && gd.count > 0
+}
+
+/// An open regiment goes back to the spacing it had and reforms. Its
+/// anchor goes back to where it stood closed unless something moved it
+/// since it opened (an order).
+pub fn close_order(gd: &mut GroupData) {
+    if gd.spacing == FormSpacing::Open {
+        if gd.anchor == open_anchor(gd) {
+            gd.anchor = gd.open.closed_anchor;
+        }
+        gd.spacing = gd.close_to;
+        gd.reform = true;
+    }
+}
+
+/// A holding regiment opens into `o`: its anchor moves along the facing
+/// so the block grows `o.front` ahead and `o.back` behind.
+pub fn open_order(gd: &mut GroupData, o: OpenOrder) {
+    gd.close_to = gd.spacing;
+    gd.spacing = FormSpacing::Open;
+    gd.open = o;
+    gd.anchor = open_anchor(gd);
+    gd.reform = true;
+}
+
+/// Where an open regiment's anchor stands.
+fn open_anchor(gd: &GroupData) -> Vec2 {
+    gd.open.closed_anchor + facing_dir(gd.facing) * gd.open.shift()
 }
 
 /// Default file count for a regiment of `n` (the ~2.2:1 block the armies
@@ -181,6 +400,56 @@ pub fn assign_slots(units: &mut Units, g: u32, gd: &mut GroupData) -> Vec<u32> {
                 units.home[m.0 as usize] = Vec2::new(r * a.cos(), r * a.sin());
             }
         }
+        FormShape::Rect if gd.spacing == FormSpacing::Open && gd.open.across => {
+            // Lanes across the facing: the ranks down the depth in their
+            // groups, the men dealt to them evenly by their forward order
+            // and laid left to right in each in their lateral order at the
+            // closed file pitch, centred, so nobody crosses anybody.
+            let files = (gd.files.max(1) as usize).min(n);
+            let groups = open_groups(files, n, gd.close_to, gd.kind, &gd.open);
+            let rows = open_lines(files, n, groups, &gd.open);
+            let ys = open_lane_offsets(groups, rows, &gd.open);
+            let pitch = gd.spacing.pitch(gd.kind);
+            members.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+            let mut stacks: Vec<Vec<(u32, f32, f32)>> = vec![Vec::new(); rows];
+            for (k, m) in members.iter().enumerate() {
+                stacks[k * rows / n].push(*m);
+            }
+            for (r, row) in stacks.iter_mut().enumerate() {
+                row.sort_unstable_by(|a, b| a.2.total_cmp(&b.2));
+                let half_w = (row.len().max(1) - 1) as f32 * 0.5;
+                for (c, m) in row.iter().enumerate() {
+                    let x = (c as f32 - half_w) * pitch.x;
+                    // The rows run front to back from the last offset.
+                    units.home[m.0 as usize] = right * x + fwd * ys[rows - 1 - r];
+                }
+            }
+        }
+        FormShape::Rect if gd.spacing == FormSpacing::Open => {
+            // Files across the frontage in their groups, the men dealt to
+            // them evenly by their lateral order and stacked front to back
+            // in each in their forward order, so nobody crosses anybody.
+            // The files stand front-aligned, the deepest one centred on
+            // the anchor.
+            let files = (gd.files.max(1) as usize).min(n);
+            let groups = open_groups(files, n, gd.close_to, gd.kind, &gd.open);
+            let cols = open_lines(files, n, groups, &gd.open);
+            let xs = open_lane_offsets(groups, cols, &gd.open);
+            let pitch = gd.spacing.pitch(gd.kind);
+            let half_d = (n.div_ceil(cols) - 1) as f32 * 0.5;
+            members.sort_unstable_by(|a, b| a.2.total_cmp(&b.2));
+            let mut stacks: Vec<Vec<(u32, f32, f32)>> = vec![Vec::new(); cols];
+            for (k, m) in members.iter().enumerate() {
+                stacks[k * cols / n].push(*m);
+            }
+            for (c, column) in stacks.iter_mut().enumerate() {
+                column.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+                for (r, m) in column.iter().enumerate() {
+                    let y = (half_d - r as f32) * pitch.y;
+                    units.home[m.0 as usize] = right * xs[c] + fwd * y;
+                }
+            }
+        }
         FormShape::Rect => {
             let files = (gd.files.max(1) as usize).min(n);
             let pitch = gd.spacing.pitch(gd.kind);
@@ -206,14 +475,16 @@ pub fn assign_slots(units: &mut Units, g: u32, gd: &mut GroupData) -> Vec<u32> {
 /// deployment zone clamp keeps the whole block inside, not just its
 /// anchor. Lives here with the rest of the block geometry (pitch,
 /// `slot_offsets`, `blob_radius`) so a density retune can't silently
-/// diverge from the clamp footprint.
+/// diverge from the clamp footprint. The block at `files` in the spacing
+/// it closes to: a new placement is a new order, and an order closes an
+/// open regiment.
 pub fn block_half_extents(gd: &GroupData, files: u32, facing: f32) -> Vec2 {
     if gd.shape == FormShape::Blob {
         return Vec2::splat(blob_radius(gd.count));
     }
     let files = (files.max(1) as usize).min(gd.count.max(1));
     let ranks = gd.count.max(1).div_ceil(files);
-    let pitch = gd.spacing.pitch(gd.kind);
+    let pitch = gd.chosen_spacing().pitch(gd.kind);
     let half_w = (files - 1) as f32 * 0.5 * pitch.x + 1.0;
     let half_d = (ranks - 1) as f32 * 0.5 * pitch.y + 1.0;
     let fwd = facing_dir(facing);
@@ -286,8 +557,7 @@ pub fn block_rect_at(gd: &GroupData, centre: Vec2) -> BlockRect {
         let r = if gd.radius > 0.0 { gd.radius } else { blob_radius(gd.count) };
         return BlockRect { centre, fwd: Vec2::ZERO, half_w: r, half_d: r };
     }
-    let files = (gd.files as usize).min(gd.count.max(1));
-    let pitch = gd.spacing.pitch(gd.kind);
+    let (files, _, pitch) = grid(gd);
     BlockRect {
         centre,
         fwd: facing_dir(gd.facing),
@@ -304,8 +574,8 @@ pub fn block_bound(gd: &GroupData) -> f32 {
     if gd.shape == FormShape::Blob || gd.files == 0 {
         return if gd.radius > 0.0 { gd.radius } else { blob_radius(gd.count) };
     }
-    let files = (gd.files as usize).min(gd.count.max(1));
-    let half_w = (files - 1) as f32 * 0.5 * gd.spacing.pitch(gd.kind).x + 1.0;
+    let (files, _, pitch) = grid(gd);
+    let half_w = (files - 1) as f32 * 0.5 * pitch.x + 1.0;
     let half_d = front_offset(gd) + 1.0;
     (half_w * half_w + half_d * half_d).sqrt()
 }
@@ -316,9 +586,8 @@ pub fn front_offset(gd: &GroupData) -> f32 {
     if gd.shape == FormShape::Blob || gd.files == 0 {
         return if gd.radius > 0.0 { gd.radius } else { blob_radius(gd.count) };
     }
-    let files = (gd.files as usize).min(gd.count.max(1));
-    let ranks = gd.count.max(1).div_ceil(files);
-    (ranks - 1) as f32 * 0.5 * gd.spacing.pitch(gd.kind).y
+    let (_, ranks, pitch) = grid(gd);
+    (ranks - 1) as f32 * 0.5 * pitch.y
 }
 
 /// Deployment placement: rebake slots, then TELEPORT every man onto his
@@ -676,12 +945,18 @@ pub fn apply_formation_cmd(
             }
             // Toggle as a set: if anyone is not yet in the mode, everyone
             // enters it; if all are, everyone falls back to close order.
-            let on = picked.iter().any(|&g| groups.list[g].spacing != want);
+            // An open regiment's spacing is the one it closes back to.
+            let on = picked.iter().any(|&g| groups.list[g].chosen_spacing() != want);
             let mut shield = 0;
             let mut spear = 0;
             for &g in &picked {
                 let gd = &mut groups.list[g];
-                gd.spacing = if on { want } else { FormSpacing::Normal };
+                let spacing = if on { want } else { FormSpacing::Normal };
+                if gd.spacing == FormSpacing::Open {
+                    gd.close_to = spacing;
+                } else {
+                    gd.spacing = spacing;
+                }
                 gd.shape = FormShape::Rect;
                 if gd.files == 0 {
                     gd.files = default_files(gd.count);
@@ -778,6 +1053,12 @@ fn apply_reforms(mut units: ResMut<Units>, mut groups: ResMut<Groups>, mut tick:
     *tick = tick.wrapping_add(1);
     for g in 0..groups.list.len() {
         let gd = &mut groups.list[g];
+        // An open regiment that gets an order, fights or breaks closes at
+        // once; its order's own reform deals the closed slots.
+        if gd.spacing == FormSpacing::Open && !holds_ground(gd) {
+            info!("regiment {g} closes");
+            close_order(gd);
+        }
         if gd.count == 0 || gd.state.is_broken() {
             gd.reform = false;
             continue;

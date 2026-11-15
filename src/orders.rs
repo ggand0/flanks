@@ -81,6 +81,23 @@ pub struct GroupData {
     // --- formation (formation.rs consumes; slots land in `units.home`) ---
     pub shape: crate::formation::FormShape,
     pub spacing: crate::formation::FormSpacing,
+    /// The spacing an open regiment (FormSpacing::Open) closes back to.
+    pub close_to: crate::formation::FormSpacing,
+    /// How an open regiment stands (formation.rs `choose_open`).
+    pub open: crate::formation::OpenOrder,
+    /// Walking through a friendly regiment that opened for it: its block
+    /// within OPEN_KEEP of an open friend's, or any of its men still
+    /// inside one (sim/job.rs `open_for_passers`). The friend's
+    /// bookkeeping: it counts this regiment's men inside it.
+    pub passing: bool,
+    /// Its living men inside each open friend's block within its reach,
+    /// as (friend, men) (frontline.rs), what the friend reads to know
+    /// when the last man is out. Empty with no open friend in reach.
+    pub inside: Vec<(u32, u32)>,
+    /// How far its farthest living man stands from its centroid (metres,
+    /// frontline.rs): the stragglers' reach, so an open friend counts this
+    /// regiment's men only when one could be inside it.
+    pub reach: f32,
     /// Formation facing (unit yaw convention, 0 = +Z). Baked into the slot
     /// offsets on reform; meaningless for Blob.
     pub facing: f32,
@@ -255,6 +272,12 @@ pub struct GroupData {
 }
 
 impl GroupData {
+    /// The spacing the player or the AI chose: an open regiment's is the
+    /// one it closes back to.
+    pub fn chosen_spacing(&self) -> crate::formation::FormSpacing {
+        if self.spacing == crate::formation::FormSpacing::Open { self.close_to } else { self.spacing }
+    }
+
     pub fn new(team: u8, kind: u8, anchor: Vec2, count: usize) -> Self {
         Self {
             team,
@@ -268,6 +291,11 @@ impl GroupData {
             // spawn switches to Rect and forms slots explicitly.
             shape: crate::formation::FormShape::Blob,
             spacing: crate::formation::FormSpacing::Normal,
+            close_to: crate::formation::FormSpacing::Normal,
+            open: crate::formation::OpenOrder::default(),
+            passing: false,
+            inside: Vec::new(),
+            reach: 0.0,
             facing: if team == 0 { 0.0 } else { std::f32::consts::PI },
             files: 0,
             hold: false,
@@ -662,7 +690,7 @@ fn line_layout(
     for (g, _) in segs {
         let gd = &groups.list[g];
         let share = len * gd.count as f32 / total as f32;
-        let pitch = gd.spacing.pitch(gd.kind);
+        let pitch = gd.chosen_spacing().pitch(gd.kind);
         let files = (((share - LINE_REG_GAP) / pitch.x).floor() as u32)
             .clamp(1, gd.count as u32);
         let ranks = (gd.count as u32).div_ceil(files);
@@ -675,17 +703,31 @@ fn line_layout(
     placements
 }
 
+/// One regiment of a line order: the block re-dressed `files` wide
+/// facing `facing`, its centre marching to `anchor`. Shared by the drag
+/// order and a setup file's `line` order (battle_setup.rs).
+pub fn line_place(gd: &mut GroupData, anchor: Vec2, facing: f32, files: u32) {
+    gd.facing = facing;
+    gd.files = files;
+    gd.shape = FormShape::Rect;
+    gd.order = Some(Order::Move(anchor));
+    gd.auto_order = false;
+    gd.reform = true;
+}
+
+/// One line of the order log: every order the player gives, with the
+/// game clock, the regiment and what it was told, in a form that
+/// turns back into a setup file's timed orders, so a play can be rerun
+/// from its log.
+pub fn log_order(t: f32, g: usize, gd: &GroupData, what: &str) {
+    info!("[order] t={t:.1}s g{g} ({}, {} men): {what}", crate::unit_types::kind_name(gd.kind), gd.count);
+}
+
 fn apply_line_order(groups: &mut Groups, layout: Vec<LinePlacement>, a: Vec2, b: Vec2) {
     let n = layout.len();
     let facing = layout.first().map(|p| p.facing).unwrap_or(0.0);
     for p in layout {
-        let gd = &mut groups.list[p.g];
-        gd.facing = p.facing;
-        gd.files = p.files;
-        gd.shape = FormShape::Rect;
-        gd.order = Some(Order::Move(p.anchor));
-        gd.auto_order = false;
-        gd.reform = true;
+        line_place(&mut groups.list[p.g], p.anchor, p.facing, p.files);
     }
     info!(
         "line order: {n} regiments across {:.0} m, facing {facing:.2} rad",
@@ -865,6 +907,7 @@ fn issue_order(
     mut cues: MessageWriter<crate::audio::UiCue>,
     ui: Query<&Interaction>,
     routes: Res<crate::sim::route::Routes>,
+    time: Res<Time>,
 ) {
     if selection.count_units == 0 {
         drag.start = None;
@@ -922,6 +965,7 @@ fn issue_order(
         return;
     }
     let Some(start) = drag.start.take() else { return };
+    let t = time.elapsed_secs();
 
     if drag.active && !drag.layout.is_empty() {
         let layout = std::mem::take(&mut drag.layout);
@@ -929,6 +973,13 @@ fn issue_order(
             deploy_place_line(&mut groups, &mut units, &terrain, layout);
             cues.write(crate::audio::UiCue::Deploy);
         } else {
+            for p in &layout {
+                let what = format!(
+                    "line to ({:.1}, {:.1}) facing {:.3} files {}",
+                    p.anchor.x, p.anchor.y, p.facing, p.files
+                );
+                log_order(t, p.g, &groups.list[p.g], &what);
+            }
             apply_line_order(&mut groups, layout, start, drag.cur);
             cues.write(crate::audio::UiCue::Move);
         }
@@ -937,14 +988,20 @@ fn issue_order(
         let picked: Vec<usize> = selection.picked_controllable(&groups).collect();
         deploy_move(&mut groups, &mut units, &terrain, routes.grid(), &picked, start);
         cues.write(crate::audio::UiCue::Deploy);
-    } else if let Some(t) = enemy_regiment_at(&groups, start) {
-        attack_regiments(&mut groups, &selected, t);
+    } else if let Some(e) = enemy_regiment_at(&groups, start) {
+        attack_regiments(&mut groups, &selected, e);
         cues.write(crate::audio::UiCue::Attack);
         info!(
-            "{} regiments ({} units) ATTACK regiment {t}",
+            "{} regiments ({} units) ATTACK regiment {e}",
             selected.len(),
             selection.count_units,
         );
+        for &g in &selected {
+            let gd = &groups.list[g];
+            if gd.order == Some(Order::Attack(e)) && !gd.state.is_broken() {
+                log_order(t, g, gd, &format!("attack g{e}"));
+            }
+        }
     } else {
         order_regiments(&mut groups, &selected, start);
         cues.write(crate::audio::UiCue::Move);
@@ -955,6 +1012,16 @@ fn issue_order(
             start.x,
             start.y
         );
+        // Each regiment's own destination (the click translated by its
+        // offset from the selection's centre) and the facing it took.
+        for &g in &selected {
+            let gd = &groups.list[g];
+            if let Some(Order::Move(d)) = gd.order
+                && !gd.state.is_broken()
+            {
+                log_order(t, g, gd, &format!("move to ({:.1}, {:.1}) facing {:.3}", d.x, d.y, gd.facing));
+            }
+        }
     }
     drag.active = false;
     drag.layout.clear();
@@ -986,7 +1053,7 @@ fn draw_order_preview(
         let gd = &groups.list[p.g];
         let fwd = facing_dir(p.facing);
         let right = Vec2::new(fwd.y, -fwd.x);
-        let pitch = gd.spacing.pitch(gd.kind);
+        let pitch = gd.chosen_spacing().pitch(gd.kind);
         let world = |off: Vec2| p.anchor + right * off.x + fwd * off.y;
 
         if total <= PREVIEW_CIRCLE_CAP {
@@ -1029,15 +1096,24 @@ fn halt_key(
     keys: Res<ButtonInput<KeyCode>>,
     selection: Res<Selection>,
     mut groups: ResMut<Groups>,
+    time: Res<Time>,
 ) {
     if !keys.just_pressed(KeyCode::Backspace) {
         return;
     }
-    halt_selected(&selection, &mut groups);
+    halt_selected(&selection, &mut groups, time.elapsed_secs());
 }
 
-/// Shared by the Backspace hotkey and the Halt button (unit_cards.rs).
-pub fn halt_selected(selection: &Selection, groups: &mut Groups) {
+/// Halt one regiment: its order dropped, its anchor where its block
+/// stands. Shared by `halt_selected` and a setup file's `halt` order.
+pub fn halt_regiment(gd: &mut GroupData) {
+    gd.anchor = gd.centroid;
+    gd.order = None;
+}
+
+/// Shared by the Backspace hotkey and the Halt button (unit_cards.rs);
+/// `t` is the game clock for the order log.
+pub fn halt_selected(selection: &Selection, groups: &mut Groups, t: f32) {
     if selection.count_units == 0 {
         return;
     }
@@ -1045,8 +1121,8 @@ pub fn halt_selected(selection: &Selection, groups: &mut Groups) {
     for (g, sel) in selection.regiments.iter().enumerate() {
         let group = &mut groups.list[g];
         if *sel && group.count > 0 && !group.state.is_broken() {
-            group.anchor = group.centroid;
-            group.order = None;
+            halt_regiment(group);
+            log_order(t, g, group, &format!("halt at ({:.1}, {:.1})", group.anchor.x, group.anchor.y));
             halted += 1;
         }
     }

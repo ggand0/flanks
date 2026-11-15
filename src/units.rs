@@ -122,6 +122,21 @@ pub struct Units {
     /// his way to his slot was clear. He reads his route every few ticks,
     /// not every tick, and walks on what he chose.
     pub way: Column<Vec2>,
+    /// How far he is into his ready stance, 0 at ease to POSE_READY (the
+    /// low four bits), and how far he has turned his shoulders to squeeze
+    /// through a crack, 0 square to POSE_READY (the high four bits;
+    /// sim/soldier.rs `pose_level`, `turn_level`): his body is wider in
+    /// the stance and narrower turned.
+    pub pose: Column<u8>,
+    /// Stuck on his way and trying a side (sim/soldier.rs `try_a_side`,
+    /// the STUCK_* fields): the ticks he has wanted to walk and not moved
+    /// while pressed from ahead, the ticks left of his try, how long he
+    /// remembers the side he tried, and that side.
+    pub stuck: Column<u16>,
+    /// The opening he saw on his last wide look and walks for (sim/soldier.rs
+    /// `choose_opening`), a point on the ground; NaN when he has none. He
+    /// looks wide only every few ticks and keeps what he found between.
+    pub aim: Column<Vec2>,
     /// Bumped every time a battle rebuilds this world. A sim tick job
     /// computed from an older world carries indices that mean nothing
     /// here: sim/mod.rs drops it instead of installing it.
@@ -305,6 +320,9 @@ pub fn push_unit(
     units.sight.push(0);
     units.chain.push(0);
     units.way.push(Vec2::NAN);
+    units.pose.push(0);
+    units.stuck.push(0);
+    units.aim.push(Vec2::NAN);
 }
 
 /// FL_TEST_SURROUND: two equal blue detachments of light infantry, one

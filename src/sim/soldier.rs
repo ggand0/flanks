@@ -18,10 +18,11 @@ const SEP_STRENGTH: f32 = 60.0;
 const QUERY_RADIUS: f32 = 2.0;
 /// Cap on summed separation push to avoid explosive forces deep in a crowd.
 const SEP_PUSH_MAX: f32 = 2.5;
-/// Below this distance overlap is resolved positionally. A soldier is
-/// 0.75 to 1.1 m across with his arms, shield and weapon. Never more than
-/// a pair's own rest distance, so the men of a wall keep their 1.05 m
-/// files. FL_BODY=<metres> sets it, up to the separation distance.
+/// Below this distance overlap is resolved positionally, for a man in
+/// his ready stance (at ease `body_ease`). A soldier is 0.75 to 1.1 m
+/// across with his arms, shield and weapon. Never more than a pair's own
+/// rest distance, so the men of a wall keep their 1.05 m files.
+/// FL_BODY=<metres> sets it, up to the separation distance.
 const BODY_DISTANCE: f32 = 1.2;
 pub(crate) fn body_distance() -> f32 {
     static D: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
@@ -36,8 +37,8 @@ pub(crate) fn body_distance() -> f32 {
 /// 1.12 m, is the crowd above which a pressing man with nobody in reach
 /// stops looking for a far enemy (`acquire`).
 const CROWD_SLOW: f32 = 1.2;
-/// The fade is set by the men's real size, not by the body distance: a
-/// man's drive eases from six neighbours at arm's length, BRAKE_FAR of
+/// The fade is set by the men's real size, not by the body distance: in
+/// his ready stance a man's drive eases from six neighbours at arm's length, BRAKE_FAR of
 /// the 1.70 m man, to nothing when six are pressed against him at
 /// BRAKE_NEAR, his width with arms and shield. Both scale with the unit
 /// scale. A band set from the body distance would be 11 cm of squeeze at
@@ -45,12 +46,154 @@ const CROWD_SLOW: f32 = 1.2;
 /// whenever a gap opened at its front.
 const BRAKE_FAR: f32 = 1.3;
 const BRAKE_NEAR: f32 = 0.9;
+/// The crowd brake of a man in his ready stance.
 pub(crate) fn crowd_brake() -> (f32, f32) {
-    static B: std::sync::OnceLock<(f32, f32)> = std::sync::OnceLock::new();
-    *B.get_or_init(|| {
+    let w = &widths()[3];
+    (w.slow, w.stop)
+}
+/// The body distance at ease: a man standing, walking or running with
+/// his arms down is narrower than one in his ready stance with weapon
+/// and shield up (BODY_DISTANCE). The spring rest at ease stays the same
+/// 0.2 m over the body (`Width`). FL_BODY_EASE=<metres> sets it, up to
+/// the body in the ready stance.
+const BODY_EASE: f32 = 0.9;
+pub(crate) fn body_ease() -> f32 {
+    static D: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *D.get_or_init(|| crate::util::env_or("FL_BODY_EASE", BODY_EASE).clamp(0.5, body_distance()))
+}
+/// The spring rest at ease (metres).
+pub(crate) fn sep_ease() -> f32 {
+    body_ease() + SEP_RADIUS - BODY_DISTANCE
+}
+/// Ticks a man takes from at ease into his ready stance and back, the
+/// change of his width: half a second, the length of the stance clip,
+/// so a block that turns to fight widens as a step and not a jolt.
+pub(crate) const POSE_READY: u8 = 15;
+/// A regiment's stance (sim/job.rs `stance_of`), as the pose pass draws
+/// its men: at ease; in the ready stance while a man stands (an enemy
+/// near, an attack, a charge); in it whatever he does (fighting, a
+/// wall).
+pub(crate) const STANCE_EASE: u8 = 0;
+pub(crate) const STANCE_READY: u8 = 1;
+pub(crate) const STANCE_FIGHT: u8 = 2;
+/// His pose as the grid carries it (spatial.rs META_POSE): 0 at ease to
+/// 3 ready, the ramp in thirds. Both men of a pair read each other's
+/// width from it and their own from the same rounding, so the pair's
+/// distances are the same from either side. The pose byte carries the
+/// stance's ramp in its low four bits and the turn of his shoulders in its
+/// high four (`turn_level`).
+pub(crate) fn pose_level(pose: u8) -> usize {
+    RAMP_LEVELS[(pose & POSE_STANCE) as usize] as usize
+}
+/// A ramp of POSE_READY ticks in thirds. A table, not a division: the grid
+/// rebuild reads it for every man every tick.
+const RAMP_LEVELS: [u8; 16] = [0, 0, 0, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 3, 3, 3];
+const POSE_STANCE: u8 = 0x0f;
+const POSE_TURN_SHIFT: u8 = 4;
+/// How far he has turned his shoulders to squeeze through a crack
+/// (`try_a_side`): 0 square to 3 turned. He turns over the stance's half
+/// second and turns back square over the same, so a man narrows as he
+/// reaches a crack and widens as he comes out, and a block whose squeezes
+/// end together does not jump wider in one tick.
+pub(crate) fn turn_level(pose: u8) -> usize {
+    RAMP_LEVELS[(pose >> POSE_TURN_SHIFT) as usize] as usize
+}
+/// His width level (`widths`): his pose level and his turn level together.
+pub(crate) fn width_level(pose: u8) -> usize {
+    pose_level(pose) + 4 * turn_level(pose)
+}
+/// A man's size at one pose level: his body distance and spring rest
+/// (a pair's are the mean of the two men's), and the crowd at which his
+/// drive starts to fade and is gone, from six men at his body plus
+/// 0.1 m to six at his body less 0.2 m at ease, and BRAKE_FAR to
+/// BRAKE_NEAR in his ready stance, each against his own spring rest.
+pub(crate) struct Width {
+    pub body: f32,
+    pub sep: f32,
+    pub slow: f32,
+    pub stop: f32,
+}
+/// The width levels: his pose level (0 at ease to 3 ready) plus four times
+/// his turn level (0 square to 3 turned). Turned, he narrows across his
+/// way toward his depth, SQUEEZE_DEPTH, body and spring alike, and his
+/// brake band toward a man's at ease, a third at each level.
+pub(crate) const WIDTH_LEVELS: usize = 16;
+pub(crate) const SQUEEZE_DEPTH: f32 = 0.5;
+pub(crate) fn widths() -> &'static [Width; WIDTH_LEVELS] {
+    static W: std::sync::OnceLock<[Width; WIDTH_LEVELS]> = std::sync::OnceLock::new();
+    W.get_or_init(|| {
         let scale = crate::unit_types::unit_scale();
-        let at = |d: f32| 6.0 * (1.0 - (d * scale).min(SEP_RADIUS) / SEP_RADIUS);
-        (at(BRAKE_FAR), at(BRAKE_NEAR))
+        let pose = |level: usize| {
+            let t = level as f32 / 3.0;
+            let mix = |ease: f32, ready: f32| ease * (1.0 - t) + ready * t;
+            let body = mix(body_ease(), body_distance());
+            let sep = mix(sep_ease(), SEP_RADIUS);
+            let at = |d: f32| 6.0 * (1.0 - (d * scale).min(sep) / sep);
+            Width {
+                body,
+                sep,
+                slow: at(mix(body_ease() + 0.1, BRAKE_FAR)),
+                stop: at(mix(body_ease() - 0.2, BRAKE_NEAR)),
+            }
+        };
+        std::array::from_fn(|level| {
+            let (w, turn) = (pose(level % 4), level / 4);
+            if turn == 0 {
+                return w;
+            }
+            let (t, ease) = (turn as f32 / 3.0, pose(0));
+            let mix = |square: f32, turned: f32| square + (turned - square) * t;
+            Width {
+                body: mix(w.body, SQUEEZE_DEPTH),
+                sep: mix(w.sep, SQUEEZE_DEPTH),
+                slow: mix(w.slow, ease.slow),
+                stop: mix(w.stop, ease.stop),
+            }
+        })
+    })
+}
+/// A pair of men by their width levels: their spring rest, its inverse,
+/// and the distance under which their bodies overlap (`scan`). Looked
+/// up per neighbour instead of averaged and divided per neighbour: the
+/// scan is the kernel's cost and dividing would take a third of it. A
+/// pair with a turned man in it rests nearer the touch, at it when he is
+/// fully turned (by the more turned of the two): turned sideways and
+/// pressing into a crack he has no air between his shoulder and the men
+/// beside him, and with the other man's spring reaching past the touch a
+/// crack narrowed by earlier passers held every squeezer short of it for
+/// good.
+pub(crate) struct PairWidth {
+    pub sep: f32,
+    pub inv_sep: f32,
+    pub hard: f32,
+}
+pub(crate) fn pair_widths() -> &'static [[PairWidth; WIDTH_LEVELS]; WIDTH_LEVELS] {
+    static T: std::sync::OnceLock<[[PairWidth; WIDTH_LEVELS]; WIDTH_LEVELS]> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        let w = widths();
+        std::array::from_fn(|a| {
+            std::array::from_fn(|b| {
+                let mut sep = 0.5 * (w[a].sep + w[b].sep);
+                let hard = (0.5 * (w[a].body + w[b].body)).min(sep);
+                sep += (hard - sep) * ((a / 4).max(b / 4) as f32 / 3.0);
+                PairWidth { sep, inv_sep: 1.0 / sep, hard }
+            })
+        })
+    })
+}
+/// A pair of men by their kinds: the mass weight of the push on the
+/// first (2 m_o / (m_i + m_o)) and the other's share of a closing speed
+/// (m_o / (m_i + m_o)).
+pub(crate) fn mass_pairs() -> &'static [[(f32, f32); crate::unit_types::NUM_KINDS]; crate::unit_types::NUM_KINDS] {
+    static T: std::sync::OnceLock<[[(f32, f32); crate::unit_types::NUM_KINDS]; crate::unit_types::NUM_KINDS]> =
+        std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        std::array::from_fn(|a| {
+            std::array::from_fn(|b| {
+                let (mi, mo) = (TYPES[a].mass, TYPES[b].mass);
+                (2.0 * mo / (mi + mo), mo / (mi + mo))
+            })
+        })
     })
 }
 /// The contact between a man and the body he runs into. By default the
@@ -70,7 +213,7 @@ const MAX_ACCEL: f32 = 50.0;
 /// every start and stop, and a lane behind an opening gap would surge
 /// and stop as one body. The spring's push and the contact are not legs
 /// and keep MAX_ACCEL.
-const LEG_ACCEL: f32 = 4.0;
+pub(crate) const LEG_ACCEL: f32 = 4.0;
 /// Facing turn smoothing (fraction/s of the remaining angle) — the
 /// settle behavior for SMALL corrections.
 const YAW_RATE: f32 = 10.0;
@@ -100,14 +243,15 @@ const ARRIVE_RADIUS: f32 = 35.0;
 /// How close to his slot a parked man stands without stepping (metres):
 /// rigid slots sit exactly at the separation rest distance, so a dressed
 /// rank is force-free and can afford a tight tolerance; with 1.5 the
-/// ranks never finished dressing.
-pub(crate) const HOLD_DEADZONE: f32 = 0.7;
+/// ranks never finished dressing. At 0.7 a man brushed by a passer
+/// stays wherever he lands and the next passer shoves him further.
+pub(crate) const HOLD_DEADZONE: f32 = 0.3;
 /// A holding soldier who leaves his mark by more than the hold deadzone
 /// walks back at this pace at least, and keeps going until he is within
 /// STEP_STOP of it: a real step, never a creep. M2TW's slowest
 /// locomotion is its shuffle, 0.75 to 0.9 m/s.
-const STEP_PACE: f32 = 0.8;
-const STEP_STOP: f32 = 0.35;
+pub(crate) const STEP_PACE: f32 = 0.8;
+pub(crate) const STEP_STOP: f32 = 0.35;
 /// Below this ground speed a standing formation's soldier keeps his
 /// facing while he moves: he steps sideways or back, he does not turn
 /// to walk (M2TW's shuffle keeps facing). The renderer plays a skinned
@@ -116,7 +260,7 @@ pub(crate) const STEP_FACE_SPEED: f32 = 1.05;
 /// Going to an enemy he can see: M2TW's ready-stance `advance`
 /// (1.06 m/s) for the last few meters or with a comrade close ahead,
 /// its `combat_jog` (2.87 m/s) from further out over open ground.
-const ADVANCE_PACE: f32 = 1.06;
+pub(crate) const ADVANCE_PACE: f32 = 1.06;
 const COMBAT_JOG_PACE: f32 = 2.87;
 const JOG_BEYOND: f32 = 3.0;
 /// A man blocked by a comrade on the way to his enemy sidesteps toward
@@ -144,9 +288,13 @@ fn sidestep_chance() -> f32 {
 }
 /// A standing man plants his feet: a push must exceed this (m/s^2 of
 /// separation push) before it moves him. About a 10 cm squeeze from one
-/// neighbor. Stepping and running men, and charge knockback, are
-/// unaffected; true overlap is still corrected.
-const STAND_GRIP: f32 = 6.0;
+/// neighbor. A man holding his place (`planted` in steer) keeps the grip
+/// while he steps back to it, and his feet take the first STAND_GRIP x dt
+/// of a shared shove too, each man 0.7 to 1.3 of it: a man brushed by a
+/// passer stays in his file instead of being carried off. Running men
+/// are unaffected, a charge's shove is far above it, and true overlap is
+/// still corrected.
+pub(crate) const STAND_GRIP: f32 = 6.0;
 /// The soft wall (FL_CONTACT=wall): a man's legs carry him this far into
 /// the body he runs into (his own give, 0.7 to 1.3 of it), losing their
 /// closing speed on the way, and nothing of his speed is handed to the
@@ -158,7 +306,12 @@ const GIVE: f32 = 0.08;
 const STANCE: f32 = 0.10;
 #[inline]
 fn give(i: usize) -> f32 {
-    GIVE * (0.7 + 0.6 * crate::units::hash01((i as u32).wrapping_mul(0x51ED).wrapping_add(77)))
+    GIVE * own_spread(i)
+}
+/// His own 0.7 to 1.3 of a man-to-man quantity (his give, his grip).
+#[inline]
+fn own_spread(i: usize) -> f32 {
+    0.7 + 0.6 * crate::units::hash01((i as u32).wrapping_mul(0x51ED).wrapping_add(77))
 }
 
 /// A man of a regiment in melee who sees no enemy joins the fight when
@@ -190,8 +343,8 @@ const LOOK_TICKS: u32 = 8;
 /// by running to the fight; one further out (far look); a man close
 /// behind him.
 const SIGHT_WAY: u16 = 1;
-const SIGHT_LEFT: u16 = 1 << 1;
-const SIGHT_RIGHT: u16 = 1 << 2;
+pub(crate) const SIGHT_LEFT: u16 = 1 << 1;
+pub(crate) const SIGHT_RIGHT: u16 = 1 << 2;
 const SIGHT_AHEAD: u16 = 1 << 3;
 const SIGHT_MARK: u16 = 1 << 4;
 const SIGHT_GO: u16 = 1 << 5;
@@ -207,6 +360,11 @@ pub(crate) const SIGHT_FOE: u16 = 1 << 8;
 /// regiment's swords-out order. With it out he draws no bow, and the
 /// renderer shows the knife and hides the bow (render_units_gpu.rs).
 const SIGHT_KNIFE_SHIFT: u16 = 10;
+/// His aim is a ring aim (`choose_opening`): kept beside or behind him
+/// until he is on it, unlike a wide-look aim, which is dropped once past.
+const SIGHT_RING: u16 = 1 << 9;
+/// Ring aims set this tick, for the straggler log (regiments.rs).
+pub(crate) static RING_AIMS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 const SIGHT_KNIFE_COUNT: u16 = 0x1f << SIGHT_KNIFE_SHIFT;
 pub(crate) const SIGHT_KNIFE: u16 = 1 << 15;
 /// The count an enemy close to him sets: 31 steps of four ticks, about
@@ -296,8 +454,12 @@ pub(crate) struct Field<'a> {
     pub anchors: &'a [Vec2],
     pub broken: &'a [bool],
     pub press: &'a [bool],
+    /// Per regiment: walking through a friend that opened for it.
+    pub passing: &'a [bool],
     /// Per regiment: under a Move order (sim/job.rs `moving`).
     pub moving: &'a [bool],
+    /// Per regiment: the stance its men are drawn in (STANCE_*).
+    pub stance: &'a [u8],
     /// Per regiment: the one enemy regiment its men fight (sim/job.rs
     /// `focus`), None for any.
     pub focus: &'a [Option<u32>],
@@ -353,7 +515,10 @@ pub(crate) struct Soldier<'a> {
     pub sight: &'a mut u16,
     pub way: &'a mut Vec2,
     pub chain: &'a mut u8,
+    pub pose: &'a mut u8,
     pub quarry: &'a mut u32,
+    pub stuck: &'a mut u16,
+    pub aim: &'a mut Vec2,
 }
 
 /// The rows of one chunk of soldiers, in index order.
@@ -373,7 +538,10 @@ pub(crate) struct Rows<'a> {
     pub sight: &'a mut [u16],
     pub way: &'a mut [Vec2],
     pub chain: &'a mut [u8],
+    pub pose: &'a mut [u8],
     pub quarry: &'a mut [u32],
+    pub stuck: &'a mut [u16],
+    pub aim: &'a mut [Vec2],
 }
 
 /// What a chunk emits beside its rows: landed swings and loosed arrows.
@@ -406,6 +574,13 @@ struct Step {
     /// His share by weight of a closing speed on them (the shared speed).
     overlap_share: f32,
     crowd: f32,
+    /// The crowd ahead of him on his way: the neighbours within the
+    /// spring whose direction is within 60 degrees of his wish, by their
+    /// closeness (`try_a_side`).
+    ahead: f32,
+    /// The crowd at which his drive starts to fade and is gone, for his
+    /// width (`Width`).
+    brake: (f32, f32),
     best_idx: u32,
     sticky: bool,
     prev_target: u32,
@@ -432,8 +607,30 @@ struct Step {
     back_blocked: bool,
     // The swing and the steering.
     face_target: Option<Vec2>,
+    /// His drive before the crowd's brake faded it (`try_a_side`).
+    wish: Vec2,
     jam: f32,
     new_v: Vec2,
+    // The choice of opening and the squeeze (`choose_opening`,
+    // `try_a_side`): whether he reads the comrades ahead this tick, his
+    // normal body and spring (not squeezed), whether the scan saw an
+    // obstacle ahead and the opening it found among them (across and
+    // along his way, its fit), a body at each of his sides, and the
+    // opening he aims at (its fit: 0 none, 1 his depth, 2 his width;
+    // `gap`: it fits his depth only; `gap_near`: that crack within his
+    // spring).
+    open_on: bool,
+    body0: f32,
+    sep0: f32,
+    saw: bool,
+    near: (f32, f32, u8),
+    /// The near opening's air across his way and the far side of its
+    /// passage along it (`choose_opening`'s taken crack).
+    near_span: (f32, f32, f32),
+    between: bool,
+    aim_fit: u8,
+    gap: bool,
+    gap_near: bool,
 }
 
 /// Run every soldier of a chunk through his tick.
@@ -455,17 +652,22 @@ pub(crate) fn tick_chunk(f: &Field, rows: Rows, out: &mut ChunkOut) {
             sight: &mut rows.sight[j],
             way: &mut rows.way[j],
             chain: &mut rows.chain[j],
+            pose: &mut rows.pose[j],
             quarry: &mut rows.quarry[j],
+            stuck: &mut rows.stuck[j],
+            aim: &mut rows.aim[j],
         };
         let mut st = begin(f, &mut s);
         drive(f, &mut s, &mut st);
         scan(f, &mut s, &mut st, out);
         look_around(f, &mut s, &mut st);
+        choose_opening(f, &mut s, &mut st);
         hold_the_frame(f, &mut st);
         acquire(f, &mut s, &mut st);
         decide_to_join(f, &mut s, &mut st);
         swing(f, &mut s, &mut st, out);
         yield_to_crowd(&mut st);
+        try_a_side(f, &mut s, &mut st);
         close_in(f, &mut s, &mut st);
         steer(f, &mut s, &mut st);
         face(f, &mut s, &mut st);
@@ -537,6 +739,8 @@ fn begin(f: &Field, s: &mut Soldier) -> Step {
         overlap_vel: Vec2::ZERO,
         overlap_share: 0.0,
         crowd: 0.0,
+        ahead: 0.0,
+        brake: (0.0, 0.0),
         best_idx: u32::MAX,
         sticky: false,
         prev_target: u32::MAX,
@@ -560,8 +764,19 @@ fn begin(f: &Field, s: &mut Soldier) -> Step {
         slot_blocked: false,
         back_blocked: false,
         face_target: None,
+        wish: Vec2::ZERO,
         jam: 0.0,
         new_v: Vec2::ZERO,
+        open_on: false,
+        body0: 0.0,
+        sep0: 0.0,
+        saw: false,
+        near: (0.0, 0.0, 0),
+        near_span: (0.0, 0.0, 0.0),
+        between: false,
+        aim_fit: 0,
+        gap: false,
+        gap_near: false,
     }
 }
 
@@ -669,7 +884,22 @@ fn drive(f: &Field, s: &mut Soldier, st: &mut Step) {
 /// body runs onto, which is a damage event from the spearman.
 #[inline]
 fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
-    let Field { grid, speed, team, yaw_snap, wall, faces_spearwall, tick_seed, .. } = *f;
+    let Field {
+        grid,
+        speed,
+        team,
+        yaw_snap,
+        wall,
+        stance,
+        faces_spearwall,
+        tick_seed,
+        orders,
+        engaged,
+        anchors,
+        home,
+        passing,
+        ..
+    } = *f;
     let i = s.i;
     let params = &TYPES[st.my_kind];
     let p = st.p;
@@ -685,10 +915,47 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
     let mut overlap_share = 0.0f32;
     let mut overlap = 0.0f32;
     let mut crowd = 0.0f32;
+    let mut ahead = 0.0f32;
+    let wish_dir = st.desired.normalize_or_zero();
     let my_team_bit = (team[i] as u32) * crate::spatial::META_TEAM;
     let my_wall = wall[gi] != 0;
-    let my_mass = params.mass;
-    let body = body_distance();
+    // His width and each neighbour's by their poses and the turn of their
+    // shoulders at the tick's start, the pair's rest, its inverse and its
+    // overlap distance from a table, and the pair's mass weights by kind.
+    let widths = widths();
+    let squeeze_on = squeezing(*s.stuck);
+    let pose_lv = pose_level(*s.pose);
+    let my_level = width_level(*s.pose);
+    let mine = &widths[my_level];
+    // The choice of opening's read (`choose_opening`): only a man walking
+    // somewhere, not fighting, reads the comrades ahead; a man squeezing
+    // feels the bodies at his sides.
+    let body0 = widths[pose_lv].body;
+    let far = (anchors[gi] + home[i]).distance_squared(p) > TRY_FROM_SLOT * TRY_FROM_SLOT;
+    let walking = orders[gi].is_some() || far;
+    // Only a man with a reason to pick an opening: his regiment walking
+    // through a friend that opened for it, or himself a straggler of a
+    // holding regiment. Read for every walking man, it costs 5.6 ms of
+    // the 200k step in a front battle where nobody passes anyone.
+    let reason = passing[gi] || (orders[gi].is_none() && far);
+    let open_on = opening_on()
+        && walking
+        && reason
+        && !engaged[gi]
+        && !dying
+        && !st.routed
+        && !st.in_melee
+        && !st.committed
+        && st.join_fp.is_none()
+        && st.desired.length_squared() > 0.25;
+    // Every obstacle within his reach is in the row nearest him (the band
+    // reaches past OPEN_SEE), so the scan keeps the nearest two on each
+    // side as it goes.
+    let mut row = Row::default();
+    let mut row_at = f32::INFINITY;
+    let (mut side_left, mut side_right) = (false, false);
+    let pairs = &pair_widths()[my_level];
+    let masses = &mass_pairs()[st.my_kind];
     let gain = CORR_GAIN;
     let reach2 = params.reach * params.reach;
     let prev_target = *s.target;
@@ -720,8 +987,14 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
         }
         let d = p - o.xz();
         let d2 = d.length_squared();
-        let enemy = (o.meta & crate::spatial::META_TEAM) != my_team_bit
-            && (o.meta & crate::spatial::META_DYING) == 0;
+        // A friend beyond the widest spring rest can touch nothing of his:
+        // out before any of the pair's work. Most of a scan's candidates
+        // in a press are such men (the cells span more than the circle).
+        let same = (o.meta & crate::spatial::META_TEAM) == my_team_bit;
+        if same && d2 >= SEP_RADIUS * SEP_RADIUS {
+            return;
+        }
+        let enemy = !same && (o.meta & crate::spatial::META_DYING) == 0;
         if enemy && d2 < reach2 {
             sticky |= o.idx == prev_target;
             if d2 < best_d2 {
@@ -765,30 +1038,55 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
         // seams the intermix needs: a pressed front's gaps shrank to about
         // 1.05 m against 0.95 m bodies and symmetric fights collapsed to a
         // two-rank duel line. It must not come back.
-        let sep_r = if !cross && my_wall && (o.meta & crate::spatial::META_WALL) != 0 {
-            WALL_SEP_RADIUS
+        // The comrades ahead for the choice of opening: a queue (a man of
+        // a regiment under an order moving his way) is not an obstacle; a
+        // holding man always is.
+        if same && (o.meta & crate::spatial::META_DYING) == 0 && (open_on | squeeze_on) {
+            let to = -d;
+            let along = to.dot(wish_dir);
+            let lat = wish_dir.x * to.y - wish_dir.y * to.x;
+            let o_body = widths[crate::spatial::meta_pose(o.meta)].body;
+            if open_on && along > OPEN_AHEAD {
+                let holding = orders[crate::spatial::meta_group(o.meta)].is_none();
+                let queue = !holding && o_vel.dot(wish_dir) > QUEUE_SPEED;
+                if !queue {
+                    row.add(lat, 0.5 * o_body, along);
+                    row_at = row_at.min(along);
+                }
+            }
+            if squeeze_on {
+                let near = 0.5 * (body0 + o_body) - BETWEEN_SLACK;
+                if d2 < near * near && along.abs() < 1.0 {
+                    side_left |= lat > 0.0;
+                    side_right |= lat < 0.0;
+                }
+            }
+        }
+        let pair = &pairs[crate::spatial::meta_width(o.meta)];
+        let (sep_r, inv_sep, hard) = if !cross && my_wall && (o.meta & crate::spatial::META_WALL) != 0 {
+            (WALL_SEP_RADIUS, 1.0 / WALL_SEP_RADIUS, pair.hard.min(WALL_SEP_RADIUS))
         } else {
-            SEP_RADIUS
+            (pair.sep, pair.inv_sep, pair.hard)
         };
         if d2 < sep_r * sep_r && d2 > 1e-8 {
             // Mass-weighted: heavies shove lights aside.
-            let o_mass = TYPES[crate::spatial::meta_kind(o.meta)].mass;
-            let mw = 2.0 * o_mass / (my_mass + o_mass);
+            let (mw, share) = masses[crate::spatial::meta_kind(o.meta)];
             let len = d2.sqrt();
-            let w = 1.0 - len / sep_r;
-            let hard = body.min(sep_r);
+            let inv_len = 1.0 / len;
+            let w = 1.0 - len * inv_sep;
             if len < hard {
                 // Overlap is resolved POSITIONALLY only. A hard force boost
                 // here as well made packed crowds oscillate at the
                 // acceleration cap, two solvers fighting over the same
                 // overlap, every frame.
                 let back = (hard - len) * gain * mw;
-                corr += d * (back / len);
+                corr += d * (back * inv_len);
                 overlap_vel += o_vel * back;
-                overlap_share += o_mass / (my_mass + o_mass) * back;
+                overlap_share += share * back;
                 overlap += back;
             }
-            push += d * (w * mw / len);
+            push += d * (w * mw * inv_len);
+            ahead += w * (d.dot(wish_dir) < -0.5 * len) as u32 as f32;
             // Jam density: COMPRESSED pairs only — a neighbor resting AT his
             // pair's rest distance contests nothing, so a formed man's
             // slot-keeping is never faded by the settled enemies one stride
@@ -826,6 +1124,24 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
             *s.sight &= !SIGHT_FOE;
         }
     }
+    // His stance for the next tick, as he is drawn: into the ready stance
+    // while his regiment fights, while it stands ready and he stands (the
+    // pose pass's guard, below the speed of his steps), or with an enemy
+    // in his reach; else back at ease, walking or running. A step of the
+    // ramp a tick.
+    let ready = match stance[gi] {
+        STANCE_FIGHT => true,
+        STANCE_READY => s.vel.xz().length_squared() < STEP_FACE_SPEED * STEP_FACE_SPEED,
+        _ => false,
+    };
+    let stance_ramp = *s.pose & POSE_STANCE;
+    let stance_ramp = if ready || best_idx != u32::MAX {
+        (stance_ramp + 1).min(POSE_READY)
+    } else {
+        stance_ramp.saturating_sub(1)
+    };
+    *s.pose = (*s.pose & !POSE_STANCE) | stance_ramp;
+    st.brake = (mine.slow, mine.stop);
     // An archer's knife: out while his regiment has its swords out, and
     // for a few seconds after an enemy came close to him, one in his
     // reach, an enemy block's edge within KNIFE_EDGE of him, or with his
@@ -851,6 +1167,7 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
         st.overlap_share = overlap_share / overlap;
     }
     st.crowd = crowd;
+    st.ahead = ahead;
     st.best_idx = best_idx;
     st.sticky = sticky;
     st.prev_target = prev_target;
@@ -858,6 +1175,300 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
     st.at_charge_speed = at_charge_speed;
     st.scan_r = scan_r;
     st.my_team_bit = my_team_bit;
+    st.open_on = open_on;
+    st.body0 = body0;
+    st.sep0 = widths[pose_lv].sep;
+    st.saw = row_at.is_finite();
+    if open_on && st.saw {
+        let (pref, coin) = side_pref(i, *s.stuck);
+        let (aim_lat, aim_along, fit, span) = openings(&row, row_at, OPEN_SEE, body0, SQUEEZE_DEPTH, false, pref, coin);
+        st.near = (aim_lat, aim_along, fit);
+        st.near_span = span;
+    }
+    st.between = side_left && side_right;
+}
+
+/// The ring read (`choose_opening`): how far round him a hemmed man reads
+/// the men for a crack, and how close to a ring aim counts as on it.
+const RING_SEE: f32 = 2.0;
+const RING_ON: f32 = 0.3;
+/// The widest open side (radians between two neighbours round him) a man
+/// may have and still count as hemmed in: a third of a turn.
+const RING_OPEN_SPAN: f32 = 2.0 * std::f32::consts::FRAC_PI_3;
+/// FL_OPEN_RING=0 turns the ring read off.
+fn open_ring() -> bool {
+    static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *K.get_or_init(|| crate::util::env_or("FL_OPEN_RING", 1u32) != 0)
+}
+
+/// The side a man leans to among equal openings: the side he chose last
+/// while he remembers it, and his own coin, the same every tick.
+#[inline]
+fn side_pref(i: usize, stuck: u16) -> (f32, f32) {
+    let pref = if (stuck & STUCK_MEM) != 0 { if stuck & STUCK_LEFT != 0 { 1.0 } else { -1.0 } } else { 0.0 };
+    let coin = if crate::units::hash01((i as u32).wrapping_mul(0x7A31).wrapping_add(13)) > 0.5 { 1.0 } else { -1.0 };
+    (pref, coin)
+}
+
+/// The choice of opening (OPEN_SEE above): from the obstacles ahead his
+/// scan saw, and on his look tick from a wider look, the opening he aims
+/// at; his drive turned toward it at its pace; the side he chose
+/// remembered as the try remembers its side. Only a man walking somewhere
+/// with no enemy in mind and his regiment not fighting (the try's test):
+/// fighting men keep their own footwork.
+#[inline]
+fn choose_opening(f: &Field, s: &mut Soldier, st: &mut Step) {
+    let Field { grid, orders, tick, anchors, home, .. } = *f;
+    let i = s.i;
+    let going = st.open_on && st.best_idx == u32::MAX && !st.memo_valid;
+    let ring_flag = *s.sight & SIGHT_RING != 0;
+    *s.sight &= !SIGHT_RING;
+    if !going {
+        *s.aim = Vec2::NAN;
+        return;
+    }
+    let p = st.p;
+    let want = st.desired.length();
+    let wd = st.desired / want;
+    let perp = Vec2::new(-wd.y, wd.x);
+    let mut v = *s.stuck;
+    // The near read, from the scan.
+    let (mut aim_lat, mut aim_along, mut fit) = st.near;
+    if fit > 0 {
+        *s.aim = Vec2::NAN;
+    }
+    // A man he follows still takes up his space: a near crack that fits
+    // only his depth is taken by any comrade ahead of him, one he follows
+    // or not, whose body overlaps its air short of its passage's far side.
+    // He may still aim at a taken crack, which is following, but never
+    // turns his shoulders for it. Only for a man with such a crack in his
+    // aim, so a second look at the comrades within the scan's box.
+    let mut taken = false;
+    if fit == 1 {
+        let (lo, hi, far) = st.near_span;
+        let my_team_bit = st.my_team_bit;
+        let widths = widths();
+        grid.for_each_candidate(p, QUERY_RADIUS, |o| {
+            if taken
+                || o.idx as usize == i
+                || (o.meta & crate::spatial::META_TEAM) != my_team_bit
+                || (o.meta & crate::spatial::META_DYING) != 0
+            {
+                return;
+            }
+            let to = o.xz() - p;
+            let along = to.dot(wd);
+            if along <= OPEN_AHEAD || to.length_squared() >= QUERY_RADIUS * QUERY_RADIUS {
+                return;
+            }
+            let lat = wd.x * to.y - wd.y * to.x;
+            let r = 0.5 * widths[crate::spatial::meta_pose(o.meta)].body;
+            taken = along - r < far && lat + r > lo && lat - r < hi;
+        });
+    }
+    // The wide look: nothing near fits and he saw somebody in his way.
+    // The ring (FL_OPEN_RING): a man of a holding regiment far from his
+    // place with nobody ahead fitting him reads the men all round him within RING_SEE on his look
+    // tick, the crack between each two neighbours round the ring, and aims
+    // at the one that fits him nearest his way, whichever side it lies.
+    // A man hemmed in a dressed block at an angle to his way sees no pair
+    // ahead of his line, and the cracks round him run between a man ahead
+    // and a man abeam or behind.
+    let look = tick.wrapping_add((i as u32).wrapping_mul(7)).is_multiple_of(OPEN_LOOK_TICKS);
+    // Only a man whose regiment holds: a marching man far from his place
+    // is the whole regiment on the march, and a lane walker who reads the
+    // ring aims beside himself and blocks the lane.
+    let hemmed = open_ring()
+        && orders[st.gi].is_none()
+        && (anchors[st.gi] + home[i]).distance_squared(p) > TRY_FROM_SLOT * TRY_FROM_SLOT;
+    let mut ring_aim = false;
+    if fit == 0 && st.saw && hemmed && look {
+        let my_team_bit = st.my_team_bit;
+        let widths = widths();
+        let mut men: [(f32, Vec2, f32); 16] = [(0.0, Vec2::ZERO, 0.0); 16];
+        let mut n = 0usize;
+        let mut own = 0usize;
+        grid.for_each_candidate_vel(p, RING_SEE, |o, o_vel| {
+            if n == men.len()
+                || o.idx as usize == i
+                || (o.meta & crate::spatial::META_TEAM) != my_team_bit
+                || (o.meta & crate::spatial::META_DYING) != 0
+            {
+                return;
+            }
+            let to = o.xz() - p;
+            if to.length_squared() >= RING_SEE * RING_SEE {
+                return;
+            }
+            let holding = orders[crate::spatial::meta_group(o.meta)].is_none();
+            if !holding && o_vel.dot(wd) > QUEUE_SPEED {
+                return;
+            }
+            let ang = (wd.x * to.y - wd.y * to.x).atan2(to.dot(wd));
+            men[n] = (ang, to, 0.5 * widths[crate::spatial::meta_pose(o.meta)].body);
+            n += 1;
+            own += usize::from(crate::spatial::meta_group(o.meta) == st.gi);
+        });
+        // Hemmed in: men on every side of him, no open side wider than
+        // RING_OPEN_SPAN, and most of them another regiment's. A man in a
+        // lane or at a block's edge has an open side and walks; a man
+        // inside his own block (an attacking block the moment it arrives)
+        // is among his comrades; the ring is for the man left in a cell of
+        // another regiment's planted men.
+        let mut open_span = std::f32::consts::TAU;
+        if n >= 3 {
+            men[..n].sort_by(|a, b| a.0.total_cmp(&b.0));
+            open_span = (0..n)
+                .map(|k| if k + 1 == n { men[0].0 + std::f32::consts::TAU - men[k].0 } else { men[k + 1].0 - men[k].0 })
+                .fold(0.0f32, f32::max);
+        }
+        if n >= 3 && open_span <= RING_OPEN_SPAN && 2 * own < n {
+            let mut best = f32::INFINITY;
+            let mut best_point = Vec2::ZERO;
+            let mut best_fit = 0u8;
+            for k in 0..n {
+                let (a0, q0, h0) = men[k];
+                let (a1, q1, h1) = men[(k + 1) % n];
+                let span = if k + 1 == n { a1 + std::f32::consts::TAU - a0 } else { a1 - a0 };
+                let (point, wf) = if span > std::f32::consts::FRAC_PI_2 {
+                    // Open ground between them: the way between at the
+                    // nearer man's distance.
+                    let mid = a0 + 0.5 * span;
+                    let dir = wd * mid.cos() + perp * mid.sin();
+                    (dir * q0.length().min(q1.length()).max(st.sep0), 2u8)
+                } else {
+                    let chord = q1 - q0;
+                    let len = chord.length();
+                    let air = len - h0 - h1;
+                    let wf = if air >= st.body0 - OPEN_SLACK {
+                        2
+                    } else if air >= SQUEEZE_DEPTH {
+                        1
+                    } else {
+                        0
+                    };
+                    if wf == 0 || len < 1e-3 {
+                        continue;
+                    }
+                    (q0 + chord * ((h0 + 0.5 * air) / len), wf)
+                };
+                let off = (wd.x * point.y - wd.y * point.x).atan2(point.dot(wd)).abs();
+                let cost = off + if wf == 1 { SQUEEZE_DETOUR } else { 0.0 };
+                if cost < best {
+                    best = cost;
+                    best_point = point;
+                    best_fit = wf;
+                }
+            }
+            if best_fit > 0 {
+                *s.aim = p + best_point;
+                v = (v & !STUCK_WIDE_DEPTH) | ((best_fit == 1) as u16 * STUCK_WIDE_DEPTH);
+                ring_aim = true;
+                RING_AIMS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+    // The wide look: nothing near fits and he saw somebody in his way.
+    if fit == 0 && !ring_aim && st.saw && look {
+        let (pref, coin) = side_pref(i, v);
+        let my_team_bit = st.my_team_bit;
+        let widths = widths();
+        let read = |o: &crate::spatial::SortedUnit, o_vel: Vec2| -> Option<(f32, f32, f32)> {
+            if o.idx as usize == i
+                || (o.meta & crate::spatial::META_TEAM) != my_team_bit
+                || (o.meta & crate::spatial::META_DYING) != 0
+            {
+                return None;
+            }
+            let to = o.xz() - p;
+            let along = to.dot(wd);
+            if along <= OPEN_AHEAD || to.length_squared() >= OPEN_FAR * OPEN_FAR {
+                return None;
+            }
+            let holding = orders[crate::spatial::meta_group(o.meta)].is_none();
+            if !holding && o_vel.dot(wd) > QUEUE_SPEED {
+                return None;
+            }
+            let lat = wd.x * to.y - wd.y * to.x;
+            Some((along, lat, 0.5 * widths[crate::spatial::meta_pose(o.meta)].body))
+        };
+        // One pass over the grid: the comrades in his sight into a buffer,
+        // then the nearest and the row from it. Two passes cost 3.0 ms of
+        // the 200k step; the buffer overflowing (a press denser than
+        // WIDE_SEEN men in 4 m) falls back to the second pass.
+        let mut wide_at = f32::INFINITY;
+        let mut seen: [(f32, f32, f32); WIDE_SEEN] = [(0.0, 0.0, 0.0); WIDE_SEEN];
+        let mut n_seen = 0usize;
+        let mut overflow = false;
+        grid.for_each_candidate_vel(p, OPEN_FAR, |o, o_vel| {
+            if let Some(m) = read(o, o_vel) {
+                wide_at = wide_at.min(m.0);
+                if n_seen < WIDE_SEEN {
+                    seen[n_seen] = m;
+                    n_seen += 1;
+                } else {
+                    overflow = true;
+                }
+            }
+        });
+        let mut wide = Row::default();
+        if overflow {
+            grid.for_each_candidate_vel(p, OPEN_FAR, |o, o_vel| {
+                if let Some((along, lat, half)) = read(o, o_vel)
+                    && along < wide_at + OPEN_BAND
+                {
+                    wide.add(lat, half, along);
+                }
+            });
+        } else {
+            for &(along, lat, half) in &seen[..n_seen] {
+                if along < wide_at + OPEN_BAND {
+                    wide.add(lat, half, along);
+                }
+            }
+        }
+        let (w_lat, w_along, w_fit, _) = openings(&wide, wide_at, OPEN_FAR, st.body0, SQUEEZE_DEPTH, true, pref, coin);
+        *s.aim = if w_fit > 0 { p + wd * w_along + perp * w_lat } else { Vec2::NAN };
+        v = (v & !STUCK_WIDE_DEPTH) | ((w_fit == 1) as u16 * STUCK_WIDE_DEPTH);
+    }
+    // A near fit wins; else the wide aim while it is still ahead of him,
+    // or a ring aim within RING_SEE whichever way it lies, until he is on
+    // it.
+    let mut ring_kept = false;
+    if fit == 0 && s.aim.x.is_finite() {
+        let rel = *s.aim - p;
+        let r_along = rel.dot(wd);
+        let d2 = rel.length_squared();
+        let near_ring = (ring_flag || ring_aim) && d2 < RING_SEE * RING_SEE && d2 > RING_ON * RING_ON;
+        if r_along > OPEN_AHEAD || near_ring {
+            aim_lat = rel.dot(perp);
+            aim_along = r_along;
+            fit = if v & STUCK_WIDE_DEPTH != 0 { 1 } else { 2 };
+            ring_kept = r_along <= OPEN_AHEAD;
+            if near_ring {
+                *s.sight |= SIGHT_RING;
+            }
+        } else {
+            *s.aim = Vec2::NAN;
+        }
+    }
+    st.aim_fit = fit;
+    st.gap = fit == 1 && !taken;
+    st.gap_near = st.gap && aim_along < st.sep0;
+    if fit > 0 {
+        // The side he chose, remembered as the try remembers its side.
+        if aim_lat.abs() > 0.1 {
+            v = (v & !(STUCK_MEM | STUCK_LEFT)) | (SIDE_MEMORY << STUCK_MEM_SHIFT) | ((aim_lat > 0.0) as u16 * STUCK_LEFT);
+        }
+        // His drive turned toward the aim, at its pace; a ring aim beside
+        // or behind him is driven at straight.
+        let to = if ring_kept { wd * aim_along + perp * aim_lat } else { wd * aim_along.max(OPEN_MIN_AHEAD) + perp * aim_lat };
+        let len = to.length();
+        if len > 1e-6 {
+            st.desired = to * (want / len);
+        }
+    }
+    *s.stuck = v;
 }
 
 /// What he remembers and what he sees of his comrades: the enemy he
@@ -1022,6 +1633,351 @@ fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
     st.right_blocked = right_blocked;
     st.comrade_ahead = comrade_ahead;
     st.slot_blocked = slot_blocked;
+}
+
+/// Stuck ticks before a man tries a side (half a second); how long a try
+/// lasts at most (a second) and at least (a real step, not a twitch);
+/// how long he remembers the side he tried, in steps of 8 ticks (four
+/// seconds).
+const STUCK_TICKS: u16 = 15;
+const TRY_TICKS: u16 = 30;
+const TRY_MIN: u16 = 6;
+const SIDE_MEMORY: u16 = 15;
+/// The crowd ahead of him (`Step::ahead`) that counts as someone in his
+/// way, and the sideways lean of his separation push that picks his
+/// side over his memory and his coin.
+const AHEAD_MIN: f32 = 0.1;
+const LEAN_MIN: f32 = 0.05;
+/// A holding man this far from his slot is walking somewhere too, and
+/// tries a side when stuck: a man left inside a friend that closed, or
+/// carried off by a friend walking through, works his way out instead of
+/// standing against the gripping men for good.
+const TRY_FROM_SLOT: f32 = 5.0;
+/// The `stuck` column: the stuck ticks (bits 0 to 3), the try's ticks
+/// left (4 to 8), the side memory in steps of 8 ticks (9 to 12), the
+/// remembered side (13, set for his left), squeezing (14; then bits 0 to
+/// 8 count his ticks in the squeeze instead, since a squeezing man is
+/// neither counting nor trying), and whether the opening of his last wide
+/// look fits only his depth (15, `choose_opening`).
+const STUCK_COUNT: u16 = 0x000f;
+const STUCK_TRY_SHIFT: u16 = 4;
+const STUCK_TRY: u16 = 0x1f << STUCK_TRY_SHIFT;
+const STUCK_MEM_SHIFT: u16 = 9;
+const STUCK_MEM: u16 = 0x0f << STUCK_MEM_SHIFT;
+pub(crate) const STUCK_LEFT: u16 = 1 << 13;
+const STUCK_SQUEEZE: u16 = 1 << 14;
+const STUCK_SQUEEZE_TICKS: u16 = 0x01ff;
+const STUCK_WIDE_DEPTH: u16 = 1 << 15;
+/// The stuck ticks and the try's ticks left packed in `stuck`.
+pub(crate) fn stuck_count(v: u16) -> u16 {
+    if squeezing(v) { 0 } else { v & STUCK_COUNT }
+}
+pub(crate) fn stuck_trying(v: u16) -> u16 {
+    if squeezing(v) { 0 } else { (v & STUCK_TRY) >> STUCK_TRY_SHIFT }
+}
+/// Whether he is squeezing through a crack, and for how many ticks.
+pub(crate) fn squeezing(v: u16) -> bool {
+    v & STUCK_SQUEEZE != 0
+}
+fn squeeze_ticks(v: u16) -> u16 {
+    if squeezing(v) { v & STUCK_SQUEEZE_TICKS } else { 0 }
+}
+
+/// The squeeze: a man going through a crack narrower
+/// than he is wide turns his shoulders and is SQUEEZE_DEPTH across
+/// (`turn_level`). It lasts from the crack's mouth until he is through:
+/// it ends once he has no body within his normal width at each side
+/// (less BETWEEN_SLACK, within a metre along his way) and either he aims
+/// at no crack or he moves freely at nine tenths of the advance pace with
+/// no crack within his spring, after TRY_MIN ticks, or after
+/// SQUEEZE_STALL ticks with no progress, whatever is beside him: a man
+/// wedged in a press turns back square. While
+/// it lasts his legs push along his wish with their full effort, not
+/// faded by the crowd's brake, and his speed is capped at SQUEEZE_CAP,
+/// a walk.
+const BETWEEN_SLACK: f32 = 0.05;
+const SQUEEZE_STALL: u16 = 60;
+const SQUEEZE_CAP: f32 = 2.0;
+/// The choice of opening: a man going somewhere, with no
+/// enemy in his reach and his regiment not fighting (the try's own test),
+/// reads the comrades ahead of him within OPEN_SEE (the scan's same-team
+/// reach) and aims at an opening between them that fits him, before he
+/// reaches them. A comrade of a regiment under an order who moves his way
+/// faster than QUEUE_SPEED is a queue he follows, not an obstacle; a
+/// holding man is an obstacle whatever a shove does to him, and a man
+/// squeezing who has stopped is a body like any other. Of the obstacles he takes the row nearest him (the men within
+/// OPEN_BAND along of the nearest one, a rank's pitch and a bit, so the
+/// two files of a pair offset by a rank read as one row) and in it the
+/// nearest two on each side of his way. The air between neighbouring men
+/// of the row fits his width (his normal body, less OPEN_SLACK), else his
+/// depth (the squeeze), else nothing. For each fitting opening his centre
+/// goes to its point nearest his way; the nearest wins, a squeeze counting
+/// as SQUEEZE_DETOUR metres of detour, the side he chose last worth
+/// OPEN_SIDE_KEEP, his own coin breaking a tie. His drive keeps its pace
+/// and turns toward that point, OPEN_MIN_AHEAD ahead at least. The near
+/// read takes only openings between two men it has seen. When nothing
+/// near fits and he saw an obstacle, he looks out to OPEN_FAR once in
+/// OPEN_LOOK_TICKS, in his own rhythm, where the open ground beyond the
+/// last man on each side counts too, and keeps what he found (`aim`)
+/// until his next look, until it is behind him or until his near read
+/// fits. A man he follows still takes up his space: a crack that fits
+/// only his depth with any comrade inside its passage is taken, and he
+/// does not turn his shoulders for it, though he may aim at it, which is
+/// following.
+const OPEN_SEE: f32 = SEP_RADIUS;
+const OPEN_FAR: f32 = 4.0;
+const OPEN_BAND: f32 = 1.5;
+const OPEN_AHEAD: f32 = 0.05;
+const QUEUE_SPEED: f32 = 0.3;
+const SQUEEZE_DETOUR: f32 = 1.0;
+const OPEN_LOOK_TICKS: u32 = 8;
+/// The comrades the wide look keeps from its one pass over the grid.
+const WIDE_SEEN: usize = 96;
+const OPEN_SLACK: f32 = 0.02;
+const OPEN_SIDE_KEEP: f32 = 0.2;
+const OPEN_MIN_AHEAD: f32 = 0.3;
+
+fn opening_on() -> bool {
+    static O: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *O.get_or_init(|| crate::util::env_or("FL_OPENING", 1u32) != 0)
+}
+
+/// The row nearest a man: the nearest two obstacles on each side of his
+/// way by their offset across it (left positive), each with his half
+/// body and his far side along the way (his offset along it plus his half
+/// body).
+#[derive(Default)]
+struct Row {
+    left: [(f32, f32, f32); 2],
+    right: [(f32, f32, f32); 2],
+    n_left: u8,
+    n_right: u8,
+}
+impl Row {
+    #[inline]
+    fn add(&mut self, lat: f32, half: f32, along: f32) {
+        let (side, n, key) = if lat >= 0.0 {
+            (&mut self.left, &mut self.n_left, lat)
+        } else {
+            (&mut self.right, &mut self.n_right, -lat)
+        };
+        let man = (key, half, along + half);
+        if *n == 0 || key < side[0].0 {
+            side[1] = side[0];
+            side[0] = man;
+            *n = (*n + 1).min(2);
+        } else if *n == 1 || key < side[1].0 {
+            side[1] = man;
+            *n = 2;
+        }
+    }
+}
+
+/// The openings a man sees in a row at `row_at` along his way, out to
+/// `see`: ahead between the nearest man on each side, left between the
+/// two nearest on his left, right between the two on his right, and, when
+/// `beyond` (the wide look), the open ground past the last man seen on a
+/// side up to the edge of his sight at that distance. Returns the aim
+/// across and along his way, its fit (0 none, 1 his depth, 2 his width),
+/// and the picked opening's air across his way with the far side of its
+/// passage along it (the farther of its two men's far sides).
+#[allow(clippy::too_many_arguments)]
+fn openings(
+    row: &Row,
+    row_at: f32,
+    see: f32,
+    body: f32,
+    depth: f32,
+    beyond: bool,
+    pref: f32,
+    coin: f32,
+) -> (f32, f32, u8, (f32, f32, f32)) {
+    let none = (f32::NAN, f32::NAN, f32::NAN);
+    if row.n_left == 0 && row.n_right == 0 {
+        return (0.0, 0.0, 0, none);
+    }
+    let edge = (see * see - row_at.min(see) * row_at.min(see)).max(0.0).sqrt();
+    let far = if beyond { edge } else { f32::NAN };
+    let (l1, l1r, l1f) = if row.n_left >= 1 { row.left[0] } else { none };
+    let (r1, r1r, r1f) = if row.n_right >= 1 { row.right[0] } else { none };
+    let (hi_l, l2f) = if row.n_left >= 2 { (row.left[1].0 - row.left[1].1, row.left[1].2) } else { (far, f32::NAN) };
+    let (lo_r, r2f) = if row.n_right >= 2 { (-(row.right[1].0 - row.right[1].1), row.right[1].2) } else { (-far, f32::NAN) };
+    // f32::max takes the number over a NaN: a side with one man seen has
+    // his far side.
+    let ahead = (
+        if row.n_right >= 1 { -(r1 - r1r) } else { -far },
+        if row.n_left >= 1 { l1 - l1r } else { far },
+        true,
+        l1f.max(r1f),
+    );
+    let left = (l1 + l1r, hi_l, row.n_left >= 1, l1f.max(l2f));
+    let right = (lo_r, -(r1 + r1r), row.n_right >= 1, r1f.max(r2f));
+    let sign = |x: f32| if x > 0.0 { 1.0 } else if x < 0.0 { -1.0 } else { 0.0 };
+    let (mut best, mut aim_lat, mut fit, mut span) = (f32::INFINITY, 0.0, 0u8, none);
+    for (lo, hi, ok, pass) in [ahead, left, right] {
+        if !ok {
+            continue;
+        }
+        // NaN air (an edge the near read does not see) fits nothing.
+        let air = hi - lo;
+        let fw = air >= body - OPEN_SLACK;
+        let fd = !fw && air >= depth - OPEN_SLACK;
+        if !(fw || fd) {
+            continue;
+        }
+        let r = 0.5 * if fw { body } else { depth };
+        let aim = (lo + r).max(0.0).min(hi - r);
+        let aim = if aim.is_finite() { aim } else { 0.0 };
+        let cost = aim.abs() + if fd { SQUEEZE_DETOUR } else { 0.0 }
+            - if pref != 0.0 && sign(aim) == pref { OPEN_SIDE_KEEP } else { 0.0 }
+            - if sign(aim) == coin { 0.01 } else { 0.0 };
+        if cost < best {
+            best = cost;
+            aim_lat = aim;
+            fit = if fw { 2 } else { 1 };
+            span = (lo, hi, pass);
+        }
+    }
+    (aim_lat, if fit > 0 { row_at.min(see) } else { 0.0 }, fit, span)
+}
+
+/// A man going somewhere who finds himself stuck tries a side. Stuck is
+/// felt, not seen: he wants to walk and has moved at under half his wish,
+/// and slower than a step, for STUCK_TICKS with bodies pressed against
+/// him ahead (the net push would not do: in a press the men behind cancel
+/// the men in front). He
+/// tries the side his separation push leans to, the side with more room;
+/// when it leans nowhere, the side he tried within the last SIDE_MEMORY,
+/// else his own coin: a sidestep at STEP_PACE on top of whatever the
+/// crowd leaves of his drive, not faded by the crowd's brake, so a man
+/// packed in still shuffles sideways. The step ends as soon as the way
+/// ahead of him is clear, after TRY_MIN ticks, and at TRY_TICKS at the
+/// latest: he steps into the gap and walks, he does not step through it
+/// into the next man, which would bounce him from column to column. Pressed
+/// forward and free to slide sideways, he slides into the gap beside the
+/// man in his way, and the man behind him does the same a moment later.
+/// The blind sidestep is only for a man with no opening to aim at
+/// (`choose_opening`): reaching a crack he aims at that fits only his
+/// depth, he turns his shoulders at once and squeezes through
+/// (`turn_level`). Only a man walking somewhere, under his regiment's
+/// order or back to a slot more than TRY_FROM_SLOT off, with no enemy in
+/// mind and his regiment not fighting: men walking to a fight and the
+/// rear ranks of a fighting regiment keep their own rules (`close_in`),
+/// so the melee keeps its own footwork, and a squeeze ends when the
+/// fight reaches him. His state rides the `stuck` column (STUCK_*).
+#[inline]
+fn try_a_side(f: &Field, s: &mut Soldier, st: &mut Step) {
+    let Field { orders, engaged, anchors, home, tick, .. } = *f;
+    let i = s.i;
+    let wish = st.wish;
+    let want = wish.length();
+    let walking = orders[st.gi].is_some()
+        || (anchors[st.gi] + home[i]).distance_squared(st.p) > TRY_FROM_SLOT * TRY_FROM_SLOT;
+    let going = walking
+        && !engaged[st.gi]
+        && !st.dying
+        && !st.routed
+        && !st.in_melee
+        && !st.committed
+        && st.best_idx == u32::MAX
+        && !st.memo_valid
+        && st.join_fp.is_none()
+        && want > 0.5;
+    if !going {
+        *s.stuck = 0;
+        turn_shoulders(s);
+        return;
+    }
+    let dir = wish / want;
+    let left_dir = Vec2::new(-dir.y, dir.x);
+    let v = *s.stuck;
+    let mut squeeze = squeeze_ticks(v);
+    let mut count = stuck_count(v);
+    let mut trying = stuck_trying(v);
+    let mut mem = (v & STUCK_MEM) >> STUCK_MEM_SHIFT;
+    let mut left = v & STUCK_LEFT != 0;
+    let v_along = s.vel.xz().dot(dir);
+    // The squeeze (SQUEEZE_STALL above): it ends once no body is at each
+    // of his sides and either no crack is ahead or he walks freely, or
+    // once he has made no progress for SQUEEZE_STALL ticks, whatever is
+    // beside him: a man wedged in a press turns back square.
+    if squeeze > 0 {
+        let free = v_along >= 0.9 * ADVANCE_PACE && !st.gap_near;
+        let stalled = squeeze >= SQUEEZE_STALL && v_along < 0.1;
+        let through = !st.between && squeeze >= TRY_MIN && (!st.gap || free);
+        squeeze = if through || stalled { 0 } else { (squeeze + 1).min(STUCK_SQUEEZE_TICKS) };
+    }
+    if squeeze > 0 {
+        // His legs at their full effort along his wish: he pushes with
+        // all he has, at a walk at most (`steer`).
+        st.desired = wish;
+    } else if trying > 0 {
+        trying -= 1;
+        // The way ahead clear after the first TRY_MIN ticks: the step is
+        // done, he walks.
+        if trying <= TRY_TICKS - TRY_MIN && st.ahead < AHEAD_MIN {
+            trying = 0;
+        }
+        let side = if left { left_dir } else { -left_dir };
+        st.desired += side * STEP_PACE;
+        mem = SIDE_MEMORY;
+    } else {
+        // Stuck: pressed, and not even stepping. Under half his wish
+        // alone would count a lane walker at the sprint behind a slower man
+        // as stuck at a jog, and he would zigzag down the lane. A crack he aims at
+        // that fits only his depth presses him too.
+        let pressed = st.ahead > AHEAD_MIN || st.gap;
+        let stuck = pressed && v_along < (0.5 * want).min(STEP_PACE);
+        count = if stuck { (count + 1).min(STUCK_TICKS) } else { count.saturating_sub(1) };
+        // He turns his shoulders as he reaches the crack he aims at, no
+        // stuck wait; the blind sidestep only with no opening to aim at.
+        // A straggler of a holding regiment whose aim has not moved him
+        // (stuck at its top, a ring or wide aim into a standing man's
+        // spring) drops it and tries a side; the ring reads again after
+        // the step. Passers keep their aims: a lane queue stands still too.
+        let dead_aim = st.aim_fit != 0
+            && orders[st.gi].is_none()
+            && (anchors[st.gi] + home[i]).distance_squared(st.p) > TRY_FROM_SLOT * TRY_FROM_SLOT;
+        let start = count >= STUCK_TICKS && !st.gap_near && (st.aim_fit == 0 || dead_aim);
+        if start {
+            if dead_aim {
+                *s.aim = Vec2::NAN;
+                *s.sight &= !SIGHT_RING;
+            }
+            let lean = st.push.dot(left_dir);
+            left = if lean.abs() > LEAN_MIN {
+                lean > 0.0
+            } else if mem > 0 {
+                left
+            } else {
+                crate::units::hash01((i as u32).wrapping_mul(0x2545).wrapping_add(tick)) > 0.5
+            };
+            trying = TRY_TICKS;
+            count = 0;
+            mem = SIDE_MEMORY;
+        } else {
+            if st.gap_near {
+                squeeze = 1;
+                count = 0;
+            }
+            if mem > 0 && tick.is_multiple_of(8) {
+                mem -= 1;
+            }
+        }
+    }
+    let low = if squeeze > 0 { STUCK_SQUEEZE | squeeze } else { count | (trying << STUCK_TRY_SHIFT) };
+    *s.stuck = low | (mem << STUCK_MEM_SHIFT) | (left as u16 * STUCK_LEFT) | (v & STUCK_WIDE_DEPTH);
+    turn_shoulders(s);
+}
+
+/// The turn of his shoulders follows his squeeze a step a tick
+/// (`turn_level`): toward turned while he squeezes, back toward square
+/// once he does not.
+#[inline]
+fn turn_shoulders(s: &mut Soldier) {
+    let turn = *s.pose >> POSE_TURN_SHIFT;
+    let turn = if squeezing(*s.stuck) { (turn + 1).min(POSE_READY) } else { turn.saturating_sub(1) };
+    *s.pose = (*s.pose & POSE_STANCE) | (turn << POSE_TURN_SHIFT);
 }
 
 /// Two things a man in melee does not do for his slot: step back away
@@ -1671,8 +2627,9 @@ fn yield_to_crowd(st: &mut Step) {
     // Yield in dense crowds: goal drive fades out entirely so the mass can't
     // keep compressing itself; `jam` (0 = free, 1 = packed) also damps the
     // response below.
-    let (slow, stop) = crowd_brake();
+    let (slow, stop) = st.brake;
     let jam = ((crowd - slow) / (stop - slow)).clamp(0.0, 1.0);
+    st.wish = desired;
     desired *= 1.0 - jam;
     st.corr = corr;
     st.push = push;
@@ -1750,7 +2707,7 @@ fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
         (*s.target, false)
     } else if best_idx != u32::MAX {
         (best_idx, false)
-    } else if crowd < crowd_brake().0 && committed {
+    } else if crowd < st.brake.0 && committed {
         (*s.target, true)
     } else {
         (u32::MAX, false)
@@ -1863,11 +2820,14 @@ fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
 /// give of his legs at a body he runs into.
 #[inline]
 fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
-    let Field { speed, wall, charging, fat_speed, fat_nocharge, dt, .. } = *f;
+    let Field { speed, orders, wall, charging, fat_speed, fat_nocharge, dt, .. } = *f;
     let i = s.i;
     let gi = st.gi;
     let dying = st.dying;
     let routed = st.routed;
+    // Holding his place: his regiment has no order and he is not broken,
+    // dying, in its melee or out of formation for a fight.
+    let planted = orders[gi].is_none() && !dying && !routed && !st.in_melee && !st.committed;
     let push = st.push;
     let jam = st.jam;
     let mut desired = st.desired;
@@ -1896,13 +2856,15 @@ fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
     // shoves do (less the grip). Without it any squeeze turned straight into
     // sliding, and a fight's jostle rippled back through packed ranks. His
     // stance takes the first STANCE of a net squeeze the same way: he gives
-    // ground only to what is beyond it.
-    if desired.length_squared() < 1e-6 {
+    // ground only to what is beyond it. A man holding his place keeps the
+    // grip while he steps back to it.
+    let standing = desired.length_squared() < 1e-6;
+    if standing || planted {
         let pl = push_a.length();
         push_a *= if pl > STAND_GRIP { (pl - STAND_GRIP) / pl } else { 0.0 };
-        if st.overlap_depth > 0.0 && *s.swing & crate::units::SWING_STAGGERED == 0 {
-            st.corr *= ((st.overlap_depth - STANCE) / st.overlap_depth).max(0.0);
-        }
+    }
+    if standing && st.overlap_depth > 0.0 && *s.swing & crate::units::SWING_STAGGERED == 0 {
+        st.corr *= ((st.overlap_depth - STANCE) / st.overlap_depth).max(0.0);
     }
     let mut legs = (desired - v) * STEER_GAIN;
     let l2 = legs.length_squared();
@@ -1919,7 +2881,9 @@ fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
     // Viscous damping in the press: bleeds the spring energy that otherwise
     // ping-pongs between neighbors every tick.
     new_v *= 1.0 - 0.4 * jam;
-    let vmax = speed[i] * 1.15; // slight overspeed under crowd pressure
+    // Slight overspeed under crowd pressure; a man squeezing through a
+    // crack goes at a walk at most.
+    let vmax = if squeezing(*s.stuck) { SQUEEZE_CAP } else { speed[i] * 1.15 };
     let v2 = new_v.length_squared();
     if v2 > vmax * vmax {
         new_v *= vmax / v2.sqrt();
@@ -1938,7 +2902,13 @@ fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
     if dir != Vec2::ZERO && share_contact() {
         let into = (new_v - st.overlap_vel).dot(-dir);
         if into > 0.0 {
-            new_v += dir * (into * st.overlap_share);
+            // A man holding his place loses less of it: his feet take the
+            // first part of the shove.
+            let mut lost = into * st.overlap_share;
+            if planted {
+                lost = (lost - STAND_GRIP * dt * own_spread(i)).max(0.0);
+            }
+            new_v += dir * lost;
         }
     } else if dir != Vec2::ZERO {
         let own = new_v.dot(-dir);

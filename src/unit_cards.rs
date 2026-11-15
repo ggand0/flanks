@@ -1157,13 +1157,14 @@ fn control_buttons(
     query: Query<(&Interaction, &ControlButton), Changed<Interaction>>,
     selection: Res<Selection>,
     mut groups: ResMut<Groups>,
+    time: Res<Time>,
 ) {
     for (interaction, btn) in &query {
         if *interaction != Interaction::Pressed || selection.count_units == 0 {
             continue;
         }
         match btn {
-            ControlButton::Halt => halt_selected(&selection, &mut groups),
+            ControlButton::Halt => halt_selected(&selection, &mut groups, time.elapsed_secs()),
             ControlButton::Form(cmd) => {
                 apply_formation_cmd(*cmd, &selection, &mut groups)
             }
@@ -1198,10 +1199,10 @@ fn refresh_control_buttons(
             all_melee &= gd.melee;
         } else {
             any_wall = true;
-            all_wall &= gd.spacing == FormSpacing::Wall;
+            all_wall &= gd.chosen_spacing() == FormSpacing::Wall;
             all_spear &= is_spearwall_kind(gd.kind);
         }
-        all_loose &= gd.spacing == FormSpacing::Loose;
+        all_loose &= gd.chosen_spacing() == FormSpacing::Loose;
         all_hold &= gd.hold;
     }
     let archer_btn = |btn: ControlButton| {

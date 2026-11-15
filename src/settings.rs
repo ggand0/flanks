@@ -233,6 +233,12 @@ impl Settings {
             Ok(text) => match serde_yaml_ng::from_str::<Self>(&text) {
                 Ok(mut s) => {
                     s.sanitize();
+                    // FL_OVERLAY=off: a measured run starts with the debug
+                    // overlay off whatever the saved setting, so the
+                    // saved F3 state never skews a benchmark.
+                    if std::env::var("FL_OVERLAY").is_ok_and(|v| v == "off") {
+                        s.interface.overlay = Overlay::Off;
+                    }
                     s
                 }
                 Err(e) => {
@@ -673,6 +679,7 @@ const CONTROLS: [(&str, &[(&str, &str)]); 4] = [
             ("F2", "Unit panel"),
             ("F3", "Stats line, debug overlay"),
             ("F4", "Hover rings"),
+            ("F5", "Contact overlay (debug, heavy)"),
             ("G", "Banners and map lines"),
             ("X, in the full F3 overlay", "Dig a crater"),
         ],

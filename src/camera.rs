@@ -204,11 +204,20 @@ pub fn apply_camera_transform(
     mut query: Query<(&mut RtsCamera, &mut Transform, &mut Projection)>,
     terrain: Res<crate::terrain::Terrain>,
     time: Res<Time>,
+    state: Res<State<crate::game_state::GameState>>,
+    mut path: Local<Option<CamPath>>,
 ) {
     let Ok((mut cam, mut transform, mut projection)) = query.single_mut() else {
         return;
     };
     let limit = max_distance(terrain.kind);
+    // FL_CAM_REC=<file> writes the camera's path while the battle runs;
+    // FL_CAM_PLAY=<file> drives the camera along a recorded path, so a
+    // measured run repeats the player's own spots and moves.
+    if *state.get() == crate::game_state::GameState::Battle {
+        let path = path.get_or_insert_with(CamPath::from_env);
+        path.tick(&mut cam, time.elapsed_secs());
+    }
     if terrain.is_changed() {
         cam.distance = cam.distance.min(limit);
         cam.target_distance = cam.target_distance.min(limit);
@@ -257,6 +266,94 @@ pub fn apply_camera_transform(
     *transform = Transform::from_translation(camera_eye(&cam, &terrain)).looking_at(cam.focus, Vec3::Y);
 }
 
+/// A camera path on disk: one line per sample, `t x z yaw pitch dist`,
+/// `t` in seconds from the first frame of the run's first battle, its
+/// deployment included. FL_CAM_REC=<file> records one every
+/// CAM_REC_STEP seconds; FL_CAM_PLAY=<file> plays one back, the camera
+/// set to the sample for that time (the last one held once the path
+/// ends), over any input. With both set, the recording shows what the
+/// playback did, which checks the player.
+/// FL_CAM_LOCK is applied after and overrides the playback, so do not
+/// set it with FL_CAM_PLAY.
+pub struct CamPath {
+    rec: Option<(std::fs::File, f32)>,
+    play: Option<Vec<[f32; 6]>>,
+    start: Option<f32>,
+}
+
+const CAM_REC_STEP: f32 = 0.25;
+
+impl CamPath {
+    fn from_env() -> Self {
+        let play = std::env::var("FL_CAM_PLAY").ok().and_then(|p| match std::fs::read_to_string(&p) {
+            Ok(text) => {
+                let samples: Vec<[f32; 6]> = text
+                    .lines()
+                    .filter_map(|l| {
+                        let v: Vec<f32> = l.split_whitespace().filter_map(|t| t.parse().ok()).collect();
+                        <[f32; 6]>::try_from(v).ok()
+                    })
+                    .collect();
+                info!("camera path: playing {} samples from {p}", samples.len());
+                Some(samples)
+            }
+            Err(e) => {
+                warn!("camera path: cannot read {p}: {e}");
+                None
+            }
+        });
+        let rec = std::env::var("FL_CAM_REC").ok().and_then(|p| match std::fs::File::create(&p) {
+            Ok(file) => {
+                info!("camera path: recording to {p} every {CAM_REC_STEP} s");
+                Some((file, 0.0))
+            }
+            Err(e) => {
+                warn!("camera path: cannot write {p}: {e}");
+                None
+            }
+        });
+        Self { rec, play, start: None }
+    }
+
+    fn tick(&mut self, cam: &mut RtsCamera, now: f32) {
+        if self.rec.is_none() && self.play.is_none() {
+            return;
+        }
+        let t = now - *self.start.get_or_insert(now);
+        if let Some(samples) = &self.play
+            && let Some(last) = samples.last()
+        {
+            let i = samples.partition_point(|s| s[0] <= t);
+            let s = if i == 0 {
+                samples[0]
+            } else if i >= samples.len() {
+                *last
+            } else {
+                let (a, b) = (samples[i - 1], samples[i]);
+                let k = ((t - a[0]) / (b[0] - a[0]).max(1e-3)).clamp(0.0, 1.0);
+                std::array::from_fn(|j| a[j] + (b[j] - a[j]) * k)
+            };
+            cam.focus.x = s[1];
+            cam.focus.z = s[2];
+            cam.yaw = s[3];
+            cam.pitch = s[4];
+            cam.distance = s[5];
+            cam.target_distance = s[5];
+        }
+        if let Some((file, next)) = &mut self.rec
+            && t >= *next
+        {
+            use std::io::Write;
+            *next = t + CAM_REC_STEP;
+            let _ = writeln!(
+                file,
+                "{t:.2} {:.2} {:.2} {:.4} {:.4} {:.2}",
+                cam.focus.x, cam.focus.z, cam.yaw, cam.pitch, cam.distance
+            );
+        }
+    }
+}
+
 fn camera_eye(cam: &RtsCamera, terrain: &crate::terrain::Terrain) -> Vec3 {
     let rot = Quat::from_euler(EulerRot::YXZ, cam.yaw, -cam.pitch, 0.0);
     let mut eye = cam.focus + rot * Vec3::new(0.0, 0.0, cam.distance);
@@ -294,7 +391,11 @@ mod tests {
     #[test]
     fn map_switches_update_camera_range_and_keep_focus_on_the_field() {
         let mut app = App::new();
-        app.init_resource::<Time>()
+        // `apply_camera_transform` reads the game state. In the menu,
+        // the default, it leaves the camera path alone.
+        app.add_plugins(bevy::state::app::StatesPlugin)
+            .init_state::<crate::game_state::GameState>()
+            .init_resource::<Time>()
             .insert_resource(build_terrain(MapKind::BigGrassland))
             .add_systems(Update, apply_camera_transform);
         let camera = app

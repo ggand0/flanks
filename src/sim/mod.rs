@@ -21,6 +21,7 @@ use crate::spatial::SpatialGrid;
 use crate::terrain::Terrain;
 use crate::units::Units;
 
+pub mod contact_viz;
 pub mod damage;
 mod diag;
 pub mod job;
@@ -106,7 +107,17 @@ impl Plugin for SimPlugin {
                 )
                     .in_set(crate::game_state::SimSet),
             )
-            .add_systems(Update, (toggle_debug_viz, route::draw_routes));
+            .init_resource::<contact_viz::ContactViz>()
+            .add_systems(
+                Update,
+                (
+                    toggle_debug_viz,
+                    route::draw_routes,
+                    contact_viz::toggle_contact_viz
+                        .run_if(in_state(crate::game_state::GameState::Battle)),
+                    contact_viz::draw_contact_viz,
+                ),
+            );
     }
 }
 
@@ -311,6 +322,9 @@ fn run_tick_job(job: &mut TickJob) {
         sight_in,
         chain_in,
         way_in,
+        pose_in,
+        stuck_in,
+        aim_in,
         quarry_in,
         pos_out,
         vel,
@@ -326,12 +340,17 @@ fn run_tick_job(job: &mut TickJob) {
         sight,
         chain,
         way,
+        pose,
+        stuck,
+        aim,
         quarry,
         orders,
         anchors,
         reg_broken,
         press,
         moving,
+        passing,
+        stance,
         focus,
         engaged,
         contact,
@@ -421,7 +440,7 @@ fn run_tick_job(job: &mut TickJob) {
     let t0 = Instant::now();
     {
         let _span = info_span!("grid_rebuild").entered();
-        grid.rebuild(pos_prev, &vel_in[..], team, kind, group, death_t_in, group_wall);
+        grid.rebuild(pos_prev, &vel_in[..], team, kind, group, death_t_in, &pose_in[..], group_wall);
     }
     let t1 = Instant::now();
     *grid_ms = (t1 - t0).as_secs_f32() * 1000.0;
@@ -438,6 +457,8 @@ fn run_tick_job(job: &mut TickJob) {
     let broken = &reg_broken[..];
     let press = &press[..];
     let moving = &moving[..];
+    let passing = &passing[..];
+    let stance = &stance[..];
     let focus = &focus[..];
     let engaged = &engaged[..];
     let contact = &contact[..];
@@ -471,6 +492,8 @@ fn run_tick_job(job: &mut TickJob) {
         broken,
         press,
         moving,
+        passing,
+        stance,
         focus,
         engaged,
         contact,
@@ -512,6 +535,9 @@ fn run_tick_job(job: &mut TickJob) {
     let sight_in = &sight_in[..];
     let chain_in = &chain_in[..];
     let way_in = &way_in[..];
+    let pose_in = &pose_in[..];
+    let stuck_in = &stuck_in[..];
+    let aim_in = &aim_in[..];
     let quarry_in = &quarry_in[..];
     // The map edges a router leaves the field at (combat.rs), widened by
     // the charge knockback the apply pass can still add to a position:
@@ -537,11 +563,14 @@ fn run_tick_job(job: &mut TickJob) {
             .zip(sight.chunks_mut(CHUNK))
             .zip(way.chunks_mut(CHUNK))
             .zip(chain.chunks_mut(CHUNK))
+            .zip(pose.chunks_mut(CHUNK))
             .zip(quarry.chunks_mut(CHUNK))
+            .zip(stuck.chunks_mut(CHUNK))
+            .zip(aim.chunks_mut(CHUNK))
             .enumerate()
         {
-            let ((((((((((((((((pos, vel), yaw), yaw_prev), target), swing), swing_t), flash),
-                death_t), events), ammo), arrows), out_form), sight), way), chain), quarry) =
+            let (((((((((((((((((((pos, vel), yaw), yaw_prev), target), swing), swing_t), flash),
+                death_t), events), ammo), arrows), out_form), sight), way), chain), pose), quarry), stuck), aim) =
                 chunk;
             let start = ci * CHUNK;
             let end = start + pos.len();
@@ -560,7 +589,10 @@ fn run_tick_job(job: &mut TickJob) {
                 sight.copy_from_slice(&sight_in[start..end]);
                 way.copy_from_slice(&way_in[start..end]);
                 chain.copy_from_slice(&chain_in[start..end]);
+                pose.copy_from_slice(&pose_in[start..end]);
                 quarry.copy_from_slice(&quarry_in[start..end]);
+                stuck.copy_from_slice(&stuck_in[start..end]);
+                aim.copy_from_slice(&aim_in[start..end]);
                 let rows = soldier::Rows {
                     start,
                     pos: &mut *pos,
@@ -577,7 +609,10 @@ fn run_tick_job(job: &mut TickJob) {
                     sight,
                     way,
                     chain,
+                    pose,
                     quarry,
+                    stuck,
+                    aim,
                 };
                 events.clear();
                 let mut out = soldier::ChunkOut { events, arrows };
@@ -695,7 +730,7 @@ pub fn step_sim(
             vel <- vel, yaw <- yaw, yaw_prev <- yaw_prev, target <- target, swing <- swing,
             swing_t <- swing_t, flash <- flash, death_t <- death_t, ammo <- ammo,
             out_form <- out_form, sight <- sight, way <- way, chain <- chain,
-            quarry <- quarry
+            pose <- pose, quarry <- quarry, stuck <- stuck, aim <- aim
         );
     }
     // The sweep's candidates (combat.rs), ascending.

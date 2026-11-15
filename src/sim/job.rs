@@ -106,6 +106,9 @@ pub struct TickJob {
     pub(crate) sight_in: Arc<Vec<u16>>,
     pub(crate) chain_in: Arc<Vec<u8>>,
     pub(crate) way_in: Arc<Vec<Vec2>>,
+    pub(crate) pose_in: Arc<Vec<u8>>,
+    pub(crate) stuck_in: Arc<Vec<u16>>,
+    pub(crate) aim_in: Arc<Vec<Vec2>>,
     pub(crate) quarry_in: Arc<Vec<u32>>,
     // Read only to pack the render snapshot.
     pub(crate) pos_prev_in: Arc<Vec<Vec3>>,
@@ -132,6 +135,9 @@ pub struct TickJob {
     pub(crate) sight: Vec<u16>,
     pub(crate) chain: Vec<u8>,
     pub(crate) way: Vec<Vec2>,
+    pub(crate) pose: Vec<u8>,
+    pub(crate) stuck: Vec<u16>,
+    pub(crate) aim: Vec<Vec2>,
     pub(crate) quarry: Vec<u32>,
     // Per-regiment command snapshot, taken at prep.
     pub(crate) orders: Vec<Option<Vec2>>,
@@ -139,6 +145,12 @@ pub struct TickJob {
     pub(crate) reg_broken: Vec<bool>,
     pub(crate) press: Vec<bool>,
     pub(crate) moving: Vec<bool>,
+    /// Per regiment: walking through a friend that opened for it
+    /// (`GroupData::passing`), the choice of opening's reason to run.
+    pub(crate) passing: Vec<bool>,
+    /// Per regiment: the stance its men are drawn in, which sets their
+    /// width (sim/soldier.rs STANCE_*).
+    pub(crate) stance: Vec<u8>,
     pub(crate) focus: Vec<Option<u32>>,
     pub(crate) engaged: Vec<bool>,
     pub(crate) contact: Vec<bool>,
@@ -246,6 +258,9 @@ impl TickJob {
         self.sight_in = Default::default();
         self.chain_in = Default::default();
         self.way_in = Default::default();
+        self.pose_in = Default::default();
+        self.stuck_in = Default::default();
+        self.aim_in = Default::default();
         self.quarry_in = Default::default();
         self.pos_prev_in = Default::default();
         self.color_in = Default::default();
@@ -322,6 +337,8 @@ pub(crate) fn prepare_tick(
     let t1 = std::time::Instant::now();
     skirmish_reactions(groups, tracks, terrain, tick);
     let t2 = std::time::Instant::now();
+    open_for_passers(groups, tracks, tick);
+    let t2b = std::time::Instant::now();
     let kept_clear_blocks = std::mem::take(&mut job.clear_blocks);
     let fire = archer_fire_solutions(
         groups,
@@ -362,17 +379,18 @@ pub(crate) fn prepare_tick(
     job.sidearm = sidearm_reasons(groups, tracks, terrain, &last, tick);
     job.field.size_to(terrain.min(), terrain.max());
     let t5 = std::time::Instant::now();
-    log_prep([t1 - t0, t2 - t1, t3 - t2, t4 - t3, t5 - t4, t5 - t0]);
+    log_prep([t1 - t0, t2 - t1, t2b - t2, t3 - t2b, t4 - t3, t5 - t4, t5 - t0]);
 }
 
 /// FL_LOG_STEP=1: the mean time of each part of the prep over 150 ticks
 /// (5 s), beside the `[step]` line (sim/diag.rs): the column share, the
-/// skirmish reactions, the fire solutions, the orders and the regiment
-/// snapshot, the sidearm reasons, and the whole prep.
-fn log_prep(parts: [std::time::Duration; 6]) {
+/// skirmish reactions, the opening for passers, the fire solutions, the
+/// orders and the regiment snapshot, the sidearm reasons, and the whole
+/// prep.
+fn log_prep(parts: [std::time::Duration; 7]) {
     use std::sync::{Mutex, OnceLock};
     static ON: OnceLock<bool> = OnceLock::new();
-    static ACC: Mutex<([f64; 6], u32)> = Mutex::new(([0.0; 6], 0));
+    static ACC: Mutex<([f64; 7], u32)> = Mutex::new(([0.0; 7], 0));
     if !*ON.get_or_init(|| std::env::var("FL_LOG_STEP").is_ok()) {
         return;
     }
@@ -384,11 +402,11 @@ fn log_prep(parts: [std::time::Duration; 6]) {
     if acc.1 == 150 {
         let m = acc.0.map(|v| v / 150.0);
         info!(
-            "[prep] share {:.3}, skirmish {:.3}, fire {:.3}, orders and snapshot {:.3}, \
+            "[prep] share {:.3}, skirmish {:.3}, make space {:.4}, fire {:.3}, orders and snapshot {:.3}, \
              sidearm {:.3}, whole prep {:.3} ms",
-            m[0], m[1], m[2], m[3], m[4], m[5]
+            m[0], m[1], m[2], m[3], m[4], m[5], m[6]
         );
-        *acc = ([0.0; 6], 0);
+        *acc = ([0.0; 7], 0);
     }
 }
 
@@ -417,6 +435,9 @@ fn share_columns(job: &mut TickJob, units: &Units) {
     job.sight_in = units.sight.share();
     job.chain_in = units.chain.share();
     job.way_in = units.way.share();
+    job.pose_in = units.pose.share();
+    job.stuck_in = units.stuck.share();
+    job.aim_in = units.aim.share();
     job.quarry_in = units.quarry.share();
     job.pos_prev_in = units.pos_prev.share();
     job.color_in = units.color.share();
@@ -440,6 +461,9 @@ fn share_columns(job: &mut TickJob, units: &Units) {
     fit(&mut job.sight, n);
     fit(&mut job.chain, n);
     fit(&mut job.way, n);
+    fit(&mut job.pose, n);
+    fit(&mut job.stuck, n);
+    fit(&mut job.aim, n);
     fit(&mut job.quarry, n);
 }
 
@@ -675,6 +699,228 @@ pub(crate) fn approach_hits(
             && (before(ed.centroid, f)
                 || (before(ed.centroid + side, f) && before(ed.centroid - side, f)))
     })
+}
+
+/// A holding regiment opens this far ahead of a friend coming through it,
+/// beyond the ground its opening grows toward him (metres).
+const OPEN_MARGIN: f32 = 5.0;
+/// ...and never less than this much of the friend's walk ahead (seconds).
+const OPEN_LEAD_S: f32 = 8.0;
+/// A friend's block this close to an open regiment's keeps it open
+/// (metres).
+const OPEN_KEEP: f32 = 3.0;
+/// FL_KEEP_INSIDE=0 turns off the keep by men inside: a holder then
+/// closes once no friend's block crosses it or stands near it, whoever
+/// is still inside, and a passer stops passing when its block has moved
+/// on. A switch for reproducing the man a block closes on (the
+/// straggler log, regiments.rs).
+fn keep_inside() -> bool {
+    static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *K.get_or_init(|| crate::util::env_or("FL_KEEP_INSIDE", 1u32) != 0)
+}
+
+/// A regiment's men standing still are drawn in their ready stance
+/// (render_units.rs `stance_tier` above zero, the guard of the pose
+/// pass), or a wall: they stand at their combat width.
+pub(crate) fn ready_stance(g: &GroupData) -> bool {
+    crate::render_units::stance_tier(g) > 0.0 || crate::render_units::wall_signal(g) > 0.0
+}
+
+/// The stance a regiment's men are drawn in (sim/soldier.rs STANCE_*):
+/// fighting or in a wall, in the ready stance whatever they do; with an
+/// enemy near, attacking or charging, in it while they stand; else at
+/// ease.
+fn stance_of(g: &GroupData) -> u8 {
+    if g.engaged || crate::render_units::wall_signal(g) > 0.0 {
+        crate::sim::soldier::STANCE_FIGHT
+    } else if ready_stance(g) {
+        crate::sim::soldier::STANCE_READY
+    } else {
+        crate::sim::soldier::STANCE_EASE
+    }
+}
+
+/// The free ground before a holding regiment's front and behind its rear
+/// (metres): of every other regiment with men whose block reaches across
+/// its frontage, the nearest block's gap on each side, OPEN_ROOM_MAX
+/// when none is nearer. What `formation::choose_open` grows into.
+fn room_around(groups: &Groups, h: usize) -> (f32, f32) {
+    let rect = crate::formation::block_rect(&groups.list[h]);
+    let right = Vec2::new(rect.fwd.y, -rect.fwd.x);
+    let (mut front, mut back) = (crate::formation::OPEN_ROOM_MAX, crate::formation::OPEN_ROOM_MAX);
+    for (o, od) in groups.list.iter().enumerate() {
+        if o == h || od.count == 0 {
+            continue;
+        }
+        let other = crate::formation::block_rect(od);
+        let d = other.centre - rect.centre;
+        if d.dot(right).abs() - other.reach_along(right) >= rect.half_w {
+            continue;
+        }
+        let along = d.dot(rect.fwd);
+        let gap = (along.abs() - other.reach_along(rect.fwd) - rect.half_d).max(0.0);
+        if along >= 0.0 {
+            front = front.min(gap);
+        } else {
+            back = back.min(gap);
+        }
+    }
+    (front, back)
+}
+
+/// A regiment walking somewhere: a goal further than a metre off, not
+/// standing off its target, holding before a block or fighting on a
+/// contact frame. The friends a holding regiment opens for.
+fn goes_to(groups: &Groups, m: usize) -> Option<Vec2> {
+    let md = &groups.list[m];
+    if md.count == 0 || md.state.is_broken() || md.standoff || md.skirmish_hold.is_some() || md.contact {
+        return None;
+    }
+    groups.goal(m).filter(|goal| goal.distance_squared(md.centroid) > 1.0)
+}
+
+/// Allies make space: every ARCHER_LOOK ticks, staggered, a regiment
+/// holding its ground (`formation::holds_ground`) looks at the friendly
+/// regiments walking somewhere. It opens (FormSpacing::Open, the layout
+/// `formation::choose_open` picks for the free ground around it,
+/// `room_around`) when one's path to its goal, swept by its width,
+/// crosses its block within the walk the opening needs (the ground the
+/// block grows toward him plus OPEN_MARGIN at his speed, never less than
+/// OPEN_LEAD_S of it), or when one's block already overlaps its own. It
+/// closes when no friend's path crosses it, no walking friend's block is
+/// within OPEN_KEEP of it and no standing friend stands on its closed
+/// ground. An order, a fight or a rout closes it at once (formation.rs
+/// `apply_reforms`). A walking regiment whose block is within OPEN_KEEP
+/// of an open friend's is passing it (`GroupData::passing`), on its own
+/// look. A passing regiment counts its men inside each open friend's
+/// block (`GroupData::inside`, frontline.rs): the friend stays open while
+/// any of them is inside, and the passer stays passing until none is.
+fn open_for_passers(groups: &mut Groups, tracks: &crate::arrows::RegTracks, tick: u32) {
+    let n = groups.list.len();
+    for m in 0..n {
+        if !tick.wrapping_add(m as u32).is_multiple_of(ARCHER_LOOK) {
+            continue;
+        }
+        let gl: &Groups = &*groups;
+        let md = &gl.list[m];
+        // Walking, it passes an open friend within OPEN_KEEP of it. It
+        // stays passing while any of its men stands inside one, its order
+        // done or not: its tail is still in the friend when its block
+        // has walked on or its head arrives.
+        let near = goes_to(gl, m).is_some() && {
+            let bound = crate::formation::block_bound(md);
+            let rect = crate::formation::block_rect(md);
+            gl.list.iter().enumerate().any(|(h, hd)| {
+                h != m
+                    && hd.team == md.team
+                    && hd.spacing == crate::formation::FormSpacing::Open
+                    && hd.centroid.distance(md.centroid) - bound - crate::formation::block_bound(hd)
+                        <= OPEN_KEEP
+                    && rect_gap(&rect, &crate::formation::block_rect(hd)) <= OPEN_KEEP
+            })
+        };
+        let passing = near || keep_inside() && md.passing && md.inside.iter().any(|&(_, c)| c > 0);
+        groups.list[m].passing = passing;
+    }
+    for h in 0..n {
+        if !tick.wrapping_add(h as u32).is_multiple_of(ARCHER_LOOK) {
+            continue;
+        }
+        let gl: &Groups = &*groups;
+        let hd = &gl.list[h];
+        if !crate::formation::holds_ground(hd)
+            || hd.shape != crate::formation::FormShape::Rect
+            || hd.files == 0
+        {
+            continue;
+        }
+        let open = hd.spacing == crate::formation::FormSpacing::Open;
+        let rect = crate::formation::block_rect(hd);
+        let bound = crate::formation::block_bound(hd);
+        let fwd = crate::formation::facing_dir(hd.facing);
+        // The open order it stands in, or the one it would take now,
+        // looked at only once a friend comes near enough.
+        let mut plan = open.then_some(hd.open);
+        let mut opener: Option<usize> = None;
+        let mut keep = false;
+        for m in 0..n {
+            let md = &gl.list[m];
+            if m == h || md.team != hd.team || md.count == 0 || md.state.is_broken() {
+                continue;
+            }
+            // A friend passing keeps it open while one of its men is
+            // inside.
+            keep |= keep_inside() && md.inside.iter().any(|&(o, c)| o as usize == h && c > 0);
+            let Some(goal) = goes_to(gl, m) else {
+                // A standing friend on its closed ground keeps it open:
+                // one ordered onto that ground stands there.
+                if open && !md.passing && md.order.is_none() {
+                    let ground = crate::formation::closed_rect_at(hd, crate::formation::closed_centre(hd));
+                    keep |= rect_gap(&ground, &crate::formation::block_rect(md)) < 0.0;
+                }
+                continue;
+            };
+            let track = tracks.vel.get(m).copied().unwrap_or(Vec2::ZERO);
+            let speed = if track.length() >= 0.3 {
+                track.length()
+            } else {
+                crate::unit_types::TYPES[md.kind as usize].speed
+            };
+            let to_goal = goal.distance(md.centroid);
+            let apart = hd.centroid.distance(md.centroid) - bound - crate::formation::block_bound(md);
+            let most = ((crate::formation::OPEN_ROOM_MAX + OPEN_MARGIN) / speed).max(OPEN_LEAD_S) * speed;
+            if apart > to_goal.min(most).max(OPEN_KEEP) {
+                continue;
+            }
+            // The ground the block grows toward him. The lanes run his
+            // way: along the facing, or across it for a friend coming
+            // from the side.
+            let dir = (goal - md.centroid) / to_goal;
+            let o = *plan.get_or_insert_with(|| {
+                let across = dir.dot(fwd).abs() < dir.dot(Vec2::new(fwd.y, -fwd.x)).abs();
+                let (front, back) = room_around(gl, h);
+                crate::formation::choose_open(hd, ready_stance(hd), across, front, back)
+            });
+            // A friend from the side meets the block's flank, which does
+            // not move.
+            let growth = if o.across {
+                0.0
+            } else if (md.centroid - hd.centroid).dot(fwd) > 0.0 {
+                o.front
+            } else {
+                o.back
+            };
+            let ahead = ((growth.max(0.0) + OPEN_MARGIN) / speed).max(OPEN_LEAD_S) * speed;
+            let len = to_goal.min(ahead);
+            if apart > len.max(OPEN_KEEP) {
+                continue;
+            }
+            let gap = rect_gap(&rect, &crate::formation::block_rect(md));
+            let crosses = path_hit(gl, m, dir, len, h).is_some();
+            if crosses || gap < 0.0 {
+                opener.get_or_insert(m);
+            }
+            keep |= crosses || gap <= OPEN_KEEP;
+        }
+        let gd = &mut groups.list[h];
+        if !open && let (Some(m), Some(o)) = (opener, plan) {
+            crate::formation::open_order(gd, o);
+            if o.across {
+                info!(
+                    "regiment {h} opens for regiment {m} from the side: {} ranks to a group, {:.1} m ahead and {:.1} m behind",
+                    o.files, o.front, o.back
+                );
+            } else {
+                info!(
+                    "regiment {h} opens for regiment {m}: {} files to a group, {:.1} m ahead and {:.1} m behind",
+                    o.files, o.front, o.back
+                );
+            }
+        } else if open && !keep {
+            crate::formation::close_order(gd);
+            info!("regiment {h} closes");
+        }
+    }
 }
 
 /// An enemy block's edge this close to the regiment's: run (the first
@@ -1483,6 +1729,8 @@ fn snapshot_regiments(job: &mut TickJob, groups: &Groups, terrain: &Terrain) {
     job.reg_broken = group_broken;
     job.press = press;
     job.moving = moving;
+    job.passing = groups.list.iter().map(|g| g.passing).collect();
+    job.stance = groups.list.iter().map(stance_of).collect();
     job.focus = focus;
     job.engaged = engaged;
     job.contact = contact;

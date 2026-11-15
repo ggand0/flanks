@@ -13,6 +13,7 @@
 use bevy::prelude::*;
 
 use crate::sim::DebugViz;
+use crate::formation::BlockRect;
 use crate::orders::Groups;
 use crate::terrain::Terrain;
 use crate::units::Units;
@@ -330,12 +331,13 @@ fn retarget_focus() -> bool {
 }
 
 /// One regiment's sums over its men, in index order.
-#[derive(Clone, Copy)]
 struct RegimentSums {
     pos: Vec2,
     count: usize,
     home: Vec2,
     r2: f32,
+    /// The farthest living man's squared distance from the centroid.
+    far2: f32,
     slot_err: f32,
     front_off: f32,
     back_off: f32,
@@ -346,6 +348,9 @@ struct RegimentSums {
     /// (`GroupData::vel`).
     vel: Vec2,
     alive: u32,
+    /// Its living men inside each open friend's block within its reach,
+    /// in the order of the friends given (`GroupData::inside`).
+    inside: Vec<u32>,
     line_sum: f32,
     line_n: u32,
     fight_n: u32,
@@ -363,23 +368,28 @@ const REGIMENTS_PER_TASK: usize = 16;
 /// One regiment's sums over its men, walking its runs in index order. `pc`
 /// and `pb` are its centroid and home bias from the last tick, `f` its
 /// forward vector, `tg` its attack target, `bows` whether it is an archer
-/// regiment, the only kind whose lead and velocity anything reads.
+/// regiment, the only kind whose lead and velocity anything reads, and
+/// `open` the blocks of the open friends within its reach, empty when
+/// there is none.
 fn regiment_sums(
     units: &Units,
     runs: &[(u32, u32)],
     (pc, pb, f, tg, bows): (Vec2, Vec2, Vec2, Option<u32>, bool),
+    open: &[(u32, BlockRect)],
 ) -> RegimentSums {
     let mut a = RegimentSums {
         pos: Vec2::ZERO,
         count: 0,
         home: Vec2::ZERO,
         r2: 0.0,
+        far2: 0.0,
         slot_err: 0.0,
         front_off: f32::MIN,
         back_off: f32::MAX,
         lead: f32::MIN,
         vel: Vec2::ZERO,
         alive: 0,
+        inside: vec![0; open.len()],
         line_sum: 0.0,
         line_n: 0,
         fight_n: 0,
@@ -400,7 +410,16 @@ fn regiment_sums(
                 a.vel += Vec2::new(units.vel[i].x, units.vel[i].z);
                 a.alive += 1;
             }
-            a.r2 += (p - pc).length_squared();
+            if !open.is_empty() && units.death_t[i] == 0 {
+                for (k, (_, rect)) in open.iter().enumerate() {
+                    a.inside[k] += u32::from(rect.distance(p) == 0.0);
+                }
+            }
+            let d2 = (p - pc).length_squared();
+            a.r2 += d2;
+            if units.death_t[i] == 0 {
+                a.far2 = a.far2.max(d2);
+            }
             a.slot_err += (p - pc - units.home[i] + pb).length();
             // Ground-truth contact: a unit in WIND-UP has an enemy in reach
             // and is striking. TW rule: one soldier fighting engages the
@@ -466,14 +485,45 @@ fn update_groups(
         })
         .collect();
     let bows: Vec<bool> = groups.list.iter().map(|g| g.kind == crate::unit_types::KIND_ARCHER).collect();
+    // Every regiment counts its men inside each open friend's block that
+    // one of them could be in: the friend within the regiment's reach
+    // (its farthest man last tick, plus a step). A regiment whose men are
+    // all far from every open friend lists none and tests nothing.
+    // The open regiments first, usually none: then nothing below runs.
+    let open_regs: Vec<(u32, &crate::orders::GroupData, BlockRect, f32)> = groups
+        .list
+        .iter()
+        .enumerate()
+        .filter(|(_, hd)| hd.count > 0 && hd.spacing == crate::formation::FormSpacing::Open)
+        .map(|(h, hd)| (h as u32, hd, crate::formation::block_rect(hd), crate::formation::block_bound(hd)))
+        .collect();
+    let open: Vec<Vec<(u32, BlockRect)>> = groups
+        .list
+        .iter()
+        .enumerate()
+        .map(|(g, gd)| {
+            if gd.count == 0 || open_regs.is_empty() {
+                return Vec::new();
+            }
+            open_regs
+                .iter()
+                .filter(|(h, hd, _, bound)| {
+                    *h as usize != g
+                        && hd.team == gd.team
+                        && hd.centroid.distance(gd.centroid) <= gd.reach + 1.0 + bound
+                })
+                .map(|(h, _, rect, _)| (*h, *rect))
+                .collect()
+        })
+        .collect();
     // The sums over the men, a pool task per few regiments, each regiment's
     // runs walked in index order: the same additions in the same order as
     // one scan of the army, regiment by regiment, so the same bits. Bevy's
     // scope returns the tasks' results in spawn order.
     let units = &*units;
     let runs = &*runs;
-    let (prev_cents_r, prev_bias_r, fwd_r, target_r, bows_r) =
-        (&prev_cents, &prev_bias, &fwd, &attack_target, &bows);
+    let (prev_cents_r, prev_bias_r, fwd_r, target_r, bows_r, open_r) =
+        (&prev_cents, &prev_bias, &fwd, &attack_target, &bows, &open);
     let batches: Vec<Vec<RegimentSums>> = bevy::tasks::ComputeTaskPool::get().scope(|scope| {
         for first in (0..n).step_by(REGIMENTS_PER_TASK) {
             scope.spawn(async move {
@@ -481,7 +531,7 @@ fn update_groups(
                     .map(|g| {
                         let regiment =
                             (prev_cents_r[g], prev_bias_r[g], fwd_r[g], target_r[g], bows_r[g]);
-                        regiment_sums(units, runs.of(g), regiment)
+                        regiment_sums(units, runs.of(g), regiment, &open_r[g])
                     })
                     .collect::<Vec<RegimentSums>>()
             });
@@ -510,6 +560,8 @@ fn update_groups(
         // Measured against last tick's centroid, a step at most off.
         group.lead = if sums[g].lead > f32::MIN { sums[g].lead } else { 0.0 };
         group.vel = if sums[g].alive > 0 { sums[g].vel / sums[g].alive as f32 } else { Vec2::ZERO };
+        group.reach = sums[g].far2.sqrt();
+        group.inside = open[g].iter().zip(&sums[g].inside).map(|(&(h, _), &c)| (h, c)).collect();
         // Formation disorder: how far the regiment stands from its slots,
         // smoothed ~2 s. Only Rect makes the discipline claim.
         let err = if group.shape == crate::formation::FormShape::Rect {

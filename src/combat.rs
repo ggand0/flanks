@@ -135,6 +135,9 @@ pub fn process_deaths(
             units.sight.swap_remove(i);
             units.chain.swap_remove(i);
             units.way.swap_remove(i);
+            units.pose.swap_remove(i);
+            units.stuck.swap_remove(i);
+            units.aim.swap_remove(i);
             moves.swap_remove(i, units.len() + 1);
             // The hole took the last man; a popped tail took nobody.
             if i >= units.len() {
@@ -242,7 +245,7 @@ fn fill_vacated_slots(
         let gd = &groups.list[g as usize];
         let f = crate::formation::facing_dir(gd.facing);
         let r = Vec2::new(f.y, -f.x);
-        let half_file = 0.5 * gd.spacing.pitch(gd.kind).x;
+        let half_file = 0.5 * crate::formation::grid(gd).2.x;
         file.clear();
         for &i in &members[g as usize] {
             if units.swing[i] & crate::units::SWING_STATE_MASK != crate::units::SWING_READY {
