@@ -133,10 +133,11 @@ struct PullVertex {
 
 #ifdef UNIT_BOUND_CHECK
 // FL_OCCLUDE_CHECK (render_units_occlusion.rs): per kind, standing, dying,
-// then settled (a corpse record, his death played out), how far any drawn
-// corner reached from his position in his facing frame: forward, back,
-// sideways, up, down, as float bits.
-@group(3) @binding(10) var<storage, read_write> bound_reach: array<atomic<u32>, 60>;
+// then settled (a corpse record, his death played out) by the way he fell
+// (forward, back, either side), how far any drawn corner reached from his
+// position in his facing frame: forward, back, right, left, up, down, as
+// float bits.
+@group(3) @binding(10) var<storage, read_write> bound_reach: array<atomic<u32>, 144>;
 
 fn measure_reach(placed: vec3<f32>) {
     let d = placed - pose_at(P_POS).xyz;
@@ -146,14 +147,21 @@ fn measure_reach(placed: vec3<f32>) {
     let z = d.x * yaw.y + d.z * yaw.x;
     // A corpse record's death has played out to 1; a dying man's stops
     // a tick short of it (combat.rs freezes him at his last tick).
-    let death = pose_at(P_DEATH).w;
-    let state = select(select(0u, 1u, death > 0.0), 2u, death > 0.999);
-    let base = ((#{PULL_BUCKET}u / 4u) * 3u + state) * 5u;
+    // The way he fell from his topple (unit_pose.wgsl `put_common`): about
+    // x forward or back by the sign of its sine, about z to either side.
+    let topple = pose_at(P_DEATH);
+    var state = select(0u, 1u, topple.w > 0.0);
+    if topple.w > 0.999 {
+        let neg = topple.y < 0.0;
+        state = 2u + select(select(0u, 1u, neg), select(3u, 2u, neg), topple.z > 1.5);
+    }
+    let base = ((#{PULL_BUCKET}u / 4u) * 6u + state) * 6u;
     atomicMax(&bound_reach[base], bitcast<u32>(max(z, 0.0)));
     atomicMax(&bound_reach[base + 1u], bitcast<u32>(max(-z, 0.0)));
-    atomicMax(&bound_reach[base + 2u], bitcast<u32>(abs(x)));
-    atomicMax(&bound_reach[base + 3u], bitcast<u32>(max(d.y, 0.0)));
-    atomicMax(&bound_reach[base + 4u], bitcast<u32>(max(-d.y, 0.0)));
+    atomicMax(&bound_reach[base + 2u], bitcast<u32>(max(x, 0.0)));
+    atomicMax(&bound_reach[base + 3u], bitcast<u32>(max(-x, 0.0)));
+    atomicMax(&bound_reach[base + 4u], bitcast<u32>(max(d.y, 0.0)));
+    atomicMax(&bound_reach[base + 5u], bitcast<u32>(max(-d.y, 0.0)));
 }
 #endif
 
