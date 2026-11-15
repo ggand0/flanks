@@ -282,6 +282,12 @@ pub struct GroupData {
     /// The regiment is coming onto a lane and its men take their places
     /// there as they arrive (formation.rs `fill_lane_slots`).
     pub lane_fill: Option<LaneFill>,
+    /// The living men past the waypoint its route's frame waits at, as
+    /// (waypoint, men past, living men), counted from the tick's start
+    /// positions (frontline.rs). The frame moves on once their share
+    /// reaches `route::frame_share` (sim/route.rs `update_routes`). None
+    /// with no frame short of its route's end.
+    pub frame_past: Option<(u32, u32, u32)>,
 }
 
 impl GroupData {
@@ -364,6 +370,7 @@ impl GroupData {
             lead: 0.0,
             vel: Vec2::ZERO,
             lane_fill: None,
+            frame_past: None,
         }
     }
 }

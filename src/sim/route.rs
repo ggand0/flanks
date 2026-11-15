@@ -38,7 +38,9 @@
 //!   cannot be reached becomes a move to the nearest reachable ground
 //!   with room for the regiment, and the log states it.
 //!
-//! `FL_PATH=0` turns routes off. `FL_LOG_ROUTE=1` logs each route event
+//! `FL_PATH=0` turns routes off. `FL_FRAME_SHARE` sets the share of a
+//! regiment's men past a waypoint that moves its frame on (`frame_share`;
+//! 0 turns that way on off). `FL_LOG_ROUTE=1` logs each route event
 //! (`log_route`): an order's end and whether its route stays, a holding
 //! regiment's route dropped, and each move of a frame to a later waypoint.
 
@@ -152,6 +154,33 @@ fn log_route() -> bool {
     *ON.get_or_init(|| std::env::var("FL_LOG_ROUTE").is_ok())
 }
 
+/// The share of a regiment's living men that moves its frame on once
+/// they are past the waypoint it waits at: a fifth. With a third, the men
+/// already through, sent back to the frame, fill the passage's mouth
+/// before enough are past; with fewer, a few runners move the whole
+/// regiment's slots.
+const FRAME_SHARE: f32 = 0.2;
+
+/// The share of a regiment's living men past the waypoint its frame
+/// waits at that moves the frame on (`update_routes`). The frame's other
+/// two tests read the regiment's centre, and a regiment filing through a
+/// passage narrower than its block stands strung along its route, its
+/// centre short of the passage's far end for good; its head is through.
+/// `FL_FRAME_SHARE` sets it; 0 turns this way on off, and the frame then
+/// moves exactly as it did without it.
+pub fn frame_share() -> f32 {
+    static S: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *S.get_or_init(|| crate::util::env_or("FL_FRAME_SHARE", FRAME_SHARE))
+}
+
+/// Whether the count `past` (waypoint, men past it, living men; frontline.rs
+/// fills it at the tick's start) moves a frame waiting at waypoint `k` on:
+/// it was taken at that waypoint, and the men past are `share` of the
+/// living or more.
+fn share_passed(past: Option<(u32, u32, u32)>, k: usize, share: f32) -> bool {
+    matches!(past, Some((at, n, of)) if share > 0.0 && at as usize == k && of > 0 && n as f32 >= share * of as f32)
+}
+
 impl Routes {
     /// The grid, for the job and the debug view.
     pub fn nav(&self) -> Option<&Arc<NavGrid>> {
@@ -261,6 +290,24 @@ impl Routes {
             }),
             _ => None,
         }
+    }
+
+    /// The line regiment `g`'s waiting frame is passed at: the waypoint's
+    /// index, the waypoint, and the unit direction of the leg after it
+    /// (toward `goal` on the last leg). A man is past the waypoint when
+    /// he stands beyond the line through it across that leg. None without
+    /// a ready route, at its last waypoint, or with `frame_share` off.
+    pub(crate) fn frame_line(&self, g: usize, goal: Vec2) -> Option<(u32, Vec2, Vec2)> {
+        if frame_share() <= 0.0 {
+            return None;
+        }
+        let State::Ready(route) = &self.per.get(g)?.state else { return None };
+        if route.k + 1 >= route.points.len() {
+            return None;
+        }
+        let here = route.points[route.k];
+        let dir = (next_point(&route.points, route.k, goal) - here).normalize_or_zero();
+        (dir != Vec2::ZERO).then_some((route.k as u32, here, dir))
     }
 
     /// The route points a regiment follows, for the debug view and the
@@ -427,8 +474,11 @@ pub fn update_routes(
         }
     }
 
-    // Each frame along its route; a holding regiment's route goes once it
-    // holds elsewhere.
+    // Each frame along its route: on to the next waypoint once the
+    // regiment's centre is within its half width of this one, or the
+    // straight way to the next is clear at that width, or a share of its
+    // men are past this one (`frame_share`). A holding regiment's route
+    // goes once it holds elsewhere.
     for g in 0..n {
         let gd = &groups.list[g];
         let Some(goal) = groups.goal(g) else {
@@ -463,6 +513,12 @@ pub fn update_routes(
             if near || nav.straight_ok(gd.centroid, next, w) {
                 passed = if near { "near" } else { "clear" };
                 k += 1;
+            } else if share_passed(gd.frame_past, k, frame_share()) {
+                // The regiment's centre is short of the waypoint and the
+                // way on is too narrow for its block, but enough of its
+                // men are past it: it is filing through.
+                passed = "share";
+                k += 1;
             } else {
                 break;
             }
@@ -470,8 +526,12 @@ pub fn update_routes(
         if k != route.k {
             if log_route() {
                 let c = gd.centroid;
+                let men = match gd.frame_past {
+                    Some((at, n, of)) if at as usize == route.k => format!("; {n} of {of} men past waypoint {at}"),
+                    _ => String::new(),
+                };
                 info!(
-                    "[route] tick {tick} regiment {g}: frame from waypoint {} to {k} of {last}; centre ({:.1}, {:.1}), half width {w:.2} m; passed by: {passed}",
+                    "[route] tick {tick} regiment {g}: frame from waypoint {} to {k} of {last}; centre ({:.1}, {:.1}), half width {w:.2} m; passed by: {passed}{men}",
                     route.k,
                     c.x,
                     c.y
@@ -784,5 +844,48 @@ pub fn draw_routes(
         gizmos.line(lift(gd.centroid, 1.0), lift(points[k.min(points.len() - 1)], 1.0), Color::srgb(0.3, 0.9, 1.0));
         let wp = lift(points[k.min(points.len() - 1)], 1.0);
         gizmos.circle(Isometry3d::new(wp, Quat::from_rotation_x(std::f32::consts::FRAC_PI_2)), 3.0, ahead);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn routes_at(points: &[Vec2], k: usize) -> Routes {
+        let route = Route { points: points.into(), k };
+        Routes { per: vec![RegRoute { state: State::Ready(Arc::new(route)), ..RegRoute::default() }], ..Routes::default() }
+    }
+
+    /// The line a waiting frame is passed at lies through its waypoint,
+    /// across the leg after it; on the last leg that leg runs to the goal.
+    #[test]
+    fn a_waiting_frame_is_passed_across_the_leg_after_its_waypoint() {
+        let points = [Vec2::ZERO, Vec2::new(10.0, 0.0), Vec2::new(10.0, 10.0), Vec2::new(20.0, 10.0)];
+        let goal = Vec2::new(10.0, 30.0);
+        assert_eq!(routes_at(&points, 1).frame_line(0, goal), Some((1, points[1], Vec2::Y)));
+        // The last leg: from the waypoint before the end toward the goal,
+        // not toward the route's own last point.
+        assert_eq!(routes_at(&points, 2).frame_line(0, goal), Some((2, points[2], Vec2::Y)));
+        // At its last waypoint the frame waits for nothing.
+        assert_eq!(routes_at(&points, 3).frame_line(0, goal), None);
+        // No route, no regiment, and a route still being planned: no line.
+        assert_eq!(Routes::default().frame_line(0, goal), None);
+        let mut pending = routes_at(&points, 1);
+        pending.per[0].state = State::Pending { serial: 1, old: None };
+        assert_eq!(pending.frame_line(0, goal), None);
+    }
+
+    /// The frame moves on by its men once a fifth of the living are past
+    /// the waypoint it waits at, and only on a count taken at that waypoint.
+    #[test]
+    fn a_fifth_of_the_living_men_past_its_waypoint_moves_a_frame_on() {
+        assert!(share_passed(Some((4, 40, 200)), 4, FRAME_SHARE));
+        assert!(!share_passed(Some((4, 39, 200)), 4, FRAME_SHARE));
+        // A count taken at an earlier waypoint says nothing about this one.
+        assert!(!share_passed(Some((3, 200, 200)), 4, FRAME_SHARE));
+        assert!(!share_passed(Some((4, 0, 0)), 4, FRAME_SHARE));
+        assert!(!share_passed(None, 4, FRAME_SHARE));
+        // Switched off, no count moves it.
+        assert!(!share_passed(Some((4, 200, 200)), 4, 0.0));
     }
 }
