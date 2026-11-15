@@ -96,7 +96,9 @@ pub fn bound_check() -> bool {
 /// His held level and his shadow do not change. The rule reads the depth
 /// pyramid, which the probe (render_units_gpu.rs `OcclusionProbe`) builds
 /// every frame only while the vertex runs it and the occlusion test save
-/// pay for it; between the probes every man holds his count and his mesh.
+/// pay for it; between the probes every man holds his count and his mesh,
+/// and a probe steps his count by the frames since the last one, so the
+/// rule moves in time whether or not the pyramid is built every frame.
 /// `FL_LOD_HIDDEN_TOP`, `FL_LOD_HIDDEN_HALF` and `FL_LOD_HIDDEN_HOLD` tune it.
 #[derive(Clone, Copy, Debug)]
 pub struct LodHidden {

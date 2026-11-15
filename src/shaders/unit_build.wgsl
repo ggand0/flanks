@@ -186,8 +186,9 @@ struct Params {
     bound_down_fall: vec4<f32>,
     // FL_LOD_HIDDEN (render_units_occlusion.rs): x the mode (0 off, 1 the
     // held level 2, 2 also level 1, 3 also level 0), y the hold
-    // (`body_state`). z 1 under FL_FALLEN_FAR (render_units.rs `fallen_far`):
-    // a body at level 2 draws at level 3.
+    // (`body_state`), w the frames since the last frame with a pyramid, the
+    // step of each man's count. z 1 under FL_FALLEN_FAR (render_units.rs
+    // `fallen_far`): a body at level 2 draws at level 3.
     lod_hidden: vec4<u32>,
     // The body box: x its half-width, y its top above his feet, z its
     // bottom above his feet, in metres.
@@ -492,8 +493,9 @@ fn occlusion(bucket: u32, p: vec3<f32>, yaw: f32, kind: u32, state: u32) -> u32 
 // FL_LOD_HIDDEN: a living soldier's body count and his coarse latch, from
 // `prev`, last frame's (the count in the low ten bits, the latch in
 // BODY_COARSE). His body box runs from just above his feet to the box's top,
-// a small square around him. A frame with it hidden adds one to the count,
-// up to twice the hold; a frame with it showing takes one off. The latch
+// a small square around him. A frame with it hidden adds the frames since
+// the last frame with a pyramid to the count, up to twice the hold; a frame
+// with it showing takes them off. The latch
 // closes when the count reaches the hold and opens when it is back at 0, so
 // a man whose body is hidden most of the time keeps his coarse mesh, and one
 // who comes into view is back at his held level within twice the hold. A
@@ -516,12 +518,15 @@ fn body_state(prev: u32, lod: u32, p: vec3<f32>, yaw: f32, kind: u32, occl: u32,
         let feet = params.half_height[kind];
         hidden = box_hidden(p, yaw, vec4<f32>(bb.x), bb.y - feet, feet - bb.z);
     }
+    // The step is the frames since the last frame with a pyramid: 1 while
+    // it is built every frame, a probe's gap between probes.
     let hold = params.lod_hidden.y;
+    let step = max(params.lod_hidden.w, 1u);
     var count = prev & BODY_MASK;
     if hidden {
-        count = min(count + 1u, 2u * hold);
+        count = min(count + step, 2u * hold);
     } else {
-        count = max(count, 1u) - 1u;
+        count -= min(count, step);
     }
     var coarse = prev & BODY_COARSE;
     if count >= hold {
