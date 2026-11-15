@@ -390,7 +390,11 @@ mod tests {
     #[test]
     fn map_switches_update_camera_range_and_keep_focus_on_the_field() {
         let mut app = App::new();
-        app.init_resource::<Time>()
+        // `apply_camera_transform` reads the game state. In the menu,
+        // the default, it leaves the camera path alone.
+        app.add_plugins(bevy::state::app::StatesPlugin)
+            .init_state::<crate::game_state::GameState>()
+            .init_resource::<Time>()
             .insert_resource(build_terrain(MapKind::BigGrassland))
             .add_systems(Update, apply_camera_transform);
         let camera = app
