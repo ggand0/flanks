@@ -693,6 +693,12 @@ fn update_overlay(
                 render_counts.hidden
             );
         }
+        if crate::render_units_occlusion::lod_hidden().mode != 0 {
+            info!(
+                "  lod hidden: drawn a level coarser per held level {:?}",
+                render_counts.coarser
+            );
+        }
         let pacing = &mut *pacing;
         info!(
             "  frame ms without a tick: {} | with a tick: {} | inside the fixed tick: {}",
