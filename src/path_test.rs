@@ -72,8 +72,8 @@
 //! - the men out, each with the slot and the aim the sim gives him.
 //!
 //! `FL_TEST_DUMP=<file>` writes every watched man's position, height
-//! included, with his place and the ground under him, every five seconds
-//! (`dump_men`).
+//! included, with his place, the ground under him, his velocity and his
+//! facing, every five seconds (`dump_men`).
 //!
 //! `FL_LOG_ROUTE=1` adds the route events from sim/route.rs: an order's end
 //! and whether its route stays, a holding regiment's route dropped, and
@@ -776,7 +776,8 @@ fn frame_text(routes: &crate::sim::route::Routes, g: usize) -> String {
 /// order, his regiment and his index, his position (x, height, z), his
 /// place at the order's end (x, z), the slot the sim gives him now
 /// (x, z), the sim's ground height under him and the drawn ground's,
-/// whether the ground under him is blocked, and his velocity (x, z).
+/// whether the ground under him is blocked, his velocity (x, z), and his
+/// facing (radians from +z toward +x: 0 looks along +z, half pi along +x).
 fn dump_men(
     test: &mut PathTest,
     units: &Units,
@@ -791,7 +792,7 @@ fn dump_men(
         let Ok(path) = std::env::var("FL_TEST_DUMP") else { return };
         match std::fs::File::create(&path) {
             Ok(mut file) => {
-                let _ = writeln!(file, "t g i x y z place_x place_z slot_x slot_z sim_h ground_h blocked vx vz");
+                let _ = writeln!(file, "t g i x y z place_x place_z slot_x slot_z sim_h ground_h blocked vx vz yaw");
                 info!("[path-test] every man's position goes to {path} every 5 s");
                 test.dump = Some(file);
             }
@@ -818,7 +819,7 @@ fn dump_men(
             let (place, slot) = (place_at + units.home[i], slot_at + units.home[i]);
             let _ = writeln!(
                 file,
-                "{secs:.1} {g} {i} {:.2} {:.2} {:.2} {:.2} {:.2} {:.2} {:.2} {:.2} {:.2} {} {:.2} {:.2}",
+                "{secs:.1} {g} {i} {:.2} {:.2} {:.2} {:.2} {:.2} {:.2} {:.2} {:.2} {:.2} {} {:.2} {:.2} {:.3}",
                 p.x,
                 p.y,
                 p.z,
@@ -830,7 +831,8 @@ fn dump_men(
                 terrain.ground_at(p.x, p.z),
                 u8::from(terrain.blocked_at(p.x, p.z)),
                 units.vel[i].x,
-                units.vel[i].z
+                units.vel[i].z,
+                units.yaw[i]
             );
         }
     }
