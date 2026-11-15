@@ -230,19 +230,43 @@ pub fn grid(gd: &GroupData) -> (usize, usize, Vec2) {
 /// abreast (a lane narrower than two men abreast slows a pass
 /// steeply). It takes the fewest files to a group whose
 /// added depth fits the room on both sides together, less a margin on
-/// each, else the most files. The added depth goes to the two sides in
-/// proportion to their room, so the block backs up only into free
-/// ground.
-pub fn choose_open(gd: &GroupData, ready: bool, across: bool, room_front: f32, room_back: f32) -> OpenOrder {
+/// each; None when no layout fits, and the regiment stays closed. A
+/// layout of a single group leaves no lane, so it is no open order and is
+/// never taken. The added depth goes to the two sides in proportion to
+/// their room, so the block backs up only into free ground.
+pub fn choose_open(gd: &GroupData, ready: bool, across: bool, room_front: f32, room_back: f32) -> Option<OpenOrder> {
+    let front = (room_front - OPEN_ROOM_MARGIN).max(0.0);
+    let back = (room_back - OPEN_ROOM_MARGIN).max(0.0);
+    let layout = open_layouts(gd, ready, across);
+    let (mut o, added) = (1..=OPEN_FILES_MAX).filter_map(layout).find(|&(_, added)| added <= front + back)?;
+    let share = if added > 0.0 && front + back > 0.0 { front / (front + back) } else { 0.5 };
+    o.front = added * share;
+    o.back = added - o.front;
+    o.closed_anchor = gd.anchor;
+    Some(o)
+}
+
+/// The least depth any open layout adds to the block (metres): what
+/// `choose_open` needs on both sides together, past the margins, to open
+/// at all. None when no layout leaves a lane.
+pub fn least_open_growth(gd: &GroupData, ready: bool, across: bool) -> Option<f32> {
+    let layout = open_layouts(gd, ready, across);
+    (1..=OPEN_FILES_MAX).filter_map(layout).map(|(_, added)| added).reduce(f32::min)
+}
+
+/// The open layout of `a` files to a group for `gd` (`choose_open`), with
+/// the depth it adds to the closed block; its growth on each side and its
+/// closed anchor still unset. None when it comes to a single group: the
+/// lanes are the gaps between groups, and one group has none.
+fn open_layouts(gd: &GroupData, ready: bool, across: bool) -> impl Fn(u8) -> Option<(OpenOrder, f32)> {
     let n = gd.count.max(1);
     let files = (gd.files.max(1) as usize).min(n);
     let closed = gd.chosen_spacing();
     let width = &crate::sim::soldier::widths()[if ready { 3 } else { 0 }];
     let ease = &crate::sim::soldier::widths()[0];
     let shut = (n.div_ceil(files) - 1) as f32 * closed.pitch(gd.kind).y;
-    let front = (room_front - OPEN_ROOM_MARGIN).max(0.0);
-    let back = (room_back - OPEN_ROOM_MARGIN).max(0.0);
-    let layout = |a: u8| {
+    let kind = gd.kind;
+    move |a: u8| {
         let o = OpenOrder {
             files: a,
             sep: width.sep,
@@ -250,24 +274,20 @@ pub fn choose_open(gd: &GroupData, ready: bool, across: bool, room_front: f32, r
             across,
             ..OpenOrder::default()
         };
-        let groups = open_groups(files, n, closed, gd.kind, &o);
+        let groups = open_groups(files, n, closed, kind, &o);
+        if groups < 2 {
+            return None;
+        }
         let lines = open_lines(files, n, groups, &o);
         let depth = if across {
             // The ranks at their lane offsets.
             let at = open_lane_offsets(groups, lines, &o);
             at.last().copied().unwrap_or(0.0) - at[0]
         } else {
-            (n.div_ceil(lines) - 1) as f32 * gap(gd.kind)
+            (n.div_ceil(lines) - 1) as f32 * gap(kind)
         };
-        (o, depth - shut)
-    };
-    let a = (1..=OPEN_FILES_MAX).find(|&a| layout(a).1 <= front + back).unwrap_or(OPEN_FILES_MAX);
-    let (mut o, added) = layout(a);
-    let share = if added > 0.0 && front + back > 0.0 { front / (front + back) } else { 0.5 };
-    o.front = added * share;
-    o.back = added - o.front;
-    o.closed_anchor = gd.anchor;
-    o
+        Some((o, depth - shut))
+    }
 }
 
 /// Where an open regiment's closed block is centred: its centroid less
@@ -1201,5 +1221,60 @@ fn fill_lane_slots(mut units: ResMut<Units>, mut groups: ResMut<Groups>, terrain
             info!("regiment {g}: its men have all taken their places on the lane");
             gd.lane_fill = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 200 archers in 50 files by 4 ranks, closed, facing +z.
+    fn holder() -> GroupData {
+        let mut gd = GroupData::new(0, crate::unit_types::KIND_ARCHER, Vec2::ZERO, 200);
+        gd.shape = FormShape::Rect;
+        gd.files = 50;
+        gd.facing = facing_of(Vec2::Y);
+        gd
+    }
+
+    /// No room or too little gives no plan; just enough gives the layout
+    /// with the least growth, split as the room is.
+    #[test]
+    fn choose_open_needs_room_for_its_least_growth() {
+        let gd = holder();
+        let least = least_open_growth(&gd, false, false).expect("a layout with a lane");
+        // Three files to a group: five ranks of 1.4 m where four stood.
+        assert!((least - 1.4).abs() < 1e-4, "the least growth is {least}");
+        let m = OPEN_ROOM_MARGIN;
+        assert!(choose_open(&gd, false, false, 0.0, 0.0).is_none());
+        assert!(choose_open(&gd, false, false, m + least * 0.75 - 0.01, m + least * 0.25).is_none());
+        let (front, back) = (least * 0.75 + 0.01, least * 0.25);
+        let o = choose_open(&gd, false, false, m + front, m + back).expect("a plan");
+        assert_eq!(o.files, 3);
+        assert!((o.front + o.back - least).abs() < 1e-4);
+        assert!((o.front - least * front / (front + back)).abs() < 1e-4);
+    }
+
+    /// Lanes across the facing of a block four ranks deep: all four ranks
+    /// in one group would stand shallower than the closed block and fit
+    /// in no room at all, but they leave no lane. The least a layout with
+    /// a lane adds is two groups of two ranks.
+    #[test]
+    fn a_layout_of_one_group_is_no_open_order() {
+        let gd = holder();
+        let least = least_open_growth(&gd, false, true).expect("a layout with a lane");
+        assert!(least > 0.0, "the least growth across is {least}");
+        let m = OPEN_ROOM_MARGIN;
+        assert!(choose_open(&gd, false, true, 0.0, 0.0).is_none());
+        assert!(choose_open(&gd, false, true, m, m + least - 0.01).is_none());
+        let o = choose_open(&gd, false, true, m, m + least + 0.01).expect("a plan across");
+        assert_eq!(o.files, 2);
+        assert!(o.across);
+        assert!(o.front.abs() < 1e-4 && (o.back - least).abs() < 1e-4);
+        // A block one rank deep has no ranks to part.
+        let mut line = holder();
+        line.files = 200;
+        assert!(least_open_growth(&line, false, true).is_none());
+        assert!(choose_open(&line, false, true, OPEN_ROOM_MAX, OPEN_ROOM_MAX).is_none());
     }
 }

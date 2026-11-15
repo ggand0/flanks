@@ -337,7 +337,7 @@ pub(crate) fn prepare_tick(
     let t1 = std::time::Instant::now();
     skirmish_reactions(groups, tracks, terrain, tick);
     let t2 = std::time::Instant::now();
-    open_for_passers(groups, tracks, tick);
+    open_for_passers(groups, terrain, tracks, tick);
     let t2b = std::time::Instant::now();
     let kept_clear_blocks = std::mem::take(&mut job.clear_blocks);
     let fire = archer_fire_solutions(
@@ -741,11 +741,31 @@ fn stance_of(g: &GroupData) -> u8 {
 }
 
 /// The free ground before a holding regiment's front and behind its rear
-/// (metres): of every other regiment with men whose block reaches across
-/// its frontage, the nearest block's gap on each side, OPEN_ROOM_MAX
-/// when none is nearer. What `formation::choose_open` grows into.
-fn room_around(groups: &Groups, h: usize) -> (f32, f32) {
-    let rect = crate::formation::block_rect(&groups.list[h]);
+/// (metres), round its block as it stands dressed at its anchor (only a
+/// closed holder is measured, so that is its closed anchor). On each
+/// side, the least of: OPEN_ROOM_MAX; of every other regiment with men
+/// whose block reaches across the frontage, that block's gap; and on a
+/// map with blocked ground, the distance from the face to the first
+/// ground a man cannot stand on, or to the map's edge, over lines across
+/// the whole frontage (`ground_room`). What `formation::choose_open`
+/// grows into.
+///
+/// The ground costs nothing on a map without blocked ground. Elsewhere it
+/// is at most about (frontage in metres) times (room in metres) mask reads
+/// per side, once per look for a closed holder a friend comes near: 72
+/// lines of up to 61 reads for a block of 50 archers.
+fn room_around(groups: &Groups, terrain: &Terrain, h: usize) -> (f32, f32) {
+    let hd = &groups.list[h];
+    let rect = crate::formation::block_rect_at(hd, hd.anchor);
+    let (front, back) = units_room(groups, h, &rect);
+    if !terrain.kind.has_blocked_ground() {
+        return (front, back);
+    }
+    (ground_room(terrain, &rect, 1.0, front), ground_room(terrain, &rect, -1.0, back))
+}
+
+/// The other regiments' part of `room_around`, round `rect`.
+fn units_room(groups: &Groups, h: usize, rect: &crate::formation::BlockRect) -> (f32, f32) {
     let right = Vec2::new(rect.fwd.y, -rect.fwd.x);
     let (mut front, mut back) = (crate::formation::OPEN_ROOM_MAX, crate::formation::OPEN_ROOM_MAX);
     for (o, od) in groups.list.iter().enumerate() {
@@ -766,6 +786,48 @@ fn room_around(groups: &Groups, h: usize) -> (f32, f32) {
         }
     }
     (front, back)
+}
+
+/// Mask reads a metre apart: half the 2 m vertex grid, so a line that
+/// crosses a blocked vertex's cell for a metre or more reads it.
+const ROOM_STEP: f32 = 1.0;
+
+/// The ground beyond `rect`'s front face (`side` 1) or its rear face
+/// (`side` -1): the least distance, over lines `ROOM_STEP` apart across
+/// its whole width, from the face to the first point a man cannot stand
+/// on (`Terrain::blocked_at`) or that is off the map, read every
+/// `ROOM_STEP`; no farther than `most`, which it returns when the ground
+/// is open that far. A line stops at its first blocked read, and each
+/// line reads no farther than the least found so far.
+fn ground_room(terrain: &Terrain, rect: &crate::formation::BlockRect, side: f32, most: f32) -> f32 {
+    let out = rect.fwd * side;
+    let right = Vec2::new(rect.fwd.y, -rect.fwd.x);
+    let face = rect.centre + out * rect.half_d;
+    let (lo, hi) = (terrain.min(), terrain.max());
+    let lines = ((2.0 * rect.half_w / ROOM_STEP).ceil() as usize).max(1);
+    let mut room = most;
+    for l in 0..=lines {
+        let across = -rect.half_w + 2.0 * rect.half_w * l as f32 / lines as f32;
+        let start = face + right * across;
+        let mut d = 0.0;
+        while d <= room {
+            let p = start + out * d;
+            if p.x < lo.x || p.y < lo.y || p.x > hi.x || p.y > hi.y || terrain.blocked_at(p.x, p.y) {
+                room = d;
+                break;
+            }
+            d += ROOM_STEP;
+        }
+    }
+    room
+}
+
+/// FL_LOG_OPEN=1: log each look where a holder stays closed because no
+/// open layout fits its room (`open_for_passers`). Off by default; it
+/// changes no decision.
+fn log_open() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FL_LOG_OPEN").is_ok())
 }
 
 /// A regiment walking somewhere: a goal further than a metre off, not
@@ -795,7 +857,9 @@ fn goes_to(groups: &Groups, m: usize) -> Option<Vec2> {
 /// look. A passing regiment counts its men inside each open friend's
 /// block (`GroupData::inside`, frontline.rs): the friend stays open while
 /// any of them is inside, and the passer stays passing until none is.
-fn open_for_passers(groups: &mut Groups, tracks: &crate::arrows::RegTracks, tick: u32) {
+/// A holder with no layout that fits its room stays closed
+/// (`formation::choose_open`); FL_LOG_OPEN=1 logs each look where it does.
+fn open_for_passers(groups: &mut Groups, terrain: &Terrain, tracks: &crate::arrows::RegTracks, tick: u32) {
     let n = groups.list.len();
     for m in 0..n {
         if !tick.wrapping_add(m as u32).is_multiple_of(ARCHER_LOOK) {
@@ -839,8 +903,9 @@ fn open_for_passers(groups: &mut Groups, tracks: &crate::arrows::RegTracks, tick
         let bound = crate::formation::block_bound(hd);
         let fwd = crate::formation::facing_dir(hd.facing);
         // The open order it stands in, or the one it would take now,
-        // looked at only once a friend comes near enough.
-        let mut plan = open.then_some(hd.open);
+        // looked at only once a friend comes near enough, and once a look:
+        // the inner None is no layout that fits its room.
+        let mut plan: Option<Option<crate::formation::OpenOrder>> = open.then_some(Some(hd.open));
         let mut opener: Option<usize> = None;
         let mut keep = false;
         for m in 0..n {
@@ -876,11 +941,25 @@ fn open_for_passers(groups: &mut Groups, tracks: &crate::arrows::RegTracks, tick
             // way: along the facing, or across it for a friend coming
             // from the side.
             let dir = (goal - md.centroid) / to_goal;
-            let o = *plan.get_or_insert_with(|| {
+            let looked = *plan.get_or_insert_with(|| {
                 let across = dir.dot(fwd).abs() < dir.dot(Vec2::new(fwd.y, -fwd.x)).abs();
-                let (front, back) = room_around(gl, h);
-                crate::formation::choose_open(hd, ready_stance(hd), across, front, back)
+                let (front, back) = room_around(gl, terrain, h);
+                let o = crate::formation::choose_open(hd, ready_stance(hd), across, front, back);
+                if o.is_none() && log_open() {
+                    let needs = match crate::formation::least_open_growth(hd, ready_stance(hd), across) {
+                        Some(d) => format!("the least growth needs {d:.1} m"),
+                        None => "no layout leaves a lane".into(),
+                    };
+                    info!(
+                        "[open] tick {tick} regiment {h} stays closed for regiment {m}, lanes {}: room {front:.1} m ahead and {back:.1} m behind, {needs}",
+                        if across { "across" } else { "along" }
+                    );
+                }
+                o
             });
+            // No layout fits: it stays closed, and only an open holder's
+            // keep reads the other friends.
+            let Some(o) = looked else { break };
             // A friend from the side meets the block's flank, which does
             // not move.
             let growth = if o.across {
@@ -903,7 +982,7 @@ fn open_for_passers(groups: &mut Groups, tracks: &crate::arrows::RegTracks, tick
             keep |= crosses || gap <= OPEN_KEEP;
         }
         let gd = &mut groups.list[h];
-        if !open && let (Some(m), Some(o)) = (opener, plan) {
+        if !open && let (Some(m), Some(Some(o))) = (opener, plan) {
             crate::formation::open_order(gd, o);
             if o.across {
                 info!(
@@ -1744,4 +1823,98 @@ fn snapshot_regiments(job: &mut TickJob, groups: &Groups, terrain: &Terrain) {
     job.charging = charging;
     job.fat_speed = fat_speed;
     job.fat_nocharge = fat_nocharge;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::formation::{choose_open, facing_of, least_open_growth, FormShape, OPEN_ROOM_MAX};
+    use crate::terrain::{build_terrain, MapKind, CELL};
+
+    /// The crossing scene's holder: 200 archers in 50 files by 4 ranks,
+    /// facing out over the parapet, its men about `centroid`.
+    fn holder(anchor: Vec2, centroid: Vec2) -> GroupData {
+        let mut gd = GroupData::new(0, crate::unit_types::KIND_ARCHER, anchor, 200);
+        gd.shape = FormShape::Rect;
+        gd.files = 50;
+        gd.facing = facing_of(Vec2::Y);
+        gd.centroid = centroid;
+        gd
+    }
+
+    fn one(gd: GroupData) -> Groups {
+        Groups { list: vec![gd] }
+    }
+
+    /// On the wall walk the block's front face is on the parapet and its
+    /// rear face a metre short of the kerb: no layout that grows the
+    /// block fits, wherever its men are.
+    #[test]
+    fn a_holder_on_the_walk_has_no_room_to_open() {
+        let terrain = build_terrain(MapKind::WallDebug);
+        let anchor = Vec2::new(20.9, -129.7);
+        for centroid in [Vec2::new(30.0, -145.0), anchor] {
+            let groups = one(holder(anchor, centroid));
+            let (front, back) = room_around(&groups, &terrain, 0);
+            assert_eq!((front, back), (0.0, 1.0), "the room with the men about {centroid}");
+            let gd = &groups.list[0];
+            // Lanes along its facing, and across it for a friend from the
+            // side, as the crossing scene's is.
+            for across in [false, true] {
+                assert!(least_open_growth(gd, false, across).is_some_and(|d| d > 0.0));
+                assert!(choose_open(gd, false, across, front, back).is_none(), "lanes across: {across}");
+            }
+        }
+    }
+
+    /// Far from the wall the ground is open: the room is all there is and
+    /// the plan is the one the full room gives.
+    #[test]
+    fn a_holder_on_open_ground_has_the_whole_room() {
+        let terrain = build_terrain(MapKind::WallDebug);
+        let anchor = Vec2::new(0.0, 150.0);
+        let mut z = anchor.y - 80.0;
+        while z <= anchor.y + 80.0 {
+            let mut x = anchor.x - 80.0;
+            while x <= anchor.x + 80.0 {
+                assert!(!terrain.blocked_at(x, z), "blocked at ({x}, {z})");
+                x += CELL;
+            }
+            z += CELL;
+        }
+        let groups = one(holder(anchor, anchor));
+        let (front, back) = room_around(&groups, &terrain, 0);
+        assert_eq!((front, back), (OPEN_ROOM_MAX, OPEN_ROOM_MAX));
+        let gd = &groups.list[0];
+        let o = choose_open(gd, false, false, front, back).expect("a plan");
+        let want = choose_open(gd, false, false, OPEN_ROOM_MAX, OPEN_ROOM_MAX).expect("a plan");
+        assert_eq!((o.files, o.sep, o.pitch, o.across), (want.files, want.sep, want.pitch, want.across));
+        assert_eq!((o.front, o.back, o.closed_anchor), (want.front, want.back, want.closed_anchor));
+        // The fewest files to a group: one, its 5.6 m split evenly.
+        assert_eq!(o.files, 1);
+        assert!((o.front - 2.8).abs() < 1e-4 && (o.back - 2.8).abs() < 1e-4);
+    }
+
+    /// Where no ground blocks, the room is the other regiments' alone: a
+    /// block 5 m behind leaves 5 m behind.
+    #[test]
+    fn on_open_maps_the_room_is_the_other_regiments() {
+        let terrain = build_terrain(MapKind::Grassland);
+        assert!(!terrain.kind.has_blocked_ground());
+        let mut groups = one(holder(Vec2::ZERO, Vec2::ZERO));
+        let rect = crate::formation::block_rect_at(&groups.list[0], Vec2::ZERO);
+        assert_eq!(room_around(&groups, &terrain, 0), units_room(&groups, 0, &rect));
+        assert_eq!(room_around(&groups, &terrain, 0), (OPEN_ROOM_MAX, OPEN_ROOM_MAX));
+        let mut other = GroupData::new(0, crate::unit_types::KIND_HEAVY, Vec2::ZERO, 100);
+        other.shape = FormShape::Rect;
+        other.files = 20;
+        other.facing = facing_of(Vec2::Y);
+        let reach = crate::formation::block_rect_at(&other, Vec2::ZERO).half_d;
+        other.centroid = Vec2::new(0.0, -(rect.half_d + 5.0 + reach));
+        groups.list.push(other);
+        let (front, back) = room_around(&groups, &terrain, 0);
+        assert_eq!((front, back), units_room(&groups, 0, &rect));
+        assert_eq!(front, OPEN_ROOM_MAX);
+        assert!((back - 5.0).abs() < 1e-4, "the room behind is {back}");
+    }
 }
