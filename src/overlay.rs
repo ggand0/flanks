@@ -583,7 +583,7 @@ fn update_overlay(
     groups: Res<Groups>,
     selection: Res<Selection>,
     combat: Res<CombatStats>,
-    render_counts: Res<RenderCounts>,
+    mut render_counts: ResMut<RenderCounts>,
     arrows: Res<crate::arrows::Arrows>,
     outcome: Res<crate::ai::BattleOutcome>,
     mut query: Query<&mut Text, With<OverlayText>>,
@@ -695,9 +695,12 @@ fn update_overlay(
         }
         if crate::render_units_occlusion::lod_hidden().mode != 0 {
             info!(
-                "  lod hidden: drawn a level coarser per held level {:?}",
-                render_counts.coarser
+                "  lod hidden: drawn a level coarser per held level {:?}, flips a frame {:.1}",
+                render_counts.coarser,
+                render_counts.flips as f32 / render_counts.flip_frames.max(1) as f32
             );
+            render_counts.flips = 0;
+            render_counts.flip_frames = 0;
         }
         let pacing = &mut *pacing;
         info!(

@@ -68,6 +68,10 @@ pub struct RenderCounts {
     /// Per held level, the living drawn a level coarser because the men in
     /// front hid their body (`FL_LOD_HIDDEN`, render_units_occlusion.rs).
     pub coarser: [usize; NUM_LODS],
+    /// The soldiers the same rule sent coarser or back, summed over the
+    /// frames read back since the overlay's last log line, and those frames.
+    pub flips: usize,
+    pub flip_frames: usize,
     /// Cost of sync_instance_data this frame (cull + bucket build).
     pub sync_ms: f32,
     /// FL_GPU_CHECK: what the CPU sweep would have drawn on recent frames,
