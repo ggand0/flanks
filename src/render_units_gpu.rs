@@ -289,8 +289,10 @@ pub struct BuildParams {
     bound_fall: [Vec4; NUM_KINDS],
     bound_down_live: Vec4,
     bound_down_fall: Vec4,
-    /// `FL_LOD_HIDDEN` (render_units_occlusion.rs): x the mode, y the hold.
-    /// z 1 under `FL_FALLEN_FAR` (render_units.rs `fallen_far`).
+    /// `FL_LOD_HIDDEN` (render_units_occlusion.rs): x the mode, y the hold,
+    /// w the frames since the last frame the test read a pyramid (the step
+    /// of each man's count). z 1 under `FL_FALLEN_FAR` (render_units.rs
+    /// `fallen_far`).
     lod_hidden: UVec4,
     /// The body box: x its half-width, y its top above his feet, z its
     /// bottom above his feet, in metres.
@@ -363,6 +365,10 @@ pub struct OcclusionProbe {
     active: bool,
     /// Frames since the pyramid was last built.
     since: u32,
+    /// Frames since the last frame the test could read a pyramid, and
+    /// whether this frame's predecessor built one.
+    since_test: u32,
+    built_last: bool,
 }
 
 /// Frames the main world asked for the depth pyramid and frames it built
@@ -763,6 +769,16 @@ fn build_frame_params(
             PYRAMID_FRAMES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         PYRAMID_FRAMES[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // `FL_LOD_HIDDEN` steps each man's count by the frames since the
+        // last frame the test read a pyramid, so under probing the rule
+        // moves in time and not in probes. A gap longer than a probe's (a
+        // cut, a resize, the start) counts as one probe.
+        probe.since_test += 1;
+        if probe.built_last {
+            p.lod_hidden.w = probe.since_test.min(PROBE_EVERY);
+            probe.since_test = 0;
+        }
+        probe.built_last = frame.build_pyramid;
     }
     crate::frame_log::set_frame_params(p.alpha, p.occlude.z != 0, frame.build_pyramid);
     // The sun's cascades for this camera, as the shadow pass draws them
