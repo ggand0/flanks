@@ -41,12 +41,25 @@
 //!   stair, where the defenders deploy, given a line along the walk above
 //!   and west of them, so the whole regiment has to walk back along the
 //!   foot to the stair.
+//! - `FL_TEST_PATH=walls_cross` with `FL_MAP=walled_town` or
+//!   `FL_MAP=wall_debug`: two regiments of 200 archers at the wall's inner
+//!   foot on either side of the stair east of the gate, each given a line
+//!   along the walk on the far side of the stair from where it stands, so
+//!   both climb the same stair and cross on it and on the walk. Its log
+//!   adds, per regiment, the men who have never stood on the walk and the
+//!   waypoint its route has reached, so a route stalled at the stair's
+//!   foot, men who never got up and men up but not at their places read
+//!   apart. It has 300 s to arrive.
 //!
 //! Per regiment the log has the share of men within 5 m of their slots,
 //! the men stuck (slower than 0.1 m/s for 10 s while more than 5 m from
-//! their slot), the route's length against the straight line, and a
-//! verdict once 99% have arrived: the time taken against twice the time
-//! the route's length takes at the men's pace.
+//! their slot), the route's length against the straight line, the
+//! waypoint the route has reached, and a verdict once 99% have arrived:
+//! the time taken against twice the time the route's length takes at the
+//! men's pace. A regiment fails when it has not arrived by its scene's
+//! timeout (`timeout_s`) or three times the route's length at its pace,
+//! whichever is longer. On the wall scenes the log also counts the men on
+//! the walk and the men who have never stood on it.
 
 use bevy::prelude::*;
 
@@ -66,8 +79,22 @@ const MANY_REGS: usize = 200;
 const WALK_MEN: usize = 40;
 /// Where the archers' target stands: on the slope 70 m out from the wall.
 const ARCHERS_TARGET: Vec2 = Vec2::new(60.0, crate::town_layout::WALL_Z + 70.0);
-/// Seconds after the order a regiment has to arrive before it fails.
+/// Seconds after the order a regiment has to arrive before it fails,
+/// on every scene but the crossing (`timeout_s`).
 const TIMEOUT_S: f32 = 180.0;
+/// The crossing scene's timeout: a pass takes about two minutes, and a
+/// regiment stalled on the stair is watched for a while longer.
+const CROSS_TIMEOUT_S: f32 = 300.0;
+/// The crossing scene's starts, by the stair east of the gate (its foot
+/// at x = 36): 40 m west of its foot and 14 m behind the wall's line,
+/// (-4, -144); east of its end and 18 m behind the line, (68, -148).
+const CROSS_WEST_START: Vec2 = Vec2::new(spots::STAIR_FOOT_EAST.x - 40.0, crate::town_layout::WALL_Z - 14.0);
+const CROSS_EAST_START: Vec2 = Vec2::new(spots::STAIR_FOOT_EAST.x + 32.0, crate::town_layout::WALL_Z - 18.0);
+/// Its lines along the walk, each on the far side of the stair from its
+/// regiment: the west one's from x = 62 to 102, the east one's from
+/// x = -14 to 26.
+const CROSS_EAST_LINE: (f32, f32) = (spots::STAIR_FOOT_EAST.x + 26.0, spots::STAIR_FOOT_EAST.x + 66.0);
+const CROSS_WEST_LINE: (f32, f32) = (spots::STAIR_FOOT_EAST.x - 50.0, spots::STAIR_FOOT_EAST.x - 10.0);
 /// Within this of his slot a man has arrived; beyond it, slower than
 /// `STUCK_SPEED` for `STUCK_S`, he is stuck.
 const ARRIVED_M: f32 = 5.0;
@@ -91,6 +118,9 @@ struct Subject {
     route_note: String,
     done_s: Option<f32>,
     peak_stuck: usize,
+    /// The time it has to arrive (s): the scene's timeout until the route
+    /// is known, then that or three times the route at its pace.
+    limit: f32,
     reported: bool,
     /// Where its centre stood at the verdict, to see that it then stays.
     settled_at: Option<Vec2>,
@@ -101,6 +131,8 @@ struct PathTest {
     subjects: Vec<Subject>,
     /// Per unit, ticks spent stuck so far.
     stuck_ticks: Vec<u32>,
+    /// Per unit, whether he has stood on the wall's walk (wall scenes).
+    been_on_walk: Vec<bool>,
     ordered: bool,
     summary_done: bool,
     /// The 200-regiment scene: when every regiment had its route.
@@ -149,7 +181,7 @@ pub fn spawn(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
     // The wall scenes run on either map with the wall.
     let wanted_map = match scene.as_str() {
         "river" => Some(crate::terrain::MapKind::River),
-        "walls" | "walls_archers" | "walls_place" | "walls_under" => None,
+        "walls" | "walls_archers" | "walls_place" | "walls_under" | "walls_cross" => None,
         _ => Some(crate::terrain::MapKind::Obstacles),
     };
     match wanted_map {
@@ -197,6 +229,13 @@ pub fn spawn(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
             let at = Vec2::new(spots::STAIR_FOOT_EAST.x + 36.0, crate::town_layout::WALL_Z - 12.0);
             crate::regiments::spawn_regiment(units, terrain, &mut list, 0, KIND_ARCHER, at, CASE_MEN, -1.0);
             list[0].skirmish = false;
+        }
+        "walls_cross" => {
+            for at in [CROSS_WEST_START, CROSS_EAST_START] {
+                crate::regiments::spawn_regiment(units, terrain, &mut list, 0, KIND_ARCHER, at, CASE_MEN, -1.0);
+            }
+            list[0].skirmish = false;
+            list[1].skirmish = false;
         }
         "walls_archers" => {
             crate::regiments::spawn_regiment(units, terrain, &mut list, 0, KIND_ARCHER, spots::PLAZA, 60, -1.0);
@@ -279,6 +318,13 @@ fn give_orders(
             crate::orders::line_order(&mut groups, &terrain, &[0], c - Vec2::new(20.0, 0.0), c + Vec2::new(20.0, 0.0));
             order(&mut groups, &mut units, &terrain, &mut test, pipeline.tick, 0, "walls-under", None);
         }
+        "walls_cross" => {
+            let z = crate::town_layout::WALL_Z;
+            for (g, case, (a, b)) in [(0, "cross-east", CROSS_EAST_LINE), (1, "cross-west", CROSS_WEST_LINE)] {
+                crate::orders::line_order(&mut groups, &terrain, &[g], Vec2::new(a, z), Vec2::new(b, z));
+                order(&mut groups, &mut units, &terrain, &mut test, pipeline.tick, g, case, None);
+            }
+        }
         "walls_archers" => {
             // 50 m: at the archers' spacing, three ranks, which the walk
             // holds.
@@ -340,14 +386,17 @@ fn order(
     if groups.list[g].reform {
         crate::formation::assign_slots(units, g as u32, &mut groups.list[g]);
         let gd = &groups.list[g];
-        let off = (0..units.len())
-            .filter(|&i| units.group[i] == g as u32 && units.death_t[i] == 0)
-            .filter(|&i| {
-                let p = goal + units.home[i];
-                terrain.blocked_at(p.x, p.y)
-            })
-            .count();
-        info!("[path-test] {case}: {} men in {} files, {off} places on blocked ground", gd.count, gd.files);
+        let (mut off, mut lo, mut hi) = (0, Vec2::splat(f32::INFINITY), Vec2::splat(f32::NEG_INFINITY));
+        for i in (0..units.len()).filter(|&i| units.group[i] == g as u32 && units.death_t[i] == 0) {
+            let p = goal + units.home[i];
+            off += usize::from(terrain.blocked_at(p.x, p.y));
+            lo = lo.min(p);
+            hi = hi.max(p);
+        }
+        info!(
+            "[path-test] {case}: {} men in {} files, {off} places on blocked ground, places x {:.1} to {:.1}, z {:.1} to {:.1}",
+            gd.count, gd.files, lo.x, hi.x, lo.y, hi.y
+        );
     }
     let start = groups.list[g].centroid;
     test.subjects.push(Subject {
@@ -360,6 +409,7 @@ fn order(
         route_note: String::new(),
         done_s: None,
         peak_stuck: 0,
+        limit: timeout_s(&scene().unwrap_or_default()),
         reported: false,
         settled_at: None,
     });
@@ -385,13 +435,19 @@ fn log_progress(
     if test.stuck_ticks.len() != units.len() {
         test.stuck_ticks = vec![0; units.len()];
     }
+    if test.been_on_walk.len() != units.len() {
+        test.been_on_walk = vec![false; units.len()];
+    }
+    let scene = scene().unwrap_or_default();
+    let walls = scene.starts_with("walls");
+    let walk_lane = walls.then(|| crate::town_layout::walk_lane(terrain.body_radius()));
     // The slot each man is going to: his regiment's ordered point (or the
     // anchor once it arrived) plus his offset.
     let target = |g: usize| match groups.list[g].order {
         Some(Order::Move(p)) => p,
         _ => groups.list[g].anchor,
     };
-    let mut men = vec![(0usize, 0usize, 0usize); groups.list.len()];
+    let mut men = vec![Tally::default(); groups.list.len()];
     for i in 0..units.len() {
         if units.death_t[i] != 0 {
             continue;
@@ -406,11 +462,16 @@ fn log_progress(
             test.stuck_ticks[i] = 0;
         }
         let e = &mut men[g];
-        e.0 += 1;
-        e.1 += (d <= ARRIVED_M) as usize;
-        e.2 += (test.stuck_ticks[i] as f32 >= STUCK_S * 30.0) as usize;
+        e.alive += 1;
+        e.arrived += (d <= ARRIVED_M) as usize;
+        e.stuck += (test.stuck_ticks[i] as f32 >= STUCK_S * 30.0) as usize;
+        if let Some(lane) = &walk_lane {
+            let on = lane.contains(p);
+            test.been_on_walk[i] |= on;
+            e.walk += usize::from(on);
+            e.never += usize::from(!test.been_on_walk[i]);
+        }
     }
-    let scene = scene().unwrap_or_default();
     if scene == "many" {
         // From the tick after the orders, once the route pass has seen them.
         if test.many_routed_tick.is_none() && tick > ORDER_TICK {
@@ -448,8 +509,13 @@ fn log_progress(
                 s.route_len = Some(s.straight);
                 s.route_note = "no route, the straight way is clear".into();
             }
+            if let Some(len) = s.route_len {
+                s.limit = timeout_s(&scene).max(3.0 * len / regiment_pace(&units, s.g).max(0.1));
+            }
         }
-        let (alive, arrived, stuck) = men[s.g];
+        let Tally { alive, arrived, stuck, walk, never } = men[s.g];
+        let g = s.g;
+        let frame = || frame_text(&routes, g);
         s.peak_stuck = s.peak_stuck.max(stuck);
         let share = arrived as f32 / alive.max(1) as f32;
         if s.done_s.is_none() && share >= 0.99 {
@@ -457,21 +523,24 @@ fn log_progress(
         }
         if tick.is_multiple_of(60) && !s.reported {
             info!(
-                "[path-test] {} reg {} t={secs:.0}s: arrived {:.1}% ({arrived}/{alive}), stuck {stuck}, centroid ({:.0}, {:.0}), order {}",
+                "[path-test] {} reg {} t={secs:.0}s: arrived {:.1}% ({arrived}/{alive}), stuck {stuck}, centroid ({:.0}, {:.0}), order {}, {}",
                 s.case,
                 s.g,
                 share * 100.0,
                 gd.centroid.x,
                 gd.centroid.y,
-                if gd.order.is_some() { "on" } else { "done" }
+                if gd.order.is_some() { "on" } else { "done" },
+                frame()
             );
         }
         // On the walled town, where the men are on the way up: on the
         // walk, on a stair (flight or platform), on the ground within
         // 6 m of a stair's foot, and within a metre of their place.
-        if scene.starts_with("walls") && tick.is_multiple_of(300) && !s.reported {
+        if let Some(lane) = &walk_lane
+            && tick.is_multiple_of(300)
+            && !s.reported
+        {
             use crate::town_layout::{STAIRS_X, STAIR_W, WALL_Z};
-            let lane = crate::town_layout::walk_lane(terrain.body_radius());
             let (mut walk, mut stair, mut foot, mut placed) = (0, 0, 0, 0);
             // Where the men on a flight stand across it: their mean offset
             // from the tread's middle toward the wall (m), and the widest.
@@ -496,7 +565,7 @@ fn log_progress(
                 None => 0,
             };
             info!(
-                "[path-test] {} reg {} t={secs:.0}s: on the walk {walk}, on a stair {stair} (toward the wall {:+.2} m mean, {:+.2} m most), at a foot {foot}, in place {placed}, places not yet taken {pending}",
+                "[path-test] {} reg {} t={secs:.0}s: on the walk {walk}, on a stair {stair} (toward the wall {:+.2} m mean, {:+.2} m most), at a foot {foot}, in place {placed}, places not yet taken {pending}, never on the walk {never}",
                 s.case,
                 s.g,
                 if stair > 0 { across / stair as f32 } else { 0.0 },
@@ -505,7 +574,7 @@ fn log_progress(
         }
         // Where the men still out stand, every ten seconds once most are
         // in (on the walled town, from the start).
-        if ((0.9..0.99).contains(&share) || scene.starts_with("walls"))
+        if ((0.9..0.99).contains(&share) || walls)
             && tick.is_multiple_of(300)
             && !s.reported
         {
@@ -544,8 +613,10 @@ fn log_progress(
         if let Some(at) = s.settled_at
             && tick.is_multiple_of(300)
         {
+            let on_wall =
+                if walls { format!(", on the walk {walk}, never on the walk {never}") } else { String::new() };
             info!(
-                "[path-test] {} reg {} t={secs:.0}s: holding at ({:.0}, {:.0}), {:.1} m from where it stood at the verdict, arrived {:.1}%",
+                "[path-test] {} reg {} t={secs:.0}s: holding at ({:.0}, {:.0}), {:.1} m from where it stood at the verdict, arrived {:.1}% ({arrived}/{alive}){on_wall}",
                 s.case,
                 s.g,
                 gd.centroid.x,
@@ -554,7 +625,7 @@ fn log_progress(
                 share * 100.0
             );
         }
-        let timed_out = secs >= TIMEOUT_S.max(3.0 * s.route_len.unwrap_or(0.0) / regiment_pace(&units, s.g).max(0.1));
+        let timed_out = secs >= s.limit;
         if !s.reported && (s.done_s.is_some() || timed_out) {
             s.reported = true;
             s.settled_at = Some(gd.centroid);
@@ -565,10 +636,15 @@ fn log_progress(
             let verdict = match s.done_s {
                 Some(t) if t <= bound => format!("OK in {t:.1} s (bound {bound:.1} s)"),
                 Some(t) => format!("SLOW: {t:.1} s against a bound of {bound:.1} s"),
-                None => format!("FAIL: {:.1}% arrived after {TIMEOUT_S:.0} s", share * 100.0),
+                None => format!("FAIL: {:.1}% arrived after {:.0} s", share * 100.0, s.limit),
+            };
+            let on_wall = if walls {
+                format!("; on the walk {walk}, never on the walk {never}, {}", frame())
+            } else {
+                String::new()
             };
             info!(
-                "[path-test] VERDICT {} reg {}: {verdict}; route {len:.0} m against {:.0} m straight ({}); pace {pace:.2} m/s; most stuck at once {}; ended at ({:.0}, {:.0}), ordered to ({:.0}, {:.0})",
+                "[path-test] VERDICT {} reg {}: {verdict}; route {len:.0} m against {:.0} m straight ({}); pace {pace:.2} m/s; most stuck at once {}; ended at ({:.0}, {:.0}), ordered to ({:.0}, {:.0}){on_wall}",
                 s.case, s.g, s.straight, s.route_note, s.peak_stuck, end.x, end.y, s.goal.x, s.goal.y
             );
         }
@@ -580,6 +656,33 @@ fn log_progress(
     }
     if tick.is_multiple_of(30) {
         frames.window_max = 0.0;
+    }
+}
+
+/// One regiment's men in a tick of `log_progress`: the living, those
+/// within `ARRIVED_M` of their places, those stuck, and on the wall scenes
+/// those on the walk now and those never on it yet.
+#[derive(Clone, Copy, Default)]
+struct Tally {
+    alive: usize,
+    arrived: usize,
+    stuck: usize,
+    walk: usize,
+    never: usize,
+}
+
+/// The seconds a regiment of `scene` has to arrive, unless its route is
+/// so long that three times its length at the men's pace is longer.
+fn timeout_s(scene: &str) -> f32 {
+    if scene == "walls_cross" { CROSS_TIMEOUT_S } else { TIMEOUT_S }
+}
+
+/// Where regiment `g`'s route frame is, for the log: the waypoint it is
+/// heading for out of the route's last, or no route.
+fn frame_text(routes: &crate::sim::route::Routes, g: usize) -> String {
+    match routes.route_of(g) {
+        Some((points, k)) => format!("frame at waypoint {k} of {}", points.len().saturating_sub(1)),
+        None => "no route".into(),
     }
 }
 
@@ -596,11 +699,12 @@ fn regiment_pace(units: &Units, g: usize) -> f32 {
 }
 
 /// What the route does, for the log: on the river map whether it crosses
-/// on the bridge or wades the ford; on the walled town which stairs it
-/// climbs and where it crosses the wall's line.
+/// on the bridge or wades the ford; on the wall scenes which stairs it
+/// climbs, where it crosses the wall's line and whether it goes over the
+/// bridge.
 fn route_note(points: &[Vec2], scene: &str) -> String {
     let n = points.len().saturating_sub(1);
-    if scene == "walls" {
+    if scene.starts_with("walls") {
         use crate::town_layout::{STAIRS_X, WALL_Z};
         let along = |f: &dyn Fn(Vec2) -> bool| {
             points.windows(2).any(|w| (0..=80).any(|k| f(w[0].lerp(w[1], k as f32 / 80.0))))
