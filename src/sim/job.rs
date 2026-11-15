@@ -1831,8 +1831,8 @@ mod tests {
     use crate::formation::{choose_open, facing_of, least_open_growth, FormShape, OPEN_ROOM_MAX};
     use crate::terrain::{build_terrain, MapKind, CELL};
 
-    /// The crossing scene's holder: 200 archers in 50 files by 4 ranks,
-    /// facing out over the parapet, its men about `centroid`.
+    /// 200 archers in 50 files by 4 ranks at the field's pitch, facing
+    /// +z, its men about `centroid`.
     fn holder(anchor: Vec2, centroid: Vec2) -> GroupData {
         let mut gd = GroupData::new(0, crate::unit_types::KIND_ARCHER, anchor, 200);
         gd.shape = FormShape::Rect;
@@ -1846,23 +1846,29 @@ mod tests {
         Groups { list: vec![gd] }
     }
 
-    /// On the wall walk the block's front face is on the parapet and its
-    /// rear face a metre short of the kerb: no layout that grows the
-    /// block fits, wherever its men are.
+    /// On the wall walk the block stands five ranks deep at the lane's
+    /// pitch, its front face on the parapet and its rear face at the
+    /// kerb: no layout that grows the block fits, wherever its men are.
     #[test]
     fn a_holder_on_the_walk_has_no_room_to_open() {
         let terrain = build_terrain(MapKind::WallDebug);
-        let anchor = Vec2::new(20.9, -129.7);
+        let lane = crate::town_layout::walk_lane(terrain.body_radius());
+        let pitch = crate::formation::lane_pitch(crate::formation::FormSpacing::Normal, crate::unit_types::KIND_ARCHER);
+        let anchor = Vec2::new(20.9, lane.across.1 - 2.0 * pitch.y);
         for centroid in [Vec2::new(30.0, -145.0), anchor] {
-            let groups = one(holder(anchor, centroid));
+            let mut gd = holder(anchor, centroid);
+            (gd.files, gd.lane) = (40, true);
+            let groups = one(gd);
             let (front, back) = room_around(&groups, &terrain, 0);
-            assert_eq!((front, back), (0.0, 1.0), "the room with the men about {centroid}");
+            assert!(front == 0.0 && back <= 1.0, "the room with the men about {centroid}: {front} m ahead, {back} m behind");
             let gd = &groups.list[0];
             // Lanes along its facing, and across it for a friend from the
             // side, as the crossing scene's is.
             for across in [false, true] {
-                assert!(least_open_growth(gd, false, across).is_some_and(|d| d > 0.0));
+                assert!(least_open_growth(gd, false, across).is_none(), "lanes across: {across}");
                 assert!(choose_open(gd, false, across, front, back).is_none(), "lanes across: {across}");
+                // Not even into all the room there could be.
+                assert!(choose_open(gd, false, across, OPEN_ROOM_MAX, OPEN_ROOM_MAX).is_none());
             }
         }
     }

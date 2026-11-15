@@ -282,6 +282,11 @@ pub struct GroupData {
     /// The regiment is coming onto a lane and its men take their places
     /// there as they arrive (formation.rs `fill_lane_slots`).
     pub lane_fill: Option<LaneFill>,
+    /// Its block stands, or is ordered to stand, in a lane's rows (the
+    /// wall's walk): in normal order its places are then the lane's pitch
+    /// apart (`formation::pitch_of`). Set by a lane order and kept in
+    /// step with its order and anchor by `formation::fill_lane_slots`.
+    pub lane: bool,
     /// The living men past the waypoint its route's frame waits at, as
     /// (waypoint, men past, living men), counted from the tick's start
     /// positions (frontline.rs). The frame moves on once their share
@@ -370,6 +375,7 @@ impl GroupData {
             lead: 0.0,
             vel: Vec2::ZERO,
             lane_fill: None,
+            lane: false,
             frame_past: None,
         }
     }
@@ -599,6 +605,7 @@ pub fn order_regiments(groups: &mut Groups, selected: &[usize], target: Vec2) {
         group.order = Some(Order::Move(dest));
         group.auto_order = false;
         group.lane_fill = None;
+        group.lane = false;
         // March facing the way we're going: the front rank leads.
         let dir = dest - group.centroid;
         if group.shape == FormShape::Rect && dir.length() > 1.0 {
@@ -610,16 +617,20 @@ pub fn order_regiments(groups: &mut Groups, selected: &[usize], target: Vec2) {
 
 /// A click order on the map: on a lane, the lane's places from the
 /// click on (`lane_layout` with a line of no length); anywhere else
-/// `order_regiments`.
-pub fn click_order(groups: &mut Groups, terrain: &Terrain, selected: &[usize], target: Vec2) {
+/// `order_regiments`. Returns whether any regiment was ordered: a click
+/// on a lane with no room for any of them orders nobody, and is never a
+/// march to the point on the wall itself.
+pub fn click_order(groups: &mut Groups, terrain: &Terrain, selected: &[usize], target: Vec2) -> bool {
     if lane_at(terrain, target).is_some() {
         let layout = line_layout(groups, terrain, selected, target, target, Vec2::ZERO);
-        if !layout.is_empty() {
-            apply_line_order(groups, layout, target, target);
-            return;
+        if layout.is_empty() {
+            return false;
         }
+        apply_line_order(groups, layout, target, target);
+        return true;
     }
     order_regiments(groups, selected, target);
+    true
 }
 
 /// The map's lane an order at `p` is meant for, if any: the stone wall's
@@ -781,12 +792,19 @@ pub fn log_order(t: f32, g: usize, gd: &GroupData, what: &str) {
 }
 
 /// Lay `picked` regiments along a lane from `a` toward `b` (a click is
-/// `a == b`): each block faces out, its ranks are as many as the lane
-/// holds at its spacing, its files run along the lane as far as its
-/// share of the drag or as far as its men need in those ranks, whichever
-/// is more, and its run slides along the lane past the runs the team's
-/// other regiments hold (`free_run`). The regiments keep their order
-/// along the drag, each run after the one before it.
+/// `a == b`): each block faces out, its places are the lane's pitch apart
+/// (`formation::lane_pitch`), its ranks are as many as the lane holds at
+/// that pitch, its files run along the lane as far as its share of the
+/// drag or as far as its men need in those ranks, whichever is more, and
+/// its run slides along the lane past the runs the team's other
+/// regiments hold (`free_run`). The regiments keep their order along the
+/// drag, each run after the one before it.
+///
+/// A regiment gets a placement only where its whole run is on the lane
+/// and clear of every other run: where the drawn width has no such
+/// stretch it takes the least width its ranks allow, and where that has
+/// none either it gets no placement and keeps the order it had. Places
+/// are never laid past the lane's ends or over another regiment's.
 fn lane_layout(groups: &Groups, lane: &Lane, picked: &[usize], a: Vec2, b: Vec2) -> Vec<LinePlacement> {
     let dir = if b.x >= a.x { 1.0 } else { -1.0 };
     let facing = lane.facing();
@@ -801,15 +819,17 @@ fn lane_layout(groups: &Groups, lane: &Lane, picked: &[usize], a: Vec2, b: Vec2)
     let mut placements = Vec::with_capacity(segs.len());
     for (g, _) in segs {
         let gd = &groups.list[g];
-        let pitch = gd.spacing.pitch(gd.kind);
+        let pitch = crate::formation::lane_pitch(gd.chosen_spacing(), gd.kind);
         let share = len * gd.count as f32 / total as f32;
         let ranks_max = (((lane.across.1 - lane.across.0) / pitch.y).floor() as u32 + 1).max(1);
-        let files = ((share / pitch.x).floor() as u32)
-            .max((gd.count as u32).div_ceil(ranks_max))
-            .clamp(1, gd.count as u32);
+        let least = (gd.count as u32).div_ceil(ranks_max).clamp(1, gd.count as u32);
+        let drawn = ((share / pitch.x).floor() as u32).clamp(least, gd.count as u32);
+        let placed = [drawn, least].into_iter().find_map(|files| {
+            let width = (files - 1) as f32 * pitch.x + body;
+            free_run(lane, &taken, cursor, dir, width).map(|run| (files, run))
+        });
+        let Some((files, run)) = placed else { continue };
         let ranks = (gd.count as u32).div_ceil(files);
-        let width = (files - 1) as f32 * pitch.x + body;
-        let run = free_run(lane, &taken, cursor, dir, width);
         let anchor = Vec2::new((run.0 + run.1) * 0.5, lane.across.1 - (ranks - 1) as f32 * 0.5 * pitch.y);
         cursor = if dir > 0.0 { run.1 + LINE_REG_GAP } else { run.0 - LINE_REG_GAP };
         taken.push(run);
@@ -820,7 +840,9 @@ fn lane_layout(groups: &Groups, lane: &Lane, picked: &[usize], a: Vec2, b: Vec2)
 
 /// The stretches of the lane (x ranges) the team's regiments other than
 /// `skip` stand on or are going to: each one whose order's point, or
-/// its anchor without an order, is on the lane.
+/// its anchor without an order, is on the lane; and a regiment of the
+/// lane that was told to attack, for as long as its men are still on it
+/// (archers shooting from the wall keep their places).
 fn lane_runs(groups: &Groups, lane: &Lane, team: u8, skip: &[usize]) -> Vec<(f32, f32)> {
     let body = crate::sim::soldier::body_distance();
     groups
@@ -831,6 +853,7 @@ fn lane_runs(groups: &Groups, lane: &Lane, team: u8, skip: &[usize]) -> Vec<(f32
         .filter_map(|(_, gd)| {
             let at = match gd.order {
                 Some(Order::Move(p)) => p,
+                Some(Order::Attack(_)) if gd.lane && lane.contains(gd.centroid) => gd.anchor,
                 Some(Order::Attack(_)) => return None,
                 None => gd.anchor,
             };
@@ -838,7 +861,8 @@ fn lane_runs(groups: &Groups, lane: &Lane, team: u8, skip: &[usize]) -> Vec<(f32
                 return None;
             }
             let files = if gd.files == 0 { crate::formation::default_files(gd.count) } else { gd.files };
-            let half = (files.min(gd.count as u32) - 1) as f32 * 0.5 * gd.spacing.pitch(gd.kind).x + body * 0.5;
+            let pitch = crate::formation::lane_pitch(gd.chosen_spacing(), gd.kind);
+            let half = (files.min(gd.count as u32) - 1) as f32 * 0.5 * pitch.x + body * 0.5;
             Some((at.x - half, at.x + half))
         })
         .collect()
@@ -847,8 +871,8 @@ fn lane_runs(groups: &Groups, lane: &Lane, team: u8, skip: &[usize]) -> Vec<(f32
 /// The first stretch of `width` on the lane from `start` along `dir`
 /// that is clear of `taken`, slid past each run it meets and kept inside
 /// the lane's ends; failing that, the first one the other way; failing
-/// both, the stretch at `start` itself (the lane is full).
-fn free_run(lane: &Lane, taken: &[(f32, f32)], start: f32, dir: f32, width: f32) -> (f32, f32) {
+/// both, none: the lane has no room for that width.
+fn free_run(lane: &Lane, taken: &[(f32, f32)], start: f32, dir: f32, width: f32) -> Option<(f32, f32)> {
     let fits = |run: (f32, f32)| {
         run.0 >= lane.along.0 - 0.01
             && run.1 <= lane.along.1 + 0.01
@@ -882,9 +906,7 @@ fn free_run(lane: &Lane, taken: &[(f32, f32)], start: f32, dir: f32, width: f32)
         }
         None
     };
-    along(start, dir)
-        .or_else(|| along(start, -dir))
-        .unwrap_or(if dir > 0.0 { (start, start + width) } else { (start - width, start) })
+    along(start, dir).or_else(|| along(start, -dir))
 }
 
 fn apply_line_order(groups: &mut Groups, layout: Vec<LinePlacement>, a: Vec2, b: Vec2) {
@@ -894,6 +916,7 @@ fn apply_line_order(groups: &mut Groups, layout: Vec<LinePlacement>, a: Vec2, b:
     for p in layout {
         let gd = &mut groups.list[p.g];
         line_place(gd, p.anchor, p.facing, p.files);
+        gd.lane = p.lane;
         // Coming onto the lane from off it: the men take their places as
         // they arrive. Already on it, they keep their order as any
         // reform does.
@@ -986,7 +1009,10 @@ fn clamp_layout_to_zone(
 ) {
     for p in layout {
         let he = crate::formation::block_half_extents(&groups.list[p.g], p.files, p.facing);
-        p.anchor = clamp_anchor(p.anchor, he, terrain, nav);
+        let anchor = clamp_anchor(p.anchor, he, terrain, nav);
+        // A lane's block moved off its rows is a block on the ground.
+        p.lane &= anchor == p.anchor;
+        p.anchor = anchor;
     }
 }
 
@@ -1006,6 +1032,7 @@ fn deploy_place_line(
         gd.shape = FormShape::Rect;
         gd.order = None;
         gd.auto_order = false;
+        gd.lane = p.lane;
         crate::formation::snap_to_slots(units, terrain, p.g as u32, gd);
     }
     info!("deployment: placed {n} regiments");
@@ -1034,6 +1061,7 @@ fn deploy_move(
         gd.anchor = clamp_anchor(target + (gd.centroid - centroid), he, terrain, nav);
         gd.order = None;
         gd.auto_order = false;
+        gd.lane = false;
         crate::formation::snap_to_slots(units, terrain, g as u32, gd);
     }
     info!("deployment: moved {} regiments", picked.len());
@@ -1140,9 +1168,23 @@ fn issue_order(
     let Some(start) = drag.start.take() else { return };
     let t = time.elapsed_secs();
 
-    if drag.active && !drag.layout.is_empty() {
+    if drag.active {
         let layout = std::mem::take(&mut drag.layout);
-        if deploy.active {
+        // The regiments of the selection the drag placed nowhere: a lane
+        // with no room for them. They keep the orders they had.
+        let unplaced = selected
+            .iter()
+            .filter(|&&g| {
+                let gd = &groups.list[g];
+                gd.count > 0 && !gd.state.is_broken() && !layout.iter().any(|p| p.g == g)
+            })
+            .count();
+        if unplaced > 0 {
+            info!("no room on the lane: {unplaced} of {} regiments got no order", selected.len());
+        }
+        if layout.is_empty() {
+            // Nobody placed: no order, and never a click's order instead.
+        } else if deploy.active {
             deploy_place_line(&mut groups, &mut units, &terrain, layout);
             cues.write(crate::audio::UiCue::Deploy);
         } else {
@@ -1175,8 +1217,9 @@ fn issue_order(
                 log_order(t, g, gd, &format!("attack g{e}"));
             }
         }
+    } else if !click_order(&mut groups, &terrain, &selected, start) {
+        info!("no room on the lane at ({:.0}, {:.0}): {} regiments got no order", start.x, start.y, selected.len());
     } else {
-        click_order(&mut groups, &terrain, &selected, start);
         cues.write(crate::audio::UiCue::Move);
         info!(
             "{} regiments ({} units) move to ({:.0}, {:.0})",
@@ -1226,7 +1269,11 @@ fn draw_order_preview(
         let gd = &groups.list[p.g];
         let fwd = facing_dir(p.facing);
         let right = Vec2::new(fwd.y, -fwd.x);
-        let pitch = gd.chosen_spacing().pitch(gd.kind);
+        let pitch = if p.lane {
+            crate::formation::lane_pitch(gd.chosen_spacing(), gd.kind)
+        } else {
+            gd.chosen_spacing().pitch(gd.kind)
+        };
         let world = |off: Vec2| p.anchor + right * off.x + fwd * off.y;
 
         if total <= PREVIEW_CIRCLE_CAP {
@@ -1510,5 +1557,130 @@ fn test_orders_script(
             *stage = 4;
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The wall's walk as the game lays it, and a regiment of archers
+    /// behind the wall.
+    fn walk() -> Lane {
+        crate::town_layout::walk_lane(0.5 * crate::sim::soldier::body_distance())
+    }
+
+    fn archers(men: usize, at: Vec2) -> GroupData {
+        let mut gd = GroupData::new(0, crate::unit_types::KIND_ARCHER, at, men);
+        gd.shape = FormShape::Rect;
+        gd.files = crate::formation::default_files(men);
+        gd.centroid = at;
+        gd
+    }
+
+    /// The lane order as the drag gives it: the placements, applied.
+    fn lane_order(groups: &mut Groups, lane: &Lane, g: usize, a: f32, b: f32) -> bool {
+        let z = crate::town_layout::WALL_Z;
+        let layout = lane_layout(groups, lane, &[g], Vec2::new(a, z), Vec2::new(b, z));
+        let placed = !layout.is_empty();
+        apply_line_order(groups, layout, Vec2::new(a, z), Vec2::new(b, z));
+        placed
+    }
+
+    /// A regiment's run on the lane: its outer centres less and plus half
+    /// a body.
+    fn run_of(gd: &GroupData) -> (f32, f32) {
+        let Some(Order::Move(at)) = gd.order else { panic!("no order") };
+        let half = (gd.files - 1) as f32 * 0.5 * crate::formation::pitch_of(gd).x + 0.5 * crate::sim::soldier::body_distance();
+        (at.x - half, at.x + half)
+    }
+
+    #[test]
+    fn a_run_slides_past_a_taken_one_and_stays_on_the_lane() {
+        let lane = walk();
+        assert_eq!(free_run(&lane, &[(0.0, 50.0)], 10.0, 1.0, 30.0), Some((53.0, 83.0)));
+        // No room on that side of the taken run: the other way.
+        let run = free_run(&lane, &[(100.0, 150.0)], 120.0, 1.0, 30.0).expect("room to the west");
+        assert_eq!(run, (67.0, 97.0));
+        // A start past the lane's end comes back inside it.
+        let run = free_run(&lane, &[], 150.0, 1.0, 30.0).expect("an empty lane");
+        assert!((run.1 - lane.along.1).abs() < 1e-4 && (run.1 - run.0 - 30.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn a_lane_with_no_room_gives_no_run() {
+        let lane = walk();
+        // The play of 2026-11-15: one regiment holds from the gate to the
+        // east end, the next is dragged westward from west of the gate
+        // and needs 174.8 m of the 136 m left.
+        assert_eq!(free_run(&lane, &[(-16.4, 158.4)], -39.3, -1.0, 174.8), None);
+        // Wider than the lane itself.
+        assert_eq!(free_run(&lane, &[], 0.0, 1.0, lane.along.1 - lane.along.0 + 1.0), None);
+    }
+
+    /// Three regiments of 500 sent onto the walk one after the other: the
+    /// first two fit, each whole on the lane and clear of the other; the
+    /// third has no room, gets no order and stays what it was.
+    #[test]
+    fn a_regiment_the_lane_has_no_room_for_gets_no_order() {
+        let lane = walk();
+        let behind = Vec2::new(0.0, crate::town_layout::WALL_Z - 50.0);
+        let mut groups = Groups { list: (0..3).map(|_| archers(500, behind)).collect() };
+        assert!(lane_order(&mut groups, &lane, 0, 100.0, 108.0));
+        assert!(lane_order(&mut groups, &lane, 1, -39.3, -77.3));
+        let (a, b) = (run_of(&groups.list[0]), run_of(&groups.list[1]));
+        for run in [a, b] {
+            assert!(run.0 >= lane.along.0 - 0.01 && run.1 <= lane.along.1 + 0.01, "the run {run:?} is on the lane");
+        }
+        assert!(b.1 + LINE_REG_GAP <= a.0 + 0.01, "the runs {b:?} and {a:?} are clear of each other");
+        for g in 0..2 {
+            let gd = &groups.list[g];
+            assert!(gd.lane, "regiment {g} is a lane's");
+            // Five ranks of a hundred at the lane's pitch.
+            assert_eq!((gd.files, crate::formation::grid(gd).1), (100, 5));
+        }
+        assert!(!lane_order(&mut groups, &lane, 2, 0.0, 8.0));
+        let third = &groups.list[2];
+        assert!(third.order.is_none() && !third.lane && third.lane_fill.is_none());
+        // A click does the same, and is no march to the point on the wall.
+        let terrain = crate::terrain::build_terrain(crate::terrain::MapKind::WallDebug);
+        assert!(!click_order(&mut groups, &terrain, &[2], Vec2::new(0.0, crate::town_layout::WALL_Z)));
+        assert!(groups.list[2].order.is_none());
+    }
+
+    /// A drag wider than the room left takes the least width the lane's
+    /// ranks allow instead of no place at all.
+    #[test]
+    fn a_drag_too_wide_for_the_room_takes_the_least_width() {
+        let lane = walk();
+        let behind = Vec2::new(0.0, crate::town_layout::WALL_Z - 50.0);
+        let mut groups = Groups { list: (0..2).map(|_| archers(200, behind)).collect() };
+        // The first takes all but 60 m at the west end, in one rank or two.
+        assert!(lane_order(&mut groups, &lane, 0, lane.along.0 + 60.0, lane.along.1));
+        // The second is dragged 100 m into the 57 m left: 40 files by 5.
+        assert!(lane_order(&mut groups, &lane, 1, lane.along.0, lane.along.0 + 100.0));
+        let gd = &groups.list[1];
+        assert_eq!(gd.files, 40);
+        let (a, b) = (run_of(&groups.list[0]), run_of(gd));
+        assert!(b.0 >= lane.along.0 - 0.01 && b.1 + LINE_REG_GAP <= a.0 + 0.01, "the runs {b:?} and {a:?}");
+    }
+
+    /// Bowmen told to shoot from the walk keep their run: nobody else is
+    /// placed on it while they still stand there.
+    #[test]
+    fn a_regiment_shooting_from_the_lane_keeps_its_run() {
+        let lane = walk();
+        let behind = Vec2::new(0.0, crate::town_layout::WALL_Z - 50.0);
+        let mut groups = Groups { list: (0..2).map(|_| archers(200, behind)).collect() };
+        assert!(lane_order(&mut groups, &lane, 0, 0.0, 8.0));
+        let held = run_of(&groups.list[0]);
+        let gd = &mut groups.list[0];
+        let Some(Order::Move(at)) = gd.order else { panic!("no order") };
+        (gd.anchor, gd.centroid) = (at, at);
+        gd.order = Some(Order::Attack(1));
+        assert_eq!(lane_runs(&groups, &lane, 0, &[1]), vec![held]);
+        // Once its men have left the walk the run is free.
+        groups.list[0].centroid = behind;
+        assert!(lane_runs(&groups, &lane, 0, &[1]).is_empty());
     }
 }

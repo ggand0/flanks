@@ -399,8 +399,7 @@ fn give_orders(
             }
         }
         "walls_archers" => {
-            // 50 m: at the archers' spacing, three ranks, which the walk
-            // holds.
+            // 50 m: two ranks at the walk's pitch.
             let c = spots::WALK_EAST - Vec2::new(80.0, 0.0);
             crate::orders::line_order(&mut groups, &terrain, &[0], c - Vec2::new(25.0, 0.0), c + Vec2::new(25.0, 0.0));
             order(&mut groups, &mut units, &terrain, &mut test, pipeline.tick, 0, "walls-archers", None);
