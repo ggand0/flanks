@@ -301,6 +301,16 @@ pub(crate) fn shadow_level(cfg: &LodConfig, kind: usize, texel: f32) -> usize {
         .unwrap_or(0)
 }
 
+/// `FL_FALLEN_FAR=1`: a body whose level by the plain thresholds is 2 (137 m
+/// and farther at 1360 rows, 5 to 21 px) draws at level 3. A look change,
+/// off by default: late in a battle the fallen are the largest share of
+/// what is drawn. Bodies at levels 0 and 1 and every shadow are as without
+/// it. Read once.
+pub(crate) fn fallen_far() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::util::env_or("FL_FALLEN_FAR", 0_u32) != 0)
+}
+
 /// Per-kind corpse cap (ring-buffered: oldest bodies fade from the field).
 pub const CORPSE_CAP: usize = 25_000;
 
