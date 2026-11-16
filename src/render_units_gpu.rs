@@ -1143,6 +1143,8 @@ pub struct PullMesh {
     /// The level carries joints and weights (unit_glb.rs `ATTRIBUTE_SKIN`),
     /// so its draw shader compiles the skinning instead of the part chain.
     skinned: bool,
+    /// The light last level (`from_mesh`).
+    light: bool,
 }
 
 /// A level drawn indexed: its vertices, and its index list repeated for
@@ -1265,7 +1267,10 @@ fn welded_levels() -> bool {
 /// the light of that vertex alone (`@interpolate(flat, first)`), and the
 /// normal leaves the weld: every vertex then starts one triangle. The other
 /// corners keep a normal of one of the triangles they sit on, which only
-/// offsets where the sun's shadow is sampled.
+/// offsets where the sun's shadow is sampled. The vertex colour leaves the
+/// weld too and rides on the provoking vertex, the corner of the triangle
+/// it stands for, since the lit colour is taken from that vertex alone: a
+/// corner of the light last level touches faces of three colours.
 fn weld(corners: &[PullVertex], flat_light: bool) -> IndexedMesh {
     let flat_atlas = corners
         .chunks(3)
@@ -1283,7 +1288,7 @@ fn weld(corners: &[PullVertex], flat_light: bool) -> IndexedMesh {
             n(v.normal[1]),
             n(v.normal[2]),
             f(v.pivot),
-            v.color,
+            if flat_light { 0 } else { v.color },
             if flat_atlas { 0 } else { v.atlas_uv },
             v.skin,
             f(v.weight),
@@ -1307,23 +1312,24 @@ fn weld(corners: &[PullVertex], flat_light: bool) -> IndexedMesh {
         for t in order {
             let tri = [list[3 * t], list[3 * t + 1], list[3 * t + 2]];
             let atlas = corners[3 * t].atlas_uv;
-            let first = match (0..3).find(|&k| !provokes[tri[k] as usize]) {
+            let (first, k) = match (0..3).find(|&k| !provokes[tri[k] as usize]) {
                 Some(k) => {
                     one.extend([tri[k], tri[(k + 1) % 3], tri[(k + 2) % 3]]);
-                    tri[k]
+                    (tri[k], k)
                 }
                 None => {
                     vertices.push(vertices[tri[0] as usize]);
                     provokes.push(false);
                     let dup = vertices.len() as u32 - 1;
                     one.extend([dup, tri[1], tri[2]]);
-                    dup
+                    (dup, 0)
                 }
             };
             provokes[first as usize] = true;
             vertices[first as usize].atlas_uv = atlas;
             if flat_light {
                 vertices[first as usize].normal = light_normal(&corners[3 * t..3 * t + 3]);
+                vertices[first as usize].color = corners[3 * t + k].color;
             }
         }
     } else {
@@ -1477,37 +1483,17 @@ fn pack_unorm16(v: [f32; 2]) -> u32 {
 }
 
 impl PullMesh {
-    pub fn from_mesh(mesh: &Mesh, bucket: usize) -> Option<Self> {
+    /// `cast_source`: the mesh the level's shadow casters draw instead of
+    /// `mesh`. `light`: the level is the light last level (unit_glb.rs
+    /// `light_last_level`), which takes its colour from the vertex colour
+    /// word as that level packs it.
+    pub fn from_mesh(mesh: &Mesh, bucket: usize, cast_source: Option<&Mesh>, light: bool) -> Option<Self> {
         use bevy::mesh::VertexAttributeValues as V;
-        let Some(V::Float32x3(pos)) = mesh.attribute(Mesh::ATTRIBUTE_POSITION) else {
-            return None;
-        };
-        let Some(V::Float32x3(nrm)) = mesh.attribute(Mesh::ATTRIBUTE_NORMAL) else {
-            return None;
-        };
-        let Some(V::Float32x2(uv)) = mesh.attribute(Mesh::ATTRIBUTE_UV_0) else {
-            return None;
-        };
-        let Some(V::Float32x4(col)) = mesh.attribute(Mesh::ATTRIBUTE_COLOR) else {
-            return None;
-        };
+        let (records, skinned) = pull_vertices(mesh)?;
         let Some(V::Float32x2(atlas_uv)) = mesh.attribute(Mesh::ATTRIBUTE_UV_1) else {
             return None;
         };
-        let skin = match mesh.attribute(crate::unit_glb::ATTRIBUTE_SKIN) {
-            Some(V::Float32x2(skin)) => Some(skin),
-            _ => None,
-        };
-        let vertex = |i: usize| PullVertex {
-            position: pos[i],
-            part: uv[i][0],
-            normal: nrm[i],
-            pivot: uv[i][1],
-            color: pack_unorm8(col[i]),
-            atlas_uv: pack_unorm16(atlas_uv[i]),
-            skin: skin.map_or(0, |s| s[i][0] as u32),
-            weight: skin.map_or(0.0, |s| s[i][1]),
-        };
+        let vertex = |i: usize| records[i];
         let indices = mesh.indices()?;
         let mut corners: Vec<PullVertex> = indices.iter().map(vertex).collect();
         // Under FL_ATLAS_POINT a level that interpolates its atlas then
@@ -1526,23 +1512,28 @@ impl PullMesh {
         let indexed = if welded_levels() {
             let m = weld(&corners, flat_light_levels()[bucket % NUM_LODS]);
             info!(
-                "unit bucket {bucket}: {} triangles on {} welded vertices, {} soldiers per instance{}{}",
+                "unit bucket {bucket}: {} triangles on {} welded vertices, {} soldiers per instance{}{}{}",
                 corners.len() / 3,
                 m.vertices.len(),
                 m.group,
                 if m.flat_atlas { ", atlas point per triangle" } else { "" },
-                if m.flat_light { ", light per triangle" } else { "" }
+                if m.flat_light { ", light per triangle" } else { "" },
+                if light { ", the light last level" } else { "" }
             );
             Some(m)
         } else {
-            (corners.len() as f32 >= INDEXED_REUSE * pos.len() as f32).then(|| {
+            (corners.len() as f32 >= INDEXED_REUSE * records.len() as f32).then(|| {
                 let list: Vec<u32> = indices.iter().map(|i| i as u32).collect();
-                let one = tipsify(&list, pos.len(), VERTEX_CACHE);
-                IndexedMesh::grouped((0..pos.len()).map(vertex).collect(), &one, 1, false)
+                let one = tipsify(&list, records.len(), VERTEX_CACHE);
+                IndexedMesh::grouped(records.clone(), &one, 1, false)
             })
         };
+        let cast_corners = cast_source.and_then(|m| {
+            let (records, _) = pull_vertices(m)?;
+            Some(m.indices()?.iter().map(|i| records[i]).collect::<Vec<_>>())
+        });
         let cast = (welded_levels() && cast_meshes()).then(|| {
-            let m = weld_cast(&corners);
+            let m = weld_cast(cast_corners.as_deref().unwrap_or(&corners));
             info!(
                 "unit bucket {bucket}: its shadow casters on {} vertices, {} soldiers per instance",
                 m.vertices.len(),
@@ -1555,9 +1546,49 @@ impl PullMesh {
             indexed,
             cast,
             bucket,
-            skinned: skin.is_some(),
+            skinned,
+            light,
         })
     }
+}
+
+/// A mesh's vertices as the pulled draw reads them, and whether it carries
+/// a skin. Any `Mesh` with position, normal, the part/pivot UV, vertex
+/// colour and the atlas UV qualifies.
+fn pull_vertices(mesh: &Mesh) -> Option<(Vec<PullVertex>, bool)> {
+    use bevy::mesh::VertexAttributeValues as V;
+    let Some(V::Float32x3(pos)) = mesh.attribute(Mesh::ATTRIBUTE_POSITION) else {
+        return None;
+    };
+    let Some(V::Float32x3(nrm)) = mesh.attribute(Mesh::ATTRIBUTE_NORMAL) else {
+        return None;
+    };
+    let Some(V::Float32x2(uv)) = mesh.attribute(Mesh::ATTRIBUTE_UV_0) else {
+        return None;
+    };
+    let Some(V::Float32x4(col)) = mesh.attribute(Mesh::ATTRIBUTE_COLOR) else {
+        return None;
+    };
+    let Some(V::Float32x2(atlas_uv)) = mesh.attribute(Mesh::ATTRIBUTE_UV_1) else {
+        return None;
+    };
+    let skin = match mesh.attribute(crate::unit_glb::ATTRIBUTE_SKIN) {
+        Some(V::Float32x2(skin)) => Some(skin),
+        _ => None,
+    };
+    let records = (0..pos.len())
+        .map(|i| PullVertex {
+            position: pos[i],
+            part: uv[i][0],
+            normal: nrm[i],
+            pivot: uv[i][1],
+            color: pack_unorm8(col[i]),
+            atlas_uv: pack_unorm16(atlas_uv[i]),
+            skin: skin.map_or(0, |s| s[i][0] as u32),
+            weight: skin.map_or(0.0, |s| s[i][1]),
+        })
+        .collect();
+    Some((records, skin.is_some()))
 }
 
 /// Render-world side of `PullMesh`: the corners in a storage buffer.
@@ -1592,6 +1623,8 @@ pub struct DrawShape {
     pub flat_atlas: bool,
     /// Each triangle takes the light of its first vertex (`weld`).
     pub flat_light: bool,
+    /// The light last level's colour (`PullMesh::light`).
+    pub light_level: bool,
 }
 
 /// Uploads each pulled bucket's mesh once. The render entity persists,
@@ -1627,11 +1660,12 @@ fn extract_pull_meshes(
                 verts: m.vertices.len() as u32,
                 flat_atlas: m.flat_atlas,
                 flat_light: m.flat_light,
+                light_level: false,
             })
         };
         let indexed = mesh.indexed.as_ref().map(upload);
         let cast = mesh.cast.as_ref().map(upload);
-        let shape = shape_of(mesh.indexed.as_ref());
+        let shape = DrawShape { light_level: mesh.light, ..shape_of(mesh.indexed.as_ref()) };
         let cast_shape = shape_of(mesh.cast.as_ref().or(mesh.indexed.as_ref()));
         commands.entity(e).insert(PullMeshGpu {
             vertices: render_device.create_buffer_with_data(&BufferInitDescriptor {
@@ -2598,8 +2632,14 @@ impl Plugin for GpuUnitRenderPlugin {
 }
 
 /// Which bucket entity draws pulled: every unit bucket in GPU mode.
-pub fn pull_mesh_for(mesh: &Mesh, bucket: &InstanceBucket, cfg: &GpuSyncConfig) -> Option<PullMesh> {
-    cfg.enabled.then(|| PullMesh::from_mesh(mesh, bucket.0)).flatten()
+pub fn pull_mesh_for(
+    mesh: &Mesh,
+    bucket: &InstanceBucket,
+    cfg: &GpuSyncConfig,
+    cast_source: Option<&Mesh>,
+    light: bool,
+) -> Option<PullMesh> {
+    cfg.enabled.then(|| PullMesh::from_mesh(mesh, bucket.0, cast_source, light)).flatten()
 }
 
 #[cfg(test)]

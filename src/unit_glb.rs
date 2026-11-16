@@ -150,6 +150,11 @@ pub struct KindMeshes {
     pub textured: [bool; NUM_LODS],
     pub rig: Rig,
     pub clips: Vec<[f32; 4]>,
+    /// The last level is the light one (`light_last_level`), and
+    /// `cast_last` is the file's own last level, which its shadow casters
+    /// keep.
+    pub light_last: bool,
+    pub cast_last: Option<Mesh>,
 }
 
 impl KindMeshes {
@@ -160,6 +165,8 @@ impl KindMeshes {
             textured: [false; NUM_LODS],
             rig: crate::unit_meshes::code_rig(kind),
             clips: Vec::new(),
+            light_last: false,
+            cast_last: None,
         }
     }
 }
@@ -452,7 +459,7 @@ fn import(kind: usize, path: &Path) -> Fallible<KindMeshes> {
     // does. That level is cloned because the array below empties `levels`
     // as it builds.
     let mut source = levels.iter().flatten().next().cloned().expect("checked above");
-    let textured: [bool; NUM_LODS] =
+    let mut textured: [bool; NUM_LODS] =
         std::array::from_fn(|l| atlas.is_some() && levels[l].is_some());
     let atlas = atlas.map(|(_, image)| image);
     if let Some(image) = &atlas {
@@ -466,6 +473,16 @@ fn import(kind: usize, path: &Path) -> Fallible<KindMeshes> {
         let size = image.texture_descriptor.size;
         let mips = image.texture_descriptor.mip_level_count;
         info!("{name}: atlas {}x{} with {mips} mip levels", size.width, size.height);
+    }
+    // FL_L3_LIGHT=1: the file's last level is drawn as two boxes coloured
+    // from it, and keeps only its shadow casters.
+    let last = NUM_LODS - 1;
+    let mut cast_last = None;
+    let light_last = l3_light() && levels[last].is_some();
+    if light_last && let Some(file) = levels[last].take() {
+        levels[last] = Some(light_last_level(&file, atlas.as_ref(), NECK_SHARE[kind], half_height, name));
+        cast_last = Some(level_mesh(&file));
+        textured[last] = false;
     }
     let weights = visible_weights(&source);
     let code_far = std::env::var("FL_GLB_FAR").is_ok_and(|v| v == "code");
@@ -483,7 +500,204 @@ fn import(kind: usize, path: &Path) -> Fallible<KindMeshes> {
         textured,
         rig,
         clips,
+        light_last,
+        cast_last,
     })
+}
+
+/// `FL_L3_LIGHT=1`: every imported kind draws its last level from two boxes
+/// (`light_last_level`). Read once, at import.
+pub fn l3_light() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::util::env_or("FL_L3_LIGHT", 0_u32) != 0)
+}
+
+/// Where the light last level splits head from body, as a share of the
+/// soldier's height from the feet: the top of the shoulders in the files'
+/// last levels (knight, man-at-arms, spearman 1.49 of 1.80 m, archer 1.46).
+const NECK_SHARE: [f32; NUM_KINDS] = [0.83, 0.83, 0.83, 0.81];
+
+/// The last level as 20 triangles: a head box and a body box, each without
+/// its bottom face, built from the file's last level `file` at rest in
+/// engine local space (feet at `-half_height`).
+///
+/// The boxes stand on the soldier's axis. Below `neck_share` of his height
+/// is the body box, from the feet, where its rectangle is the extent of
+/// the file's vertices in the lowest tenth of his height, to the neck,
+/// where it is their extent in the tenth below the neck: a tapered box. The
+/// head box spans the vertices above the neck. Only the trunk's vertices
+/// count (`is_trunk`), up to the top of the head, and each extent is the
+/// smaller of the two sides of the axis, so an arm, a weapon or a bow held
+/// out to one side does not widen the box: the archer's bow is not drawn at
+/// this level.
+///
+/// Each face takes the area-weighted mean of the colour the file's
+/// triangles show where they face the same way: a triangle goes to the box
+/// its centroid's height is in and to that box's face whose normal is
+/// nearest its own. With an atlas, the colour is the atlas sample at the
+/// triangle's atlas point, rgb averaged in linear light and the team tint
+/// mask as it is. The vertex colour holds the square root of the linear rgb
+/// and the mask (unit_instancing.wgsl `UNIT_LIGHT_LEVEL`). Every corner is
+/// on the body, part 0, with the pivot and skin of a body corner of the
+/// file, so the level draws as the body alone.
+fn light_last_level(file: &Level, atlas: Option<&Image>, neck_share: f32, half_height: f32, name: &str) -> Level {
+    let height = 2.0 * half_height;
+    let feet = -half_height;
+    let neck = feet + neck_share * height;
+    let trunk: Vec<Vec3> = file
+        .pos
+        .iter()
+        .zip(&file.part)
+        .filter(|(p, part)| is_trunk(**part) && p.y <= half_height + 0.01 * height)
+        .map(|(p, _)| *p)
+        .collect();
+    // Half the extent across and front to back, the smaller side of the
+    // axis, of the trunk vertices between two heights.
+    let extent = |lo: f32, hi: f32| -> Vec2 {
+        let (mut min, mut max) = (Vec2::splat(f32::MAX), Vec2::splat(f32::MIN));
+        for p in trunk.iter().filter(|p| p.y >= lo && p.y <= hi) {
+            min = min.min(Vec2::new(p.x, p.z));
+            max = max.max(Vec2::new(p.x, p.z));
+        }
+        if min.x > max.x {
+            return Vec2::splat(0.05 * height);
+        }
+        (-min).min(max).max(Vec2::splat(0.01 * height))
+    };
+    let above = neck + 0.003 * height;
+    let top = trunk.iter().filter(|p| p.y > above).fold(neck + 0.05 * height, |t, p| t.max(p.y));
+    let foot = extent(feet, feet + 0.1 * height);
+    let shoulder = extent(neck - 0.1 * height, above);
+    let head = extent(above, f32::MAX);
+    info!(
+        "{name}: light last level (engine units): body from the feet to {:.2}, {:.2} x {:.2} at the feet to {:.2} x {:.2} \
+         at the shoulders; head to {:.2}, {:.2} x {:.2}",
+        neck - feet,
+        2.0 * foot.x,
+        2.0 * foot.y,
+        2.0 * shoulder.x,
+        2.0 * shoulder.y,
+        top - feet,
+        2.0 * head.x,
+        2.0 * head.y,
+    );
+    // Per box: the bottom height and half extents, the top height and half
+    // extents. Faces: top, +x, -x, +z, -z, each four corners turned
+    // outward.
+    let boxes = [((feet, foot), (neck, shoulder)), ((neck, head), (top, head))];
+    let mut faces: Vec<([Vec3; 4], Vec3)> = Vec::new();
+    for &((y0, e0), (y1, e1)) in &boxes {
+        let b = |sx: f32, sz: f32| Vec3::new(sx * e0.x, y0, sz * e0.y);
+        let t = |sx: f32, sz: f32| Vec3::new(sx * e1.x, y1, sz * e1.y);
+        let centre = Vec3::new(0.0, (y0 + y1) / 2.0, 0.0);
+        for quad in [
+            [t(-1.0, -1.0), t(1.0, -1.0), t(1.0, 1.0), t(-1.0, 1.0)],
+            [b(1.0, -1.0), b(1.0, 1.0), t(1.0, 1.0), t(1.0, -1.0)],
+            [b(-1.0, 1.0), b(-1.0, -1.0), t(-1.0, -1.0), t(-1.0, 1.0)],
+            [b(1.0, 1.0), b(-1.0, 1.0), t(-1.0, 1.0), t(1.0, 1.0)],
+            [b(-1.0, -1.0), b(1.0, -1.0), t(1.0, -1.0), t(-1.0, -1.0)],
+        ] {
+            let mut quad = quad;
+            let mid = (quad[0] + quad[1] + quad[2] + quad[3]) / 4.0;
+            if (quad[1] - quad[0]).cross(quad[2] - quad[0]).dot(mid - centre) < 0.0 {
+                quad.reverse();
+            }
+            let n = (quad[1] - quad[0]).cross(quad[2] - quad[0]).normalize_or(Vec3::Y);
+            faces.push((quad, n));
+        }
+    }
+    // Area-weighted colour per face (linear rgb, mask), from the file's
+    // triangles.
+    let lut = srgb_to_linear_lut();
+    let texel = |uv: Vec2| -> Option<[f32; 4]> {
+        let image = atlas?;
+        let size = image.texture_descriptor.size;
+        let (w, h) = (size.width as usize, size.height as usize);
+        let px = image.data.as_deref().filter(|d| d.len() >= w * h * 4)?;
+        // One bilinear sample of the finest mip, as the GPU filters it.
+        let x = uv.x * w as f32 - 0.5;
+        let y = uv.y * h as f32 - 0.5;
+        let (x0, y0) = (x.floor(), y.floor());
+        let (fx, fy) = (x - x0, y - y0);
+        let at = |i: f32, n: usize| (i as i64).clamp(0, n as i64 - 1) as usize;
+        let mut out = [0.0f32; 4];
+        for (dx, dy, wt) in [
+            (0.0, 0.0, (1.0 - fx) * (1.0 - fy)),
+            (1.0, 0.0, fx * (1.0 - fy)),
+            (0.0, 1.0, (1.0 - fx) * fy),
+            (1.0, 1.0, fx * fy),
+        ] {
+            let p = &px[(at(y0 + dy, h) * w + at(x0 + dx, w)) * 4..][..4];
+            for c in 0..3 {
+                out[c] += wt * lut[p[c] as usize];
+            }
+            out[3] += wt * p[3] as f32 / 255.0;
+        }
+        Some(out)
+    };
+    let mut sums = vec![[0.0f32; 5]; faces.len()];
+    for tri in file.idx.chunks_exact(3) {
+        let [a, b, c] = [0, 1, 2].map(|k| file.pos[tri[k] as usize]);
+        let cross = (b - a).cross(c - a);
+        let area = cross.length() / 2.0;
+        if area <= 0.0 {
+            continue;
+        }
+        let normal = cross / (2.0 * area);
+        let box_first = if (a.y + b.y + c.y) / 3.0 > neck { 5 } else { 0 };
+        let face = (box_first..box_first + 5)
+            .max_by(|&i, &j| faces[i].1.dot(normal).total_cmp(&faces[j].1.dot(normal)))
+            .expect("five faces");
+        let uv = tri.iter().map(|&i| Vec2::from(file.tex[i as usize])).sum::<Vec2>() / 3.0;
+        let colour = texel(uv).unwrap_or_else(|| {
+            let mut c = [0.0f32; 4];
+            for &i in tri {
+                for (k, v) in file.col[i as usize].iter().enumerate() {
+                    c[k] += v / 3.0;
+                }
+            }
+            c
+        });
+        let s = &mut sums[face];
+        for k in 0..4 {
+            s[k] += area * colour[k];
+        }
+        s[4] += area;
+    }
+    // A face no triangle faced takes its box's mean, then the whole mean.
+    let mean = |range: std::ops::Range<usize>| -> [f32; 5] {
+        let mut m = [0.0f32; 5];
+        for s in &sums[range] {
+            for k in 0..5 {
+                m[k] += s[k];
+            }
+        }
+        m
+    };
+    let whole = mean(0..faces.len());
+    let mut level = Level::default();
+    let body = file.part.iter().position(|p| p.round() == 0.0).unwrap_or(0);
+    let pivot = file.pivot.get(body).copied().unwrap_or(0.0);
+    for (i, (quad, n)) in faces.iter().enumerate() {
+        let own = sums[i];
+        let boxed = mean(i / 5 * 5..i / 5 * 5 + 5);
+        let s = [own, boxed, whole].into_iter().find(|s| s[4] > 0.0).unwrap_or([1.0, 1.0, 1.0, 0.0, 1.0]);
+        let col = [(s[0] / s[4]).sqrt(), (s[1] / s[4]).sqrt(), (s[2] / s[4]).sqrt(), s[3] / s[4]];
+        let first = level.pos.len() as u32;
+        for p in quad {
+            level.pos.push(*p);
+            level.nrm.push(*n);
+            level.part.push(0.0);
+            level.pivot.push(pivot);
+            level.col.push(col);
+            level.tex.push([0.0, 0.0]);
+            if let Some(skin) = file.skin.get(body) {
+                level.skin.push(*skin);
+            }
+        }
+        level.idx.extend([first, first + 1, first + 2, first, first + 2, first + 3]);
+    }
+    level
 }
 
 fn finest_local(levels: &[Option<Level>; NUM_LODS]) -> &Level {

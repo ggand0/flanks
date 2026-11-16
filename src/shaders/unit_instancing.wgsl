@@ -225,10 +225,19 @@ fn vertex_pull(@builtin(vertex_index) index: u32, @builtin(instance_index) insta
         rgb = rgb * 0.4 + tint * 0.6;
     }
 #endif
+#ifdef UNIT_LIGHT_LEVEL
+    // The light last level (unit_glb.rs `light_last_level`): rgb holds the
+    // square root of the linear colour, a the team tint mask, which tints
+    // as the atlas mask does.
+    let face = unpack4x8unorm(v.color);
+    let v_color = vec4<f32>(face.rgb * face.rgb * mix(vec3<f32>(1.0), rgb, face.a), 0.0);
+#else
+    let v_color = unpack4x8unorm(v.color);
+#endif
     var out = unit_output(
         placed.position,
         placed.normal,
-        unpack4x8unorm(v.color),
+        v_color,
         rgb,
         pose_at(P_DEATH).w,
         team.w,
