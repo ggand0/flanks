@@ -67,12 +67,13 @@ fn spawn_camera(mut commands: Commands) {
     if crate::render_units_occlusion::mode() != crate::render_units_occlusion::OccludeMode::Off {
         depth_usage |= bevy::render::render_resource::TextureUsages::TEXTURE_BINDING;
     }
-    commands.spawn((
+    let aa = post_aa();
+    let mut camera = commands.spawn((
         Camera3d {
             depth_texture_usages: depth_usage.into(),
             ..default()
         },
-        msaa(),
+        msaa(aa),
         // Required: the unit renderer issues direct (non-indirect) draws.
         NoIndirectDrawing,
         RtsCamera {
@@ -89,12 +90,41 @@ fn spawn_camera(mut commands: Commands) {
             target_distance: crate::util::env_or("FL_CAM_DIST", 280.0),
         },
     ));
+    match aa {
+        PostAa::None => {}
+        PostAa::Fxaa => {
+            camera.insert(bevy::anti_alias::fxaa::Fxaa::default());
+        }
+        PostAa::Smaa => {
+            camera.insert(bevy::anti_alias::smaa::Smaa::default());
+        }
+    }
+}
+
+/// An anti-aliasing pass over the finished image, after tonemapping.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PostAa {
+    None,
+    Fxaa,
+    Smaa,
+}
+
+/// `FL_AA=fxaa` or `FL_AA=smaa`: Bevy's FXAA or SMAA over the 3D view.
+/// Unset or any other value, none.
+fn post_aa() -> PostAa {
+    match std::env::var("FL_AA").as_deref() {
+        Ok("fxaa") => PostAa::Fxaa,
+        Ok("smaa") => PostAa::Smaa,
+        _ => PostAa::None,
+    }
 }
 
 /// Samples per pixel of the 3D view: Bevy's default 4, or `FL_MSAA=1`
-/// (off), 2 or 8 for A/B runs.
-fn msaa() -> Msaa {
-    match crate::util::env_or("FL_MSAA", 4_u32) {
+/// (off), 2 or 8 for A/B runs. With a pass over the finished image
+/// (`post_aa`) and `FL_MSAA` unset, 1.
+fn msaa(aa: PostAa) -> Msaa {
+    let default = if aa == PostAa::None { 4_u32 } else { 1 };
+    match crate::util::env_or("FL_MSAA", default) {
         1 => Msaa::Off,
         2 => Msaa::Sample2,
         8 => Msaa::Sample8,
