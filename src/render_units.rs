@@ -537,7 +537,7 @@ fn setup_unit_mesh(
     // NotShadowCaster: Bevy's own shadow queue would find no material on
     // these entities. They cast through render_units_shadow.rs instead.
     for kind in 0..crate::unit_types::NUM_KINDS {
-        let model = crate::unit_glb::kind_lods(kind);
+        let model = crate::unit_glb::kind_lods(kind, gpu.enabled);
         let lods = model.lods;
         let mut rig = model.rig;
         // The gait pose is built on the leg this mesh has, or about half
