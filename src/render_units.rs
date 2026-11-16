@@ -312,14 +312,14 @@ pub(crate) fn fallen_far() -> bool {
     *ON.get_or_init(|| crate::util::env_or("FL_FALLEN_FAR", 0_u32) != 0)
 }
 
-/// `FL_FALLEN_COARSE`: 1 draws a body whose plain level is 1 or 2 one
-/// level coarser and a level-0 body at his own level, since near the
+/// `FL_FALLEN_COARSE`: 1 draws a body whose distance gives him level 1 or
+/// 2 one level coarser and a level-0 body at his own level, since near the
 /// camera the coarser body is plainly cruder; 2 draws every body one level
 /// coarser, the last level at most, for measuring; 0, the default, none
 /// (`FL_PERF` can set it, util.rs `perf_or`).
-/// A look change. A body casts by his plain level, and a casting body is
-/// posed for it. With `FL_FALLEN_FAR` on too, a level-2 body draws at
-/// level 3 as with this alone. Read once.
+/// A look change. A body casts by the level his distance gives him, and a
+/// casting body is posed for it. With `FL_FALLEN_FAR` on too, a level-2
+/// body draws at level 3 as with this alone. Read once.
 pub(crate) fn fallen_coarse() -> u32 {
     static MODE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| crate::util::perf_or("FL_FALLEN_COARSE", 0_u32).min(2))

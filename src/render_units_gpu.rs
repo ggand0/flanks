@@ -1159,8 +1159,8 @@ struct IndexedMesh {
     /// The atlas coordinate rides on each triangle's first vertex and is not
     /// interpolated (`weld`).
     flat_atlas: bool,
-    /// Each triangle's first vertex carries its normal, and the triangle
-    /// takes the light of that vertex alone (`weld`).
+    /// Each triangle's first vertex carries its three corner normals, and
+    /// the triangle takes the mean of their lights at that vertex (`weld`).
     flat_light: bool,
 }
 

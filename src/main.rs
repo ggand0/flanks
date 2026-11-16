@@ -234,7 +234,7 @@ fn log_task_pools() {
     );
 }
 
-/// The sun's turn: it shines along its -Z, so toward the sun is its +Z.
+/// The sun's rotation: it shines along its -Z, so toward the sun is its +Z.
 pub(crate) fn sun_rotation() -> Quat {
     Quat::from_euler(EulerRot::YXZ, 0.7, -0.75, 0.0)
 }
