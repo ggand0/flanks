@@ -291,8 +291,9 @@ pub struct BuildParams {
     bound_down_fall: Vec4,
     /// `FL_LOD_HIDDEN` (render_units_occlusion.rs): x the mode, y the hold,
     /// w the frames since the last frame the test read a pyramid (the step
-    /// of each man's count). z bit 0 under `FL_FALLEN_FAR`, bit 1 under
-    /// `FL_FALLEN_COARSE` (render_units.rs `fallen_far`, `fallen_coarse`).
+    /// of each man's count). z bit 0 under `FL_FALLEN_FAR`, bits 1 and 2 the
+    /// `FL_FALLEN_COARSE` mode (render_units.rs `fallen_far`,
+    /// `fallen_coarse`).
     lod_hidden: UVec4,
     /// The body box: x its half-width, y its top above his feet, z its
     /// bottom above his feet, in metres.
@@ -777,7 +778,7 @@ fn build_frame_params(
     }
     occlusion_params(&mut p, rts.single().ok(), &mut last_rts, terrain.is_changed());
     p.lod_hidden.z =
-        crate::render_units::fallen_far() as u32 | ((crate::render_units::fallen_coarse() as u32) << 1);
+        crate::render_units::fallen_far() as u32 | (crate::render_units::fallen_coarse() << 1);
     frame.build_pyramid = false;
     if p.occlude.x != 0 {
         use crate::render_units_occlusion::{OccludeMode, mode};

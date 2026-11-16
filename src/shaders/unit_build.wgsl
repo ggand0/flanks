@@ -188,8 +188,9 @@ struct Params {
     // held level 2, 2 also level 1, 3 also level 0), y the hold
     // (`body_state`), w the frames since the last frame with a pyramid, the
     // step of each man's count. z bit 0 under FL_FALLEN_FAR (render_units.rs
-    // `fallen_far`): a body at level 2 draws at level 3; bit 1 under
-    // FL_FALLEN_COARSE (`fallen_coarse`): every body draws a level coarser.
+    // `fallen_far`): a body at level 2 draws at level 3; bits 1 and 2 the
+    // FL_FALLEN_COARSE mode (`fallen_coarse`): 1 a body past level 0 draws
+    // a level coarser, 2 every body.
     lod_hidden: vec4<u32>,
     // The body box: x its half-width, y its top above his feet, z its
     // bottom above his feet, in metres.
@@ -1002,13 +1003,14 @@ fn build_corpse(j: u32, t: u32) {
     let d2 = dot(d, d) * jitter * jitter;
     let lod = level(params.bands[kind * 3u + 2u], d2);
     // FL_FALLEN_FAR: a far body draws at the last level. FL_FALLEN_COARSE:
-    // every body draws a level coarser, the last level at most. He casts by
-    // his plain level.
+    // 1 a body past level 0 draws a level coarser, 2 every body, the last
+    // level at most. He casts by his plain level.
     var draw_lod = lod;
     if (params.lod_hidden.z & 1u) != 0u && lod == NUM_LODS - 2u {
         draw_lod = NUM_LODS - 1u;
     }
-    if (params.lod_hidden.z & 2u) != 0u {
+    let coarse = (params.lod_hidden.z >> 1u) & 3u;
+    if coarse == 2u || (coarse == 1u && lod > 0u) {
         draw_lod = min(lod + 1u, NUM_LODS - 1u);
     }
     let in_view = !culled(position);
