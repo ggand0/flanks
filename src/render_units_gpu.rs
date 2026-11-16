@@ -1180,9 +1180,11 @@ impl IndexedMesh {
 }
 
 /// The detail levels named by the digits of the variable `key`, as in
-/// `FL_FLAT_LIGHT=23`. Unset or empty names none.
+/// `FL_FLAT_LIGHT=23`, or by `FL_PERF`'s set when the variable is unset
+/// (util.rs `perf_str`). Empty names none, and so does 0 in effect: level 0
+/// never samples one atlas point per triangle.
 fn level_set(key: &str) -> [bool; NUM_LODS] {
-    let digits = std::env::var(key).unwrap_or_default();
+    let digits = crate::util::perf_str(key).unwrap_or_default();
     std::array::from_fn(|lod| digits.contains(char::from(b'0' + lod as u8)))
 }
 
