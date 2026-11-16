@@ -104,22 +104,6 @@ fn receive_lods() -> usize {
     *BELOW.get_or_init(|| crate::util::env_or("FL_RECEIVE_LODS", NUM_LODS))
 }
 
-/// `FL_SHADOW_SOFT_LODS=n`: the levels below n look up the sun's shadow
-/// with the view's filter, the levels from n on with one hardware 2x2
-/// comparison tap (Bevy's `Hardware2x2`). Unset, every level keeps the
-/// view's filter. Only the camera's unit draws change: the casters and
-/// the terrain keep their own keys. Read once.
-pub(crate) fn soft_shadow_lods() -> usize {
-    static BELOW: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *BELOW.get_or_init(|| {
-        let below = crate::util::env_or("FL_SHADOW_SOFT_LODS", NUM_LODS);
-        if below < NUM_LODS {
-            info!("sun shadow: levels {below} and on look up the shadow with one 2x2 tap");
-        }
-        below
-    })
-}
-
 #[allow(clippy::type_complexity)] // bevy system params
 fn update_sun_uniform(
     camera: Query<(Entity, &Camera, &Projection), With<Camera3d>>,
