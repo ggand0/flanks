@@ -1489,16 +1489,6 @@ fn level_mesh_unskinned(level: &Level) -> Mesh {
         .with_inserted_indices(Indices::U32(level.idx.clone()))
 }
 
-/// The atlas sampler's anisotropy clamp: 8, or `FL_ATLAS_ANISO` as 1, 2,
-/// 4, 8 or 16 (any other value rounds down to one of them), for measuring.
-/// Only a level whose atlas coordinate varies across a triangle (L0, and
-/// the archer's L1) gets anything from it: on a flat-atlas level every
-/// fragment of a triangle samples one point.
-fn atlas_anisotropy() -> u16 {
-    let n = crate::util::env_or("FL_ATLAS_ANISO", 8_u16).clamp(1, 16);
-    1 << (15 - n.leading_zeros())
-}
-
 /// The model's atlas: the base colour texture of its first textured
 /// material, decoded, with a mip chain. The glTF image index comes with
 /// it so every primitive can be checked against it.
@@ -1534,7 +1524,7 @@ fn read_atlas(
     };
     let sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
         mipmap_filter: ImageFilterMode::Linear,
-        anisotropy_clamp: atlas_anisotropy(),
+        anisotropy_clamp: 8,
         ..ImageSamplerDescriptor::linear()
     });
     // sRGB colour. The mask in alpha stays linear, which is what an sRGB
