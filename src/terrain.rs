@@ -433,7 +433,14 @@ impl Plugin for TerrainPlugin {
             .add_systems(Startup, spawn_chunks)
             .add_systems(
                 Update,
-                (rebuild_map.in_set(MapRebuild), crater_tool, auto_test_craters, remesh_dirty).chain(),
+                (
+                    rebuild_map.in_set(MapRebuild),
+                    crater_tool,
+                    auto_test_craters,
+                    remesh_dirty,
+                    decide_terrain_casting,
+                )
+                    .chain(),
             );
     }
 }
@@ -995,21 +1002,105 @@ fn spawn_chunk_meshes(
             if let Some(aabb) = aabb {
                 e.insert(aabb);
             }
-            if !terrain_casts() {
+            if terrain_shadow_switch() == Some(false) {
                 e.insert(bevy::light::NotShadowCaster);
             }
         }
     }
 }
 
-/// `FL_TERRAIN_SHADOW=0`: the ground casts no sun shadow, for measuring
-/// what its share of the shadow maps costs. The ground still receives the
-/// shadows of the soldiers and the plants. The maps with walls or cliffs
-/// in the ground mesh (Obstacles, Town, River, Classic, the hills) need
-/// the ground to cast, so this is for the gentle maps. Read once.
-fn terrain_casts() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| crate::util::env_or("FL_TERRAIN_SHADOW", 1_u32) != 0)
+/// `FL_TERRAIN_SHADOW`: unset, the ground casts the sun's shadow only where
+/// it can shadow anything (`decide_terrain_casting`); `1` always, `0`
+/// never, for measuring. The ground receives every shadow either way. Read
+/// once.
+fn terrain_shadow_switch() -> Option<bool> {
+    static ON: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FL_TERRAIN_SHADOW").ok().and_then(|v| v.parse::<u32>().ok()).map(|v| v != 0))
+}
+
+/// The steepest rise of any triangle toward the sun: over a step `d` along
+/// the ground toward the sun (`toward_sun` without its height, unit
+/// length), how much the triangle's plane climbs. A face standing upright
+/// rises without bound. A point of the ground, or anything standing on it,
+/// is in the ground's shadow only if somewhere the ground climbs toward the
+/// sun faster than the sun's ray does, `toward_sun.y` over its horizontal
+/// length.
+fn steepest_rise_toward(positions: &[[f32; 3]], indices: &[u32], toward_sun: Vec3) -> f32 {
+    let d = Vec2::new(toward_sun.x, toward_sun.z).normalize_or_zero();
+    let mut steepest = f32::NEG_INFINITY;
+    for t in indices.chunks_exact(3) {
+        let [a, b, c] = [t[0], t[1], t[2]].map(|i| Vec3::from(positions[i as usize]));
+        let mut n = (b - a).cross(c - a);
+        if n.y < 0.0 {
+            n = -n;
+        }
+        let across = Vec2::new(n.x, n.z);
+        if across == Vec2::ZERO {
+            steepest = steepest.max(0.0);
+            continue;
+        }
+        if n.y <= 1e-6 * n.length() {
+            return f32::INFINITY;
+        }
+        // The plane's height is (k - n_xz . p) / n_y, so its slope along d
+        // is -(n_xz . d) / n_y.
+        steepest = steepest.max(-across.dot(d) / n.y);
+    }
+    steepest
+}
+
+/// The ground casts the sun's shadow only where it can shadow anything:
+/// on a map where no triangle rises toward the sun as steeply as 0.98 of
+/// the sun's own slope, the sun's rays to every point on or above the
+/// ground stay clear of it, and the chunks skip the shadow maps. Decided
+/// again when a chunk is spawned or remeshed or the sun turns.
+fn decide_terrain_casting(
+    mut commands: Commands,
+    chunks: Res<TerrainChunks>,
+    meshes: Res<Assets<Mesh>>,
+    mut mesh_events: MessageReader<AssetEvent<Mesh>>,
+    added: Query<(), Added<GroundChunk>>,
+    sun: Query<Ref<Transform>, With<DirectionalLight>>,
+    ground: Query<Entity, With<GroundChunk>>,
+) {
+    let remeshed = mesh_events.read().any(|e| match e {
+        AssetEvent::Modified { id } => chunks.meshes.iter().any(|h| h.id() == *id),
+        _ => false,
+    });
+    if terrain_shadow_switch().is_some() {
+        return;
+    }
+    let Ok(sun) = sun.single() else { return };
+    if !(remeshed || !added.is_empty() || sun.is_changed()) || ground.is_empty() {
+        return;
+    }
+    let toward_sun = sun.back().as_vec3();
+    let limit = 0.98 * toward_sun.y / Vec2::new(toward_sun.x, toward_sun.z).length();
+    let mut steepest = f32::NEG_INFINITY;
+    for handle in &chunks.meshes {
+        let Some(mesh) = meshes.get(handle) else { return };
+        let Some(bevy::mesh::VertexAttributeValues::Float32x3(positions)) = mesh.attribute(Mesh::ATTRIBUTE_POSITION)
+        else {
+            continue;
+        };
+        let indices: Vec<u32> = match mesh.indices() {
+            Some(indices) => indices.iter().map(|i| i as u32).collect(),
+            None => (0..positions.len() as u32).collect(),
+        };
+        steepest = steepest.max(steepest_rise_toward(positions, &indices, toward_sun));
+    }
+    let casts = steepest >= limit;
+    info!(
+        "terrain shadow: steepest rise toward the sun {steepest:.3} against the limit {limit:.3}, the ground {}",
+        if casts { "casts" } else { "casts no shadow" }
+    );
+    for e in &ground {
+        if casts {
+            commands.entity(e).remove::<bevy::light::NotShadowCaster>();
+        } else {
+            commands.entity(e).insert(bevy::light::NotShadowCaster);
+        }
+    }
 }
 
 /// Central differences use the global grid, including across chunk boundaries.
@@ -1340,6 +1431,40 @@ fn auto_test_craters(
 mod tests {
     use super::*;
     use bevy::mesh::VertexAttributeValues;
+
+    /// A ramp climbing toward the sun more steeply than the sun stands
+    /// rises past the limit, and the same ramp falling toward the sun
+    /// does not, under the scene's sun.
+    #[test]
+    fn a_ramp_casts_only_when_it_climbs_toward_the_sun() {
+        let toward_sun = crate::sun_rotation() * Vec3::Z;
+        assert!(toward_sun.y > 0.0, "the sun stands above the ground");
+        let along = Vec2::new(toward_sun.x, toward_sun.z);
+        let sun_slope = toward_sun.y / along.length();
+        let d = along.normalize();
+        let side = Vec2::new(-d.y, d.x);
+        // A 1 m square ramp whose height climbs `slope` per metre along d.
+        let ramp = |slope: f32| -> Vec<[f32; 3]> {
+            [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
+                .map(|(u, v)| {
+                    let p = d * u + side * v;
+                    [p.x, slope * u, p.y]
+                })
+                .to_vec()
+        };
+        let quad = [0, 1, 2, 0, 2, 3];
+        let limit = 0.98 * sun_slope;
+        let up = steepest_rise_toward(&ramp(1.5 * sun_slope), &quad, toward_sun);
+        assert!(up >= limit, "{up} against {limit}");
+        assert!((up - 1.5 * sun_slope).abs() < 1e-4);
+        let down = steepest_rise_toward(&ramp(-1.5 * sun_slope), &quad, toward_sun);
+        assert!(down < limit, "{down} against {limit}");
+        // A gentle climb toward the sun stays under the limit.
+        assert!(steepest_rise_toward(&ramp(0.5 * sun_slope), &quad, toward_sun) < limit);
+        // An upright face rises without bound.
+        let wall = vec![[0.0, 0.0, 0.0], [side.x, 0.0, side.y], [side.x, 1.0, side.y]];
+        assert_eq!(steepest_rise_toward(&wall, &[0, 1, 2], toward_sun), f32::INFINITY);
+    }
 
     const CHUNKS_X: usize = 16;
     const CHUNKS_Z: usize = 12;
