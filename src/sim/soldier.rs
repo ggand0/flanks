@@ -181,6 +181,15 @@ pub(crate) fn pair_widths() -> &'static [[PairWidth; WIDTH_LEVELS]; WIDTH_LEVELS
         })
     })
 }
+/// The widest pair's spring rest over the pair table (`pair_widths`),
+/// for the scan's cut of its foes.
+fn widest_rest() -> f32 {
+    static R: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *R.get_or_init(|| pair_widths().iter().flatten().fold(0.0f32, |r, w| r.max(w.sep)))
+}
+/// The scan's cut of its foes (`scan`): metres past the farthest a foe can
+/// be and still count, far above the rounding of a place on the map.
+const CUT_MARGIN: f32 = 0.01;
 /// A pair of men by their kinds: the mass weight of the push on the
 /// first (2 m_o / (m_i + m_o)) and the other's share of a closing speed
 /// (m_o / (m_i + m_o)).
@@ -682,6 +691,8 @@ struct Step {
 
 /// Run every soldier of a chunk through his tick.
 pub(crate) fn tick_chunk(f: &Field, rows: Rows, out: &mut ChunkOut) {
+    // The scan's scratch: the ranks of a man's candidates within its cut.
+    let mut cands: Vec<u32> = Vec::new();
     for j in 0..rows.pos.len() {
         let mut s = Soldier {
             i: rows.start + j,
@@ -707,7 +718,7 @@ pub(crate) fn tick_chunk(f: &Field, rows: Rows, out: &mut ChunkOut) {
         };
         let mut st = begin(f, &mut s);
         drive(f, &mut s, &mut st);
-        scan(f, &mut s, &mut st, out);
+        scan(f, &mut s, &mut st, out, &mut cands);
         look_around(f, &mut s, &mut st);
         choose_opening(f, &mut s, &mut st);
         hold_the_frame(f, &mut st);
@@ -932,7 +943,7 @@ fn drive(f: &Field, s: &mut Soldier, st: &mut Step) {
 /// fights), and, at charge speed against a spearwall, the braced point his
 /// body runs onto, which is a damage event from the spearman.
 #[inline]
-fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
+fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut, cands: &mut Vec<u32>) {
     let Field {
         grid,
         speed,
@@ -955,9 +966,7 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
     let gi = st.gi;
     let dying = st.dying;
     // Fused neighbor scan: separation physics + nearest living enemy in reach
-    // (swing targeting). Scalar over cache-ordered SortedUnits — an 8-wide
-    // SIMD variant measured slower here: candidate runs are too short for
-    // lane occupancy.
+    // (swing targeting), over the cache-ordered SortedUnits within the cut.
     let mut push = Vec2::ZERO;
     let mut corr = Vec2::ZERO;
     let mut overlap_vel = Vec2::ZERO;
@@ -1034,19 +1043,43 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
     } else {
         QUERY_RADIUS.max(params.reach)
     };
-    grid.for_each_candidate_vel(p, scan_r, |o, o_vel| {
-        if o.idx as usize == i {
-            return;
-        }
+    // The farthest a foe can be and still count for anything below: the
+    // widest pair's spring rest, his weapon's reach, or at charge speed a
+    // braced spear's point. A friend counts only within SEP_RADIUS.
+    let spear_cut = if at_charge_speed {
+        (spear_reach * spear_reach + SPEAR_LINE_HALF_W * SPEAR_LINE_HALF_W).sqrt()
+    } else {
+        0.0
+    };
+    let foe_cut = widest_rest().max(params.reach).max(spear_cut) + CUT_MARGIN;
+    // First the candidates within the cut, by rank, in the walk's order:
+    // which of them pass is a coin toss in a press, so each is written and
+    // kept by the test's outcome instead of by a branch on it. A friend
+    // beyond SEP_RADIUS can touch nothing of his, and most of a scan's
+    // candidates in a press are such men (the cells span more than the
+    // circle); a foe beyond `foe_cut` fails every foe test. The box stays
+    // `scan_r`'s, which the look round him reads again (`look_around`).
+    cands.clear();
+    cands.reserve(grid.box_len(p, scan_r));
+    let cut = crate::spatial::KeepCut {
+        team_bit: my_team_bit,
+        me: i as u32,
+        same_cut2: SEP_RADIUS * SEP_RADIUS,
+        foe_cut2: foe_cut * foe_cut,
+    };
+    // SAFETY: `box_len` counts every man of the box the walk visits, and
+    // the list has room for all of them; the first `n_kept` are written.
+    unsafe {
+        let n_kept = grid.kept_in_box(p, scan_r, &cut, cands.as_mut_ptr());
+        cands.set_len(n_kept);
+    }
+    let sorted = grid.sorted();
+    for &o_rank in cands.iter() {
+        let o = &sorted[o_rank as usize];
+        let o_vel = grid.sorted_vel(o_rank as usize);
         let d = p - o.xz();
         let d2 = d.length_squared();
-        // A friend beyond the widest spring rest can touch nothing of his:
-        // out before any of the pair's work. Most of a scan's candidates
-        // in a press are such men (the cells span more than the circle).
         let same = (o.meta & crate::spatial::META_TEAM) == my_team_bit;
-        if same && d2 >= SEP_RADIUS * SEP_RADIUS {
-            return;
-        }
         let enemy = !same && (o.meta & crate::spatial::META_DYING) == 0;
         if enemy && d2 < reach2 {
             sticky |= o.idx == prev_target;
@@ -1153,7 +1186,7 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
                 crowd_still += w * on * still_weight(o_vel, wish_dir);
             }
         }
-    });
+    }
 
     // Ran onto a braced spear: the collision is a damage event from the
     // SPEARMAN, resolved with everything else in the serial apply (which also
