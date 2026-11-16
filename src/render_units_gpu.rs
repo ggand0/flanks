@@ -1153,6 +1153,9 @@ struct IndexedMesh {
     /// The atlas coordinate rides on each triangle's first vertex and is not
     /// interpolated (`weld`).
     flat_atlas: bool,
+    /// Each triangle's first vertex carries its normal, and the triangle
+    /// takes the light of that vertex alone (`weld`).
+    flat_light: bool,
 }
 
 impl IndexedMesh {
@@ -1165,8 +1168,36 @@ impl IndexedMesh {
             indices,
             group,
             flat_atlas,
+            flat_light: false,
         }
     }
+}
+
+/// The detail levels named by the digits of the variable `key`, as in
+/// `FL_FLAT_LIGHT=23`. Unset or empty names none.
+fn level_set(key: &str) -> [bool; NUM_LODS] {
+    let digits = std::env::var(key).unwrap_or_default();
+    std::array::from_fn(|lod| digits.contains(char::from(b'0' + lod as u8)))
+}
+
+/// `FL_FLAT_LIGHT=<levels>`: the levels whose triangles are lit once each,
+/// at their first vertex (`weld`). Read once, as the meshes are welded at
+/// load.
+fn flat_light_levels() -> [bool; NUM_LODS] {
+    static SET: std::sync::OnceLock<[bool; NUM_LODS]> = std::sync::OnceLock::new();
+    *SET.get_or_init(|| level_set("FL_FLAT_LIGHT"))
+}
+
+/// The normal a triangle is lit by under `FL_FLAT_LIGHT`: its three corner
+/// normals summed and normalized, or, where they cancel, the normal of its
+/// face at rest.
+fn light_normal(t: &[PullVertex]) -> [f32; 3] {
+    let sum: Vec3 = t.iter().map(|c| Vec3::from(c.normal)).sum();
+    if sum.length() >= 1e-3 {
+        return sum.normalize().into();
+    }
+    let p = t.iter().map(|c| Vec3::from(c.position)).collect::<Vec<_>>();
+    (p[1] - p[0]).cross(p[2] - p[0]).normalize_or(Vec3::Y).into()
 }
 
 /// Corners per vertex from which a level draws indexed under
@@ -1216,20 +1247,29 @@ fn welded_levels() -> bool {
 /// fragment sees stays what the expanded corners gave it. The far levels
 /// go from three vertex shader runs per triangle to 1.3 to 1.55 (L1 and
 /// L2) under a 16-entry cache.
-fn weld(corners: &[PullVertex]) -> IndexedMesh {
+///
+/// With `flat_light` (`FL_FLAT_LIGHT`) a flat-atlas level's provoking vertex
+/// also carries the triangle's normal (`light_normal`), the triangle takes
+/// the light of that vertex alone (`@interpolate(flat, first)`), and the
+/// normal leaves the weld: every vertex then starts one triangle. The other
+/// corners keep a normal of one of the triangles they sit on, which only
+/// offsets where the sun's shadow is sampled.
+fn weld(corners: &[PullVertex], flat_light: bool) -> IndexedMesh {
     let flat_atlas = corners
         .chunks(3)
         .all(|t| t[1].atlas_uv == t[0].atlas_uv && t[2].atlas_uv == t[0].atlas_uv);
+    let flat_light = flat_atlas && flat_light;
     let key = |v: &PullVertex| -> [u32; 12] {
         let f = f32::to_bits;
+        let n = |x: f32| if flat_light { 0 } else { x.to_bits() };
         [
             f(v.position[0]),
             f(v.position[1]),
             f(v.position[2]),
             f(v.part),
-            f(v.normal[0]),
-            f(v.normal[1]),
-            f(v.normal[2]),
+            n(v.normal[0]),
+            n(v.normal[1]),
+            n(v.normal[2]),
             f(v.pivot),
             v.color,
             if flat_atlas { 0 } else { v.atlas_uv },
@@ -1270,12 +1310,17 @@ fn weld(corners: &[PullVertex]) -> IndexedMesh {
             };
             provokes[first as usize] = true;
             vertices[first as usize].atlas_uv = atlas;
+            if flat_light {
+                vertices[first as usize].normal = light_normal(&corners[3 * t..3 * t + 3]);
+            }
         }
     } else {
         one.extend(order.into_iter().flat_map(|t| [list[3 * t], list[3 * t + 1], list[3 * t + 2]]));
     }
     let group = (GROUP_INDICES / one.len().max(1)).clamp(1, MAX_GROUP as usize) as u32;
-    IndexedMesh::grouped(vertices, &one, group, flat_atlas)
+    let mut m = IndexedMesh::grouped(vertices, &one, group, flat_atlas);
+    m.flat_light = flat_light;
+    m
 }
 
 /// The same triangles, reordered so each one mostly reuses vertices the
@@ -1419,13 +1464,14 @@ impl PullMesh {
         let indices = mesh.indices()?;
         let corners: Vec<PullVertex> = indices.iter().map(vertex).collect();
         let indexed = if welded_levels() {
-            let m = weld(&corners);
+            let m = weld(&corners, flat_light_levels()[bucket % NUM_LODS]);
             info!(
-                "unit bucket {bucket}: {} triangles on {} welded vertices, {} soldiers per instance{}",
+                "unit bucket {bucket}: {} triangles on {} welded vertices, {} soldiers per instance{}{}",
                 corners.len() / 3,
                 m.vertices.len(),
                 m.group,
-                if m.flat_atlas { ", atlas point per triangle" } else { "" }
+                if m.flat_atlas { ", atlas point per triangle" } else { "" },
+                if m.flat_light { ", light per triangle" } else { "" }
             );
             Some(m)
         } else {
@@ -1470,6 +1516,8 @@ pub struct DrawShape {
     pub verts: u32,
     /// The atlas coordinate is flat, from each triangle's first vertex.
     pub flat_atlas: bool,
+    /// Each triangle takes the light of its first vertex (`weld`).
+    pub flat_light: bool,
 }
 
 /// Uploads each pulled bucket's mesh once. The render entity persists,
@@ -1503,6 +1551,7 @@ fn extract_pull_meshes(
             group: m.group,
             verts: m.vertices.len() as u32,
             flat_atlas: m.flat_atlas,
+            flat_light: m.flat_light,
         });
         commands.entity(e).insert(PullMeshGpu {
             vertices: render_device.create_buffer_with_data(&BufferInitDescriptor {
@@ -2570,7 +2619,7 @@ mod tests {
                 weight: 0.0,
             })
             .collect();
-        let m = weld(&corners);
+        let m = weld(&corners, false);
         assert!(m.flat_atlas);
         let per = corners.len();
         assert_eq!(m.indices.len(), per * m.group as usize);
@@ -2612,7 +2661,7 @@ mod tests {
             corner(2.0, 3), corner(1.0, 2), corner(3.0, 4),
             corner(3.0, 9), corner(1.0, 2), corner(0.0, 1),
         ];
-        let m = weld(&corners);
+        let m = weld(&corners, false);
         assert!(!m.flat_atlas);
         // Corner (3, 9) differs from (3, 4) in its atlas coordinate only.
         assert_eq!(m.vertices.len(), 5);

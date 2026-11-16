@@ -48,8 +48,14 @@ struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     // rgb = the lit vertex colour: part material blended with the team
     // colour, times the sun and the sky. a = the sun's share of that
-    // light, the part the shadow takes away.
+    // light, the part the shadow takes away. Under UNIT_LIGHT_FLAT each
+    // triangle takes it from its first vertex, which carries the
+    // triangle's normal (render_units_gpu.rs `weld`).
+#ifdef UNIT_LIGHT_FLAT
+    @location(0) @interpolate(flat, first) color: vec4<f32>,
+#else
     @location(0) color: vec4<f32>,
+#endif
     // Per instance, so flat. x = team colour, unorm8 rgb, and the death
     // darkening in the top byte; y = the hit flash, unorm8 in the low byte,
     // and under FL_OCCLUDE_CHECK the occlusion mark in bit 8.
@@ -276,8 +282,10 @@ fn unit_output(
     out.clip_position.z = min(out.clip_position.z, out.clip_position.w);
 #endif
     // Lambert from the scene's sun, so shading and shadow agree, over a
-    // hemispheric ambient brighter from above. Normals are per face
-    // (turned with the pose in `place`), so per-vertex light is exact.
+    // hemispheric ambient brighter from above, at the corner's normal
+    // turned with the pose in `place`. Most triangles of the model files
+    // have different normals at their corners, so the light is blended
+    // across the face, except under UNIT_LIGHT_FLAT.
     let n = normalize(normal);
     let sky = 0.30 + 0.20 * (0.5 + 0.5 * n.y);
     let direct = 0.65 * max(dot(n, sun.direction_to_light.xyz), 0.0);
