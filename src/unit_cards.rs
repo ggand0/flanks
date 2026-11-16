@@ -144,13 +144,21 @@ impl Plugin for UnitCardsPlugin {
     }
 }
 
+/// Hidden, the bar also leaves the UI layout (`Display::None`): a hidden
+/// node keeps its place in the layout, and the cards' changing fills
+/// would lay it out again for nothing.
 fn show_card_bar(
     settings: Res<crate::settings::Settings>,
-    mut bar: Query<&mut Visibility, With<CardBar>>,
+    mut bar: Query<(&mut Visibility, &mut Node), With<CardBar>>,
 ) {
-    let want = if settings.interface.hud { Visibility::Inherited } else { Visibility::Hidden };
-    for mut vis in &mut bar {
+    let hud = settings.interface.hud;
+    let (want, display) =
+        if hud { (Visibility::Inherited, Display::Flex) } else { (Visibility::Hidden, Display::None) };
+    for (mut vis, mut node) in &mut bar {
         vis.set_if_neq(want);
+        if node.display != display {
+            node.display = display;
+        }
     }
 }
 
@@ -801,6 +809,9 @@ fn spawn_card(strip: &mut ChildSpawnerCommands, g: usize, kind: u8, icon: Handle
                 Node {
                     width: Val::Px(20.0),
                     height: Val::Px(24.0),
+                    // The letter shows until a layout gives the card its
+                    // width (`refresh_cards`).
+                    display: Display::None,
                     ..default()
                 },
                 ImageNode::new(icon),
@@ -1008,9 +1019,11 @@ fn refresh_cards(
     groups: Res<Groups>,
     selection: Res<Selection>,
     // Wide-enough cards show the kind icon, narrow ones the letter
-    // (which the sliver clip then eats). Indexed by regiment; kept
-    // across frames to stay allocation-free.
-    mut wide: Local<Vec<bool>>,
+    // (which the sliver clip then eats). Indexed by regiment, `None` for
+    // a card with no width yet or out of the layout (the bar hidden,
+    // `show_card_bar`): its art stays as it is. Kept across frames to
+    // stay allocation-free.
+    mut wide: Local<Vec<Option<bool>>>,
     mut cards: Query<(
         &UnitCard,
         &ComputedNode,
@@ -1047,11 +1060,11 @@ fn refresh_cards(
     mut firing_icons: Query<(&CardFiring, &mut Visibility)>,
 ) {
     wide.clear();
-    wide.resize(groups.list.len(), false);
+    wide.resize(groups.list.len(), None);
 
     for (card, computed, interaction, mut bg, mut outline) in &mut cards {
-        wide[card.0] =
-            computed.size().x * computed.inverse_scale_factor() >= CARD_ICON_MIN_W;
+        let width = computed.size().x * computed.inverse_scale_factor();
+        wide[card.0] = (width > 0.0).then_some(width >= CARD_ICON_MIN_W);
         let gd = &groups.list[card.0];
         let want_bg = if gd.count == 0 {
             CARD_BG_DEAD
@@ -1139,7 +1152,8 @@ fn refresh_cards(
     // Display (not Visibility) so the hidden one leaves the flex layout;
     // it only flips when a card crosses the width threshold.
     for (art, mut node) in &mut arts {
-        let want = if wide[art.g] == art.icon {
+        let Some(is_wide) = wide[art.g] else { continue };
+        let want = if is_wide == art.icon {
             Display::Flex
         } else {
             Display::None
