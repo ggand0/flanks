@@ -1135,6 +1135,9 @@ struct PullVertex {
 pub struct PullMesh {
     corners: Vec<PullVertex>,
     indexed: Option<IndexedMesh>,
+    /// The same triangles welded for the sun's cascades alone
+    /// (`weld_cast`), which `indexed` stands in for when it is `None`.
+    cast: Option<IndexedMesh>,
     bucket: usize,
     /// The level carries joints and weights (unit_glb.rs `ATTRIBUTE_SKIN`),
     /// so its draw shader compiles the skinning instead of the part chain.
@@ -1331,6 +1334,41 @@ fn weld(corners: &[PullVertex], flat_light: bool) -> IndexedMesh {
     m
 }
 
+/// The shadow casters draw a depth-only mesh of their own (`weld_cast`).
+/// Read once: `FL_SHADOW_MESH=0` casts with the camera's mesh.
+fn cast_meshes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::util::env_or("FL_SHADOW_MESH", 1_u32) != 0)
+}
+
+/// The level's corners welded for the sun's cascades, which keep depth
+/// alone: a corner is placed from its position, part, pivot, skin and
+/// weight (unit_pose.wgsl `place`), and nothing it carries besides reaches
+/// a shadow map, so the normal, the colour and the atlas point leave the
+/// weld and no triangle needs a provoking vertex of its own. The same
+/// triangles, each with its corners in the same order, ordered for vertex
+/// reuse.
+fn weld_cast(corners: &[PullVertex]) -> IndexedMesh {
+    let key = |v: &PullVertex| -> [u32; 7] {
+        let f = f32::to_bits;
+        [f(v.position[0]), f(v.position[1]), f(v.position[2]), f(v.part), f(v.pivot), v.skin, f(v.weight)]
+    };
+    let mut slots = bevy::platform::collections::HashMap::<[u32; 7], u32>::default();
+    let mut vertices: Vec<PullVertex> = Vec::new();
+    let list: Vec<u32> = corners
+        .iter()
+        .map(|c| {
+            *slots.entry(key(c)).or_insert_with(|| {
+                vertices.push(*c);
+                vertices.len() as u32 - 1
+            })
+        })
+        .collect();
+    let one: Vec<u32> = tipsify(&list, vertices.len(), VERTEX_CACHE);
+    let group = (GROUP_INDICES / one.len().max(1)).clamp(1, MAX_GROUP as usize) as u32;
+    IndexedMesh::grouped(vertices, &one, group, false)
+}
+
 /// The same triangles, reordered so each one mostly reuses vertices the
 /// GPU has just shaded (`tipsify_triangles`), as an index list.
 fn tipsify(indices: &[u32], vertices: usize, cache: usize) -> Vec<u32> {
@@ -1502,9 +1540,19 @@ impl PullMesh {
                 IndexedMesh::grouped((0..pos.len()).map(vertex).collect(), &one, 1, false)
             })
         };
+        let cast = (welded_levels() && cast_meshes()).then(|| {
+            let m = weld_cast(&corners);
+            info!(
+                "unit bucket {bucket}: its shadow casters on {} vertices, {} soldiers per instance",
+                m.vertices.len(),
+                m.group
+            );
+            m
+        });
         Some(Self {
             corners,
             indexed,
+            cast,
             bucket,
             skinned: skin.is_some(),
         })
@@ -1517,10 +1565,14 @@ pub struct PullMeshGpu {
     vertices: Buffer,
     /// The indexed form: its vertices (storage) and its group list.
     indexed: Option<(Buffer, Buffer)>,
+    /// The same for the shadow casters (`PullMesh::cast`), else `indexed`.
+    cast: Option<(Buffer, Buffer)>,
     /// Corners per soldier (the level's index count).
     pub count: u32,
     pub bucket: usize,
     pub shape: DrawShape,
+    /// How the shadow casters draw: `shape`, or the shape of `cast`.
+    pub cast_shape: DrawShape,
     /// As `PullMesh::skinned`.
     pub skinned: bool,
     /// Every corner is on the body, part 0: the vertex shader reads only
@@ -1554,7 +1606,7 @@ fn extract_pull_meshes(
         if uploaded.contains(e) {
             continue;
         }
-        let indexed = mesh.indexed.as_ref().map(|m| {
+        let upload = |m: &IndexedMesh| {
             (
                 render_device.create_buffer_with_data(&BufferInitDescriptor {
                     label: Some("unit pull mesh vertices"),
@@ -1567,13 +1619,19 @@ fn extract_pull_meshes(
                     usage: BufferUsages::INDEX,
                 }),
             )
-        });
-        let shape = mesh.indexed.as_ref().map_or(DrawShape::default(), |m| DrawShape {
-            group: m.group,
-            verts: m.vertices.len() as u32,
-            flat_atlas: m.flat_atlas,
-            flat_light: m.flat_light,
-        });
+        };
+        let shape_of = |m: Option<&IndexedMesh>| {
+            m.map_or(DrawShape::default(), |m| DrawShape {
+                group: m.group,
+                verts: m.vertices.len() as u32,
+                flat_atlas: m.flat_atlas,
+                flat_light: m.flat_light,
+            })
+        };
+        let indexed = mesh.indexed.as_ref().map(upload);
+        let cast = mesh.cast.as_ref().map(upload);
+        let shape = shape_of(mesh.indexed.as_ref());
+        let cast_shape = shape_of(mesh.cast.as_ref().or(mesh.indexed.as_ref()));
         commands.entity(e).insert(PullMeshGpu {
             vertices: render_device.create_buffer_with_data(&BufferInitDescriptor {
                 label: Some("unit pull mesh"),
@@ -1581,9 +1639,11 @@ fn extract_pull_meshes(
                 usage: BufferUsages::STORAGE,
             }),
             indexed,
+            cast,
             count: mesh.corners.len() as u32,
             bucket: mesh.bucket,
             shape,
+            cast_shape,
             skinned: mesh.skinned,
             body_only: mesh.corners.iter().all(|c| c.part < 0.5),
         });
@@ -1597,6 +1657,8 @@ pub struct PulledBucketGpu {
     pub bind_group: BindGroup,
     /// The index list of an indexed camera draw (`PullMeshGpu::indexed`).
     pub index: Option<Buffer>,
+    /// The index list of the shadow casters' draw (`PullMeshGpu::cast`).
+    pub shadow_index: Option<Buffer>,
     /// The same group for drawing into each sun shadow cascade: it binds
     /// that cascade's set of the bucket table, so the bucket's draw reads
     /// the cascade's caster list for its kind.
@@ -2091,15 +2153,16 @@ pub(crate) fn prepare_gpu_units(
     }
 
     // The bucket table: the camera's set, then one set per cascade whose
-    // every level of a kind points at the cascade's caster list for it.
+    // every level of a kind points at the cascade's caster list for it. The
+    // casters draw the same triangles, grouped as their own mesh is.
     let mut info = [[[0u32; 4]; NUM_BUCKETS]; 1 + MAX_CASCADES];
     for mesh in &meshes {
         let b = mesh.bucket;
         let stride = alloc.pose_stride[b / NUM_LODS];
-        let group = mesh.shape.group;
-        info[0][b] = [alloc.bases[b], mesh.count, stride, group];
+        info[0][b] = [alloc.bases[b], mesh.count, stride, mesh.shape.group];
         for c in 0..MAX_CASCADES {
-            info[1 + c][b] = [alloc.shadow_bases[c][b / NUM_LODS], mesh.count, stride, group];
+            let base = alloc.shadow_bases[c][b / NUM_LODS];
+            info[1 + c][b] = [base, mesh.count, stride, mesh.cast_shape.group];
         }
     }
     queue.write_buffer(&alloc.bucket_info, 0, bytemuck::cast_slice(&info));
@@ -2113,7 +2176,7 @@ pub(crate) fn prepare_gpu_units(
     let cast_with = |field: usize| {
         input.shadow_levels.map(|levels| {
             UVec4::from_array(std::array::from_fn(|kind| {
-                info[0][kind * NUM_LODS + levels[kind] as usize][field]
+                info[1][kind * NUM_LODS + levels[kind] as usize][field]
             }))
         })
     };
@@ -2320,9 +2383,14 @@ fn prepare_pull_bind_groups(
         let (view, sampler, atlas_settled) = custom_pipeline.atlas_for(atlas, &images);
         let layout = pipeline_cache.get_bind_group_layout(&custom_pipeline.pull_layout);
         // Set 0 of the bucket table is the camera's, set 1 + c cascade c's.
-        // An indexed level draws indexed into every one of them.
+        // An indexed level draws indexed into every one of them, the
+        // cascades from the casters' own mesh where it has one.
         let group = |set: u64| {
-            let corners = match &mesh.indexed {
+            let indexed = match set {
+                0 => mesh.indexed.as_ref(),
+                _ => mesh.cast.as_ref().or(mesh.indexed.as_ref()),
+            };
+            let corners = match indexed {
                 Some((vertices, _)) => vertices,
                 None => &mesh.vertices,
             };
@@ -2354,6 +2422,7 @@ fn prepare_pull_bind_groups(
         commands.entity(entity).insert(PulledBucketGpu {
             bind_group: group(0),
             index: mesh.indexed.as_ref().map(|(_, indices)| indices.clone()),
+            shadow_index: mesh.cast.as_ref().or(mesh.indexed.as_ref()).map(|(_, indices)| indices.clone()),
             shadow: (1..=MAX_CASCADES as u64).map(group).collect(),
             generation: buffers.generation,
             atlas_settled,
@@ -2686,5 +2755,41 @@ mod tests {
         assert!(!m.flat_atlas);
         // Corner (3, 9) differs from (3, 4) in its atlas coordinate only.
         assert_eq!(m.vertices.len(), 5);
+    }
+
+    #[test]
+    fn weld_cast_keeps_every_triangle_and_its_winding() {
+        let corner = |x: f32, z: f32, normal: f32, atlas: u32| PullVertex {
+            position: [x, 0.0, z],
+            part: 0.0,
+            normal: [normal, 1.0, 0.0],
+            pivot: 0.0,
+            color: atlas,
+            atlas_uv: atlas,
+            skin: 0,
+            weight: 0.0,
+        };
+        // Two triangles on four positions, each corner with its own normal,
+        // colour and atlas point.
+        let corners = [
+            corner(0.0, 0.0, 0.0, 1), corner(1.0, 0.0, 0.1, 2), corner(0.0, 1.0, 0.2, 3),
+            corner(1.0, 0.0, 0.3, 4), corner(1.0, 1.0, 0.4, 5), corner(0.0, 1.0, 0.5, 6),
+        ];
+        let m = weld_cast(&corners);
+        assert_eq!(m.vertices.len(), 4);
+        let at = |i: u32| m.vertices[i as usize].position;
+        let mut tris: Vec<[[f32; 3]; 3]> =
+            m.indices[..corners.len()].chunks(3).map(|t| [at(t[0]), at(t[1]), at(t[2])]).collect();
+        // Each triangle is one of the input's, its corners in the same
+        // cyclic order.
+        for t in corners.chunks(3) {
+            let want = [t[0].position, t[1].position, t[2].position];
+            let k = tris
+                .iter()
+                .position(|got| (0..3).any(|r| (0..3).all(|j| got[(j + r) % 3] == want[j])))
+                .expect("a triangle of the input");
+            tris.remove(k);
+        }
+        assert!(tris.is_empty());
     }
 }

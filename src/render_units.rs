@@ -1631,7 +1631,7 @@ impl PullPipelineKey {
             shape: DrawShape {
                 flat_atlas: false,
                 flat_light: false,
-                ..pull_mesh.shape
+                ..pull_mesh.cast_shape
             },
         }
     }
