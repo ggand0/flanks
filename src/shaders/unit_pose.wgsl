@@ -655,6 +655,8 @@ fn p_skel() -> u32 {
 // The levels a skinned kind poses by its skeleton (render_units_gpu.rs
 // SKEL_LODS): L0 and L1. Further out he poses by his parts.
 const SKEL_LODS: u32 = 2u;
+// The last detail level (render_units.rs NUM_LODS - 1).
+const LAST_LOD: u32 = 3u;
 // A skinned kind's clips, by slot (unit_glb.rs `SKEL_CLIPS`).
 const CLIP_STAND: u32 = 0u;
 const CLIP_READY: u32 = 1u;
@@ -1787,9 +1789,15 @@ fn put_skeleton() {
 }
 
 // The whole pose of the soldier with this instance record, into the slots
-// from `base` on. His part pose always: his shadow draws by his parts at
-// every distance, and so do his far levels. His joints as well when his
-// level (`lod`) plays the clips.
+// from `base` on. His part pose, but for the case below: his shadow draws
+// by his parts at every distance, and so do his far levels. His joints as
+// well when his level (`lod`) plays the clips.
+// `body` not 0: his kind's last level is all body, part 0
+// (render_units_gpu.rs `PoseParams::body`). Drawn there he casts no
+// shadow, and a part-0 corner of a level without a skin reads only the
+// slots `pose_begin` writes (P_POS, P_YAW, P_TURN, P_HIP, P_DEATH and
+// P_TEAM) and, on a bow rig kind, P_KNIFE, so the rest is left out. With
+// `body` 2 every slot left out holds 1e30.
 fn pose_write(
     base: u32,
     pos_scale: vec4<f32>,
@@ -1798,10 +1806,24 @@ fn pose_write(
     anim2: vec4<f32>,
     time: f32,
     lod: u32,
+    body: u32,
 ) {
     pose_base = base;
     let skel = rig.skel.params.x > 0u && lod < SKEL_LODS;
     pose_begin(pos_scale, color, anim, anim2, time, skel);
+    if body != 0u && lod == LAST_LOD {
+        let bow_rig = rig.bow.params.w > 0.5;
+        if body == 2u {
+            let end = p_skel() + rig.skel.params.x;
+            for (var k = P_LEG; k < end; k++) {
+                pose_put(k, vec4<f32>(1e30));
+            }
+        }
+        if bow_rig {
+            pose_put(P_KNIFE, vec4<f32>(select(0.0, 1.0, pre.knife), 0.0, 0.0, 0.0));
+        }
+        return;
+    }
     put_simple();
     // The fallen keep the legs they fell with (`place`).
     if pre.leg > 0.0 {

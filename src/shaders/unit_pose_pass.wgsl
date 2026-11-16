@@ -20,6 +20,9 @@ struct Params {
     src_base: vec4<u32>,
     stride: vec4<u32>,
     cap: vec4<u32>,
+    // Per kind, how a man drawn at the last level is posed
+    // (unit_pose.wgsl `pose_write`).
+    body: vec4<u32>,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -53,5 +56,14 @@ fn pose(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let src = pose_src[params.src_base[k] + slot];
     let r = records[src & 0x3fffffffu];
-    pose_write(slot * params.stride[k], r.pos_scale, r.color, r.anim, r.anim2, globals.time, src >> 30u);
+    pose_write(
+        slot * params.stride[k],
+        r.pos_scale,
+        r.color,
+        r.anim,
+        r.anim2,
+        globals.time,
+        src >> 30u,
+        params.body[k],
+    );
 }

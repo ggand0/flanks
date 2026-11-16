@@ -312,6 +312,25 @@ struct PoseParams {
     src_base: UVec4,
     stride: UVec4,
     cap: UVec4,
+    /// Per kind, how a man drawn at the last level is posed
+    /// (`pose_body_mode`): 0 in full, 1 for his body alone, 2 for his body
+    /// alone with every slot it leaves out filled with 1e30. Not 0 only
+    /// where the kind's last level is all body (`PullMeshGpu::body_only`).
+    body: UVec4,
+}
+
+/// A man whose pose source level is the last one casts no shadow, so his
+/// pose is read only by the last level's mesh (unit_pose.wgsl
+/// `pose_write`).
+const _: () = assert!(CAST_LODS < NUM_LODS - 1, "a man drawn at the last level casts no shadow");
+
+/// `FL_POSE_BODY`: 1 (the default) poses a man drawn at a body-only last
+/// level for his body alone, 0 poses him in full, 2 as 1 with the slots
+/// it leaves out filled with 1e30, to show any corner that reads one.
+/// Read once.
+fn pose_body_mode() -> u32 {
+    static MODE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| crate::util::env_or("FL_POSE_BODY", 1_u32).min(2))
 }
 
 const _: () = assert!(NUM_KINDS == 4, "BuildParams and PoseParams pack per-kind values in vec4s");
@@ -1436,6 +1455,9 @@ pub struct PullMeshGpu {
     pub shape: DrawShape,
     /// As `PullMesh::skinned`.
     pub skinned: bool,
+    /// Every corner is on the body, part 0: the vertex shader reads only
+    /// the pose slots `pose_begin` writes (unit_pose.wgsl `pose_write`).
+    pub body_only: bool,
 }
 
 /// How a bucket's level draws. `group` 0: expanded corners, one plain draw
@@ -1492,6 +1514,7 @@ fn extract_pull_meshes(
             bucket: mesh.bucket,
             shape,
             skinned: mesh.skinned,
+            body_only: mesh.corners.iter().all(|c| c.part < 0.5),
         });
     }
 }
@@ -1901,6 +1924,7 @@ pub(crate) fn prepare_gpu_units(
     gpu_buffers: Res<RenderAssets<GpuShaderBuffer>>,
     globals: Res<GlobalsBuffer>,
     pyramid: Res<crate::render_units_occlusion::UnitDepthPyramid>,
+    mut body_logged: Local<Option<UVec4>>,
 ) {
     if !input.enabled {
         return;
@@ -2042,10 +2066,24 @@ pub(crate) fn prepare_gpu_units(
     buffers.params.write_buffer(&device, &queue);
     buffers.threads = n as u32 + input.corpse_len.iter().sum::<u32>();
     buffers.pose_pass = input.pose_pass;
+    // Per kind, whether a man drawn at the last level is posed for his
+    // body alone: only where that level's mesh is uploaded and all body.
+    let mut body = [0u32; NUM_KINDS];
+    for mesh in &meshes {
+        if mesh.bucket % NUM_LODS == NUM_LODS - 1 && mesh.body_only {
+            body[mesh.bucket / NUM_LODS] = pose_body_mode();
+        }
+    }
+    let body = UVec4::from_array(body);
+    if *body_logged != Some(body) {
+        *body_logged = Some(body);
+        info!("unit pose: the last level posed for the body alone per kind {:?}", body.to_array());
+    }
     buffers.pose_params.set(PoseParams {
         src_base: UVec4::from_array(alloc.pose_src_base),
         stride: UVec4::from_array(alloc.pose_stride),
         cap: UVec4::from_array(alloc.pose_cap),
+        body,
     });
     buffers.pose_params.write_buffer(&device, &queue);
 
