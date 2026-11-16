@@ -50,7 +50,7 @@ struct VertexOutput {
     // colour, times the sun and the sky. a = the sun's share of that
     // light, the part the shadow takes away. Under UNIT_LIGHT_FLAT each
     // triangle takes it from its first vertex, which carries the
-    // triangle's normal (render_units_gpu.rs `weld`).
+    // triangle's three corner normals (render_units_gpu.rs `weld`).
 #ifdef UNIT_LIGHT_FLAT
     @location(0) @interpolate(flat, first) color: vec4<f32>,
 #else
@@ -205,7 +205,19 @@ fn vertex_pull(@builtin(vertex_index) index: u32, @builtin(instance_index) insta
     let inst = pull_records[entry & 0x1fffffffu];
     pose_begin(inst.pos_scale, inst.color, inst.anim, inst.anim2, globals.time, false);
 #endif
+#ifdef UNIT_LIGHT_FLAT
+    // The normal field holds the triangle's three corner normals
+    // (render_units_gpu.rs `pack_normals`), each turned with this corner's
+    // pose. A part-posed level's triangle lies on one part, so that is its
+    // corners' own turn; on a skinned level the other two corners' joints
+    // can differ a little, and their normals take this corner's turn.
+    let words = bitcast<vec3<u32>>(v.normal);
+    let placed = place(v.position, oct_decode(words.x), v.part, v.pivot, v.skin, v.weight);
+    let second = place(v.position, oct_decode(words.y), v.part, v.pivot, v.skin, v.weight).normal;
+    let third = place(v.position, oct_decode(words.z), v.part, v.pivot, v.skin, v.weight).normal;
+#else
     let placed = place(v.position, v.normal, v.part, v.pivot, v.skin, v.weight);
+#endif
 #ifdef UNIT_BOUND_CHECK
     measure_reach(placed.position);
 #endif
@@ -243,6 +255,14 @@ fn vertex_pull(@builtin(vertex_index) index: u32, @builtin(instance_index) insta
         team.w,
         unpack2x16unorm(v.atlas_uv),
     );
+#ifdef UNIT_LIGHT_FLAT
+    // The triangle's light is the mean of its three corners' lights, the
+    // mean the blended corner light gives it.
+    let light = (sky_and_sun(normalize(placed.normal)) + sky_and_sun(normalize(second))
+        + sky_and_sun(normalize(third))) / 3.0;
+    let base = mix(v_color.rgb, rgb, v_color.a);
+    out.color = vec4<f32>(base * (light.x + light.y), light.y / (light.x + light.y));
+#endif
 #ifdef UNIT_BOUND_CHECK
     // A soldier the occlusion test hid draws flat magenta (unit_build.wgsl
     // `occlusion`).
@@ -294,10 +314,11 @@ fn unit_output(
     // hemispheric ambient brighter from above, at the corner's normal
     // turned with the pose in `place`. Most triangles of the model files
     // have different normals at their corners, so the light is blended
-    // across the face, except under UNIT_LIGHT_FLAT.
+    // across the face, except under UNIT_LIGHT_FLAT (`vertex_pull`).
     let n = normalize(normal);
-    let sky = 0.30 + 0.20 * (0.5 + 0.5 * n.y);
-    let direct = 0.65 * max(dot(n, sun.direction_to_light.xyz), 0.0);
+    let light = sky_and_sun(n);
+    let sky = light.x;
+    let direct = light.y;
     // Part material blended with the team color (a = team amount), lit.
     // The fragment takes the shadow off the sun's share, then the hit
     // flash lerps toward white and death darkens.
@@ -314,6 +335,25 @@ fn unit_output(
     out.atlas_uv = atlas_uv;
 #endif
     return out;
+}
+
+// The light at a unit normal: x the hemispheric sky, brighter from above,
+// y the sun's Lambert term.
+fn sky_and_sun(n: vec3<f32>) -> vec2<f32> {
+    let sky = 0.30 + 0.20 * (0.5 + 0.5 * n.y);
+    let direct = 0.65 * max(dot(n, sun.direction_to_light.xyz), 0.0);
+    return vec2<f32>(sky, direct);
+}
+
+// A unit direction from its octahedral word: x and y of the projection as
+// unorm16 (render_units_gpu.rs `oct_encode`).
+fn oct_decode(word: u32) -> vec3<f32> {
+    let p = unpack2x16unorm(word) * 2.0 - 1.0;
+    var n = vec3<f32>(p.x, p.y, 1.0 - abs(p.x) - abs(p.y));
+    let t = max(-n.z, 0.0);
+    n.x += select(t, -t, n.x >= 0.0);
+    n.y += select(t, -t, n.y >= 0.0);
+    return normalize(n);
 }
 
 // Depth along the camera's view axis, negative in front of it.
