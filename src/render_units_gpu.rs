@@ -1188,6 +1188,14 @@ fn flat_light_levels() -> [bool; NUM_LODS] {
     *SET.get_or_init(|| level_set("FL_FLAT_LIGHT"))
 }
 
+/// `FL_ATLAS_POINT=<levels>`: the levels that sample one atlas point per
+/// triangle, its centroid's, where the file gives each corner its own.
+/// Read once, at load.
+fn atlas_point_levels() -> [bool; NUM_LODS] {
+    static SET: std::sync::OnceLock<[bool; NUM_LODS]> = std::sync::OnceLock::new();
+    *SET.get_or_init(|| level_set("FL_ATLAS_POINT"))
+}
+
 /// The normal a triangle is lit by under `FL_FLAT_LIGHT`: its three corner
 /// normals summed and normalized, or, where they cancel, the normal of its
 /// face at rest.
@@ -1462,7 +1470,20 @@ impl PullMesh {
             weight: skin.map_or(0.0, |s| s[i][1]),
         };
         let indices = mesh.indices()?;
-        let corners: Vec<PullVertex> = indices.iter().map(vertex).collect();
+        let mut corners: Vec<PullVertex> = indices.iter().map(vertex).collect();
+        // Under FL_ATLAS_POINT a level that interpolates its atlas then
+        // welds as a flat-atlas level.
+        let interpolated = corners
+            .chunks(3)
+            .any(|t| t[1].atlas_uv != t[0].atlas_uv || t[2].atlas_uv != t[0].atlas_uv);
+        if interpolated && atlas_point_levels()[bucket % NUM_LODS] {
+            let list: Vec<usize> = indices.iter().collect();
+            for (t, tri) in corners.chunks_mut(3).enumerate() {
+                let centroid: Vec2 = list[3 * t..3 * t + 3].iter().map(|&i| Vec2::from(atlas_uv[i])).sum();
+                let point = pack_unorm16((centroid / 3.0).into());
+                tri.iter_mut().for_each(|c| c.atlas_uv = point);
+            }
+        }
         let indexed = if welded_levels() {
             let m = weld(&corners, flat_light_levels()[bucket % NUM_LODS]);
             info!(
