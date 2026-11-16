@@ -173,14 +173,15 @@ pub struct LodConfig {
 impl Default for LodConfig {
     /// FL_LOD=0 draws everything at L0 (the pre-LOD renderer, for A/B
     /// checks). FL_LOD_PX=a,b,c overrides the thresholds, as soldier
-    /// heights in pixels, for feel passes.
+    /// heights in pixels, for feel passes, and `FL_LOD_PX=0` keeps the
+    /// defaults; `FL_PERF=2` sets it (util.rs `perf_str`).
     fn default() -> Self {
         let mut px: [[f32; NUM_LODS - 1]; crate::unit_types::NUM_KINDS] =
             std::array::from_fn(|kind| {
                 let height = 2.0 * crate::unit_types::half_height(kind);
                 LOD_PX_PER_M.map(|per_m| per_m * height)
             });
-        if let Ok(v) = std::env::var("FL_LOD_PX") {
+        if let Some(v) = crate::util::perf_str("FL_LOD_PX").filter(|v| v.trim() != "0") {
             let parsed: Vec<f32> = v.split(',').filter_map(|t| t.trim().parse().ok()).collect();
             match <[f32; NUM_LODS - 1]>::try_from(parsed) {
                 Ok(p) => px = [p; crate::unit_types::NUM_KINDS],
@@ -314,13 +315,14 @@ pub(crate) fn fallen_far() -> bool {
 /// `FL_FALLEN_COARSE`: 1 draws a body whose plain level is 1 or 2 one
 /// level coarser and a level-0 body at his own level, since near the
 /// camera the coarser body is plainly cruder; 2 draws every body one level
-/// coarser, the last level at most, for measuring; 0, the default, none.
+/// coarser, the last level at most, for measuring; 0, the default, none
+/// (`FL_PERF` can set it, util.rs `perf_or`).
 /// A look change. A body casts by his plain level, and a casting body is
 /// posed for it. With `FL_FALLEN_FAR` on too, a level-2 body draws at
 /// level 3 as with this alone. Read once.
 pub(crate) fn fallen_coarse() -> u32 {
     static MODE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| crate::util::env_or("FL_FALLEN_COARSE", 0_u32).min(2))
+    *MODE.get_or_init(|| crate::util::perf_or("FL_FALLEN_COARSE", 0_u32).min(2))
 }
 
 /// Per-kind corpse cap (ring-buffered: oldest bodies fade from the field).

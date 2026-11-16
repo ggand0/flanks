@@ -97,11 +97,15 @@ impl Default for ShadowReceiveLevels {
 }
 
 /// `FL_RECEIVE_LODS=n`: only the levels below n receive the sun's
-/// shadow, on top of the distance rule of `ShadowReceiveLevels`. Unset,
-/// every level the distance rule lets in. Read once.
+/// shadow, on top of the distance rule of `ShadowReceiveLevels`. Unset or
+/// 0, every level the distance rule lets in. `FL_PERF` can set it (util.rs
+/// `perf_or`). Read once.
 fn receive_lods() -> usize {
     static BELOW: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *BELOW.get_or_init(|| crate::util::env_or("FL_RECEIVE_LODS", NUM_LODS))
+    *BELOW.get_or_init(|| match crate::util::perf_or("FL_RECEIVE_LODS", NUM_LODS) {
+        0 => NUM_LODS,
+        n => n,
+    })
 }
 
 #[allow(clippy::type_complexity)] // bevy system params

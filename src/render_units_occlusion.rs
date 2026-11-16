@@ -113,7 +113,7 @@ pub fn lod_hidden() -> LodHidden {
     static CFG: std::sync::OnceLock<LodHidden> = std::sync::OnceLock::new();
     *CFG.get_or_init(|| {
         let cfg = LodHidden {
-            mode: crate::util::env_or("FL_LOD_HIDDEN", 0_u32).min(3),
+            mode: crate::util::perf_or("FL_LOD_HIDDEN", 0_u32).min(3),
             top: crate::util::env_or("FL_LOD_HIDDEN_TOP", 1.0_f32).max(0.2),
             half: crate::util::env_or("FL_LOD_HIDDEN_HALF", 0.15_f32).max(0.01),
             hold: crate::util::env_or("FL_LOD_HIDDEN_HOLD", 96_u32).clamp(1, 255),
