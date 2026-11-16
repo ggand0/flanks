@@ -481,7 +481,7 @@ fn import(kind: usize, path: &Path, pulled: bool) -> Fallible<KindMeshes> {
     let last = NUM_LODS - 1;
     let mut cast_last = None;
     if l3_light() && !pulled && kind == 0 {
-        warn!("FL_L3_LIGHT: the light last level draws only on the GPU path, the file's last level stands");
+        warn!("FL_L3_LIGHT: the light last level draws only on the GPU path; drawing the file's last level");
     }
     let light_last = l3_light() && pulled && levels[last].is_some();
     if light_last && let Some(file) = levels[last].take() {

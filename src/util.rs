@@ -38,15 +38,17 @@ pub fn env_or<T: std::str::FromStr + Copy>(key: &str, default: T) -> T {
         .unwrap_or(default)
 }
 
-/// `FL_PERF`: sets of look switches to try with one variable. Each switch
-/// reads its own variable first; only where that is unset does the set give
-/// its value, so `FL_PERF=2 FL_FLAT_LIGHT=23` is set 2 with set 1's flat
-/// light.
+/// `FL_PERF`: sets of switches that trade picture detail for frame time,
+/// turned on with one variable. Each switch reads its own variable first;
+/// only where that is unset does the chosen set give its value, so
+/// `FL_PERF=2 FL_FLAT_LIGHT=23` is set 2 with set 1's flat light.
 ///
 /// - `FL_PERF=1`: `FL_LOD_HIDDEN=1 FL_FALLEN_COARSE=1 FL_RECEIVE_LODS=1
 ///   FL_FLAT_LIGHT=23`
 /// - `FL_PERF=2`: as 1 with `FL_FLAT_LIGHT=123` and the level thresholds
-///   at 36, 16 and 3 px per metre of height, `FL_LOD_PX=61.2,27.2,5.1`
+///   at soldier heights of 61.2, 27.2 and 5.1 px for every kind,
+///   `FL_LOD_PX=61.2,27.2,5.1` (about 36, 16 and 3 px per metre for a
+///   1.7 m soldier)
 ///
 /// Unset or 0: none.
 const PERF_SETS: [&[(&str, &str)]; 2] = [

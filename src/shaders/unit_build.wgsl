@@ -1004,7 +1004,7 @@ fn build_corpse(j: u32, t: u32) {
     let lod = level(params.bands[kind * 3u + 2u], d2);
     // FL_FALLEN_FAR: a far body draws at the last level. FL_FALLEN_COARSE:
     // 1 a body past level 0 draws a level coarser, 2 every body, the last
-    // level at most. He casts by his plain level.
+    // level at most. He casts by the level his distance gives him, `lod`.
     var draw_lod = lod;
     if (params.lod_hidden.z & 1u) != 0u && lod == NUM_LODS - 2u {
         draw_lod = NUM_LODS - 1u;
@@ -1026,7 +1026,7 @@ fn build_corpse(j: u32, t: u32) {
     if !visible && casts == 0u {
         return;
     }
-    // A casting body is posed for his plain level, as his shadow needs
+    // A casting body is posed for his distance level, as his shadow needs
     // (`build_soldier`).
     let entry = list_entry(kind, ridx, select(draw_lod, lod, casts != 0u));
     if visible {

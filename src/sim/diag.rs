@@ -179,8 +179,8 @@ if let Some(every) = hash_every
 
 /// Name any tick that blows past the norm, with its component costs:
 /// lag hunting works on facts. The audit runs in the job after the step,
-/// outside the step's time and the threshold; an audit tick shows its
-/// fresh cost next to them.
+/// outside the step's time and the threshold; on an audit tick the line
+/// also prints the audit's time in the job.
 pub(super) fn spike_line(stats: &SimStats, tick: u32, units: usize) {
 if stats.step_ms + stats.grid_ms > 14.0 {
     info!(
