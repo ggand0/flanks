@@ -1207,6 +1207,7 @@ fn queue_custom(
     let draw_unit = unit_draw_functions.read().id::<DrawCustom>();
     let lod_debug = gpu_input.as_ref().is_some_and(|g| g.lod_debug);
     let pose_pass = gpu_input.as_ref().is_some_and(|g| g.pose_pass);
+    let soft_lods = crate::render_units_shadow::soft_shadow_lods();
 
     for view in &views {
         let Some(transparent_phase) = transparent_render_phases.get_mut(&view.retained_view_entity)
@@ -1231,11 +1232,18 @@ fn queue_custom(
             let Some(mesh) = meshes.get(mesh_instance.mesh_asset_id()) else {
                 continue;
             };
-            let key = view_key
+            let mut key = view_key
                 | MeshPipelineKey::from_primitive_topology_and_strip_index(
                     mesh.primitive_topology(),
                     mesh.index_format(),
                 );
+            // A level from FL_SHADOW_SOFT_LODS on looks up the sun's
+            // shadow with one 2x2 tap, the filter value 0. `remove` clears
+            // only these bits: the key's complement would also drop the
+            // bits that are no named flag, the primitive topology among them.
+            if bucket.is_some_and(|b| b.0 % NUM_LODS >= soft_lods) {
+                key.remove(MeshPipelineKey::SHADOW_FILTER_METHOD_RESERVED_BITS);
+            }
             let pipeline = match pull_mesh {
                 // GPU mode: the pulled variant, no vertex buffers.
                 Some(pull_mesh) => pull_pipelines.specialize(
