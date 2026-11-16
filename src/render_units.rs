@@ -1638,6 +1638,7 @@ impl PullPipelineKey {
             skinned: pull_mesh.skinned && pull_mesh.bucket % NUM_LODS < crate::render_units_gpu::SKEL_LODS,
             shape: DrawShape {
                 flat_atlas: false,
+                flat_light: false,
                 ..pull_mesh.shape
             },
         }
@@ -1730,6 +1731,12 @@ impl SpecializedRenderPipeline for CustomPipeline {
             descriptor.vertex.shader_defs.push("UNIT_ATLAS_FLAT".into());
             if let Some(fragment) = descriptor.fragment.as_mut() {
                 fragment.shader_defs.push("UNIT_ATLAS_FLAT".into());
+            }
+        }
+        if key.shape.flat_light {
+            descriptor.vertex.shader_defs.push("UNIT_LIGHT_FLAT".into());
+            if let Some(fragment) = descriptor.fragment.as_mut() {
+                fragment.shader_defs.push("UNIT_LIGHT_FLAT".into());
             }
         }
         atlas_defs(&mut descriptor, key.atlas);
