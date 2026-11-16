@@ -166,10 +166,13 @@ pub struct OverlayPlugin;
 
 impl Plugin for OverlayPlugin {
     fn build(&self, app: &mut App) {
-        app.add_plugins((
-            FrameTimeDiagnosticsPlugin::default(),
-            RenderDiagnosticsPlugin,
-        ))
+        // FL_RENDER_DIAG=0: no GPU pass timings and counters, for measuring
+        // what recording them costs. The periodic log then has no `gpu`
+        // lines; the passes record into nothing (their recorder is None).
+        if crate::util::env_or("FL_RENDER_DIAG", 1_u32) != 0 {
+            app.add_plugins(RenderDiagnosticsPlugin);
+        }
+        app.add_plugins(FrameTimeDiagnosticsPlugin::default())
             .add_systems(Startup, (spawn_overlay, spawn_stats_line, spawn_inspect_panel))
             .add_systems(
                 OnEnter(crate::game_state::GameState::Battle),
