@@ -187,8 +187,9 @@ struct Params {
     // FL_LOD_HIDDEN (render_units_occlusion.rs): x the mode (0 off, 1 the
     // held level 2, 2 also level 1, 3 also level 0), y the hold
     // (`body_state`), w the frames since the last frame with a pyramid, the
-    // step of each man's count. z 1 under FL_FALLEN_FAR (render_units.rs
-    // `fallen_far`): a body at level 2 draws at level 3.
+    // step of each man's count. z bit 0 under FL_FALLEN_FAR (render_units.rs
+    // `fallen_far`): a body at level 2 draws at level 3; bit 1 under
+    // FL_FALLEN_COARSE (`fallen_coarse`): every body draws a level coarser.
     lod_hidden: vec4<u32>,
     // The body box: x its half-width, y its top above his feet, z its
     // bottom above his feet, in metres.
@@ -1000,11 +1001,15 @@ fn build_corpse(j: u32, t: u32) {
     let d = position - params.cam_pos;
     let d2 = dot(d, d) * jitter * jitter;
     let lod = level(params.bands[kind * 3u + 2u], d2);
-    // FL_FALLEN_FAR: a far body draws at the last level. He casts by his
-    // plain level, and level 2 casts nothing.
+    // FL_FALLEN_FAR: a far body draws at the last level. FL_FALLEN_COARSE:
+    // every body draws a level coarser, the last level at most. He casts by
+    // his plain level.
     var draw_lod = lod;
-    if params.lod_hidden.z != 0u && lod == NUM_LODS - 2u {
+    if (params.lod_hidden.z & 1u) != 0u && lod == NUM_LODS - 2u {
         draw_lod = NUM_LODS - 1u;
+    }
+    if (params.lod_hidden.z & 2u) != 0u {
+        draw_lod = min(lod + 1u, NUM_LODS - 1u);
     }
     let in_view = !culled(position);
     var occl = DRAWN;
@@ -1019,7 +1024,9 @@ fn build_corpse(j: u32, t: u32) {
     if !visible && casts == 0u {
         return;
     }
-    let entry = list_entry(kind, ridx, draw_lod);
+    // A casting body is posed for his plain level, as his shadow needs
+    // (`build_soldier`).
+    let entry = list_entry(kind, ridx, select(draw_lod, lod, casts != 0u));
     if visible {
         let bucket = kind * NUM_LODS + draw_lod;
         atomicAdd(&counts[16u + bucket], 1u);

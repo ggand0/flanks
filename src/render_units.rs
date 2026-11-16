@@ -311,6 +311,16 @@ pub(crate) fn fallen_far() -> bool {
     *ON.get_or_init(|| crate::util::env_or("FL_FALLEN_FAR", 0_u32) != 0)
 }
 
+/// `FL_FALLEN_COARSE=1`: every body draws one level coarser than his
+/// plain level, the last level at most. A look change, off by default.
+/// He casts by his plain level, and a casting body is posed for it. With
+/// `FL_FALLEN_FAR` on too, a level-2 body draws at level 3 as with this
+/// alone. Read once.
+pub(crate) fn fallen_coarse() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::util::env_or("FL_FALLEN_COARSE", 0_u32) != 0)
+}
+
 /// Per-kind corpse cap (ring-buffered: oldest bodies fade from the field).
 pub const CORPSE_CAP: usize = 25_000;
 
