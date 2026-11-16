@@ -558,7 +558,9 @@ fn setup_unit_mesh(
             let bucket = InstanceBucket(bucket_of(kind, lod));
             // GPU mode: the bucket also carries its expanded mesh for the
             // pulled draw. Its instance data stays, and stays empty.
-            let pulled = pull_mesh_for(&mesh, &bucket, &gpu);
+            let last = lod == NUM_LODS - 1;
+            let cast_source = model.cast_last.as_ref().filter(|_| last);
+            let pulled = pull_mesh_for(&mesh, &bucket, &gpu, cast_source, last && model.light_last);
             let mut entity = commands.spawn((
                 Mesh3d(meshes.add(mesh)),
                 InstanceMaterialData::default(),
@@ -1633,6 +1635,7 @@ impl PullPipelineKey {
             shape: DrawShape {
                 flat_atlas: false,
                 flat_light: false,
+                light_level: false,
                 ..pull_mesh.cast_shape
             },
         }
@@ -1732,6 +1735,9 @@ impl SpecializedRenderPipeline for CustomPipeline {
             if let Some(fragment) = descriptor.fragment.as_mut() {
                 fragment.shader_defs.push("UNIT_LIGHT_FLAT".into());
             }
+        }
+        if key.shape.light_level {
+            descriptor.vertex.shader_defs.push("UNIT_LIGHT_LEVEL".into());
         }
         atlas_defs(&mut descriptor, key.atlas);
         receive_defs(&mut descriptor, key.receive);
