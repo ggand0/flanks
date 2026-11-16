@@ -823,11 +823,18 @@ fn ground_texture(assets: &AssetServer, path: &'static str) -> Handle<Image> {
             settings.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
                 address_mode_u: address_mode,
                 address_mode_v: address_mode,
-                anisotropy_clamp: 8,
+                anisotropy_clamp: ground_anisotropy(),
                 ..ImageSamplerDescriptor::linear()
             });
         })
         .load(path)
+}
+
+/// The ground textures' anisotropy clamp: 8, or `FL_GROUND_ANISO` from 1
+/// to 16, for measuring. Read once.
+fn ground_anisotropy() -> u16 {
+    static N: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
+    *N.get_or_init(|| crate::util::env_or("FL_GROUND_ANISO", 8_u16).clamp(1, 16))
 }
 
 fn ground_base() -> StandardMaterial {
