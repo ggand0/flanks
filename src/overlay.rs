@@ -166,9 +166,11 @@ pub struct OverlayPlugin;
 
 impl Plugin for OverlayPlugin {
     fn build(&self, app: &mut App) {
-        // FL_RENDER_DIAG=0: no GPU pass timings and counters, for measuring
-        // what recording them costs. The periodic log then has no `gpu`
-        // lines; the passes record into nothing (their recorder is None).
+        // FL_RENDER_DIAG=0: no Bevy GPU pass timings and counters, for
+        // measuring what recording them costs; those passes record into
+        // nothing (their recorder is None). With shadows on, the periodic
+        // log still prints `render/sun_shadows/elapsed_gpu`, which has its
+        // own timer (render_units_shadow.rs `ShadowPassTimer`).
         if crate::util::env_or("FL_RENDER_DIAG", 1_u32) != 0 {
             app.add_plugins(RenderDiagnosticsPlugin);
         }
