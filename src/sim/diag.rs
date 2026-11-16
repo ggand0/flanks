@@ -37,26 +37,47 @@ pub(super) fn log_step(stats: &mut SimStats, step_ms: f32, grid_ms: f32, units: 
 /// then added, so the size is part of its numbers and stays as it is.
 const AUDIT_CHUNK: usize = 16_384;
 
-/// The overlap and movement audit over the full population: the
-/// smallest and mean nearest-neighbour distance and the mean per-tick
-/// displacement, for the overlay. Parallel over chunks.
-pub(super) fn neighbour_audit(stats: &mut SimStats, grid: &SpatialGrid, pos: &[Vec3], pos_prev: &[Vec3]) {
-{
+/// The overlap and movement audit over the full population runs on the
+/// ticks whose number after the install is a multiple of 60, every 2 s.
+pub(super) fn audit_tick(tick_after_install: u32) -> bool {
+    tick_after_install.is_multiple_of(60)
+}
+
+/// The neighbour half of the audit, from the tick job: per chunk of
+/// `AUDIT_CHUNK` men, the smallest squared nearest-neighbour distance,
+/// the sum of the nearest-neighbour distances and how many men had a
+/// neighbour; and the time it took.
+pub(crate) struct NeighbourSums {
+    partials: Vec<(f32, f64, u64)>,
+    ms: f32,
+    /// The address of the positions they were taken from.
+    positions: usize,
+}
+
+impl NeighbourSums {
+    /// Taken from these very positions: the install made the job's start
+    /// positions `pos_prev` without a copy, so nothing wrote them since.
+    pub(super) fn of(&self, pos_prev: &[Vec3]) -> bool {
+        self.positions == pos_prev.as_ptr() as usize
+    }
+}
+
+/// The nearest neighbour of every man at the tick's start, from the grid
+/// built of those positions, in parallel over chunks. Runs at the end of
+/// the tick job (`run_tick_job`), so its scope is `sim_scope`.
+pub(super) fn neighbour_sums(grid: &SpatialGrid, pos_prev: &[Vec3]) -> NeighbourSums {
     let _span = info_span!("nn_audit").entered();
-    let audit_t0 = Instant::now();
-    let pos_now = pos;
-    let partials: Vec<(f32, f64, u64, f64)> = ComputeTaskPool::get().scope(|scope| {
+    let t0 = Instant::now();
+    let partials: Vec<(f32, f64, u64)> = crate::util::sim_scope(|scope| {
         for (ci, chunk) in pos_prev.chunks(AUDIT_CHUNK).enumerate() {
             let start = ci * AUDIT_CHUNK;
             scope.spawn(async move {
                 let mut min_d2 = f32::MAX;
                 let mut sum_d = 0.0f64;
                 let mut counted = 0u64;
-                let mut sum_disp = 0.0f64;
                 for (j, p) in chunk.iter().enumerate() {
                     let i = start + j;
                     let p2 = p.xz();
-                    sum_disp += p2.distance(pos_now[i].xz()) as f64;
                     let mut best = f32::MAX;
                     grid.for_each_candidate(p2, crate::sim::soldier::SEP_RADIUS, |o| {
                         if o.idx as usize != i {
@@ -69,14 +90,41 @@ pub(super) fn neighbour_audit(stats: &mut SimStats, grid: &SpatialGrid, pos: &[V
                         counted += 1;
                     }
                 }
-                (min_d2, sum_d, counted, sum_disp)
+                (min_d2, sum_d, counted)
             });
         }
     });
+    NeighbourSums {
+        partials,
+        ms: t0.elapsed().as_secs_f32() * 1000.0,
+        positions: pos_prev.as_ptr() as usize,
+    }
+}
+
+/// The audit's numbers for the overlay: the job's neighbour sums, and the
+/// mean per-tick displacement, taken here because it reads the positions
+/// after the damage apply's shoves. The displacement is summed per chunk
+/// of `AUDIT_CHUNK` men like the neighbour sums. `audit_ms` is the
+/// neighbour half's time in the job.
+pub(super) fn audit_stats(stats: &mut SimStats, sums: &NeighbourSums, pos: &[Vec3], pos_prev: &[Vec3]) {
+    let pos_now = pos;
+    let disp: Vec<f64> = ComputeTaskPool::get().scope(|scope| {
+        for (ci, chunk) in pos_prev.chunks(AUDIT_CHUNK).enumerate() {
+            let start = ci * AUDIT_CHUNK;
+            scope.spawn(async move {
+                let mut sum_disp = 0.0f64;
+                for (j, p) in chunk.iter().enumerate() {
+                    sum_disp += p.xz().distance(pos_now[start + j].xz()) as f64;
+                }
+                sum_disp
+            });
+        }
+    });
+    let partials = &sums.partials;
     let min_d2 = partials.iter().fold(f32::MAX, |m, p| m.min(p.0));
     let sum_d: f64 = partials.iter().map(|p| p.1).sum();
     let counted: u64 = partials.iter().map(|p| p.2).sum();
-    let sum_disp: f64 = partials.iter().map(|p| p.3).sum();
+    let sum_disp: f64 = disp.iter().copied().sum();
     stats.nn_min = min_d2.sqrt();
     stats.nn_avg = if counted > 0 {
         (sum_d / counted as f64) as f32
@@ -84,9 +132,7 @@ pub(super) fn neighbour_audit(stats: &mut SimStats, grid: &SpatialGrid, pos: &[V
         0.0
     };
     stats.move_avg = (sum_disp / pos_prev.len().max(1) as f64) as f32;
-    stats.audit_ms = audit_t0.elapsed().as_secs_f32() * 1000.0;
-}
-
+    stats.audit_ms = sums.ms;
 }
 
 /// FL_HASH: an FNV-1a fingerprint of the sim state on a fixed tick
@@ -132,17 +178,17 @@ if let Some(every) = hash_every
 }
 
 /// Name any tick that blows past the norm, with its component costs:
-/// lag hunting works on facts. The audit runs every 60 ticks, so an
-/// audit tick shows its fresh cost here.
+/// lag hunting works on facts. The audit runs in the job after the step,
+/// outside the step's time and the threshold; an audit tick shows its
+/// fresh cost next to them.
 pub(super) fn spike_line(stats: &SimStats, tick: u32, units: usize) {
-let audit_now = tick.is_multiple_of(60);
-if stats.step_ms + stats.grid_ms + if audit_now { stats.audit_ms } else { 0.0 } > 14.0 {
+if stats.step_ms + stats.grid_ms > 14.0 {
     info!(
         "[spike] step {:.1} + grid {:.1}{} ms ({} damage events, {} units)",
         stats.step_ms,
         stats.grid_ms,
-        if audit_now {
-            format!(" + AUDIT {:.1}", stats.audit_ms)
+        if audit_tick(tick) {
+            format!(" (audit in the job {:.1})", stats.audit_ms)
         } else {
             String::new()
         },
