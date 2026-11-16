@@ -1204,16 +1204,26 @@ fn atlas_point_levels() -> [bool; NUM_LODS] {
     *SET.get_or_init(|| level_set("FL_ATLAS_POINT"))
 }
 
-/// The normal a triangle is lit by under `FL_FLAT_LIGHT`: its three corner
-/// normals summed and normalized, or, where they cancel, the normal of its
-/// face at rest.
-fn light_normal(t: &[PullVertex]) -> [f32; 3] {
-    let sum: Vec3 = t.iter().map(|c| Vec3::from(c.normal)).sum();
-    if sum.length() >= 1e-3 {
-        return sum.normalize().into();
-    }
-    let p = t.iter().map(|c| Vec3::from(c.position)).collect::<Vec<_>>();
-    (p[1] - p[0]).cross(p[2] - p[0]).normalize_or(Vec3::Y).into()
+/// A unit direction in 32 bits: its octahedral projection, x and y as
+/// unorm16 (unit_instancing.wgsl `oct_decode`). A zero direction packs as
+/// up.
+fn oct_encode(n: [f32; 3]) -> u32 {
+    let n = Vec3::from(n).normalize_or(Vec3::Y);
+    let p = Vec2::new(n.x, n.y) / (n.x.abs() + n.y.abs() + n.z.abs());
+    let p = if n.z < 0.0 {
+        let sign = Vec2::new(if p.x >= 0.0 { 1.0 } else { -1.0 }, if p.y >= 0.0 { 1.0 } else { -1.0 });
+        (Vec2::ONE - Vec2::new(p.y.abs(), p.x.abs())) * sign
+    } else {
+        p
+    };
+    pack_unorm16((p * 0.5 + 0.5).into())
+}
+
+/// The three corner normals a provoking vertex carries under
+/// `FL_FLAT_LIGHT`, in its 12-byte normal field as three `oct_encode`
+/// words, the provoking corner's own first.
+fn pack_normals(n: [[f32; 3]; 3]) -> [f32; 3] {
+    n.map(|n| f32::from_bits(oct_encode(n)))
 }
 
 /// Corners per vertex from which a level draws indexed under
@@ -1265,14 +1275,16 @@ fn welded_levels() -> bool {
 /// L2) under a 16-entry cache.
 ///
 /// With `flat_light` (`FL_FLAT_LIGHT`) a flat-atlas level's provoking vertex
-/// also carries the triangle's normal (`light_normal`), the triangle takes
-/// the light of that vertex alone (`@interpolate(flat, first)`), and the
-/// normal leaves the weld: every vertex then starts one triangle. The other
-/// corners keep a normal of one of the triangles they sit on, which only
-/// offsets where the sun's shadow is sampled. The vertex colour leaves the
-/// weld too and rides on the provoking vertex, the corner of the triangle
-/// it stands for, since the lit colour is taken from that vertex alone: a
-/// corner of the light last level touches faces of three colours.
+/// also carries the triangle's three corner normals (`pack_normals`), the
+/// triangle takes the mean of their three lights, computed at that vertex
+/// alone (`@interpolate(flat, first)`), so it keeps the mean brightness the
+/// blended corner light gives it, and the normal leaves the weld: every
+/// vertex then starts one triangle. The other corners that reuse the vertex
+/// take its first normal, which only offsets where the sun's shadow is
+/// sampled. The vertex colour leaves the weld too and rides on the
+/// provoking vertex, the corner of the triangle it stands for, since the
+/// lit colour is taken from that vertex alone: a corner of the light last
+/// level touches faces of three colours.
 fn weld(corners: &[PullVertex], flat_light: bool) -> IndexedMesh {
     let flat_atlas = corners
         .chunks(3)
@@ -1330,8 +1342,15 @@ fn weld(corners: &[PullVertex], flat_light: bool) -> IndexedMesh {
             provokes[first as usize] = true;
             vertices[first as usize].atlas_uv = atlas;
             if flat_light {
-                vertices[first as usize].normal = light_normal(&corners[3 * t..3 * t + 3]);
+                let corner = |j: usize| corners[3 * t + (k + j) % 3].normal;
+                vertices[first as usize].normal = pack_normals([corner(0), corner(1), corner(2)]);
                 vertices[first as usize].color = corners[3 * t + k].color;
+            }
+        }
+        // A vertex that starts no triangle keeps its own normal, packed.
+        if flat_light {
+            for (v, _) in vertices.iter_mut().zip(&provokes).filter(|(_, p)| !**p) {
+                v.normal = pack_normals([v.normal; 3]);
             }
         }
     } else {
@@ -2773,6 +2792,33 @@ mod tests {
         firsts.sort();
         firsts.dedup();
         assert_eq!(firsts.len(), per / 3);
+    }
+
+    /// The octahedral normal words decode, as the shader does it, to within
+    /// 1e-3 of the directions packed.
+    #[test]
+    fn oct_normals_round_trip() {
+        let decode = |w: u32| -> Vec3 {
+            let p = Vec2::new((w & 0xffff) as f32, (w >> 16) as f32) / 65535.0 * 2.0 - Vec2::ONE;
+            let mut n = Vec3::new(p.x, p.y, 1.0 - p.x.abs() - p.y.abs());
+            let t = (-n.z).max(0.0);
+            n.x += if n.x >= 0.0 { -t } else { t };
+            n.y += if n.y >= 0.0 { -t } else { t };
+            n.normalize()
+        };
+        let mut worst = 0.0f32;
+        for i in 0..40 {
+            for j in 0..80 {
+                let theta = std::f32::consts::PI * (i as f32 + 0.5) / 40.0;
+                let phi = std::f32::consts::TAU * j as f32 / 80.0;
+                let n = Vec3::new(theta.sin() * phi.cos(), theta.sin() * phi.sin(), theta.cos());
+                worst = worst.max((decode(oct_encode(n.into())) - n).length());
+            }
+        }
+        for n in [Vec3::X, Vec3::Y, Vec3::Z, -Vec3::X, -Vec3::Y, -Vec3::Z] {
+            worst = worst.max((decode(oct_encode(n.into())) - n).length());
+        }
+        assert!(worst < 1e-3, "worst {worst}");
     }
 
     /// A level whose atlas coordinate varies across a triangle keeps it
