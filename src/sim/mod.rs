@@ -63,7 +63,7 @@ pub struct SimStats {
     pub step_ms: f32,
     /// Density splat + blur + contour (frontline.rs), per tick.
     pub field_ms: f32,
-    /// Last nn_audit sweep cost (runs every ~2 s).
+    /// Last neighbour audit's cost in the tick job (runs every 2 s).
     pub audit_ms: f32,
     /// Landed-swing events this tick (damage apply pass).
     pub events: usize,
@@ -395,6 +395,7 @@ fn run_tick_job(job: &mut TickJob) {
         plans,
         routes,
         nav,
+        audit,
         ..
     } = job;
 
@@ -665,6 +666,9 @@ fn run_tick_job(job: &mut TickJob) {
         }
         None => plans.clear(),
     }
+    // The neighbour audit's sums on its ticks, from this tick's grid and
+    // start positions; the tick count goes up by one at the install.
+    *audit = diag::audit_tick(tick.wrapping_add(1)).then(|| diag::neighbour_sums(grid, pos_prev));
 }
 
 #[allow(clippy::too_many_arguments)] // bevy system params
@@ -779,9 +783,17 @@ pub fn step_sim(
 
     pipeline.tick = pipeline.tick.wrapping_add(1);
     let tick = pipeline.tick;
-    if tick.is_multiple_of(60) {
+    let audit = job.audit.take();
+    if diag::audit_tick(tick) {
         let _frame_log = crate::frame_log::time_audit();
-        diag::neighbour_audit(&mut stats, &grid, &units.pos[..], &units.pos_prev[..]);
+        // The job's sums. When it left none (prepared under another tick
+        // count), or a write between the kick and the install made the
+        // start positions a copy, they are taken here from the same grid
+        // and these positions.
+        let sums = audit
+            .filter(|sums| sums.of(&units.pos_prev[..]))
+            .unwrap_or_else(|| diag::neighbour_sums(&grid, &units.pos_prev[..]));
+        diag::audit_stats(&mut stats, &sums, &units.pos[..], &units.pos_prev[..]);
     }
     diag::fingerprint(tick, &units);
     diag::spike_line(&stats, tick, units.pos.len());

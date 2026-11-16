@@ -131,7 +131,7 @@ pub fn time_step() -> Span {
     span(&STEP)
 }
 
-/// Times one `neighbour_audit`.
+/// Times the main thread's part of one neighbour audit (`audit_stats`).
 pub fn time_audit() -> Span {
     span(&AUDIT)
 }

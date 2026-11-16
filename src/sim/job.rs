@@ -231,6 +231,9 @@ pub struct TickJob {
     pub(crate) grid_ms: f32,
     pub(crate) step_ms: f32,
     pub(crate) field_ms: f32,
+    /// The neighbour audit's sums (sim/diag.rs), on the ticks it runs;
+    /// taken at the install.
+    pub(crate) audit: Option<crate::sim::diag::NeighbourSums>,
     // Routes (sim/route.rs): the plans asked for at prep, planned after
     // the kernel, and each regiment's route with the grid its men read.
     pub(crate) plan_requests: Vec<crate::sim::route::PlanJob>,
