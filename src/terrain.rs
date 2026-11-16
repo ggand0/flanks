@@ -995,8 +995,21 @@ fn spawn_chunk_meshes(
             if let Some(aabb) = aabb {
                 e.insert(aabb);
             }
+            if !terrain_casts() {
+                e.insert(bevy::light::NotShadowCaster);
+            }
         }
     }
+}
+
+/// `FL_TERRAIN_SHADOW=0`: the ground casts no sun shadow, for measuring
+/// what its share of the shadow maps costs. The ground still receives the
+/// shadows of the soldiers and the plants. The maps with walls or cliffs
+/// in the ground mesh (Obstacles, Town, River, Classic, the hills) need
+/// the ground to cast, so this is for the gentle maps. Read once.
+fn terrain_casts() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::util::env_or("FL_TERRAIN_SHADOW", 1_u32) != 0)
 }
 
 /// Central differences use the global grid, including across chunk boundaries.
