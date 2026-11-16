@@ -234,6 +234,11 @@ fn log_task_pools() {
     );
 }
 
+/// The sun's turn: it shines along its -Z, so toward the sun is its +Z.
+pub(crate) fn sun_rotation() -> Quat {
+    Quat::from_euler(EulerRot::YXZ, 0.7, -0.75, 0.0)
+}
+
 /// Sun; terrain chunks come from TerrainPlugin.
 fn setup_world(mut commands: Commands, settings: Res<settings::Settings>) {
     commands.spawn((
@@ -247,7 +252,7 @@ fn setup_world(mut commands: Commands, settings: Res<settings::Settings>) {
             ..default()
         },
         // Lowish sun: flat-shaded relief needs directional contrast.
-        Transform::from_rotation(Quat::from_euler(EulerRot::YXZ, 0.7, -0.75, 0.0)),
+        Transform::from_rotation(sun_rotation()),
         // Three cascades out to 280 m, split at 40 and 106 m. The first
         // covers the close-up, where a soldier's shadow at his feet needs
         // the finest texels. Soldiers stop casting at about 100 m, where
