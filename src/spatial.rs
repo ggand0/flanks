@@ -71,8 +71,10 @@ pub fn meta_group(meta: u32) -> usize {
     (meta >> META_GROUP_SHIFT) as usize
 }
 
-/// One unit in grid order: everything a neighbor query needs, in 16 bytes.
+/// One unit in grid order: everything a neighbor query needs, in 16 bytes,
+/// in this order (the scan's cut loads four f32 a man, `keep_run`).
 #[derive(Clone, Copy, Default)]
+#[repr(C)]
 pub struct SortedUnit {
     pub x: f32,
     pub z: f32,
@@ -310,6 +312,290 @@ impl SpatialGrid {
             }
         }
         false
+    }
+
+    /// How many units the cells `for_each_candidate` reads for `center`
+    /// and `radius` hold.
+    #[inline]
+    pub fn box_len(&self, center: Vec2, radius: f32) -> usize {
+        if self.dims.0 == 0 {
+            return 0;
+        }
+        let (cx0, cy0) = self.cell_coords(center - radius);
+        let (cx1, cy1) = self.cell_coords(center + radius);
+        let mut men = 0;
+        for cy in cy0..=cy1 {
+            let row = cy * self.dims.0;
+            men += (self.starts[row + cx1 + 1] - self.starts[row + cx0]) as usize;
+        }
+        men
+    }
+
+    /// Every unit in grid order: his rank is his slot here.
+    #[inline]
+    pub fn sorted(&self) -> &[SortedUnit] {
+        &self.sorted
+    }
+
+    /// The tick-start ground velocity of the unit at rank `r`.
+    #[inline]
+    pub fn sorted_vel(&self, r: usize) -> Vec2 {
+        self.sorted_vel[r]
+    }
+
+    /// The scan's cut over its walk (sim/soldier.rs `scan`): the walk
+    /// visits the units of the cells `for_each_candidate` reads for
+    /// `center` and `radius`, in the same order, and the rank of every
+    /// man it visits who is not `cut.me` and is within his team's cut (not
+    /// d2 >= `same_cut2` for a friend, `foe_cut2` for a foe) is written to
+    /// `out`, in that order, and the count returned. Eight or four men at
+    /// a time, with the same arithmetic as one at a time.
+    ///
+    /// # Safety
+    /// `out` has room for every man in the cells of the box (`box_len`).
+    #[inline]
+    pub unsafe fn kept_in_box(&self, center: Vec2, radius: f32, cut: &KeepCut, out: *mut u32) -> usize {
+        #[cfg(target_arch = "x86_64")]
+        if simd_avx2() {
+            // SAFETY: the CPU has AVX2; the rest is the caller's.
+            return unsafe { self.kept_in_box_avx2(center, radius, cut, out) };
+        }
+        let lanes = KeepLanes::new(center, cut);
+        // SAFETY: the caller's.
+        self.kept_rows(center, radius, |s, e, n| unsafe {
+            keep_run(&self.sorted[s..e], s as u32, center, cut, &lanes, out, n)
+        })
+    }
+
+    /// `kept_in_box` eight candidates at a time, on a CPU with AVX2.
+    ///
+    /// # Safety
+    /// The CPU has AVX2, and `out` is as for `kept_in_box`.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn kept_in_box_avx2(&self, center: Vec2, radius: f32, cut: &KeepCut, out: *mut u32) -> usize {
+        let lanes = KeepLanes::new(center, cut);
+        let lanes8 = KeepLanes8::new(center, cut);
+        // SAFETY: the caller's.
+        self.kept_rows(center, radius, |s, e, n| unsafe {
+            keep_run8(&self.sorted[s..e], s as u32, center, cut, &lanes, &lanes8, out, n)
+        })
+    }
+
+    /// The walk of `kept_in_box`: each row's run of `sorted` over the box,
+    /// `run(start, end, count)` returning the new count.
+    #[inline(always)]
+    fn kept_rows(&self, center: Vec2, radius: f32, mut run: impl FnMut(usize, usize, usize) -> usize) -> usize {
+        if self.dims.0 == 0 {
+            return 0;
+        }
+        let (cx0, cy0) = self.cell_coords(center - radius);
+        let (cx1, cy1) = self.cell_coords(center + radius);
+        let mut n = 0;
+        for cy in cy0..=cy1 {
+            let row = cy * self.dims.0;
+            let s = self.starts[row + cx0] as usize;
+            let e = self.starts[row + cx1 + 1] as usize;
+            n = run(s, e, n);
+        }
+        n
+    }
+}
+
+/// The scan's cut for `SpatialGrid::kept_in_box`: the man's own team bit
+/// and index, and the squared cuts of a friend and of a foe.
+pub struct KeepCut {
+    pub team_bit: u32,
+    pub me: u32,
+    pub same_cut2: f32,
+    pub foe_cut2: f32,
+}
+
+/// The cut runs eight men at a time where the CPU has AVX2, unless
+/// FL_SIMD=sse2 keeps it on four at a time (the same numbers either way;
+/// the switch is for checking that).
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn simd_avx2() -> bool {
+    static A: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *A.get_or_init(|| std::arch::is_x86_feature_detected!("avx2") && !std::env::var("FL_SIMD").is_ok_and(|v| v == "sse2"))
+}
+
+/// `KeepCut` in all four lanes, set once for a man's walk.
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy)]
+struct KeepLanes {
+    px: std::arch::x86_64::__m128,
+    pz: std::arch::x86_64::__m128,
+    team: std::arch::x86_64::__m128i,
+    me: std::arch::x86_64::__m128i,
+    sc2: std::arch::x86_64::__m128,
+    fc2: std::arch::x86_64::__m128,
+}
+#[cfg(not(target_arch = "x86_64"))]
+struct KeepLanes;
+
+impl KeepLanes {
+    #[inline]
+    fn new(center: Vec2, cut: &KeepCut) -> KeepLanes {
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: SSE2 is part of every x86_64.
+        unsafe {
+            use std::arch::x86_64::*;
+            KeepLanes {
+                px: _mm_set1_ps(center.x),
+                pz: _mm_set1_ps(center.y),
+                team: _mm_set1_epi32(cut.team_bit as i32),
+                me: _mm_set1_epi32(cut.me as i32),
+                sc2: _mm_set1_ps(cut.same_cut2),
+                fc2: _mm_set1_ps(cut.foe_cut2),
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = (center, cut);
+            KeepLanes
+        }
+    }
+}
+
+/// `kept_in_box` over one run of `sorted` from rank `start`, writing from
+/// `out[n]` on; returns the new count. Each man's rank is written and the
+/// count advanced by his outcome, without a branch on it. The distance is
+/// the scalar's, (x - x') squared plus (z - z') squared, in that order and
+/// without a fused multiply-add.
+///
+/// # Safety
+/// `out` has room for `n` plus every man of the run.
+#[inline]
+unsafe fn keep_run(units: &[SortedUnit], start: u32, center: Vec2, cut: &KeepCut, lanes: &KeepLanes, out: *mut u32, mut n: usize) -> usize {
+    #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
+    let mut k = 0;
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = lanes;
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::x86_64::*;
+        // SAFETY: SSE2 is part of every x86_64; the loads read units
+        // k..k + 4, within the run.
+        unsafe {
+            let KeepLanes { px, pz, team, me, sc2, fc2 } = *lanes;
+            let one = _mm_set1_epi32(META_TEAM as i32);
+            let ub = units.as_ptr() as *const f32;
+            while k + 4 <= units.len() {
+                // Four men's x, z, index and meta, one man a column.
+                let p0 = _mm_loadu_ps(ub.add(4 * k));
+                let p1 = _mm_loadu_ps(ub.add(4 * k + 4));
+                let p2 = _mm_loadu_ps(ub.add(4 * k + 8));
+                let p3 = _mm_loadu_ps(ub.add(4 * k + 12));
+                let (t0, t1) = (_mm_unpacklo_ps(p0, p1), _mm_unpacklo_ps(p2, p3));
+                let (t2, t3) = (_mm_unpackhi_ps(p0, p1), _mm_unpackhi_ps(p2, p3));
+                let (x, z) = (_mm_movelh_ps(t0, t1), _mm_movehl_ps(t1, t0));
+                let idx = _mm_castps_si128(_mm_movelh_ps(t2, t3));
+                let meta = _mm_castps_si128(_mm_movehl_ps(t3, t2));
+                let (dx, dz) = (_mm_sub_ps(px, x), _mm_sub_ps(pz, z));
+                let d2 = _mm_add_ps(_mm_mul_ps(dx, dx), _mm_mul_ps(dz, dz));
+                let same = _mm_castsi128_ps(_mm_cmpeq_epi32(_mm_and_si128(meta, one), team));
+                let cut2 = _mm_or_ps(_mm_and_ps(same, sc2), _mm_andnot_ps(same, fc2));
+                let is_me = _mm_castsi128_ps(_mm_cmpeq_epi32(idx, me));
+                let keep = _mm_movemask_ps(_mm_or_ps(_mm_cmpge_ps(d2, cut2), is_me)) ^ 0b1111;
+                for lane in 0..4 {
+                    *out.add(n) = start + (k + lane) as u32;
+                    n += (keep >> lane) as usize & 1;
+                }
+                k += 4;
+            }
+        }
+    }
+    for (j, u) in units.iter().enumerate().skip(k) {
+        let d2 = (center - u.xz()).length_squared();
+        let cut2 = if (u.meta & META_TEAM) == cut.team_bit { cut.same_cut2 } else { cut.foe_cut2 };
+        let beyond = d2 >= cut2;
+        // SAFETY: the caller's.
+        unsafe { *out.add(n) = start + j as u32 };
+        n += ((u.idx != cut.me) & !beyond) as usize;
+    }
+    n
+}
+
+/// `KeepCut` in all eight lanes, for `keep_run8`.
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy)]
+struct KeepLanes8 {
+    px: std::arch::x86_64::__m256,
+    pz: std::arch::x86_64::__m256,
+    team: std::arch::x86_64::__m256i,
+    me: std::arch::x86_64::__m256i,
+    sc2: std::arch::x86_64::__m256,
+    fc2: std::arch::x86_64::__m256,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl KeepLanes8 {
+    #[target_feature(enable = "avx2")]
+    fn new(center: Vec2, cut: &KeepCut) -> KeepLanes8 {
+        use std::arch::x86_64::*;
+        KeepLanes8 {
+            px: _mm256_set1_ps(center.x),
+            pz: _mm256_set1_ps(center.y),
+            team: _mm256_set1_epi32(cut.team_bit as i32),
+            me: _mm256_set1_epi32(cut.me as i32),
+            sc2: _mm256_set1_ps(cut.same_cut2),
+            fc2: _mm256_set1_ps(cut.foe_cut2),
+        }
+    }
+}
+
+/// `keep_run` eight men at a time, the same arithmetic in each lane, and
+/// the rest of the run four at a time and one at a time as there.
+///
+/// # Safety
+/// The CPU has AVX2, and `out` has room for `n` plus every man of the
+/// run.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(clippy::too_many_arguments)] // the run and the man's cut
+unsafe fn keep_run8(
+    units: &[SortedUnit],
+    start: u32,
+    center: Vec2,
+    cut: &KeepCut,
+    lanes: &KeepLanes,
+    lanes8: &KeepLanes8,
+    out: *mut u32,
+    mut n: usize,
+) -> usize {
+    use std::arch::x86_64::*;
+    let KeepLanes8 { px, pz, team, me, sc2, fc2 } = *lanes8;
+    let one = _mm256_set1_epi32(META_TEAM as i32);
+    let ub = units.as_ptr() as *const f32;
+    let mut k = 0;
+    // SAFETY: the loads read units k..k + 8, within the run; the stores
+    // are the caller's.
+    unsafe {
+        while k + 8 <= units.len() {
+            // Men k..k + 4 in the low half of each register, k + 4..k + 8
+            // in the high half, so lane j holds man k + j.
+            let pair = |a: usize| _mm256_insertf128_ps::<1>(_mm256_castps128_ps256(_mm_loadu_ps(ub.add(4 * (k + a)))), _mm_loadu_ps(ub.add(4 * (k + a + 4))));
+            let (p0, p1, p2, p3) = (pair(0), pair(1), pair(2), pair(3));
+            let (t0, t1) = (_mm256_unpacklo_ps(p0, p1), _mm256_unpacklo_ps(p2, p3));
+            let (t2, t3) = (_mm256_unpackhi_ps(p0, p1), _mm256_unpackhi_ps(p2, p3));
+            let (x, z) = (_mm256_shuffle_ps::<0x44>(t0, t1), _mm256_shuffle_ps::<0xEE>(t0, t1));
+            let idx = _mm256_castps_si256(_mm256_shuffle_ps::<0x44>(t2, t3));
+            let meta = _mm256_castps_si256(_mm256_shuffle_ps::<0xEE>(t2, t3));
+            let (dx, dz) = (_mm256_sub_ps(px, x), _mm256_sub_ps(pz, z));
+            let d2 = _mm256_add_ps(_mm256_mul_ps(dx, dx), _mm256_mul_ps(dz, dz));
+            let same = _mm256_castsi256_ps(_mm256_cmpeq_epi32(_mm256_and_si256(meta, one), team));
+            let cut2 = _mm256_or_ps(_mm256_and_ps(same, sc2), _mm256_andnot_ps(same, fc2));
+            let is_me = _mm256_castsi256_ps(_mm256_cmpeq_epi32(idx, me));
+            let keep = _mm256_movemask_ps(_mm256_or_ps(_mm256_cmp_ps::<_CMP_GE_OQ>(d2, cut2), is_me)) ^ 0xFF;
+            for lane in 0..8 {
+                *out.add(n) = start + (k + lane) as u32;
+                n += (keep >> lane) as usize & 1;
+            }
+            k += 8;
+        }
+        keep_run(&units[k..], start + k as u32, center, cut, lanes, out, n)
     }
 }
 
