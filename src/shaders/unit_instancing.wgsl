@@ -207,14 +207,24 @@ fn vertex_pull(@builtin(vertex_index) index: u32, @builtin(instance_index) insta
 #endif
 #ifdef UNIT_LIGHT_FLAT
     // The normal field holds the triangle's three corner normals
-    // (render_units_gpu.rs `pack_normals`), each turned with this corner's
-    // pose. A part-posed level's triangle lies on one part, so that is its
-    // corners' own turn; on a skinned level the other two corners' joints
-    // can differ a little, and their normals take this corner's turn.
+    // (render_units_gpu.rs `pack_normals`), all three turned by this
+    // corner's pose in the one `place`. A part-posed level's triangle lies
+    // on one part, so that is its corners' own turn; on a skinned level the
+    // other two corners' joints can differ a little, and their normals take
+    // this corner's turn.
     let words = bitcast<vec3<u32>>(v.normal);
-    let placed = place(v.position, oct_decode(words.x), v.part, v.pivot, v.skin, v.weight);
-    let second = place(v.position, oct_decode(words.y), v.part, v.pivot, v.skin, v.weight).normal;
-    let third = place(v.position, oct_decode(words.z), v.part, v.pivot, v.skin, v.weight).normal;
+    let placed = place(
+        v.position,
+        oct_decode(words.x),
+        v.part,
+        v.pivot,
+        v.skin,
+        v.weight,
+        oct_decode(words.y),
+        oct_decode(words.z),
+    );
+    let second = placed.second;
+    let third = placed.third;
 #else
     let placed = place(v.position, v.normal, v.part, v.pivot, v.skin, v.weight);
 #endif
@@ -274,7 +284,22 @@ fn vertex_pull(@builtin(vertex_index) index: u32, @builtin(instance_index) insta
 @vertex
 fn vertex(vertex: Vertex) -> VertexOutput {
     pose_begin(vertex.i_pos_scale, vertex.i_color, vertex.i_anim, vertex.i_anim2, globals.time, false);
+#ifdef UNIT_LIGHT_FLAT
+    // The fragment stage of a pulled flat-lit bucket compiles this entry
+    // point with the def too; it never draws with it.
+    let placed = place(
+        vertex.position,
+        vertex.normal,
+        vertex.part_pivot.x,
+        vertex.part_pivot.y,
+        0u,
+        0.0,
+        vertex.normal,
+        vertex.normal,
+    );
+#else
     let placed = place(vertex.position, vertex.normal, vertex.part_pivot.x, vertex.part_pivot.y, 0u, 0.0);
+#endif
     let team = pose_at(P_TEAM);
     return unit_output(
         placed.position,
