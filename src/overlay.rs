@@ -591,8 +591,11 @@ fn update_overlay(
     mut log_timer: Local<f32>,
     mut pacing: ResMut<FramePacing>,
     mut phases: ResMut<FramePhases>,
-    viz: Res<crate::sim::DebugViz>,
-    contact_on: Res<crate::sim::contact_viz::ContactViz>,
+    (viz, contact_on, settings): (
+        Res<crate::sim::DebugViz>,
+        Res<crate::sim::contact_viz::ContactViz>,
+        Res<crate::settings::Settings>,
+    ),
 ) {
     let (frame_ms, fps) = frame_rate(&diagnostics);
     let contact = if crate::sim::contact_viz::contact_viz_on(&contact_on, &viz) {
@@ -601,42 +604,47 @@ fn update_overlay(
         String::new()
     };
 
-    let banner = match outcome.0 {
-        Some(0) => "\n=== VICTORY: the enemy army is broken ===",
-        Some(1) => "\n=== DEFEAT: your army is broken ===",
-        Some(2) => "\n=== MUTUAL DESTRUCTION ===",
-        _ => "",
-    };
-    for mut text in &mut query {
-        text.0 = format!(
-            "{fps:>5.0} fps  {frame_ms:.2} ms\n{} units, drawn {} [{}] lod {:?} + {} fallen (frustum culled)\nsim tick: grid {:.2} ms, step {:.2} ms, field {:.2} ms, audit {:.2} ms | sync {:.2} ms\n{} groups ({} engaged, {} broken), {} selected\nblue {} ({} lost, {} fled)  orange {} ({} lost, {} fled){banner}",
-            units.len(),
-            render_counts.drawn,
-            render_counts
-                .bucket_drawn
-                .iter()
-                .map(|n| n.to_string())
-                .collect::<Vec<_>>()
-                .join("/"),
-            render_counts.lod_drawn,
-            render_counts.corpses_drawn,
-            stats.grid_ms,
-            stats.step_ms,
-            stats.field_ms,
-            stats.audit_ms,
-            render_counts.sync_ms,
-            groups.list.len(),
-            groups.list.iter().filter(|g| g.engaged).count(),
-            groups.list.iter().filter(|g| g.state.is_broken()).count(),
-            selection.count_units,
-            combat.alive[0],
-            combat.kills[0],
-            combat.fled[0],
-            combat.alive[1],
-            combat.kills[1],
-            combat.fled[1],
-        );
-        text.0.push_str(&contact);
+    // Only while the readouts show (`show_overlay`, the same frame): a
+    // write marks the text changed, and Bevy then measures, lays out and
+    // shapes it again, hidden or not.
+    if settings.interface.overlay == crate::settings::Overlay::Full {
+        let banner = match outcome.0 {
+            Some(0) => "\n=== VICTORY: the enemy army is broken ===",
+            Some(1) => "\n=== DEFEAT: your army is broken ===",
+            Some(2) => "\n=== MUTUAL DESTRUCTION ===",
+            _ => "",
+        };
+        for mut text in &mut query {
+            text.0 = format!(
+                "{fps:>5.0} fps  {frame_ms:.2} ms\n{} units, drawn {} [{}] lod {:?} + {} fallen (frustum culled)\nsim tick: grid {:.2} ms, step {:.2} ms, field {:.2} ms, audit {:.2} ms | sync {:.2} ms\n{} groups ({} engaged, {} broken), {} selected\nblue {} ({} lost, {} fled)  orange {} ({} lost, {} fled){banner}",
+                units.len(),
+                render_counts.drawn,
+                render_counts
+                    .bucket_drawn
+                    .iter()
+                    .map(|n| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join("/"),
+                render_counts.lod_drawn,
+                render_counts.corpses_drawn,
+                stats.grid_ms,
+                stats.step_ms,
+                stats.field_ms,
+                stats.audit_ms,
+                render_counts.sync_ms,
+                groups.list.len(),
+                groups.list.iter().filter(|g| g.engaged).count(),
+                groups.list.iter().filter(|g| g.state.is_broken()).count(),
+                selection.count_units,
+                combat.alive[0],
+                combat.kills[0],
+                combat.fled[0],
+                combat.alive[1],
+                combat.kills[1],
+                combat.fled[1],
+            );
+            text.0.push_str(&contact);
+        }
     }
 
     // Periodic log so FPS is verifiable from a headless-ish run. GPU pass
