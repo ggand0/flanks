@@ -940,7 +940,7 @@ pub fn kick_tick(
     );
     job.field_wanted = true;
     // What the regiment sums read of each regiment, as the job sees it.
-    job.sum_inputs = crate::frontline::sum_inputs(&groups);
+    job.sum_inputs = crate::frontline::sum_inputs(&groups, Some(&routes));
     job.sums_wanted = true;
     drop(tick_log_prep);
     let _tick_log_send = crate::frame_log::tick::time(crate::frame_log::tick::Part::KickSend);

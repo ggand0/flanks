@@ -57,8 +57,19 @@ struct VertexOutput {
     @location(1) @interpolate(flat) style: u32,
 };
 
-// Bilinear height of the field, as terrain.rs `height_at` samples it.
-fn ground(x: f32, z: f32) -> f32 {
+// A cliff: this much height between two neighbouring vertices blocks
+// them (terrain.rs `SLOPE_BLOCK` over one cell).
+const CLIFF: f32 = 2.0;
+
+// The field's height on the level of `level`: bilinear, with every corner a
+// cliff above or below `level` taken at `level`, as terrain.rs `height_at`
+// takes its corners on the nearest vertex's level. A ring beside a wall
+// lies on the ground its soldier stands on, not up the wall's face.
+fn level_height(h: f32, level: f32) -> f32 {
+    return select(h, level, abs(h - level) >= CLIFF);
+}
+
+fn ground(x: f32, z: f32, level: f32) -> f32 {
     let nx = ring.grid.x;
     let nz = ring.grid.y;
     let g = (vec2<f32>(x, z) - ring.terrain.xy) / ring.terrain.z;
@@ -69,8 +80,8 @@ fn ground(x: f32, z: f32) -> f32 {
     let fx = gx - f32(x0);
     let fz = gz - f32(z0);
     let i = z0 * nx + x0;
-    let near = mix(heights[i], heights[i + 1u], fx);
-    let far = mix(heights[i + nx], heights[i + nx + 1u], fx);
+    let near = mix(level_height(heights[i], level), level_height(heights[i + 1u], level), fx);
+    let far = mix(level_height(heights[i + nx], level), level_height(heights[i + nx + 1u], level), fx);
     return mix(near, far, fz);
 }
 
@@ -101,8 +112,8 @@ fn vertex(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
 
     let feet = centre.y - ring.half_heights[kind];
     var y = feet;
-    if abs(feet - ground(centre.x, centre.z)) < OFF_FIELD {
-        y = ground(xz.x, xz.y);
+    if abs(feet - ground(centre.x, centre.z, feet)) < OFF_FIELD {
+        y = ground(xz.x, xz.y, feet);
     }
     let world = vec3<f32>(xz.x, y, xz.y);
     let lift = LIFT + LIFT_PER_M * distance(world, view.world_position);

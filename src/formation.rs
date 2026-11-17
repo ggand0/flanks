@@ -79,6 +79,21 @@ pub enum FormShape {
     Blob,
 }
 
+/// Two men on a lane whose places cross by more than this (m) along it
+/// trade places (`fill_lane_slots`).
+const LANE_CROSS: f32 = 2.0;
+
+/// A regiment coming onto a lane (town_layout.rs `Lane`) fills its run
+/// from the far end as its men arrive: `fill_lane_slots`.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum LaneFill {
+    /// Ordered onto the lane; its slots are not written yet.
+    Fresh,
+    /// The men (unit indices) still on their way to the lane, each holding
+    /// a place another arrival may take over.
+    Pending(Vec<u32>),
+}
+
 /// Slot density of a Rect formation.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum FormSpacing {
@@ -147,6 +162,24 @@ impl FormSpacing {
     }
 }
 
+/// The slot pitch of a regiment on a lane (the wall's walk). In normal
+/// order it is the rest distance of two men at ease (sim/soldier.rs
+/// `sep_ease`), the closest two standing men keep without pushing each
+/// other, so the walk holds a rank more than at the field's pitch; the
+/// other spacings keep their own.
+pub fn lane_pitch(spacing: FormSpacing, kind: u8) -> Vec2 {
+    match spacing {
+        FormSpacing::Normal => Vec2::splat(crate::sim::soldier::sep_ease()),
+        _ => spacing.pitch(kind),
+    }
+}
+
+/// A regiment's slot pitch as it stands: its spacing's, or the lane's
+/// while its block is on a lane (`GroupData::lane`).
+pub fn pitch_of(gd: &GroupData) -> Vec2 {
+    if gd.lane { lane_pitch(gd.spacing, gd.kind) } else { gd.spacing.pitch(gd.kind) }
+}
+
 /// The groups the open order `o` lays: for lanes along the facing, the
 /// groups of files that cover the closed frontage of `files` files at
 /// `closed` spacing within half a group pitch, never more files than
@@ -190,7 +223,7 @@ pub fn grid(gd: &GroupData) -> (usize, usize, Vec2) {
     let n = gd.count.max(1);
     let files = (gd.files.max(1) as usize).min(n);
     if gd.spacing != FormSpacing::Open {
-        return (files, n.div_ceil(files), gd.spacing.pitch(gd.kind));
+        return (files, n.div_ceil(files), pitch_of(gd));
     }
     let groups = open_groups(files, n, gd.close_to, gd.kind, &gd.open);
     let lines = open_lines(files, n, groups, &gd.open);
@@ -215,19 +248,48 @@ pub fn grid(gd: &GroupData) -> (usize, usize, Vec2) {
 /// abreast (a lane narrower than two men abreast slows a pass
 /// steeply). It takes the fewest files to a group whose
 /// added depth fits the room on both sides together, less a margin on
-/// each, else the most files. The added depth goes to the two sides in
-/// proportion to their room, so the block backs up only into free
-/// ground.
-pub fn choose_open(gd: &GroupData, ready: bool, across: bool, room_front: f32, room_back: f32) -> OpenOrder {
+/// each; None when no layout fits, and the regiment stays closed. A
+/// layout of a single group leaves no lane, so it is no open order and is
+/// never taken. The added depth goes to the two sides in proportion to
+/// their room, so the block backs up only into free ground.
+pub fn choose_open(gd: &GroupData, ready: bool, across: bool, room_front: f32, room_back: f32) -> Option<OpenOrder> {
+    let front = (room_front - OPEN_ROOM_MARGIN).max(0.0);
+    let back = (room_back - OPEN_ROOM_MARGIN).max(0.0);
+    let layout = open_layouts(gd, ready, across);
+    let (mut o, added) = (1..=OPEN_FILES_MAX).filter_map(layout).find(|&(_, added)| added <= front + back)?;
+    let share = if added > 0.0 && front + back > 0.0 { front / (front + back) } else { 0.5 };
+    o.front = added * share;
+    o.back = added - o.front;
+    o.closed_anchor = gd.anchor;
+    Some(o)
+}
+
+/// The least depth any open layout adds to the block (metres): what
+/// `choose_open` needs on both sides together, past the margins, to open
+/// at all. None when no layout leaves a lane.
+pub fn least_open_growth(gd: &GroupData, ready: bool, across: bool) -> Option<f32> {
+    let layout = open_layouts(gd, ready, across);
+    (1..=OPEN_FILES_MAX).filter_map(layout).map(|(_, added)| added).reduce(f32::min)
+}
+
+/// The open layout of `a` files to a group for `gd` (`choose_open`), with
+/// the depth it adds to the closed block; its growth on each side and its
+/// closed anchor still unset. None when it comes to a single group: the
+/// lanes are the gaps between groups, and one group has none. None for a
+/// regiment on a lane: the lane's rows are all the ground it has.
+fn open_layouts(gd: &GroupData, ready: bool, across: bool) -> impl Fn(u8) -> Option<(OpenOrder, f32)> {
+    let on_lane = gd.lane;
     let n = gd.count.max(1);
     let files = (gd.files.max(1) as usize).min(n);
     let closed = gd.chosen_spacing();
     let width = &crate::sim::soldier::widths()[if ready { 3 } else { 0 }];
     let ease = &crate::sim::soldier::widths()[0];
     let shut = (n.div_ceil(files) - 1) as f32 * closed.pitch(gd.kind).y;
-    let front = (room_front - OPEN_ROOM_MARGIN).max(0.0);
-    let back = (room_back - OPEN_ROOM_MARGIN).max(0.0);
-    let layout = |a: u8| {
+    let kind = gd.kind;
+    move |a: u8| {
+        if on_lane {
+            return None;
+        }
         let o = OpenOrder {
             files: a,
             sep: width.sep,
@@ -235,24 +297,20 @@ pub fn choose_open(gd: &GroupData, ready: bool, across: bool, room_front: f32, r
             across,
             ..OpenOrder::default()
         };
-        let groups = open_groups(files, n, closed, gd.kind, &o);
+        let groups = open_groups(files, n, closed, kind, &o);
+        if groups < 2 {
+            return None;
+        }
         let lines = open_lines(files, n, groups, &o);
         let depth = if across {
             // The ranks at their lane offsets.
             let at = open_lane_offsets(groups, lines, &o);
             at.last().copied().unwrap_or(0.0) - at[0]
         } else {
-            (n.div_ceil(lines) - 1) as f32 * gap(gd.kind)
+            (n.div_ceil(lines) - 1) as f32 * gap(kind)
         };
-        (o, depth - shut)
-    };
-    let a = (1..=OPEN_FILES_MAX).find(|&a| layout(a).1 <= front + back).unwrap_or(OPEN_FILES_MAX);
-    let (mut o, added) = layout(a);
-    let share = if added > 0.0 && front + back > 0.0 { front / (front + back) } else { 0.5 };
-    o.front = added * share;
-    o.back = added - o.front;
-    o.closed_anchor = gd.anchor;
-    o
+        Some((o, depth - shut))
+    }
 }
 
 /// Where an open regiment's closed block is centred: its centroid less
@@ -317,6 +375,19 @@ pub fn open_order(gd: &mut GroupData, o: OpenOrder) {
 /// Where an open regiment's anchor stands.
 fn open_anchor(gd: &GroupData) -> Vec2 {
     gd.open.closed_anchor + facing_dir(gd.facing) * gd.open.shift()
+}
+
+/// Where a regiment holds its ground: its anchor, or while it stands in
+/// the open order the anchor it had closed. Opening moves the anchor
+/// along the facing so the block grows where it has room; the regiment
+/// has not gone anywhere. An order given since it opened has moved the
+/// anchor for good (`close_order`), and it then holds there.
+pub fn hold_point(gd: &GroupData) -> Vec2 {
+    if gd.spacing == FormSpacing::Open && gd.anchor == open_anchor(gd) {
+        gd.open.closed_anchor
+    } else {
+        gd.anchor
+    }
 }
 
 /// Default file count for a regiment of `n` (the ~2.2:1 block the armies
@@ -453,7 +524,7 @@ pub fn assign_slots(units: &mut Units, g: u32, gd: &mut GroupData) -> Vec<u32> {
         }
         FormShape::Rect => {
             let files = (gd.files.max(1) as usize).min(n);
-            let pitch = gd.spacing.pitch(gd.kind);
+            let pitch = pitch_of(gd);
             let slots = slot_offsets(n, files, pitch);
             // Front-to-back, then left-to-right within each rank: the
             // greedy crossing-minimizer, matching the slots' row-major
@@ -485,7 +556,7 @@ pub fn block_half_extents(gd: &GroupData, files: u32, facing: f32) -> Vec2 {
     }
     let files = (files.max(1) as usize).min(gd.count.max(1));
     let ranks = gd.count.max(1).div_ceil(files);
-    let pitch = gd.chosen_spacing().pitch(gd.kind);
+    let pitch = if gd.lane { lane_pitch(gd.chosen_spacing(), gd.kind) } else { gd.chosen_spacing().pitch(gd.kind) };
     let half_w = (files - 1) as f32 * 0.5 * pitch.x + 1.0;
     let half_d = (ranks - 1) as f32 * 0.5 * pitch.y + 1.0;
     let fwd = facing_dir(facing);
@@ -604,7 +675,10 @@ pub fn snap_to_slots(
 ) {
     for i in assign_slots(units, g, gd) {
         let i = i as usize;
+        // Off blocked ground (a block deployed over a wall's foot): a man
+        // whose centre is on a blocked vertex could never move again.
         let p = gd.anchor + units.home[i];
+        let p = terrain.nearest_open(p, 12.0).unwrap_or(p);
         let hh = crate::unit_types::half_height(units.kind[i] as usize);
         let pos = Vec3::new(p.x, terrain.height_at(p.x, p.y) + hh, p.y);
         units.pos[i] = pos;
@@ -664,7 +738,8 @@ impl Plugin for FormationPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(
             FixedUpdate,
-            apply_reforms
+            (apply_reforms, fill_lane_slots)
+                .chain()
                 .after(crate::sim::take_tick)
                 .before(crate::sim::step_sim)
                 .in_set(crate::game_state::SimSet),
@@ -734,6 +809,7 @@ fn regiment_nn(units: &Units, g: usize) -> f32 {
 fn test_form_script(
     time: Res<Time>,
     units: Res<Units>,
+    terrain: Res<crate::terrain::Terrain>,
     mut groups: ResMut<Groups>,
     mut stage: Local<u32>,
     mut watch: Local<Vec<usize>>,
@@ -767,9 +843,9 @@ fn test_form_script(
             // opposite hand must face the same way (facing follows the
             // enemy side of the line, not the drag direction). The
             // reversed order is immediately overwritten by the real one.
-            crate::orders::line_order(&mut groups, &picked, b, a);
+            crate::orders::line_order(&mut groups, &terrain, &picked, b, a);
             let rev_facing = groups.list[picked[0]].facing;
-            crate::orders::line_order(&mut groups, &picked, a, b);
+            crate::orders::line_order(&mut groups, &terrain, &picked, a, b);
             let fwd_facing = groups.list[picked[0]].facing;
             if (rev_facing - fwd_facing).abs() < 0.01 {
                 info!(
@@ -1066,9 +1142,12 @@ fn apply_reforms(mut units: ResMut<Units>, mut groups: ResMut<Groups>, mut tick:
             continue;
         }
         let mut do_reform = gd.reform;
+        // No dressing while the men are still filing onto a lane: the
+        // places are handed out as they arrive.
         if !do_reform
             && gd.shape == FormShape::Rect
             && !gd.engaged
+            && gd.lane_fill.is_none()
             && (*tick).wrapping_add(g as u32).is_multiple_of(CLOSE_RANKS_PERIOD)
         {
             let lost = gd.count_at_reform.saturating_sub(gd.count);
@@ -1086,5 +1165,243 @@ fn apply_reforms(mut units: ResMut<Units>, mut groups: ResMut<Groups>, mut tick:
             let gd = &mut groups.list[g];
             assign_slots(&mut units, g as u32, gd);
         }
+    }
+}
+
+/// Whether a regiment's block is a lane's: it is ordered onto the lane,
+/// holds on it, or was told to attack from it and its men still stand on
+/// it (archers shooting from a wall).
+pub(crate) fn stands_on_lane(gd: &GroupData, lane: &crate::town_layout::Lane) -> bool {
+    gd.count > 0
+        && gd.shape == FormShape::Rect
+        && !gd.state.is_broken()
+        && match gd.order {
+            Some(crate::orders::Order::Move(p)) => lane.contains(p),
+            Some(crate::orders::Order::Attack(_)) => gd.lane && lane.contains(gd.centroid),
+            None => lane.contains(gd.anchor),
+        }
+}
+
+/// Keeps each regiment's lane flag in step with its order
+/// (`stands_on_lane`), re-dressing it when the flag changes. A regiment
+/// coming onto a lane (orders.rs `lane_layout`) hands out its
+/// places in arrival order: the man who steps onto the lane takes the
+/// farthest place still held by a man behind him, and that man takes the
+/// place he had. The men already standing then always hold the far
+/// places, and nobody has to pass anybody along a walk too narrow to
+/// pass on, and the men on the lane keep their order along it. One test
+/// per man still on his way and one pass over the men there per tick,
+/// nothing once they are all there; a new order or a fight ends it.
+fn fill_lane_slots(mut units: ResMut<Units>, mut groups: ResMut<Groups>, terrain: Res<crate::terrain::Terrain>) {
+    if !terrain.kind.has_wall() {
+        return;
+    }
+    let lane = crate::town_layout::walk_lane(terrain.body_radius());
+    for g in 0..groups.list.len() {
+        let gd = &mut groups.list[g];
+        // Every order comes through here, whoever gave it, so a regiment
+        // sent off the lane dresses back to its field pitch.
+        let on = stands_on_lane(gd, &lane);
+        if on != gd.lane {
+            gd.lane = on;
+            gd.reform = true;
+        }
+        if gd.lane_fill.is_none() {
+            continue;
+        }
+        if gd.count == 0 || gd.state.is_broken() || gd.engaged || gd.shape != FormShape::Rect {
+            gd.lane_fill = None;
+            continue;
+        }
+        if gd.lane_fill == Some(LaneFill::Fresh) {
+            if gd.reform {
+                continue;
+            }
+            let members: Vec<u32> = (0..units.len())
+                .filter(|&i| units.group[i] == g as u32 && units.death_t[i] == 0)
+                .map(|i| i as u32)
+                .collect();
+            gd.lane_fill = Some(LaneFill::Pending(members));
+        }
+        let at = match gd.order {
+            Some(crate::orders::Order::Move(p)) => p,
+            _ => gd.anchor,
+        };
+        let Some(LaneFill::Pending(pending)) = &mut gd.lane_fill else { continue };
+        // Whether a place changed hands this tick: its slots are dealt
+        // again (`GroupData::slots_dealt`), as by `assign_slots`.
+        let mut dealt = false;
+        let mut k = 0;
+        while k < pending.len() {
+            let i = pending[k] as usize;
+            if units.death_t[i] != 0 {
+                pending.swap_remove(k);
+                continue;
+            }
+            let p = Vec2::new(units.pos[i].x, units.pos[i].z);
+            if !lane.contains(p) {
+                k += 1;
+                continue;
+            }
+            // The farthest place a man still on his way holds, his own
+            // among them.
+            let far = pending
+                .iter()
+                .map(|&j| j as usize)
+                .max_by(|&a, &b| {
+                    let d = |j: usize| (at + units.home[j]).distance_squared(p);
+                    d(a).total_cmp(&d(b))
+                })
+                .unwrap_or(i);
+            if far != i {
+                let (a, b) = (units.home[i], units.home[far]);
+                units.home[i] = b;
+                units.home[far] = a;
+                dealt = true;
+            }
+            pending.swap_remove(k);
+        }
+        // The men on the lane keep their order along it: the stream at a
+        // stair's doorway shoves a man past it, and the place he took on
+        // the far side would have him pass every man standing between.
+        // Two neighbours in that order whose places cross by more than a
+        // pace swap them, one pass a tick, so the order settles without
+        // two men side by side trading places every tick.
+        pending.sort_unstable();
+        let mut on: Vec<(f32, usize)> = (0..units.len())
+            .filter(|&i| units.group[i] == g as u32 && units.death_t[i] == 0)
+            .filter(|&i| pending.binary_search(&(i as u32)).is_err())
+            .map(|i| (units.pos[i].x, i))
+            .collect();
+        on.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+        for w in on.windows(2) {
+            let (a, b) = (w[0].1, w[1].1);
+            if units.home[a].x > units.home[b].x + LANE_CROSS {
+                let (ha, hb) = (units.home[a], units.home[b]);
+                units.home[a] = hb;
+                units.home[b] = ha;
+                dealt = true;
+            }
+        }
+        if dealt {
+            gd.slots_dealt = gd.slots_dealt.wrapping_add(1);
+        }
+        if pending.is_empty() {
+            info!("regiment {g}: its men have all taken their places on the lane");
+            gd.lane_fill = None;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 200 archers in 50 files by 4 ranks, closed, facing +z.
+    fn holder() -> GroupData {
+        let mut gd = GroupData::new(0, crate::unit_types::KIND_ARCHER, Vec2::ZERO, 200);
+        gd.shape = FormShape::Rect;
+        gd.files = 50;
+        gd.facing = facing_of(Vec2::Y);
+        gd
+    }
+
+    /// No room or too little gives no plan; just enough gives the layout
+    /// with the least growth, split as the room is.
+    #[test]
+    fn choose_open_needs_room_for_its_least_growth() {
+        let gd = holder();
+        let least = least_open_growth(&gd, false, false).expect("a layout with a lane");
+        // Three files to a group: five ranks of 1.4 m where four stood.
+        assert!((least - 1.4).abs() < 1e-4, "the least growth is {least}");
+        let m = OPEN_ROOM_MARGIN;
+        assert!(choose_open(&gd, false, false, 0.0, 0.0).is_none());
+        assert!(choose_open(&gd, false, false, m + least * 0.75 - 0.01, m + least * 0.25).is_none());
+        let (front, back) = (least * 0.75 + 0.01, least * 0.25);
+        let o = choose_open(&gd, false, false, m + front, m + back).expect("a plan");
+        assert_eq!(o.files, 3);
+        assert!((o.front + o.back - least).abs() < 1e-4);
+        assert!((o.front - least * front / (front + back)).abs() < 1e-4);
+    }
+
+    /// On the wall's walk a regiment in normal order stands at the rest
+    /// distance of men at ease, five ranks on the walk; ordered off the
+    /// walk it is back at its field pitch.
+    #[test]
+    fn a_regiment_stands_tighter_on_a_lane_and_only_there() {
+        let lane = crate::town_layout::walk_lane(0.6);
+        let on_walk = Vec2::new(20.0, crate::town_layout::WALL_Z);
+        let mut gd = holder();
+        gd.order = Some(crate::orders::Order::Move(on_walk));
+        assert!(stands_on_lane(&gd, &lane));
+        gd.lane = true;
+        let tight = crate::sim::soldier::sep_ease();
+        assert_eq!(pitch_of(&gd), Vec2::splat(tight));
+        assert_eq!(grid(&gd).2, Vec2::splat(tight));
+        assert!(((lane.across.1 - lane.across.0) / tight).floor() as u32 + 1 == 5, "ranks the walk holds");
+        // Holding there, and told to shoot from there with its men on it.
+        gd.order = None;
+        gd.anchor = on_walk;
+        assert!(stands_on_lane(&gd, &lane));
+        gd.order = Some(crate::orders::Order::Attack(1));
+        gd.centroid = on_walk;
+        assert!(stands_on_lane(&gd, &lane));
+        // Sent to the ground behind the wall.
+        gd.order = Some(crate::orders::Order::Move(on_walk - Vec2::new(0.0, 40.0)));
+        assert!(!stands_on_lane(&gd, &lane));
+        gd.lane = false;
+        assert_eq!(pitch_of(&gd), Vec2::splat(gap(gd.kind)));
+        // The other spacings keep their own pitch on the lane.
+        gd.lane = true;
+        gd.spacing = FormSpacing::Wall;
+        assert_eq!(pitch_of(&gd), FormSpacing::Wall.pitch(gd.kind));
+    }
+
+    /// A block that opens 3.9 m behind and nothing ahead moves its anchor
+    /// 1.95 m back, but it still holds where it stood closed: a route that
+    /// ended there still ends where the regiment holds.
+    #[test]
+    fn an_open_regiment_holds_where_it_stood_closed() {
+        let mut gd = holder();
+        gd.anchor = Vec2::new(20.9, -129.7);
+        let route_end = gd.anchor;
+        assert_eq!(hold_point(&gd), route_end);
+        let o = choose_open(&gd, false, true, OPEN_ROOM_MARGIN, OPEN_ROOM_MAX).expect("a plan across");
+        assert!(o.front.abs() < 1e-4 && (o.back - 3.9).abs() < 0.05, "grows {} ahead, {} behind", o.front, o.back);
+        open_order(&mut gd, o);
+        assert!((route_end.distance(gd.anchor) - 1.95).abs() < 0.03);
+        assert_eq!(hold_point(&gd), route_end);
+        // An order since it opened moves the anchor for good.
+        let elsewhere = Vec2::new(60.0, -129.7);
+        gd.anchor = elsewhere;
+        assert_eq!(hold_point(&gd), elsewhere);
+        // Closed again where it opened, it holds at its anchor as before.
+        gd.anchor = open_anchor(&gd);
+        close_order(&mut gd);
+        assert_eq!(gd.anchor, route_end);
+        assert_eq!(hold_point(&gd), route_end);
+    }
+
+    /// Lanes across the facing of a block four ranks deep: all four ranks
+    /// in one group would stand shallower than the closed block and fit
+    /// in no room at all, but they leave no lane. The least a layout with
+    /// a lane adds is two groups of two ranks.
+    #[test]
+    fn a_layout_of_one_group_is_no_open_order() {
+        let gd = holder();
+        let least = least_open_growth(&gd, false, true).expect("a layout with a lane");
+        assert!(least > 0.0, "the least growth across is {least}");
+        let m = OPEN_ROOM_MARGIN;
+        assert!(choose_open(&gd, false, true, 0.0, 0.0).is_none());
+        assert!(choose_open(&gd, false, true, m, m + least - 0.01).is_none());
+        let o = choose_open(&gd, false, true, m, m + least + 0.01).expect("a plan across");
+        assert_eq!(o.files, 2);
+        assert!(o.across);
+        assert!(o.front.abs() < 1e-4 && (o.back - least).abs() < 1e-4);
+        // A block one rank deep has no ranks to part.
+        let mut line = holder();
+        line.files = 200;
+        assert!(least_open_growth(&line, false, true).is_none());
+        assert!(choose_open(&line, false, true, OPEN_ROOM_MAX, OPEN_ROOM_MAX).is_none());
     }
 }

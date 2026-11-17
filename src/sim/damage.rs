@@ -683,7 +683,7 @@ pub fn apply_damage(
                         let mut nz = (pos[v].z + shove.y).clamp(bounds_min.y, bounds_max.y);
                         // Charges can't knock a man into the river or
                         // through a terrace riser — the shove just dies.
-                        if terrain.blocked_at(nx, nz) {
+                        if !terrain.body_free(nx, nz, terrain.body_radius(), shove.x, shove.y) {
                             nx = pos[v].x;
                             nz = pos[v].z;
                         }
