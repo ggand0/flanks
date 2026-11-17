@@ -374,6 +374,7 @@ pub fn blob_radius(n: usize) -> f32 {
 /// Returns the living member indices so callers (the deployment teleport)
 /// don't rescan the unit buffer for the set this already built.
 pub fn assign_slots(units: &mut Units, g: u32, gd: &mut GroupData) -> Vec<u32> {
+    gd.slots_dealt = gd.slots_dealt.wrapping_add(1);
     // (unit index, forward coord, lateral coord) relative to the anchor.
     let fwd = facing_dir(gd.facing);
     let right = Vec2::new(fwd.y, -fwd.x);

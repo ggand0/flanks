@@ -39,6 +39,12 @@ use job::{prepare_tick, regiment_runs, TickJob, CHUNK};
 #[derive(Resource, Default)]
 pub struct RegimentRuns {
     pub runs: Vec<Vec<(u32, u32)>>,
+    /// The taken job's sums per regiment (frontline.rs `update_groups`),
+    /// the inputs it took them with, and whether they hold for this tick:
+    /// a job was taken and no write copied a column they read.
+    pub(crate) job_sums: Vec<crate::frontline::RegimentSums>,
+    pub(crate) job_inputs: crate::frontline::SumInputs,
+    pub(crate) job_sums_valid: bool,
 }
 
 impl RegimentRuns {
@@ -238,11 +244,20 @@ pub fn take_tick(
     pipeline.field_from_job = false;
     match taken {
         Some(mut job) => {
+            // The job's regiment sums hold when it took them for every
+            // regiment and every column they read is still the buffer it
+            // read: a write while the job held a column copied it.
+            runs.job_sums_valid = job.sums_wanted
+                && job.sum_inputs.len() == groups.list.len()
+                && job.group_sums.len() == groups.list.len()
+                && job.shares_sum_columns(&units);
             // The run is over: let go of the shared columns now, so the
             // systems between here and the install (a regiment closing
             // ranks writes `home`) write in place instead of copying.
             job.release_inputs();
             std::mem::swap(&mut runs.runs, &mut job.reg_runs);
+            std::mem::swap(&mut runs.job_sums, &mut job.group_sums);
+            std::mem::swap(&mut runs.job_inputs, &mut job.sum_inputs);
             if let Some(mut field) = field {
                 std::mem::swap(&mut *field, &mut job.field);
                 pipeline.field_from_job = true;
@@ -252,6 +267,7 @@ pub fn take_tick(
         }
         None => {
             regiment_runs(&units.group, groups.list.len(), &mut runs.runs);
+            runs.job_sums_valid = false;
         }
     }
 }
@@ -387,6 +403,9 @@ fn run_tick_job(job: &mut TickJob) {
         pack,
         pos_prev_in,
         color_in,
+        group_sums,
+        sum_inputs,
+        sums_wanted,
         ..
     } = job;
 
@@ -412,6 +431,30 @@ fn run_tick_job(job: &mut TickJob) {
     let sight_snap = &sight_in[..];
     let slot = pack.as_ref();
     let (runs_out, target_out, clear_out, field_out) = (&mut *reg_runs, &mut *target_members, &mut *clear_members, &mut *field);
+    // Each regiment's sums for `update_groups` (frontline.rs), from the
+    // columns as kicked: as soon as the runs exist, a task per few
+    // regiments joins the pool's other work beside the rebuild.
+    let sum_cols = crate::frontline::SumColumns {
+        pos: pos_prev,
+        home,
+        death_t: death_t_in,
+        vel: &vel_in[..],
+        swing: &swing_in[..],
+        target: &target_in[..],
+        group,
+    };
+    let sum_inputs = &*sum_inputs;
+    // Prep stored the inputs of every regiment it snapshotted; anything
+    // else leaves no sums, and update_groups sums every regiment itself.
+    *sums_wanted &= sum_inputs.len() == n_groups;
+    if *sums_wanted {
+        group_sums.resize_with(n_groups, Default::default);
+    }
+    let sums_out: Vec<&mut [crate::frontline::RegimentSums]> = if *sums_wanted {
+        group_sums.chunks_mut(crate::frontline::REGIMENTS_PER_TASK).collect()
+    } else {
+        Vec::new()
+    };
     let field_took: Vec<f32> = crate::util::sim_scope(|scope| {
         if let Some(slot) = slot {
             let columns = crate::render_units_gpu::PackColumns {
@@ -438,6 +481,16 @@ fn run_tick_job(job: &mut TickJob) {
             // The regiment runs, and from them the living members of every
             // regiment under fire, in index order.
             regiment_runs(group, n_groups, reg_runs);
+            let reg_runs = shared(reg_runs);
+            for (k, out) in sums_out.into_iter().enumerate() {
+                scope.spawn(async move {
+                    let first = k * crate::frontline::REGIMENTS_PER_TASK;
+                    for (j, sums) in out.iter_mut().enumerate() {
+                        *sums = sum_inputs.sums(&sum_cols, &reg_runs[first + j], first + j);
+                    }
+                    -1.0
+                });
+            }
             target_members.resize_with(n_groups, Vec::new);
             for (g, members) in target_members.iter_mut().enumerate() {
                 members.clear();
@@ -750,6 +803,8 @@ pub fn step_sim(
             );
             // update_field rebuilt the resource inline this tick.
             job.field_wanted = false;
+            // update_groups summed this tick itself.
+            job.sums_wanted = false;
             run_tick_job(&mut job);
             job
         }
@@ -884,6 +939,9 @@ pub fn kick_tick(
         pipeline.tick,
     );
     job.field_wanted = true;
+    // What the regiment sums read of each regiment, as the job sees it.
+    job.sum_inputs = crate::frontline::sum_inputs(&groups);
+    job.sums_wanted = true;
     drop(tick_log_prep);
     let _tick_log_send = crate::frame_log::tick::time(crate::frame_log::tick::Part::KickSend);
     // The render snapshot of the columns as kicked: the job packs it on
@@ -896,6 +954,11 @@ pub fn kick_tick(
     let worker = pipeline.worker.get_or_insert_with(TickWorker::default);
     worker.to_worker.lock().unwrap().send(job).expect("sim tick worker alive");
     pipeline.in_flight = true;
+}
+
+/// A finished exclusive borrow, read from now on by tasks beside each other.
+fn shared<T>(r: &mut T) -> &T {
+    r
 }
 
 fn toggle_debug_viz(keys: Res<ButtonInput<KeyCode>>, mut viz: ResMut<DebugViz>) {

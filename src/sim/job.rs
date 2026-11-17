@@ -211,6 +211,13 @@ pub struct TickJob {
     /// `update_field` already rebuilt the resource this tick).
     pub(crate) field: crate::frontline::InfluenceField,
     pub(crate) field_wanted: bool,
+    /// Each regiment's sums for `update_groups` (frontline.rs), taken
+    /// beside the grid rebuild with the inputs prep stored, when a taker
+    /// wants them (not on the inline path, where `update_groups` already
+    /// summed).
+    pub(crate) group_sums: Vec<crate::frontline::RegimentSums>,
+    pub(crate) sum_inputs: crate::frontline::SumInputs,
+    pub(crate) sums_wanted: bool,
     /// Men whose death countdown reached its last tick, ascending.
     pub(crate) dead: Vec<u32>,
     /// Living men standing near or beyond their own map edge, ascending:
@@ -243,6 +250,22 @@ pub struct TickJob {
 }
 
 impl TickJob {
+    /// Every column the regiment sums read is still the buffer this job
+    /// was kicked with: no write copied it while the job held it. Called
+    /// at the take, before the job lets go of them.
+    pub(crate) fn shares_sum_columns(&self, units: &Units) -> bool {
+        fn same<T>(a: &Arc<Vec<T>>, b: &Vec<T>) -> bool {
+            std::ptr::eq(Arc::as_ptr(a), b)
+        }
+        same(&self.pos_in, &units.pos)
+            && same(&self.home, &units.home)
+            && same(&self.death_t_in, &units.death_t)
+            && same(&self.vel_in, &units.vel)
+            && same(&self.swing_in, &units.swing)
+            && same(&self.target_in, &units.target)
+            && same(&self.group, &units.group)
+    }
+
     /// Release the job's handles on the shared columns. Called the moment
     /// a finished job is taken (and again, harmlessly, at the install):
     /// nothing reads them once the run is over, and a column nobody else

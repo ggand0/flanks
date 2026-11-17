@@ -215,6 +215,11 @@ pub struct GroupData {
     /// apply pass): recent_kills vs recent_deaths is the winning/losing-
     /// melee morale factor.
     pub recent_kills: u32,
+    /// How many times `formation::assign_slots` has dealt this regiment's
+    /// slots, which is every write of its men's `home` after the kick: the
+    /// tick job's regiment sums (frontline.rs) hold only while it is the
+    /// count they were taken with.
+    pub slots_dealt: u32,
     // --- ranged (archer regiments only; dead flags for melee kinds) ---
     /// Fire-at-will (M2TW default ON): with no explicit target order,
     /// the regiment's bows engage the nearest enemy block in range.
@@ -332,6 +337,7 @@ impl GroupData {
             state: RegState::Steady,
             recent_deaths: 0,
             recent_kills: 0,
+            slots_dealt: 0,
             fire_at_will: true,
             melee: false,
             skirmish: kind == crate::unit_types::KIND_ARCHER,
