@@ -332,7 +332,8 @@ fn retarget_focus() -> bool {
 }
 
 /// One regiment's sums over its men, in index order.
-struct RegimentSums {
+#[derive(Clone, Default)]
+pub(crate) struct RegimentSums {
     pos: Vec2,
     count: usize,
     home: Vec2,
@@ -364,7 +365,143 @@ struct RegimentSums {
 
 /// Regiments per pool task in `update_groups`: a task sums about 16k men
 /// rather than a regiment's thousand.
-const REGIMENTS_PER_TASK: usize = 16;
+pub(crate) const REGIMENTS_PER_TASK: usize = 16;
+
+/// The soldier columns the sums read: the live ones on the main thread,
+/// the tick job's shared copies of the same buffers in the job.
+#[derive(Clone, Copy)]
+pub(crate) struct SumColumns<'a> {
+    pub(crate) pos: &'a [Vec3],
+    pub(crate) home: &'a [Vec2],
+    pub(crate) death_t: &'a [u8],
+    pub(crate) vel: &'a [Vec3],
+    pub(crate) swing: &'a [u8],
+    pub(crate) target: &'a [u32],
+    pub(crate) group: &'a [u32],
+}
+
+impl<'a> SumColumns<'a> {
+    fn of(units: &'a Units) -> Self {
+        Self {
+            pos: &units.pos[..],
+            home: &units.home[..],
+            death_t: &units.death_t[..],
+            vel: &units.vel[..],
+            swing: &units.swing[..],
+            target: &units.target[..],
+            group: &units.group[..],
+        }
+    }
+}
+
+/// What the sums read of each regiment besides its men: its centroid and
+/// home bias from the last tick, its forward vector, its attack target,
+/// whether it is an archer regiment, how many times its slots have been
+/// dealt (`GroupData::slots_dealt`, which stands for its men's `home`),
+/// and the blocks of the open friends within its reach. Built the same
+/// way at the kick, for the job, and in `update_groups`: a regiment whose
+/// inputs are the same bits in both takes the job's sums.
+#[derive(Default)]
+pub(crate) struct SumInputs {
+    cents: Vec<Vec2>,
+    bias: Vec<Vec2>,
+    fwd: Vec<Vec2>,
+    target: Vec<Option<u32>>,
+    bows: Vec<bool>,
+    slots: Vec<u32>,
+    open: Vec<Vec<(u32, BlockRect)>>,
+}
+
+impl SumInputs {
+    pub(crate) fn len(&self) -> usize {
+        self.cents.len()
+    }
+
+    /// Regiment `g`'s inputs are the same bits here and in `other`.
+    fn same(&self, other: &SumInputs, g: usize) -> bool {
+        let v = |a: Vec2, b: Vec2| a.x.to_bits() == b.x.to_bits() && a.y.to_bits() == b.y.to_bits();
+        let r = |a: &BlockRect, b: &BlockRect| {
+            v(a.centre, b.centre)
+                && v(a.fwd, b.fwd)
+                && a.half_w.to_bits() == b.half_w.to_bits()
+                && a.half_d.to_bits() == b.half_d.to_bits()
+        };
+        v(self.cents[g], other.cents[g])
+            && v(self.bias[g], other.bias[g])
+            && v(self.fwd[g], other.fwd[g])
+            && self.target[g] == other.target[g]
+            && self.bows[g] == other.bows[g]
+            && self.slots[g] == other.slots[g]
+            && self.open[g].len() == other.open[g].len()
+            && self.open[g].iter().zip(&other.open[g]).all(|((h, a), (k, b))| h == k && r(a, b))
+    }
+
+    /// Regiment `g`'s sums over its men.
+    pub(crate) fn sums(&self, cols: &SumColumns, runs: &[(u32, u32)], g: usize) -> RegimentSums {
+        let regiment = (self.cents[g], self.bias[g], self.fwd[g], self.target[g], self.bows[g]);
+        regiment_sums(cols, runs, regiment, &self.open[g])
+    }
+}
+
+/// Every regiment's inputs to the sums, from the regiments as they stand.
+pub(crate) fn sum_inputs(groups: &Groups) -> SumInputs {
+    // Disorder measures SHAPE coherence, not travel: deviation from the
+    // slot relative to the regiment's own centroid (last tick's — 33 ms
+    // stale is nothing at 2 s smoothing). A rigid march scores ~0; a
+    // block churned up by melee scores meters.
+    let cents: Vec<Vec2> = groups.list.iter().map(|g| g.centroid).collect();
+    let bias: Vec<Vec2> = groups.list.iter().map(|g| g.home_bias).collect();
+    // Contact frame inputs (see the frame in `update_groups`): each
+    // regiment's forward vector, its front-most slot, and the depth of the
+    // men fighting an enemy ahead of the frame.
+    let fwd: Vec<Vec2> = groups
+        .list
+        .iter()
+        .map(|g| crate::formation::facing_dir(g.facing))
+        .collect();
+    let target: Vec<Option<u32>> = groups
+        .list
+        .iter()
+        .map(|g| match g.order {
+            Some(crate::orders::Order::Attack(t)) => Some(t),
+            _ => None,
+        })
+        .collect();
+    let bows: Vec<bool> = groups.list.iter().map(|g| g.kind == crate::unit_types::KIND_ARCHER).collect();
+    let slots: Vec<u32> = groups.list.iter().map(|g| g.slots_dealt).collect();
+    // Every regiment counts its men inside each open friend's block that
+    // one of them could be in: the friend within the regiment's reach
+    // (its farthest man last tick, plus a step). A regiment whose men are
+    // all far from every open friend lists none and tests nothing.
+    // The open regiments first, usually none: then nothing below runs.
+    let open_regs: Vec<(u32, &crate::orders::GroupData, BlockRect, f32)> = groups
+        .list
+        .iter()
+        .enumerate()
+        .filter(|(_, hd)| hd.count > 0 && hd.spacing == crate::formation::FormSpacing::Open)
+        .map(|(h, hd)| (h as u32, hd, crate::formation::block_rect(hd), crate::formation::block_bound(hd)))
+        .collect();
+    let open: Vec<Vec<(u32, BlockRect)>> = groups
+        .list
+        .iter()
+        .enumerate()
+        .map(|(g, gd)| {
+            if gd.count == 0 || open_regs.is_empty() {
+                return Vec::new();
+            }
+            open_regs
+                .iter()
+                .filter(|(h, hd, _, bound)| {
+                    *h as usize != g
+                        && hd.team == gd.team
+                        && hd.centroid.distance(gd.centroid) <= gd.reach + 1.0 + bound
+                })
+                .map(|(h, _, rect, _)| (*h, *rect))
+                .collect()
+        })
+        .collect();
+    SumInputs { cents, bias, fwd, target, bows, slots, open }
+}
 
 /// One regiment's sums over its men, walking its runs in index order. `pc`
 /// and `pb` are its centroid and home bias from the last tick, `f` its
@@ -373,7 +510,7 @@ const REGIMENTS_PER_TASK: usize = 16;
 /// `open` the blocks of the open friends within its reach, empty when
 /// there is none.
 fn regiment_sums(
-    units: &Units,
+    units: &SumColumns,
     runs: &[(u32, u32)],
     (pc, pb, f, tg, bows): (Vec2, Vec2, Vec2, Option<u32>, bool),
     open: &[(u32, BlockRect)],
@@ -436,11 +573,11 @@ fn regiment_sums(
             {
                 a.fight_n += 1;
                 let ti = units.target[i] as usize;
-                let at_target = ti < units.len() && Some(units.group[ti]) == tg;
+                let at_target = ti < units.pos.len() && Some(units.group[ti]) == tg;
                 if at_target {
                     a.target_fight_n += 1;
                 }
-                if ti < units.len() {
+                if ti < units.pos.len() {
                     let d = Vec2::new(units.pos[ti].x - p.x, units.pos[ti].z - p.y);
                     if d.dot(f) > 0.5 * d.length() {
                         a.line_sum += p.dot(f);
@@ -464,84 +601,41 @@ fn update_groups(
 ) {
     let _tick_log = crate::frame_log::tick::time(crate::frame_log::tick::Part::Groups);
     let n = groups.list.len();
-    // Disorder measures SHAPE coherence, not travel: deviation from the
-    // slot relative to the regiment's own centroid (last tick's — 33 ms
-    // stale is nothing at 2 s smoothing). A rigid march scores ~0; a
-    // block churned up by melee scores meters.
-    let prev_cents: Vec<Vec2> = groups.list.iter().map(|g| g.centroid).collect();
-    let prev_bias: Vec<Vec2> = groups.list.iter().map(|g| g.home_bias).collect();
-    // Contact frame inputs (see the frame below): each regiment's
-    // forward vector, its front-most slot, and the depth of the men
-    // fighting an enemy ahead of the frame.
-    let fwd: Vec<Vec2> = groups
-        .list
-        .iter()
-        .map(|g| crate::formation::facing_dir(g.facing))
-        .collect();
-    let attack_target: Vec<Option<u32>> = groups
-        .list
-        .iter()
-        .map(|g| match g.order {
-            Some(crate::orders::Order::Attack(t)) => Some(t),
-            _ => None,
-        })
-        .collect();
-    let bows: Vec<bool> = groups.list.iter().map(|g| g.kind == crate::unit_types::KIND_ARCHER).collect();
-    // Every regiment counts its men inside each open friend's block that
-    // one of them could be in: the friend within the regiment's reach
-    // (its farthest man last tick, plus a step). A regiment whose men are
-    // all far from every open friend lists none and tests nothing.
-    // The open regiments first, usually none: then nothing below runs.
-    let open_regs: Vec<(u32, &crate::orders::GroupData, BlockRect, f32)> = groups
-        .list
-        .iter()
-        .enumerate()
-        .filter(|(_, hd)| hd.count > 0 && hd.spacing == crate::formation::FormSpacing::Open)
-        .map(|(h, hd)| (h as u32, hd, crate::formation::block_rect(hd), crate::formation::block_bound(hd)))
-        .collect();
-    let open: Vec<Vec<(u32, BlockRect)>> = groups
-        .list
-        .iter()
-        .enumerate()
-        .map(|(g, gd)| {
-            if gd.count == 0 || open_regs.is_empty() {
-                return Vec::new();
-            }
-            open_regs
-                .iter()
-                .filter(|(h, hd, _, bound)| {
-                    *h as usize != g
-                        && hd.team == gd.team
-                        && hd.centroid.distance(gd.centroid) <= gd.reach + 1.0 + bound
-                })
-                .map(|(h, _, rect, _)| (*h, *rect))
-                .collect()
-        })
-        .collect();
-    // The sums over the men, a pool task per few regiments, each regiment's
-    // runs walked in index order: the same additions in the same order as
-    // one scan of the army, regiment by regiment, so the same bits. Bevy's
+    let inputs = sum_inputs(&groups);
+    // The sums over the men. The tick job took them from the columns it
+    // was kicked with, which are the columns here (sim/mod.rs `take_tick`
+    // checks that no write copied one of them), walking the same runs in
+    // the same order, so the same bits. A regiment whose own inputs
+    // changed since the kick (an order, a facing, an opening, its slots
+    // dealt again) is summed here instead, and so is every regiment when
+    // the job left no sums: a pool task per few regiments, each
+    // regiment's runs walked in index order, the same additions in the
+    // same order as one scan of the army, regiment by regiment. Bevy's
     // scope returns the tasks' results in spawn order.
+    let from_job: Vec<bool> = (0..n).map(|g| runs.job_sums_valid && inputs.same(&runs.job_inputs, g)).collect();
     let units = &*units;
+    let cols = SumColumns::of(units);
     let runs = &*runs;
-    let (prev_cents_r, prev_bias_r, fwd_r, target_r, bows_r, open_r) =
-        (&prev_cents, &prev_bias, &fwd, &attack_target, &bows, &open);
+    let (inputs_r, cols_r) = (&inputs, &cols);
     let tick_log_sums = crate::frame_log::tick::time(crate::frame_log::tick::Part::GroupsSums);
-    let batches: Vec<Vec<RegimentSums>> = bevy::tasks::ComputeTaskPool::get().scope(|scope| {
-        for first in (0..n).step_by(REGIMENTS_PER_TASK) {
-            scope.spawn(async move {
-                (first..n.min(first + REGIMENTS_PER_TASK))
-                    .map(|g| {
-                        let regiment =
-                            (prev_cents_r[g], prev_bias_r[g], fwd_r[g], target_r[g], bows_r[g]);
-                        regiment_sums(units, runs.of(g), regiment, &open_r[g])
-                    })
-                    .collect::<Vec<RegimentSums>>()
-            });
-        }
-    });
-    let sums: Vec<RegimentSums> = batches.into_iter().flatten().collect();
+    let missing: Vec<usize> = (0..n).filter(|&g| !from_job[g]).collect();
+    let batches: Vec<Vec<RegimentSums>> = if missing.is_empty() {
+        Vec::new()
+    } else {
+        bevy::tasks::ComputeTaskPool::get().scope(|scope| {
+            for batch in missing.chunks(REGIMENTS_PER_TASK) {
+                scope.spawn(async move {
+                    batch.iter().map(|&g| inputs_r.sums(cols_r, runs.of(g), g)).collect::<Vec<RegimentSums>>()
+                });
+            }
+        })
+    };
+    let mut computed = batches.into_iter().flatten();
+    let sums: Vec<RegimentSums> = (0..n)
+        .map(|g| if from_job[g] { runs.job_sums[g].clone() } else { computed.next().expect("a sum per missing regiment") })
+        .collect();
     drop(tick_log_sums);
+    let SumInputs { cents: prev_cents, fwd, target: attack_target, open, .. } = inputs;
     let counts: Vec<usize> = sums.iter().map(|a| a.count).collect();
     let fighting: Vec<bool> = sums.iter().map(|a| a.fight_n > 0).collect();
     let cents: Vec<Vec2> = sums
