@@ -105,8 +105,9 @@ struct SharedVel(*mut Vec2);
 unsafe impl Send for SharedVel {}
 unsafe impl Sync for SharedVel {}
 /// The same for a chunk's histogram in the merge, whose tasks each read
-/// and write their own run of cells of every chunk's histogram.
-struct SharedHist(*mut u32);
+/// and write their own run of cells of every chunk's histogram: its first
+/// cell and its length.
+struct SharedHist(*mut u32, usize, usize);
 unsafe impl Send for SharedHist {}
 unsafe impl Sync for SharedHist {}
 
@@ -124,8 +125,11 @@ pub struct SpatialGrid {
     sorted_vel: Vec<Vec2>,
     /// Scratch: per-unit cell index from the count pass.
     cell_of: Vec<u32>,
-    /// Scratch: per-chunk histogram / write cursors.
+    /// Scratch: per-chunk histogram / write cursors, over the chunk's own
+    /// span of cells from its first (`hist_lo`): a chunk's men stand in a
+    /// part of the field.
     hists: Vec<Vec<u32>>,
+    hist_lo: Vec<usize>,
 }
 
 impl SpatialGrid {
@@ -179,21 +183,28 @@ impl SpatialGrid {
         let n_chunks = n.div_ceil(REBUILD_CHUNK);
         self.cell_of.resize(n, 0);
         self.hists.resize(n_chunks, Vec::new());
+        self.hist_lo.resize(n_chunks, 0);
 
-        // Count pass: per-chunk histograms + cached per-unit cell index.
+        // Count pass: per-unit cell index, then per-chunk histograms over
+        // the chunk's span of cells.
         crate::util::sim_scope(|scope| {
-            for (pos_chunk, (cell_chunk, hist)) in positions
+            for (pos_chunk, ((cell_chunk, hist), hist_lo)) in positions
                 .chunks(REBUILD_CHUNK)
-                .zip(self.cell_of.chunks_mut(REBUILD_CHUNK).zip(&mut self.hists))
+                .zip(self.cell_of.chunks_mut(REBUILD_CHUNK).zip(&mut self.hists).zip(&mut self.hist_lo))
             {
                 scope.spawn(async move {
-                    hist.clear();
-                    hist.resize(cells, 0);
+                    let (mut lo, mut hi) = (usize::MAX, 0usize);
                     for (j, p) in pos_chunk.iter().enumerate() {
                         let c = cell_index_for(origin, dims, Vec2::new(p.x, p.z));
                         cell_chunk[j] = c as u32;
-                        hist[c] += 1;
+                        (lo, hi) = (lo.min(c), hi.max(c));
                     }
+                    hist.clear();
+                    hist.resize(hi + 1 - lo, 0);
+                    for &c in cell_chunk.iter() {
+                        hist[c as usize - lo] += 1;
+                    }
+                    *hist_lo = lo;
                 });
             }
         });
@@ -203,12 +214,14 @@ impl SpatialGrid {
         // cell-major, chunk order within a cell. In parallel over runs of
         // cells: each run's men first, then the runs' offsets one after the
         // other, then each run's prefix sums and cursors from its offset,
-        // the same numbers one pass over the cells gives. SAFETY
-        // (SharedHist): every histogram holds `cells` slots, and each task
-        // reads and writes only its own run of them.
+        // the same numbers one pass over the cells gives. A chunk holds no
+        // man of a cell outside its span. SAFETY (SharedHist): every
+        // histogram holds its span's slots, and each task reads and writes
+        // only its own run of cells of them.
         self.starts.clear();
         self.starts.resize(cells + 1, 0);
-        let hist_at: Vec<SharedHist> = self.hists.iter_mut().map(|h| SharedHist(h.as_mut_ptr())).collect();
+        let hist_at: Vec<SharedHist> =
+            self.hists.iter_mut().zip(&self.hist_lo).map(|(h, &lo)| SharedHist(h.as_mut_ptr(), lo, h.len())).collect();
         let hist_at = &hist_at[..];
         let run_men: Vec<u32> = crate::util::sim_scope(|scope| {
             for c0 in (0..cells).step_by(CELL_CHUNK) {
@@ -216,7 +229,8 @@ impl SpatialGrid {
                     let c1 = (c0 + CELL_CHUNK).min(cells);
                     let mut men = 0u32;
                     for h in hist_at {
-                        men += (c0..c1).map(|c| unsafe { *h.0.add(c) }).sum::<u32>();
+                        let (a, b) = (c0.max(h.1), c1.min(h.1 + h.2));
+                        men += (a..b.max(a)).map(|c| unsafe { *h.0.add(c - h.1) }).sum::<u32>();
                     }
                     men
                 });
@@ -237,8 +251,12 @@ impl SpatialGrid {
                     let c0 = k * CELL_CHUNK;
                     let mut acc = from;
                     for (j, start) in starts.iter_mut().enumerate() {
+                        let c = c0 + j;
                         for h in hist_at {
-                            let at = unsafe { h.0.add(c0 + j) };
+                            if c < h.1 || c >= h.1 + h.2 {
+                                continue;
+                            }
+                            let at = unsafe { h.0.add(c - h.1) };
                             let cnt = unsafe { *at };
                             unsafe { *at = acc };
                             acc += cnt;
@@ -259,16 +277,16 @@ impl SpatialGrid {
         let out_vel = SharedVel(self.sorted_vel.as_mut_ptr());
         let out_vel = &out_vel;
         crate::util::sim_scope(|scope| {
-            for (t, (pos_chunk, (cell_chunk, hist))) in positions
+            for (t, (pos_chunk, ((cell_chunk, hist), &lo))) in positions
                 .chunks(REBUILD_CHUNK)
-                .zip(self.cell_of.chunks(REBUILD_CHUNK).zip(&mut self.hists))
+                .zip(self.cell_of.chunks(REBUILD_CHUNK).zip(&mut self.hists).zip(&self.hist_lo))
                 .enumerate()
             {
                 let start = t * REBUILD_CHUNK;
                 scope.spawn(async move {
                     for (j, p) in pos_chunk.iter().enumerate() {
                         let i = start + j;
-                        let c = cell_chunk[j] as usize;
+                        let c = cell_chunk[j] as usize - lo;
                         let k = hist[c] as usize;
                         hist[c] += 1;
                         let meta = ((teams[i] as u32) * META_TEAM)
