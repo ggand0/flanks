@@ -45,6 +45,8 @@ pub fn process_deaths(
     (pipeline, runs): (Res<crate::sim::TickPipeline>, Res<crate::sim::RegimentRuns>),
 ) {
     let _span = info_span!("process_deaths").entered();
+    let _tick_log = crate::frame_log::tick::time(crate::frame_log::tick::Part::Deaths);
+    let tick_log_sweep = crate::frame_log::tick::time(crate::frame_log::tick::Part::DeathsSweep);
     let (edge_min, edge_max) = (terrain.min().y + 8.0, terrain.max().y - 8.0);
     let mut craters: Vec<(Vec2, f32)> = Vec::new();
     // Slots the dead leave in formed regiments, filled after the sweep.
@@ -149,8 +151,13 @@ pub fn process_deaths(
     for (c, r) in craters {
         terrain.carve_crater(c, r, r * 0.4);
     }
+    drop(tick_log_sweep);
+    let tick_log_fill = crate::frame_log::tick::time(crate::frame_log::tick::Part::DeathsFill);
     fill_vacated_slots(&mut units, &groups, &vacated, &runs, &moves);
+    drop(tick_log_fill);
 
+    crate::frame_log::tick::units(units.len());
+    let _tick_log_count = crate::frame_log::tick::time(crate::frame_log::tick::Part::DeathsCount);
     stats.alive = [0, 0];
     for (&t, &d) in units.team.iter().zip(&units.death_t[..]) {
         if d == 0 {

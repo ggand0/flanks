@@ -1136,6 +1136,7 @@ pub fn halt_selected(selection: &Selection, groups: &mut Groups, t: f32) {
 /// ends when the target regiment is wiped (hold in place there). Uses the
 /// centroid refreshed by the frontline pass each tick.
 pub fn clear_arrived_orders(mut groups: ResMut<Groups>) {
+    let _tick_log = crate::frame_log::tick::time(crate::frame_log::tick::Part::ClearOrders);
     let counts: Vec<usize> = groups.list.iter().map(|g| g.count).collect();
     for (g, group) in groups.list.iter_mut().enumerate() {
         match group.order {

@@ -123,6 +123,7 @@ const FAT_RECOVER: f32 = 0.12;
 /// `engaged`/`charging` are this tick's truth, before the morale tick
 /// that reads the result.
 pub fn update_fatigue(mut groups: ResMut<Groups>, time: Res<Time>) {
+    let _tick_log = crate::frame_log::tick::time(crate::frame_log::tick::Part::Fatigue);
     let dt = time.delta_secs();
     for g in groups.list.iter_mut() {
         if g.count == 0 {

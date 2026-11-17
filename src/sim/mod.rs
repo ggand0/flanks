@@ -199,9 +199,11 @@ impl TickPipeline {
         );
         self.in_flight = false;
         let worker = self.worker.as_ref().expect("worker exists while a job is in flight");
+        let tick_log_wait = crate::frame_log::tick::time(crate::frame_log::tick::Part::TakeWait);
         let start = crate::frame_log::take_start();
         let job = worker.from_worker.lock().unwrap().recv().expect("sim tick worker alive");
         crate::frame_log::take_end(start);
+        drop(tick_log_wait);
         Some(job)
     }
 }
@@ -221,6 +223,7 @@ pub fn take_tick(
     field: Option<ResMut<InfluenceField>>,
     mut stats: ResMut<SimStats>,
 ) {
+    let _tick_log = crate::frame_log::tick::time(crate::frame_log::tick::Part::Take);
     // A job computed from an older world (a new battle started while it
     // ran) carries indices that mean nothing here: recycle its buffers
     // and drop the result.
@@ -269,6 +272,7 @@ fn pipeline_enabled() -> bool {
 pub struct SharedTerrain(pub Option<std::sync::Arc<Terrain>>);
 
 pub fn refresh_shared_terrain(terrain: Res<Terrain>, mut shared: ResMut<SharedTerrain>) {
+    let _tick_log = crate::frame_log::tick::time(crate::frame_log::tick::Part::Terrain);
     if terrain.is_changed() || shared.0.is_none() {
         shared.0 = Some(std::sync::Arc::new(terrain.clone()));
     }
@@ -718,6 +722,7 @@ pub fn step_sim(
     mut routes: ResMut<route::Routes>,
 ) {
     let _frame_log = crate::frame_log::time_step();
+    let _tick_log = crate::frame_log::tick::time(crate::frame_log::tick::Part::Step);
     let finished = pipeline.taken.take();
     if units.pos.is_empty() {
         return;
@@ -727,6 +732,7 @@ pub fn step_sim(
     let mut job = match finished {
         Some(job) => job,
         None => {
+            let _tick_log_inline = crate::frame_log::tick::time(crate::frame_log::tick::Part::StepInline);
             let Some(terrain_arc) = shared_terrain.0.as_ref() else {
                 return;
             };
@@ -756,6 +762,7 @@ pub fn step_sim(
     // buffers: no copy, no allocation. pos_prev <- the state at tick
     // start (the job's shared position column), pos <- the new
     // kinematics.
+    let tick_log_install = crate::frame_log::tick::time(crate::frame_log::tick::Part::StepInstall);
     job.release_inputs();
     {
         let u = &mut *units;
@@ -789,6 +796,8 @@ pub fn step_sim(
     stats.grid_ms = job.grid_ms;
     stats.step_ms = job.step_ms;
     diag::log_step(&mut stats, job.step_ms, job.grid_ms, units.pos.len());
+    drop(tick_log_install);
+    let tick_log_damage = crate::frame_log::tick::time(crate::frame_log::tick::Part::StepDamage);
     stats.events = damage::apply_damage(
         &mut damage.0,
         &mut units,
@@ -806,12 +815,14 @@ pub fn step_sim(
         &mut dir_stats,
         sounds.as_deref_mut(),
     );
+    drop(tick_log_damage);
 
     pipeline.tick = pipeline.tick.wrapping_add(1);
     let tick = pipeline.tick;
     let audit = job.audit.take();
     if diag::audit_tick(tick) {
         let _frame_log = crate::frame_log::time_audit();
+        let _tick_log_audit = crate::frame_log::tick::time(crate::frame_log::tick::Part::StepAudit);
         // The job's sums. When it left none (prepared under another tick
         // count), or a write between the kick and the install made the
         // start positions a copy, they are taken here from the same grid
@@ -852,12 +863,14 @@ pub fn kick_tick(
     mut routes: ResMut<route::Routes>,
 ) {
     let _frame_log = crate::frame_log::time_kick();
+    let _tick_log = crate::frame_log::tick::time(crate::frame_log::tick::Part::Kick);
     if !pipeline_enabled() || units.pos.is_empty() || pipeline.in_flight {
         return;
     }
     let Some(terrain_arc) = shared_terrain.0.as_ref() else {
         return;
     };
+    let tick_log_prep = crate::frame_log::tick::time(crate::frame_log::tick::Part::KickPrep);
     let mut job = pipeline.scratch.take().unwrap_or_default();
     prepare_tick(
         &mut job,
@@ -871,6 +884,8 @@ pub fn kick_tick(
         pipeline.tick,
     );
     job.field_wanted = true;
+    drop(tick_log_prep);
+    let _tick_log_send = crate::frame_log::tick::time(crate::frame_log::tick::Part::KickSend);
     // The render snapshot of the columns as kicked: the job packs it on
     // the sim's pool while the frame runs, instead of the frame packing
     // the same columns after Update (render_units_gpu.rs).
