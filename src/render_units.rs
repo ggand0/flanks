@@ -1687,6 +1687,34 @@ fn receive_defs(descriptor: &mut RenderPipelineDescriptor, receive: bool) {
     }
 }
 
+/// `FL_CENTROID=1`: the blended corner light is read at a sample the
+/// triangle covers instead of at the pixel centre (unit_instancing.wgsl
+/// `UNIT_CENTROID`), for measuring how much of the far band's bright
+/// specks comes from a triangle smaller than a pixel. Off by default.
+/// Every stage and pipeline of the process takes the same value, so it
+/// rides in no pipeline key. Read once, and logged when on.
+fn centroid() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = crate::util::env_or("FL_CENTROID", 0_u32) != 0;
+        if on {
+            bevy::log::info!("unit light read at a covered sample (centroid)");
+        }
+        on
+    })
+}
+
+/// The vertex and fragment stages must agree on how the light is
+/// interpolated, so both take the def.
+fn centroid_defs(descriptor: &mut RenderPipelineDescriptor) {
+    if centroid() {
+        descriptor.vertex.shader_defs.push("UNIT_CENTROID".into());
+        if let Some(fragment) = descriptor.fragment.as_mut() {
+            fragment.shader_defs.push("UNIT_CENTROID".into());
+        }
+    }
+}
+
 impl SpecializedRenderPipeline for CustomPipeline {
     type Key = PullPipelineKey;
 
@@ -1743,6 +1771,7 @@ impl SpecializedRenderPipeline for CustomPipeline {
         }
         atlas_defs(&mut descriptor, key.atlas);
         receive_defs(&mut descriptor, key.receive);
+        centroid_defs(&mut descriptor);
         descriptor.set_layout(3, self.pull_layout.clone());
         descriptor
     }
@@ -1790,6 +1819,7 @@ impl SpecializedMeshPipeline for CustomPipeline {
         descriptor.fragment.as_mut().unwrap().shader = self.shader.clone();
         atlas_defs(&mut descriptor, key.atlas);
         receive_defs(&mut descriptor, key.receive);
+        centroid_defs(&mut descriptor);
         descriptor.set_layout(3, self.bucket_layout.clone());
         Ok(descriptor)
     }
