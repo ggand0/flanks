@@ -54,7 +54,15 @@ struct VertexOutput {
 #ifdef UNIT_LIGHT_FLAT
     @location(0) @interpolate(flat, first) color: vec4<f32>,
 #else
+#ifdef UNIT_CENTROID
+    // FL_CENTROID=1 (render_units.rs `centroid_defs`): under multisampling
+    // a fragment of a triangle smaller than a pixel reads the blended
+    // light at a sample the triangle covers, not at the pixel centre
+    // outside it, where the blend runs past its corners' values.
+    @location(0) @interpolate(perspective, centroid) color: vec4<f32>,
+#else
     @location(0) color: vec4<f32>,
+#endif
 #endif
     // Per instance, so flat. x = team colour, unorm8 rgb, and the death
     // darkening in the top byte; y = the hit flash, unorm8 in the low byte,
