@@ -363,3 +363,285 @@ impl Plugin for FrameLogPlugin {
             );
     }
 }
+
+/// `FL_LOG_TICK=1`: the cost of each system of the sim's fixed tick
+/// (`SimSet`), and of named parts inside some of them. Every 60 ticks one
+/// `[tick]` line gives, per system and part, the mean and the largest time
+/// of one tick in microseconds over the ticks since the last line; a part
+/// that did not run on a tick counts 0 for that tick. `fixed` is the whole
+/// fixed step, FixedFirst to FixedLast (overlay.rs `fixed_begin` and
+/// `fixed_end`), `in systems` the sum of the systems' own times, and
+/// `outside` the rest of the step: Bevy's executor and the fixed systems of
+/// its own. A system with parts ends with `rest`, its time outside them. A
+/// `[tick-order]` line names the order the systems started in, with how
+/// many ticks of the window ran in it, on the first line and whenever the
+/// order is not the same single order as in the last window.
+///
+/// The systems run on the compute pool's threads as well as the main
+/// thread, and two that do not conflict can overlap, so the spans add into
+/// atomics and `in systems` can exceed the step. Without the variable every
+/// span is one branch on a value read once. No system, resource or system
+/// parameter is added, so the schedule and what the sim computes stay as
+/// they are.
+pub mod tick {
+    use std::fmt::Write as _;
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Instant;
+
+    use bevy::prelude::*;
+
+    /// A timed system or part of the fixed tick. The order is the line's.
+    #[derive(Clone, Copy)]
+    pub enum Part {
+        Terrain,
+        Take,
+        TakeWait,
+        Field,
+        Groups,
+        GroupsSums,
+        Reforms,
+        Ammo,
+        Step,
+        StepInline,
+        StepInstall,
+        StepDamage,
+        StepAudit,
+        Arrows,
+        Deaths,
+        DeathsSweep,
+        DeathsFill,
+        DeathsCount,
+        Fatigue,
+        Morale,
+        ClearOrders,
+        PathOrders,
+        PathLog,
+        Routes,
+        Kick,
+        KickPrep,
+        KickSend,
+        CountTick,
+    }
+
+    const N: usize = Part::CountTick as usize + 1;
+
+    /// Each part's name in the line, and the system it is a part of (None
+    /// for a system), in the order of `Part`.
+    const PARTS: [(&str, Option<Part>); N] = [
+        ("terrain", None),
+        ("take", None),
+        ("wait", Some(Part::Take)),
+        ("field", None),
+        ("groups", None),
+        ("sums", Some(Part::Groups)),
+        ("reforms", None),
+        ("ammo", None),
+        ("step", None),
+        ("inline", Some(Part::Step)),
+        ("install", Some(Part::Step)),
+        ("damage", Some(Part::Step)),
+        ("audit", Some(Part::Step)),
+        ("arrows", None),
+        ("deaths", None),
+        ("sweep", Some(Part::Deaths)),
+        ("fill", Some(Part::Deaths)),
+        ("count", Some(Part::Deaths)),
+        ("fatigue", None),
+        ("morale", None),
+        ("clear orders", None),
+        ("path orders", None),
+        ("path log", None),
+        ("routes", None),
+        ("kick", None),
+        ("prep", Some(Part::Kick)),
+        ("send", Some(Part::Kick)),
+        ("count tick", None),
+    ];
+
+    /// The log is on.
+    pub fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var("FL_LOG_TICK").is_ok_and(|v| v != "0"))
+    }
+
+    // This step: each part's nanoseconds, each system's start rank (0 for
+    // not run), the next rank, and the step's start.
+    static NOW: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+    static STARTED: [AtomicU32; N] = [const { AtomicU32::new(0) }; N];
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    static STEP_START: Mutex<Option<Instant>> = Mutex::new(None);
+    static UNITS: AtomicU64 = AtomicU64::new(0);
+
+    /// The ticks since the last line.
+    struct Window {
+        ticks: u32,
+        sum: [u64; N],
+        max: [u64; N],
+        rest_sum: [u64; N],
+        rest_max: [u64; N],
+        /// The whole step, the systems' sum, the rest: sum and max.
+        fixed: (u64, u64),
+        inside: (u64, u64),
+        outside: (u64, u64),
+        orders: Vec<(String, u32)>,
+        last_orders: Vec<String>,
+    }
+
+    static WINDOW: Mutex<Window> = Mutex::new(Window {
+        ticks: 0,
+        sum: [0; N],
+        max: [0; N],
+        rest_sum: [0; N],
+        rest_max: [0; N],
+        fixed: (0, 0),
+        inside: (0, 0),
+        outside: (0, 0),
+        orders: Vec::new(),
+        last_orders: Vec::new(),
+    });
+
+    /// Adds the wall time from its creation to its drop into its part.
+    /// Holds nothing when the log is off.
+    pub struct Span(Option<(Instant, usize)>);
+
+    impl Drop for Span {
+        fn drop(&mut self) {
+            if let Some((t0, k)) = self.0 {
+                NOW[k].fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+            }
+        }
+    }
+
+    /// Times one run of a system or part, to the guard's drop.
+    pub fn time(part: Part) -> Span {
+        if !on() {
+            return Span(None);
+        }
+        let k = part as usize;
+        if PARTS[k].1.is_none() && STARTED[k].load(Relaxed) == 0 {
+            STARTED[k].store(NEXT.fetch_add(1, Relaxed) + 1, Relaxed);
+        }
+        Span(Some((Instant::now(), k)))
+    }
+
+    /// The army's size for the line (`process_deaths`, after the sweep).
+    pub fn units(n: usize) {
+        if on() {
+            UNITS.store(n as u64, Relaxed);
+        }
+    }
+
+    /// FixedFirst: a fixed step starts.
+    pub fn step_begin() {
+        if on() {
+            *STEP_START.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+        }
+    }
+
+    fn add(acc: &mut (u64, u64), v: u64) {
+        acc.0 += v;
+        acc.1 = acc.1.max(v);
+    }
+
+    /// FixedLast: the step is over. Files it in the window when the sim's
+    /// tick ran in it, and writes the line once the window holds 60 ticks.
+    pub fn step_end() {
+        if !on() {
+            return;
+        }
+        let wall = STEP_START
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .map_or(0, |t0| t0.elapsed().as_nanos() as u64);
+        let now: [u64; N] = std::array::from_fn(|k| NOW[k].swap(0, Relaxed));
+        let started: [u32; N] = std::array::from_fn(|k| STARTED[k].swap(0, Relaxed));
+        NEXT.store(0, Relaxed);
+        // A step in which no system of the tick ran (the menu, the
+        // deployment) is not a tick.
+        if started.iter().all(|&s| s == 0) {
+            return;
+        }
+        let parent = |j: usize| PARTS[j].1.map(|p| p as usize);
+        let mut w = WINDOW.lock().unwrap_or_else(|e| e.into_inner());
+        w.ticks += 1;
+        let mut inside = 0;
+        for (k, (_, of)) in PARTS.iter().enumerate() {
+            w.sum[k] += now[k];
+            w.max[k] = w.max[k].max(now[k]);
+            if of.is_some() {
+                continue;
+            }
+            inside += now[k];
+            if (0..N).any(|j| parent(j) == Some(k)) {
+                let parts: u64 = (0..N).filter(|&j| parent(j) == Some(k)).map(|j| now[j]).sum();
+                let rest = now[k].saturating_sub(parts);
+                w.rest_sum[k] += rest;
+                w.rest_max[k] = w.rest_max[k].max(rest);
+            }
+        }
+        add(&mut w.fixed, wall);
+        add(&mut w.inside, inside);
+        add(&mut w.outside, wall.saturating_sub(inside));
+        let mut ran: Vec<usize> = (0..N).filter(|&k| started[k] > 0).collect();
+        ran.sort_by_key(|&k| started[k]);
+        let order = ran.iter().map(|&k| PARTS[k].0).collect::<Vec<_>>().join(" > ");
+        match w.orders.iter().position(|(o, _)| *o == order) {
+            Some(i) => w.orders[i].1 += 1,
+            None => w.orders.push((order, 1)),
+        }
+        if w.ticks == 60 {
+            write_line(&mut w);
+        }
+    }
+
+    fn write_line(w: &mut Window) {
+        let n = w.ticks as f64;
+        let us = |sum: u64, max: u64| format!("{:.0}/{:.0}", sum as f64 / n / 1000.0, max as f64 / 1000.0);
+        let mut line = format!(
+            "[tick] {} ticks, {} units, us mean/max: fixed {}, in systems {}, outside {} |",
+            w.ticks,
+            UNITS.load(Relaxed),
+            us(w.fixed.0, w.fixed.1),
+            us(w.inside.0, w.inside.1),
+            us(w.outside.0, w.outside.1),
+        );
+        for (k, (name, of)) in PARTS.iter().enumerate() {
+            if of.is_some() {
+                continue;
+            }
+            let _ = write!(line, " {} {}", name, us(w.sum[k], w.max[k]));
+            let parts: Vec<usize> = (0..N).filter(|&j| PARTS[j].1.map(|p| p as usize) == Some(k)).collect();
+            if !parts.is_empty() {
+                line.push_str(" (");
+                for j in parts {
+                    let _ = write!(line, "{} {}, ", PARTS[j].0, us(w.sum[j], w.max[j]));
+                }
+                let _ = write!(line, "rest {})", us(w.rest_sum[k], w.rest_max[k]));
+            }
+            line.push(',');
+        }
+        line.pop();
+        info!("{line}");
+        let orders: Vec<String> = w.orders.iter().map(|(o, _)| o.clone()).collect();
+        if orders.len() > 1 || orders != w.last_orders {
+            for (o, c) in &w.orders {
+                info!("[tick-order] {c} of {} ticks: {o}", w.ticks);
+            }
+        }
+        let last_orders = orders;
+        *w = Window {
+            ticks: 0,
+            sum: [0; N],
+            max: [0; N],
+            rest_sum: [0; N],
+            rest_max: [0; N],
+            fixed: (0, 0),
+            inside: (0, 0),
+            outside: (0, 0),
+            orders: Vec::new(),
+            last_orders,
+        };
+    }
+}

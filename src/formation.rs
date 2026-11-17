@@ -1050,6 +1050,7 @@ pub fn apply_formation_cmd(
 /// regiment that lost enough men since it last formed compacts its grid
 /// (only out of contact — nobody dresses ranks mid-melee).
 fn apply_reforms(mut units: ResMut<Units>, mut groups: ResMut<Groups>, mut tick: Local<u32>) {
+    let _tick_log = crate::frame_log::tick::time(crate::frame_log::tick::Part::Reforms);
     *tick = tick.wrapping_add(1);
     for g in 0..groups.list.len() {
         let gd = &mut groups.list[g];

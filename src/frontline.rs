@@ -297,6 +297,7 @@ fn update_field(
     pipeline: Res<crate::sim::TickPipeline>,
     mut stats: ResMut<crate::sim::SimStats>,
 ) {
+    let _tick_log = crate::frame_log::tick::time(crate::frame_log::tick::Part::Field);
     if pipeline.field_from_job {
         return;
     }
@@ -461,6 +462,7 @@ fn update_groups(
     runs: Res<crate::sim::RegimentRuns>,
     mut groups: ResMut<Groups>,
 ) {
+    let _tick_log = crate::frame_log::tick::time(crate::frame_log::tick::Part::Groups);
     let n = groups.list.len();
     // Disorder measures SHAPE coherence, not travel: deviation from the
     // slot relative to the regiment's own centroid (last tick's — 33 ms
@@ -524,6 +526,7 @@ fn update_groups(
     let runs = &*runs;
     let (prev_cents_r, prev_bias_r, fwd_r, target_r, bows_r, open_r) =
         (&prev_cents, &prev_bias, &fwd, &attack_target, &bows, &open);
+    let tick_log_sums = crate::frame_log::tick::time(crate::frame_log::tick::Part::GroupsSums);
     let batches: Vec<Vec<RegimentSums>> = bevy::tasks::ComputeTaskPool::get().scope(|scope| {
         for first in (0..n).step_by(REGIMENTS_PER_TASK) {
             scope.spawn(async move {
@@ -538,6 +541,7 @@ fn update_groups(
         }
     });
     let sums: Vec<RegimentSums> = batches.into_iter().flatten().collect();
+    drop(tick_log_sums);
     let counts: Vec<usize> = sums.iter().map(|a| a.count).collect();
     let fighting: Vec<bool> = sums.iter().map(|a| a.fight_n > 0).collect();
     let cents: Vec<Vec2> = sums

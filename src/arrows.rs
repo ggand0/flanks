@@ -354,6 +354,7 @@ fn update_arrows(
     mut tick: Local<u32>,
 ) {
     let _timed = Timed(&ARROW_UPDATE_NS, std::time::Instant::now());
+    let _tick_log = crate::frame_log::tick::time(crate::frame_log::tick::Part::Arrows);
     let _span = info_span!("update_arrows").entered();
     let dt = time.delta_secs();
     *tick = tick.wrapping_add(1);
@@ -644,6 +645,7 @@ fn ammo_tally(
     units: Res<crate::units::Units>,
     runs: Res<crate::sim::RegimentRuns>,
 ) {
+    let _tick_log = crate::frame_log::tick::time(crate::frame_log::tick::Part::Ammo);
     for (g, gd) in groups.list.iter_mut().enumerate() {
         if gd.kind != crate::unit_types::KIND_ARCHER {
             continue;

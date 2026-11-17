@@ -170,6 +170,7 @@ fn give_orders(
     mut units: ResMut<Units>,
     mut test: ResMut<PathTest>,
 ) {
+    let _tick_log = crate::frame_log::tick::time(crate::frame_log::tick::Part::PathOrders);
     if test.ordered || pipeline.tick < ORDER_TICK || groups.list.is_empty() {
         return;
     }
@@ -235,6 +236,7 @@ fn log_progress(
     mut test: ResMut<PathTest>,
     mut frames: ResMut<FrameWatch>,
 ) {
+    let _tick_log = crate::frame_log::tick::time(crate::frame_log::tick::Part::PathLog);
     if !test.ordered {
         return;
     }

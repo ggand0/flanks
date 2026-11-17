@@ -46,6 +46,7 @@ struct InspectText;
 struct TicksThisFrame(u32);
 
 fn count_sim_tick(mut ticks: ResMut<TicksThisFrame>) {
+    let _tick_log = crate::frame_log::tick::time(crate::frame_log::tick::Part::CountTick);
     ticks.0 += 1;
 }
 
@@ -65,6 +66,7 @@ struct FramePacing {
 }
 
 fn fixed_begin(mut pacing: ResMut<FramePacing>) {
+    crate::frame_log::tick::step_begin();
     pacing.fixed_start = Some(std::time::Instant::now());
 }
 
@@ -72,6 +74,7 @@ fn fixed_end(mut pacing: ResMut<FramePacing>) {
     if let Some(t0) = pacing.fixed_start.take() {
         pacing.fixed_this_frame += t0.elapsed().as_secs_f32() * 1000.0;
     }
+    crate::frame_log::tick::step_end();
 }
 
 /// Runs once per frame in Update, after this frame's fixed ticks: the
