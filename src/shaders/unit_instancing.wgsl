@@ -293,8 +293,9 @@ fn vertex_pull(@builtin(vertex_index) index: u32, @builtin(instance_index) insta
 fn vertex(vertex: Vertex) -> VertexOutput {
     pose_begin(vertex.i_pos_scale, vertex.i_color, vertex.i_anim, vertex.i_anim2, globals.time, false);
 #ifdef UNIT_LIGHT_FLAT
-    // The fragment stage of a pulled flat-lit bucket compiles this entry
-    // point with the def too; it never draws with it.
+    // A flat-lit batch drawn through `vertex_pull` gives its fragment stage
+    // UNIT_LIGHT_FLAT but not VERTEX_PULL, so that stage builds this entry
+    // point under UNIT_LIGHT_FLAT too; the batch never draws with it.
     let placed = place(
         vertex.position,
         vertex.normal,

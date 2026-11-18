@@ -1896,8 +1896,8 @@ fn put_away(part: f32) -> bool {
 // Where a corner of the mesh lands in the world, posed: its rest position
 // and normal in the soldier's local space, its body part and the part's
 // pivot height. On a skinned kind, `skin` is its joint pair, a + 256 * b,
-// and `weight` the share of b. Under UNIT_LIGHT_FLAT two more rest
-// directions ride along and are turned by every step that turns the
+// and `weight` the share of b. Under UNIT_LIGHT_FLAT it also takes two
+// more rest directions and turns them by every step that turns the
 // normal.
 fn place(
     rest: vec3<f32>,

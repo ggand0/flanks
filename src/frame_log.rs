@@ -371,8 +371,8 @@ impl Plugin for FrameLogPlugin {
 /// that did not run on a tick counts 0 for that tick. `fixed` is the whole
 /// fixed step, FixedFirst to FixedLast (overlay.rs `fixed_begin` and
 /// `fixed_end`), `in systems` the sum of the systems' own times, and
-/// `outside` the rest of the step: Bevy's executor and the fixed systems of
-/// its own. A system with parts ends with `rest`, its time outside them. A
+/// `outside` the rest of the step: Bevy's executor and Bevy's own fixed
+/// systems. A system with parts ends with `rest`, its time outside them. A
 /// `[tick-order]` line names the order the systems started in, with how
 /// many ticks of the window ran in it, on the first line and whenever the
 /// order is not the same single order as in the last window.
@@ -391,7 +391,7 @@ pub mod tick {
 
     use bevy::prelude::*;
 
-    /// A timed system or part of the fixed tick. The order is the line's.
+    /// A timed system or part of the fixed tick, in the order the line prints them.
     #[derive(Clone, Copy)]
     pub enum Part {
         Terrain,
