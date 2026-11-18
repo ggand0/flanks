@@ -212,9 +212,9 @@ pub struct TickJob {
     pub(crate) field: crate::frontline::InfluenceField,
     pub(crate) field_wanted: bool,
     /// Each regiment's sums for `update_groups` (frontline.rs), taken
-    /// beside the grid rebuild with the inputs prep stored, when a taker
-    /// wants them (not on the inline path, where `update_groups` already
-    /// summed).
+    /// beside the grid rebuild from the inputs `kick_tick` stored in
+    /// `sum_inputs`. `sums_wanted` is false on the inline path, where
+    /// `update_groups` already summed.
     pub(crate) group_sums: Vec<crate::frontline::RegimentSums>,
     pub(crate) sum_inputs: crate::frontline::SumInputs,
     pub(crate) sums_wanted: bool,

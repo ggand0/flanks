@@ -188,7 +188,7 @@ fn widest_rest() -> f32 {
     *R.get_or_init(|| pair_widths().iter().flatten().fold(0.0f32, |r, w| r.max(w.sep)))
 }
 /// The scan's cut of its foes (`scan`): metres past the farthest a foe can
-/// be and still count, far above the rounding of a place on the map.
+/// be and still count, far above the float rounding of a position on the map.
 const CUT_MARGIN: f32 = 0.01;
 /// A pair of men by their kinds: the mass weight of the push on the
 /// first (2 m_o / (m_i + m_o)) and the other's share of a closing speed
@@ -966,7 +966,7 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut, cands: &m
     let gi = st.gi;
     let dying = st.dying;
     // Fused neighbor scan: separation physics + nearest living enemy in reach
-    // (swing targeting), over the cache-ordered SortedUnits within the cut.
+    // (swing targeting), over the grid's cache-ordered units within the cut.
     let mut push = Vec2::ZERO;
     let mut corr = Vec2::ZERO;
     let mut overlap_vel = Vec2::ZERO;
@@ -1053,12 +1053,12 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut, cands: &m
     };
     let foe_cut = widest_rest().max(params.reach).max(spear_cut) + CUT_MARGIN;
     // First the candidates within the cut, by rank, in the walk's order:
-    // which of them pass is a coin toss in a press, so each is written and
+    // in a press, whether each passes is hard to predict, so each is written and
     // kept by the test's outcome instead of by a branch on it. A friend
     // beyond SEP_RADIUS can touch nothing of his, and most of a scan's
     // candidates in a press are such men (the cells span more than the
     // circle); a foe beyond `foe_cut` fails every foe test. The box stays
-    // `scan_r`'s, which the look round him reads again (`look_around`).
+    // `scan_r`'s, which the look around him reads again (`look_around`).
     cands.clear();
     cands.reserve(grid.box_len(p, scan_r));
     let cut = crate::spatial::KeepCut {

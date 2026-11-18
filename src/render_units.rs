@@ -1689,10 +1689,10 @@ fn receive_defs(descriptor: &mut RenderPipelineDescriptor, receive: bool) {
 
 /// `FL_CENTROID=1`: the blended corner light is read at a sample the
 /// triangle covers instead of at the pixel centre (unit_instancing.wgsl
-/// `UNIT_CENTROID`), for measuring how much of the far band's bright
+/// `UNIT_CENTROID`), for measuring how much of the distant soldiers' bright
 /// specks comes from a triangle smaller than a pixel. Off by default.
 /// Every stage and pipeline of the process takes the same value, so it
-/// rides in no pipeline key. Read once, and logged when on.
+/// is not part of any pipeline key. Read once, and logged when on.
 fn centroid() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -1705,7 +1705,7 @@ fn centroid() -> bool {
 }
 
 /// The vertex and fragment stages must agree on how the light is
-/// interpolated, so both take the def.
+/// interpolated, so both get the UNIT_CENTROID shader def.
 fn centroid_defs(descriptor: &mut RenderPipelineDescriptor) {
     if centroid() {
         descriptor.vertex.shader_defs.push("UNIT_CENTROID".into());

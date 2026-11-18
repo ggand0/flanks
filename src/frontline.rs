@@ -445,15 +445,17 @@ impl SumInputs {
 
 /// Every regiment's inputs to the sums, from the regiments as they stand.
 pub(crate) fn sum_inputs(groups: &Groups) -> SumInputs {
-    // Disorder measures SHAPE coherence, not travel: deviation from the
-    // slot relative to the regiment's own centroid (last tick's — 33 ms
-    // stale is nothing at 2 s smoothing). A rigid march scores ~0; a
-    // block churned up by melee scores meters.
+    // The disorder in the sums measures the block's shape, not its
+    // travel: each man's distance from his slot, measured from the
+    // regiment's own centroid. That centroid is last tick's; 33 ms old is
+    // nothing next to the 2 s smoothing. A block marching in step scores
+    // about 0 m, a block broken up in melee several metres.
     let cents: Vec<Vec2> = groups.list.iter().map(|g| g.centroid).collect();
     let bias: Vec<Vec2> = groups.list.iter().map(|g| g.home_bias).collect();
-    // Contact frame inputs (see the frame in `update_groups`): each
-    // regiment's forward vector, its front-most slot, and the depth of the
-    // men fighting an enemy ahead of the frame.
+    // The contact frame's input (the frame in `update_groups`): each
+    // regiment's forward vector. The sums take from it the regiment's
+    // front-most slot and the depth of its men fighting an enemy ahead of
+    // the frame.
     let fwd: Vec<Vec2> = groups
         .list
         .iter()

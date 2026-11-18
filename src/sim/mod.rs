@@ -956,7 +956,7 @@ pub fn kick_tick(
     pipeline.in_flight = true;
 }
 
-/// A finished exclusive borrow, read from now on by tasks beside each other.
+/// A finished exclusive borrow, read from then on by tasks running at the same time.
 fn shared<T>(r: &mut T) -> &T {
     r
 }
