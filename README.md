@@ -42,6 +42,7 @@ Requires Rust 1.95 or newer. The models and ground textures are stored with [Git
 | Clear the selection             | Enter                     |
 | Move / attack                   | Right click               |
 | Draw a battle line              | Right drag                |
+| Draw a battle line with no gaps between units | Ctrl + right drag |
 | Halt selection                  | Backspace                 |
 | Shield / spear wall             | F                         |
 | Loose order                     | L                         |
