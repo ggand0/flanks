@@ -279,7 +279,10 @@ pub fn push_unit(
     ];
     let params = &crate::unit_types::TYPES[kind as usize];
     let hh = crate::unit_types::half_height(kind as usize);
-    let p = Vec3::new(x, terrain.height_at(x, z) + hh, z);
+    // Off blocked ground (a block spawned over a wall's foot): a man whose
+    // centre is on a blocked vertex could never move again.
+    let at = terrain.nearest_open(Vec2::new(x, z), 12.0).unwrap_or(Vec2::new(x, z));
+    let p = Vec3::new(at.x, terrain.height_at(at.x, at.y) + hh, at.y);
     units.pos.push(p);
     units.pos_prev.push(p);
     units.vel.push(Vec3::ZERO);

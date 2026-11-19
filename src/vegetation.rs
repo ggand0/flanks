@@ -88,7 +88,7 @@ fn respawn_vegetation(
             let groups = RIVER_ZONES.map(|zone| (zone, None));
             planting.log(&specs, "river", &groups);
         }
-        MapKind::Hill | MapKind::BigHill => {
+        MapKind::Hill | MapKind::BigHill | MapKind::WalledTown | MapKind::WallDebug => {
             let specs: Vec<_> = trees.0.iter().map(|tree| (tree.name, tree.reach)).collect();
             let stands = hill_stands(terrain.kind);
             let planting = hill_planting(&specs, &terrain, &stands);
@@ -96,7 +96,12 @@ fn respawn_vegetation(
             let groups: Vec<_> = stands.iter()
                 .map(|stand| (stand.name, Some((stand.trees, stand.shrubs))))
                 .collect();
-            let map = if terrain.kind == MapKind::BigHill { "big_hill" } else { "hill" };
+            let map = match terrain.kind {
+                MapKind::BigHill => "big_hill",
+                MapKind::WalledTown => "walled_town",
+                MapKind::WallDebug => "wall_debug",
+                _ => "hill",
+            };
             planting.log(&specs, map, &groups);
         }
         MapKind::Classic | MapKind::BigGrassland | MapKind::Obstacles | MapKind::Town => {}
@@ -1150,6 +1155,11 @@ fn read_tree_image(
     }
     foliage_mips(&mut image, normal, !opaque)?;
     Ok(image)
+}
+
+/// The mip chain of an opaque sRGB atlas (the town's models).
+pub(crate) fn opaque_mips(image: &mut Image) -> Result<(), String> {
+    foliage_mips(image, false, false)
 }
 
 /// Alpha-weighted linear colour avoids dark borders; coverage scaling retains distant leaves.

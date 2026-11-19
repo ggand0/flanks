@@ -361,6 +361,11 @@ pub(crate) struct RegimentSums {
     target_fight_n: u32,
     target_line_sum: f32,
     target_line_n: u32,
+    /// With a route frame waiting at a waypoint: the living men beyond
+    /// the line through it across the next leg, and the living men
+    /// (`GroupData::frame_past`).
+    past: u32,
+    living: u32,
 }
 
 /// Regiments per pool task in `update_groups`: a task sums about 16k men
@@ -398,9 +403,12 @@ impl<'a> SumColumns<'a> {
 /// home bias from the last tick, its forward vector, its attack target,
 /// whether it is an archer regiment, how many times its slots have been
 /// dealt (`GroupData::slots_dealt`, which stands for its men's `home`),
-/// and the blocks of the open friends within its reach. Built the same
-/// way at the kick, for the job, and in `update_groups`: a regiment whose
-/// inputs are the same bits in both takes the job's sums.
+/// the blocks of the open friends within its reach, and the line its
+/// waiting route frame is passed at (sim/route.rs `frame_line`: the
+/// waypoint's index, the waypoint and the leg's direction after it), if
+/// it has one. Built the same way at the kick, for the job, and in
+/// `update_groups`: a regiment whose inputs are the same bits in both
+/// takes the job's sums.
 #[derive(Default)]
 pub(crate) struct SumInputs {
     cents: Vec<Vec2>,
@@ -410,6 +418,7 @@ pub(crate) struct SumInputs {
     bows: Vec<bool>,
     slots: Vec<u32>,
     open: Vec<Vec<(u32, BlockRect)>>,
+    lines: Vec<Option<(u32, Vec2, Vec2)>>,
 }
 
 impl SumInputs {
@@ -434,17 +443,24 @@ impl SumInputs {
             && self.slots[g] == other.slots[g]
             && self.open[g].len() == other.open[g].len()
             && self.open[g].iter().zip(&other.open[g]).all(|((h, a), (k, b))| h == k && r(a, b))
+            && match (self.lines[g], other.lines[g]) {
+                (None, None) => true,
+                (Some((k, here, dir)), Some((j, there, way))) => k == j && v(here, there) && v(dir, way),
+                _ => false,
+            }
     }
 
     /// Regiment `g`'s sums over its men.
     pub(crate) fn sums(&self, cols: &SumColumns, runs: &[(u32, u32)], g: usize) -> RegimentSums {
         let regiment = (self.cents[g], self.bias[g], self.fwd[g], self.target[g], self.bows[g]);
-        regiment_sums(cols, runs, regiment, &self.open[g])
+        let line = self.lines[g].map(|(_, here, dir)| (here, dir));
+        regiment_sums(cols, runs, regiment, &self.open[g], line)
     }
 }
 
-/// Every regiment's inputs to the sums, from the regiments as they stand.
-pub(crate) fn sum_inputs(groups: &Groups) -> SumInputs {
+/// Every regiment's inputs to the sums, from the regiments and their
+/// routes as they stand.
+pub(crate) fn sum_inputs(groups: &Groups, routes: Option<&crate::sim::route::Routes>) -> SumInputs {
     // The disorder in the sums measures the block's shape, not its
     // travel: each man's distance from his slot, measured from the
     // regiment's own centroid. That centroid is last tick's; 33 ms old is
@@ -502,20 +518,27 @@ pub(crate) fn sum_inputs(groups: &Groups) -> SumInputs {
                 .collect()
         })
         .collect();
-    SumInputs { cents, bias, fwd, target, bows, slots, open }
+    // The line each waiting route frame is passed at: the men beyond it
+    // are counted with the sums, for the regiments that have one.
+    let lines: Vec<Option<(u32, Vec2, Vec2)>> = (0..groups.list.len())
+        .map(|g| routes?.frame_line(g, groups.goal(g)?))
+        .collect();
+    SumInputs { cents, bias, fwd, target, bows, slots, open, lines }
 }
 
 /// One regiment's sums over its men, walking its runs in index order. `pc`
 /// and `pb` are its centroid and home bias from the last tick, `f` its
 /// forward vector, `tg` its attack target, `bows` whether it is an archer
-/// regiment, the only kind whose lead and velocity anything reads, and
+/// regiment, the only kind whose lead and velocity anything reads,
 /// `open` the blocks of the open friends within its reach, empty when
-/// there is none.
+/// there is none, and `line` the waypoint its route frame waits at with
+/// the unit direction of the leg after it, if it has one.
 fn regiment_sums(
     units: &SumColumns,
     runs: &[(u32, u32)],
     (pc, pb, f, tg, bows): (Vec2, Vec2, Vec2, Option<u32>, bool),
     open: &[(u32, BlockRect)],
+    line: Option<(Vec2, Vec2)>,
 ) -> RegimentSums {
     let mut a = RegimentSums {
         pos: Vec2::ZERO,
@@ -536,6 +559,8 @@ fn regiment_sums(
         target_fight_n: 0,
         target_line_sum: 0.0,
         target_line_n: 0,
+        past: 0,
+        living: 0,
     };
     for &(s, e) in runs {
         for i in s as usize..e as usize {
@@ -554,6 +579,12 @@ fn regiment_sums(
                 for (k, (_, rect)) in open.iter().enumerate() {
                     a.inside[k] += u32::from(rect.distance(p) == 0.0);
                 }
+            }
+            if let Some((here, dir)) = line
+                && units.death_t[i] == 0
+            {
+                a.living += 1;
+                a.past += u32::from((p - here).dot(dir) > 0.0);
             }
             let d2 = (p - pc).length_squared();
             a.r2 += d2;
@@ -600,20 +631,21 @@ fn update_groups(
     units: Res<Units>,
     runs: Res<crate::sim::RegimentRuns>,
     mut groups: ResMut<Groups>,
+    routes: Option<Res<crate::sim::route::Routes>>,
 ) {
     let _tick_log = crate::frame_log::tick::time(crate::frame_log::tick::Part::Groups);
     let n = groups.list.len();
-    let inputs = sum_inputs(&groups);
+    let inputs = sum_inputs(&groups, routes.as_deref());
     // The sums over the men. The tick job took them from the columns it
     // was kicked with, which are the columns here (sim/mod.rs `take_tick`
     // checks that no write copied one of them), walking the same runs in
     // the same order, so the same bits. A regiment whose own inputs
     // changed since the kick (an order, a facing, an opening, its slots
-    // dealt again) is summed here instead, and so is every regiment when
-    // the job left no sums: a pool task per few regiments, each
-    // regiment's runs walked in index order, the same additions in the
-    // same order as one scan of the army, regiment by regiment. Bevy's
-    // scope returns the tasks' results in spawn order.
+    // dealt again, its route frame's line) is summed here instead, and
+    // so is every regiment when the job left no sums: a pool task per few
+    // regiments, each regiment's runs walked in index order, the same
+    // additions in the same order as one scan of the army, regiment by
+    // regiment. Bevy's scope returns the tasks' results in spawn order.
     let from_job: Vec<bool> = (0..n).map(|g| runs.job_sums_valid && inputs.same(&runs.job_inputs, g)).collect();
     let units = &*units;
     let cols = SumColumns::of(units);
@@ -637,7 +669,7 @@ fn update_groups(
         .map(|g| if from_job[g] { runs.job_sums[g].clone() } else { computed.next().expect("a sum per missing regiment") })
         .collect();
     drop(tick_log_sums);
-    let SumInputs { cents: prev_cents, fwd, target: attack_target, open, .. } = inputs;
+    let SumInputs { cents: prev_cents, fwd, target: attack_target, open, lines: frame_lines, .. } = inputs;
     let counts: Vec<usize> = sums.iter().map(|a| a.count).collect();
     let fighting: Vec<bool> = sums.iter().map(|a| a.fight_n > 0).collect();
     let cents: Vec<Vec2> = sums
@@ -649,6 +681,7 @@ fn update_groups(
 
     for (g, group) in groups.list.iter_mut().enumerate() {
         group.count = counts[g];
+        group.frame_past = frame_lines[g].map(|(k, _, _)| (k, sums[g].past, sums[g].living));
         if counts[g] == 0 {
             group.engaged = false;
             group.engage_hold = 0;
@@ -1087,5 +1120,37 @@ fn test_front_script(
             *stage = 3;
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// With a route frame waiting at a waypoint, the sums count the
+    /// living men beyond the line through it across the next leg, and the
+    /// living; without one they count nothing.
+    #[test]
+    fn the_sums_count_the_living_men_past_a_waiting_frames_waypoint() {
+        let terrain = crate::terrain::build_terrain(crate::terrain::MapKind::Grassland);
+        let mut units = Units::default();
+        // The waypoint at (10, 0), the next leg toward +z: a man is past
+        // it when he stands at z over 0, wherever he stands along x.
+        let (here, dir) = (Vec2::new(10.0, 0.0), Vec2::Y);
+        let places = [(10.0, 4.0), (40.0, 0.5), (-30.0, 2.0), (10.0, -0.5), (12.0, -6.0), (10.0, 0.0), (9.0, 3.0)];
+        for (k, &(x, z)) in places.iter().enumerate() {
+            crate::units::push_unit(&mut units, &terrain, k as u32, 0, 0, 0, x, z, Vec2::ZERO);
+        }
+        // The last man is past the line but dying: not counted.
+        units.death_t[6] = 1;
+        let runs = [(0u32, places.len() as u32)];
+        let regiment = (Vec2::ZERO, Vec2::ZERO, Vec2::Y, None, false);
+        let cols = SumColumns::of(&units);
+        let with = regiment_sums(&cols, &runs, regiment, &[], Some((here, dir)));
+        assert_eq!((with.past, with.living), (3, 6));
+        let without = regiment_sums(&cols, &runs, regiment, &[], None);
+        assert_eq!((without.past, without.living), (0, 0));
+        // The other sums do not depend on the line.
+        assert_eq!((with.count, with.pos), (without.count, without.pos));
     }
 }

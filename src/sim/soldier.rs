@@ -667,6 +667,8 @@ struct Step {
     wish: Vec2,
     jam: f32,
     new_v: Vec2,
+    /// Where his step ends on the ground plane (`slide`).
+    next: Vec2,
     // The choice of opening and the squeeze (`choose_opening`,
     // `try_a_side`): whether he reads the comrades ahead this tick, his
     // normal body and spring (not squeezed), whether the scan saw an
@@ -729,6 +731,7 @@ pub(crate) fn tick_chunk(f: &Field, rows: Rows, out: &mut ChunkOut) {
         try_a_side(f, &mut s, &mut st);
         close_in(f, &mut s, &mut st);
         steer(f, &mut s, &mut st);
+        slide(f, s.i, &mut st);
         face(f, &mut s, &mut st);
         integrate(f, &mut s, &mut st);
     }
@@ -827,6 +830,7 @@ fn begin(f: &Field, s: &mut Soldier) -> Step {
         wish: Vec2::ZERO,
         jam: 0.0,
         new_v: Vec2::ZERO,
+        next: Vec2::ZERO,
         open_on: false,
         body0: 0.0,
         sep0: 0.0,
@@ -3143,43 +3147,97 @@ fn face(f: &Field, s: &mut Soldier, st: &mut Step) {
     }
 }
 
-/// The step: velocity into position, clamped to the field, sliding along
-/// impassable ground, set down on the terrain.
+/// `FL_EDGE_STOP=0` leaves a man the velocity an edge of impassable
+/// ground stopped (`slide`): he is then turned to it and keeps it, as
+/// before.
+fn edge_stop() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("FL_EDGE_STOP").is_ok_and(|v| v == "0"))
+}
+
+/// A man's velocity after a step that an edge stopped on the axes given:
+/// on such an axis it loses the part that points the way the step went.
+/// A velocity that points away from the edge stays.
 #[inline]
-fn integrate(f: &Field, s: &mut Soldier, st: &mut Step) {
-    let Field { terrain, pos_prev, kind, dt, bounds_min, bounds_max, .. } = *f;
-    let i = s.i;
+fn stopped_velocity(v: Vec2, step: Vec2, stop_x: bool, stop_z: bool) -> Vec2 {
+    Vec2::new(
+        if stop_x && v.x * step.x > 0.0 { 0.0 } else { v.x },
+        if stop_z && v.y * step.y > 0.0 { 0.0 } else { v.y },
+    )
+}
+
+/// The step: velocity into a new place, clamped to the field, sliding
+/// along impassable ground. Where an edge stops the step on an axis, his
+/// velocity loses that axis too: he keeps no speed into a rail or a wall
+/// he cannot pass. Before `face`, so he is turned to the way he moves,
+/// not to the way he was pushed at the edge.
+#[inline]
+fn slide(f: &Field, i: usize, st: &mut Step) {
+    let Field { terrain, pos_prev, dt, bounds_min, bounds_max, .. } = *f;
     let new_v = st.new_v;
     let corr = st.corr;
-    *s.vel = Vec3::new(new_v.x, 0.0, new_v.y);
     let mut nx = (pos_prev[i].x + new_v.x * dt + corr.x)
         .clamp(bounds_min.x, bounds_max.x);
     let mut nz = (pos_prev[i].z + new_v.y * dt + corr.y)
         .clamp(bounds_min.y, bounds_max.y);
-    // Impassable ground (terrace risers, gorge walls, crater lips):
-    // wall-slide — keep the axis that stays on walkable ground, drop the one
-    // that doesn't, so crowds flow along the obstacle.
-    if terrain.blocked_at(nx, nz) {
-        let (px, pz) = (pos_prev[i].x, pos_prev[i].z);
-        if !terrain.blocked_at(nx, pz) {
+    // Impassable ground (terrace risers, gorge walls, crater lips, a
+    // wall's edges): wall-slide — keep the axis that stays on walkable
+    // ground, drop the one that doesn't, so crowds flow along the
+    // obstacle. His body stops at the edge, half the distance he keeps
+    // from his neighbours (`body_distance`) out from his centre.
+    let (px, pz) = (pos_prev[i].x, pos_prev[i].z);
+    let r = terrain.body_radius();
+    let step = Vec2::new(nx - px, nz - pz);
+    if !terrain.body_free(nx, nz, r, step.x, step.y) {
+        let (stop_x, stop_z) = if terrain.body_free(nx, pz, r, step.x, 0.0) {
             nz = pz;
-        } else if !terrain.blocked_at(px, nz) {
+            (false, true)
+        } else if terrain.body_free(px, nz, r, 0.0, step.y) {
             nx = px;
+            (true, false)
         } else {
             nx = px;
             nz = pz;
+            (true, true)
+        };
+        if edge_stop() {
+            st.new_v = stopped_velocity(new_v, step, stop_x, stop_z);
         }
     }
+    // An edge across his motion over blocked ground (a crowd pushed him
+    // into the metre at a wall's face, then he walked along it): the step
+    // takes him off it, so he climbs a stair down its middle instead of
+    // with his shoulder on the wall.
+    if r > 0.0 {
+        let off = terrain.body_overlap(nx, nz, r);
+        if off != Vec2::ZERO && !terrain.blocked_at(nx + off.x, nz + off.y) {
+            nx = (nx + off.x).clamp(bounds_min.x, bounds_max.x);
+            nz = (nz + off.y).clamp(bounds_min.y, bounds_max.y);
+        }
+    }
+    st.next = Vec2::new(nx, nz);
+}
+
+/// The step taken: his velocity kept for the next tick, and his body set
+/// down on the terrain where the step ended.
+#[inline]
+fn integrate(f: &Field, s: &mut Soldier, st: &mut Step) {
+    let Field { terrain, pos_prev, kind, dt, .. } = *f;
+    let (new_v, next) = (st.new_v, st.next);
+    *s.vel = Vec3::new(new_v.x, 0.0, new_v.y);
     *s.pos = Vec3::new(
-        nx,
-        terrain.height_at(nx, nz) + crate::unit_types::half_height(kind[i] as usize),
-        nz,
+        next.x,
+        terrain.height_at(next.x, next.y) + crate::unit_types::half_height(kind[s.i] as usize),
+        next.y,
     );
     // The friction contact: his kept speed is the move he made, and what
-    // the setting apart, the field's edge and the blocked ground did to his
-    // legs' speed is added to the total his feet take back.
+    // the setting apart, the field's edge and the step off blocked ground
+    // did to it beyond his legs' speed is added to the total his feet take back. His legs' speed is
+    // the one `slide` left, after an edge he could not pass stopped it, so
+    // a rail's stop is not a push his feet take back.
     if friction_contact() && dt > 0.0 {
-        let kept = Vec2::new(nx - pos_prev[i].x, nz - pos_prev[i].z) / dt;
+        let p = pos_prev[s.i];
+        let kept = (next - Vec2::new(p.x, p.z)) / dt;
         *s.vel = Vec3::new(kept.x, 0.0, kept.y);
         *s.imposed = held_total(*s.imposed, kept, new_v);
     }
@@ -3225,5 +3283,30 @@ mod tests {
         let t = held_total(Vec2::new(0.7, 0.0), Vec2::new(0.0, 0.0), Vec2::new(-1.0, 0.0));
         assert!((t.length() - STEP_PACE).abs() < 1e-6);
         assert!(t.x > 0.0 && t.y == 0.0);
+    }
+
+    /// A man pushed at a rail on z while he climbs along x: the rail
+    /// stops the z of his step, and his velocity keeps only the climb.
+    #[test]
+    fn a_stopped_axis_loses_the_speed_into_the_edge() {
+        let v = stopped_velocity(Vec2::new(1.2, 10.0), Vec2::new(0.04, 0.33), false, true);
+        assert_eq!(v, Vec2::new(1.2, 0.0));
+        let v = stopped_velocity(Vec2::new(-3.0, -2.0), Vec2::new(-0.1, -0.07), true, true);
+        assert_eq!(v, Vec2::ZERO);
+    }
+
+    /// The setting apart pushed his step into the edge while his own
+    /// velocity points away from it: that velocity stays.
+    #[test]
+    fn a_velocity_away_from_the_edge_stays() {
+        let v = stopped_velocity(Vec2::new(1.2, -0.5), Vec2::new(0.04, 0.02), false, true);
+        assert_eq!(v, Vec2::new(1.2, -0.5));
+    }
+
+    /// An axis no edge stopped keeps its speed whatever the step.
+    #[test]
+    fn a_free_axis_keeps_its_speed() {
+        let v = stopped_velocity(Vec2::new(1.2, 10.0), Vec2::new(0.04, 0.33), false, false);
+        assert_eq!(v, Vec2::new(1.2, 10.0));
     }
 }

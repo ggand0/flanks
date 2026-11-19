@@ -1147,6 +1147,104 @@ mod tests {
         assert!(g.clearance_at(cross) >= 12.0, "wide: crossed at {cross}");
     }
 
+    /// The maps with the wall: the plain, the plaza, the plateau behind the
+    /// wall and the wall walk are one region (the town's streets too, on
+    /// the walled town), the walk reached through the stairs; the drum
+    /// roofs and the house roofs are cut off; the gate is closed, so the
+    /// way from the plain to the plaza goes around an open end of the wall.
+    /// The lanes are as wide as the module docs of town_layout.rs work out:
+    /// 6 m on the walk, through a tower and over the gatehouse's bridge,
+    /// 2 m up a stair. Wall Debug has no houses, so its house roof check
+    /// has nothing to check.
+    #[test]
+    fn the_walled_town_walk_is_reached_by_its_stairs_and_its_gate_is_closed() {
+        use crate::town_layout::{pieces, spots, Kind, STAIRS_X, TOWERS_X, WALL_Z};
+        for kind in [MapKind::WalledTown, MapKind::WallDebug] {
+            let g = NavGrid::build(&build_terrain(kind)).unwrap_or_else(|| panic!("{kind:?} has a grid"));
+            let region = |p: Vec2| g.cell_at(p).filter(|&i| g.walk[i]).map(|i| g.region[i]);
+            let main = Some(g.main_region);
+            for (name, p) in [
+                ("plain", spots::PLAIN),
+                ("outside the gate", spots::OUTSIDE_GATE),
+                ("plaza", spots::PLAZA),
+                ("behind the town", spots::BEHIND_TOWN),
+                ("west walk", spots::WALK_WEST),
+                ("east walk", spots::WALK_EAST),
+                ("bridge", spots::BRIDGE),
+            ] {
+                assert_eq!(region(p), main, "{kind:?}: {name} at {p} is cut off");
+            }
+            for i in 0..STAIRS_X.len() {
+                assert_eq!(region(spots::stair_mid(i)), main, "{kind:?}: stair {i} is cut off");
+            }
+            for &x in &TOWERS_X {
+                assert_eq!(region(Vec2::new(x, WALL_Z)), main, "{kind:?}: the passage of the tower at {x}");
+                assert_ne!(region(Vec2::new(x, WALL_Z + 6.0)), main, "{kind:?}: the roof of the tower at {x}");
+            }
+            for p in pieces(kind).iter().filter(|p| matches!(p.kind, Kind::House(_))) {
+                assert_ne!(region(p.pos), main, "{kind:?}: the roof of the house at {}", p.pos);
+            }
+            // Open vertices across a lane, along z, over the piece's own rows
+            // (the ground at its faces is open too).
+            let lane = |x: f32, z0: f32, z1: f32| {
+                let mut z = z0;
+                let mut n = 0;
+                while z <= z1 {
+                    n += usize::from(region(Vec2::new(x, z)) == main);
+                    z += CELL;
+                }
+                n
+            };
+            let w = WALL_Z;
+            println!(
+                "{kind:?} lanes (open vertices): walk {}, tower passage {}, bridge {}, stair {}",
+                lane(130.0, w - 4.0, w + 4.0),
+                lane(TOWERS_X[2], w - 4.0, w + 4.0),
+                lane(0.0, w - 4.0, w + 4.0),
+                lane(STAIRS_X[2] + 6.0, w - 4.0 - crate::town_layout::STAIR_W, w - 4.0),
+            );
+            assert_eq!(lane(130.0, w - 4.0, w + 4.0), 3, "{kind:?}: the walk");
+            assert_eq!(lane(TOWERS_X[2], w - 4.0, w + 4.0), 3, "{kind:?}: the tower passage");
+            assert_eq!(lane(0.0, w - 4.0, w + 4.0), 3, "{kind:?}: the bridge");
+            // The stair's treads: its width less a cell for the rail and a
+            // cell for the wall's face, over the cell pitch.
+            let stair_w = crate::town_layout::STAIR_W;
+            let treads = (stair_w / CELL) as usize - 1;
+            assert_eq!(lane(STAIRS_X[2] + 6.0, w - 4.0 - stair_w, w - 4.0), treads, "{kind:?}: the stair");
+            // The end towers' passages open onto air: closed, and the ground
+            // under their mouths too.
+            for (x, side) in [(TOWERS_X[0], -1.0), (TOWERS_X[3], 1.0)] {
+                assert_ne!(region(Vec2::new(x + side * 8.0, w)), main, "{kind:?}: the mouth of the tower at {x}");
+                assert_ne!(region(Vec2::new(x + side * 10.0, w)), main, "{kind:?}: the ground under the mouth at {x}");
+                assert_eq!(region(Vec2::new(x + side * 6.0, w)), main, "{kind:?}: the passage of the tower at {x}");
+            }
+            // The ground at the wall's inner and outer faces is open, and the
+            // way from a stair's platform onto the walk is two columns wide.
+            assert_eq!(region(Vec2::new(130.0, w - 6.0)), main, "{kind:?}: the ground at the inner face");
+            assert_eq!(region(Vec2::new(130.0, w + 6.0)), main, "{kind:?}: the ground at the outer face");
+            for &s in &STAIRS_X {
+                for x in [12.0, 14.0] {
+                    assert_eq!(region(Vec2::new(s + x, w - 4.0)), main, "{kind:?}: the landing at {}", s + x);
+                }
+                let kerb = region(Vec2::new(s + 10.0, w - 4.0));
+                assert_ne!(kerb, main, "{kind:?}: the kerb before the landing at {s}");
+                assert_ne!(region(Vec2::new(s + 16.0, w - 4.0)), main, "{kind:?}: the return rail at {s}");
+            }
+            // From the plain to the plaza: around an end, never through the gate.
+            let plan = g.plan(&req(spots::OUTSIDE_GATE, spots::PLAZA));
+            assert!(plan.reached, "{kind:?}: the plaza is out of reach");
+            assert_walkable(&g, &plan);
+            for s in plan.points.windows(2) {
+                let (a, b) = (s[0], s[1]);
+                if (a.y - w) * (b.y - w) <= 0.0 && a.y != b.y {
+                    let x = a.x + (b.x - a.x) * (w - a.y) / (b.y - a.y);
+                    assert!(x.abs() > TOWERS_X[3], "{kind:?}: the route crosses the wall line at x {x}");
+                }
+            }
+            println!("{kind:?}: plain to plaza: {:.0} m around the wall", plan.length());
+        }
+    }
+
     #[test]
     fn the_same_request_plans_the_same_route() {
         let g = grid();
@@ -1167,3 +1265,4 @@ mod tests {
         assert!(ticks > 5, "{ticks} ticks");
     }
 }
+

@@ -37,6 +37,8 @@ mod settings;
 mod sim;
 mod spatial;
 mod terrain;
+mod town;
+mod town_layout;
 mod unit_cards;
 mod unit_glb;
 mod unit_meshes;
@@ -166,6 +168,7 @@ fn main() {
         .add_plugins(battle_setup::BattleSetupPlugin)
         .add_plugins(window_icon::WindowIconPlugin)
         .add_plugins(path_test::PathTestPlugin)
+        .add_plugins(town::TownPlugin)
         .add_plugins((
             terrain::TerrainPlugin,
             water::WaterPlugin,
