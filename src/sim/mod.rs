@@ -967,3 +967,136 @@ fn toggle_debug_viz(keys: Res<ButtonInput<KeyCode>>, mut viz: ResMut<DebugViz>) 
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy::math::Vec3Swizzles;
+    use crate::orders::{GroupData, Order};
+    use crate::terrain::{build_terrain, MapKind};
+    use crate::unit_types::KIND_LIGHT;
+
+    /// One tick computed by the job and installed as `step_sim` installs it,
+    /// with no damage applied: nobody is hurt, staggered or killed.
+    fn step(
+        job: &mut TickJob,
+        units: &mut Units,
+        groups: &mut Groups,
+        routes: &mut route::Routes,
+        terrain: &std::sync::Arc<Terrain>,
+        tick: u32,
+    ) {
+        let tracks = crate::arrows::RegTracks::default();
+        prepare_tick(job, units, groups, &tracks, routes, terrain, 1.0 / 30.0, 1.0, tick);
+        job.field_wanted = false;
+        job.sums_wanted = false;
+        run_tick_job(job);
+        job.release_inputs();
+        let u = &mut *units;
+        macro_rules! install {
+            ($($col:ident <- $out:ident),*) => {$(
+                let released = u.$col.install(std::mem::take(&mut job.$out));
+                job.$out = std::sync::Arc::try_unwrap(released).unwrap_or_default();
+            )*};
+        }
+        let tick_start = u.pos.install(std::mem::take(&mut job.pos_out));
+        let released = u.pos_prev.install_shared(tick_start);
+        job.pos_out = std::sync::Arc::try_unwrap(released).unwrap_or_default();
+        install!(
+            vel <- vel, yaw <- yaw, yaw_prev <- yaw_prev, target <- target, swing <- swing,
+            swing_t <- swing_t, flash <- flash, death_t <- death_t, ammo <- ammo,
+            out_form <- out_form, sight <- sight, way <- way, chain <- chain,
+            pose <- pose, quarry <- quarry, stuck <- stuck, aim <- aim,
+            imposed <- imposed
+        );
+    }
+
+    /// The bracing scene under the friction contact: a holding line of 8
+    /// files by 4 ranks of light infantry in its ready stance and fighting,
+    /// and a column of 2 files by 8 ranks of enemy light infantry under a
+    /// Move order to 20 m behind the line, starting 4 m before it. Both
+    /// regiments' `engaged` is set by hand (the regiment state
+    /// `update_groups` keeps is not run here), and both start fully in the
+    /// ready stance, so only the Move order tells the walkers from the line.
+    /// It prints how far the line was carried, how many walkers got behind
+    /// its rear rank and the closest two men came. Run it once per brace:
+    /// FL_CONTACT=friction FL_BRACE=1 cargo test -- --ignored --nocapture bracing_scene
+    #[test]
+    #[ignore]
+    fn bracing_scene() {
+        assert_eq!(
+            std::env::var("FL_CONTACT").as_deref(),
+            Ok("friction"),
+            "the bracing scene runs under the friction contact only: set FL_CONTACT=friction"
+        );
+        bevy::tasks::ComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
+        bevy::tasks::AsyncComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
+        let terrain = std::sync::Arc::new(build_terrain(MapKind::Grassland));
+        let mut units = Units::default();
+        let pitch = crate::formation::FormSpacing::Normal.pitch(KIND_LIGHT);
+        let (files, ranks) = (8, 4);
+        let line_anchor = Vec2::new(0.0, 0.0);
+        for r in 0..ranks {
+            for f in 0..files {
+                let x = (f as f32 - 0.5 * (files - 1) as f32) * pitch.x;
+                let z = -(r as f32) * pitch.y;
+                crate::units::push_unit(&mut units, &terrain, (r * files + f) as u32, 0, KIND_LIGHT, 0, x, z, line_anchor);
+            }
+        }
+        let n_line = units.pos.len();
+        let (col_files, col_ranks) = (2, 8);
+        let col_anchor = Vec2::new(0.0, 4.0 + 0.5 * (col_ranks - 1) as f32 * pitch.y);
+        for r in 0..col_ranks {
+            for f in 0..col_files {
+                let x = (f as f32 - 0.5 * (col_files - 1) as f32) * pitch.x;
+                let z = 4.0 + r as f32 * pitch.y;
+                crate::units::push_unit(&mut units, &terrain, 1000 + (r * col_files + f) as u32, 1, KIND_LIGHT, 1, x, z, col_anchor);
+            }
+        }
+        let n = units.pos.len();
+        units.pose.install(vec![soldier::POSE_READY; n]);
+        let mut line = GroupData::new(0, KIND_LIGHT, line_anchor, n_line);
+        line.engaged = true;
+        let mut column = GroupData::new(1, KIND_LIGHT, col_anchor, n - n_line);
+        column.engaged = true;
+        column.order = Some(Order::Move(col_anchor - Vec2::new(0.0, 4.0 + 20.0 + col_anchor.y)));
+        let mut groups = Groups { list: vec![line, column] };
+        let mut routes = route::Routes::default();
+        let mut job = TickJob::default();
+        let start: Vec<Vec2> = units.pos.iter().map(|p| p.xz()).collect();
+        let rear = -((ranks - 1) as f32) * pitch.y;
+        let ticks = 300;
+        let mut closest = f32::INFINITY;
+        for tick in 0..ticks {
+            step(&mut job, &mut units, &mut groups, &mut routes, &terrain, tick);
+            for a in 0..n {
+                for b in a + 1..n {
+                    closest = closest.min(units.pos[a].xz().distance(units.pos[b].xz()));
+                }
+            }
+            if tick == ticks / 2 || tick == ticks - 1 {
+                let mut levels = [[0u32; 4]; 2];
+                for (i, &p) in units.pose.iter().enumerate() {
+                    levels[(i >= n_line) as usize][soldier::pose_level(p)] += 1;
+                }
+                println!("tick {tick}: pose levels 0..3, line {:?}, walkers {:?}", levels[0], levels[1]);
+            }
+        }
+        let carried: Vec<f32> = (0..n_line).map(|i| units.pos[i].xz().distance(start[i])).collect();
+        let mean = carried.iter().sum::<f32>() / n_line as f32;
+        let most = carried.iter().fold(0.0f32, |m, &c| m.max(c));
+        let behind = (n_line..n).filter(|&i| units.pos[i].z < rear).count();
+        let mut closest_end = f32::INFINITY;
+        for a in 0..n {
+            for b in a + 1..n {
+                closest_end = closest_end.min(units.pos[a].xz().distance(units.pos[b].xz()));
+            }
+        }
+        let brace = std::env::var("FL_BRACE").unwrap_or_else(|_| "default".into());
+        println!(
+            "FL_BRACE={brace}, {ticks} ticks: line carried {mean:.3} m on average, {most:.3} m at most; \
+             {behind} of {} walkers behind the rear rank; closest pair {closest:.3} m over the run, {closest_end:.3} m at the end",
+            n - n_line
+        );
+        assert!(units.pos.iter().all(|p| p.is_finite()));
+    }
+}

@@ -218,9 +218,59 @@ fn share_contact() -> bool {
 /// between men, no grip, no stance and no contact speed. The setting apart
 /// moves him, his kept speed is where he ended up, and what the contacts
 /// put into that speed his feet take back at FEET (`steer`, `integrate`).
+/// The one thing that stands in for a stance is the bracing: in the
+/// setting apart a man braced against a push (`brace_pairs`) holds his
+/// ground, and the man who walks into him takes most of it.
 fn friction_contact() -> bool {
     static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *S.get_or_init(|| std::env::var("FL_CONTACT").is_ok_and(|v| v == "friction"))
+}
+/// Under the friction contact, how many times his weight a man braced
+/// against a push counts for when two bodies are set apart: his feet are
+/// planted and his weight is behind his shield, so the man who walks into
+/// him is the one who gives. He is braced as far as he is in his ready
+/// stance (`pose_level`, a third of the way at each level), unless his
+/// regiment is under a Move order (sim/job.rs `moving`), when he is walking
+/// somewhere whatever his pose, or he is dying. This is a man bracing his
+/// body, not a spearwall's braced points. FL_BRACE=<number> sets it, from
+/// 1 (his own weight, as without it) to 20.
+const BRACE: f32 = 4.0;
+fn brace() -> f32 {
+    static B: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *B.get_or_init(|| crate::util::env_or("FL_BRACE", BRACE).clamp(1.0, 20.0))
+}
+/// His brace level: 0 not braced to 3 fully braced (`BRACE`).
+const BRACE_LEVELS: usize = 4;
+/// The weight of the setting apart on a man of mass `mi` at brace level
+/// `bi` from one of mass `mo` at level `bo`, with a fully braced man
+/// counting `brace` times his mass: 2 m_o / (m_i + m_o) over the braced
+/// masses. Two men braced alike share it by their own masses, exactly as
+/// `mass_pairs`, so the weights of a pair sum to 2 whatever their levels.
+fn brace_weight(mi: f32, mo: f32, bi: usize, bo: usize, brace: f32) -> f32 {
+    if bi == bo {
+        return 2.0 * mo / (mi + mo);
+    }
+    let braced = |m: f32, b: usize| m * (1.0 + (brace - 1.0) * b as f32 / 3.0);
+    let (mi, mo) = (braced(mi, bi), braced(mo, bo));
+    2.0 * mo / (mi + mo)
+}
+type BraceTable =
+    [[[[f32; BRACE_LEVELS]; BRACE_LEVELS]; crate::unit_types::NUM_KINDS]; crate::unit_types::NUM_KINDS];
+fn brace_table(brace: f32) -> BraceTable {
+    std::array::from_fn(|a| {
+        std::array::from_fn(|o| {
+            std::array::from_fn(|bi| {
+                std::array::from_fn(|bo| brace_weight(TYPES[a].mass, TYPES[o].mass, bi, bo, brace))
+            })
+        })
+    })
+}
+/// The friction contact's weights of the setting apart, by his kind, the
+/// other's kind, his brace level and the other's: a table read per
+/// overlapping neighbour instead of a division (`pair_widths`).
+fn brace_pairs() -> &'static BraceTable {
+    static T: std::sync::OnceLock<BraceTable> = std::sync::OnceLock::new();
+    T.get_or_init(|| brace_table(brace()))
 }
 /// Under the friction contact the crowd's brake reads the still men ahead
 /// of his wish (`crowd_still`), against a band half as wide. FL_BRAKE=density
@@ -962,6 +1012,7 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut, cands: &m
         anchors,
         home,
         passing,
+        moving,
         ..
     } = *f;
     let i = s.i;
@@ -1022,6 +1073,14 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut, cands: &m
     let (mut side_left, mut side_right) = (false, false);
     let pairs = &pair_widths()[my_level];
     let masses = &mass_pairs()[st.my_kind];
+    // Under the friction contact the setting apart weighs each man by how
+    // braced he is (`brace_pairs`): his own level from his pose at the
+    // tick's start, the one the grid carries for him, and each
+    // neighbour's from the grid, so both men of a pair read the same two
+    // levels.
+    let friction = friction_contact();
+    let my_brace = if friction && !dying && !moving[gi] { pose_lv } else { 0 };
+    let braces = if friction { Some(&brace_pairs()[st.my_kind]) } else { None };
     let gain = CORR_GAIN;
     let reach2 = params.reach * params.reach;
     let prev_target = *s.target;
@@ -1170,7 +1229,23 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut, cands: &m
                 // acceleration cap, two solvers fighting over the same
                 // overlap, every frame.
                 let back = (hard - len) * gain * mw;
-                corr += d * (back * inv_len);
+                // The friction contact sets him apart by the braced
+                // weights; what the contact speed reads below stays by
+                // the plain ones.
+                let set = match braces {
+                    Some(braces) => {
+                        let o_brace = if (o.meta & crate::spatial::META_DYING) != 0
+                            || moving[crate::spatial::meta_group(o.meta)]
+                        {
+                            0
+                        } else {
+                            crate::spatial::meta_pose(o.meta)
+                        };
+                        (hard - len) * gain * braces[crate::spatial::meta_kind(o.meta)][my_brace][o_brace]
+                    }
+                    None => back,
+                };
+                corr += d * (set * inv_len);
                 overlap_vel += o_vel * back;
                 overlap_share += share * back;
                 overlap += back;
@@ -3301,6 +3376,68 @@ mod tests {
     fn a_velocity_away_from_the_edge_stays() {
         let v = stopped_velocity(Vec2::new(1.2, -0.5), Vec2::new(0.04, 0.02), false, true);
         assert_eq!(v, Vec2::new(1.2, -0.5));
+    }
+
+    /// Two men braced alike, or any two with a brace of 1, share the
+    /// setting apart exactly as the plain mass weights do, to the bit.
+    #[test]
+    fn equal_bracing_is_the_plain_mass_weight() {
+        let plain = mass_pairs();
+        for brace in [1.0, BRACE, 20.0] {
+            let t = brace_table(brace);
+            for a in 0..crate::unit_types::NUM_KINDS {
+                for o in 0..crate::unit_types::NUM_KINDS {
+                    for b in 0..BRACE_LEVELS {
+                        assert_eq!(t[a][o][b][b].to_bits(), plain[a][o].0.to_bits());
+                    }
+                }
+            }
+        }
+        let t = brace_table(1.0);
+        for a in 0..crate::unit_types::NUM_KINDS {
+            for o in 0..crate::unit_types::NUM_KINDS {
+                for bi in 0..BRACE_LEVELS {
+                    for bo in 0..BRACE_LEVELS {
+                        assert_eq!(t[a][o][bi][bo].to_bits(), plain[a][o].0.to_bits());
+                    }
+                }
+            }
+        }
+    }
+
+    /// A fully braced man against an unbraced one of his own kind takes
+    /// 2 / (1 + BRACE) of the setting apart and the other 2 BRACE / (1 + BRACE).
+    #[test]
+    fn a_braced_man_takes_little_of_the_setting_apart() {
+        let t = brace_table(BRACE);
+        for k in 0..crate::unit_types::NUM_KINDS {
+            assert!((t[k][k][3][0] - 2.0 / (1.0 + BRACE)).abs() < 1e-6);
+            assert!((t[k][k][0][3] - 2.0 * BRACE / (1.0 + BRACE)).abs() < 1e-6);
+        }
+    }
+
+    /// For any pair, whatever their kinds and levels: the two weights sum
+    /// to 2, as the plain weights do, so the pair is set apart by the same
+    /// distance in all; and each man's braced mass times his weight is the
+    /// other's, as m_i w_i = m_o w_o holds for the plain weights.
+    #[test]
+    fn a_pair_is_set_apart_by_the_same_distance_in_all() {
+        for brace in [1.0, BRACE, 20.0] {
+            let t = brace_table(brace);
+            let braced = |k: usize, b: usize| TYPES[k].mass * (1.0 + (brace - 1.0) * b as f32 / 3.0);
+            for a in 0..crate::unit_types::NUM_KINDS {
+                for o in 0..crate::unit_types::NUM_KINDS {
+                    for bi in 0..BRACE_LEVELS {
+                        for bo in 0..BRACE_LEVELS {
+                            let (wi, wo) = (t[a][o][bi][bo], t[o][a][bo][bi]);
+                            assert!((wi + wo - 2.0).abs() < 1e-5, "{a} {o} {bi} {bo}: {wi} + {wo}");
+                            let (mi, mo) = (braced(a, bi), braced(o, bo));
+                            assert!((mi * wi - mo * wo).abs() < 1e-4 * mi.max(mo), "{a} {o} {bi} {bo}");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// An axis no edge stopped keeps its speed whatever the step.
