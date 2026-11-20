@@ -298,6 +298,15 @@ fn feet_take(imposed: Vec2, dt: f32) -> Vec2 {
 fn still_weight(o_vel: Vec2, wish_dir: Vec2) -> f32 {
     (1.0 - o_vel.dot(wish_dir) / CRAWL).clamp(0.0, 1.0)
 }
+/// Whether a man of a regiment standing ready stands, below the speed of
+/// his steps. Under the friction contact it is where he is trying to go,
+/// so a push he gets does not take him out of the ready stance and only
+/// his own walking does; else it is how fast he moved last tick.
+#[inline]
+fn stands(friction: bool, kept: Vec2, wish: Vec2) -> bool {
+    let v = if friction { wish } else { kept };
+    v.length_squared() < STEP_FACE_SPEED * STEP_FACE_SPEED
+}
 /// What the contacts have put into his speed and his feet have not taken
 /// back, after this tick's step: the old total plus the kept speed less
 /// the legs' speed, never more than a step's pace.
@@ -1298,12 +1307,13 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut, cands: &m
     }
     // His stance for the next tick, as he is drawn: into the ready stance
     // while his regiment fights, while it stands ready and he stands (the
-    // pose pass's guard, below the speed of his steps), or with an enemy
-    // in his reach; else back at ease, walking or running. A step of the
-    // ramp a tick.
+    // pose pass's guard, below the speed of his steps; under the friction
+    // contact a push does not count, only his own wish to walk, `stands`),
+    // or with an enemy in his reach; else back at ease, walking or
+    // running. A step of the ramp a tick.
     let ready = match stance[gi] {
         STANCE_FIGHT => true,
-        STANCE_READY => s.vel.xz().length_squared() < STEP_FACE_SPEED * STEP_FACE_SPEED,
+        STANCE_READY => stands(friction, s.vel.xz(), st.desired),
         _ => false,
     };
     let stance_ramp = *s.pose & POSE_STANCE;
@@ -3334,6 +3344,20 @@ mod tests {
         let small = Vec2::new(0.05, 0.0);
         assert_eq!(feet_take(small, dt), small);
         assert_eq!(feet_take(Vec2::ZERO, dt), Vec2::ZERO);
+    }
+
+    /// Without the friction contact a man stands by his kept speed; with
+    /// it a man pushed at 2 m/s who wishes to go nowhere stands, and a still
+    /// man who wishes to walk at 3 m/s does not.
+    #[test]
+    fn stands_reads_the_wish_under_friction() {
+        let fast = Vec2::new(2.0, 0.0);
+        let walk = Vec2::new(0.0, 3.0);
+        assert!(!stands(false, fast, Vec2::ZERO));
+        assert!(stands(false, Vec2::ZERO, walk));
+        assert!(stands(false, Vec2::new(0.5, 0.0), walk));
+        assert!(stands(true, fast, Vec2::ZERO));
+        assert!(!stands(true, Vec2::ZERO, walk));
     }
 
     /// A man ahead who stood or came at the reader counts in full, one who
