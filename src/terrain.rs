@@ -24,7 +24,7 @@ pub const CHUNK_CELLS: usize = 32;
 /// The battlefields in the menu's Map row. At launch a setup's map wins
 /// (an `FL_SETUP` file, or the Demo's with `FL_DEMO=1`), then
 /// `FL_MAP=big_grassland`, `hill`, `big_hill`, `walled_town`, `wall_debug`,
-/// `classic`, `river`, `sandbox`, `obstacles` or `town`.
+/// `line_debug`, `classic`, `river`, `sandbox`, `obstacles` or `town`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub enum MapKind {
     /// Broad pasture shoulders around an open lowland: the default.
@@ -42,6 +42,10 @@ pub enum MapKind {
     /// The walled town's wall on the same ground, with no houses: a field
     /// for watching units on the wall, its stairs and its walk.
     WallDebug,
+    /// The grassland again, where both armies deploy each rank of
+    /// regiments with no gap between them (regiments.rs), a field for
+    /// watching two unbroken lines meet.
+    LineDebug,
     /// The 0.1.0 heightfield: rolling noise with ridged peaks, no river.
     Classic,
     /// Experimental: the same noise with terraces, a river and a bridge.
@@ -69,6 +73,7 @@ impl MapKind {
             Ok("big_hill") => Self::BigHill,
             Ok("walled_town") => Self::WalledTown,
             Ok("wall_debug") => Self::WallDebug,
+            Ok("line_debug") => Self::LineDebug,
             Ok("river") => Self::River,
             Ok("classic") => Self::Classic,
             Ok("sandbox") => Self::Sandbox,
@@ -86,6 +91,7 @@ impl MapKind {
             Self::BigHill => "Big Hill",
             Self::WalledTown => "Walled Town",
             Self::WallDebug => "Wall Debug",
+            Self::LineDebug => "Line Debug",
             Self::Classic => "Classic",
             Self::River => "River",
             Self::Sandbox => "Sandbox",
@@ -119,13 +125,14 @@ impl MapKind {
     }
 
     /// Every map, in the menu's order.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Grassland,
         Self::BigGrassland,
         Self::Hill,
         Self::BigHill,
         Self::WalledTown,
         Self::WallDebug,
+        Self::LineDebug,
         Self::Classic,
         Self::River,
         Self::Sandbox,
@@ -933,7 +940,7 @@ pub(crate) fn build_terrain(kind: MapKind) -> Terrain {
                 heights[z * verts_x + x] = big_grassland_height(p);
                 continue;
             }
-            if matches!(kind, MapKind::Grassland | MapKind::Sandbox) {
+            if matches!(kind, MapKind::Grassland | MapKind::Sandbox | MapKind::LineDebug) {
                 heights[z * verts_x + x] = classic_height(p);
                 continue;
             }
@@ -1065,7 +1072,7 @@ fn ground_base() -> StandardMaterial {
 fn ground_layers(assets: &AssetServer, images: &mut Assets<Image>, terrain: &Terrain) -> GroundLayers {
     let hill = terrain.kind.on_hill();
     let authored = hill
-        || matches!(terrain.kind, MapKind::Grassland | MapKind::BigGrassland | MapKind::Sandbox | MapKind::Town);
+        || matches!(terrain.kind, MapKind::Grassland | MapKind::BigGrassland | MapKind::Sandbox | MapKind::LineDebug | MapKind::Town);
     GroundLayers {
         pasture: ground_texture(
             assets,
@@ -2017,6 +2024,7 @@ mod tests {
             MapKind::BigGrassland,
             MapKind::River,
             MapKind::Sandbox,
+            MapKind::LineDebug,
             MapKind::Grassland,
         ] {
             app.world_mut().write_message(MapChanged(kind));

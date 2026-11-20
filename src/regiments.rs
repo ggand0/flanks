@@ -324,6 +324,24 @@ pub(crate) fn spawn_regiment(
     crate::formation::assign_slots(units, g, gd);
 }
 
+/// The centre x of each block in a rank laid with no gap between its
+/// blocks, given their widths left to right: each block starts where the
+/// one before it ends and the whole run is centred on x = 0. The outer
+/// files of two neighbours then stand half of each one's pitch from their
+/// shared edge, as in the Ctrl drag line (orders.rs `line_layout`).
+fn gapless_rank_xs(widths: &[f32]) -> Vec<f32> {
+    let total: f32 = widths.iter().sum();
+    let mut run = 0.0;
+    widths
+        .iter()
+        .map(|&w| {
+            let x = run + w * 0.5 - total * 0.5;
+            run += w;
+            x
+        })
+        .collect()
+}
+
 /// `nav` is the map's walkability grid when it has one: the layout then
 /// keeps every regiment's footprint on open ground.
 pub fn do_spawn_battle(
@@ -397,7 +415,12 @@ pub fn do_spawn_battle(
         .max(n_regs.div_ceil(max_ranks))
         .max(1);
     let pitch_x = (usable_w / per_rank as f32).min(block_w + REG_GAP);
-    if pitch_x < block_w + 1.0 {
+    // On Line Debug each rank stands with no gap between its regiments
+    // (`gapless_rank_xs`): it is tight only when the rank of the widest
+    // blocks would not fit the usable width.
+    let gapless = terrain.kind == crate::terrain::MapKind::LineDebug;
+    let tight = if gapless { per_rank as f32 * block_w > usable_w } else { pitch_x < block_w + 1.0 };
+    if tight {
         warn!(
             "regiment layout tight: pitch {pitch_x:.1} m vs block {block_w:.1} m — \
              reduce FL_REG_SIZE or FL_UNITS"
@@ -473,6 +496,21 @@ pub fn do_spawn_battle(
                 .collect();
         }
         let n_regs = kinds.len();
+        // Line Debug: each rank's x positions, the blocks side by side.
+        let gapless_xs: Vec<f32> = if gapless {
+            kinds
+                .chunks(per_rank)
+                .flat_map(|rank| {
+                    let widths: Vec<f32> = rank
+                        .iter()
+                        .map(|&k| cols as f32 * crate::formation::FormSpacing::Normal.pitch(k).x)
+                        .collect();
+                    gapless_rank_xs(&widths)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let dir: f32 = if team == 0 { -1.0 } else { 1.0 };
         let rank_z = |rank: usize| centre + dir * (army_gap / 2.0 + block_d / 2.0 + rank as f32 * (block_d + REG_GAP));
         // A regiment whose planned slot stands on blocked ground (a wall,
@@ -488,7 +526,7 @@ pub fn do_spawn_battle(
             let file = r % per_rank;
             // This rank's regiment count (last rank may be partial) — center it.
             let in_rank = per_rank.min(n_regs - rank * per_rank);
-            let x0 = (file as f32 - (in_rank - 1) as f32 / 2.0) * pitch_x;
+            let x0 = if gapless { gapless_xs[r] } else { (file as f32 - (in_rank - 1) as f32 / 2.0) * pitch_x };
             let mut anchor = Vec2::new(x0, rank_z(rank));
             if !fits(anchor) {
                 loop {
@@ -2319,4 +2357,153 @@ pub fn rout_test_log(
         g.centroid.y,
         g.enemy_near,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::game_state::{BattleConfig, EnemyComp, Scenario};
+    use crate::terrain::{MapKind, build_terrain};
+
+    fn spawn(map: MapKind, per_team: usize, size: usize, player: [usize; NUM_KINDS], enemy: [usize; NUM_KINDS]) -> (Terrain, Units, Groups) {
+        let terrain = build_terrain(map);
+        let config = BattleConfig {
+            units_per_team: per_team,
+            reg_size: size,
+            map,
+            scenario: Scenario::Normal,
+            player_regs: player,
+            enemy: EnemyComp::Manual(enemy),
+            ..default()
+        };
+        let (mut units, mut groups) = (Units::default(), Groups::default());
+        do_spawn_battle(&mut units, &terrain, &mut groups, &config, None);
+        (terrain, units, groups)
+    }
+
+    /// Each team's ranks, front to back, each its regiment indices left
+    /// to right.
+    fn ranks(groups: &Groups, team: u8) -> Vec<Vec<usize>> {
+        let mut out: Vec<(f32, Vec<usize>)> = Vec::new();
+        for (g, gd) in groups.list.iter().enumerate().filter(|(_, gd)| gd.team == team) {
+            match out.iter_mut().find(|(z, _)| *z == gd.anchor.y) {
+                Some((_, rank)) => rank.push(g),
+                None => out.push((gd.anchor.y, vec![g])),
+            }
+        }
+        out.sort_by(|a, b| a.0.abs().total_cmp(&b.0.abs()));
+        for (_, rank) in &mut out {
+            rank.sort_by(|&a, &b| groups.list[a].anchor.x.total_cmp(&groups.list[b].anchor.x));
+        }
+        out.into_iter().map(|(_, rank)| rank).collect()
+    }
+
+    /// The leftmost and rightmost slot x of regiment `g`.
+    fn slot_span(units: &Units, groups: &Groups, g: usize) -> (f32, f32) {
+        let anchor = groups.list[g].anchor.x;
+        (0..units.len()).filter(|&i| units.group[i] == g as u32).fold((f32::MAX, f32::MIN), |(lo, hi), i| {
+            let x = anchor + units.home[i].x;
+            (lo.min(x), hi.max(x))
+        })
+    }
+
+    #[test]
+    fn gapless_rank_xs_abut_blocks_of_unequal_pitch() {
+        // 47 files at three made-up pitches: the outer files of two
+        // neighbours stand the mean of their pitches apart.
+        let pitches = [1.4, 2.0, 1.1];
+        let widths: Vec<f32> = pitches.iter().map(|p| 47.0 * p).collect();
+        let xs = gapless_rank_xs(&widths);
+        let total: f32 = widths.iter().sum();
+        assert!((xs[0] - widths[0] * 0.5 + total * 0.5).abs() < 1e-3);
+        assert!((xs[2] + widths[2] * 0.5 - total * 0.5).abs() < 1e-3);
+        for k in 0..2 {
+            let right_file = xs[k] + 23.0 * pitches[k];
+            let left_file = xs[k + 1] - 23.0 * pitches[k + 1];
+            let seam = left_file - right_file;
+            assert!((seam - 0.5 * (pitches[k] + pitches[k + 1])).abs() < 1e-3, "seam {seam}");
+        }
+    }
+
+    /// Line Debug lays every rank of both armies with no gap: neighbours'
+    /// outer files one file pitch apart, every man on the field.
+    #[test]
+    fn line_debug_ranks_have_no_gaps() {
+        let setups = [
+            (100_000, 1000, frac_comp(100), [25, 25, 25, 25]),
+            (10_000, 500, [6, 5, 5, 4], [3, 7, 4, 6]),
+        ];
+        for (per_team, size, player, enemy) in setups {
+            let (terrain, units, groups) = spawn(MapKind::LineDebug, per_team, size, player, enemy);
+            let (min, max) = (terrain.min(), terrain.max());
+            for i in 0..units.len() {
+                let p = units.pos[i];
+                assert!(p.x > min.x && p.x < max.x && p.z > min.y && p.z < max.y, "man {i} off the field at {p}");
+            }
+            for team in 0..2 {
+                let ranks = ranks(&groups, team);
+                for rank in &ranks {
+                    for pair in rank.windows(2) {
+                        let (a, b) = (&groups.list[pair[0]], &groups.list[pair[1]]);
+                        let pitch = 0.5 * (crate::formation::gap(a.kind) + crate::formation::gap(b.kind));
+                        let seam = slot_span(&units, &groups, pair[1]).0 - slot_span(&units, &groups, pair[0]).1;
+                        assert!((seam - pitch).abs() < 1e-3, "team {team}: seam {seam} m, the pitch {pitch} m");
+                    }
+                    let mixed = rank.iter().any(|&g| groups.list[g].kind != groups.list[rank[0]].kind);
+                    let (lo, hi) = (slot_span(&units, &groups, rank[0]).0, slot_span(&units, &groups, *rank.last().unwrap()).1);
+                    assert!(lo > min.x + SIDE_MARGIN - 1.0 && hi < max.x - SIDE_MARGIN + 1.0);
+                    println!(
+                        "line debug {per_team}/{size} team {team}: {} regiments, line {:.1} m{}",
+                        rank.len(),
+                        hi - lo,
+                        if mixed { ", mixed kinds" } else { "" }
+                    );
+                }
+            }
+        }
+    }
+
+    /// Off Line Debug the deployment is the old arithmetic: every anchor
+    /// matches the formula from before the gapless rank, bit for bit.
+    #[test]
+    fn grassland_anchors_keep_the_old_layout() {
+        let setups = [
+            (100_000, 1000, frac_comp(100), [25, 25, 25, 25]),
+            (10_000, 500, [6, 5, 5, 4], [3, 7, 4, 6]),
+        ];
+        for (per_team, size, player, enemy) in setups {
+            let (terrain, _, groups) = spawn(MapKind::Grassland, per_team, size, player, enemy);
+            let n_regs = per_team / size;
+            let cols = ((size as f32 * 2.2).sqrt().ceil() as usize).max(1);
+            let rows = size.div_ceil(cols);
+            let gap = crate::formation::widest_gap();
+            let (block_w, block_d) = (cols as f32 * gap, rows as f32 * gap);
+            let (field_min, field_max) = army_field(&terrain);
+            let usable_w = (field_max.x - field_min.x) - 2.0 * SIDE_MARGIN;
+            let (centre, army_gap) = army_lines(terrain.kind);
+            let usable_d = (field_max.y - EDGE_MARGIN - army_gap / 2.0 - centre)
+                .min(-field_min.y - EDGE_MARGIN - army_gap / 2.0 + centre);
+            let max_ranks = (((usable_d - block_d) / (block_d + REG_GAP)).floor() as usize + 1).max(1);
+            let per_rank = ((usable_w / (block_w + REG_GAP)).floor() as usize).max(n_regs.div_ceil(max_ranks)).max(1);
+            let pitch_x = (usable_w / per_rank as f32).min(block_w + REG_GAP);
+            let mut g = 0;
+            for (team, comp) in [(0u8, player), (1, enemy)] {
+                let n: usize = comp.iter().sum();
+                let dir: f32 = if team == 0 { -1.0 } else { 1.0 };
+                for r in 0..n {
+                    let (rank, file) = (r / per_rank, r % per_rank);
+                    let in_rank = per_rank.min(n - rank * per_rank);
+                    let x0 = (file as f32 - (in_rank - 1) as f32 / 2.0) * pitch_x;
+                    let z = centre + dir * (army_gap / 2.0 + block_d / 2.0 + rank as f32 * (block_d + REG_GAP));
+                    assert_eq!(groups.list[g].anchor, Vec2::new(x0, z), "regiment {g}");
+                    g += 1;
+                }
+            }
+            assert_eq!(g, groups.list.len());
+            let rank = ranks(&groups, 0).remove(0);
+            let lo = groups.list[rank[0]].anchor.x - block_w * 0.5;
+            let hi = groups.list[*rank.last().unwrap()].anchor.x + block_w * 0.5;
+            println!("grassland {per_team}/{size}: {} regiments a rank, line {:.1} m, gap {:.1} m", rank.len(), hi - lo, pitch_x - block_w);
+        }
+    }
 }
