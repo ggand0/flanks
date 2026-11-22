@@ -232,7 +232,9 @@ fn friction_contact() -> bool {
 /// stance (`pose_level`, a third of the way at each level) while he stands
 /// (`steer`, the `stood` column), whatever his regiment's order. He
 /// becomes a walker when his own wish to move reaches the speed of a step,
-/// and stands again when it drops under it. This is the standing bracing,
+/// and stands again when it drops under it. The sidestep of a jammed
+/// soldier's try at a side (`try_a_side`) is not part of that wish: trying
+/// a side, a standing soldier still stands. This is the standing bracing,
 /// the one that meets a charge, and it counts against any body. A walking
 /// soldier does not have it (he may have the walking bracing against the
 /// other side, `BRACE_BASIC`), and neither does a dying man. A push does
@@ -352,7 +354,9 @@ fn still_weight(o_vel: Vec2, wish_dir: Vec2) -> f32 {
 /// Whether a man of a regiment standing ready stands, below the speed of
 /// his steps. Under the friction contact it is where he is trying to go,
 /// so a push he gets does not take him out of the ready stance and only
-/// his own walking does; else it is how fast he moved last tick.
+/// his own walking does; else it is how fast he moved last tick. For his
+/// bracing (`steer`) that wish leaves out the sidestep of a soldier's try
+/// at a side.
 #[inline]
 fn stands(friction: bool, kept: Vec2, wish: Vec2) -> bool {
     let v = if friction { wish } else { kept };
@@ -781,6 +785,9 @@ struct Step {
     /// What the crowd's brake has taken off his wish since `yield_to_crowd`,
     /// so that `desired + fade` is his own wish unfaded (`steer`).
     fade: Vec2,
+    /// The sidestep of his try at a side (`try_a_side`), part of `desired`;
+    /// left out of whether he stands (`steer`).
+    side: Vec2,
     jam: f32,
     new_v: Vec2,
     /// Where his step ends on the ground plane (`slide`).
@@ -946,6 +953,7 @@ fn begin(f: &Field, s: &mut Soldier) -> Step {
         face_target: None,
         wish: Vec2::ZERO,
         fade: Vec2::ZERO,
+        side: Vec2::ZERO,
         jam: 0.0,
         new_v: Vec2::ZERO,
         next: Vec2::ZERO,
@@ -2176,6 +2184,7 @@ fn try_a_side(f: &Field, s: &mut Soldier, st: &mut Step) {
         }
         let side = if left { left_dir } else { -left_dir };
         st.desired += side * STEP_PACE;
+        st.side = side * STEP_PACE;
         mem = SIDE_MEMORY;
     } else {
         // Stuck: pressed, and not even stepping. Under half his wish
@@ -3105,10 +3114,13 @@ fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
     // Whether he stands, for his bracing next tick (`brace_pairs`) and his
     // stance (`scan`). The line is his own wish as it comes here, after
     // every stage that sets it, with what the crowd's brake took off it put
-    // back, before the paces and caps below, under the speed of a step
-    // (`stands`). A push he gets does not count.
+    // back and the sidestep of his try at a side taken out, before the
+    // paces and caps below, under the speed of a step (`stands`). A push he
+    // gets does not count, and neither does that sidestep: a jammed soldier
+    // who tries a side still stands, or his weight against his own side
+    // would change each time a try begins or ends.
     if friction {
-        *s.stood = stands(true, Vec2::ZERO, desired + st.fade);
+        *s.stood = stands(true, Vec2::ZERO, desired + st.fade - st.side);
     }
     // Formation pace: walls advance deliberately (running breaks a wall), the
     // charge phase runs the last stretch home. Broken/dying already excluded
@@ -3445,6 +3457,18 @@ mod tests {
         assert!(stands(false, Vec2::new(0.5, 0.0), walk));
         assert!(stands(true, fast, Vec2::ZERO));
         assert!(!stands(true, Vec2::ZERO, walk));
+    }
+
+    /// A jammed soldier who waits at under a step's pace still stands while
+    /// he tries a side: the sidestep at STEP_PACE across his wish takes the
+    /// wish over the step's speed, and `steer` leaves it out.
+    #[test]
+    fn a_sidestep_does_not_make_him_a_walker() {
+        let wish = Vec2::new(0.0, 0.9);
+        let side = Vec2::new(STEP_PACE, 0.0);
+        assert!(stands(true, Vec2::ZERO, wish));
+        assert!(!stands(true, Vec2::ZERO, wish + side));
+        assert!(stands(true, Vec2::ZERO, wish + side - side));
     }
 
     /// A man ahead who stood or came at the reader counts in full, one who
