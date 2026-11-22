@@ -231,20 +231,45 @@ fn friction_contact() -> bool {
 /// him is the one who gives. He is braced as far as he is in his ready
 /// stance (`pose_level`, a third of the way at each level) while he stands
 /// (`steer`, the `stood` column), whatever his regiment's order. He
-/// becomes a walker when his own wish to move reaches the speed of a step,
-/// and stands again when it drops under it. The sidestep of a jammed
-/// soldier's try at a side (`try_a_side`) is not part of that wish: trying
-/// a side, a standing soldier still stands. This is the standing bracing,
-/// the one that meets a charge, and it counts against any body. A walking
-/// soldier does not have it (he may have the walking bracing against the
-/// other side, `BRACE_BASIC`), and neither does a dying man. A push does
-/// not take him out of it, only his own walking does. This is a man
-/// bracing his body, not a spearwall's braced points. FL_BRACE=<number>
-/// sets it, from 1 (his own weight, as without it) to 20.
+/// becomes a walker when his own wish to move reaches the speed of a step.
+/// On the walk to his place with nothing else to do (`on_his_way`), in a
+/// fighting regiment's rear ranks too, he stands again only once he has
+/// arrived there, within STEP_STOP, or his own rule tells him to stand
+/// where he is (`has_arrived`, `still_stands`); a soldier under fight
+/// footwork stands again as soon as his wish drops under that speed. So a
+/// jammed soldier on his way, whose wish slides with the few centimetres a
+/// shove moves him, does not change his weight back and forth. The
+/// sidestep of a jammed soldier's try at a side (`try_a_side`) is not part
+/// of that wish: trying a side, a standing soldier still stands. This is
+/// the standing bracing, the one that meets a charge, and it counts
+/// against any body. A walking soldier does not have it (he may have the
+/// walking bracing against the other side, `BRACE_BASIC`), and neither
+/// does a dying man. A push does not take him out of it, only his own
+/// walking does. This is a man bracing his body, not a spearwall's braced
+/// points. FL_BRACE=<number> sets it, from 1 (his own weight, as without
+/// it) to 20.
 const BRACE: f32 = 4.0;
 fn brace() -> f32 {
     static B: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
     *B.get_or_init(|| crate::util::env_or("FL_BRACE", BRACE).clamp(1.0, 20.0))
+}
+/// Whether a walker on the walk to his place has stopped walking: he is
+/// there, within STEP_STOP; he is a holding soldier parked inside the hold
+/// deadzone (`drive`); or his own rule told him to stand where he is this
+/// tick (`told_to_stand`: `hold_the_frame` zeroed his wish, a holding
+/// soldier of a fighting regiment with a comrade between him and his
+/// mark). A wish that is merely small is not arrival.
+#[inline]
+fn has_arrived(place_dist: f32, parked: bool, told_to_stand: bool) -> bool {
+    place_dist <= STEP_STOP || parked || told_to_stand
+}
+/// Whether a soldier on the walk to his place stands this tick, for his
+/// bracing and his stance: a wish at or over the speed of a step makes him
+/// a walker; under it a standing soldier still stands, and a walking one
+/// stands again only when he has arrived at his place.
+#[inline]
+fn still_stands(was_stood: bool, wish_under_line: bool, arrived: bool) -> bool {
+    wish_under_line && (was_stood || arrived)
 }
 /// Under the friction contact, the walking bracing: how many times his
 /// weight a soldier in his ready stance counts for against a body of the
@@ -373,11 +398,35 @@ fn still_weight(o_vel: Vec2, wish_dir: Vec2) -> f32 {
 /// so a push he gets does not take him out of the ready stance and only
 /// his own walking does; else it is how fast he moved last tick. For his
 /// bracing (`steer`) that wish leaves out the sidestep of a soldier's try
-/// at a side.
+/// at a side. It is the line a wish crosses, not yet whether he stands:
+/// on the walk to his place with nothing else to do a walker stays one
+/// until he arrives (`still_stands`).
 #[inline]
 fn stands(friction: bool, kept: Vec2, wish: Vec2) -> bool {
     let v = if friction { wish } else { kept };
     v.length_squared() < STEP_FACE_SPEED * STEP_FACE_SPEED
+}
+/// Whether his wish this tick is the drive to his place and nothing else
+/// (`still_stands`): alive and not broken, his regiment not in its melee
+/// (so no joining), himself in formation, no enemy in his reach or in his
+/// mind, and no blow, parry or draw under way. His regiment may be
+/// engaged: a soldier in the rear ranks of a fighting regiment with no
+/// enemy in reach or in mind walks to his place like any other. Fight
+/// footwork (`close_in`, `decide_to_join`, `swing`) steers only a soldier
+/// this is false for; `hold_the_frame` may still stop him where he stands,
+/// which ends his walk (`has_arrived`). The scan reads it before
+/// `decide_to_join` and `swing` run, so it sees his formation and his
+/// swing as they were kept from last tick.
+#[inline]
+fn on_his_way(s: &Soldier, st: &Step) -> bool {
+    !st.dying
+        && !st.routed
+        && !st.in_melee
+        && !st.committed
+        && st.join_fp.is_none()
+        && st.best_idx == u32::MAX
+        && !st.memo_valid
+        && *s.swing & crate::units::SWING_STATE_MASK == crate::units::SWING_READY
 }
 /// What the contacts have put into his speed and his feet have not taken
 /// back, after this tick's step: the old total plus the kept speed less
@@ -805,6 +854,12 @@ struct Step {
     /// The sidestep of his try at a side (`try_a_side`), part of `desired`;
     /// left out of whether he stands (`steer`).
     side: Vec2,
+    /// How far he is from his place (`drive`): his regiment's order or
+    /// anchor plus his slot, never a route's waypoint; and whether he is a
+    /// holding soldier inside the hold deadzone. Either within STEP_STOP or
+    /// parked, he has arrived (`steer`).
+    place_dist: f32,
+    parked: bool,
     jam: f32,
     new_v: Vec2,
     /// Where his step ends on the ground plane (`slide`).
@@ -971,6 +1026,8 @@ fn begin(f: &Field, s: &mut Soldier) -> Step {
         wish: Vec2::ZERO,
         fade: Vec2::ZERO,
         side: Vec2::ZERO,
+        place_dist: f32::INFINITY,
+        parked: false,
         jam: 0.0,
         new_v: Vec2::ZERO,
         next: Vec2::ZERO,
@@ -1025,6 +1082,7 @@ fn drive(f: &Field, s: &mut Soldier, st: &mut Step) {
     } else if !dying {
         let holding = orders[gi].is_none();
         let mut goal = orders[gi].unwrap_or(anchors[gi]) + home[i];
+        st.place_dist = goal.distance(p);
         // On a route, a man whose straight way to his slot is blocked
         // follows the route instead (sim/route.rs); short of the last leg
         // he keeps his pace. He reads the route every LOOK_TICKS, when he
@@ -1057,7 +1115,8 @@ fn drive(f: &Field, s: &mut Soldier, st: &mut Step) {
         let stepping = s.vel.xz().length_squared()
             > (0.5 * STEP_PACE) * (0.5 * STEP_PACE);
         let deadzone = if stepping { STEP_STOP } else { HOLD_DEADZONE };
-        if !(holding && dist < deadzone) {
+        st.parked = holding && dist < deadzone;
+        if !st.parked {
             // Slope penalty: steep ground is slow ground. Wading the river is
             // slow too (the bridge deck is dry: full speed).
             let slope = terrain.slope_at(p.x, p.y);
@@ -1409,8 +1468,8 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut, cands: &m
     // With his regiment focused on one target (sim/job.rs `focus`), a man
     // of another regiment is remembered only within his threat distance:
     // one who is not on him he lets go, and follows his orders. Read here
-    // rather than in `look_around`, so that the scan's own later steps can
-    // read it too.
+    // rather than in `look_around` so that his stance below knows whether
+    // he is on his way to his place (`on_his_way`).
     let memo = prev_target as usize;
     let (memo_d2, memo_valid) = if (best_idx == u32::MAX && !dying && !st.routed)
         || (st.in_melee && !st.committed)
@@ -1421,15 +1480,25 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut, cands: &m
     };
     st.memo_valid = memo_valid;
     st.memo_d2 = memo_d2;
+    st.best_idx = best_idx;
     // His stance for the next tick, as he is drawn: into the ready stance
     // while his regiment fights, while it stands ready and he stands (the
     // pose pass's guard, below the speed of his steps; under the friction
     // contact a push does not count, only his own wish to walk, `stands`),
     // or with an enemy in his reach; else back at ease, walking or
-    // running. A step of the ramp a tick.
+    // running. A step of the ramp a tick. Under the friction contact a
+    // soldier on the walk to his place with nothing else to do who was a
+    // walker last tick (`steer` keeps it in `stood` until he arrives,
+    // `still_stands`) is on his way and stays at ease, whatever his wish
+    // this tick. In a fighting regiment (STANCE_FIGHT) every soldier is
+    // ready, walking or standing, so a walker there is in the ready stance,
+    // his weight his own against his side and the walking bracing against
+    // the other side.
     let ready = match stance[gi] {
         STANCE_FIGHT => true,
-        STANCE_READY => stands(friction, s.vel.xz(), st.desired),
+        STANCE_READY => {
+            stands(friction, s.vel.xz(), st.desired) && !(friction && !*s.stood && on_his_way(s, st))
+        }
         _ => false,
     };
     let stance_ramp = *s.pose & POSE_STANCE;
@@ -3133,9 +3202,29 @@ fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
     // paces and caps below, under the speed of a step (`stands`). A push he
     // gets does not count, and neither does that sidestep: a jammed soldier
     // who tries a side still stands, or his weight against his own side
-    // would change each time a try begins or ends.
+    // would change each time a try begins or ends. A wish at or over the
+    // line makes him a walker. Under it, a soldier under fight footwork
+    // stands at once; a soldier on the walk to his place with nothing else
+    // to do (`on_his_way`) who was walking keeps walking until he arrives
+    // there, within STEP_STOP or parked in the hold deadzone, or until his
+    // own rule tells him to stand where he is: a holding soldier of a
+    // fighting regiment shoved off his mark with a comrade between him and
+    // it, whose wish `hold_the_frame` zeroed (`has_arrived`,
+    // `still_stands`). That holds in the rear ranks of a fighting regiment
+    // too. His wish slides with his distance to his place and crosses the
+    // line some metres out, and the few centimetres a shove moves a jammed
+    // soldier there would else change his weight and stance again and
+    // again.
     if friction {
-        *s.stood = stands(true, Vec2::ZERO, desired + st.fade - st.side);
+        let side = st.side;
+        let under = stands(true, Vec2::ZERO, desired + st.fade - side);
+        let stood = if on_his_way(s, st) {
+            let arrived = has_arrived(st.place_dist, st.parked, st.slot_blocked);
+            still_stands(*s.stood, under, arrived)
+        } else {
+            under
+        };
+        *s.stood = stood;
     }
     // Formation pace: walls advance deliberately (running breaks a wall), the
     // charge phase runs the last stretch home. Broken/dying already excluded
@@ -3484,6 +3573,54 @@ mod tests {
         assert!(stands(true, Vec2::ZERO, wish));
         assert!(!stands(true, Vec2::ZERO, wish + side));
         assert!(stands(true, Vec2::ZERO, wish + side - side));
+    }
+
+    /// On the walk to his place: a walker whose wish has dropped
+    /// under the speed of a step far from his place still walks; arriving
+    /// within STEP_STOP he stands; a standing soldier shoved 5 cm stays
+    /// standing; a wish over the line makes him a walker. A jammed soldier
+    /// shoved back and forth 5 cm across the distance where his wish
+    /// crosses the line changes once, not every time. A walker told to
+    /// stand where he is (his wish zeroed, a comrade between him and his
+    /// mark) stands though he is far from his place, and walks again once
+    /// his wish reaches the line; a walker whose wish is merely small has
+    /// not arrived.
+    #[test]
+    fn a_walker_stands_again_only_at_his_place() {
+        // The drive's wish of a soldier of 6 m/s at `d` metres from his place.
+        let wish = |d: f32| Vec2::new(0.0, 6.0 * (d / ARRIVE_RADIUS).min(1.0));
+        let under = |d: f32| stands(true, Vec2::ZERO, wish(d));
+        let arrived = |d: f32| has_arrived(d, false, false);
+        assert!(has_arrived(0.3, false, false));
+        assert!(has_arrived(5.0, true, false));
+        assert!(!has_arrived(0.4, false, false));
+        // Told to stand 5 m from his place: his wish is zero, he stands.
+        let told = has_arrived(5.0, false, true);
+        assert!(told && stands(true, Vec2::ZERO, Vec2::ZERO));
+        assert!(still_stands(false, stands(true, Vec2::ZERO, Vec2::ZERO), told));
+        // The way clears: his wish back over the line, he walks again.
+        assert!(!still_stands(true, under(10.0), arrived(10.0)));
+        // Merely slowed to a crawl 5 m out, not told to stand: he walks on.
+        assert!(!still_stands(false, stands(true, Vec2::ZERO, Vec2::new(0.0, 0.1)), arrived(5.0)));
+        assert!(under(5.0) && !arrived(5.0));
+        assert!(!still_stands(false, under(5.0), arrived(5.0)));
+        assert!(still_stands(false, under(0.3), arrived(0.3)));
+        assert!(still_stands(true, under(5.05), arrived(5.05)));
+        assert!(still_stands(true, under(4.95), arrived(4.95)));
+        assert!(!under(10.0));
+        assert!(!still_stands(true, under(10.0), arrived(10.0)));
+        assert!(!still_stands(false, under(10.0), arrived(10.0)));
+        // The line is at 35 x 1.05 / 6 = 6.125 m.
+        let mut stood = true;
+        let mut changes = 0;
+        for k in 0..60 {
+            let d = if k % 2 == 0 { 6.10 } else { 6.15 };
+            let next = still_stands(stood, under(d), arrived(d));
+            changes += (next != stood) as u32;
+            stood = next;
+        }
+        assert_eq!(changes, 1);
+        assert!(!stood);
     }
 
     /// A man ahead who stood or came at the reader counts in full, one who

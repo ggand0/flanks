@@ -142,9 +142,12 @@ pub struct Units {
     /// that his feet have not yet taken back. Zero otherwise.
     pub imposed: Column<Vec2>,
     /// Under the friction contact: he stood last tick (sim/soldier.rs
-    /// `steer`): his own wish to move was under the speed of a step. A
-    /// standing soldier is braced against any body (sim/soldier.rs `BRACE`),
-    /// a walking one only against the other side (`BRACE_BASIC`).
+    /// `steer`): his own wish to move was under the speed of a step. On the
+    /// walk to his place with nothing else to do (`on_his_way`), once he has
+    /// set off, he stands again only after he has arrived there
+    /// (`still_stands`). A standing soldier is braced against any body
+    /// (sim/soldier.rs `BRACE`), a walking one only against the other side
+    /// (`BRACE_BASIC`).
     pub stood: Column<bool>,
     /// Bumped every time a battle rebuilds this world. A sim tick job
     /// computed from an older world carries indices that mean nothing
