@@ -195,17 +195,52 @@ pub(crate) struct PairWidth {
 }
 pub(crate) fn pair_widths() -> &'static [[PairWidth; WIDTH_LEVELS]; WIDTH_LEVELS] {
     static T: std::sync::OnceLock<[[PairWidth; WIDTH_LEVELS]; WIDTH_LEVELS]> = std::sync::OnceLock::new();
-    T.get_or_init(|| {
-        let w = widths();
-        std::array::from_fn(|a| {
-            std::array::from_fn(|b| {
-                let mut sep = 0.5 * (w[a].sep + w[b].sep);
-                let hard = (0.5 * (w[a].body + w[b].body)).min(sep);
-                sep += (hard - sep) * ((a / 4).max(b / 4) as f32 / 3.0);
-                PairWidth { sep, inv_sep: 1.0 / sep, hard }
-            })
-        })
-    })
+    T.get_or_init(|| std::array::from_fn(|a| std::array::from_fn(|b| pair_width_of(a, 1.0, b, 1.0))))
+}
+/// A pair of men by their width levels and the share of his body each
+/// still has (`fall_share`, 1 for a living soldier): each man's body and
+/// spring rest times his share, then the pair's as in the table. A share
+/// of 1 is the table's entry to the bit. The same from either side.
+#[inline]
+pub(crate) fn pair_width_of(a: usize, share_a: f32, b: usize, share_b: f32) -> PairWidth {
+    pair_of(widths(), a, share_a, b, share_b)
+}
+/// `pair_width_of` on a given set of width levels.
+#[inline]
+fn pair_of(w: &[Width; WIDTH_LEVELS], a: usize, share_a: f32, b: usize, share_b: f32) -> PairWidth {
+    let mut sep = 0.5 * (w[a].sep * share_a + w[b].sep * share_b);
+    let hard = (0.5 * (w[a].body * share_a + w[b].body * share_b)).min(sep);
+    sep += (hard - sep) * ((a / 4).max(b / 4) as f32 / 3.0);
+    PairWidth { sep, inv_sep: 1.0 / sep, hard }
+}
+/// Under the friction contact, a soldier who is struck down falls over his
+/// death clock instead of in single ticks. While he dies he keeps the
+/// weight he had when he was struck: his stance, the turn of his shoulders
+/// and his stood bit stay as they were (`scan`, `try_a_side`, `steer`), and
+/// he is braced in the setting apart as a living soldier in that state
+/// (`brace_level`). And his body goes down: its width and spring rest
+/// shrink with the share of his death clock that is left, whole on his
+/// first tick down and nothing on his last (`fall_share`), so the men
+/// around him close over the place he fell a little each tick, and nothing
+/// overlaps him when he is swept. Without the friction contact a dying
+/// soldier weighs nothing from the tick he is struck and his whole body
+/// stays until it is swept.
+#[inline]
+pub(crate) fn fall() -> bool {
+    friction_contact()
+}
+/// The share of his body a soldier still has, from his death clock as the
+/// grid carries it (spatial.rs META_FALL): 1 alive and on his first tick
+/// down (DEATH_TICKS), falling a step a tick to nothing on his last tick
+/// in the grid (2: on the tick his clock reaches 1 he is swept). Both
+/// soldiers of a pair read it from the same clock, so they read the same.
+#[inline]
+pub(crate) fn fall_share(death_t: u8) -> f32 {
+    const LAST: u8 = 2;
+    if death_t == 0 {
+        return 1.0;
+    }
+    (death_t.saturating_sub(LAST) as f32 / (crate::sim::damage::DEATH_TICKS - LAST) as f32).min(1.0)
 }
 /// The widest pair's spring rest over the pair table (`pair_widths`),
 /// for the scan's cut of its foes.
@@ -270,7 +305,8 @@ fn friction_contact() -> bool {
 /// the standing bracing, the one that meets a charge, and it counts
 /// against any body. A walking soldier does not have it (he may have the
 /// walking bracing against the other side, `BRACE_BASIC`), and neither
-/// does a dying man. A push does not take him out of it, only his own
+/// does a dying man unless he falls over his death clock (`fall`),
+/// keeping what he had. A push does not take him out of it, only his own
 /// walking does. This is a man bracing his body, not a spearwall's braced
 /// points. FL_BRACE=<number> sets it, from 1 (his own weight, as without
 /// it) to 20.
@@ -304,9 +340,10 @@ fn still_stands(was_stood: bool, wish_under_line: bool, arrived: bool) -> bool {
 /// him as through a walker. Against his own side a walking soldier weighs
 /// as a walker. It is by his pose level as `BRACE` is, and a soldier whose
 /// regiment is under a Move order (sim/job.rs `moving`) or a dying soldier
-/// does not have it. A soldier who stands has the standing bracing
-/// (`BRACE`) against every body instead. Both sides have it alike: it
-/// reads only whether the two bodies are of one side.
+/// does not have it (a falling one keeps it, `fall`). A soldier who stands
+/// has the standing bracing (`BRACE`) against every body instead. Both
+/// sides have it alike: it reads only whether the two bodies are of one
+/// side.
 const BRACE_BASIC: f32 = 4.0;
 /// His brace level in a pair: 0 not braced (weight 1); 1 to 3 standing,
 /// braced by his pose level (`BRACE`); 4 to 6 walking, braced against the
@@ -361,12 +398,20 @@ fn brace_pairs() -> &'static BraceTable {
 /// both soldiers of the pair read alike in the grid: standing (`stood`),
 /// his pose level against anyone; walking, against the other side
 /// (`cross`) and not under a Move order, the walking bracing's level for
-/// his pose; else 0. A dying soldier is 0. `moving` is called only when
-/// the walking bracing could count, so a neighbour's regiment is read only
-/// then.
+/// his pose; else 0. A dying soldier is 0, unless he falls over his death
+/// clock (`fall`): then he is braced as a living soldier in the same
+/// state. `moving` is called only when the walking bracing could count,
+/// so a neighbour's regiment is read only then.
 #[inline]
-fn brace_level(pose_lv: usize, stood: bool, dying: bool, cross: bool, moving: impl FnOnce() -> bool) -> usize {
-    if dying {
+fn brace_level(
+    pose_lv: usize,
+    stood: bool,
+    dying: bool,
+    fall: bool,
+    cross: bool,
+    moving: impl FnOnce() -> bool,
+) -> usize {
+    if dying && !fall {
         0
     } else if stood {
         pose_lv
@@ -1311,11 +1356,16 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut, cands: &m
     // (`brace_level`), so his level against a friend and against a foe are
     // kept apart.
     let friction = friction_contact();
+    // A falling soldier's own share of his body, from his clock at the
+    // tick's start as the grid carries it (his own column has already
+    // counted down this tick, `begin`).
+    let fall_on = fall();
+    let my_share = if fall_on { fall_share(f.death_snap[i]) } else { 1.0 };
     let my_stood = *s.stood;
     let (my_brace_same, my_brace_cross) = if friction {
         (
-            brace_level(pose_lv, my_stood, dying, false, || moving[gi]),
-            brace_level(pose_lv, my_stood, dying, true, || moving[gi]),
+            brace_level(pose_lv, my_stood, dying, fall_on, false, || moving[gi]),
+            brace_level(pose_lv, my_stood, dying, fall_on, true, || moving[gi]),
         )
     } else {
         (0, 0)
@@ -1451,9 +1501,21 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut, cands: &m
                 }
             }
         }
-        let pair = &pairs[crate::spatial::meta_width(o.meta)];
+        // A pair with a falling soldier in it (`fall`) is as far apart as
+        // what is left of his body: each man's body and rest by his share,
+        // a wall pair's rest too. Two living soldiers read the table.
+        let o_dying = (o.meta & crate::spatial::META_DYING) != 0;
+        let falling = fall_on && (dying | o_dying);
+        let fallen;
+        let (pair, wall_rest) = if falling {
+            let o_share = fall_share(crate::spatial::meta_fall(o.meta));
+            fallen = pair_width_of(my_level, my_share, crate::spatial::meta_width(o.meta), o_share);
+            (&fallen, WALL_SEP_RADIUS * (0.5 * (my_share + o_share)))
+        } else {
+            (&pairs[crate::spatial::meta_width(o.meta)], WALL_SEP_RADIUS)
+        };
         let (sep_r, inv_sep, hard) = if !cross && my_wall && (o.meta & crate::spatial::META_WALL) != 0 {
-            (WALL_SEP_RADIUS, 1.0 / WALL_SEP_RADIUS, pair.hard.min(WALL_SEP_RADIUS))
+            (wall_rest, 1.0 / wall_rest, pair.hard.min(wall_rest))
         } else {
             (pair.sep, pair.inv_sep, pair.hard)
         };
@@ -1488,7 +1550,8 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut, cands: &m
                         let o_brace = brace_level(
                             crate::spatial::meta_pose(o.meta),
                             (o.meta & crate::spatial::META_STOOD) != 0,
-                            (o.meta & crate::spatial::META_DYING) != 0,
+                            o_dying,
+                            fall_on,
                             cross,
                             || moving[crate::spatial::meta_group(o.meta)],
                         );
@@ -1588,13 +1651,16 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut, cands: &m
         }
         _ => false,
     };
-    let stance_ramp = *s.pose & POSE_STANCE;
-    let stance_ramp = if ready || best_idx != u32::MAX {
-        (stance_ramp + 1).min(POSE_READY)
-    } else {
-        stance_ramp.saturating_sub(1)
-    };
-    *s.pose = (*s.pose & !POSE_STANCE) | stance_ramp;
+    // A falling soldier keeps the stance he was struck in (`fall`).
+    if !(dying && fall_on) {
+        let stance_ramp = *s.pose & POSE_STANCE;
+        let stance_ramp = if ready || best_idx != u32::MAX {
+            (stance_ramp + 1).min(POSE_READY)
+        } else {
+            stance_ramp.saturating_sub(1)
+        };
+        *s.pose = (*s.pose & !POSE_STANCE) | stance_ramp;
+    }
     st.brake = (mine.slow, mine.stop);
     // An archer's knife: out while his regiment has its swords out, and
     // for a few seconds after an enemy came close to him, one in his
@@ -2320,7 +2386,10 @@ fn try_a_side(f: &Field, s: &mut Soldier, st: &mut Step) {
         && want > 0.5;
     if !going {
         *s.stuck = 0;
-        turn_shoulders(s);
+        // A falling soldier keeps the turn of his shoulders (`fall`).
+        if !(st.dying && fall()) {
+            turn_shoulders(s);
+        }
         return;
     }
     let dir = wish / want;
@@ -3332,7 +3401,11 @@ fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
         } else {
             under
         };
-        *s.stood = stood;
+        // A falling soldier keeps his stood bit as it was when he was
+        // struck (`fall`).
+        if !(dying && fall()) {
+            *s.stood = stood;
+        }
     }
     // Formation pace: walls advance deliberately (running breaks a wall), the
     // charge phase runs the last stretch home. Broken/dying already excluded
@@ -3842,20 +3915,47 @@ mod tests {
         }
     }
 
-    /// The grid's stood bit sits between the turn of his shoulders and his
-    /// regiment, and no field reads another; the regiment keeps 22 bits.
+    /// The grid's stood bit sits above the turn of his shoulders, the fall
+    /// field between it and his regiment, and no field reads another; the
+    /// regiment keeps 17 bits.
     #[test]
-    fn the_stood_bit_leaves_the_width_and_the_regiment_alone() {
-        use crate::spatial::{META_GROUP_SHIFT, META_POSE_SHIFT, META_STOOD, META_TURN_SHIFT, meta_group, meta_width};
+    fn the_stood_bit_and_the_fall_field_leave_the_width_and_the_regiment_alone() {
+        use crate::spatial::{
+            META_FALL_SHIFT, META_GROUP_SHIFT, META_POSE_SHIFT, META_STOOD, META_TURN_SHIFT, meta_fall, meta_group,
+            meta_width,
+        };
         assert_eq!(META_STOOD, 1 << 9);
-        assert_eq!(META_GROUP_SHIFT, 10);
+        assert_eq!(META_FALL_SHIFT, 10);
+        assert_eq!(META_GROUP_SHIFT, 15);
         let g = (1u32 << (32 - META_GROUP_SHIFT)) - 1;
         for stood in [false, true] {
-            let meta =
-                (3 << META_POSE_SHIFT) | (2 << META_TURN_SHIFT) | (stood as u32 * META_STOOD) | (g << META_GROUP_SHIFT);
-            assert_eq!(meta_width(meta), 3 + 4 * 2);
-            assert_eq!(meta_group(meta), g as usize);
-            assert_eq!((meta & META_STOOD) != 0, stood);
+            for d in [0, 2, 9, crate::sim::damage::DEATH_TICKS as u32, 31] {
+                let meta = (3 << META_POSE_SHIFT)
+                    | (2 << META_TURN_SHIFT)
+                    | (stood as u32 * META_STOOD)
+                    | (d << META_FALL_SHIFT)
+                    | (g << META_GROUP_SHIFT);
+                assert_eq!(meta_width(meta), 3 + 4 * 2);
+                assert_eq!(meta_group(meta), g as usize);
+                assert_eq!((meta & META_STOOD) != 0, stood);
+                assert_eq!(meta_fall(meta), d as u8);
+            }
+        }
+    }
+
+    /// A living soldier has his whole body; a falling one has it whole on his
+    /// first tick down, half of it half way through his clock, and nothing
+    /// on his last tick in the grid, a sixteenth less each tick.
+    #[test]
+    fn the_fall_takes_his_body_down_over_his_death_clock() {
+        let first = crate::sim::damage::DEATH_TICKS;
+        assert_eq!(fall_share(0), 1.0);
+        assert_eq!(fall_share(first), 1.0);
+        assert_eq!(fall_share((first + 2) / 2), 0.5);
+        assert_eq!(fall_share(2), 0.0);
+        for d in 3..=first {
+            let step = fall_share(d) - fall_share(d - 1);
+            assert!((step - 1.0 / (first - 2) as f32).abs() < 1e-6, "{d}");
         }
     }
 
@@ -3870,6 +3970,58 @@ mod tests {
             assert_eq!(w.body.to_bits(), BODY_EASE.to_bits(), "{level}");
         }
         assert_eq!(ready_body_of(false, BODY_EASE, BODY_DISTANCE), BODY_DISTANCE);
+    }
+
+    /// A pair with a falling soldier in it is as far apart on his first tick
+    /// down as two living soldiers, to the bit, and closes to the living
+    /// soldier's half alone on his last; the pair reads the same from either
+    /// side, and at every share between it lies between the two.
+    #[test]
+    #[allow(clippy::needless_range_loop)] // the indices are kinds and levels of more than one table
+    fn a_falling_body_closes_to_the_living_half() {
+        let w = widths();
+        let table = pair_widths();
+        let first = crate::sim::damage::DEATH_TICKS;
+        for a in 0..WIDTH_LEVELS {
+            for b in 0..WIDTH_LEVELS {
+                let whole = pair_width_of(a, 1.0, b, fall_share(first));
+                assert_eq!(whole.sep.to_bits(), table[a][b].sep.to_bits());
+                assert_eq!(whole.inv_sep.to_bits(), table[a][b].inv_sep.to_bits());
+                assert_eq!(whole.hard.to_bits(), table[a][b].hard.to_bits());
+                let gone = pair_width_of(a, 1.0, b, fall_share(2));
+                let hard = (0.5 * w[a].body).min(0.5 * w[a].sep);
+                let sep = 0.5 * w[a].sep + (hard - 0.5 * w[a].sep) * ((a / 4).max(b / 4) as f32 / 3.0);
+                assert!((gone.hard - hard).abs() < 1e-6, "{a} {b}");
+                assert!((gone.sep - sep).abs() < 1e-6, "{a} {b}");
+                for d in 2..=first {
+                    let one = pair_width_of(a, 1.0, b, fall_share(d));
+                    let other = pair_width_of(b, fall_share(d), a, 1.0);
+                    assert_eq!(one.sep.to_bits(), other.sep.to_bits());
+                    assert_eq!(one.hard.to_bits(), other.hard.to_bits());
+                    assert!(one.hard <= table[a][b].hard && one.hard >= gone.hard - 1e-6);
+                }
+            }
+        }
+    }
+
+    /// Falling, a dying soldier is braced as a living one with the same
+    /// pose, stood bit and side; without the fall he is not braced at all.
+    #[test]
+    fn a_falling_soldier_keeps_his_brace() {
+        for p in 0..4 {
+            for stood in [false, true] {
+                for cross in [false, true] {
+                    for moving in [false, true] {
+                        let living = brace_level(p, stood, false, false, cross, || moving);
+                        let falling = brace_level(p, stood, true, true, cross, || moving);
+                        let fallen = brace_level(p, stood, true, false, cross, || moving);
+                        assert_eq!(falling, living, "{p} {stood} {cross} {moving}");
+                        assert_eq!(fallen, 0);
+                        assert_eq!(brace_level(p, stood, false, true, cross, || moving), living);
+                    }
+                }
+            }
+        }
     }
 
     /// A fully braced man against an unbraced one of his own kind takes
@@ -3965,18 +4117,18 @@ mod tests {
         for p in 0..4 {
             for moving in [false, true] {
                 for cross in [false, true] {
-                    assert_eq!(brace_level(p, true, false, cross, || moving), p);
+                    assert_eq!(brace_level(p, true, false, false, cross, || moving), p);
                     let walk = if cross && !moving && p > 0 { BRACE_BASIC_FROM + p - 1 } else { 0 };
-                    assert_eq!(brace_level(p, false, false, cross, || moving), walk, "{p} {moving} {cross}");
+                    assert_eq!(brace_level(p, false, false, false, cross, || moving), walk, "{p} {moving} {cross}");
                     for stood in [false, true] {
-                        assert_eq!(brace_level(p, stood, true, cross, || moving), 0);
+                        assert_eq!(brace_level(p, stood, true, false, cross, || moving), 0);
                     }
                 }
             }
         }
         // `moving` is not read for a standing soldier or a friend.
-        assert_eq!(brace_level(2, true, false, true, || unreachable!()), 2);
-        assert_eq!(brace_level(2, false, false, false, || unreachable!()), 0);
+        assert_eq!(brace_level(2, true, false, false, true, || unreachable!()), 2);
+        assert_eq!(brace_level(2, false, false, false, false, || unreachable!()), 0);
         let t = brace_table(BRACE, BRACE);
         for a in 0..crate::unit_types::NUM_KINDS {
             for o in 0..crate::unit_types::NUM_KINDS {

@@ -50,9 +50,16 @@ pub const META_TURN: u32 = 0b11 << META_TURN_SHIFT;
 /// (sim/soldier.rs `steer`, the `stood` column). Under the friction contact
 /// a standing soldier is braced against any body (`brace_pairs`).
 pub const META_STOOD: u32 = 1 << 9;
+/// How far a dying soldier is through his fall, a 5-bit FIELD: his death
+/// clock (`death_t`, sim/damage.rs DEATH_TICKS down to 2 while the grid
+/// sees him), 0 for the living. Under the friction contact his body goes
+/// down with it (sim/soldier.rs `fall_share`). Read it with `meta_fall`.
+pub const META_FALL_SHIFT: u32 = 10;
+pub const META_FALL: u32 = 0b1_1111 << META_FALL_SHIFT;
+const _: () = assert!((crate::sim::damage::DEATH_TICKS as u32) < 32);
 /// The unit's regiment (index into `Groups::list`) fills the bits above
-/// the flags, 22 bits: read it with `meta_group`.
-pub const META_GROUP_SHIFT: u32 = 10;
+/// the flags, 17 bits (131,071 regiments): read it with `meta_group`.
+pub const META_GROUP_SHIFT: u32 = 15;
 
 /// The kind field of a `SortedUnit::meta` (index into `unit_types::TYPES`).
 #[inline]
@@ -71,6 +78,12 @@ pub fn meta_pose(meta: u32) -> usize {
 #[inline]
 pub fn meta_width(meta: u32) -> usize {
     ((meta & (META_POSE | META_TURN)) >> META_POSE_SHIFT) as usize
+}
+
+/// The fall field of a `SortedUnit::meta`: his death clock, 0 alive.
+#[inline]
+pub fn meta_fall(meta: u32) -> u8 {
+    ((meta & META_FALL) >> META_FALL_SHIFT) as u8
 }
 
 /// The regiment field of a `SortedUnit::meta`.
@@ -301,6 +314,7 @@ impl SpatialGrid {
                             | ((crate::sim::soldier::pose_level(poses[i]) as u32) << META_POSE_SHIFT)
                             | ((crate::sim::soldier::turn_level(poses[i]) as u32) << META_TURN_SHIFT)
                             | ((stood[i] as u32) * META_STOOD)
+                            | ((death_t[i] as u32) << META_FALL_SHIFT)
                             | (groups[i] << META_GROUP_SHIFT);
                         unsafe {
                             *out.0.add(k) = SortedUnit {
