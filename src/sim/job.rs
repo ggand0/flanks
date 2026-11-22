@@ -164,6 +164,8 @@ pub struct TickJob {
     pub(crate) engaged: Vec<bool>,
     pub(crate) contact: Vec<bool>,
     pub(crate) fight_point: Vec<Option<Vec2>>,
+    /// Per regiment, its fighting line along `form_face` (NaN none).
+    pub(crate) fight_line: Vec<f32>,
     pub(crate) melee_ticks: Vec<u32>,
     pub(crate) hold: Vec<bool>,
     pub(crate) threat: Vec<Vec2>,
@@ -1785,6 +1787,7 @@ fn snapshot_regiments(job: &mut TickJob, groups: &Groups, terrain: &Terrain) {
     let contact: Vec<bool> = groups.list.iter().map(|g| g.contact).collect();
     // Where each regiment in melee has its fight, and for how long.
     let fight_point: Vec<Option<Vec2>> = groups.list.iter().map(|g| g.fight_point).collect();
+    let fight_line: Vec<f32> = groups.list.iter().map(|g| g.fight_line).collect();
     let melee_ticks: Vec<u32> = groups.list.iter().map(|g| g.melee_ticks).collect();
 
     // Hold-position leash: units of a held regiment close only the last
@@ -1855,6 +1858,7 @@ fn snapshot_regiments(job: &mut TickJob, groups: &Groups, terrain: &Terrain) {
     job.engaged = engaged;
     job.contact = contact;
     job.fight_point = fight_point;
+    job.fight_line = fight_line;
     job.melee_ticks = melee_ticks;
     job.hold = hold;
     job.threat = threat;

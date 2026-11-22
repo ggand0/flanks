@@ -162,6 +162,13 @@ pub struct GroupData {
     /// target if alive and unbroken, else the nearest unbroken enemy
     /// regiment. None when not in melee or in hold (guard) mode.
     pub fight_point: Option<Vec2>,
+    /// Where its men fighting an enemy ahead stand along its forward
+    /// (frontline.rs; the axis is `formation::facing_dir(facing)`, the
+    /// soldiers' `form_face`): set while the regiment's melee runs, moved a
+    /// tenth of the way to the live mean each tick, kept when nobody fights
+    /// for a tick, NaN otherwise. Under the friction contact a joiner behind
+    /// it walks straight ahead up to it (sim/soldier.rs `join_goal`).
+    pub fight_line: f32,
     /// In the charge phase: attack order, inside charge range of the
     /// target, not yet in contact, and running at it (frontline.rs).
     /// Drives the charge pace, the sprint pose and the charge cries.
@@ -342,6 +349,7 @@ impl GroupData {
             contact_lateral: 0.0,
             melee_ticks: 0,
             fight_point: None,
+            fight_line: f32::NAN,
             charging: false,
             crashing: false,
             crash_ticks: 0,

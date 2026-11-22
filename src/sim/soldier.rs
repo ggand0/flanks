@@ -430,17 +430,24 @@ fn still_brake() -> bool {
 }
 /// Under the friction contact's brake a soldier out of formation with no
 /// enemy in his reach walks to the fight like any walker: his wish to go
-/// to the enemy he remembers, or else to his regiment's fight, is made in
-/// `drive` (`join_goal`) in place of the walk to his slot, so the scan
-/// reads the men ahead of him on that way, and the still men ahead stop
-/// him there (`yield_to_crowd`) as they stop every walker. He does not
-/// wait at arm's length behind a comrade and move up in hops. Once the men
-/// ahead have stopped him behind a comrade in his way he stands, braced,
-/// with no wish, until his look no longer finds a comrade in his way
-/// (`drive`, `steer`). Without that brake he joins through `close_in`.
+/// to the enemy he remembers, straight ahead to his regiment's fighting
+/// line, or to his regiment's fight is made in `drive` (`join_goal`) in
+/// place of the walk to his slot, so the scan reads the men ahead of him
+/// on that way, and the still men ahead stop him there (`yield_to_crowd`)
+/// as they stop every walker. He does not wait at arm's length behind a
+/// comrade and move up in hops. Once the men ahead have stopped him behind
+/// a comrade in his way he stands, braced, with no wish, until a short
+/// step of room opens ahead (`drive`, `steer`). Without that brake he
+/// joins through `close_in`.
 fn joins_as_walker() -> bool {
     still_brake()
 }
+/// The room (m) a standing joiner wants behind the man ahead before he
+/// steps up: his look calls a comrade "in his way" only within a ready
+/// body plus this (`look_around`), so he steps up once a short step of
+/// room has opened, and from formation spacing every rank first closes up
+/// to the bodies ahead.
+const JOIN_ROOM: f32 = 0.3;
 /// The enemy he remembers (`target` at the tick's start) as one still to
 /// go for: a living index of the other team within his sight plus a
 /// metre, and with his regiment focused on one target, a man of it or
@@ -900,6 +907,9 @@ pub(crate) struct Field<'a> {
     pub engaged: &'a [bool],
     pub contact: &'a [bool],
     pub fight_point: &'a [Option<Vec2>],
+    /// Per regiment, its fighting line along `form_face` (NaN none;
+    /// orders.rs `fight_line`).
+    pub fight_line: &'a [f32],
     pub melee_ticks: &'a [u32],
     pub hold: &'a [bool],
     pub threat: &'a [Vec2],
@@ -1042,8 +1052,8 @@ struct Step {
     join_fp: Option<Vec2>,
     /// He walks to the fight (`joins_as_walker`): out of formation with no
     /// enemy in his reach, his wish from `drive` is the way to the enemy
-    /// he remembers or to his regiment's fight, not to his slot
-    /// (`join_goal`).
+    /// he remembers, to his regiment's fighting line or to its fight, not
+    /// to his slot (`join_goal`).
     joining: bool,
     /// He left his place to join the fight on this tick (`decide_to_join`):
     /// he sets off as a walker, so his stood bit is cleared (`steer`) and he
@@ -1392,7 +1402,7 @@ fn drive(f: &Field, s: &mut Soldier, st: &mut Step) {
         // Arrived at the men ahead: a comrade in his way by his last look
         // and himself standing since the still men ahead stopped him
         // (`steer` sets his stood bit then), he stands with no wish until
-        // his look no longer finds a comrade in his way. His own standing is
+        // a step of room opens ahead (JOIN_ROOM). His own standing is
         // read, never his speed: in a packed regiment the bodies around
         // him move him more than a centimetre a tick, and read from his
         // speed that push would make him a walker again, unbraced, and the
@@ -1409,20 +1419,26 @@ fn drive(f: &Field, s: &mut Soldier, st: &mut Step) {
 /// (a unit vector, zero for none) and his wish along it. `drive` makes his
 /// wish from it and `look_around` looks along the way, so his looks and
 /// his facing follow the way he walks. In this order:
-/// - the enemy he remembers (`remembered_foe`) within his closing range:
-///   toward him;
+/// - an enemy he remembers (`remembered_foe`) within the short look
+///   (WIDE_ACQUIRE_R): toward him;
+/// - his regiment facing a way and holding a fighting line, and himself
+///   more than a ready body behind that line along the facing
+///   (`behind_the_line`): straight ahead along the facing, so a fighting
+///   regiment's rear walks up as a block and not as a clump about one
+///   point;
+/// - the enemy he remembers within his closing range: toward him;
 /// - his regiment's fight point while more than a metre off;
 /// - else nowhere.
 ///
 /// Toward an enemy he goes at the jog over open ground more than
 /// JOG_BEYOND from him, else at the advance, slowing over his last 0.8 m
 /// and standing at his own stopping distance, between nine tenths of his
-/// reach and just inside it. To the fight point he goes at the jog, or at
-/// the advance with a comrade ahead. "A comrade ahead" is his last look
-/// (`look_around`).
+/// reach and just inside it. Straight ahead and to the fight point he goes
+/// at the jog, or at the advance with a comrade ahead. "A comrade ahead" is
+/// his last look (`look_around`).
 #[inline]
 fn join_goal(f: &Field, s: &Soldier, st: &Step) -> (Vec2, Vec2) {
-    let Field { pos_prev, engaged, hold, .. } = *f;
+    let Field { pos_prev, engaged, hold, form_face, fight_line, .. } = *f;
     let i = s.i;
     let p = st.p;
     let gi = st.gi;
@@ -1446,6 +1462,15 @@ fn join_goal(f: &Field, s: &Soldier, st: &Step) -> (Vec2, Vec2) {
     };
     let look = if engaged[gi] { seek_radius() } else { WIDE_ACQUIRE_R };
     let max_close = if hold[gi] { 2.2 } else { look + 1.0 };
+    if counts && dist < WIDE_ACQUIRE_R {
+        return to_foe(max_close);
+    }
+    let face = form_face[gi];
+    let line = fight_line[gi];
+    if behind_the_line(face, line, p, ready_body()) {
+        let pace = if ahead { ADVANCE_PACE } else { COMBAT_JOG_PACE };
+        return (face, face * pace);
+    }
     if counts {
         return to_foe(max_close);
     }
@@ -1459,6 +1484,14 @@ fn join_goal(f: &Field, s: &Soldier, st: &Step) -> (Vec2, Vec2) {
         return (to_fp.normalize_or_zero(), Vec2::ZERO);
     }
     (Vec2::ZERO, Vec2::ZERO)
+}
+
+/// Whether a soldier at `p` stands more than `body` behind his regiment's
+/// fighting line `line` along its facing `face` (`join_goal`): never with
+/// no facing or no line (NaN).
+#[inline]
+fn behind_the_line(face: Vec2, line: f32, p: Vec2, body: f32) -> bool {
+    face != Vec2::ZERO && !line.is_nan() && line - p.dot(face) > body
 }
 
 /// The fused neighbour scan every man runs every tick over the 2 m box:
@@ -2221,7 +2254,7 @@ fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
     let memo_valid = st.memo_valid;
     // Which way he is going: to that enemy, else to his regiment's fight.
     // A man walking to the fight with nobody in reach looks along the way
-    // he walks (`join_goal`): to an enemy or to the fight.
+    // he walks (`join_goal`): straight ahead, to an enemy or to the fight.
     let memo_dir = if joins_as_walker() && committed && best_idx == u32::MAX && !dying && !routed {
         join_goal(f, s, st).0
     } else if memo_valid {
@@ -2258,6 +2291,10 @@ fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
     let look_lanes = memo_dir != Vec2::ZERO && best_idx == u32::MAX && !dying && !routed;
     let watch_go = in_melee && !committed && !memo_valid;
     let slot_on = slot_dir != Vec2::ZERO;
+    // A joiner's comrade "in his way" stands within a ready body plus a
+    // short step of room (JOIN_ROOM); for everyone else, and for his
+    // sides and mark, within SEP_RADIUS.
+    let way_r = if st.joining { ready_body() + JOIN_ROOM } else { SEP_RADIUS };
     if (i as u32).wrapping_add(tick).is_multiple_of(LOOK_TICKS) {
         let mut seen = 0u16;
         if look_lanes || watch_go || slot_on {
@@ -2280,7 +2317,7 @@ fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
                 let away = going > 0.5;
                 let ahead = comrade & look_lanes & ((-d).dot(memo_dir) > reach) & !away;
                 ahead_any |= ahead;
-                way |= ahead & near;
+                way |= ahead & (d2 < way_r * way_r);
                 // A comrade of his own regiment close by, running to the
                 // fight: the sight that makes him follow.
                 go |= comrade
@@ -4428,6 +4465,24 @@ mod tests {
                 assert!((t[a][o][BRACE_BASIC_FROM + 2][3] - t[a][o][3][3]).abs() < 1e-6);
             }
         }
+    }
+
+    /// A joiner more than a ready body behind his regiment's fighting line
+    /// along its facing walks straight ahead; within a ready body of it, past
+    /// it, or with no line or no facing he does not.
+    #[test]
+    fn a_joiner_walks_straight_ahead_only_from_behind_the_line() {
+        let face = Vec2::new(0.0, 1.0);
+        let body = 0.9;
+        assert!(behind_the_line(face, 10.0, Vec2::new(3.0, 5.0), body));
+        assert!(behind_the_line(face, 10.0, Vec2::new(-40.0, 9.0), body));
+        assert!(!behind_the_line(face, 10.0, Vec2::new(0.0, 9.1), body));
+        assert!(!behind_the_line(face, 10.0, Vec2::new(0.0, 12.0), body));
+        assert!(!behind_the_line(face, f32::NAN, Vec2::new(0.0, 0.0), body));
+        assert!(!behind_the_line(Vec2::ZERO, 10.0, Vec2::new(0.0, 0.0), body));
+        let east = Vec2::new(1.0, 0.0);
+        assert!(behind_the_line(east, -20.0, Vec2::new(-25.0, 100.0), body));
+        assert!(!behind_the_line(east, -20.0, Vec2::new(-20.5, 100.0), body));
     }
 
     /// An axis no edge stopped keeps its speed whatever the step.

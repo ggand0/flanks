@@ -368,6 +368,7 @@ fn run_tick_job(job: &mut TickJob) {
         engaged,
         contact,
         fight_point,
+        fight_line,
         melee_ticks,
         hold,
         threat,
@@ -556,6 +557,7 @@ fn run_tick_job(job: &mut TickJob) {
     let engaged = &engaged[..];
     let contact = &contact[..];
     let fight_point = &fight_point[..];
+    let fight_line = &fight_line[..];
     let melee_ticks = &melee_ticks[..];
     let hold = &hold[..];
     let threat = &threat[..];
@@ -591,6 +593,7 @@ fn run_tick_job(job: &mut TickJob) {
         engaged,
         contact,
         fight_point,
+        fight_line,
         melee_ticks,
         hold,
         threat,

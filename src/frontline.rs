@@ -885,6 +885,22 @@ fn update_groups(
             group.contact = false;
             info!("regiment {g} releases its contact frame");
         }
+        // Its fighting line, live, for as long as its melee runs: a tenth
+        // of the way to where its men striking at an enemy ahead stand now,
+        // set outright the first time; kept while nobody strikes. It does
+        // not wait for a contact frame: a regiment met at ease before its
+        // automatic attack order came has no order and so no frame, and
+        // under the friction contact its men behind the front walk straight
+        // ahead to this line all the same (sim/soldier.rs `join_goal`).
+        if engaged && group.melee_ticks > 0 {
+            if line_n > 0 {
+                let now = line_sum / line_n as f32;
+                group.fight_line =
+                    if group.fight_line.is_nan() { now } else { group.fight_line + (now - group.fight_line) * 0.1 };
+            }
+        } else {
+            group.fight_line = f32::NAN;
+        }
         group.engaged = engaged;
 
         // How fast the regiment's centre closes on its attack target: the
