@@ -374,6 +374,47 @@ fn remembered_foe(f: &Field, i: usize, p: Vec2, gi: usize, memo: usize) -> (f32,
         && focus[gi].is_none_or(|t| group[memo] == t || d2 < threat_radius() * threat_radius());
     (d2, ok)
 }
+/// Under the friction contact, a soldier surrounded by bodies does not
+/// sprint, he walks: with other bodies overlapping his own on all four
+/// sides his wish is this long at most (m/s, a human walk), and he goes at
+/// his full speed once a side of him is free (`steer`). How far he is
+/// surrounded is read from the side that is pressed least (`press_shares`,
+/// CROWD_DEPTH), so the wish goes over from his full speed to the walk
+/// without a jump.
+const CROWD_WALK: f32 = 1.5;
+/// How deep another body is in his own, from the touch (the pair's body
+/// distance) on, at which it presses on him in full for the crowd walk (m).
+/// Of the soldiers running in a packed mass, 85 in 100 have a body at
+/// least this deep in theirs on every side; of the soldiers moving on a
+/// stair or a wall crossing, 2 to 12 in 100.
+const CROWD_DEPTH: f32 = 0.1;
+/// How much of a body lies on each of his four sides about his wish
+/// (ahead, behind, left, right): 1 within 30 degrees of the side's
+/// direction, falling to nothing at 60 degrees, so a body between two
+/// sides counts in part for both and none of the four jumps as it moves
+/// around him. `n` is the unit vector from the body to him, `wish_dir` his
+/// wish's direction.
+#[inline]
+fn press_shares(n: Vec2, wish_dir: Vec2) -> [f32; 4] {
+    let along = -n.dot(wish_dir);
+    let lat = wish_dir.y * n.x - wish_dir.x * n.y;
+    let share = |c: f32| ((c - 0.5) * (1.0 / (0.866_025_4 - 0.5))).clamp(0.0, 1.0);
+    [share(along), share(-along), share(lat), share(-lat)]
+}
+/// His wish in a press: `surrounded` is how deep the least pressed of his
+/// four sides is in a body (0 free, 1 in full). Free, his wish is
+/// untouched; surrounded in full it is the walk at most; between the two
+/// its length lies between them. The direction is kept, and a wish under
+/// the walk is untouched.
+#[inline]
+fn press_walk(surrounded: f32, wish: Vec2, walk: f32) -> Vec2 {
+    let len = wish.length();
+    if surrounded <= 0.0 || len <= walk {
+        wish
+    } else {
+        wish * ((len + (walk - len) * surrounded.min(1.0)) / len)
+    }
+}
 /// The friction contact's feet: each tick they take back up to this much
 /// (m/s^2) of the speed the contacts have put into him.
 const FEET: f32 = 7.0;
@@ -817,6 +858,10 @@ struct Step {
     /// spring whose direction is within 60 degrees of his wish, by their
     /// closeness (`try_a_side`).
     ahead: f32,
+    /// How deep a body is in his on each of his four sides about his wish
+    /// (ahead, behind, left, right; 0 none, 1 in full; `press_shares`, the
+    /// crowd walk in `steer`).
+    press4: [f32; 4],
     /// The crowd at which his drive starts to fade and is gone, for his
     /// width (`Width`).
     brake: (f32, f32),
@@ -999,6 +1044,7 @@ fn begin(f: &Field, s: &mut Soldier) -> Step {
         crowd: 0.0,
         crowd_still: 0.0,
         ahead: 0.0,
+        press4: [0.0; 4],
         brake: (0.0, 0.0),
         best_idx: u32::MAX,
         sticky: false,
@@ -1186,6 +1232,12 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut, cands: &m
     // The still men ahead are read only for the friction contact's brake,
     // and only by a man who wishes to go somewhere.
     let still_on = still_brake() && st.desired.length_squared() >= 1e-12;
+    // The sides pressed against him, for the crowd walk under the
+    // friction contact: only a soldier who wishes to go somewhere has sides
+    // about his wish.
+    let sides_on = friction_contact() && st.desired.length_squared() >= 1e-12;
+    let mut press4 = [0.0f32; 4];
+    let inv_depth = 1.0 / CROWD_DEPTH;
     let my_team_bit = (team[i] as u32) * crate::spatial::META_TEAM;
     let my_wall = wall[gi] != 0;
     // His width and each neighbour's by their poses and the turn of their
@@ -1385,6 +1437,15 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut, cands: &m
             let len = d2.sqrt();
             let inv_len = 1.0 / len;
             let w = 1.0 - len * inv_sep;
+            if len < hard && sides_on {
+                // The crowd walk: how deep this body is in his, on the
+                // sides of him it lies on (`d` points from it to him).
+                let depth = ((hard - len) * inv_depth).min(1.0);
+                let shares = press_shares(d * inv_len, wish_dir);
+                for q in 0..4 {
+                    press4[q] = press4[q].max(depth * shares[q]);
+                }
+            }
             if len < hard {
                 // Overlap is resolved POSITIONALLY only. A hard force boost
                 // here as well made packed crowds oscillate at the
@@ -1536,6 +1597,7 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut, cands: &m
     st.crowd = crowd;
     st.crowd_still = crowd_still;
     st.ahead = ahead;
+    st.press4 = press4;
     st.best_idx = best_idx;
     st.sticky = sticky;
     st.prev_target = prev_target;
@@ -3179,8 +3241,8 @@ fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
 /// stagger, the crowd's damping, a standing man's grip on the ground and
 /// his stance against a squeeze, the acceleration and speed caps, and the
 /// give of his legs at a body he runs into. Under the friction contact:
-/// whether he stands, the feet's take and his legs alone, the damping and
-/// the speed cap.
+/// the crowd walk and whether he stands, the feet's take and his legs
+/// alone, the damping and the speed cap.
 #[inline]
 fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
     let Field { speed, orders, wall, charging, fat_speed, fat_nocharge, dt, .. } = *f;
@@ -3195,6 +3257,26 @@ fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
     let jam = st.jam;
     let mut desired = st.desired;
     let friction = friction_contact();
+    // The crowd walk under the friction contact: with bodies overlapping
+    // his own on all four sides he does not sprint, he walks, by the side
+    // pressed least, without a jump. This is the one point every stage's
+    // wish has reached (the drive, the join, the closing in, the sidestep),
+    // so his whole wish with what the crowd's brake took off it put back is
+    // cut to the walk, and both parts by the same share, as if it had been
+    // cut before the brake: the brake and the standing test below see the
+    // walk. A routed soldier flees, a dying one is not steering, and a
+    // regiment in its charge runs by order.
+    let charge_run = charging[gi] && !fat_nocharge[gi];
+    if friction && !dying && !routed && !charge_run {
+        let whole = desired + st.fade;
+        let p4 = st.press4;
+        let cut = press_walk(p4[0].min(p4[1]).min(p4[2]).min(p4[3]), whole, CROWD_WALK);
+        if cut != whole {
+            let k = cut.length() / whole.length();
+            desired *= k;
+            st.fade *= k;
+        }
+    }
     // Whether he stands, for his bracing next tick (`brace_pairs`) and his
     // stance (`scan`). The line is his own wish as it comes here, after
     // every stage that sets it, with what the crowd's brake took off it put
@@ -3534,6 +3616,44 @@ fn integrate(f: &Field, s: &mut Soldier, st: &mut Step) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A soldier with a side free keeps his full wish; surrounded in full
+    /// he walks, the same way; half surrounded his wish lies half way; a
+    /// wish under the walk is untouched.
+    #[test]
+    fn press_walk_goes_from_the_full_wish_to_the_walk() {
+        let wish = Vec2::new(6.0, 8.0);
+        assert_eq!(press_walk(0.0, wish, 1.5), wish);
+        let cut = press_walk(1.0, wish, 1.5);
+        assert!((cut.length() - 1.5).abs() < 1e-5);
+        assert!((cut.normalize() - wish.normalize()).length() < 1e-6);
+        let half = press_walk(0.5, wish, 1.5);
+        assert!((half.length() - 5.75).abs() < 1e-5);
+        let slow = Vec2::new(0.6, -0.8);
+        assert_eq!(press_walk(1.0, slow, 1.5), slow);
+    }
+
+    /// A body straight ahead, behind, left and right lies on its own side
+    /// in full; one between two sides lies on both in part and on the far
+    /// sides not at all. `n` points from the body to him, his wish is +y.
+    #[test]
+    fn press_shares_split_a_body_between_the_sides() {
+        let wish = Vec2::Y;
+        assert_eq!(press_shares(Vec2::new(0.0, -1.0), wish), [1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(press_shares(Vec2::new(0.0, 1.0), wish), [0.0, 1.0, 0.0, 0.0]);
+        let left = press_shares(Vec2::new(1.0, 0.0), wish);
+        let right = press_shares(Vec2::new(-1.0, 0.0), wish);
+        assert_eq!(left[0] + left[1], 0.0);
+        assert_eq!(right[0] + right[1], 0.0);
+        assert_eq!(left[2] + left[3], 1.0);
+        assert_eq!(right[2] + right[3], 1.0);
+        assert_ne!(left[2], right[2]);
+        let d = std::f32::consts::FRAC_1_SQRT_2;
+        let between = press_shares(Vec2::new(-d, -d), wish);
+        assert!(between[0] > 0.4 && between[0] < 0.7);
+        assert_eq!(between[1], 0.0);
+        assert!((between[2] + between[3] - between[0]).abs() < 1e-6);
+    }
 
     /// The feet take FEET x dt along the total, or the whole of a smaller
     /// total, and nothing of none.
