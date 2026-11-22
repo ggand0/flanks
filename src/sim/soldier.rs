@@ -428,12 +428,23 @@ fn still_brake() -> bool {
     static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *S.get_or_init(|| friction_contact() && !std::env::var("FL_BRAKE").is_ok_and(|v| v == "density"))
 }
+/// Under the friction contact's brake a soldier out of formation with no
+/// enemy in his reach walks to the fight like any walker: his wish to go
+/// to the enemy he remembers, or else to his regiment's fight, is made in
+/// `drive` (`join_goal`) in place of the walk to his slot, so the scan
+/// reads the men ahead of him on that way, and the still men ahead stop
+/// him there (`yield_to_crowd`) as they stop every walker. He does not
+/// wait at arm's length behind a comrade and move up in hops. Without that
+/// brake he joins through `close_in`.
+fn joins_as_walker() -> bool {
+    still_brake()
+}
 /// The enemy he remembers (`target` at the tick's start) as one still to
 /// go for: a living index of the other team within his sight plus a
 /// metre, and with his regiment focused on one target, a man of it or
 /// one within his threat distance. Returns the squared distance to him
 /// (f32::MAX for an index out of range or of his own team) and whether he
-/// counts. The scan's `memo_valid` reads it.
+/// counts. The scan's `memo_valid` and the join in `drive` both read it.
 #[inline]
 fn remembered_foe(f: &Field, i: usize, p: Vec2, gi: usize, memo: usize) -> (f32, bool) {
     let Field { pos_prev, team, group, focus, .. } = *f;
@@ -729,15 +740,21 @@ fn own_spread(i: usize) -> f32 {
     0.7 + 0.6 * crate::units::hash01((i as u32).wrapping_mul(0x51ED).wrapping_add(77))
 }
 
-/// A man of a regiment in melee who sees no enemy joins the fight when
-/// he sees the comrade beside him run toward it: in each half-second
-/// window he reacts with this chance (FL_JOIN_REACT overrides), so the
-/// line rolls up from the contact outward, a man at a time, as in
-/// M2TW when a deep unit hits a wide line. Once going he keeps going.
+/// When a soldier still in formation reacts to an enemy he sees, or to a
+/// comrade of his regiment going to the fight. Under the rule of joining
+/// as a walker (`joins_as_walker`) he leaves at once: the chance is 1, and
+/// the only spread left is his look, which comes every few ticks in his
+/// own rhythm. Without that rule he reacts with a chance of 0.2 in each
+/// half-second window, so the line rolls up from the contact outward, a
+/// man at a time. FL_JOIN_REACT=<chance> sets the chance under either.
+/// Once going he keeps going.
 const JOIN_WINDOW: u32 = 15;
 fn join_react_chance() -> f32 {
     static P: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-    *P.get_or_init(|| crate::util::env_or("FL_JOIN_REACT", 0.2_f32).clamp(0.0, 1.0))
+    *P.get_or_init(|| {
+        let chance = if joins_as_walker() { 1.0_f32 } else { 0.2_f32 };
+        crate::util::env_or("FL_JOIN_REACT", chance).clamp(0.0, 1.0)
+    })
 }
 /// Ground speed toward the fight that reads as "going to it". A regiment
 /// starts a charge only when its centre closes on its target this fast
@@ -1021,6 +1038,14 @@ struct Step {
     may_leave: bool,
     committed: bool,
     join_fp: Option<Vec2>,
+    /// He walks to the fight (`joins_as_walker`): out of formation with no
+    /// enemy in his reach, his wish from `drive` is the way to the enemy
+    /// he remembers or to his regiment's fight, not to his slot
+    /// (`join_goal`).
+    joining: bool,
+    /// His wish to his slot from `drive`, kept when the join replaced it,
+    /// for the tick he comes back into formation (`decide_to_join`).
+    slot_wish: Vec2,
     // What he remembers and sees.
     memo_valid: bool,
     memo_d2: f32,
@@ -1204,6 +1229,8 @@ fn begin(f: &Field, s: &mut Soldier) -> Step {
         may_leave,
         committed,
         join_fp,
+        joining: false,
+        slot_wish: Vec2::ZERO,
         memo_valid: false,
         memo_d2: f32::MAX,
         memo_dir: Vec2::ZERO,
@@ -1241,7 +1268,9 @@ fn begin(f: &Field, s: &mut Soldier) -> Step {
 /// Where he wants to go on his own account: a broken man flees for his
 /// map edge, a formed man walks to his slot under his regiment's order, at
 /// a pace set by slope and water, with a deadzone so a parked man does not
-/// jitter and a step that finishes once begun.
+/// jitter and a step that finishes once begun. Under the friction
+/// contact's brake a man out of formation with nobody in his reach walks
+/// to the fight instead (`joins_as_walker`, `join_goal`).
 #[inline]
 fn drive(f: &Field, s: &mut Soldier, st: &mut Step) {
     let Field { terrain, speed, team, home, orders, anchors, paths, .. } = *f;
@@ -1338,6 +1367,79 @@ fn drive(f: &Field, s: &mut Soldier, st: &mut Step) {
         }
     }
     st.desired = desired;
+    // Out of formation, with no enemy in his reach last tick and no blow
+    // under way, he walks to the fight instead of to his slot
+    // (`joins_as_walker`): the scan then reads the men ahead of him on
+    // that way, and the brake stops him at the still men ahead like any
+    // walker. His slot wish is kept for the tick he comes back into
+    // formation.
+    if joins_as_walker()
+        && !dying
+        && !routed
+        && st.committed
+        && *s.sight & SIGHT_FOE == 0
+        && *s.swing & crate::units::SWING_STATE_MASK == crate::units::SWING_READY
+    {
+        st.slot_wish = desired;
+        st.joining = true;
+        st.desired = join_goal(f, s, st).1;
+    }
+}
+
+/// Where a soldier walking to the fight goes (`joins_as_walker`): the way
+/// (a unit vector, zero for none) and his wish along it. `drive` makes his
+/// wish from it and `look_around` looks along the way, so his looks and
+/// his facing follow the way he walks. In this order:
+/// - the enemy he remembers (`remembered_foe`) within his closing range:
+///   toward him;
+/// - his regiment's fight point while more than a metre off;
+/// - else nowhere.
+///
+/// Toward an enemy he goes at the jog over open ground more than
+/// JOG_BEYOND from him, else at the advance, slowing over his last 0.8 m
+/// and standing at his own stopping distance, between nine tenths of his
+/// reach and just inside it. To the fight point he goes at the jog, or at
+/// the advance with a comrade ahead. "A comrade ahead" is his last look
+/// (`look_around`).
+#[inline]
+fn join_goal(f: &Field, s: &Soldier, st: &Step) -> (Vec2, Vec2) {
+    let Field { pos_prev, engaged, hold, .. } = *f;
+    let i = s.i;
+    let p = st.p;
+    let gi = st.gi;
+    let ahead = *s.sight & SIGHT_AHEAD != 0;
+    let memo = *s.target as usize;
+    let (d2, counts) = remembered_foe(f, i, p, gi, memo);
+    let dist = d2.sqrt();
+    let to_foe = |max_close: f32| {
+        let params = &TYPES[st.my_kind];
+        let to_enemy = pos_prev[memo].xz() - p;
+        let dir = to_enemy / dist.max(1e-6);
+        let own = crate::units::hash01((i as u32).wrapping_mul(0x3C1B) ^ 0x51F7);
+        let fight = FIGHT_SHARE * params.reach;
+        let stop = fight + 0.8 * (params.reach - fight) * own;
+        if dist <= stop || dist >= max_close {
+            return (dir, Vec2::ZERO);
+        }
+        let urge = ((dist - stop) / 0.8).clamp(0.0, 1.0);
+        let pace = if dist > JOG_BEYOND && !ahead { COMBAT_JOG_PACE } else { ADVANCE_PACE };
+        (dir, to_enemy * (pace * urge / dist))
+    };
+    let look = if engaged[gi] { seek_radius() } else { WIDE_ACQUIRE_R };
+    let max_close = if hold[gi] { 2.2 } else { look + 1.0 };
+    if counts {
+        return to_foe(max_close);
+    }
+    if let Some(fp) = st.join_fp {
+        let to_fp = fp - p;
+        let d = to_fp.length();
+        if d > 1.0 {
+            let pace = if ahead { ADVANCE_PACE } else { COMBAT_JOG_PACE };
+            return (to_fp / d, to_fp * (pace / d));
+        }
+        return (to_fp.normalize_or_zero(), Vec2::ZERO);
+    }
+    (Vec2::ZERO, Vec2::ZERO)
 }
 
 /// The fused neighbour scan every man runs every tick over the 2 m box:
@@ -2099,16 +2201,22 @@ fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
     let memo = st.prev_target as usize;
     let memo_valid = st.memo_valid;
     // Which way he is going: to that enemy, else to his regiment's fight.
-    let memo_dir = if memo_valid {
+    // A man walking to the fight with nobody in reach looks along the way
+    // he walks (`join_goal`): to an enemy or to the fight.
+    let memo_dir = if joins_as_walker() && committed && best_idx == u32::MAX && !dying && !routed {
+        join_goal(f, s, st).0
+    } else if memo_valid {
         (pos_prev[memo].xz() - p).normalize_or_zero()
     } else if let Some(fp) = join_fp {
         (fp - p).normalize_or_zero()
     } else {
         Vec2::ZERO
     };
-    // The blocking test toward a holding man's own mark.
+    // The blocking test toward a holding man's own mark. A man walking to
+    // the fight (`joining`) has his slot wish kept apart; the test reads
+    // that, so it stays about his mark.
     let slot_dir = if orders[gi].is_none() && engaged[gi] && !routed {
-        desired.normalize_or_zero()
+        if st.joining { st.slot_wish.normalize_or_zero() } else { desired.normalize_or_zero() }
     } else {
         Vec2::ZERO
     };
@@ -2568,14 +2676,16 @@ fn turn_shoulders(s: &mut Soldier) {
 
 /// Two things a man in melee does not do for his slot: step back away
 /// from his regiment's fight to dress, or press into the comrade between
-/// him and his mark.
+/// him and his mark. A man walking to the fight (`joining`) is not going
+/// to his slot, so neither touches his wish; they act on his kept slot
+/// wish, for the tick he comes back into formation.
 #[inline]
 fn hold_the_frame(f: &Field, st: &mut Step) {
     let Field { contact, form_face, orders, moving, .. } = *f;
     let gi = st.gi;
     let routed = st.routed;
     let slot_blocked = st.slot_blocked;
-    let mut desired = st.desired;
+    let mut desired = if st.joining { st.slot_wish } else { st.desired };
     // A regiment fighting on its contact frame never steps backward, away
     // from its fight, to dress its ranks: a man ahead of his mark (bunched up
     // behind a stopped front, or shoved forward) stays; he only steps forward
@@ -2601,7 +2711,11 @@ fn hold_the_frame(f: &Field, st: &mut Step) {
     if slot_blocked {
         desired = Vec2::ZERO;
     }
-    st.desired = desired;
+    if st.joining {
+        st.slot_wish = desired;
+    } else {
+        st.desired = desired;
+    }
 }
 
 /// The far look, every eighth tick: a pressing man with nobody in reach
@@ -2700,7 +2814,8 @@ fn acquire(f: &Field, s: &mut Soldier, st: &mut Step) {
 /// Leaving formation to fight, in his own time: a chance per half-second
 /// window while he sees an enemy or a comrade going, and patience as the
 /// backstop. Once out he never dresses on his slot while he sees an enemy
-/// or his regiment's melee runs.
+/// or his regiment's melee runs. A man walking to the fight keeps the
+/// wish `drive` gave him until an enemy is in his reach.
 #[inline]
 fn decide_to_join(f: &Field, s: &mut Soldier, st: &mut Step) {
     let Field { melee_ticks, engaged, tick, .. } = *f;
@@ -2760,9 +2875,16 @@ fn decide_to_join(f: &Field, s: &mut Soldier, st: &mut Step) {
     // Out of formation he never dresses on his slot: he fights, goes for an
     // enemy he sees, heads for the fight, or stands where he is when
     // blocked. Inferring this from his speed made a man who slowed down run
-    // back to his slot and come out again, over and over.
-    if committed {
+    // back to his slot and come out again, over and over. A man walking to
+    // the fight (`joining`) keeps that walk from `drive` until an enemy is
+    // in his reach this tick; then he fights (`close_in`). A man who came
+    // back into formation this tick walks to his slot again.
+    if committed && (!st.joining || best_idx != u32::MAX) {
         desired = Vec2::ZERO;
+        st.joining = false;
+    } else if st.joining && !committed {
+        desired = st.slot_wish;
+        st.joining = false;
     }
     st.committed = committed;
     st.desired = desired;
@@ -3271,7 +3393,8 @@ fn sidestep(i: usize, tick: u32, left_blocked: bool, right_blocked: bool, side_d
 /// With nobody in reach, going to the enemy he
 /// remembers through open ground (waiting behind a comrade, sidestepping
 /// now and then), or, with nobody to close on, joining his regiment's
-/// fight at the jog.
+/// fight at the jog. Under the friction contact's brake a joining
+/// soldier's walk comes from `drive` (`join_goal`), and this does neither.
 #[inline]
 fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
     let Field { pos_prev, speed, team, group, broken, wall, engaged, hold, moving, focus, tick, .. } = *f;
@@ -3309,7 +3432,9 @@ fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
     // range" — a legitimate closing target regardless of identity. Only a
     // man out of formation goes to a remembered enemy: a formed man seeing
     // one leaves formation first (decide_to_join), so the slot never pulls
-    // against the chase.
+    // against the chase. Under the friction contact's brake a joining
+    // soldier's walk to the enemy he remembers comes from `drive`
+    // (`join_goal`), and this does not run for him.
     let (close_to, memo_close) = if *s.swing & crate::units::SWING_STATE_MASK
         != crate::units::SWING_READY
         && (*s.target as usize) < pos_prev.len()
@@ -3317,7 +3442,7 @@ fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
         (*s.target, false)
     } else if best_idx != u32::MAX {
         (best_idx, false)
-    } else if crowd < st.brake.0 && committed {
+    } else if !joins_as_walker() && crowd < st.brake.0 && committed {
         (*s.target, true)
     } else {
         (u32::MAX, false)
@@ -3401,8 +3526,10 @@ fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
     // Joining: no enemy to close on, so he heads for the enemy unit his
     // regiment fights, jogging over open ground, walking with a comrade close
     // ahead, waiting or sidestepping when blocked. He picks a soldier to
-    // fight once one is in sight (the acquisition above).
-    if committed
+    // fight once one is in sight (the acquisition above). Under the friction
+    // contact's brake this walk comes from `drive` (`join_goal`) instead.
+    if !joins_as_walker()
+        && committed
         && !memo_valid
         && let Some(fp) = join_fp
         && best_idx == u32::MAX
