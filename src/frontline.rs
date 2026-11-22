@@ -280,7 +280,7 @@ impl Plugin for FrontlinePlugin {
                     .before(crate::sim::step_sim)
                     .in_set(crate::game_state::SimSet),
             )
-            .add_systems(Update, (draw_front_gizmos, draw_fight_points, test_front_script));
+            .add_systems(Update, (draw_front_gizmos, draw_fight_points, draw_attack_front, test_front_script));
     }
 }
 
@@ -1003,6 +1003,124 @@ fn draw_fight_points(
                 d += 4.0;
             }
         }
+    }
+}
+
+/// With FL_ATTACK_FRONT=3 and the debug overlay on (F3), for each
+/// selected regiment under an attack order with a living target. The
+/// contact point is where the line from the regiment's centre to its
+/// target's centre first crosses an enemy outline (orders.rs
+/// `outline_contact`), drawn as a ring with a post joined to the
+/// regiment's centre, with the enemy outline it was cut against in
+/// orange. With a friend between, the regiment is sent there: the ring
+/// is bright yellow and the regiment's own outline where it will stand
+/// (at its goal, facing along the line) is cyan. With no friend between,
+/// the regiment is still sent to its target's centre: the ring is dim
+/// yellow, and a red ring with a post marks the real goal (`Groups::goal`)
+/// with the regiment's outline there dashed in red. A regiment holding a
+/// contact frame also shows the frame (its block about the frame's
+/// anchor, where its slots stand instead of any goal) in white. Outlines
+/// are the formation code's block without its metre of margin, the
+/// outline `outline_entry` cuts. FL_ATTACK_FRONT_VIZ=1 draws it for
+/// every attacking regiment, F3 and selection or not. Draws only.
+fn draw_attack_front(
+    settings: Res<crate::settings::Settings>,
+    selection: Res<crate::orders::Selection>,
+    groups: Res<crate::orders::Groups>,
+    terrain: Res<Terrain>,
+    mut gizmos: Gizmos,
+) {
+    static ALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let all = *ALL.get_or_init(|| std::env::var("FL_ATTACK_FRONT_VIZ").is_ok_and(|v| v == "1"));
+    if !crate::orders::attack_front() || !(all || settings.interface.debug_overlay()) {
+        return;
+    }
+    const RING: Color = Color::srgb(1.0, 0.95, 0.1);
+    const RING_DIM: Color = Color::srgb(0.55, 0.5, 0.08);
+    const OWN: Color = Color::srgb(0.2, 0.95, 1.0);
+    const ENEMY: Color = Color::srgb(1.0, 0.55, 0.1);
+    const GOAL: Color = Color::srgb(1.0, 0.1, 0.1);
+    const FRAME: Color = Color::WHITE;
+    let lift = |p: Vec2, up: f32| Vec3::new(p.x, terrain.height_at(p.x, p.y) + up, p.y);
+    let flat = |p: Vec3| Isometry3d::new(p, Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2));
+    // A block outline about `centre` facing `fwd`, half sizes without the margin.
+    let outline = |centre: Vec2, fwd: Vec2, half_w: f32, half_d: f32| {
+        let right = Vec2::new(fwd.y, -fwd.x);
+        let corner = |sw: f32, sd: f32| lift(centre + right * (sw * half_w) + fwd * (sd * half_d), 0.4);
+        [corner(-1.0, 1.0), corner(1.0, 1.0), corner(1.0, -1.0), corner(-1.0, -1.0), corner(-1.0, 1.0)]
+    };
+    // Regiment `gd`'s block about `centre`, facing `fwd` (its own facing
+    // when ZERO), in `color`; `dash` draws its edges 2 m on, 2 m off, so
+    // an outline drawn on the same place still shows between the dashes.
+    let block = |gizmos: &mut Gizmos, gd: &crate::orders::GroupData, centre: Vec2, fwd: Vec2, color: Color, dash: bool| {
+        let r = crate::formation::block_rect_at(gd, centre);
+        if r.fwd == Vec2::ZERO {
+            gizmos.circle(flat(lift(centre, 0.4)), r.half_w, color);
+            return;
+        }
+        let f = if fwd == Vec2::ZERO { r.fwd } else { fwd };
+        let corners = outline(centre, f, (r.half_w - 1.0).max(0.0), (r.half_d - 1.0).max(0.0));
+        if !dash {
+            gizmos.linestrip(corners, color);
+            return;
+        }
+        for edge in corners.windows(2) {
+            let (p, q) = (edge[0], edge[1]);
+            let len = p.distance(q);
+            let dir = (q - p) / len.max(1e-3);
+            let mut s = 0.0;
+            while s < len {
+                gizmos.line(p + dir * s, p + dir * (s + 2.0).min(len), color);
+                s += 4.0;
+            }
+        }
+    };
+    // A ring with a post at `p`, joined to `from`.
+    let marker = |gizmos: &mut Gizmos, from: Vec3, p: Vec2, radius: f32, color: Color| {
+        gizmos.line(from, lift(p, 2.0), color);
+        gizmos.line(lift(p, 0.4), lift(p, 2.0), color);
+        gizmos.circle(flat(lift(p, 0.4)), radius, color);
+    };
+    for (g, gd) in groups.list.iter().enumerate() {
+        if gd.count == 0 || !(all || selection.regiments.get(g).copied().unwrap_or(false)) {
+            continue;
+        }
+        let Some(crate::orders::Order::Attack(t)) = gd.order else { continue };
+        let t = t as usize;
+        if groups.list.get(t).is_none_or(|td| td.count == 0) {
+            continue;
+        }
+        let a = gd.centroid;
+        let from = lift(a, 2.0);
+        if gd.contact {
+            block(&mut gizmos, gd, gd.anchor, Vec2::ZERO, FRAME, false);
+        }
+        let Some((goal, point, friend)) = groups.outline_contact(g, t) else { continue };
+        let d = (groups.list[t].centroid - a).normalize_or_zero();
+        if friend {
+            // Where the regiment will stand: its block at the goal, facing along the line.
+            block(&mut gizmos, gd, goal, d, OWN, false);
+        } else if let Some(real) = groups.goal(g) {
+            // Where the regiment is really sent: its target's centre.
+            block(&mut gizmos, gd, real, d, GOAL, true);
+            marker(&mut gizmos, from, real, 2.5, GOAL);
+        }
+        // The enemy outline the point was cut against: the living enemy
+        // whose outline the line meets at the contact point's distance.
+        let edge = (point - a).dot(d);
+        let cut = groups
+            .list
+            .iter()
+            .filter(|hd| hd.team != gd.team && hd.count > 0)
+            .min_by(|x, y| {
+                let ex = (crate::orders::outline_entry(x, a, d) - edge).abs();
+                let ey = (crate::orders::outline_entry(y, a, d) - edge).abs();
+                ex.total_cmp(&ey)
+            });
+        if let Some(hd) = cut {
+            block(&mut gizmos, hd, hd.centroid, Vec2::ZERO, ENEMY, false);
+        }
+        marker(&mut gizmos, from, point, 1.5, if friend { RING } else { RING_DIM });
     }
 }
 
