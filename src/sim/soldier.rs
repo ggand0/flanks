@@ -22,11 +22,32 @@ const SEP_PUSH_MAX: f32 = 2.5;
 /// his ready stance (at ease `body_ease`). A soldier is 0.75 to 1.1 m
 /// across with his arms, shield and weapon. Never more than a pair's own
 /// rest distance, so the men of a wall keep their 1.05 m files.
+/// The contact between two soldiers reads it through `ready_body`.
 /// FL_BODY=<metres> sets it, up to the separation distance.
 const BODY_DISTANCE: f32 = 1.2;
 pub(crate) fn body_distance() -> f32 {
     static D: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
     *D.get_or_init(|| crate::util::env_or("FL_BODY", BODY_DISTANCE).clamp(0.5, SEP_RADIUS))
+}
+/// The body of a soldier in his ready stance in the contact between two
+/// soldiers (`widths`): under the friction contact (`friction_contact`)
+/// it is the body at ease (BODY_EASE, as FL_BODY_EASE sets it), and
+/// `body_distance` without it. Under the friction contact a soldier stops
+/// pushing into still soldiers when they are at his width with arms and
+/// shield (BRAKE_NEAR, 0.9 m). A ready body wider than that would stand
+/// inside every neighbour at the fighting line, and every turn or death
+/// there would throw the soldiers around it. The wall clearance and the
+/// places on a walk keep reading `body_distance`.
+pub(crate) fn ready_body() -> f32 {
+    static D: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *D.get_or_init(|| {
+        ready_body_of(friction_contact(), crate::util::env_or("FL_BODY_EASE", BODY_EASE), body_distance())
+    })
+}
+/// `ready_body` from its inputs: under the friction contact the body at
+/// ease, else the body distance.
+fn ready_body_of(friction: bool, ease: f32, body: f32) -> f32 {
+    (if friction { ease } else { body }).clamp(0.5, SEP_RADIUS)
 }
 /// Crowd-density yield: a man's drive fades to nothing as the crowd around
 /// him (his neighbours' closeness summed, one each at a touch) rises
@@ -53,13 +74,15 @@ pub(crate) fn crowd_brake() -> (f32, f32) {
 }
 /// The body distance at ease: a man standing, walking or running with
 /// his arms down is narrower than one in his ready stance with weapon
-/// and shield up (BODY_DISTANCE). The spring rest at ease stays the same
-/// 0.2 m over the body (`Width`). FL_BODY_EASE=<metres> sets it, up to
-/// the body in the ready stance.
+/// and shield up (`ready_body`); under the friction contact the two are
+/// the same. The spring rest at ease stays the same 0.2 m over the body
+/// (`Width`): it is measured from BODY_DISTANCE, not from the body in the
+/// ready stance. FL_BODY_EASE=<metres> sets it, up to the body in the
+/// ready stance.
 const BODY_EASE: f32 = 0.9;
 pub(crate) fn body_ease() -> f32 {
     static D: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-    *D.get_or_init(|| crate::util::env_or("FL_BODY_EASE", BODY_EASE).clamp(0.5, body_distance()))
+    *D.get_or_init(|| crate::util::env_or("FL_BODY_EASE", BODY_EASE).clamp(0.5, ready_body()))
 }
 /// The spring rest at ease (metres).
 pub(crate) fn sep_ease() -> f32 {
@@ -121,35 +144,38 @@ pub(crate) const WIDTH_LEVELS: usize = 16;
 pub(crate) const SQUEEZE_DEPTH: f32 = 0.5;
 pub(crate) fn widths() -> &'static [Width; WIDTH_LEVELS] {
     static W: std::sync::OnceLock<[Width; WIDTH_LEVELS]> = std::sync::OnceLock::new();
-    W.get_or_init(|| {
-        let scale = crate::unit_types::unit_scale();
-        let pose = |level: usize| {
-            let t = level as f32 / 3.0;
-            let mix = |ease: f32, ready: f32| ease * (1.0 - t) + ready * t;
-            let body = mix(body_ease(), body_distance());
-            let sep = mix(sep_ease(), SEP_RADIUS);
-            let at = |d: f32| 6.0 * (1.0 - (d * scale).min(sep) / sep);
-            Width {
-                body,
-                sep,
-                slow: at(mix(body_ease() + 0.1, BRAKE_FAR)),
-                stop: at(mix(body_ease() - 0.2, BRAKE_NEAR)),
-            }
-        };
-        std::array::from_fn(|level| {
-            let (w, turn) = (pose(level % 4), level / 4);
-            if turn == 0 {
-                return w;
-            }
-            let (t, ease) = (turn as f32 / 3.0, pose(0));
-            let mix = |square: f32, turned: f32| square + (turned - square) * t;
-            Width {
-                body: mix(w.body, SQUEEZE_DEPTH),
-                sep: mix(w.sep, SQUEEZE_DEPTH),
-                slow: mix(w.slow, ease.slow),
-                stop: mix(w.stop, ease.stop),
-            }
-        })
+    W.get_or_init(|| widths_of(body_ease(), ready_body(), crate::unit_types::unit_scale()))
+}
+/// The width levels from the body at ease, the body in the ready stance
+/// and the unit scale (`widths`).
+fn widths_of(body_ease: f32, ready_body: f32, scale: f32) -> [Width; WIDTH_LEVELS] {
+    let sep_ease = body_ease + SEP_RADIUS - BODY_DISTANCE;
+    let pose = |level: usize| {
+        let t = level as f32 / 3.0;
+        let mix = |ease: f32, ready: f32| ease * (1.0 - t) + ready * t;
+        let body = mix(body_ease, ready_body);
+        let sep = mix(sep_ease, SEP_RADIUS);
+        let at = |d: f32| 6.0 * (1.0 - (d * scale).min(sep) / sep);
+        Width {
+            body,
+            sep,
+            slow: at(mix(body_ease + 0.1, BRAKE_FAR)),
+            stop: at(mix(body_ease - 0.2, BRAKE_NEAR)),
+        }
+    };
+    std::array::from_fn(|level| {
+        let (w, turn) = (pose(level % 4), level / 4);
+        if turn == 0 {
+            return w;
+        }
+        let (t, ease) = (turn as f32 / 3.0, pose(0));
+        let mix = |square: f32, turned: f32| square + (turned - square) * t;
+        Width {
+            body: mix(w.body, SQUEEZE_DEPTH),
+            sep: mix(w.sep, SQUEEZE_DEPTH),
+            slow: mix(w.slow, ease.slow),
+            stop: mix(w.stop, ease.stop),
+        }
     })
 }
 /// A pair of men by their width levels: their spring rest, its inverse,
@@ -3831,6 +3857,19 @@ mod tests {
             assert_eq!(meta_group(meta), g as usize);
             assert_eq!((meta & META_STOOD) != 0, stood);
         }
+    }
+
+    /// Under the friction contact the body in the ready stance is the body
+    /// at ease, at every pose level; without it, it is the body distance.
+    #[test]
+    fn the_ready_body_under_friction_is_the_body_at_ease() {
+        let ready = ready_body_of(true, BODY_EASE, BODY_DISTANCE);
+        assert_eq!(ready, BODY_EASE);
+        let w = widths_of(BODY_EASE, ready, 1.0);
+        for (level, w) in w[..4].iter().enumerate() {
+            assert_eq!(w.body.to_bits(), BODY_EASE.to_bits(), "{level}");
+        }
+        assert_eq!(ready_body_of(false, BODY_EASE, BODY_DISTANCE), BODY_DISTANCE);
     }
 
     /// A fully braced man against an unbraced one of his own kind takes

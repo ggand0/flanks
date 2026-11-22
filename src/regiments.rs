@@ -2091,7 +2091,7 @@ fn shake_log(
     }
     sh.next = t + SHAKE_WINDOW;
     let (slow, _) = crate::sim::soldier::crowd_brake();
-    let body = crate::sim::soldier::body_distance();
+    let body = crate::sim::soldier::ready_body();
     let sep = crate::sim::soldier::SEP_RADIUS;
     let (mut alive, mut hard, mut turns_sum, mut step_sum) = (0u32, 0u32, 0u32, 0.0f32);
     let (mut by_state, mut by_touch) = ([0u32; 3], [0u32; 3]);
