@@ -582,6 +582,22 @@ const CORR_GAIN: f32 = 0.15;
 const CORR_MAX: f32 = 0.1;
 /// Units slow down proportionally inside this distance to the target.
 const ARRIVE_RADIUS: f32 = 35.0;
+
+/// The share of his pace a soldier wants at `dist` metres from where he
+/// walks to, slowing over the last `arrive` metres. A soldier on a route
+/// (`through`) keeps his pace, and so does a soldier whose regiment is in
+/// its charge (`charge_run`): he runs on until bodies stop him.
+fn arrive_share(dist: f32, arrive: f32, through: bool, charge_run: bool) -> f32 {
+    if through || charge_run { 1.0 } else { (dist / arrive).min(1.0) }
+}
+
+/// Under the friction contact a soldier of a regiment in its charge does
+/// not slow for his place: his regiment's places lie at the enemy's
+/// outline, often inside a friend that fights there, and he would slow to
+/// a walk short of that friend's back while the charge cry plays.
+fn charge_runs_home() -> bool {
+    friction_contact()
+}
 /// How close to his slot a parked man stands without stepping (metres):
 /// rigid slots sit exactly at the separation rest distance, so a dressed
 /// rank is force-free and can afford a tight tolerance; with 1.5 the
@@ -1243,11 +1259,14 @@ fn drive(f: &Field, s: &mut Soldier, st: &mut Step) {
             } else {
                 (1.0, ARRIVE_RADIUS)
             };
+            // In his regiment's charge (as `steer` gives the charge pace;
+            // dying and routed men never come here).
+            let charge_run = charge_runs_home() && f.charging[gi] && !f.fat_nocharge[gi];
             let mut desired_speed = speed[i]
                 * slope_mult
                 * terrain.wade_mult(p.x, p.y)
                 * gain
-                * if through { 1.0 } else { (dist / arrive).min(1.0) };
+                * arrive_share(dist, arrive, through, charge_run);
             if holding {
                 desired_speed = desired_speed
                     .max(STEP_PACE * slope_mult * terrain.wade_mult(p.x, p.y));
@@ -3715,6 +3734,17 @@ fn integrate(f: &Field, s: &mut Soldier, st: &mut Step) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A soldier walking to his place slows over the last metres; one on a
+    /// route, or in his regiment's charge, keeps his whole pace up to it.
+    #[test]
+    fn a_charging_soldier_does_not_slow_for_his_place() {
+        assert_eq!(arrive_share(70.0, ARRIVE_RADIUS, false, false), 1.0);
+        assert!((arrive_share(10.0, ARRIVE_RADIUS, false, false) - 10.0 / ARRIVE_RADIUS).abs() < 1e-6);
+        assert_eq!(arrive_share(10.0, ARRIVE_RADIUS, true, false), 1.0);
+        assert_eq!(arrive_share(10.0, ARRIVE_RADIUS, false, true), 1.0);
+        assert_eq!(arrive_share(0.5, ARRIVE_RADIUS, false, true), 1.0);
+    }
 
     /// A soldier with a side free keeps his full wish; surrounded in full
     /// he walks, the same way; half surrounded his wish lies half way; a
