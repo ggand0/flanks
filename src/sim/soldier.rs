@@ -232,38 +232,67 @@ fn friction_contact() -> bool {
 /// stance (`pose_level`, a third of the way at each level) while he stands
 /// (`steer`, the `stood` column), whatever his regiment's order. He
 /// becomes a walker when his own wish to move reaches the speed of a step,
-/// and stands again when it drops under it. A walking soldier is not
-/// braced, and neither is a dying man. A push does not take him out of
-/// it, only his own walking does. This is a man bracing his body, not a
-/// spearwall's braced points. FL_BRACE=<number> sets it, from 1 (his own
-/// weight, as without it) to 20.
+/// and stands again when it drops under it. This is the standing bracing,
+/// the one that meets a charge, and it counts against any body. A walking
+/// soldier does not have it (he may have the walking bracing against the
+/// other side, `BRACE_BASIC`), and neither does a dying man. A push does
+/// not take him out of it, only his own walking does. This is a man
+/// bracing his body, not a spearwall's braced points. FL_BRACE=<number>
+/// sets it, from 1 (his own weight, as without it) to 20.
 const BRACE: f32 = 4.0;
 fn brace() -> f32 {
     static B: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
     *B.get_or_init(|| crate::util::env_or("FL_BRACE", BRACE).clamp(1.0, 20.0))
 }
-/// His brace level: 0 not braced to 3 fully braced (`BRACE`).
-const BRACE_LEVELS: usize = 4;
+/// Under the friction contact, the walking bracing: how many times his
+/// weight a soldier in his ready stance counts for against a body of the
+/// other side while he walks or runs. He keeps his weight behind his
+/// shield as he goes, so an enemy who walks into him does not pass through
+/// him as through a walker. Against his own side a walking soldier weighs
+/// as a walker. It is by his pose level as `BRACE` is, and a soldier whose
+/// regiment is under a Move order (sim/job.rs `moving`) or a dying soldier
+/// does not have it. A soldier who stands has the standing bracing
+/// (`BRACE`) against every body instead. Both sides have it alike: it
+/// reads only whether the two bodies are of one side.
+const BRACE_BASIC: f32 = 4.0;
+/// His brace level in a pair: 0 not braced (weight 1); 1 to 3 standing,
+/// braced by his pose level (`BRACE`); 4 to 6 walking, braced against the
+/// other side by his pose level, 4 + pose level - 1 (`BRACE_BASIC`).
+const BRACE_LEVELS: usize = 7;
+/// Where the walking bracing's levels start (`BRACE_LEVELS`).
+const BRACE_BASIC_FROM: usize = 4;
+/// How many times his mass a man at brace level `b` counts for: standing,
+/// 1 + (brace - 1) x pose level / 3; walking, 1 + (basic - 1) x pose
+/// level / 3.
+fn brace_mult(b: usize, brace: f32, basic: f32) -> f32 {
+    if b < BRACE_BASIC_FROM {
+        1.0 + (brace - 1.0) * b as f32 / 3.0
+    } else {
+        1.0 + (basic - 1.0) * (b - BRACE_BASIC_FROM + 1) as f32 / 3.0
+    }
+}
 /// The weight of the setting apart on a man of mass `mi` at brace level
 /// `bi` from one of mass `mo` at level `bo`, with a fully braced man
-/// counting `brace` times his mass: 2 m_o / (m_i + m_o) over the braced
-/// masses. Two men braced alike share it by their own masses, exactly as
-/// `mass_pairs`, so the weights of a pair sum to 2 whatever their levels.
-fn brace_weight(mi: f32, mo: f32, bi: usize, bo: usize, brace: f32) -> f32 {
+/// counting `brace` (standing) or `basic` (walking) times his mass:
+/// 2 m_o / (m_i + m_o) over the braced masses. Two men braced alike share
+/// it by their own masses, exactly as `mass_pairs`, so the weights of a
+/// pair sum to 2 whatever their levels.
+fn brace_weight(mi: f32, mo: f32, bi: usize, bo: usize, brace: f32, basic: f32) -> f32 {
     if bi == bo {
         return 2.0 * mo / (mi + mo);
     }
-    let braced = |m: f32, b: usize| m * (1.0 + (brace - 1.0) * b as f32 / 3.0);
-    let (mi, mo) = (braced(mi, bi), braced(mo, bo));
+    let (mi, mo) = (mi * brace_mult(bi, brace, basic), mo * brace_mult(bo, brace, basic));
     2.0 * mo / (mi + mo)
 }
+/// 4 kinds x 4 kinds x 7 levels x 7 levels of f32: 3,136 bytes, read by
+/// one row (his kind, his level) per soldier.
 type BraceTable =
     [[[[f32; BRACE_LEVELS]; BRACE_LEVELS]; crate::unit_types::NUM_KINDS]; crate::unit_types::NUM_KINDS];
-fn brace_table(brace: f32) -> BraceTable {
+fn brace_table(brace: f32, basic: f32) -> BraceTable {
     std::array::from_fn(|a| {
         std::array::from_fn(|o| {
             std::array::from_fn(|bi| {
-                std::array::from_fn(|bo| brace_weight(TYPES[a].mass, TYPES[o].mass, bi, bo, brace))
+                std::array::from_fn(|bo| brace_weight(TYPES[a].mass, TYPES[o].mass, bi, bo, brace, basic))
             })
         })
     })
@@ -273,7 +302,26 @@ fn brace_table(brace: f32) -> BraceTable {
 /// overlapping neighbour instead of a division (`pair_widths`).
 fn brace_pairs() -> &'static BraceTable {
     static T: std::sync::OnceLock<BraceTable> = std::sync::OnceLock::new();
-    T.get_or_init(|| brace_table(brace()))
+    T.get_or_init(|| brace_table(brace(), BRACE_BASIC))
+}
+/// A soldier's brace level in a pair under the friction contact, from what
+/// both soldiers of the pair read alike in the grid: standing (`stood`),
+/// his pose level against anyone; walking, against the other side
+/// (`cross`) and not under a Move order, the walking bracing's level for
+/// his pose; else 0. A dying soldier is 0. `moving` is called only when
+/// the walking bracing could count, so a neighbour's regiment is read only
+/// then.
+#[inline]
+fn brace_level(pose_lv: usize, stood: bool, dying: bool, cross: bool, moving: impl FnOnce() -> bool) -> usize {
+    if dying {
+        0
+    } else if stood {
+        pose_lv
+    } else if cross && pose_lv > 0 && !moving() {
+        BRACE_BASIC_FROM + pose_lv - 1
+    } else {
+        0
+    }
 }
 /// Under the friction contact the crowd's brake reads the still men ahead
 /// of his wish (`crowd_still`), against a band half as wide. FL_BRAKE=density
@@ -1032,6 +1080,7 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut, cands: &m
         anchors,
         home,
         passing,
+        moving,
         ..
     } = *f;
     let i = s.i;
@@ -1096,9 +1145,19 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut, cands: &m
     // braced he is (`brace_pairs`): his own level from his pose and his
     // stood bit at the tick's start, the ones the grid carries for him, and
     // each neighbour's from the grid, so both men of a pair read the same
-    // two levels.
+    // two levels. The walking bracing counts only against the other side
+    // (`brace_level`), so his level against a friend and against a foe are
+    // kept apart.
     let friction = friction_contact();
-    let my_brace = if friction && !dying && *s.stood { pose_lv } else { 0 };
+    let my_stood = *s.stood;
+    let (my_brace_same, my_brace_cross) = if friction {
+        (
+            brace_level(pose_lv, my_stood, dying, false, || moving[gi]),
+            brace_level(pose_lv, my_stood, dying, true, || moving[gi]),
+        )
+    } else {
+        (0, 0)
+    };
     let braces = if friction { Some(&brace_pairs()[st.my_kind]) } else { None };
     let gain = CORR_GAIN;
     let reach2 = params.reach * params.reach;
@@ -1253,13 +1312,16 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut, cands: &m
                 // the plain ones.
                 let set = match braces {
                     Some(braces) => {
-                        let o_brace = if (o.meta & crate::spatial::META_DYING) != 0
-                            || (o.meta & crate::spatial::META_STOOD) == 0
-                        {
-                            0
-                        } else {
-                            crate::spatial::meta_pose(o.meta)
-                        };
+                        // `moving` is read only for a walking foe
+                        // (`brace_level`).
+                        let o_brace = brace_level(
+                            crate::spatial::meta_pose(o.meta),
+                            (o.meta & crate::spatial::META_STOOD) != 0,
+                            (o.meta & crate::spatial::META_DYING) != 0,
+                            cross,
+                            || moving[crate::spatial::meta_group(o.meta)],
+                        );
+                        let my_brace = if cross { my_brace_cross } else { my_brace_same };
                         (hard - len) * gain * braces[crate::spatial::meta_kind(o.meta)][my_brace][o_brace]
                     }
                     None => back,
@@ -3427,13 +3489,17 @@ mod tests {
         assert_eq!(v, Vec2::new(1.2, -0.5));
     }
 
-    /// Two men braced alike, or any two with a brace of 1, share the
+    /// The (standing, walking) strengths the table tests run over.
+    const BRACE_CASES: [(f32, f32); 6] =
+        [(1.0, 1.0), (BRACE, 1.0), (BRACE, BRACE_BASIC), (BRACE, 2.0), (20.0, 20.0), (1.0, 20.0)];
+
+    /// Two men braced alike, or any two with both strengths 1, share the
     /// setting apart exactly as the plain mass weights do, to the bit.
     #[test]
     fn equal_bracing_is_the_plain_mass_weight() {
         let plain = mass_pairs();
-        for brace in [1.0, BRACE, 20.0] {
-            let t = brace_table(brace);
+        for (brace, basic) in BRACE_CASES {
+            let t = brace_table(brace, basic);
             for a in 0..crate::unit_types::NUM_KINDS {
                 for o in 0..crate::unit_types::NUM_KINDS {
                     for b in 0..BRACE_LEVELS {
@@ -3442,7 +3508,7 @@ mod tests {
                 }
             }
         }
-        let t = brace_table(1.0);
+        let t = brace_table(1.0, 1.0);
         for a in 0..crate::unit_types::NUM_KINDS {
             for o in 0..crate::unit_types::NUM_KINDS {
                 for bi in 0..BRACE_LEVELS {
@@ -3472,13 +3538,17 @@ mod tests {
     }
 
     /// A fully braced man against an unbraced one of his own kind takes
-    /// 2 / (1 + BRACE) of the setting apart and the other 2 BRACE / (1 + BRACE).
+    /// 2 / (1 + BRACE) of the setting apart and the other 2 BRACE / (1 + BRACE);
+    /// the same with BRACE_BASIC for a fully braced walking man.
     #[test]
     fn a_braced_man_takes_little_of_the_setting_apart() {
-        let t = brace_table(BRACE);
+        let t = brace_table(BRACE, BRACE_BASIC);
+        let full_walk = BRACE_BASIC_FROM + 2;
         for k in 0..crate::unit_types::NUM_KINDS {
             assert!((t[k][k][3][0] - 2.0 / (1.0 + BRACE)).abs() < 1e-6);
             assert!((t[k][k][0][3] - 2.0 * BRACE / (1.0 + BRACE)).abs() < 1e-6);
+            assert!((t[k][k][full_walk][0] - 2.0 / (1.0 + BRACE_BASIC)).abs() < 1e-6);
+            assert!((t[k][k][0][full_walk] - 2.0 * BRACE_BASIC / (1.0 + BRACE_BASIC)).abs() < 1e-6);
         }
     }
 
@@ -3488,9 +3558,9 @@ mod tests {
     /// other's, as m_i w_i = m_o w_o holds for the plain weights.
     #[test]
     fn a_pair_is_set_apart_by_the_same_distance_in_all() {
-        for brace in [1.0, BRACE, 20.0] {
-            let t = brace_table(brace);
-            let braced = |k: usize, b: usize| TYPES[k].mass * (1.0 + (brace - 1.0) * b as f32 / 3.0);
+        for (brace, basic) in BRACE_CASES {
+            let t = brace_table(brace, basic);
+            let braced = |k: usize, b: usize| TYPES[k].mass * brace_mult(b, brace, basic);
             for a in 0..crate::unit_types::NUM_KINDS {
                 for o in 0..crate::unit_types::NUM_KINDS {
                     for bi in 0..BRACE_LEVELS {
@@ -3502,6 +3572,81 @@ mod tests {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// The standing levels are the one-strength table, to the bit; and with
+    /// the walking bracing at 1 its levels weigh as level 0 against anyone,
+    /// to the bit.
+    #[test]
+    #[allow(clippy::needless_range_loop)] // the indices are kinds and levels of more than one table
+    fn the_standing_levels_are_one_strength_and_a_walking_bracing_of_1_is_none() {
+        for brace in [1.0, BRACE, 20.0] {
+            let one = |mi: f32, mo: f32, bi: usize, bo: usize| {
+                if bi == bo {
+                    return 2.0 * mo / (mi + mo);
+                }
+                let braced = |m: f32, b: usize| m * (1.0 + (brace - 1.0) * b as f32 / 3.0);
+                let (mi, mo) = (braced(mi, bi), braced(mo, bo));
+                2.0 * mo / (mi + mo)
+            };
+            for basic in [1.0, BRACE_BASIC, 20.0] {
+                let t = brace_table(brace, basic);
+                for a in 0..crate::unit_types::NUM_KINDS {
+                    for o in 0..crate::unit_types::NUM_KINDS {
+                        for bi in 0..BRACE_BASIC_FROM {
+                            for bo in 0..BRACE_BASIC_FROM {
+                                let w = one(TYPES[a].mass, TYPES[o].mass, bi, bo);
+                                assert_eq!(t[a][o][bi][bo].to_bits(), w.to_bits(), "{a} {o} {bi} {bo}");
+                            }
+                        }
+                    }
+                }
+            }
+            let t = brace_table(brace, 1.0);
+            for a in 0..crate::unit_types::NUM_KINDS {
+                for o in 0..crate::unit_types::NUM_KINDS {
+                    for p in 0..3 {
+                        for bo in 0..BRACE_LEVELS {
+                            let walk = t[a][o][BRACE_BASIC_FROM + p][bo];
+                            let bo0 = if bo >= BRACE_BASIC_FROM { 0 } else { bo };
+                            assert_eq!(walk.to_bits(), t[a][o][0][bo0].to_bits(), "{a} {o} {p} {bo}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Standing, a soldier has his pose level against anyone; walking, the
+    /// walking bracing's level for his pose only against the other side,
+    /// only in a ready pose, not under a Move order; dying, nothing. With
+    /// both bracings at the same strength a fully braced walking soldier
+    /// weighs as a standing one.
+    #[test]
+    #[allow(clippy::needless_range_loop)] // the indices are kinds and levels of more than one table
+    fn the_two_bracings_by_side_and_standing() {
+        for p in 0..4 {
+            for moving in [false, true] {
+                for cross in [false, true] {
+                    assert_eq!(brace_level(p, true, false, cross, || moving), p);
+                    let walk = if cross && !moving && p > 0 { BRACE_BASIC_FROM + p - 1 } else { 0 };
+                    assert_eq!(brace_level(p, false, false, cross, || moving), walk, "{p} {moving} {cross}");
+                    for stood in [false, true] {
+                        assert_eq!(brace_level(p, stood, true, cross, || moving), 0);
+                    }
+                }
+            }
+        }
+        // `moving` is not read for a standing soldier or a friend.
+        assert_eq!(brace_level(2, true, false, true, || unreachable!()), 2);
+        assert_eq!(brace_level(2, false, false, false, || unreachable!()), 0);
+        let t = brace_table(BRACE, BRACE);
+        for a in 0..crate::unit_types::NUM_KINDS {
+            for o in 0..crate::unit_types::NUM_KINDS {
+                assert!((t[a][o][BRACE_BASIC_FROM + 2][0] - t[a][o][3][0]).abs() < 1e-6);
+                assert!((t[a][o][BRACE_BASIC_FROM + 2][3] - t[a][o][3][3]).abs() < 1e-6);
             }
         }
     }

@@ -48,7 +48,7 @@ pub const META_TURN_SHIFT: u32 = 7;
 pub const META_TURN: u32 = 0b11 << META_TURN_SHIFT;
 /// He stood last tick: his own wish to move was under the speed of a step
 /// (sim/soldier.rs `steer`, the `stood` column). Under the friction contact
-/// only a standing soldier is braced against a push (`brace_pairs`).
+/// a standing soldier is braced against any body (`brace_pairs`).
 pub const META_STOOD: u32 = 1 << 9;
 /// The unit's regiment (index into `Groups::list`) fills the bits above
 /// the flags, 22 bits: read it with `meta_group`.
