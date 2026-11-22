@@ -434,8 +434,10 @@ fn still_brake() -> bool {
 /// `drive` (`join_goal`) in place of the walk to his slot, so the scan
 /// reads the men ahead of him on that way, and the still men ahead stop
 /// him there (`yield_to_crowd`) as they stop every walker. He does not
-/// wait at arm's length behind a comrade and move up in hops. Without that
-/// brake he joins through `close_in`.
+/// wait at arm's length behind a comrade and move up in hops. Once the men
+/// ahead have stopped him behind a comrade in his way he stands, braced,
+/// with no wish, until his look no longer finds a comrade in his way
+/// (`drive`, `steer`). Without that brake he joins through `close_in`.
 fn joins_as_walker() -> bool {
     still_brake()
 }
@@ -1043,6 +1045,10 @@ struct Step {
     /// he remembers or to his regiment's fight, not to his slot
     /// (`join_goal`).
     joining: bool,
+    /// He left his place to join the fight on this tick (`decide_to_join`):
+    /// he sets off as a walker, so his stood bit is cleared (`steer`) and he
+    /// walks up to the men ahead before he stands again (`drive`).
+    set_off: bool,
     /// His wish to his slot from `drive`, kept when the join replaced it,
     /// for the tick he comes back into formation (`decide_to_join`).
     slot_wish: Vec2,
@@ -1230,6 +1236,7 @@ fn begin(f: &Field, s: &mut Soldier) -> Step {
         committed,
         join_fp,
         joining: false,
+        set_off: false,
         slot_wish: Vec2::ZERO,
         memo_valid: false,
         memo_d2: f32::MAX,
@@ -1382,7 +1389,19 @@ fn drive(f: &Field, s: &mut Soldier, st: &mut Step) {
     {
         st.slot_wish = desired;
         st.joining = true;
-        st.desired = join_goal(f, s, st).1;
+        // Arrived at the men ahead: a comrade in his way by his last look
+        // and himself standing since the still men ahead stopped him
+        // (`steer` sets his stood bit then), he stands with no wish until
+        // his look no longer finds a comrade in his way. His own standing is
+        // read, never his speed: in a packed regiment the bodies around
+        // him move him more than a centimetre a tick, and read from his
+        // speed that push would make him a walker again, unbraced, and the
+        // ranks behind a front would shake. A joiner who kept his wish
+        // while the soldiers ahead hold him would never brace, and any
+        // creep ahead would let the rear walk into the backs ahead and
+        // drift back.
+        let arrived = *s.sight & SIGHT_WAY != 0 && *s.stood;
+        st.desired = if arrived { Vec2::ZERO } else { join_goal(f, s, st).1 };
     }
 }
 
@@ -2870,6 +2889,7 @@ fn decide_to_join(f: &Field, s: &mut Soldier, st: &mut Step) {
         if react || (in_melee && melee_ticks[gi] as f32 > patience) {
             committed = true;
             *s.out_form = true;
+            st.set_off = true;
         }
     }
     // Out of formation he never dresses on his slot: he fights, goes for an
@@ -3620,9 +3640,22 @@ fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
         let stood = if on_his_way(s, st) {
             let arrived = has_arrived(st.place_dist, st.parked, st.slot_blocked);
             still_stands(*s.stood, under, arrived)
+        } else if st.joining {
+            // A soldier walking to the fight is a walker until the still
+            // men ahead have stopped him behind a comrade in his way: the
+            // brake has taken his wish under the speed of a step. From
+            // then he stands, and `drive` gives him no wish while that
+            // comrade is in his way.
+            under || (st.way_blocked && stands(true, Vec2::ZERO, desired - side))
         } else {
             under
         };
+        // The tick he leaves his place to join the fight he sets off: a
+        // walker from then, whatever stood him at his place. Else a soldier
+        // who stood within a step of the man ahead when he joined would
+        // count as arrived at once and never close up, and the regiment's
+        // ranks would end at two different spacings.
+        let stood = stood && !(st.set_off && joins_as_walker());
         // A falling soldier keeps his stood bit as it was when he was
         // struck (`fall`).
         if !(dying && fall()) {
