@@ -598,6 +598,16 @@ fn arrive_share(dist: f32, arrive: f32, through: bool, charge_run: bool) -> f32 
 fn charge_runs_home() -> bool {
     friction_contact()
 }
+/// Under the friction contact a soldier of a regiment in its charge keeps
+/// his whole wish to run in: the soldiers ahead of him do not fade it
+/// (`yield_to_crowd`), so the regiment does not halt as one when its first
+/// soldiers touch a standing friend. The still men ahead still slow his
+/// body as they slow anyone's (`body_jam`, `steer`): he runs until he
+/// reaches them and then presses on them, so two charging regiments do not
+/// run through each other's ranks.
+fn charge_runs_in() -> bool {
+    friction_contact()
+}
 /// How close to his slot a parked man stands without stepping (metres):
 /// rigid slots sit exactly at the separation rest distance, so a dressed
 /// rank is force-free and can afford a tight tolerance; with 1.5 the
@@ -993,6 +1003,9 @@ struct Step {
     place_dist: f32,
     parked: bool,
     jam: f32,
+    /// The press's hold on his body this tick (`steer`): the brake's value
+    /// before a charge takes his own stopping away.
+    body_jam: f32,
     new_v: Vec2,
     /// Where his step ends on the ground plane (`slide`).
     next: Vec2,
@@ -1055,7 +1068,7 @@ pub(crate) fn tick_chunk(f: &Field, rows: Rows, out: &mut ChunkOut) {
         acquire(f, &mut s, &mut st);
         decide_to_join(f, &mut s, &mut st);
         swing(f, &mut s, &mut st, out);
-        yield_to_crowd(&mut st);
+        yield_to_crowd(f, &mut st);
         try_a_side(f, &mut s, &mut st);
         close_in(f, &mut s, &mut st);
         steer(f, &mut s, &mut st);
@@ -1162,6 +1175,7 @@ fn begin(f: &Field, s: &mut Soldier) -> Step {
         place_dist: f32::INFINITY,
         parked: false,
         jam: 0.0,
+        body_jam: 0.0,
         new_v: Vec2::ZERO,
         next: Vec2::ZERO,
         open_on: false,
@@ -3130,7 +3144,7 @@ fn pick_quarry(
 /// clamped, and in a packed crowd the drive fades out so the mass cannot
 /// keep compressing itself.
 #[inline]
-fn yield_to_crowd(st: &mut Step) {
+fn yield_to_crowd(f: &Field, st: &mut Step) {
     let crowd = st.crowd;
     let mut corr = st.corr;
     let mut push = st.push;
@@ -3161,12 +3175,22 @@ fn yield_to_crowd(st: &mut Step) {
     } else {
         ((crowd - slow) / (stop - slow)).clamp(0.0, 1.0)
     };
+    // A soldier of a regiment in its charge keeps his whole wish to run in
+    // (`charge_runs_in`): the soldiers ahead of him do not fade it. Else the
+    // first soldiers to reach a standing friend stand, the rank behind them
+    // stands for them, and the whole regiment halts within a second of the
+    // first touch. His body is still slowed by the still men ahead as
+    // anyone's is (`body_jam`).
+    let pressed = jam;
+    let runs_in = charge_runs_in() && f.charging[st.gi] && !f.fat_nocharge[st.gi] && !st.dying && !st.routed;
+    let jam = if runs_in { 0.0 } else { jam };
     st.wish = desired;
     st.fade = desired * jam;
     desired *= 1.0 - jam;
     st.corr = corr;
     st.push = push;
     st.jam = jam;
+    st.body_jam = if runs_in { pressed } else { jam };
     st.desired = desired;
 }
 
@@ -3484,7 +3508,7 @@ fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
     let mut new_v = v + accel * dt;
     // Viscous damping in the press: bleeds the spring energy that otherwise
     // ping-pongs between neighbors every tick.
-    new_v *= 1.0 - 0.4 * jam;
+    new_v *= 1.0 - 0.4 * st.body_jam;
     // Slight overspeed under crowd pressure; a man squeezing through a
     // crack goes at a walk at most.
     let vmax = if squeezing(*s.stuck) { SQUEEZE_CAP } else { speed[i] * 1.15 };
