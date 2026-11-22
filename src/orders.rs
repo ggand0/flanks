@@ -388,6 +388,17 @@ impl GroupData {
     }
 }
 
+/// FL_ATTACK_FRONT=3: an attacker with a living friend between it and its
+/// target lays its front rank on the enemy's outline where the line to the
+/// target crosses it (`Groups::front_on_outline`), so it stands behind the
+/// friend instead of walking into the friend's ranks toward the target's
+/// centre. Unset or any other value: every attacker goes for the target's
+/// centre.
+pub(crate) fn attack_front() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FL_ATTACK_FRONT").is_ok_and(|v| v == "3"))
+}
+
 #[derive(Resource, Default)]
 pub struct Groups {
     pub list: Vec<GroupData>,
@@ -410,11 +421,113 @@ impl Groups {
                 }
                 match gd.fire_place {
                     Some(p) if gd.standoff_target == Some(t) => Some(p),
+                    // With a friend between, on the enemy's outline where
+                    // the line to the target crosses it.
+                    _ if attack_front() => {
+                        Some(self.front_on_outline(g, t as usize).map_or(td.centroid, |(goal, _)| goal))
+                    }
                     _ => Some(td.centroid),
                 }
             }
         }
     }
+
+    /// FL_ATTACK_FRONT=3: for regiment `g` attacking `t`, None when no
+    /// living friend stands between them (`outline_contact`), else (the
+    /// goal, the contact point).
+    pub(crate) fn front_on_outline(&self, g: usize, t: usize) -> Option<(Vec2, Vec2)> {
+        self.outline_contact(g, t)
+            .and_then(|(goal, point, friend)| friend.then_some((goal, point)))
+    }
+
+    /// FL_ATTACK_FRONT=3: for regiment `g` attacking `t`, (the goal on the
+    /// outline, the contact point, whether a living friend stands between
+    /// them), whatever the friend test finds; None only when the two
+    /// centroids coincide. Only `front_on_outline` sends a regiment to this
+    /// goal, and only with a friend between; the F3 view draws it either
+    /// way. "Between": the friend's centroid lies in the corridor from
+    /// `g`'s centroid to `t`'s, ahead of `g`'s centroid and short of `t`'s,
+    /// no further to the side of the line than half `g`'s block width
+    /// across it (`sim::route::half_width`). The contact point is where the
+    /// line from `g`'s centroid to `t`'s centroid first crosses the outline
+    /// of the nearest enemy regiment on the way (`t`, or a living enemy
+    /// whose centroid lies in the same corridor; nearest = the smallest
+    /// distance along the line to its outline, `outline_entry`). The goal
+    /// is on the line, `g`'s own half depth (`formation::front_offset`)
+    /// short of the contact point, so `g`'s front rank stands on it.
+    pub(crate) fn outline_contact(&self, g: usize, t: usize) -> Option<(Vec2, Vec2, bool)> {
+        let gd = &self.list[g];
+        let td = &self.list[t];
+        let a = gd.centroid;
+        let len = (td.centroid - a).length();
+        if len < 1e-3 {
+            return None;
+        }
+        let d = (td.centroid - a) / len;
+        let across = Vec2::new(-d.y, d.x);
+        let half = crate::sim::route::half_width(gd, d);
+        let in_corridor = |c: Vec2| {
+            let s = (c - a).dot(d);
+            s > 0.0 && s < len && (c - a).dot(across).abs() < half
+        };
+        let friend = self
+            .list
+            .iter()
+            .enumerate()
+            .any(|(f, fd)| f != g && fd.team == gd.team && fd.count > 0 && in_corridor(fd.centroid));
+        let mut edge = outline_entry(td, a, d);
+        for (h, hd) in self.list.iter().enumerate() {
+            if h != t && hd.team != gd.team && hd.count > 0 && in_corridor(hd.centroid) {
+                edge = edge.min(outline_entry(hd, a, d));
+            }
+        }
+        Some((a + d * (edge - crate::formation::front_offset(gd)), a + d * edge, friend))
+    }
+}
+
+/// FL_ATTACK_FRONT=3: how far along the line from `a` in the unit
+/// direction `d` it first meets regiment `hd`'s outline. The outline is
+/// the formation code's own block (`formation::block_rect`: about the
+/// centroid, turned to the facing, files and ranks at the spacing as the
+/// block stands, open order included; a blob or a block with no files a
+/// disc of its footprint radius) without its metre of margin, so its
+/// front edge is the front rank (`formation::front_offset`), its sides
+/// the flank files and its back the rear rank. A line that misses the
+/// outline (only for an enemy beside the line, never the target, which
+/// the line runs to) meets it where the outline's nearest corner stands
+/// along the line. Negative when `a` stands inside the outline.
+pub(crate) fn outline_entry(hd: &GroupData, a: Vec2, d: Vec2) -> f32 {
+    let r = crate::formation::block_rect(hd);
+    let p = a - r.centre;
+    if r.fwd == Vec2::ZERO {
+        let b = p.dot(d);
+        let disc = b * b - (p.length_squared() - r.half_w * r.half_w);
+        if disc >= 0.0 {
+            return -b - disc.sqrt();
+        }
+        return -b - r.half_w;
+    }
+    let half_w = (r.half_w - 1.0).max(0.0);
+    let half_d = (r.half_d - 1.0).max(0.0);
+    let right = Vec2::new(r.fwd.y, -r.fwd.x);
+    let (px, pz, dx, dz) = (p.dot(right), p.dot(r.fwd), d.dot(right), d.dot(r.fwd));
+    let mut lo = f32::NEG_INFINITY;
+    let mut hi = f32::INFINITY;
+    for (q, v, h) in [(px, dx, half_w), (pz, dz, half_d)] {
+        if v.abs() < 1e-6 {
+            if q.abs() > h {
+                lo = f32::INFINITY;
+            }
+            continue;
+        }
+        let (s1, s2) = ((-h - q) / v, (h - q) / v);
+        lo = lo.max(s1.min(s2));
+        hi = hi.min(s1.max(s2));
+    }
+    if lo <= hi && hi >= 0.0 {
+        return lo;
+    }
+    -p.dot(d) - (dx.abs() * half_w + dz.abs() * half_d)
 }
 
 /// One regiment's placement on a drawn order line.
