@@ -350,6 +350,10 @@ pub struct ApplyContext<'a> {
     pub combat_scale: f32,
     pub tick_seed: u32,
     pub terrain: &'a Terrain,
+    /// The tick's length (s): under the friction contact a charge blow's
+    /// shove is the speed a soldier stops from in his own ticks
+    /// (sim/soldier.rs `shove_speed`).
+    pub dt: f32,
 }
 
 /// The sound of a blow: where it was struck and what it struck. Audio
@@ -389,6 +393,8 @@ pub fn apply_damage(
     let Units {
         pos,
         pos_prev,
+        vel,
+        imposed,
         team,
         kind,
         yaw,
@@ -678,21 +684,37 @@ pub fn apply_damage(
                         let m_a = pa.mass;
                         let m_v = pv.mass;
                         let resist = if braced { WALL_KNOCKBACK_RESIST } else { 1.0 };
-                        let shove = -dir * CHARGE_KNOCKBACK * (m_a / (m_a + m_v)) * resist;
-                        let mut nx = (pos[v].x + shove.x).clamp(bounds_min.x, bounds_max.x);
-                        let mut nz = (pos[v].z + shove.y).clamp(bounds_min.y, bounds_max.y);
-                        // Charges can't knock a man into the river or
-                        // through a terrace riser — the shove just dies.
-                        if !terrain.body_free(nx, nz, terrain.body_radius(), shove.x, shove.y) {
-                            nx = pos[v].x;
-                            nz = pos[v].z;
+                        if crate::sim::soldier::friction_contact() {
+                            // Under the friction contact the blow is a shove on
+                            // his speed, and into what the contacts put into
+                            // it, so his feet and legs take it back over about
+                            // a third of a second, like any push, and the men
+                            // behind him catch him (sim/soldier.rs
+                            // `held_total`, `shove_speed`). A shove on his
+                            // position in one tick would throw a reeling man
+                            // again at a second blow.
+                            let d = CHARGE_KNOCKBACK * (m_a / (m_a + m_v)) * resist;
+                            let push = -dir * crate::sim::soldier::shove_speed(d, ctx.dt);
+                            vel[v] += Vec3::new(push.x, 0.0, push.y);
+                            imposed[v] = (imposed[v] + push)
+                                .clamp_length_max(crate::sim::soldier::STEP_PACE);
+                        } else {
+                            let shove = -dir * CHARGE_KNOCKBACK * (m_a / (m_a + m_v)) * resist;
+                            let mut nx = (pos[v].x + shove.x).clamp(bounds_min.x, bounds_max.x);
+                            let mut nz = (pos[v].z + shove.y).clamp(bounds_min.y, bounds_max.y);
+                            // Charges can't knock a man into the river or
+                            // through a terrace riser: the shove just dies.
+                            if !terrain.body_free(nx, nz, terrain.body_radius(), shove.x, shove.y) {
+                                nx = pos[v].x;
+                                nz = pos[v].z;
+                            }
+                            pos[v] = Vec3::new(
+                                nx,
+                                terrain.height_at(nx, nz)
+                                    + crate::unit_types::half_height(kind[v] as usize),
+                                nz,
+                            );
                         }
-                        pos[v] = Vec3::new(
-                            nx,
-                            terrain.height_at(nx, nz)
-                                + crate::unit_types::half_height(kind[v] as usize),
-                            nz,
-                        );
                     }
                     // An impaled runner is STOPPED, not thrown — his
                     // momentum went into the point; the stagger is the

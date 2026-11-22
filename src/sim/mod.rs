@@ -871,6 +871,7 @@ pub fn step_sim(
             combat_scale: job.combat_scale,
             tick_seed: job.tick_seed,
             terrain: &terrain,
+            dt: job.dt,
         },
         &mut cstats,
         &mut dir_stats,

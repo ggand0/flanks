@@ -556,6 +556,47 @@ const MAX_ACCEL: f32 = 50.0;
 /// and stop as one body. The spring's push and the contact are not legs
 /// and keep MAX_ACCEL.
 pub(crate) const LEG_ACCEL: f32 = 4.0;
+/// How far a lone soldier who wants no speed (a staggered man, `steer`)
+/// goes from a speed `u` before he is at rest, ticking his stopping rule
+/// under the friction contact: each tick his feet take FEET x dt off what
+/// a contact put into his speed, which starts at `u` held to STEP_PACE
+/// (`held_total`), and then his legs brake toward zero, STEER_GAIN times
+/// his speed but LEG_ACCEL at most. Once his feet are done and his legs
+/// are under their cap his speed falls by the same share every tick, and
+/// what is left of the way is that geometric sum.
+fn rest_distance(u: f32, dt: f32) -> f32 {
+    let mut v = u;
+    let mut held = u.min(STEP_PACE);
+    let mut way = 0.0;
+    while held > 0.0 || STEER_GAIN * v > LEG_ACCEL {
+        let cut = held.min(FEET * dt);
+        v -= cut;
+        held -= cut;
+        v -= (STEER_GAIN * v).clamp(-LEG_ACCEL, LEG_ACCEL) * dt;
+        way += v * dt;
+    }
+    way + v * (1.0 - STEER_GAIN * dt) / STEER_GAIN
+}
+/// The speed at which a lone soldier who wants no speed comes to rest `d`
+/// metres on (`rest_distance`): under the friction contact the charge
+/// blow's shove on his speed, which knocks him back as far as the one-tick
+/// jump without it moves him (sim/damage.rs).
+/// The way grows with the speed, so the speed is found by halving.
+pub(crate) fn shove_speed(d: f32, dt: f32) -> f32 {
+    if d <= 0.0 || dt <= 0.0 {
+        return 0.0;
+    }
+    let mut hi = 1.0;
+    while rest_distance(hi, dt) < d && hi < 1000.0 {
+        hi *= 2.0;
+    }
+    let mut lo = 0.0;
+    for _ in 0..40 {
+        let mid = 0.5 * (lo + hi);
+        if rest_distance(mid, dt) < d { lo = mid } else { hi = mid }
+    }
+    0.5 * (lo + hi)
+}
 /// Facing turn smoothing (fraction/s of the remaining angle) — the
 /// settle behavior for SMALL corrections.
 const YAW_RATE: f32 = 10.0;
@@ -3769,6 +3810,32 @@ fn integrate(f: &Field, s: &mut Soldier, st: &mut Step) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A lone man shoved at `shove_speed(d)` who wants no speed, stepped
+    /// tick by tick with his feet and his legs, comes to rest d metres on.
+    #[test]
+    fn a_shoved_man_comes_to_rest_at_the_shove_distance() {
+        let dt = 1.0 / 30.0;
+        for d in [0.1125_f32, 0.225, 0.45, 0.675] {
+            let u = shove_speed(d, dt);
+            let mut v = Vec2::new(u, 0.0);
+            let mut imposed = v.clamp_length_max(STEP_PACE);
+            let mut x = Vec2::ZERO;
+            for _ in 0..600 {
+                let cut = feet_take(imposed, dt);
+                v -= cut;
+                imposed -= cut;
+                let mut legs = -v * STEER_GAIN;
+                if legs.length() > LEG_ACCEL {
+                    legs *= LEG_ACCEL / legs.length();
+                }
+                v += legs * dt;
+                x += v * dt;
+            }
+            assert!(v.length() < 1e-3, "{d}: still moving at {}", v.length());
+            assert!((x.length() - d).abs() < 0.03, "{d}: at rest {} on at {u} m/s", x.length());
+        }
+    }
 
     /// A soldier walking to his place slows over the last metres; one on a
     /// route, or in his regiment's charge, keeps his whole pace up to it.
