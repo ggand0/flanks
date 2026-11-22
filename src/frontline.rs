@@ -918,8 +918,15 @@ fn update_groups(
             // ammo, the same order is a real knife charge and flags
             // like one.
             let t = t as usize;
+            // Under the friction contact a regiment in range of any
+            // unbroken enemy regiment (`hostile_near`, the same 60 m)
+            // counts as in range too: one ordered onto an enemy unit
+            // behind the enemy's front runs into the front unit first, and
+            // that run is a charge too.
+            let near = cents[t].distance(group.centroid) < CHARGE_RANGE
+                || (crate::sim::soldier::friction_contact() && group.hostile_near);
             counts[t] > 0
-                && cents[t].distance(group.centroid) < CHARGE_RANGE
+                && near
                 && !(group.kind == crate::unit_types::KIND_ARCHER
                     && group.ammo_left > 0
                     && !group.melee)

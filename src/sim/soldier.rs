@@ -282,7 +282,7 @@ fn share_contact() -> bool {
 /// The one thing that stands in for a stance is the bracing: in the
 /// setting apart a man braced against a push (`brace_pairs`) holds his
 /// ground, and the man who walks into him takes most of it.
-fn friction_contact() -> bool {
+pub(crate) fn friction_contact() -> bool {
     static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *S.get_or_init(|| std::env::var("FL_CONTACT").is_ok_and(|v| v == "friction"))
 }
