@@ -422,9 +422,19 @@ impl Groups {
                 match gd.fire_place {
                     Some(p) if gd.standoff_target == Some(t) => Some(p),
                     // With a friend between, on the enemy's outline where
-                    // the line to the target crosses it.
+                    // the line to the target crosses it. A regiment in its
+                    // charge or its crash goes for the target itself, as a
+                    // direct attack does, so every one of its soldiers runs
+                    // in and the whole regiment piles up on what stops it.
+                    // Its places come back to the outline when the charge is
+                    // over, and under the friction contact its soldiers do
+                    // not step back to them (sim/soldier.rs `hold_the_frame`).
                     _ if attack_front() => {
-                        Some(self.front_on_outline(g, t as usize).map_or(td.centroid, |(goal, _)| goal))
+                        if gd.charging || gd.crashing {
+                            Some(td.centroid)
+                        } else {
+                            Some(self.front_on_outline(g, t as usize).map_or(td.centroid, |(goal, _)| goal))
+                        }
                     }
                     _ => Some(td.centroid),
                 }
