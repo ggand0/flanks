@@ -46,9 +46,13 @@ pub const META_POSE: u32 = 0b11 << META_POSE_SHIFT;
 /// (`meta_width`).
 pub const META_TURN_SHIFT: u32 = 7;
 pub const META_TURN: u32 = 0b11 << META_TURN_SHIFT;
+/// He stood last tick: his own wish to move was under the speed of a step
+/// (sim/soldier.rs `steer`, the `stood` column). Under the friction contact
+/// only a standing soldier is braced against a push (`brace_pairs`).
+pub const META_STOOD: u32 = 1 << 9;
 /// The unit's regiment (index into `Groups::list`) fills the bits above
-/// the flags: read it with `meta_group`.
-pub const META_GROUP_SHIFT: u32 = 9;
+/// the flags, 22 bits: read it with `meta_group`.
+pub const META_GROUP_SHIFT: u32 = 10;
 
 /// The kind field of a `SortedUnit::meta` (index into `unit_types::TYPES`).
 #[inline]
@@ -143,6 +147,7 @@ impl SpatialGrid {
         groups: &[u32],
         death_t: &[u8],
         poses: &[u8],
+        stood: &[bool],
         group_wall: &[bool],
     ) {
         let n = positions.len();
@@ -295,6 +300,7 @@ impl SpatialGrid {
                             | ((group_wall[groups[i] as usize] as u32) * META_WALL)
                             | ((crate::sim::soldier::pose_level(poses[i]) as u32) << META_POSE_SHIFT)
                             | ((crate::sim::soldier::turn_level(poses[i]) as u32) << META_TURN_SHIFT)
+                            | ((stood[i] as u32) * META_STOOD)
                             | (groups[i] << META_GROUP_SHIFT);
                         unsafe {
                             *out.0.add(k) = SortedUnit {

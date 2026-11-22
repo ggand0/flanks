@@ -335,6 +335,7 @@ fn run_tick_job(job: &mut TickJob) {
         stuck_in,
         aim_in,
         imposed_in,
+        stood_in,
         quarry_in,
         pos_out,
         vel,
@@ -354,6 +355,7 @@ fn run_tick_job(job: &mut TickJob) {
         stuck,
         aim,
         imposed,
+        stood,
         quarry,
         orders,
         anchors,
@@ -536,7 +538,7 @@ fn run_tick_job(job: &mut TickJob) {
         }
         let _span = info_span!("grid_rebuild").entered();
         let t0 = Instant::now();
-        grid.rebuild(pos_prev, &vel_in[..], team, kind, group, death_t_in, &pose_in[..], group_wall);
+        grid.rebuild(pos_prev, &vel_in[..], team, kind, group, death_t_in, &pose_in[..], &stood_in[..], group_wall);
         *grid_ms = t0.elapsed().as_secs_f32() * 1000.0;
     });
     let t2 = Instant::now();
@@ -630,6 +632,7 @@ fn run_tick_job(job: &mut TickJob) {
     let stuck_in = &stuck_in[..];
     let aim_in = &aim_in[..];
     let imposed_in = &imposed_in[..];
+    let stood_in = &stood_in[..];
     let quarry_in = &quarry_in[..];
     // The map edges a router leaves the field at (combat.rs), widened by
     // the charge knockback the apply pass can still add to a position:
@@ -660,11 +663,12 @@ fn run_tick_job(job: &mut TickJob) {
             .zip(stuck.chunks_mut(CHUNK))
             .zip(aim.chunks_mut(CHUNK))
             .zip(imposed.chunks_mut(CHUNK))
+            .zip(stood.chunks_mut(CHUNK))
             .enumerate()
         {
-            let ((((((((((((((((((((pos, vel), yaw), yaw_prev), target), swing), swing_t), flash),
+            let (((((((((((((((((((((pos, vel), yaw), yaw_prev), target), swing), swing_t), flash),
                 death_t), events), ammo), arrows), out_form), sight), way), chain), pose), quarry), stuck), aim),
-                imposed) = chunk;
+                imposed), stood) = chunk;
             let start = ci * CHUNK;
             let end = start + pos.len();
             scope.spawn(async move {
@@ -687,6 +691,7 @@ fn run_tick_job(job: &mut TickJob) {
                 stuck.copy_from_slice(&stuck_in[start..end]);
                 aim.copy_from_slice(&aim_in[start..end]);
                 imposed.copy_from_slice(&imposed_in[start..end]);
+                stood.copy_from_slice(&stood_in[start..end]);
                 let rows = soldier::Rows {
                     start,
                     pos: &mut *pos,
@@ -708,6 +713,7 @@ fn run_tick_job(job: &mut TickJob) {
                     stuck,
                     aim,
                     imposed,
+                    stood,
                 };
                 events.clear();
                 let mut out = soldier::ChunkOut { events, arrows };
@@ -835,7 +841,7 @@ pub fn step_sim(
             swing_t <- swing_t, flash <- flash, death_t <- death_t, ammo <- ammo,
             out_form <- out_form, sight <- sight, way <- way, chain <- chain,
             pose <- pose, quarry <- quarry, stuck <- stuck, aim <- aim,
-            imposed <- imposed
+            imposed <- imposed, stood <- stood
         );
     }
     // The sweep's candidates (combat.rs), ascending.
@@ -1006,7 +1012,7 @@ mod tests {
             swing_t <- swing_t, flash <- flash, death_t <- death_t, ammo <- ammo,
             out_form <- out_form, sight <- sight, way <- way, chain <- chain,
             pose <- pose, quarry <- quarry, stuck <- stuck, aim <- aim,
-            imposed <- imposed
+            imposed <- imposed, stood <- stood
         );
     }
 

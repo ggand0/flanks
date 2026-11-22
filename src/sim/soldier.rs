@@ -229,11 +229,14 @@ fn friction_contact() -> bool {
 /// against a push counts for when two bodies are set apart: his feet are
 /// planted and his weight is behind his shield, so the man who walks into
 /// him is the one who gives. He is braced as far as he is in his ready
-/// stance (`pose_level`, a third of the way at each level), unless his
-/// regiment is under a Move order (sim/job.rs `moving`), when he is walking
-/// somewhere whatever his pose, or he is dying. This is a man bracing his
-/// body, not a spearwall's braced points. FL_BRACE=<number> sets it, from
-/// 1 (his own weight, as without it) to 20.
+/// stance (`pose_level`, a third of the way at each level) while he stands
+/// (`steer`, the `stood` column), whatever his regiment's order. He
+/// becomes a walker when his own wish to move reaches the speed of a step,
+/// and stands again when it drops under it. A walking soldier is not
+/// braced, and neither is a dying man. A push does not take him out of
+/// it, only his own walking does. This is a man bracing his body, not a
+/// spearwall's braced points. FL_BRACE=<number> sets it, from 1 (his own
+/// weight, as without it) to 20.
 const BRACE: f32 = 4.0;
 fn brace() -> f32 {
     static B: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
@@ -629,6 +632,8 @@ pub(crate) struct Soldier<'a> {
     pub stuck: &'a mut u16,
     pub aim: &'a mut Vec2,
     pub imposed: &'a mut Vec2,
+    /// He stood last tick (`steer`); read by the scan, then written anew.
+    pub stood: &'a mut bool,
 }
 
 /// The rows of one chunk of soldiers, in index order.
@@ -653,6 +658,7 @@ pub(crate) struct Rows<'a> {
     pub stuck: &'a mut [u16],
     pub aim: &'a mut [Vec2],
     pub imposed: &'a mut [Vec2],
+    pub stood: &'a mut [bool],
 }
 
 /// What a chunk emits beside its rows: landed swings and loosed arrows.
@@ -724,6 +730,9 @@ struct Step {
     face_target: Option<Vec2>,
     /// His drive before the crowd's brake faded it (`try_a_side`).
     wish: Vec2,
+    /// What the crowd's brake has taken off his wish since `yield_to_crowd`,
+    /// so that `desired + fade` is his own wish unfaded (`steer`).
+    fade: Vec2,
     jam: f32,
     new_v: Vec2,
     /// Where his step ends on the ground plane (`slide`).
@@ -776,6 +785,7 @@ pub(crate) fn tick_chunk(f: &Field, rows: Rows, out: &mut ChunkOut) {
             stuck: &mut rows.stuck[j],
             aim: &mut rows.aim[j],
             imposed: &mut rows.imposed[j],
+            stood: &mut rows.stood[j],
         };
         let mut st = begin(f, &mut s);
         drive(f, &mut s, &mut st);
@@ -887,6 +897,7 @@ fn begin(f: &Field, s: &mut Soldier) -> Step {
         back_blocked: false,
         face_target: None,
         wish: Vec2::ZERO,
+        fade: Vec2::ZERO,
         jam: 0.0,
         new_v: Vec2::ZERO,
         next: Vec2::ZERO,
@@ -1021,7 +1032,6 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut, cands: &m
         anchors,
         home,
         passing,
-        moving,
         ..
     } = *f;
     let i = s.i;
@@ -1083,12 +1093,12 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut, cands: &m
     let pairs = &pair_widths()[my_level];
     let masses = &mass_pairs()[st.my_kind];
     // Under the friction contact the setting apart weighs each man by how
-    // braced he is (`brace_pairs`): his own level from his pose at the
-    // tick's start, the one the grid carries for him, and each
-    // neighbour's from the grid, so both men of a pair read the same two
-    // levels.
+    // braced he is (`brace_pairs`): his own level from his pose and his
+    // stood bit at the tick's start, the ones the grid carries for him, and
+    // each neighbour's from the grid, so both men of a pair read the same
+    // two levels.
     let friction = friction_contact();
-    let my_brace = if friction && !dying && !moving[gi] { pose_lv } else { 0 };
+    let my_brace = if friction && !dying && *s.stood { pose_lv } else { 0 };
     let braces = if friction { Some(&brace_pairs()[st.my_kind]) } else { None };
     let gain = CORR_GAIN;
     let reach2 = params.reach * params.reach;
@@ -1244,7 +1254,7 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut, cands: &m
                 let set = match braces {
                     Some(braces) => {
                         let o_brace = if (o.meta & crate::spatial::META_DYING) != 0
-                            || moving[crate::spatial::meta_group(o.meta)]
+                            || (o.meta & crate::spatial::META_STOOD) == 0
                         {
                             0
                         } else {
@@ -2094,6 +2104,7 @@ fn try_a_side(f: &Field, s: &mut Soldier, st: &mut Step) {
         // His legs at their full effort along his wish: he pushes with
         // all he has, at a walk at most (`steer`).
         st.desired = wish;
+        st.fade = Vec2::ZERO;
     } else if trying > 0 {
         trying -= 1;
         // The way ahead clear after the first TRY_MIN ticks: the step is
@@ -2820,6 +2831,7 @@ fn yield_to_crowd(st: &mut Step) {
         ((crowd - slow) / (stop - slow)).clamp(0.0, 1.0)
     };
     st.wish = desired;
+    st.fade = desired * jam;
     desired *= 1.0 - jam;
     st.corr = corr;
     st.push = push;
@@ -2874,6 +2886,7 @@ fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
     let comrade_ahead = st.comrade_ahead;
     let side_dir = st.side_dir;
     let mut desired = st.desired;
+    let mut fade = st.fade;
     let mut d_surge = Vec2::ZERO;
     // Fighters close the last meter to swing range. Only active when an enemy
     // is ALREADY in reach — this is combat execution (like the wind-up foot
@@ -2995,20 +3008,24 @@ fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
             let dir = to_fp / dist;
             desired = if !way_blocked {
                 let pace = if comrade_ahead { ADVANCE_PACE } else { COMBAT_JOG_PACE };
+                fade = dir * pace * jam;
                 dir * pace * (1.0 - jam)
             } else {
+                fade = Vec2::ZERO;
                 sidestep(i, tick, left_blocked, right_blocked, side_dir)
             };
         }
     }
     st.desired = desired;
+    st.fade = fade;
 }
 
 /// From drive to velocity: the wall and charge paces, fatigue, the
 /// stagger, the crowd's damping, a standing man's grip on the ground and
 /// his stance against a squeeze, the acceleration and speed caps, and the
 /// give of his legs at a body he runs into. Under the friction contact:
-/// the feet's take and his legs alone, the damping and the speed cap.
+/// whether he stands, the feet's take and his legs alone, the damping and
+/// the speed cap.
 #[inline]
 fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
     let Field { speed, orders, wall, charging, fat_speed, fat_nocharge, dt, .. } = *f;
@@ -3022,6 +3039,15 @@ fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
     let push = st.push;
     let jam = st.jam;
     let mut desired = st.desired;
+    let friction = friction_contact();
+    // Whether he stands, for his bracing next tick (`brace_pairs`) and his
+    // stance (`scan`). The line is his own wish as it comes here, after
+    // every stage that sets it, with what the crowd's brake took off it put
+    // back, before the paces and caps below, under the speed of a step
+    // (`stands`). A push he gets does not count.
+    if friction {
+        *s.stood = stands(true, Vec2::ZERO, desired + st.fade);
+    }
     // Formation pace: walls advance deliberately (running breaks a wall), the
     // charge phase runs the last stretch home. Broken/dying already excluded
     // from both states by construction.
@@ -3038,7 +3064,6 @@ fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
         desired = Vec2::ZERO;
     }
 
-    let friction = friction_contact();
     let mut v = s.vel.xz();
     if friction {
         // His feet take back part of what the contacts put into his speed,
@@ -3426,6 +3451,23 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// The grid's stood bit sits between the turn of his shoulders and his
+    /// regiment, and no field reads another; the regiment keeps 22 bits.
+    #[test]
+    fn the_stood_bit_leaves_the_width_and_the_regiment_alone() {
+        use crate::spatial::{META_GROUP_SHIFT, META_POSE_SHIFT, META_STOOD, META_TURN_SHIFT, meta_group, meta_width};
+        assert_eq!(META_STOOD, 1 << 9);
+        assert_eq!(META_GROUP_SHIFT, 10);
+        let g = (1u32 << (32 - META_GROUP_SHIFT)) - 1;
+        for stood in [false, true] {
+            let meta =
+                (3 << META_POSE_SHIFT) | (2 << META_TURN_SHIFT) | (stood as u32 * META_STOOD) | (g << META_GROUP_SHIFT);
+            assert_eq!(meta_width(meta), 3 + 4 * 2);
+            assert_eq!(meta_group(meta), g as usize);
+            assert_eq!((meta & META_STOOD) != 0, stood);
         }
     }
 

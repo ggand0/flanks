@@ -115,6 +115,7 @@ pub struct TickJob {
     pub(crate) stuck_in: Arc<Vec<u16>>,
     pub(crate) aim_in: Arc<Vec<Vec2>>,
     pub(crate) imposed_in: Arc<Vec<Vec2>>,
+    pub(crate) stood_in: Arc<Vec<bool>>,
     pub(crate) quarry_in: Arc<Vec<u32>>,
     // Read only to pack the render snapshot.
     pub(crate) pos_prev_in: Arc<Vec<Vec3>>,
@@ -145,6 +146,7 @@ pub struct TickJob {
     pub(crate) stuck: Vec<u16>,
     pub(crate) aim: Vec<Vec2>,
     pub(crate) imposed: Vec<Vec2>,
+    pub(crate) stood: Vec<bool>,
     pub(crate) quarry: Vec<u32>,
     // Per-regiment command snapshot, taken at prep.
     pub(crate) orders: Vec<Option<Vec2>>,
@@ -295,6 +297,7 @@ impl TickJob {
         self.stuck_in = Default::default();
         self.aim_in = Default::default();
         self.imposed_in = Default::default();
+        self.stood_in = Default::default();
         self.quarry_in = Default::default();
         self.pos_prev_in = Default::default();
         self.color_in = Default::default();
@@ -473,6 +476,7 @@ fn share_columns(job: &mut TickJob, units: &Units) {
     job.stuck_in = units.stuck.share();
     job.aim_in = units.aim.share();
     job.imposed_in = units.imposed.share();
+    job.stood_in = units.stood.share();
     job.quarry_in = units.quarry.share();
     job.pos_prev_in = units.pos_prev.share();
     job.color_in = units.color.share();
@@ -500,6 +504,7 @@ fn share_columns(job: &mut TickJob, units: &Units) {
     fit(&mut job.stuck, n);
     fit(&mut job.aim, n);
     fit(&mut job.imposed, n);
+    fit(&mut job.stood, n);
     fit(&mut job.quarry, n);
 }
 
