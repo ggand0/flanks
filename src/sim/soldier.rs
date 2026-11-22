@@ -598,6 +598,12 @@ fn arrive_share(dist: f32, arrive: f32, through: bool, charge_run: bool) -> f32 
 fn charge_runs_home() -> bool {
     friction_contact()
 }
+/// Under the friction contact the soldiers of a regiment under an Attack
+/// order do not step backward to their places (`hold_the_frame`), so a
+/// regiment that ran in behind a friend stays piled up.
+fn pile_stays() -> bool {
+    friction_contact()
+}
 /// Under the friction contact a soldier of a regiment in its charge keeps
 /// his whole wish to run in: the soldiers ahead of him do not fade it
 /// (`yield_to_crowd`), so the regiment does not halt as one when its first
@@ -2524,7 +2530,7 @@ fn turn_shoulders(s: &mut Soldier) {
 /// him and his mark.
 #[inline]
 fn hold_the_frame(f: &Field, st: &mut Step) {
-    let Field { contact, form_face, .. } = *f;
+    let Field { contact, form_face, orders, moving, .. } = *f;
     let gi = st.gi;
     let routed = st.routed;
     let slot_blocked = st.slot_blocked;
@@ -2536,7 +2542,12 @@ fn hold_the_frame(f: &Field, st: &mut Step) {
     // reopen its ranks the moment it made contact. A regiment struck from
     // behind has its fight at its back, so it keeps stepping back to hold its
     // ground.
-    if contact[gi] && !routed && form_face[gi] != Vec2::ZERO {
+    // Under the friction contact the same holds for a regiment under an
+    // Attack order that has not reached its fight yet: its soldiers who
+    // ran in and piled up behind a friend stay where they are, they do not
+    // walk backward to their places and open the pile again (`pile_stays`).
+    let attacking = pile_stays() && orders[gi].is_some() && !moving[gi];
+    if (contact[gi] || attacking) && !routed && form_face[gi] != Vec2::ZERO {
         let back = desired.dot(form_face[gi]);
         if back < 0.0 {
             desired -= form_face[gi] * back;
