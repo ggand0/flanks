@@ -332,6 +332,23 @@ fn still_brake() -> bool {
     static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *S.get_or_init(|| friction_contact() && !std::env::var("FL_BRAKE").is_ok_and(|v| v == "density"))
 }
+/// The enemy he remembers (`target` at the tick's start) as one still to
+/// go for: a living index of the other team within his sight plus a
+/// metre, and with his regiment focused on one target, a man of it or
+/// one within his threat distance. Returns the squared distance to him
+/// (f32::MAX for an index out of range or of his own team) and whether he
+/// counts. The scan's `memo_valid` reads it.
+#[inline]
+fn remembered_foe(f: &Field, i: usize, p: Vec2, gi: usize, memo: usize) -> (f32, bool) {
+    let Field { pos_prev, team, group, focus, .. } = *f;
+    if memo >= pos_prev.len() || team[memo] == team[i] {
+        return (f32::MAX, false);
+    }
+    let d2 = pos_prev[memo].xz().distance_squared(p);
+    let ok = d2 < (seek_radius() + 1.0) * (seek_radius() + 1.0)
+        && focus[gi].is_none_or(|t| group[memo] == t || d2 < threat_radius() * threat_radius());
+    (d2, ok)
+}
 /// The friction contact's feet: each tick they take back up to this much
 /// (m/s^2) of the speed the contacts have put into him.
 const FEET: f32 = 7.0;
@@ -1385,6 +1402,25 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut, cands: &m
             *s.sight &= !SIGHT_FOE;
         }
     }
+    // The enemy he remembers, if still in sight: he tracks him while he has
+    // no enemy in reach, and seeing him is what makes a man still in
+    // formation react. A man fighting someone in reach out of formation needs
+    // neither, and skips the lookup.
+    // With his regiment focused on one target (sim/job.rs `focus`), a man
+    // of another regiment is remembered only within his threat distance:
+    // one who is not on him he lets go, and follows his orders. Read here
+    // rather than in `look_around`, so that the scan's own later steps can
+    // read it too.
+    let memo = prev_target as usize;
+    let (memo_d2, memo_valid) = if (best_idx == u32::MAX && !dying && !st.routed)
+        || (st.in_melee && !st.committed)
+    {
+        remembered_foe(f, i, p, gi, memo)
+    } else {
+        (f32::MAX, false)
+    };
+    st.memo_valid = memo_valid;
+    st.memo_d2 = memo_d2;
     // His stance for the next tick, as he is drawn: into the ready stance
     // while his regiment fights, while it stands ready and he stands (the
     // pose pass's guard, below the speed of his steps; under the friction
@@ -1743,7 +1779,7 @@ fn choose_opening(f: &Field, s: &mut Soldier, st: &mut Step) {
 /// look.
 #[inline]
 fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
-    let Field { grid, pos_prev, team, group, orders, engaged, focus, tick, .. } = *f;
+    let Field { grid, pos_prev, orders, engaged, tick, .. } = *f;
     let i = s.i;
     let p = st.p;
     let gi = st.gi;
@@ -1753,31 +1789,12 @@ fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
     let committed = st.committed;
     let join_fp = st.join_fp;
     let desired = st.desired;
-    let prev_target = st.prev_target;
     let best_idx = st.best_idx;
     let scan_r = st.scan_r;
     let my_team_bit = st.my_team_bit;
-    // The enemy he remembers, if still in sight: he tracks him while he has
-    // no enemy in reach, and seeing him is what makes a man still in
-    // formation react. A man fighting someone in reach out of formation needs
-    // neither, and skips the lookup.
-    // With his regiment focused on one target (sim/job.rs `focus`), a man
-    // of another regiment is remembered only within his threat distance:
-    // one who is not on him he lets go, and follows his orders.
-    let memo = prev_target as usize;
-    let mut memo_d2 = f32::MAX;
-    let memo_valid = ((best_idx == u32::MAX && !dying && !routed)
-        || (in_melee && !committed))
-        && memo < pos_prev.len()
-        && team[memo] != team[i]
-        && {
-            let d2 = pos_prev[memo].xz().distance_squared(p);
-            memo_d2 = d2;
-            d2 < (seek_radius() + 1.0) * (seek_radius() + 1.0)
-                && focus[gi].is_none_or(|t| {
-                    group[memo] == t || d2 < threat_radius() * threat_radius()
-                })
-        };
+    // The enemy he remembers, as the scan read it (`scan`).
+    let memo = st.prev_target as usize;
+    let memo_valid = st.memo_valid;
     // Which way he is going: to that enemy, else to his regiment's fight.
     let memo_dir = if memo_valid {
         (pos_prev[memo].xz() - p).normalize_or_zero()
@@ -1886,8 +1903,6 @@ fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
     let comrade_ahead = *s.sight & SIGHT_AHEAD != 0;
     let slot_blocked = *s.sight & SIGHT_MARK != 0;
     st.back_blocked = *s.sight & SIGHT_BACK != 0;
-    st.memo_valid = memo_valid;
-    st.memo_d2 = memo_d2;
     st.memo_dir = memo_dir;
     st.side_dir = side_dir;
     st.watch_go = watch_go;
