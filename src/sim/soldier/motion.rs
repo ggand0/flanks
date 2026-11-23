@@ -1,0 +1,375 @@
+//! Where he wants to go: the drive to his place or away in a rout, the
+//! walk to the fight, and what the crowd's brake leaves of it.
+
+use bevy::math::Vec3Swizzles;
+use bevy::prelude::*;
+
+use super::*;
+use crate::unit_types::TYPES;
+
+/// Cap on summed separation push to avoid explosive forces deep in a crowd.
+const SEP_PUSH_MAX: f32 = 2.5;
+/// Under the friction contact's brake a soldier out of formation with no
+/// enemy in his reach walks to the fight like any walker: his wish to go
+/// to the enemy he remembers, straight ahead to his regiment's fighting
+/// line, or to his regiment's fight is made in `drive` (`join_goal`) in
+/// place of the walk to his slot, so the scan reads the men ahead of him
+/// on that way, and the still men ahead stop him there (`yield_to_crowd`)
+/// as they stop every walker. He does not wait at arm's length behind a
+/// comrade and move up in hops. Once the men ahead have stopped him behind
+/// a comrade in his way he stands, braced, with no wish, until a short
+/// step of room opens ahead (`drive`, `steer`). Without that brake he
+/// joins through `close_in`.
+pub(super) fn joins_as_walker() -> bool {
+    still_brake()
+}
+/// Units slow down proportionally inside this distance to the target.
+pub(super) const ARRIVE_RADIUS: f32 = 35.0;
+
+/// The share of his pace a soldier wants at `dist` metres from where he
+/// walks to, slowing over the last `arrive` metres. A soldier on a route
+/// (`through`) keeps his pace, and so does a soldier whose regiment is in
+/// its charge (`charge_run`): he runs on until bodies stop him.
+fn arrive_share(dist: f32, arrive: f32, through: bool, charge_run: bool) -> f32 {
+    if through || charge_run { 1.0 } else { (dist / arrive).min(1.0) }
+}
+
+/// Under the friction contact a soldier of a regiment in its charge does
+/// not slow for his place: his regiment's places lie at the enemy's
+/// outline, often inside a friend that fights there, and he would slow to
+/// a walk short of that friend's back while the charge cry plays.
+fn charge_runs_home() -> bool {
+    friction_contact()
+}
+/// Under the friction contact a soldier of a regiment in its charge keeps
+/// his whole wish to run in: the soldiers ahead of him do not fade it
+/// (`yield_to_crowd`), so the regiment does not halt as one when its first
+/// soldiers touch a standing friend. The still men ahead still slow his
+/// body as they slow anyone's (`body_jam`, `steer`): he runs until he
+/// reaches them and then presses on them, so two charging regiments do not
+/// run through each other's ranks.
+fn charge_runs_in() -> bool {
+    friction_contact()
+}
+/// How close to his slot a parked man stands without stepping (metres):
+/// rigid slots sit exactly at the separation rest distance, so a dressed
+/// rank is force-free and can afford a tight tolerance; with 1.5 the
+/// ranks never finished dressing. At 0.7 a man brushed by a passer
+/// stays wherever he lands and the next passer shoves him further.
+pub(crate) const HOLD_DEADZONE: f32 = 0.3;
+/// A holding soldier who leaves his mark by more than the hold deadzone
+/// walks back at this pace at least, and keeps going until he is within
+/// STEP_STOP of it: a real step, never a creep. M2TW's slowest
+/// locomotion is its shuffle, 0.75 to 0.9 m/s.
+pub(crate) const STEP_PACE: f32 = 0.8;
+pub(crate) const STEP_STOP: f32 = 0.35;
+/// Going to an enemy he can see: M2TW's ready-stance `advance`
+/// (1.06 m/s) for the last few meters or with a comrade close ahead,
+/// its `combat_jog` (2.87 m/s) from further out over open ground.
+pub(crate) const ADVANCE_PACE: f32 = 1.06;
+pub(super) const COMBAT_JOG_PACE: f32 = 2.87;
+pub(super) const JOG_BEYOND: f32 = 3.0;
+
+/// Routing units flee at this fraction of their speed: fleeing at
+/// exactly max speed made pursuit a zero-kill treadmill.
+const ROUT_FLEE_FRAC: f32 = 0.9;
+
+/// Where he wants to go on his own account: a broken man flees for his
+/// map edge, a formed man walks to his slot under his regiment's order, at
+/// a pace set by slope and water, with a deadzone so a parked man does not
+/// jitter and a step that finishes once begun. Under the friction
+/// contact's brake a man out of formation with nobody in his reach walks
+/// to the fight instead (`joins_as_walker`, `join_goal`).
+#[inline]
+pub(super) fn drive(f: &Field, s: &mut Soldier, st: &mut Step) {
+    let Field { terrain, speed, team, home, orders, anchors, paths, .. } = *f;
+    let i = s.i;
+    let p = st.p;
+    let gi = st.gi;
+    let dying = st.dying;
+    let routed = st.routed;
+    // Units move ONLY under orders. A regiment order is one point rigidly
+    // translated by each unit's `home` offset (the block moves; it never
+    // converges). No order = hold at the anchor — a standing order: units
+    // drift back to their slot at reduced gain inside the block. Enemy
+    // contact is pure physics: cross-team separation blocks, crowd yield
+    // stops the shove, combat thins the block. The "front line" is where that
+    // collision is.
+    let mut desired = Vec2::ZERO;
+    if !dying && routed {
+        // Broken: flee toward the own map edge with a per-unit lateral
+        // scatter — slightly SLOWER than formed pursuers (0.9x): fleeing at
+        // exactly max speed made pursuit a zero-kill treadmill (gap frozen
+        // forever, counts flat for 30-45 s).
+        let flee_z: f32 = if team[i] == 0 { -1.0 } else { 1.0 };
+        let lat = (crate::units::hash01((i as u32).wrapping_mul(17) + 3) - 0.5)
+            * 0.7;
+        let dir = Vec2::new(lat, flee_z).normalize_or_zero();
+        let slope = terrain.slope_at(p.x, p.y);
+        desired = dir
+            * speed[i]
+            * ROUT_FLEE_FRAC
+            * terrain.wade_mult(p.x, p.y)
+            / (1.0 + 3.0 * slope * slope);
+    } else if !dying {
+        let holding = orders[gi].is_none();
+        let mut goal = orders[gi].unwrap_or(anchors[gi]) + home[i];
+        st.place_dist = goal.distance(p);
+        // On a route, a man whose straight way to his slot is blocked
+        // follows the route instead (sim/route.rs); short of the last leg
+        // he keeps his pace. He reads the route every LOOK_TICKS, when he
+        // reaches the point he chose, or when he has none, and walks on
+        // what he chose between reads.
+        let mut through = false;
+        match (paths.routes.get(gi).and_then(Option::as_ref), paths.nav) {
+            (Some(route), Some(nav)) => {
+                let frame = orders[gi].unwrap_or(anchors[gi]);
+                let way = *s.way;
+                let kept = !way.x.is_nan();
+                let at_way = kept && way.x.is_finite() && p.distance_squared(way) < 4.0;
+                if !kept || at_way || (i as u32).wrapping_add(f.tick).is_multiple_of(LOOK_TICKS) {
+                    let (t, th) = crate::sim::route::man_target(nav, terrain, route, frame, p, goal, i);
+                    *s.way = if t == goal && !th { Vec2::INFINITY } else if t == goal { Vec2::NEG_INFINITY } else { t };
+                    (goal, through) = (t, th);
+                } else if way.x.is_infinite() {
+                    through = way.x < 0.0;
+                } else {
+                    (goal, through) = (way, true);
+                }
+            }
+            _ => *s.way = Vec2::NAN,
+        }
+        let to_goal = goal - p;
+        let dist = to_goal.length();
+        // Hold deadzone: parked units don't jitter around their slot point
+        // (HOLD_DEADZONE). A soldier already stepping finishes the step
+        // (STEP_STOP) instead of stalling at the deadzone's edge.
+        let stepping = s.vel.xz().length_squared()
+            > (0.5 * STEP_PACE) * (0.5 * STEP_PACE);
+        let deadzone = if stepping { STEP_STOP } else { HOLD_DEADZONE };
+        st.parked = holding && dist < deadzone;
+        if !st.parked {
+            // Slope penalty: steep ground is slow ground. Wading the river is
+            // slow too (the bridge deck is dry: full speed).
+            let slope = terrain.slope_at(p.x, p.y);
+            let slope_mult = 1.0 / (1.0 + 3.0 * slope * slope);
+            let (gain, arrive) = if holding {
+                (0.6, 10.0)
+            } else {
+                (1.0, ARRIVE_RADIUS)
+            };
+            // In his regiment's charge (as `steer` gives the charge pace;
+            // dying and routed men never come here).
+            let charge_run = charge_runs_home() && f.charging[gi] && !f.fat_nocharge[gi];
+            let mut desired_speed = speed[i]
+                * slope_mult
+                * terrain.wade_mult(p.x, p.y)
+                * gain
+                * arrive_share(dist, arrive, through, charge_run);
+            if holding {
+                desired_speed = desired_speed
+                    .max(STEP_PACE * slope_mult * terrain.wade_mult(p.x, p.y));
+            }
+            if dist > 1e-3 {
+                desired = to_goal * (desired_speed / dist);
+            }
+        }
+    }
+    st.desired = desired;
+    // Out of formation, with no enemy in his reach last tick and no blow
+    // under way, he walks to the fight instead of to his slot
+    // (`joins_as_walker`): the scan then reads the men ahead of him on
+    // that way, and the brake stops him at the still men ahead like any
+    // walker. His slot wish is kept for the tick he comes back into
+    // formation.
+    if joins_as_walker()
+        && !dying
+        && !routed
+        && st.committed
+        && *s.sight & SIGHT_FOE == 0
+        && *s.swing & crate::units::SWING_STATE_MASK == crate::units::SWING_READY
+    {
+        st.slot_wish = desired;
+        st.joining = true;
+        // Arrived at the men ahead: a comrade in his way by his last look
+        // and himself standing since the still men ahead stopped him
+        // (`steer` sets his stood bit then), he stands with no wish until
+        // a step of room opens ahead (JOIN_ROOM). His own standing is
+        // read, never his speed: in a packed regiment the bodies around
+        // him move him more than a centimetre a tick, and read from his
+        // speed that push would make him a walker again, unbraced, and the
+        // ranks behind a front would shake. A joiner who kept his wish
+        // while the soldiers ahead hold him would never brace, and any
+        // creep ahead would let the rear walk into the backs ahead and
+        // drift back.
+        let arrived = *s.sight & SIGHT_WAY != 0 && *s.stood;
+        st.desired = if arrived { Vec2::ZERO } else { join_goal(f, s, st).1 };
+    }
+}
+
+/// Where a soldier walking to the fight goes (`joins_as_walker`): the way
+/// (a unit vector, zero for none) and his wish along it. `drive` makes his
+/// wish from it and `look_around` looks along the way, so his looks and
+/// his facing follow the way he walks. In this order:
+/// - an enemy he remembers (`remembered_foe`) within the short look
+///   (WIDE_ACQUIRE_R): toward him;
+/// - his regiment facing a way and holding a fighting line, and himself
+///   more than a ready body behind that line along the facing
+///   (`behind_the_line`): straight ahead along the facing, so a fighting
+///   regiment's rear walks up as a block and not as a clump about one
+///   point;
+/// - the enemy he remembers within his closing range: toward him;
+/// - his regiment's fight point while more than a metre off;
+/// - else nowhere.
+///
+/// Toward an enemy he goes at the jog over open ground more than
+/// JOG_BEYOND from him, else at the advance, slowing over his last 0.8 m
+/// and standing at his own stopping distance, between nine tenths of his
+/// reach and just inside it. Straight ahead and to the fight point he goes
+/// at the jog, or at the advance with a comrade ahead. "A comrade ahead" is
+/// his last look (`look_around`).
+#[inline]
+pub(super) fn join_goal(f: &Field, s: &Soldier, st: &Step) -> (Vec2, Vec2) {
+    let Field { pos_prev, engaged, hold, form_face, fight_line, .. } = *f;
+    let i = s.i;
+    let p = st.p;
+    let gi = st.gi;
+    let ahead = *s.sight & SIGHT_AHEAD != 0;
+    let memo = *s.target as usize;
+    let (d2, counts) = remembered_foe(f, i, p, gi, memo);
+    let dist = d2.sqrt();
+    let to_foe = |max_close: f32| {
+        let params = &TYPES[st.my_kind];
+        let to_enemy = pos_prev[memo].xz() - p;
+        let dir = to_enemy / dist.max(1e-6);
+        let own = crate::units::hash01((i as u32).wrapping_mul(0x3C1B) ^ 0x51F7);
+        let fight = FIGHT_SHARE * params.reach;
+        let stop = fight + 0.8 * (params.reach - fight) * own;
+        if dist <= stop || dist >= max_close {
+            return (dir, Vec2::ZERO);
+        }
+        let urge = ((dist - stop) / 0.8).clamp(0.0, 1.0);
+        let pace = if dist > JOG_BEYOND && !ahead { COMBAT_JOG_PACE } else { ADVANCE_PACE };
+        (dir, to_enemy * (pace * urge / dist))
+    };
+    let look = if engaged[gi] { seek_radius() } else { WIDE_ACQUIRE_R };
+    let max_close = if hold[gi] { 2.2 } else { look + 1.0 };
+    if counts && dist < WIDE_ACQUIRE_R {
+        return to_foe(max_close);
+    }
+    let face = form_face[gi];
+    let line = fight_line[gi];
+    if behind_the_line(face, line, p, ready_body()) {
+        let pace = if ahead { ADVANCE_PACE } else { COMBAT_JOG_PACE };
+        return (face, face * pace);
+    }
+    if counts {
+        return to_foe(max_close);
+    }
+    if let Some(fp) = st.join_fp {
+        let to_fp = fp - p;
+        let d = to_fp.length();
+        if d > 1.0 {
+            let pace = if ahead { ADVANCE_PACE } else { COMBAT_JOG_PACE };
+            return (to_fp / d, to_fp * (pace / d));
+        }
+        return (to_fp.normalize_or_zero(), Vec2::ZERO);
+    }
+    (Vec2::ZERO, Vec2::ZERO)
+}
+
+/// Whether a soldier at `p` stands more than `body` behind his regiment's
+/// fighting line `line` along its facing `face` (`join_goal`): never with
+/// no facing or no line (NaN).
+#[inline]
+fn behind_the_line(face: Vec2, line: f32, p: Vec2, body: f32) -> bool {
+    face != Vec2::ZERO && !line.is_nan() && line - p.dot(face) > body
+}
+
+/// What the crowd does to his drive: overlap corrections and pushes are
+/// clamped, and in a packed crowd the drive fades out so the mass cannot
+/// keep compressing itself.
+#[inline]
+pub(super) fn yield_to_crowd(f: &Field, st: &mut Step) {
+    let crowd = st.crowd;
+    let mut corr = st.corr;
+    let mut push = st.push;
+    let mut desired = st.desired;
+    let corr_len2 = corr.length_squared();
+    if corr_len2 > 1e-12 {
+        st.overlap_dir = corr / corr_len2.sqrt();
+        st.overlap_depth = corr_len2.sqrt() / CORR_GAIN;
+    }
+    // Every correction is applied, the sub-centimetre ones too: a threshold
+    // turns a steady lean into jumps of a centimetre.
+    if corr_len2 > CORR_MAX * CORR_MAX {
+        corr *= CORR_MAX / corr_len2.sqrt();
+    }
+    let push_len = push.length();
+    if push_len > SEP_PUSH_MAX {
+        push *= SEP_PUSH_MAX / push_len;
+    }
+    // Yield in dense crowds: goal drive fades out entirely so the mass can't
+    // keep compressing itself; `jam` (0 = free, 1 = packed) also damps the
+    // response below.
+    let (slow, stop) = st.brake;
+    let jam = if still_brake() {
+        // The friction contact's brake: the still men ahead of him against
+        // a band half as wide, for that smaller count.
+        let (slow, stop) = (0.5 * slow, 0.5 * stop);
+        ((st.crowd_still - slow) / (stop - slow)).clamp(0.0, 1.0)
+    } else {
+        ((crowd - slow) / (stop - slow)).clamp(0.0, 1.0)
+    };
+    // A soldier of a regiment in its charge keeps his whole wish to run in
+    // (`charge_runs_in`): the soldiers ahead of him do not fade it. Else the
+    // first soldiers to reach a standing friend stand, the rank behind them
+    // stands for them, and the whole regiment halts within a second of the
+    // first touch. His body is still slowed by the still men ahead as
+    // anyone's is (`body_jam`).
+    let pressed = jam;
+    let runs_in = charge_runs_in() && f.charging[st.gi] && !f.fat_nocharge[st.gi] && !st.dying && !st.routed;
+    let jam = if runs_in { 0.0 } else { jam };
+    st.wish = desired;
+    st.fade = desired * jam;
+    desired *= 1.0 - jam;
+    st.corr = corr;
+    st.push = push;
+    st.jam = jam;
+    st.body_jam = if runs_in { pressed } else { jam };
+    st.desired = desired;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A soldier walking to his place slows over the last metres; one on a
+    /// route, or in his regiment's charge, keeps his whole pace up to it.
+    #[test]
+    fn a_charging_soldier_does_not_slow_for_his_place() {
+        assert_eq!(arrive_share(70.0, ARRIVE_RADIUS, false, false), 1.0);
+        assert!((arrive_share(10.0, ARRIVE_RADIUS, false, false) - 10.0 / ARRIVE_RADIUS).abs() < 1e-6);
+        assert_eq!(arrive_share(10.0, ARRIVE_RADIUS, true, false), 1.0);
+        assert_eq!(arrive_share(10.0, ARRIVE_RADIUS, false, true), 1.0);
+        assert_eq!(arrive_share(0.5, ARRIVE_RADIUS, false, true), 1.0);
+    }
+
+    /// A joiner more than a ready body behind his regiment's fighting line
+    /// along its facing walks straight ahead; within a ready body of it, past
+    /// it, or with no line or no facing he does not.
+    #[test]
+    fn a_joiner_walks_straight_ahead_only_from_behind_the_line() {
+        let face = Vec2::new(0.0, 1.0);
+        let body = 0.9;
+        assert!(behind_the_line(face, 10.0, Vec2::new(3.0, 5.0), body));
+        assert!(behind_the_line(face, 10.0, Vec2::new(-40.0, 9.0), body));
+        assert!(!behind_the_line(face, 10.0, Vec2::new(0.0, 9.1), body));
+        assert!(!behind_the_line(face, 10.0, Vec2::new(0.0, 12.0), body));
+        assert!(!behind_the_line(face, f32::NAN, Vec2::new(0.0, 0.0), body));
+        assert!(!behind_the_line(Vec2::ZERO, 10.0, Vec2::new(0.0, 0.0), body));
+        let east = Vec2::new(1.0, 0.0);
+        assert!(behind_the_line(east, -20.0, Vec2::new(-25.0, 100.0), body));
+        assert!(!behind_the_line(east, -20.0, Vec2::new(-20.5, 100.0), body));
+    }
+}
