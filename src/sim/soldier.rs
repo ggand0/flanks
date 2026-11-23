@@ -4226,21 +4226,19 @@ mod tests {
         let plain = mass_pairs();
         for (brace, basic) in BRACE_CASES {
             let t = brace_table(brace, basic);
-            for a in 0..crate::unit_types::NUM_KINDS {
-                for o in 0..crate::unit_types::NUM_KINDS {
-                    for b in 0..BRACE_LEVELS {
-                        assert_eq!(t[a][o][b][b].to_bits(), plain[a][o].0.to_bits());
+            for (ta, pa) in t.iter().zip(plain) {
+                for (tao, pao) in ta.iter().zip(pa) {
+                    for (b, row) in tao.iter().enumerate() {
+                        assert_eq!(row[b].to_bits(), pao.0.to_bits());
                     }
                 }
             }
         }
         let t = brace_table(1.0, 1.0);
-        for a in 0..crate::unit_types::NUM_KINDS {
-            for o in 0..crate::unit_types::NUM_KINDS {
-                for bi in 0..BRACE_LEVELS {
-                    for bo in 0..BRACE_LEVELS {
-                        assert_eq!(t[a][o][bi][bo].to_bits(), plain[a][o].0.to_bits());
-                    }
+        for (ta, pa) in t.iter().zip(plain) {
+            for (tao, pao) in ta.iter().zip(pa) {
+                for w in tao.iter().flatten() {
+                    assert_eq!(w.to_bits(), pao.0.to_bits());
                 }
             }
         }
@@ -4362,11 +4360,12 @@ mod tests {
     fn a_braced_man_takes_little_of_the_setting_apart() {
         let t = brace_table(BRACE, BRACE_BASIC);
         let full_walk = BRACE_BASIC_FROM + 2;
-        for k in 0..crate::unit_types::NUM_KINDS {
-            assert!((t[k][k][3][0] - 2.0 / (1.0 + BRACE)).abs() < 1e-6);
-            assert!((t[k][k][0][3] - 2.0 * BRACE / (1.0 + BRACE)).abs() < 1e-6);
-            assert!((t[k][k][full_walk][0] - 2.0 / (1.0 + BRACE_BASIC)).abs() < 1e-6);
-            assert!((t[k][k][0][full_walk] - 2.0 * BRACE_BASIC / (1.0 + BRACE_BASIC)).abs() < 1e-6);
+        for (k, tk) in t.iter().enumerate() {
+            let own = &tk[k];
+            assert!((own[3][0] - 2.0 / (1.0 + BRACE)).abs() < 1e-6);
+            assert!((own[0][3] - 2.0 * BRACE / (1.0 + BRACE)).abs() < 1e-6);
+            assert!((own[full_walk][0] - 2.0 / (1.0 + BRACE_BASIC)).abs() < 1e-6);
+            assert!((own[0][full_walk] - 2.0 * BRACE_BASIC / (1.0 + BRACE_BASIC)).abs() < 1e-6);
         }
     }
 
@@ -4379,11 +4378,11 @@ mod tests {
         for (brace, basic) in BRACE_CASES {
             let t = brace_table(brace, basic);
             let braced = |k: usize, b: usize| TYPES[k].mass * brace_mult(b, brace, basic);
-            for a in 0..crate::unit_types::NUM_KINDS {
-                for o in 0..crate::unit_types::NUM_KINDS {
-                    for bi in 0..BRACE_LEVELS {
-                        for bo in 0..BRACE_LEVELS {
-                            let (wi, wo) = (t[a][o][bi][bo], t[o][a][bo][bi]);
+            for (a, ta) in t.iter().enumerate() {
+                for (o, tao) in ta.iter().enumerate() {
+                    for (bi, row) in tao.iter().enumerate() {
+                        for (bo, &wi) in row.iter().enumerate() {
+                            let wo = t[o][a][bo][bi];
                             assert!((wi + wo - 2.0).abs() < 1e-5, "{a} {o} {bi} {bo}: {wi} + {wo}");
                             let (mi, mo) = (braced(a, bi), braced(o, bo));
                             assert!((mi * wi - mo * wo).abs() < 1e-4 * mi.max(mo), "{a} {o} {bi} {bo}");
