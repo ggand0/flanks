@@ -139,10 +139,10 @@ pub struct Bound {
 }
 
 /// The farthest any drawn corner reached under `FL_OCCLUDE_CHECK`, plus
-/// 15 cm, rounded up to 5 cm. Measured 2026-10-13 over three battles in the
-/// low flank view (40k for four minutes with the clips and again with
-/// `FL_CLIPS=0`, and 8k for five and a half minutes), and 2026-11-16 over
-/// the 200k clash for four minutes on the friction contact in the mid-air
+/// 15 cm, rounded up to 5 cm. Measured over three battles in the low flank
+/// view (40k for four minutes with the clips and again with `FL_CLIPS=0`,
+/// and 8k for five and a half minutes), and over the 200k clash for four
+/// minutes on the friction contact in the mid-air
 /// view from the west and in the low flank view on both contact paths, the
 /// charge test, and the archer sandbox with the archers in melee, with their
 /// swords out, and as the target. A box holds the farthest reach of all of
@@ -176,8 +176,8 @@ pub const BOUNDS: [[Bound; 2]; NUM_KINDS] = {
 /// `FL_OCCLUDE_CHECK`, plus 15 cm, rounded up to 5 cm. A body lies on the
 /// ground along the way he fell, so its box is flat and reaches out on one
 /// side only: under a packed crowd seen low it hides behind the standing
-/// men. Measured 2026-11-16 over the 200k clash for four minutes on the
-/// friction contact in the mid-air view from the west and in the low flank
+/// men. Measured over the 200k clash for four minutes on the friction
+/// contact in the mid-air view from the west and in the low flank
 /// view on both contact paths, the charge test, and the archer sandbox with
 /// the archers in melee, with their swords out, and as the target. Down
 /// reaches up to 2.01 m below the record position, more than a body on
@@ -228,7 +228,7 @@ pub struct Flat {
 }
 
 /// `FL_SETTLED_BOX=0`: a settled body is tested with the falling box
-/// instead, for A/B runs. Read once.
+/// instead, to set the two boxes side by side. Read once.
 pub fn settled_box() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| crate::util::env_or("FL_SETTLED_BOX", 1_u32) != 0)

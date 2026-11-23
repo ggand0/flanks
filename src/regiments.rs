@@ -2467,10 +2467,10 @@ mod tests {
         }
     }
 
-    /// Off Line Debug the deployment is the old arithmetic: every anchor
-    /// matches the formula from before the gapless rank, bit for bit.
+    /// Off Line Debug the deployment lays its blocks at an even pitch
+    /// along each rank: every anchor matches that formula, bit for bit.
     #[test]
-    fn grassland_anchors_keep_the_old_layout() {
+    fn grassland_anchors_keep_the_even_pitch_layout() {
         let setups = [
             (100_000, 1000, frac_comp(100), [25, 25, 25, 25]),
             (10_000, 500, [6, 5, 5, 4], [3, 7, 4, 6]),
