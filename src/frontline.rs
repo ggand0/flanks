@@ -1029,12 +1029,12 @@ fn draw_fight_points(
     }
 }
 
-/// With FL_ATTACK_FRONT=3 and the debug overlay on (F3), for each
-/// selected regiment under an attack order with a living target. The
-/// contact point is where the line from the regiment's centre to its
-/// target's centre first crosses an enemy outline (orders.rs
-/// `outline_contact`), drawn as a ring with a post joined to the
-/// regiment's centre, with the enemy outline it was cut against in
+/// With the attack front on (orders.rs `attack_front`) and the debug
+/// overlay on (F3), for each selected regiment under an attack order with
+/// a living target. The contact point is where the line from the
+/// regiment's centre to its target's centre first crosses an enemy outline
+/// (orders.rs `outline_contact`), drawn as a ring with a post joined to
+/// the regiment's centre, with the enemy outline it was cut against in
 /// orange. With a friend between, the regiment is sent there: the ring
 /// is bright yellow and the regiment's own outline where it will stand
 /// (at its goal, facing along the line) is cyan. With no friend between,

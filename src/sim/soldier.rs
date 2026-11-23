@@ -266,25 +266,27 @@ pub(crate) fn mass_pairs() -> &'static [[(f32, f32); crate::unit_types::NUM_KIND
         })
     })
 }
-/// The contact between a man and the body he runs into. By default the
-/// two share the closing speed by weight (half each between equal men),
-/// so a shove travels through a press and a deep mass pushes a line.
-/// FL_CONTACT=wall plays the soft wall instead: the runner's legs lose
-/// the closing speed over his give and the man hit is handed none of it.
+/// The contact between a man and the body he runs into when the friction
+/// contact is off. FL_CONTACT=share: the two share the closing speed by
+/// weight (half each between equal men), so a shove travels through a
+/// press and a deep mass pushes a line. FL_CONTACT=wall plays the soft
+/// wall instead: the runner's legs lose the closing speed over his give
+/// and the man hit is handed none of it.
 fn share_contact() -> bool {
     static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *S.get_or_init(|| !std::env::var("FL_CONTACT").is_ok_and(|v| v == "wall"))
 }
-/// FL_CONTACT=friction plays the friction contact instead: no spring
-/// between men, no grip, no stance and no contact speed. The setting apart
-/// moves him, his kept speed is where he ended up, and what the contacts
-/// put into that speed his feet take back at FEET (`steer`, `integrate`).
+/// The friction contact, on by default; FL_CONTACT=share or FL_CONTACT=wall
+/// turns it off (`share_contact`). No spring between men, no grip, no
+/// stance and no contact speed. The setting apart moves him, his kept
+/// speed is where he ended up, and what the contacts put into that speed
+/// his feet take back at FEET (`steer`, `integrate`).
 /// The one thing that stands in for a stance is the bracing: in the
 /// setting apart a man braced against a push (`brace_pairs`) holds his
 /// ground, and the man who walks into him takes most of it.
 pub(crate) fn friction_contact() -> bool {
     static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *S.get_or_init(|| std::env::var("FL_CONTACT").is_ok_and(|v| v == "friction"))
+    *S.get_or_init(|| !std::env::var("FL_CONTACT").is_ok_and(|v| v == "share" || v == "wall"))
 }
 /// Under the friction contact, how many times his weight a man braced
 /// against a push counts for when two bodies are set apart: his feet are

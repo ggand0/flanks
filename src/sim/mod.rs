@@ -1029,14 +1029,13 @@ mod tests {
     /// ready stance, so only the Move order tells the walkers from the line.
     /// It prints how far the line was carried, how many walkers got behind
     /// its rear rank and the closest two men came. Run it once per brace:
-    /// FL_CONTACT=friction FL_BRACE=1 cargo test -- --ignored --nocapture bracing_scene
+    /// FL_BRACE=1 cargo test -- --ignored --nocapture bracing_scene
     #[test]
     #[ignore]
     fn bracing_scene() {
-        assert_eq!(
-            std::env::var("FL_CONTACT").as_deref(),
-            Ok("friction"),
-            "the bracing scene runs under the friction contact only: set FL_CONTACT=friction"
+        assert!(
+            soldier::friction_contact(),
+            "the bracing scene runs under the friction contact only: leave FL_CONTACT unset"
         );
         bevy::tasks::ComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
         bevy::tasks::AsyncComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);

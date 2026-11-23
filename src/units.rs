@@ -137,7 +137,7 @@ pub struct Units {
     /// `choose_opening`), a point on the ground; NaN when he has none. He
     /// looks wide only every few ticks and keeps what he found between.
     pub aim: Column<Vec2>,
-    /// Under the friction contact (FL_CONTACT=friction, sim/soldier.rs
+    /// Under the friction contact (sim/soldier.rs `friction_contact`,
     /// `steer`, `integrate`): the speed the contacts have put into him
     /// that his feet have not yet taken back. Zero otherwise.
     pub imposed: Column<Vec2>,

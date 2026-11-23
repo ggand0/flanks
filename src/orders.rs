@@ -396,15 +396,20 @@ impl GroupData {
     }
 }
 
-/// FL_ATTACK_FRONT=3: an attacker with a living friend between it and its
+/// The attack front: an attacker with a living friend between it and its
 /// target lays its front rank on the enemy's outline where the line to the
 /// target crosses it (`Groups::front_on_outline`), so it stands behind the
 /// friend instead of walking into the friend's ranks toward the target's
-/// centre. Unset or any other value: every attacker goes for the target's
-/// centre.
+/// centre. On by default under the friction contact and off without it
+/// (sim/soldier.rs `friction_contact`); FL_ATTACK_FRONT=3 turns it on and
+/// any other value turns it off under either contact. Off, every attacker
+/// goes for the target's centre.
 pub(crate) fn attack_front() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("FL_ATTACK_FRONT").is_ok_and(|v| v == "3"))
+    *ON.get_or_init(|| match std::env::var("FL_ATTACK_FRONT") {
+        Ok(v) => v == "3",
+        Err(_) => crate::sim::soldier::friction_contact(),
+    })
 }
 
 #[derive(Resource, Default)]
@@ -450,7 +455,7 @@ impl Groups {
         }
     }
 
-    /// FL_ATTACK_FRONT=3: for regiment `g` attacking `t`, None when no
+    /// The attack front: for regiment `g` attacking `t`, None when no
     /// living friend stands between them (`outline_contact`), else (the
     /// goal, the contact point).
     pub(crate) fn front_on_outline(&self, g: usize, t: usize) -> Option<(Vec2, Vec2)> {
@@ -458,7 +463,7 @@ impl Groups {
             .and_then(|(goal, point, friend)| friend.then_some((goal, point)))
     }
 
-    /// FL_ATTACK_FRONT=3: for regiment `g` attacking `t`, (the goal on the
+    /// The attack front: for regiment `g` attacking `t`, (the goal on the
     /// outline, the contact point, whether a living friend stands between
     /// them), whatever the friend test finds; None only when the two
     /// centroids coincide. Only `front_on_outline` sends a regiment to this
@@ -503,7 +508,7 @@ impl Groups {
     }
 }
 
-/// FL_ATTACK_FRONT=3: how far along the line from `a` in the unit
+/// The attack front: how far along the line from `a` in the unit
 /// direction `d` it first meets regiment `hd`'s outline. The outline is
 /// the formation code's own block (`formation::block_rect`: about the
 /// centroid, turned to the facing, files and ranks at the spacing as the
