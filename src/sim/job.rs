@@ -904,31 +904,7 @@ fn goes_to(groups: &Groups, m: usize) -> Option<Vec2> {
 /// (`formation::choose_open`); FL_LOG_OPEN=1 logs each look where it does.
 fn open_for_passers(groups: &mut Groups, terrain: &Terrain, tracks: &crate::arrows::RegTracks, tick: u32) {
     let n = groups.list.len();
-    for m in 0..n {
-        if !tick.wrapping_add(m as u32).is_multiple_of(ARCHER_LOOK) {
-            continue;
-        }
-        let gl: &Groups = &*groups;
-        let md = &gl.list[m];
-        // Walking, it passes an open friend within OPEN_KEEP of it. It
-        // stays passing while any of its men stands inside one, its order
-        // done or not: its tail is still in the friend when its block
-        // has walked on or its head arrives.
-        let near = goes_to(gl, m).is_some() && {
-            let bound = crate::formation::block_bound(md);
-            let rect = crate::formation::block_rect(md);
-            gl.list.iter().enumerate().any(|(h, hd)| {
-                h != m
-                    && hd.team == md.team
-                    && hd.spacing == crate::formation::FormSpacing::Open
-                    && hd.centroid.distance(md.centroid) - bound - crate::formation::block_bound(hd)
-                        <= OPEN_KEEP
-                    && rect_gap(&rect, &crate::formation::block_rect(hd)) <= OPEN_KEEP
-            })
-        };
-        let passing = near || keep_inside() && md.passing && md.inside.iter().any(|&(_, c)| c > 0);
-        groups.list[m].passing = passing;
-    }
+    mark_passers(groups, tick);
     for h in 0..n {
         if !tick.wrapping_add(h as u32).is_multiple_of(ARCHER_LOOK) {
             continue;
@@ -1042,6 +1018,37 @@ fn open_for_passers(groups: &mut Groups, terrain: &Terrain, tracks: &crate::arro
             crate::formation::close_order(gd);
             info!("regiment {h} closes");
         }
+    }
+}
+
+/// Each walking regiment's passing flag, on its look (`open_for_passers`).
+#[inline]
+fn mark_passers(groups: &mut Groups, tick: u32) {
+    let n = groups.list.len();
+    for m in 0..n {
+        if !tick.wrapping_add(m as u32).is_multiple_of(ARCHER_LOOK) {
+            continue;
+        }
+        let gl: &Groups = &*groups;
+        let md = &gl.list[m];
+        // Walking, it passes an open friend within OPEN_KEEP of it. It
+        // stays passing while any of its men stands inside one, its order
+        // done or not: its tail is still in the friend when its block
+        // has walked on or its head arrives.
+        let near = goes_to(gl, m).is_some() && {
+            let bound = crate::formation::block_bound(md);
+            let rect = crate::formation::block_rect(md);
+            gl.list.iter().enumerate().any(|(h, hd)| {
+                h != m
+                    && hd.team == md.team
+                    && hd.spacing == crate::formation::FormSpacing::Open
+                    && hd.centroid.distance(md.centroid) - bound - crate::formation::block_bound(hd)
+                        <= OPEN_KEEP
+                    && rect_gap(&rect, &crate::formation::block_rect(hd)) <= OPEN_KEEP
+            })
+        };
+        let passing = near || keep_inside() && md.passing && md.inside.iter().any(|&(_, c)| c > 0);
+        groups.list[m].passing = passing;
     }
 }
 
@@ -1161,7 +1168,6 @@ fn skirmish_reactions(
     let n = groups.list.len();
     for g in 0..n {
         let gd = &groups.list[g];
-        let range = crate::unit_types::bow_range(gd.kind);
         let bows = gd.kind == crate::unit_types::KIND_ARCHER
             && !gd.melee
             && gd.count > 0
@@ -1194,121 +1200,155 @@ fn skirmish_reactions(
         if !tick.wrapping_add(g as u32).is_multiple_of(ARCHER_LOOK) {
             continue;
         }
-        let gl: &Groups = &*groups;
-        let gd = &gl.list[g];
-        let vel = |t: usize| tracks.vel.get(t).copied().unwrap_or(Vec2::ZERO);
-        let horizon = if gd.skirmishing { APPROACH_S + SKIRMISH_RETREAT_S } else { APPROACH_S };
-        let standing = gd.order.is_none() || gd.standoff || gd.skirmish_hold.is_some();
-        let cap = if standing { 0.8 * range } else { 1.1 * range };
-        // A running regiment's path is the run's; a standing one, or one
-        // without an order, has none: none of them holds.
-        let own_dir = if gd.skirmishing || gd.standoff || gd.order.is_none() {
-            None
-        } else {
-            heading_of(gl, g, vel(g))
-        };
-        // The path ahead starts at the leading men: a column strung out
-        // round a friendly block is seen by its head. A regiment already
-        // holding looks SKIRMISH_NEAR further, the hysteresis: it walks on
-        // once the block has fallen that much further off than where it
-        // stopped the regiment.
-        let ahead = SKIRMISH_WALK_AHEAD.min(range - 3.0)
-            + gd.lead.max(0.0)
-            + if gd.skirmish_hold.is_some() { SKIRMISH_NEAR } else { 0.0 };
-        let mut run = able && gd.engaged;
-        // The block the run is from (the nearest enemy block when the
-        // regiment is engaged): what a cornered regiment shoots. `why`
-        // names the trigger for the log.
-        let mut run_from: Option<(f32, u32)> = None;
-        let mut why = "engaged";
-        let mut hold: Option<(f32, u32)> = None;
-        for e in 0..n {
-            let ed = &gl.list[e];
-            if ed.team == gd.team || ed.count == 0 || ed.state.is_broken() {
-                continue;
-            }
-            let Some(gap) = gap_within(gd, ed, SKIRMISH_SCOPE * range) else {
-                continue;
-            };
-            if run {
-                if run_from.is_none_or(|(rg, _)| gap < rg) {
-                    run_from = Some((gap, e as u32));
-                }
-                continue;
-            }
-            if able && gap <= SKIRMISH_NEAR {
-                (run, why) = (true, "near");
-                run_from = Some((gap, e as u32));
-                continue;
-            }
-            if able && approach_hits(gl, g, e, vel(e), horizon, cap) {
-                (run, why) = (true, "coming");
-                run_from = Some((gap, e as u32));
-                continue;
-            }
-            if let Some(dir) = own_dir
-                && let Some(s) = path_hit(gl, g, dir, ahead, e)
-                && hold.is_none_or(|(hs, _)| s < hs)
-            {
-                hold = Some((s, e as u32));
-            }
+        let look = skirmish_look(groups, g, tracks, terrain, tick, able);
+        skirmish_act(&mut groups.list[g], g, look);
+    }
+}
+
+/// One archer regiment's look for a skirmish run: whether it runs and
+/// from which block, the block in its path it stands for, and where it
+/// would run to when its look is due.
+#[inline]
+fn skirmish_look(
+    groups: &Groups,
+    g: usize,
+    tracks: &crate::arrows::RegTracks,
+    terrain: &Terrain,
+    tick: u32,
+    able: bool,
+) -> SkirmishLook {
+    let n = groups.list.len();
+    let range = crate::unit_types::bow_range(groups.list[g].kind);
+    let gl: &Groups = groups;
+    let gd = &gl.list[g];
+    let vel = |t: usize| tracks.vel.get(t).copied().unwrap_or(Vec2::ZERO);
+    let horizon = if gd.skirmishing { APPROACH_S + SKIRMISH_RETREAT_S } else { APPROACH_S };
+    let standing = gd.order.is_none() || gd.standoff || gd.skirmish_hold.is_some();
+    let cap = if standing { 0.8 * range } else { 1.1 * range };
+    // A running regiment's path is the run's; a standing one, or one
+    // without an order, has none: none of them holds.
+    let own_dir = if gd.skirmishing || gd.standoff || gd.order.is_none() {
+        None
+    } else {
+        heading_of(gl, g, vel(g))
+    };
+    // The path ahead starts at the leading men: a column strung out
+    // round a friendly block is seen by its head. A regiment already
+    // holding looks SKIRMISH_NEAR further, the hysteresis: it walks on
+    // once the block has fallen that much further off than where it
+    // stopped the regiment.
+    let ahead = SKIRMISH_WALK_AHEAD.min(range - 3.0)
+        + gd.lead.max(0.0)
+        + if gd.skirmish_hold.is_some() { SKIRMISH_NEAR } else { 0.0 };
+    let mut run = able && gd.engaged;
+    // The block the run is from (the nearest enemy block when the
+    // regiment is engaged): what a cornered regiment shoots. `why`
+    // names the trigger for the log.
+    let mut run_from: Option<(f32, u32)> = None;
+    let mut why = "engaged";
+    let mut hold: Option<(f32, u32)> = None;
+    for e in 0..n {
+        let ed = &gl.list[e];
+        if ed.team == gd.team || ed.count == 0 || ed.state.is_broken() {
+            continue;
         }
-        let hold = hold.map(|(_, e)| e);
-        // A running or cornered regiment looks for its point every
-        // RETREAT_REFRESH ticks; one about to run looks now.
-        let due = if gd.skirmishing || gd.skirmish_hold.is_some() {
-            tick.wrapping_add(g as u32).is_multiple_of(RETREAT_REFRESH)
-        } else {
-            true
+        let Some(gap) = gap_within(gd, ed, SKIRMISH_SCOPE * range) else {
+            continue;
         };
-        let point = if run && due { retreat_point(gl, g, tracks, terrain) } else { None };
-        let gd = &mut groups.list[g];
         if run {
-            if !due {
-                // On its way, or cornered and standing, until the next look.
-            } else if let Some(p) = point {
-                if !gd.skirmishing {
-                    gd.skirmish_saved = gd.order;
-                    gd.skirmishing = true;
-                    match run_from {
-                        Some((gap, e)) => {
-                            info!("regiment {g} runs (skirmish): block {e} {why}, gap {gap:.1} m")
-                        }
-                        None => info!("regiment {g} runs (skirmish): {why}"),
-                    }
-                }
-                gd.skirmish_hold = None;
-                gd.order = Some(crate::orders::Order::Move(p));
-                gd.auto_order = true;
-                gd.skirmish_to = Some(p);
-            } else {
-                // Cornered: no room to run. The regiment stands and shoots
-                // until room appears or the trigger lapses.
-                if gd.skirmishing {
-                    end_skirmish(gd);
-                }
-                let at = run_from.map(|(_, e)| e);
-                if gd.skirmish_hold.is_none() && at.is_some() {
-                    info!("regiment {g} is cornered, stands and shoots");
-                    pin_frame_at_head(gd);
-                }
-                gd.skirmish_hold = at;
+            if run_from.is_none_or(|(rg, _)| gap < rg) {
+                run_from = Some((gap, e as u32));
             }
+            continue;
+        }
+        if able && gap <= SKIRMISH_NEAR {
+            (run, why) = (true, "near");
+            run_from = Some((gap, e as u32));
+            continue;
+        }
+        if able && approach_hits(gl, g, e, vel(e), horizon, cap) {
+            (run, why) = (true, "coming");
+            run_from = Some((gap, e as u32));
+            continue;
+        }
+        if let Some(dir) = own_dir
+            && let Some(s) = path_hit(gl, g, dir, ahead, e)
+            && hold.is_none_or(|(hs, _)| s < hs)
+        {
+            hold = Some((s, e as u32));
+        }
+    }
+    let hold = hold.map(|(_, e)| e);
+    // A running or cornered regiment looks for its point every
+    // RETREAT_REFRESH ticks; one about to run looks now.
+    let due = if gd.skirmishing || gd.skirmish_hold.is_some() {
+        tick.wrapping_add(g as u32).is_multiple_of(RETREAT_REFRESH)
+    } else {
+        true
+    };
+    let point = if run && due { retreat_point(gl, g, tracks, terrain) } else { None };
+    SkirmishLook { run, run_from, why, hold, due, point }
+}
+
+/// What `skirmish_look` found.
+struct SkirmishLook {
+    run: bool,
+    run_from: Option<(f32, u32)>,
+    why: &'static str,
+    hold: Option<u32>,
+    due: bool,
+    point: Option<Vec2>,
+}
+
+/// The run, the cornered stand or the hold that the look calls for.
+#[inline]
+fn skirmish_act(gd: &mut GroupData, g: usize, look: SkirmishLook) {
+    let SkirmishLook { run, run_from, why, hold, due, point } = look;
+    if run {
+        if !due {
+            // On its way, or cornered and standing, until the next look.
+        } else if let Some(p) = point {
+            if !gd.skirmishing {
+                gd.skirmish_saved = gd.order;
+                gd.skirmishing = true;
+                match run_from {
+                    Some((gap, e)) => {
+                        info!("regiment {g} runs (skirmish): block {e} {why}, gap {gap:.1} m")
+                    }
+                    None => info!("regiment {g} runs (skirmish): {why}"),
+                }
+            }
+            gd.skirmish_hold = None;
+            gd.order = Some(crate::orders::Order::Move(p));
+            gd.auto_order = true;
+            gd.skirmish_to = Some(p);
         } else {
+            // Cornered: no room to run. The regiment stands and shoots
+            // until room appears or the trigger lapses.
             if gd.skirmishing {
                 end_skirmish(gd);
-                info!("regiment {g} ends its run (skirmish)");
-            } else if hold != gd.skirmish_hold {
-                match hold {
-                    Some(e) => info!("regiment {g} stands and shoots at block {e} in its path"),
-                    None => info!("regiment {g} walks on"),
-                }
-                if gd.skirmish_hold.is_none() {
-                    pin_frame_at_head(gd);
-                }
             }
-            gd.skirmish_hold = hold;
+            let at = run_from.map(|(_, e)| e);
+            if gd.skirmish_hold.is_none() && at.is_some() {
+                info!("regiment {g} is cornered, stands and shoots");
+                pin_frame_at_head(gd);
+            }
+            gd.skirmish_hold = at;
         }
+    } else {
+        if gd.skirmishing {
+            end_skirmish(gd);
+            info!("regiment {g} ends its run (skirmish)");
+        } else if hold != gd.skirmish_hold {
+            match hold {
+                Some(e) => info!("regiment {g} stands and shoots at block {e} in its path"),
+                None => info!("regiment {g} walks on"),
+            }
+            if gd.skirmish_hold.is_none() {
+                pin_frame_at_head(gd);
+            }
+        }
+        gd.skirmish_hold = hold;
     }
 }
 
@@ -1335,87 +1375,11 @@ fn archer_fire_solutions(
     tick: u32,
 ) -> FireSolutions {
     let n_groups = groups.list.len();
-    let vel = |t: usize| tracks.vel.get(t).copied().unwrap_or(Vec2::ZERO);
     scans.resize_with(n_groups, Default::default);
 
     // The stand-off of every archer regiment under an attack order.
     for g in 0..n_groups {
-        let gd = &groups.list[g];
-        // With swords out the order is a charge like any infantry's.
-        let archer = gd.kind == crate::unit_types::KIND_ARCHER
-            && !gd.melee
-            && gd.count > 0
-            && !gd.state.is_broken();
-        let target = match gd.order {
-            Some(crate::orders::Order::Attack(t)) if archer => t,
-            _ => {
-                let gd = &mut groups.list[g];
-                gd.standoff = false;
-                gd.standoff_target = None;
-                gd.fire_place = None;
-                continue;
-            }
-        };
-        let td = &groups.list[target as usize];
-        if td.count == 0 {
-            continue;
-        }
-        let t_vel = vel(target as usize);
-        let place = firing_place(gd, td, terrain);
-        let fresh = gd.standoff_target != Some(target);
-        let was = gd.standoff && !fresh;
-        // A fresh order shoots where it stands when it can; a standing
-        // regiment stands until the frame it holds is out of range; a
-        // marching one halts where its leading men arrive at the firing
-        // place, which is in range by its construction.
-        let now = if fresh {
-            in_bow_range(gd, td, t_vel, terrain)
-        } else if was {
-            frame_in_bow_range(gd, gd.anchor, td, t_vel, terrain)
-        } else {
-            head_arrived(gd, place) && frame_in_bow_range(gd, place, td, t_vel, terrain)
-        };
-        let to_target = td.centroid - gd.centroid;
-        if now != gd.standoff || fresh {
-            let gap = edge_gap(gd, td);
-            let reach = bow_reach_toward(gd, gd.centroid, td, t_vel, terrain);
-            info!(
-                "regiment {g} {} its target {target} (gap {gap:.1} m, reach {reach:.1} m, \
-                 place {:.1} m off, lead {:.1} m{})",
-                if now { "stands off" } else { "marches at" },
-                gd.centroid.distance(place),
-                gd.lead,
-                if fresh { ", fresh order" } else { "" },
-            );
-        }
-        let gd = &mut groups.list[g];
-        gd.standoff_target = Some(target);
-        gd.standoff = now;
-        gd.fire_place = Some(place);
-        if now && !was {
-            // Entering the stand-off pins the frame: a march pins it to
-            // the firing place its men already walk to, with the slots
-            // dealt in the men's present order, so nobody walks back; a
-            // fresh order in range freezes it where the regiment stands
-            // (the anchor snap engagement does), so the men dress where
-            // they stopped instead of walking back to a stale anchor.
-            if !fresh {
-                gd.anchor = place;
-                gd.reform = true;
-            } else if gd.anchor.distance(gd.centroid) > 2.0 {
-                gd.anchor = gd.centroid;
-            }
-        }
-        if !now
-            && (fresh || was)
-            && gd.shape == crate::formation::FormShape::Rect
-            && to_target.length() > 1.0
-        {
-            // The march begins: face the way we go and dress for it. In
-            // range the order turns nothing.
-            gd.facing = crate::formation::facing_of(to_target);
-            gd.reform = true;
-        }
+        stand_off(groups, g, tracks, terrain);
     }
 
     // What each archer regiment's bows shoot at this tick, and the blocks
@@ -1426,118 +1390,7 @@ fn archer_fire_solutions(
     let gl: &Groups = &*groups;
     let mut search_blocks: Vec<Vec<u32>> = vec![Vec::new(); n_groups];
     let shoot_at: Vec<Option<ShootAt>> = (0..n_groups)
-        .map(|g| {
-            let gd = &gl.list[g];
-            if gd.kind != crate::unit_types::KIND_ARCHER
-                || gd.melee
-                || gd.count == 0
-                || gd.state.is_broken()
-                || gd.melee_ticks > 0
-            {
-                return None;
-            }
-            let live = |e: usize| {
-                let eg = &gl.list[e];
-                eg.team != gd.team && eg.count > 0 && !eg.state.is_broken()
-            };
-            // With fire at will on, the enemy blocks about: one coming for
-            // the regiment within the approach horizon (`danger`), the
-            // nearest in range that is not in melee, and those in melee.
-            // The look is made every ARCHER_LOOK ticks and kept between
-            // looks; a block that died since is dropped.
-            let range = crate::unit_types::bow_range(gd.kind);
-            let scan = &mut scans[g];
-            if !gd.fire_at_will {
-                *scan = ArcherScan::default();
-            } else if scan.tick == u32::MAX || tick.wrapping_add(g as u32).is_multiple_of(ARCHER_LOOK)
-            {
-                let mut danger: Option<(f32, usize)> = None;
-                let mut best_free: Option<(f32, usize)> = None;
-                let mut busy: Vec<(f32, usize)> = Vec::new();
-                for e in 0..n_groups {
-                    if !live(e) {
-                        continue;
-                    }
-                    let eg = &gl.list[e];
-                    let Some(gap) = gap_within(gd, eg, range * 1.5) else {
-                        continue;
-                    };
-                    if danger.is_none_or(|(bg, _)| gap < bg)
-                        && approach_hits(gl, g, e, vel(e), APPROACH_S, range * 0.8)
-                    {
-                        danger = Some((gap, e));
-                    }
-                    if !in_bow_range(gd, eg, vel(e), terrain) {
-                        continue;
-                    }
-                    if eg.engaged {
-                        busy.push((gap, e));
-                    } else if best_free.is_none_or(|(bg, _)| gap < bg) {
-                        best_free = Some((gap, e));
-                    }
-                }
-                *scan = ArcherScan { tick, danger, best_free, busy };
-            }
-            let danger = scan.danger.filter(|&(_, e)| live(e));
-            let best_free = scan.best_free.filter(|&(_, e)| live(e));
-            let mut busy: Vec<(f32, usize)> =
-                scan.busy.iter().copied().filter(|&(_, e)| live(e)).collect();
-            // A regiment standing instead of walking into an enemy block
-            // shoots that block, whatever its order and fire at will say,
-            // unless a block is coming for it.
-            let held = gd.skirmish_hold.map(|h| h as usize).filter(|&h| live(h));
-            let (t, search) = match gd.order {
-                _ if danger.is_none() && held.is_some() => {
-                    let h = held.unwrap_or_default();
-                    (h, gl.list[h].engaged)
-                }
-                // On the march the bows stay down; a cornered regiment
-                // shoots at will.
-                Some(crate::orders::Order::Move(_)) if gd.skirmish_hold.is_none() => return None,
-                // The ordered target, once standing off, unless a block is
-                // coming for the regiment: the men turn their bows on that
-                // one first, whatever the order. At a block in melee the
-                // men shoot its clear members only.
-                Some(crate::orders::Order::Attack(t))
-                    if gd.skirmish_hold.is_none() && danger.is_none() =>
-                {
-                    let t = t as usize;
-                    if !gd.standoff || !live(t) {
-                        return None;
-                    }
-                    (t, gl.list[t].engaged)
-                }
-                // Fire at will: the block coming for the regiment, every
-                // man on it (with skirmish on, the run takes the regiment
-                // away before this); else the nearest block in range that
-                // is not in melee; else the men search the blocks in
-                // melee, nearest first. Fire at will off: nothing.
-                _ => {
-                    if let Some((_, e)) = danger {
-                        (e, true)
-                    } else if let Some((_, e)) = best_free {
-                        (e, false)
-                    } else {
-                        busy.sort_by(|a, b| a.0.total_cmp(&b.0));
-                        let (_, e) = *busy.first()?;
-                        search_blocks[g] =
-                            busy.iter().take(SEARCH_BLOCKS).map(|&(_, e)| e as u32).collect();
-                        (e, true)
-                    }
-                }
-            };
-            if search && search_blocks[g].is_empty() {
-                search_blocks[g].push(t as u32);
-            }
-            let tg = &gl.list[t];
-            Some(ShootAt {
-                c: tg.centroid,
-                vel: vel(t),
-                r: tg.radius.clamp(3.0, 25.0),
-                t,
-                search,
-            })
-        })
+        .map(|g| bows_target(gl, g, tracks, terrain, &mut scans[g], &mut search_blocks[g], tick))
         .collect();
     // The card's firing mark: a fire solution, arrows to spend on it and,
     // in a search, clear men to shoot (the lists of the last tick run).
@@ -1550,6 +1403,231 @@ fn archer_fire_solutions(
         });
         groups.list[g].firing = has_men && groups.list[g].ammo_left > 0;
     }
+    let (targeted, searched) = under_fire(&shoot_at, &search_blocks, n_groups);
+    let clear_blocks = clear_blocks_near(groups, &searched, kept_clear_blocks, tick);
+    let blocks = loft_blocks(groups, terrain);
+
+    FireSolutions {
+        shoot_at,
+        targeted,
+        searched,
+        search_blocks,
+        clear_blocks,
+        blocks,
+    }
+}
+
+/// One regiment's stand-off: in range of its attack target it stands
+/// and shoots, out of range it marches to the firing place.
+#[inline]
+fn stand_off(groups: &mut Groups, g: usize, tracks: &crate::arrows::RegTracks, terrain: &Terrain) {
+    let vel = |t: usize| tracks.vel.get(t).copied().unwrap_or(Vec2::ZERO);
+    let gd = &groups.list[g];
+    // With swords out the order is a charge like any infantry's.
+    let archer = gd.kind == crate::unit_types::KIND_ARCHER
+        && !gd.melee
+        && gd.count > 0
+        && !gd.state.is_broken();
+    let target = match gd.order {
+        Some(crate::orders::Order::Attack(t)) if archer => t,
+        _ => {
+            let gd = &mut groups.list[g];
+            gd.standoff = false;
+            gd.standoff_target = None;
+            gd.fire_place = None;
+            return;
+        }
+    };
+    let td = &groups.list[target as usize];
+    if td.count == 0 {
+        return;
+    }
+    let t_vel = vel(target as usize);
+    let place = firing_place(gd, td, terrain);
+    let fresh = gd.standoff_target != Some(target);
+    let was = gd.standoff && !fresh;
+    // A fresh order shoots where it stands when it can; a standing
+    // regiment stands until the frame it holds is out of range; a
+    // marching one halts where its leading men arrive at the firing
+    // place, which is in range by its construction.
+    let now = if fresh {
+        in_bow_range(gd, td, t_vel, terrain)
+    } else if was {
+        frame_in_bow_range(gd, gd.anchor, td, t_vel, terrain)
+    } else {
+        head_arrived(gd, place) && frame_in_bow_range(gd, place, td, t_vel, terrain)
+    };
+    let to_target = td.centroid - gd.centroid;
+    if now != gd.standoff || fresh {
+        let gap = edge_gap(gd, td);
+        let reach = bow_reach_toward(gd, gd.centroid, td, t_vel, terrain);
+        info!(
+            "regiment {g} {} its target {target} (gap {gap:.1} m, reach {reach:.1} m, \
+             place {:.1} m off, lead {:.1} m{})",
+            if now { "stands off" } else { "marches at" },
+            gd.centroid.distance(place),
+            gd.lead,
+            if fresh { ", fresh order" } else { "" },
+        );
+    }
+    let gd = &mut groups.list[g];
+    gd.standoff_target = Some(target);
+    gd.standoff = now;
+    gd.fire_place = Some(place);
+    if now && !was {
+        // Entering the stand-off pins the frame: a march pins it to
+        // the firing place its men already walk to, with the slots
+        // dealt in the men's present order, so nobody walks back; a
+        // fresh order in range freezes it where the regiment stands
+        // (the anchor snap engagement does), so the men dress where
+        // they stopped instead of walking back to a stale anchor.
+        if !fresh {
+            gd.anchor = place;
+            gd.reform = true;
+        } else if gd.anchor.distance(gd.centroid) > 2.0 {
+            gd.anchor = gd.centroid;
+        }
+    }
+    if !now
+        && (fresh || was)
+        && gd.shape == crate::formation::FormShape::Rect
+        && to_target.length() > 1.0
+    {
+        // The march begins: face the way we go and dress for it. In
+        // range the order turns nothing.
+        gd.facing = crate::formation::facing_of(to_target);
+        gd.reform = true;
+    }
+}
+
+/// What one archer regiment's bows shoot at this tick, and the blocks
+/// its men search in (`search_in`).
+#[inline]
+fn bows_target(
+    gl: &Groups,
+    g: usize,
+    tracks: &crate::arrows::RegTracks,
+    terrain: &Terrain,
+    scan: &mut ArcherScan,
+    search_in: &mut Vec<u32>,
+    tick: u32,
+) -> Option<ShootAt> {
+    let n_groups = gl.list.len();
+    let vel = |t: usize| tracks.vel.get(t).copied().unwrap_or(Vec2::ZERO);
+    let gd = &gl.list[g];
+    if gd.kind != crate::unit_types::KIND_ARCHER
+        || gd.melee
+        || gd.count == 0
+        || gd.state.is_broken()
+        || gd.melee_ticks > 0
+    {
+        return None;
+    }
+    let live = |e: usize| {
+        let eg = &gl.list[e];
+        eg.team != gd.team && eg.count > 0 && !eg.state.is_broken()
+    };
+    // With fire at will on, the enemy blocks about: one coming for
+    // the regiment within the approach horizon (`danger`), the
+    // nearest in range that is not in melee, and those in melee.
+    // The look is made every ARCHER_LOOK ticks and kept between
+    // looks; a block that died since is dropped.
+    let range = crate::unit_types::bow_range(gd.kind);
+    if !gd.fire_at_will {
+        *scan = ArcherScan::default();
+    } else if scan.tick == u32::MAX || tick.wrapping_add(g as u32).is_multiple_of(ARCHER_LOOK)
+    {
+        let mut danger: Option<(f32, usize)> = None;
+        let mut best_free: Option<(f32, usize)> = None;
+        let mut busy: Vec<(f32, usize)> = Vec::new();
+        for e in 0..n_groups {
+            if !live(e) {
+                continue;
+            }
+            let eg = &gl.list[e];
+            let Some(gap) = gap_within(gd, eg, range * 1.5) else {
+                continue;
+            };
+            if danger.is_none_or(|(bg, _)| gap < bg)
+                && approach_hits(gl, g, e, vel(e), APPROACH_S, range * 0.8)
+            {
+                danger = Some((gap, e));
+            }
+            if !in_bow_range(gd, eg, vel(e), terrain) {
+                continue;
+            }
+            if eg.engaged {
+                busy.push((gap, e));
+            } else if best_free.is_none_or(|(bg, _)| gap < bg) {
+                best_free = Some((gap, e));
+            }
+        }
+        *scan = ArcherScan { tick, danger, best_free, busy };
+    }
+    let danger = scan.danger.filter(|&(_, e)| live(e));
+    let best_free = scan.best_free.filter(|&(_, e)| live(e));
+    let mut busy: Vec<(f32, usize)> =
+        scan.busy.iter().copied().filter(|&(_, e)| live(e)).collect();
+    // A regiment standing instead of walking into an enemy block
+    // shoots that block, whatever its order and fire at will say,
+    // unless a block is coming for it.
+    let held = gd.skirmish_hold.map(|h| h as usize).filter(|&h| live(h));
+    let (t, search) = match gd.order {
+        _ if danger.is_none() && held.is_some() => {
+            let h = held.unwrap_or_default();
+            (h, gl.list[h].engaged)
+        }
+        // On the march the bows stay down; a cornered regiment
+        // shoots at will.
+        Some(crate::orders::Order::Move(_)) if gd.skirmish_hold.is_none() => return None,
+        // The ordered target, once standing off, unless a block is
+        // coming for the regiment: the men turn their bows on that
+        // one first, whatever the order. At a block in melee the
+        // men shoot its clear members only.
+        Some(crate::orders::Order::Attack(t))
+            if gd.skirmish_hold.is_none() && danger.is_none() =>
+        {
+            let t = t as usize;
+            if !gd.standoff || !live(t) {
+                return None;
+            }
+            (t, gl.list[t].engaged)
+        }
+        // Fire at will: the block coming for the regiment, every
+        // man on it (with skirmish on, the run takes the regiment
+        // away before this); else the nearest block in range that
+        // is not in melee; else the men search the blocks in
+        // melee, nearest first. Fire at will off: nothing.
+        _ => {
+            if let Some((_, e)) = danger {
+                (e, true)
+            } else if let Some((_, e)) = best_free {
+                (e, false)
+            } else {
+                busy.sort_by(|a, b| a.0.total_cmp(&b.0));
+                let (_, e) = *busy.first()?;
+                *search_in =
+                    busy.iter().take(SEARCH_BLOCKS).map(|&(_, e)| e as u32).collect();
+                (e, true)
+            }
+        }
+    };
+    if search && search_in.is_empty() {
+        search_in.push(t as u32);
+    }
+    let tg = &gl.list[t];
+    Some(ShootAt {
+        c: tg.centroid,
+        vel: vel(t),
+        r: tg.radius.clamp(3.0, 25.0),
+        t,
+        search,
+    })
+}
+
+/// The regiments under fire this tick, and those under search.
+#[inline]
+fn under_fire(shoot_at: &[Option<ShootAt>], search_blocks: &[Vec<u32>], n_groups: usize) -> (Vec<bool>, Vec<bool>) {
     // Regiments under fire this tick, and those under search. The job
     // lists their living members (`target_members`, built on the worker
     // from its shared columns) and the searched ones' clear members
@@ -1567,6 +1645,18 @@ fn archer_fire_solutions(
             }
         }
     }
+    (targeted, searched)
+}
+
+/// The shooters' side's blocks near each searched block (`clear_reach`).
+#[inline]
+fn clear_blocks_near(
+    groups: &Groups,
+    searched: &[bool],
+    kept_clear_blocks: Vec<Vec<crate::formation::BlockRect>>,
+    tick: u32,
+) -> Vec<Vec<crate::formation::BlockRect>> {
+    let n_groups = groups.list.len();
     // The blocks of the shooters' side within a shaft's reach of each
     // searched block, by the gap between the edges, as rectangles: a man
     // of the searched block farther than that reach from every one of
@@ -1603,6 +1693,12 @@ fn archer_fire_solutions(
                 .collect()
         })
         .collect();
+    clear_blocks
+}
+
+/// Each team's live formed regiments as discs with a clearance ceiling.
+#[inline]
+fn loft_blocks(groups: &Groups, terrain: &Terrain) -> [Vec<(Vec2, f32, f32)>; 2] {
     // Friendly blocks per team for the loft-over-friendlies check: every
     // live formed regiment as a disc with a clearance ceiling. A
     // shooter's own regiment is in here too — that is what makes rear
@@ -1623,15 +1719,7 @@ fn archer_fire_solutions(
             })
             .collect()
     });
-
-    FireSolutions {
-        shoot_at,
-        targeted,
-        searched,
-        search_blocks,
-        clear_blocks,
-        blocks,
-    }
+    blocks
 }
 
 /// How far a shaft aimed at a man can come down from him: the corner of
