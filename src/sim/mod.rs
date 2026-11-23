@@ -297,123 +297,46 @@ pub fn refresh_shared_terrain(terrain: Res<Terrain>, mut shared: ResMut<SharedTe
 /// Run one kinematic tick on the job's data: the regiment runs and the
 /// member lists of the regiments under fire, the grid rebuild, the
 /// density field, then the parallel integrate. No ECS access, so it can
-/// run on any thread. The kernel below is the long-standing integrate
-/// loop, verbatim: only the binding preamble changed when the tick
-/// became a job. Every scope in here, the grid rebuild's and the field's
-/// included, goes through `util::sim_scope`.
+/// run on any thread. The kernel (`integrate_chunks`) is the long-standing
+/// integrate loop, verbatim: only the binding preamble changed when the
+/// tick became a job. Every scope in here, the grid rebuild's and the
+/// field's included, goes through `util::sim_scope`.
 fn run_tick_job(job: &mut TickJob) {
-    let (generation, hit_flash) = (job.generation, job.hit_flash);
     let terrain_arc = job.terrain.clone().expect("terrain snapshot set at prep");
     let terrain: &Terrain = &terrain_arc;
-    let dt = job.dt;
-    let tick_seed = job.tick_seed;
+    let t2 = rebuild_beside_products(job);
+    integrate_chunks(job, terrain);
+    job.step_ms = t2.elapsed().as_secs_f32() * 1000.0;
+    let TickJob { tick, pos_in, grid, plan_requests, plans, nav, audit, .. } = job;
+    // The routes asked for at the kick, planned now that the soldiers are
+    // done; the install hands them back.
+    match nav.as_deref() {
+        Some(nav) => {
+            let _span = info_span!("plan_routes").entered();
+            route::plan_all(nav, plan_requests, plans);
+        }
+        None => plans.clear(),
+    }
+    // The neighbour audit's sums on its ticks, from this tick's grid and
+    // start positions; the tick count goes up by one at the install.
+    *audit = diag::audit_tick(tick.wrapping_add(1)).then(|| diag::neighbour_sums(grid, &pos_in[..]));
+}
+
+/// The grid rebuild, and beside it on the same pool the render snapshot,
+/// the regiment runs and sums, the members of the regiments under fire
+/// and search, and the density field. Returns when the integrate's clock
+/// starts.
+fn rebuild_beside_products(job: &mut TickJob) -> Instant {
+    let (generation, hit_flash) = (job.generation, job.hit_flash);
     let tick = job.tick;
-    let bounds_min = job.bounds_min;
-    let bounds_max = job.bounds_max;
-    let faces_spearwall = job.faces_spearwall;
     let TickJob {
-        pos_in,
-        speed,
-        team,
-        kind,
-        group,
-        home,
-        vel_in,
-        yaw_in,
-        yaw_prev_in,
-        target_in,
-        swing_in,
-        swing_t_in,
-        flash_in,
-        death_t_in,
-        ammo_in,
-        out_form_in,
-        sight_in,
-        chain_in,
-        way_in,
-        pose_in,
-        stuck_in,
-        aim_in,
-        imposed_in,
-        stood_in,
-        quarry_in,
-        pos_out,
-        vel,
-        yaw,
-        yaw_prev,
-        target,
-        swing,
-        swing_t,
-        flash,
-        death_t,
-        ammo,
-        out_form,
-        sight,
-        chain,
-        way,
-        pose,
-        stuck,
-        aim,
-        imposed,
-        stood,
-        quarry,
-        orders,
-        anchors,
-        reg_broken,
-        press,
-        moving,
-        passing,
-        stance,
-        focus,
-        engaged,
-        contact,
-        fight_point,
-        fight_line,
-        melee_ticks,
-        hold,
-        threat,
-        form_face,
-        wall,
-        group_wall,
-        charging,
-        fat_speed,
-        fat_nocharge,
-        shoot_at,
-        targeted,
-        blocks,
-        reg_runs,
-        target_members,
-        searched,
-        search_blocks,
-        sidearm,
-        clear_members,
-        clear_blocks,
-        field,
-        field_wanted,
-        dead,
-        at_edge,
-        grid,
-        events,
-        arrow_spawns,
-        grid_ms,
-        step_ms,
-        field_ms,
-        plan_requests,
-        plans,
-        routes,
-        nav,
-        audit,
-        pack,
-        pos_prev_in,
-        color_in,
-        group_sums,
-        sum_inputs,
-        sums_wanted,
-        ..
+        pos_in, team, kind, group, home, vel_in, yaw_in, yaw_prev_in, target_in, swing_in, swing_t_in,
+        flash_in, death_t_in, sight_in, pose_in, stood_in, orders, group_wall, targeted, reg_runs,
+        target_members, searched, clear_members, clear_blocks, field, field_wanted, grid, grid_ms, field_ms,
+        pack, pos_prev_in, color_in, group_sums, sum_inputs, sums_wanted, ..
     } = job;
 
     let pos_prev = &pos_in[..];
-    let speed = &speed[..];
     let team = &team[..];
     let kind = &kind[..];
     let group = &group[..];
@@ -426,7 +349,7 @@ fn run_tick_job(job: &mut TickJob) {
     // the gaps between the rebuild's passes: the render snapshot (first,
     // the frame asks for it soonest), the regiment runs and members, and
     // the density field. None reads what another writes, and the kernel
-    // below needs all four done. The rebuild and the field are timed on
+    // after it needs all four done. The rebuild and the field are timed on
     // their own: each its own work from its start to its end, while the
     // others run beside it.
     let field_wanted = *field_wanted;
@@ -544,99 +467,96 @@ fn run_tick_job(job: &mut TickJob) {
     });
     let t2 = Instant::now();
     *field_ms = field_took.iter().copied().fold(0.0, f32::max);
+    t2
+}
 
-    let grid = &*grid;
-    let orders = &orders[..];
-    let anchors = &anchors[..];
-    let broken = &reg_broken[..];
-    let press = &press[..];
-    let moving = &moving[..];
-    let passing = &passing[..];
-    let stance = &stance[..];
-    let focus = &focus[..];
-    let engaged = &engaged[..];
-    let contact = &contact[..];
-    let fight_point = &fight_point[..];
-    let fight_line = &fight_line[..];
-    let melee_ticks = &melee_ticks[..];
-    let hold = &hold[..];
-    let threat = &threat[..];
-    let form_face = &form_face[..];
-    let wall = &wall[..];
-    let charging = &charging[..];
-    let fat_speed = &fat_speed[..];
-    let fat_nocharge = &fat_nocharge[..];
-    let shoot_at = &shoot_at[..];
-    let target_members = &target_members[..];
-    let clear_members = &clear_members[..];
-    let search_blocks = &search_blocks[..];
-    let sidearm = &sidearm[..];
-    let blocks = &*blocks;
+/// The parallel integrate: every soldier through his stages, a chunk of
+/// CHUNK rows a task, each chunk's rows copied in from the shared columns
+/// first; then the death sweep's candidates of every chunk, in chunk
+/// order.
+fn integrate_chunks(job: &mut TickJob, terrain: &Terrain) {
+    let dt = job.dt;
+    let tick_seed = job.tick_seed;
+    let tick = job.tick;
+    let bounds_min = job.bounds_min;
+    let bounds_max = job.bounds_max;
+    let faces_spearwall = job.faces_spearwall;
+    let TickJob {
+        pos_in, speed, team, kind, group, home, vel_in, yaw_in, yaw_prev_in, target_in, swing_in, swing_t_in,
+        flash_in, death_t_in, ammo_in, out_form_in, sight_in, chain_in, way_in, pose_in, stuck_in, aim_in,
+        imposed_in, stood_in, quarry_in, pos_out, vel, yaw, yaw_prev, target, swing, swing_t, flash, death_t,
+        ammo, out_form, sight, chain, way, pose, stuck, aim, imposed, stood, quarry, orders, anchors,
+        reg_broken, press, moving, passing, stance, focus, engaged, contact, fight_point, fight_line,
+        melee_ticks, hold, threat, form_face, wall, charging, fat_speed, fat_nocharge, shoot_at, blocks,
+        target_members, search_blocks, sidearm, clear_members, dead, at_edge, grid, events, arrow_spawns,
+        routes, nav, ..
+    } = job;
+    let team = &team[..];
+    let death_t_in = &death_t_in[..];
     let field = soldier::Field {
-        grid,
+        grid: &*grid,
         terrain,
-        pos_prev,
-        speed,
+        pos_prev: &pos_in[..],
+        speed: &speed[..],
         team,
-        kind,
-        group,
-        home,
-        yaw_snap,
-        orders,
-        anchors,
-        broken,
-        press,
-        moving,
-        passing,
-        stance,
-        focus,
-        engaged,
-        contact,
-        fight_point,
-        fight_line,
-        melee_ticks,
-        hold,
-        threat,
-        form_face,
-        wall,
-        charging,
-        fat_speed,
-        fat_nocharge,
-        shoot_at,
-        target_members,
-        clear_members,
-        search_blocks,
-        sidearm,
+        kind: &kind[..],
+        group: &group[..],
+        home: &home[..],
+        yaw_snap: &yaw_in[..],
+        orders: &orders[..],
+        anchors: &anchors[..],
+        broken: &reg_broken[..],
+        press: &press[..],
+        moving: &moving[..],
+        passing: &passing[..],
+        stance: &stance[..],
+        focus: &focus[..],
+        engaged: &engaged[..],
+        contact: &contact[..],
+        fight_point: &fight_point[..],
+        fight_line: &fight_line[..],
+        melee_ticks: &melee_ticks[..],
+        hold: &hold[..],
+        threat: &threat[..],
+        form_face: &form_face[..],
+        wall: &wall[..],
+        charging: &charging[..],
+        fat_speed: &fat_speed[..],
+        fat_nocharge: &fat_nocharge[..],
+        shoot_at: &shoot_at[..],
+        target_members: &target_members[..],
+        clear_members: &clear_members[..],
+        search_blocks: &search_blocks[..],
+        sidearm: &sidearm[..],
         death_snap: death_t_in,
-        blocks,
-        faces_spearwall,
-        dt,
-        tick_seed,
-        tick,
-        bounds_min,
-        bounds_max,
+        blocks: &*blocks,
+        faces_spearwall, dt, tick_seed, tick, bounds_min, bounds_max,
         paths: route::KernelRoutes { routes: &routes[..], nav: nav.as_deref() },
     };
     let f = &field;
     // The shared read-modify-write columns, for the copy-in per chunk.
-    let vel_in = &vel_in[..];
-    let yaw_in = &yaw_in[..];
-    let yaw_prev_in = &yaw_prev_in[..];
-    let target_in = &target_in[..];
-    let swing_in = &swing_in[..];
-    let swing_t_in = &swing_t_in[..];
-    let flash_in = &flash_in[..];
-    let ammo_in = &ammo_in[..];
-    let out_form_in = &out_form_in[..];
-    let sight_in = &sight_in[..];
-    let chain_in = &chain_in[..];
-    let way_in = &way_in[..];
-    let pose_in = &pose_in[..];
-    let stuck_in = &stuck_in[..];
-    let aim_in = &aim_in[..];
-    let imposed_in = &imposed_in[..];
-    let stood_in = &stood_in[..];
-    let quarry_in = &quarry_in[..];
+    let ins = RowsIn {
+        vel: &vel_in[..],
+        yaw: &yaw_in[..],
+        yaw_prev: &yaw_prev_in[..],
+        target: &target_in[..],
+        swing: &swing_in[..],
+        swing_t: &swing_t_in[..],
+        flash: &flash_in[..],
+        death_t: death_t_in,
+        ammo: &ammo_in[..],
+        out_form: &out_form_in[..],
+        sight: &sight_in[..],
+        way: &way_in[..],
+        chain: &chain_in[..],
+        pose: &pose_in[..],
+        quarry: &quarry_in[..],
+        stuck: &stuck_in[..],
+        aim: &aim_in[..],
+        imposed: &imposed_in[..],
+        stood: &stood_in[..],
+    };
+    let ins = &ins;
     // The map edges a router leaves the field at (combat.rs), widened by
     // the charge knockback the apply pass can still add to a position:
     // the sweep's candidate list must hold every man it might remove.
@@ -673,29 +593,8 @@ fn run_tick_job(job: &mut TickJob) {
                 death_t), events), ammo), arrows), out_form), sight), way), chain), pose), quarry), stuck), aim),
                 imposed), stood) = chunk;
             let start = ci * CHUNK;
-            let end = start + pos.len();
             scope.spawn(async move {
-                // The chunk's rows, copied in from the shared columns.
-                vel.copy_from_slice(&vel_in[start..end]);
-                yaw.copy_from_slice(&yaw_in[start..end]);
-                yaw_prev.copy_from_slice(&yaw_prev_in[start..end]);
-                target.copy_from_slice(&target_in[start..end]);
-                swing.copy_from_slice(&swing_in[start..end]);
-                swing_t.copy_from_slice(&swing_t_in[start..end]);
-                flash.copy_from_slice(&flash_in[start..end]);
-                death_t.copy_from_slice(&death_t_in[start..end]);
-                ammo.copy_from_slice(&ammo_in[start..end]);
-                out_form.copy_from_slice(&out_form_in[start..end]);
-                sight.copy_from_slice(&sight_in[start..end]);
-                way.copy_from_slice(&way_in[start..end]);
-                chain.copy_from_slice(&chain_in[start..end]);
-                pose.copy_from_slice(&pose_in[start..end]);
-                quarry.copy_from_slice(&quarry_in[start..end]);
-                stuck.copy_from_slice(&stuck_in[start..end]);
-                aim.copy_from_slice(&aim_in[start..end]);
-                imposed.copy_from_slice(&imposed_in[start..end]);
-                stood.copy_from_slice(&stood_in[start..end]);
-                let rows = soldier::Rows {
+                let mut rows = soldier::Rows {
                     start,
                     pos: &mut *pos,
                     vel,
@@ -718,26 +617,11 @@ fn run_tick_job(job: &mut TickJob) {
                     imposed,
                     stood,
                 };
+                ins.copy_into(&mut rows);
                 events.clear();
                 let mut out = soldier::ChunkOut { events, arrows };
                 soldier::tick_chunk(f, rows, &mut out);
-                // The sweep's candidates from this chunk: countdowns that
-                // just ran out, and living men near their own map edge.
-                let mut dead = Vec::new();
-                let mut at_edge = Vec::new();
-                for j in 0..pos.len() {
-                    let i = start + j;
-                    if death_t[j] == 1 {
-                        dead.push(i as u32);
-                    } else if death_t[j] == 0 {
-                        let z = pos[j].z;
-                        let out = if team[i] == 0 { z < edge_lo } else { z > edge_hi };
-                        if out {
-                            at_edge.push(i as u32);
-                        }
-                    }
-                }
-                (dead, at_edge)
+                sweep_candidates(start, pos, death_t, team, edge_lo, edge_hi)
             });
         }
     });
@@ -748,19 +632,85 @@ fn run_tick_job(job: &mut TickJob) {
         dead.extend(d);
         at_edge.extend(e);
     }
-    *step_ms = t2.elapsed().as_secs_f32() * 1000.0;
-    // The routes asked for at the kick, planned now that the soldiers are
-    // done; the install hands them back.
-    match nav.as_deref() {
-        Some(nav) => {
-            let _span = info_span!("plan_routes").entered();
-            route::plan_all(nav, plan_requests, plans);
-        }
-        None => plans.clear(),
+}
+
+/// The shared columns a chunk's rows are copied in from.
+struct RowsIn<'a> {
+    vel: &'a [Vec3],
+    yaw: &'a [f32],
+    yaw_prev: &'a [f32],
+    target: &'a [u32],
+    swing: &'a [u8],
+    swing_t: &'a [u8],
+    flash: &'a [u8],
+    death_t: &'a [u8],
+    ammo: &'a [u8],
+    out_form: &'a [bool],
+    sight: &'a [u16],
+    way: &'a [Vec2],
+    chain: &'a [u8],
+    pose: &'a [u8],
+    quarry: &'a [u32],
+    stuck: &'a [u16],
+    aim: &'a [Vec2],
+    imposed: &'a [Vec2],
+    stood: &'a [bool],
+}
+
+impl RowsIn<'_> {
+    /// The chunk's rows, copied in from the shared columns.
+    #[inline]
+    fn copy_into(&self, rows: &mut soldier::Rows) {
+        let start = rows.start;
+        let end = start + rows.pos.len();
+        rows.vel.copy_from_slice(&self.vel[start..end]);
+        rows.yaw.copy_from_slice(&self.yaw[start..end]);
+        rows.yaw_prev.copy_from_slice(&self.yaw_prev[start..end]);
+        rows.target.copy_from_slice(&self.target[start..end]);
+        rows.swing.copy_from_slice(&self.swing[start..end]);
+        rows.swing_t.copy_from_slice(&self.swing_t[start..end]);
+        rows.flash.copy_from_slice(&self.flash[start..end]);
+        rows.death_t.copy_from_slice(&self.death_t[start..end]);
+        rows.ammo.copy_from_slice(&self.ammo[start..end]);
+        rows.out_form.copy_from_slice(&self.out_form[start..end]);
+        rows.sight.copy_from_slice(&self.sight[start..end]);
+        rows.way.copy_from_slice(&self.way[start..end]);
+        rows.chain.copy_from_slice(&self.chain[start..end]);
+        rows.pose.copy_from_slice(&self.pose[start..end]);
+        rows.quarry.copy_from_slice(&self.quarry[start..end]);
+        rows.stuck.copy_from_slice(&self.stuck[start..end]);
+        rows.aim.copy_from_slice(&self.aim[start..end]);
+        rows.imposed.copy_from_slice(&self.imposed[start..end]);
+        rows.stood.copy_from_slice(&self.stood[start..end]);
     }
-    // The neighbour audit's sums on its ticks, from this tick's grid and
-    // start positions; the tick count goes up by one at the install.
-    *audit = diag::audit_tick(tick.wrapping_add(1)).then(|| diag::neighbour_sums(grid, pos_prev));
+}
+
+/// The sweep's candidates from a chunk starting at row `start`: countdowns
+/// that just ran out, and living men near their own map edge.
+#[inline]
+fn sweep_candidates(
+    start: usize,
+    pos: &[Vec3],
+    death_t: &[u8],
+    team: &[u8],
+    edge_lo: f32,
+    edge_hi: f32,
+) -> (Vec<u32>, Vec<u32>) {
+    let mut dead = Vec::new();
+    let mut at_edge = Vec::new();
+    for j in 0..pos.len() {
+        let i = start + j;
+        if death_t[j] == 1 {
+            dead.push(i as u32);
+        } else if death_t[j] == 0 {
+            let z = pos[j].z;
+            let out = if team[i] == 0 { z < edge_lo } else { z > edge_hi };
+            if out {
+                at_edge.push(i as u32);
+            }
+        }
+    }
+    (dead, at_edge)
 }
 
 #[allow(clippy::too_many_arguments)] // bevy system params
@@ -823,30 +773,9 @@ pub fn step_sim(
     // handles on the shared columns are released first (already done at
     // the take on the threaded path), so the columns the install
     // replaces are unique and come back as the next tick's output
-    // buffers: no copy, no allocation. pos_prev <- the state at tick
-    // start (the job's shared position column), pos <- the new
-    // kinematics.
+    // buffers: no copy, no allocation.
     let tick_log_install = crate::frame_log::tick::time(crate::frame_log::tick::Part::StepInstall);
-    job.release_inputs();
-    {
-        let u = &mut *units;
-        macro_rules! install {
-            ($($col:ident <- $out:ident),*) => {$(
-                let released = u.$col.install(std::mem::take(&mut job.$out));
-                job.$out = std::sync::Arc::try_unwrap(released).unwrap_or_default();
-            )*};
-        }
-        let tick_start = u.pos.install(std::mem::take(&mut job.pos_out));
-        let released = u.pos_prev.install_shared(tick_start);
-        job.pos_out = std::sync::Arc::try_unwrap(released).unwrap_or_default();
-        install!(
-            vel <- vel, yaw <- yaw, yaw_prev <- yaw_prev, target <- target, swing <- swing,
-            swing_t <- swing_t, flash <- flash, death_t <- death_t, ammo <- ammo,
-            out_form <- out_form, sight <- sight, way <- way, chain <- chain,
-            pose <- pose, quarry <- quarry, stuck <- stuck, aim <- aim,
-            imposed <- imposed, stood <- stood
-        );
-    }
+    install_job(&mut job, &mut units);
     // The sweep's candidates (combat.rs), ascending.
     pipeline.sweep_candidates.clear();
     pipeline.sweep_candidates.extend_from_slice(&job.dead);
@@ -885,6 +814,46 @@ pub fn step_sim(
     pipeline.tick = pipeline.tick.wrapping_add(1);
     let tick = pipeline.tick;
     let audit = job.audit.take();
+    audit_and_log(audit, tick, &units, &grid, &mut stats);
+
+    pipeline.scratch = Some(job);
+}
+
+/// The install: the job's output columns become the live ones, and the
+/// columns they replace come back as the job's next output buffers.
+/// pos_prev <- the state at tick start (the job's shared position
+/// column), pos <- the new kinematics.
+#[inline]
+fn install_job(job: &mut TickJob, u: &mut Units) {
+    job.release_inputs();
+    macro_rules! install {
+        ($($col:ident <- $out:ident),*) => {$(
+            let released = u.$col.install(std::mem::take(&mut job.$out));
+            job.$out = std::sync::Arc::try_unwrap(released).unwrap_or_default();
+        )*};
+    }
+    let tick_start = u.pos.install(std::mem::take(&mut job.pos_out));
+    let released = u.pos_prev.install_shared(tick_start);
+    job.pos_out = std::sync::Arc::try_unwrap(released).unwrap_or_default();
+    install!(
+        vel <- vel, yaw <- yaw, yaw_prev <- yaw_prev, target <- target, swing <- swing,
+        swing_t <- swing_t, flash <- flash, death_t <- death_t, ammo <- ammo,
+        out_form <- out_form, sight <- sight, way <- way, chain <- chain,
+        pose <- pose, quarry <- quarry, stuck <- stuck, aim <- aim,
+        imposed <- imposed, stood <- stood
+    );
+}
+
+/// The installed tick's numbers: the neighbour audit on its ticks, the
+/// FL_HASH fingerprint and the spike line.
+#[inline]
+fn audit_and_log(
+    audit: Option<diag::NeighbourSums>,
+    tick: u32,
+    units: &Units,
+    grid: &SpatialGrid,
+    stats: &mut SimStats,
+) {
     if diag::audit_tick(tick) {
         let _frame_log = crate::frame_log::time_audit();
         let _tick_log_audit = crate::frame_log::tick::time(crate::frame_log::tick::Part::StepAudit);
@@ -894,13 +863,11 @@ pub fn step_sim(
         // and these positions.
         let sums = audit
             .filter(|sums| sums.of(&units.pos_prev[..]))
-            .unwrap_or_else(|| diag::neighbour_sums(&grid, &units.pos_prev[..]));
-        diag::audit_stats(&mut stats, &sums, &units.pos[..], &units.pos_prev[..]);
+            .unwrap_or_else(|| diag::neighbour_sums(grid, &units.pos_prev[..]));
+        diag::audit_stats(stats, &sums, &units.pos[..], &units.pos_prev[..]);
     }
-    diag::fingerprint(tick, &units);
-    diag::spike_line(&stats, tick, units.pos.len());
-
-    pipeline.scratch = Some(job);
+    diag::fingerprint(tick, units);
+    diag::spike_line(stats, tick, units.pos.len());
 }
 
 /// Kick the next tick's job once this tick is completely over: after the
@@ -1000,24 +967,7 @@ mod tests {
         job.field_wanted = false;
         job.sums_wanted = false;
         run_tick_job(job);
-        job.release_inputs();
-        let u = &mut *units;
-        macro_rules! install {
-            ($($col:ident <- $out:ident),*) => {$(
-                let released = u.$col.install(std::mem::take(&mut job.$out));
-                job.$out = std::sync::Arc::try_unwrap(released).unwrap_or_default();
-            )*};
-        }
-        let tick_start = u.pos.install(std::mem::take(&mut job.pos_out));
-        let released = u.pos_prev.install_shared(tick_start);
-        job.pos_out = std::sync::Arc::try_unwrap(released).unwrap_or_default();
-        install!(
-            vel <- vel, yaw <- yaw, yaw_prev <- yaw_prev, target <- target, swing <- swing,
-            swing_t <- swing_t, flash <- flash, death_t <- death_t, ammo <- ammo,
-            out_form <- out_form, sight <- sight, way <- way, chain <- chain,
-            pose <- pose, quarry <- quarry, stuck <- stuck, aim <- aim,
-            imposed <- imposed, stood <- stood
-        );
+        install_job(job, units);
     }
 
     /// The bracing scene under the friction contact: a holding line of 8
