@@ -57,8 +57,9 @@ fn scripts_active() -> bool {
 fn ai_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // FL_ENEMY_STATIC=1 / FL_ARENA=1: practice-dummy modes — the enemy
-    // spawns in hold-position (regiments.rs) and the strategy AI stands
-    // down, so regiments defend where they stand but never advance.
+    // spawns in hold-position (regiments.rs, scenes/arena.rs) and the
+    // strategy AI stands down, so regiments defend where they stand but
+    // never advance.
     // Launch-time knobs stay cached; the scenario check must NOT be
     // (menu buttons swap scenarios between battles).
     let static_on = *ON.get_or_init(|| {

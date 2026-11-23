@@ -32,10 +32,10 @@ pub enum Scenario {
     Join,
     Routpass,
     /// A lane behind a gap: three regiments hold in a line, a mass of
-    /// twelve is sent past them (regiments.rs `spawn_push_test`).
+    /// twelve is sent past them (scenes/push.rs `spawn_push_test`).
     Push,
     Archery,
-    /// A new attack target mid-fight (regiments.rs `spawn_retarget_test`).
+    /// A new attack target mid-fight (scenes/retarget.rs `spawn_retarget_test`).
     Retarget,
     /// An empty battlefield with a free camera and no armies, for looking
     /// at the map, the scenery and the light (`FL_SCENE=1`).

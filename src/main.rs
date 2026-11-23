@@ -23,7 +23,6 @@ mod nav;
 mod obstacle_map;
 mod orders;
 mod overlay;
-mod path_test;
 mod picker;
 mod regiments;
 mod render_units;
@@ -31,6 +30,7 @@ mod render_units_gpu;
 mod render_units_occlusion;
 mod render_units_phase;
 mod render_units_shadow;
+mod scenes;
 mod selection;
 mod selection_rings;
 mod settings;
@@ -167,14 +167,13 @@ fn main() {
         .add_plugins(settings::SettingsPlugin)
         .add_plugins(battle_setup::BattleSetupPlugin)
         .add_plugins(window_icon::WindowIconPlugin)
-        .add_plugins(path_test::PathTestPlugin)
         .add_plugins(town::TownPlugin)
         .add_plugins((
             terrain::TerrainPlugin,
             water::WaterPlugin,
             vegetation::VegetationPlugin,
             units::UnitsPlugin,
-            regiments::RegimentsPlugin,
+            scenes::ScenesPlugin,
             morale::MoralePlugin,
             fatigue::FatiguePlugin,
             ai::AiPlugin,

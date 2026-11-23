@@ -6,7 +6,7 @@
 //! between neighbouring vertices, so the terrain's own blocked rule
 //! (`SLOPE_BLOCK`) closes every side of it and the soldiers' wall slide
 //! applies with no new collision code. Each test case stands in its own
-//! part of the field; the scripted scenes (path_test.rs) read the start
+//! part of the field; the scripted scenes (scenes/path.rs) read the start
 //! and goal points from here, so the map and the scenes cannot drift.
 //!
 //! Vertices sit on even metres (the field is 1024 by 768 m centred on the

@@ -300,7 +300,7 @@ pub struct DamageBuffers(pub Vec<Vec<DamageEvent>>);
 
 /// FL_TEST_DIR / FL_ARENA bookkeeping: every blow bucketed by victim
 /// team, attack sector and outcome, filled by the damage apply pass,
-/// logged from regiments.rs (the dir test reads blue victims, the arena
+/// logged from scenes/ (the dir test reads blue victims, the arena
 /// reads orange victims, the player's kills).
 #[derive(Resource)]
 pub struct DirTestStats {

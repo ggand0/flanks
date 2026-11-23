@@ -756,7 +756,7 @@ const OPEN_KEEP: f32 = 3.0;
 /// closes once no friend's block crosses it or stands near it, whoever
 /// is still inside, and a passer stops passing when its block has moved
 /// on. A switch for reproducing the man a block closes on (the
-/// straggler log, regiments.rs).
+/// straggler log, scenes/logs.rs).
 fn keep_inside() -> bool {
     static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *K.get_or_init(|| crate::util::env_or("FL_KEEP_INSIDE", 1u32) != 0)
