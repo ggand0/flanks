@@ -636,6 +636,51 @@ fn update_groups(
     let _tick_log = crate::frame_log::tick::time(crate::frame_log::tick::Part::Groups);
     let n = groups.list.len();
     let inputs = sum_inputs(&groups, routes.as_deref());
+    let sums = gather_sums(&units, &runs, &inputs, n);
+    let SumInputs { cents: prev_cents, fwd, target: attack_target, open, lines: frame_lines, .. } = inputs;
+    let counts: Vec<usize> = sums.iter().map(|a| a.count).collect();
+    let fighting: Vec<bool> = sums.iter().map(|a| a.fight_n > 0).collect();
+    let cents: Vec<Vec2> = sums
+        .iter()
+        .map(|a| if a.count > 0 { a.pos / a.count as f32 } else { Vec2::ZERO })
+        .collect();
+    let teams: Vec<u8> = groups.list.iter().map(|g| g.team).collect();
+    let broken: Vec<bool> = groups.list.iter().map(|g| g.state.is_broken()).collect();
+    let tk = GroupsTick {
+        sums: &sums,
+        counts: &counts,
+        fighting: &fighting,
+        cents: &cents,
+        teams: &teams,
+        broken: &broken,
+        prev_cents: &prev_cents,
+        fwd: &fwd,
+        attack_target: &attack_target,
+        open: &open,
+        frame_lines: &frame_lines,
+    };
+
+    for (g, group) in groups.list.iter_mut().enumerate() {
+        if !take_sums(g, group, &tk) {
+            continue;
+        }
+        let nearest_formed = look_for_enemies(g, group, &tk);
+        let e = engagement(g, group, &tk);
+        melee_clock(g, group, &tk, &e, nearest_formed);
+        contact_frame(g, group, &tk, &e);
+        charge_phase(g, group, &tk, e.engaged);
+    }
+}
+
+/// Every regiment's sums over its men: the tick job's where they hold,
+/// the rest summed here.
+#[inline]
+fn gather_sums(
+    units: &Units,
+    runs: &crate::sim::RegimentRuns,
+    inputs: &SumInputs,
+    n: usize,
+) -> Vec<RegimentSums> {
     // The sums over the men. The tick job took them from the columns it
     // was kicked with, which are the columns here (sim/mod.rs `take_tick`
     // checks that no write copied one of them), walking the same runs in
@@ -647,9 +692,7 @@ fn update_groups(
     // additions in the same order as one scan of the army, regiment by
     // regiment. Bevy's scope returns the tasks' results in spawn order.
     let from_job: Vec<bool> = (0..n).map(|g| runs.job_sums_valid && inputs.same(&runs.job_inputs, g)).collect();
-    let units = &*units;
     let cols = SumColumns::of(units);
-    let runs = &*runs;
     let (inputs_r, cols_r) = (&inputs, &cols);
     let tick_log_sums = crate::frame_log::tick::time(crate::frame_log::tick::Part::GroupsSums);
     let missing: Vec<usize> = (0..n).filter(|&g| !from_job[g]).collect();
@@ -669,316 +712,376 @@ fn update_groups(
         .map(|g| if from_job[g] { runs.job_sums[g].clone() } else { computed.next().expect("a sum per missing regiment") })
         .collect();
     drop(tick_log_sums);
-    let SumInputs { cents: prev_cents, fwd, target: attack_target, open, lines: frame_lines, .. } = inputs;
-    let counts: Vec<usize> = sums.iter().map(|a| a.count).collect();
-    let fighting: Vec<bool> = sums.iter().map(|a| a.fight_n > 0).collect();
-    let cents: Vec<Vec2> = sums
-        .iter()
-        .map(|a| if a.count > 0 { a.pos / a.count as f32 } else { Vec2::ZERO })
-        .collect();
-    let teams: Vec<u8> = groups.list.iter().map(|g| g.team).collect();
-    let broken: Vec<bool> = groups.list.iter().map(|g| g.state.is_broken()).collect();
+    sums
+}
 
-    for (g, group) in groups.list.iter_mut().enumerate() {
-        group.count = counts[g];
-        group.frame_past = frame_lines[g].map(|(k, _, _)| (k, sums[g].past, sums[g].living));
-        if counts[g] == 0 {
-            group.engaged = false;
-            group.engage_hold = 0;
-            group.charging = false;
-            continue;
-        }
-        group.centroid = cents[g];
-        group.home_bias = sums[g].home / counts[g] as f32;
-        // Measured against last tick's centroid, a step at most off.
-        group.lead = if sums[g].lead > f32::MIN { sums[g].lead } else { 0.0 };
-        group.vel = if sums[g].alive > 0 { sums[g].vel / sums[g].alive as f32 } else { Vec2::ZERO };
-        group.reach = sums[g].far2.sqrt();
-        group.inside = open[g].iter().zip(&sums[g].inside).map(|(&(h, _), &c)| (h, c)).collect();
-        // Formation disorder: how far the regiment stands from its slots,
-        // smoothed ~2 s. Only Rect makes the discipline claim.
-        let err = if group.shape == crate::formation::FormShape::Rect {
-            sums[g].slot_err / counts[g] as f32
-        } else {
-            0.0
-        };
-        group.disorder += (err - group.disorder) / 60.0;
-        // Footprint radius: RMS distance x 1.5 reaches the block edge
-        // (uniform disc: RMS = R/sqrt(2)); smoothed like disorder.
-        let r = (sums[g].r2 / counts[g] as f32).sqrt() * 1.5;
-        group.radius += (r - group.radius) / 60.0;
-        let mut nearest_d2 = ENEMY_NEAR_R * ENEMY_NEAR_R;
-        let mut threat = Vec2::ZERO;
-        let mut hostile = false;
-        let mut nearest_formed_d2 = ENEMY_NEAR_R * ENEMY_NEAR_R;
-        let mut nearest_formed: Option<Vec2> = None;
-        for t in 0..n {
-            if t != g && counts[t] > 0 && teams[t] != group.team {
-                let d2 = cents[t].distance_squared(group.centroid);
-                if d2 < nearest_d2 {
-                    nearest_d2 = d2;
-                    threat = cents[t] - group.centroid;
-                }
-                if !broken[t] && d2 < nearest_formed_d2 {
-                    nearest_formed_d2 = d2;
-                    nearest_formed = Some(cents[t]);
-                }
-                if d2 < ENEMY_NEAR_R * ENEMY_NEAR_R && !broken[t] {
-                    hostile = true;
-                }
-            }
-        }
-        group.enemy_near = threat != Vec2::ZERO;
-        group.threat_dir = threat.normalize_or_zero();
-        // Victory cheer: the last UNBROKEN enemy regiment nearby routed
-        // or died — the line roars (render-only, ~5 s).
-        if group.hostile_near && !hostile && !group.state.is_broken() {
-            group.celebrate = CELEBRATE_TICKS;
-            info!("regiment {g} CHEERS");
-        }
-        if hostile || group.state.is_broken() {
-            group.celebrate = 0;
-        } else {
-            group.celebrate = group.celebrate.saturating_sub(1);
-        }
-        group.hostile_near = hostile;
+/// What every regiment's update reads of this tick: the sums, the
+/// per-regiment numbers taken from them and from the regiments, and the
+/// sum inputs.
+#[derive(Clone, Copy)]
+struct GroupsTick<'a> {
+    sums: &'a [RegimentSums],
+    counts: &'a [usize],
+    fighting: &'a [bool],
+    cents: &'a [Vec2],
+    teams: &'a [u8],
+    broken: &'a [bool],
+    prev_cents: &'a [Vec2],
+    fwd: &'a [Vec2],
+    attack_target: &'a [Option<u32>],
+    open: &'a [Vec<(u32, BlockRect)>],
+    frame_lines: &'a [Option<(u32, Vec2, Vec2)>],
+}
 
-        if fighting[g] {
-            group.engage_hold = ENGAGE_HOLD_TICKS;
-        } else {
-            group.engage_hold = group.engage_hold.saturating_sub(1);
-        }
-        let engaged = group.engage_hold > 0;
-        let lock_threshold = ((group.count as f32 * ENGAGE_LOCK_FRAC) as u32).max(ENGAGE_LOCK_FLOOR);
-        // A new attack target while fighting (orders.rs `retarget`): the
-        // regiment leaves its fight and marches on the new one, and its
-        // melee, when it comes, is with that target alone. It lasts while
-        // the order stands and the regiment stays engaged.
-        let target = attack_target[g];
-        if engaged && target.is_some() && target != group.seen_target {
-            group.retarget = true;
-            group.melee_ticks = 0;
-            if group.contact {
-                group.contact = false;
-                info!("regiment {g} releases its contact frame");
+/// Where a regiment stands against the fight this tick (`engagement`).
+struct Engagement {
+    engaged: bool,
+    lock_threshold: u32,
+    fight_n: u32,
+    line_sum: f32,
+    line_n: u32,
+    moving: bool,
+}
+
+/// The regiment's numbers from its sums: count, centre, reach, inside,
+/// disorder and footprint. False for a regiment with nobody left.
+#[inline]
+fn take_sums(g: usize, group: &mut crate::orders::GroupData, tk: &GroupsTick) -> bool {
+    let GroupsTick { sums, counts, cents, open, frame_lines, .. } = *tk;
+    group.count = counts[g];
+    group.frame_past = frame_lines[g].map(|(k, _, _)| (k, sums[g].past, sums[g].living));
+    if counts[g] == 0 {
+        group.engaged = false;
+        group.engage_hold = 0;
+        group.charging = false;
+        return false;
+    }
+    group.centroid = cents[g];
+    group.home_bias = sums[g].home / counts[g] as f32;
+    // Measured against last tick's centroid, a step at most off.
+    group.lead = if sums[g].lead > f32::MIN { sums[g].lead } else { 0.0 };
+    group.vel = if sums[g].alive > 0 { sums[g].vel / sums[g].alive as f32 } else { Vec2::ZERO };
+    group.reach = sums[g].far2.sqrt();
+    group.inside = open[g].iter().zip(&sums[g].inside).map(|(&(h, _), &c)| (h, c)).collect();
+    // Formation disorder: how far the regiment stands from its slots,
+    // smoothed ~2 s. Only Rect makes the discipline claim.
+    let err = if group.shape == crate::formation::FormShape::Rect {
+        sums[g].slot_err / counts[g] as f32
+    } else {
+        0.0
+    };
+    group.disorder += (err - group.disorder) / 60.0;
+    // Footprint radius: RMS distance x 1.5 reaches the block edge
+    // (uniform disc: RMS = R/sqrt(2)); smoothed like disorder.
+    let r = (sums[g].r2 / counts[g] as f32).sqrt() * 1.5;
+    group.radius += (r - group.radius) / 60.0;
+    true
+}
+
+/// The enemy regiments about it: the threat, the cheer and whether it is
+/// near a hostile. Gives the nearest formed enemy's centre.
+#[inline]
+fn look_for_enemies(g: usize, group: &mut crate::orders::GroupData, tk: &GroupsTick) -> Option<Vec2> {
+    let n = tk.counts.len();
+    let GroupsTick { counts, cents, teams, broken, .. } = *tk;
+    let mut nearest_d2 = ENEMY_NEAR_R * ENEMY_NEAR_R;
+    let mut threat = Vec2::ZERO;
+    let mut hostile = false;
+    let mut nearest_formed_d2 = ENEMY_NEAR_R * ENEMY_NEAR_R;
+    let mut nearest_formed: Option<Vec2> = None;
+    for t in 0..n {
+        if t != g && counts[t] > 0 && teams[t] != group.team {
+            let d2 = cents[t].distance_squared(group.centroid);
+            if d2 < nearest_d2 {
+                nearest_d2 = d2;
+                threat = cents[t] - group.centroid;
             }
-            info!("regiment {g} breaks off for its new target");
-        }
-        group.seen_target = target;
-        if group.retarget && (!engaged || target.is_none()) {
-            group.retarget = false;
-            info!("regiment {g} ends its break-off");
-        }
-        // The men who count toward starting a melee and laying a contact
-        // frame: all who strike, or after a retarget only those striking
-        // the target.
-        let (fight_n, line_sum, line_n) = if group.retarget {
-            (sums[g].target_fight_n, sums[g].target_line_sum, sums[g].target_line_n)
-        } else {
-            (sums[g].fight_n, sums[g].line_sum, sums[g].line_n)
-        };
-        // Under a Move order, or on the way to a new target, the regiment
-        // has no fight: its melee clock stops.
-        let breaking_off = group.retarget && group.melee_ticks == 0 && fight_n < lock_threshold;
-        let moving = matches!(group.order, Some(crate::orders::Order::Move(_))) || breaking_off;
-        if engaged != group.engaged {
-            info!(
-                "regiment {g} {}",
-                if engaged { "ENGAGED" } else { "DISENGAGED" }
-            );
-        }
-        // Contact frame. An attacking regiment's slots are laid on its
-        // target's live center, which is right for the approach but
-        // wrong in melee: every slot sits inside the enemy and moves
-        // with it, so rear men lean on the backs ahead and whole blocks
-        // slide after a moving center. M2TW stops
-        // updating a formation near the end of its path
-        // (formation_hold_distance). So once a real share of the
-        // regiment is fighting, whoever the enemy is, the frame holds:
-        // laterally where the block stood at contact, and in depth with
-        // its front slot on the fight line, the mean position of the
-        // men striking at an enemy ahead, as it stands at contact. Then
-        // the frame stays put for the whole fight, as an M2TW formation
-        // does: a file with no enemy in front of it holds its slots, and
-        // men who see an enemy go to him themselves (sim/soldier.rs).
-        // Built from the regiment's own slot geometry, so any width,
-        // depth and spacing works.
-        // Melee clock and fight point (sim/soldier.rs joins the men out of
-        // sight of an enemy to the fight after their own delay). The
-        // clock starts at the count gate, so a stray poke does not pull
-        // a whole regiment in; M2TW engages a unit when enough enemy
-        // soldiers are in its proximity zone.
-        // The crash of a charge: the block keeps coming until the enemy
-        // has stopped it; only then does the melee begin.
-        if engaged
-            && !group.state.is_broken()
-            && !group.crashing
-            && !moving
-            && (group.melee_ticks > 0 || fight_n >= lock_threshold)
-        {
-            if group.retarget && group.melee_ticks == 0 {
-                info!("regiment {g} fights its new target");
+            if !broken[t] && d2 < nearest_formed_d2 {
+                nearest_formed_d2 = d2;
+                nearest_formed = Some(cents[t]);
             }
-            group.melee_ticks = group.melee_ticks.saturating_add(1);
-        } else {
-            // The melee is over: its men come back into formation as each
-            // loses sight of the enemy (sim/soldier.rs decide_to_join). A
-            // regiment with no attack order re-forms where it stands,
-            // M2TW's discrete reforming state; an attacker's order lays its
-            // slots again.
-            if group.melee_ticks > 0
-                && group.shape == crate::formation::FormShape::Rect
-                && !group.state.is_broken()
-                && !matches!(group.order, Some(crate::orders::Order::Attack(_)))
-            {
-                group.anchor = group.centroid;
-                group.reform = true;
+            if d2 < ENEMY_NEAR_R * ENEMY_NEAR_R && !broken[t] {
+                hostile = true;
             }
-            group.melee_ticks = 0;
         }
-        if group.retarget && group.melee_ticks > 0 && !retarget_focus() {
-            group.retarget = false;
-            info!("regiment {g} ends its break-off (FL_RETARGET_FOCUS=0)");
-        }
-        // No fight point without a fight: a Move order takes the regiment
-        // out (M2TW's WITHDRAW, devlog 0120), so its men leave the melee
-        // and walk where they were sent.
-        // An ordered target stays the fight while it has men, routing
-        // too: the regiment pursues it, as its march does (orders.rs
-        // `goal`), instead of turning to whatever formed enemy is near.
-        group.fight_point = if group.melee_ticks > 0 && !group.hold && !moving {
-            match group.order {
-                Some(crate::orders::Order::Attack(t)) if counts[t as usize] > 0 => {
-                    Some(cents[t as usize])
-                }
-                _ => nearest_formed,
-            }
-        } else {
-            None
-        };
-        let attacking = matches!(group.order, Some(crate::orders::Order::Attack(t))
-            if counts[t as usize] > 0 && !broken[t as usize]);
-        let formed = group.shape == crate::formation::FormShape::Rect
-            && !group.state.is_broken();
-        let starts = fight_n >= lock_threshold;
-        if formed && attacking && engaged && !group.crashing && (group.contact || starts) {
-            let f = fwd[g];
-            let r = Vec2::new(f.y, -f.x);
-            if !group.contact {
-                group.contact = true;
-                // Sideways the frame stays where the slots already
-                // were: an attack lays them around the target's center.
-                // Snapping to the men's average instead sent a wide
-                // line's flanks, still converging, walking back out.
-                group.contact_lateral = match group.order {
-                    Some(crate::orders::Order::Attack(t)) => cents[t as usize].dot(r),
-                    _ => (group.centroid - group.home_bias).dot(r),
-                };
-                let mut depth = (group.centroid - group.home_bias).dot(f);
-                if line_n > 0 {
-                    depth = line_sum / line_n as f32 - sums[g].front_off;
-                }
-                group.anchor = r * group.contact_lateral + f * depth;
-                info!("regiment {g} holds a contact frame");
-            }
-        } else if group.contact {
+    }
+    group.enemy_near = threat != Vec2::ZERO;
+    group.threat_dir = threat.normalize_or_zero();
+    // Victory cheer: the last UNBROKEN enemy regiment nearby routed
+    // or died — the line roars (render-only, ~5 s).
+    if group.hostile_near && !hostile && !group.state.is_broken() {
+        group.celebrate = CELEBRATE_TICKS;
+        info!("regiment {g} CHEERS");
+    }
+    if hostile || group.state.is_broken() {
+        group.celebrate = 0;
+    } else {
+        group.celebrate = group.celebrate.saturating_sub(1);
+    }
+    group.hostile_near = hostile;
+    nearest_formed
+}
+
+/// The engaged flag, a new target's break-off, and the men who count
+/// toward a melee.
+#[inline]
+fn engagement(g: usize, group: &mut crate::orders::GroupData, tk: &GroupsTick) -> Engagement {
+    let GroupsTick { sums, fighting, attack_target, .. } = *tk;
+    if fighting[g] {
+        group.engage_hold = ENGAGE_HOLD_TICKS;
+    } else {
+        group.engage_hold = group.engage_hold.saturating_sub(1);
+    }
+    let engaged = group.engage_hold > 0;
+    let lock_threshold = ((group.count as f32 * ENGAGE_LOCK_FRAC) as u32).max(ENGAGE_LOCK_FLOOR);
+    // A new attack target while fighting (orders.rs `retarget`): the
+    // regiment leaves its fight and marches on the new one, and its
+    // melee, when it comes, is with that target alone. It lasts while
+    // the order stands and the regiment stays engaged.
+    let target = attack_target[g];
+    if engaged && target.is_some() && target != group.seen_target {
+        group.retarget = true;
+        group.melee_ticks = 0;
+        if group.contact {
             group.contact = false;
             info!("regiment {g} releases its contact frame");
         }
-        // Its fighting line, live, for as long as its melee runs: a tenth
-        // of the way to where its men striking at an enemy ahead stand now,
-        // set outright the first time; kept while nobody strikes. It does
-        // not wait for a contact frame: a regiment met at ease before its
-        // automatic attack order came has no order and so no frame, and
-        // under the friction contact its men behind the front walk straight
-        // ahead to this line all the same (sim/soldier.rs `join_goal`).
-        if engaged && group.melee_ticks > 0 {
-            if line_n > 0 {
-                let now = line_sum / line_n as f32;
-                group.fight_line =
-                    if group.fight_line.is_nan() { now } else { group.fight_line + (now - group.fight_line) * 0.1 };
-            }
-        } else {
-            group.fight_line = f32::NAN;
-        }
-        group.engaged = engaged;
-
-        // How fast the regiment's centre closes on its attack target: the
-        // mean of its men's velocities toward it, smoothed like adv_speed.
-        let toward = match group.order {
-            Some(crate::orders::Order::Attack(t)) if counts[t as usize] > 0 => {
-                (cents[t as usize] - group.centroid).normalize_or_zero()
-            }
-            _ => Vec2::ZERO,
-        };
-        let v_toward = (group.centroid - prev_cents[g]).dot(toward) / TICK_DT;
-        group.approach_speed += (v_toward - group.approach_speed) * 0.1;
-        // A charge is a run at the enemy: a regiment starts one when it
-        // closes on its target at a walk or faster, and keeps it until it
-        // has all but stopped. A regiment held up behind its own ranks
-        // never runs, so it never charges (no sprint, no charge pace, no
-        // charge cries) until it is free to run again.
-        let running = group.approach_speed
-            >= if group.charging { CRASH_STALL } else { crate::sim::soldier::GOING_SPEED };
-
-        // Charge phase: explicit attack order, inside charge range of the
-        // target, not yet in contact, and running at it.
-        let charging = if engaged || group.state.is_broken() {
-            false
-        } else if let Some(crate::orders::Order::Attack(t)) = group.order {
-            // An archer regiment with arrows left is VOLLEYING, not
-            // charging — its attack order is a fire order (the
-            // stand-off), even at point-blank. Gated on ammo rather
-            // than the firing flag, which lags a tick behind a fresh
-            // order and let a one-tick charge blip through. Out of
-            // ammo, the same order is a real knife charge and flags
-            // like one.
-            let t = t as usize;
-            // Under the friction contact a regiment in range of any
-            // unbroken enemy regiment (`hostile_near`, the same 60 m)
-            // counts as in range too: one ordered onto an enemy unit
-            // behind the enemy's front runs into the front unit first, and
-            // that run is a charge too.
-            let near = cents[t].distance(group.centroid) < CHARGE_RANGE
-                || (crate::sim::soldier::friction_contact() && group.hostile_near);
-            counts[t] > 0
-                && near
-                && !(group.kind == crate::unit_types::KIND_ARCHER
-                    && group.ammo_left > 0
-                    && !group.melee)
-                && running
-        } else {
-            false
-        };
-        if charging != group.charging {
-            info!(
-                "regiment {g} {}",
-                if charging { "CHARGES" } else { "CHARGE ENDS" }
-            );
-        }
-        // The crash: a charging regiment that engages keeps its block
-        // moving (M2TW runs the charge task until most of the unit has
-        // charged) until the enemy has stopped it, read off its centroid's
-        // smoothed forward speed, or until its rear has had time to arrive.
-        let v_fwd = (group.centroid - prev_cents[g]).dot(fwd[g]) / TICK_DT;
-        group.adv_speed += (v_fwd - group.adv_speed) * 0.1;
-        if group.charging && !charging && engaged && group.melee_ticks == 0 && !group.crashing {
-            group.crashing = true;
-            group.crash_ticks = 0;
-            // The rear needs depth / pace to arrive; that long at most.
-            let depth = (sums[g].front_off - sums[g].back_off).max(0.0);
-            group.crash_cap = ((depth / CRASH_PACE / TICK_DT) as u16).clamp(30, CRASH_MAX_TICKS);
-            info!("regiment {g} CRASHES");
-        } else if group.crashing {
-            group.crash_ticks = group.crash_ticks.saturating_add(1);
-            let stalled = group.crash_ticks > 15 && group.adv_speed < CRASH_STALL;
-            if stalled || group.crash_ticks > group.crash_cap || !engaged {
-                group.crashing = false;
-                info!("regiment {g} CRASH ENDS ({} ticks)", group.crash_ticks);
-            }
-        }
-        group.charging = charging;
+        info!("regiment {g} breaks off for its new target");
     }
+    group.seen_target = target;
+    if group.retarget && (!engaged || target.is_none()) {
+        group.retarget = false;
+        info!("regiment {g} ends its break-off");
+    }
+    // The men who count toward starting a melee and laying a contact
+    // frame: all who strike, or after a retarget only those striking
+    // the target.
+    let (fight_n, line_sum, line_n) = if group.retarget {
+        (sums[g].target_fight_n, sums[g].target_line_sum, sums[g].target_line_n)
+    } else {
+        (sums[g].fight_n, sums[g].line_sum, sums[g].line_n)
+    };
+    // Under a Move order, or on the way to a new target, the regiment
+    // has no fight: its melee clock stops.
+    let breaking_off = group.retarget && group.melee_ticks == 0 && fight_n < lock_threshold;
+    let moving = matches!(group.order, Some(crate::orders::Order::Move(_))) || breaking_off;
+    if engaged != group.engaged {
+        info!(
+            "regiment {g} {}",
+            if engaged { "ENGAGED" } else { "DISENGAGED" }
+        );
+    }
+    Engagement { engaged, lock_threshold, fight_n, line_sum, line_n, moving }
+}
+
+/// The melee clock and the fight point.
+#[inline]
+fn melee_clock(g: usize, group: &mut crate::orders::GroupData, tk: &GroupsTick, e: &Engagement, nearest_formed: Option<Vec2>) {
+    let GroupsTick { counts, cents, .. } = *tk;
+    let Engagement { engaged, lock_threshold, fight_n, moving, .. } = *e;
+    // Contact frame. An attacking regiment's slots are laid on its
+    // target's live center, which is right for the approach but
+    // wrong in melee: every slot sits inside the enemy and moves
+    // with it, so rear men lean on the backs ahead and whole blocks
+    // slide after a moving center. M2TW stops
+    // updating a formation near the end of its path
+    // (formation_hold_distance). So once a real share of the
+    // regiment is fighting, whoever the enemy is, the frame holds:
+    // laterally where the block stood at contact, and in depth with
+    // its front slot on the fight line, the mean position of the
+    // men striking at an enemy ahead, as it stands at contact. Then
+    // the frame stays put for the whole fight, as an M2TW formation
+    // does: a file with no enemy in front of it holds its slots, and
+    // men who see an enemy go to him themselves (sim/soldier.rs).
+    // Built from the regiment's own slot geometry, so any width,
+    // depth and spacing works.
+    // Melee clock and fight point (sim/soldier.rs joins the men out of
+    // sight of an enemy to the fight after their own delay). The
+    // clock starts at the count gate, so a stray poke does not pull
+    // a whole regiment in; M2TW engages a unit when enough enemy
+    // soldiers are in its proximity zone.
+    // The crash of a charge: the block keeps coming until the enemy
+    // has stopped it; only then does the melee begin.
+    if engaged
+        && !group.state.is_broken()
+        && !group.crashing
+        && !moving
+        && (group.melee_ticks > 0 || fight_n >= lock_threshold)
+    {
+        if group.retarget && group.melee_ticks == 0 {
+            info!("regiment {g} fights its new target");
+        }
+        group.melee_ticks = group.melee_ticks.saturating_add(1);
+    } else {
+        // The melee is over: its men come back into formation as each
+        // loses sight of the enemy (sim/soldier.rs decide_to_join). A
+        // regiment with no attack order re-forms where it stands,
+        // M2TW's discrete reforming state; an attacker's order lays its
+        // slots again.
+        if group.melee_ticks > 0
+            && group.shape == crate::formation::FormShape::Rect
+            && !group.state.is_broken()
+            && !matches!(group.order, Some(crate::orders::Order::Attack(_)))
+        {
+            group.anchor = group.centroid;
+            group.reform = true;
+        }
+        group.melee_ticks = 0;
+    }
+    if group.retarget && group.melee_ticks > 0 && !retarget_focus() {
+        group.retarget = false;
+        info!("regiment {g} ends its break-off (FL_RETARGET_FOCUS=0)");
+    }
+    // No fight point without a fight: a Move order takes the regiment
+    // out (M2TW's WITHDRAW, devlog 0120), so its men leave the melee
+    // and walk where they were sent.
+    // An ordered target stays the fight while it has men, routing
+    // too: the regiment pursues it, as its march does (orders.rs
+    // `goal`), instead of turning to whatever formed enemy is near.
+    group.fight_point = if group.melee_ticks > 0 && !group.hold && !moving {
+        match group.order {
+            Some(crate::orders::Order::Attack(t)) if counts[t as usize] > 0 => {
+                Some(cents[t as usize])
+            }
+            _ => nearest_formed,
+        }
+    } else {
+        None
+    };
+}
+
+/// The contact frame and the fighting line.
+#[inline]
+fn contact_frame(g: usize, group: &mut crate::orders::GroupData, tk: &GroupsTick, e: &Engagement) {
+    let GroupsTick { sums, counts, cents, broken, fwd, .. } = *tk;
+    let Engagement { engaged, lock_threshold, fight_n, line_sum, line_n, .. } = *e;
+    let attacking = matches!(group.order, Some(crate::orders::Order::Attack(t))
+        if counts[t as usize] > 0 && !broken[t as usize]);
+    let formed = group.shape == crate::formation::FormShape::Rect
+        && !group.state.is_broken();
+    let starts = fight_n >= lock_threshold;
+    if formed && attacking && engaged && !group.crashing && (group.contact || starts) {
+        let f = fwd[g];
+        let r = Vec2::new(f.y, -f.x);
+        if !group.contact {
+            group.contact = true;
+            // Sideways the frame stays where the slots already
+            // were: an attack lays them around the target's center.
+            // Snapping to the men's average instead sent a wide
+            // line's flanks, still converging, walking back out.
+            group.contact_lateral = match group.order {
+                Some(crate::orders::Order::Attack(t)) => cents[t as usize].dot(r),
+                _ => (group.centroid - group.home_bias).dot(r),
+            };
+            let mut depth = (group.centroid - group.home_bias).dot(f);
+            if line_n > 0 {
+                depth = line_sum / line_n as f32 - sums[g].front_off;
+            }
+            group.anchor = r * group.contact_lateral + f * depth;
+            info!("regiment {g} holds a contact frame");
+        }
+    } else if group.contact {
+        group.contact = false;
+        info!("regiment {g} releases its contact frame");
+    }
+    // Its fighting line, live, for as long as its melee runs: a tenth
+    // of the way to where its men striking at an enemy ahead stand now,
+    // set outright the first time; kept while nobody strikes. It does
+    // not wait for a contact frame: a regiment met at ease before its
+    // automatic attack order came has no order and so no frame, and
+    // under the friction contact its men behind the front walk straight
+    // ahead to this line all the same (sim/soldier.rs `join_goal`).
+    if engaged && group.melee_ticks > 0 {
+        if line_n > 0 {
+            let now = line_sum / line_n as f32;
+            group.fight_line =
+                if group.fight_line.is_nan() { now } else { group.fight_line + (now - group.fight_line) * 0.1 };
+        }
+    } else {
+        group.fight_line = f32::NAN;
+    }
+    group.engaged = engaged;
+}
+
+/// The approach speed, the charge and the crash.
+#[inline]
+fn charge_phase(g: usize, group: &mut crate::orders::GroupData, tk: &GroupsTick, engaged: bool) {
+    let GroupsTick { sums, counts, cents, prev_cents, fwd, .. } = *tk;
+    // How fast the regiment's centre closes on its attack target: the
+    // mean of its men's velocities toward it, smoothed like adv_speed.
+    let toward = match group.order {
+        Some(crate::orders::Order::Attack(t)) if counts[t as usize] > 0 => {
+            (cents[t as usize] - group.centroid).normalize_or_zero()
+        }
+        _ => Vec2::ZERO,
+    };
+    let v_toward = (group.centroid - prev_cents[g]).dot(toward) / TICK_DT;
+    group.approach_speed += (v_toward - group.approach_speed) * 0.1;
+    // A charge is a run at the enemy: a regiment starts one when it
+    // closes on its target at a walk or faster, and keeps it until it
+    // has all but stopped. A regiment held up behind its own ranks
+    // never runs, so it never charges (no sprint, no charge pace, no
+    // charge cries) until it is free to run again.
+    let running = group.approach_speed
+        >= if group.charging { CRASH_STALL } else { crate::sim::soldier::GOING_SPEED };
+
+    // Charge phase: explicit attack order, inside charge range of the
+    // target, not yet in contact, and running at it.
+    let charging = if engaged || group.state.is_broken() {
+        false
+    } else if let Some(crate::orders::Order::Attack(t)) = group.order {
+        // An archer regiment with arrows left is VOLLEYING, not
+        // charging — its attack order is a fire order (the
+        // stand-off), even at point-blank. Gated on ammo rather
+        // than the firing flag, which lags a tick behind a fresh
+        // order and let a one-tick charge blip through. Out of
+        // ammo, the same order is a real knife charge and flags
+        // like one.
+        let t = t as usize;
+        // Under the friction contact a regiment in range of any
+        // unbroken enemy regiment (`hostile_near`, the same 60 m)
+        // counts as in range too: one ordered onto an enemy unit
+        // behind the enemy's front runs into the front unit first, and
+        // that run is a charge too.
+        let near = cents[t].distance(group.centroid) < CHARGE_RANGE
+            || (crate::sim::soldier::friction_contact() && group.hostile_near);
+        counts[t] > 0
+            && near
+            && !(group.kind == crate::unit_types::KIND_ARCHER
+                && group.ammo_left > 0
+                && !group.melee)
+            && running
+    } else {
+        false
+    };
+    if charging != group.charging {
+        info!(
+            "regiment {g} {}",
+            if charging { "CHARGES" } else { "CHARGE ENDS" }
+        );
+    }
+    // The crash: a charging regiment that engages keeps its block
+    // moving (M2TW runs the charge task until most of the unit has
+    // charged) until the enemy has stopped it, read off its centroid's
+    // smoothed forward speed, or until its rear has had time to arrive.
+    let v_fwd = (group.centroid - prev_cents[g]).dot(fwd[g]) / TICK_DT;
+    group.adv_speed += (v_fwd - group.adv_speed) * 0.1;
+    if group.charging && !charging && engaged && group.melee_ticks == 0 && !group.crashing {
+        group.crashing = true;
+        group.crash_ticks = 0;
+        // The rear needs depth / pace to arrive; that long at most.
+        let depth = (sums[g].front_off - sums[g].back_off).max(0.0);
+        group.crash_cap = ((depth / CRASH_PACE / TICK_DT) as u16).clamp(30, CRASH_MAX_TICKS);
+        info!("regiment {g} CRASHES");
+    } else if group.crashing {
+        group.crash_ticks = group.crash_ticks.saturating_add(1);
+        let stalled = group.crash_ticks > 15 && group.adv_speed < CRASH_STALL;
+        if stalled || group.crash_ticks > group.crash_cap || !engaged {
+            group.crashing = false;
+            info!("regiment {g} CRASH ENDS ({} ticks)", group.crash_ticks);
+        }
+    }
+    group.charging = charging;
 }
 
 /// With the debug overlay on (F3): each selected regiment's fight point,
