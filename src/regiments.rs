@@ -235,41 +235,8 @@ pub fn do_spawn_battle(
     config: &crate::game_state::BattleConfig,
     nav: Option<&crate::nav::NavGrid>,
 ) {
-    use crate::game_state::Scenario;
-    if crate::scenes::path::scene().is_some() {
-        crate::scenes::path::spawn(units, terrain, groups);
+    if spawn_scene(units, terrain, groups, config.scenario) {
         return;
-    }
-    match config.scenario {
-        Scenario::Surround => {
-            crate::scenes::surround::spawn_surround_test(units, terrain, groups);
-            return;
-        }
-        Scenario::Rout => { spawn_rout_test(units, terrain, groups); return; }
-        Scenario::Dir => { spawn_dir_test(units, terrain, groups); return; }
-        Scenario::Arena => { spawn_arena(units, terrain, groups); return; }
-        Scenario::Charge => { spawn_charge_test(units, terrain, groups); return; }
-        Scenario::Pile => {
-            spawn_pile_test(units, terrain, groups, PileSetup::SIX);
-            return;
-        }
-        Scenario::PileWide => {
-            spawn_pile_test(units, terrain, groups, PileSetup::WIDE);
-            return;
-        }
-        Scenario::PileTwo => {
-            spawn_pile_test(units, terrain, groups, PileSetup::TWO);
-            return;
-        }
-        Scenario::Join => { spawn_join_test(units, terrain, groups); return; }
-        Scenario::Routpass => { spawn_routpass_test(units, terrain, groups); return; }
-        Scenario::Push => { spawn_push_test(units, terrain, groups); return; }
-        // The scene: no armies. The victory check stays quiet on an empty
-        // regiment list and the camera is free in the Battle state.
-        Scenario::Scene => { groups.list.clear(); return; }
-        Scenario::Archery => { spawn_archery_test(units, terrain, groups); return; }
-        Scenario::Retarget => { spawn_retarget_test(units, terrain, groups); return; }
-        Scenario::Normal | Scenario::Demo => {}
     }
 
     let per_team = config.units_per_team;
@@ -329,56 +296,8 @@ pub fn do_spawn_battle(
         || crate::game_state::scripts_active();
 
     for team in 0..2u8 {
-        let comp = if team == 0 {
-            if env_fracs { frac_comp(n_regs) } else { config.player_regs }
-        } else {
-            // FL_ENEMY_REGS caps the enemy regiment count (sandbox
-            // asymmetry, e.g. 5v4 so one player regiment stays
-            // unchased); it also falls back to the classic split.
-            let capped = crate::util::env_or("FL_ENEMY_REGS", n_regs).clamp(1, n_regs);
-            if env_fracs || capped != n_regs {
-                frac_comp(capped)
-            } else {
-                use crate::game_state::EnemyComp;
-                match config.enemy {
-                    EnemyComp::Manual(comp) => comp,
-                    EnemyComp::Style(idx) => {
-                        let idx = idx.min(ARCHETYPES.len() - 1);
-                        info!("enemy army style: {}", archetype_name(idx));
-                        archetype_jittered(idx, n_regs, time_seed())
-                    }
-                    EnemyComp::Random => {
-                        let seed = time_seed();
-                        let idx =
-                            (hash01(seed) * ARCHETYPES.len() as f32) as usize % ARCHETYPES.len();
-                        info!("enemy army style: {}", archetype_name(idx));
-                        archetype_jittered(idx, n_regs, seed)
-                    }
-                }
-            }
-        };
-        // An empty army cannot fight; fall back to the classic split.
-        let comp = if comp.iter().sum::<usize>() == 0 { frac_comp(n_regs) } else { comp };
-        // Ladder order: heavies lead, spears back them, lights fill the
-        // middle, archers take the rear ranks (they shoot over everyone).
-        let mut kinds: Vec<u8> = Vec::new();
-        for k in [KIND_HEAVY, KIND_SPEAR, KIND_LIGHT, KIND_ARCHER] {
-            kinds.extend(std::iter::repeat_n(k, comp[k as usize]));
-        }
-        // FL_ARCHER_SCATTER=1: the archer regiments stand spread through
-        // the army, one at the middle of each equal stretch of the
-        // ladder, instead of together in the rear ranks. The scene of the
-        // ten-archer measurement: every archer regiment has its own
-        // neighbours and its own enemy blocks in range.
-        let n_archer = comp[KIND_ARCHER as usize];
-        if std::env::var("FL_ARCHER_SCATTER").is_ok() && n_archer > 0 {
-            let n = kinds.len();
-            let slots: Vec<usize> = (0..n_archer).map(|k| (2 * k + 1) * n / (2 * n_archer)).collect();
-            let mut others = kinds.iter().copied().filter(|&k| k != KIND_ARCHER);
-            kinds = (0..n)
-                .map(|r| if slots.contains(&r) { KIND_ARCHER } else { others.next().unwrap_or(KIND_LIGHT) })
-                .collect();
-        }
+        let comp = army_comp(team, config, n_regs, env_fracs);
+        let kinds = ladder(&comp);
         let n_regs = kinds.len();
         // Line Debug: each rank's x positions, the blocks side by side.
         let gapless_xs: Vec<f32> = if gapless {
@@ -435,21 +354,8 @@ pub fn do_spawn_battle(
     if moved > 0 {
         info!("regiment layout: {moved} regiments moved off blocked ground to the spare ranks");
     }
-    // The cost tables the routes will need, one per width class a
-    // regiment spans across any way it may take, built now rather than
-    // in a tick.
     if let Some(nav) = nav {
-        let mut widths: Vec<crate::nav::PlanRequest> = Vec::new();
-        for gd in &list {
-            for half_w in [
-                crate::sim::route::half_width(gd, Vec2::Y),
-                crate::sim::route::half_width(gd, Vec2::X),
-                crate::sim::route::half_width_max(gd),
-            ] {
-                widths.push(crate::nav::PlanRequest { g: 0, serial: 0, start: Vec2::ZERO, goal: Vec2::ZERO, half_w });
-            }
-        }
-        nav.prepare_costs(&widths);
+        prepare_route_costs(nav, &list);
     }
     // FL_ENEMY_STATIC=1: the enemy army holds position (never auto-
     // engages, never chases — hold's existing semantics) and the AI
@@ -476,6 +382,133 @@ pub fn do_spawn_battle(
         units.len()
     );
     groups.list = list;
+}
+
+/// The scripted scenes and the empty scene, which spawn their own
+/// regiments or none: whether `scenario` is one of them (or a path
+/// scene is set) and was spawned.
+#[inline]
+fn spawn_scene(
+    units: &mut Units,
+    terrain: &Terrain,
+    groups: &mut Groups,
+    scenario: crate::game_state::Scenario,
+) -> bool {
+    use crate::game_state::Scenario;
+    if crate::scenes::path::scene().is_some() {
+        crate::scenes::path::spawn(units, terrain, groups);
+        return true;
+    }
+    match scenario {
+        Scenario::Surround => {
+            crate::scenes::surround::spawn_surround_test(units, terrain, groups);
+            true
+        }
+        Scenario::Rout => { spawn_rout_test(units, terrain, groups); true }
+        Scenario::Dir => { spawn_dir_test(units, terrain, groups); true }
+        Scenario::Arena => { spawn_arena(units, terrain, groups); true }
+        Scenario::Charge => { spawn_charge_test(units, terrain, groups); true }
+        Scenario::Pile => {
+            spawn_pile_test(units, terrain, groups, PileSetup::SIX);
+            true
+        }
+        Scenario::PileWide => {
+            spawn_pile_test(units, terrain, groups, PileSetup::WIDE);
+            true
+        }
+        Scenario::PileTwo => {
+            spawn_pile_test(units, terrain, groups, PileSetup::TWO);
+            true
+        }
+        Scenario::Join => { spawn_join_test(units, terrain, groups); true }
+        Scenario::Routpass => { spawn_routpass_test(units, terrain, groups); true }
+        Scenario::Push => { spawn_push_test(units, terrain, groups); true }
+        // The scene: no armies. The victory check stays quiet on an empty
+        // regiment list and the camera is free in the Battle state.
+        Scenario::Scene => { groups.list.clear(); true }
+        Scenario::Archery => { spawn_archery_test(units, terrain, groups); true }
+        Scenario::Retarget => { spawn_retarget_test(units, terrain, groups); true }
+        Scenario::Normal | Scenario::Demo => false,
+    }
+}
+
+/// Team `team`'s regiments per kind: the picker's, the enemy's style or
+/// the classic split.
+#[inline]
+fn army_comp(team: u8, config: &crate::game_state::BattleConfig, n_regs: usize, env_fracs: bool) -> [usize; NUM_KINDS] {
+    let comp = if team == 0 {
+        if env_fracs { frac_comp(n_regs) } else { config.player_regs }
+    } else {
+        // FL_ENEMY_REGS caps the enemy regiment count (sandbox
+        // asymmetry, e.g. 5v4 so one player regiment stays
+        // unchased); it also falls back to the classic split.
+        let capped = crate::util::env_or("FL_ENEMY_REGS", n_regs).clamp(1, n_regs);
+        if env_fracs || capped != n_regs {
+            frac_comp(capped)
+        } else {
+            use crate::game_state::EnemyComp;
+            match config.enemy {
+                EnemyComp::Manual(comp) => comp,
+                EnemyComp::Style(idx) => {
+                    let idx = idx.min(ARCHETYPES.len() - 1);
+                    info!("enemy army style: {}", archetype_name(idx));
+                    archetype_jittered(idx, n_regs, time_seed())
+                }
+                EnemyComp::Random => {
+                    let seed = time_seed();
+                    let idx =
+                        (hash01(seed) * ARCHETYPES.len() as f32) as usize % ARCHETYPES.len();
+                    info!("enemy army style: {}", archetype_name(idx));
+                    archetype_jittered(idx, n_regs, seed)
+                }
+            }
+        }
+    };
+    // An empty army cannot fight; fall back to the classic split.
+    if comp.iter().sum::<usize>() == 0 { frac_comp(n_regs) } else { comp }
+}
+
+/// The army's regiment kinds in ladder order.
+#[inline]
+fn ladder(comp: &[usize; NUM_KINDS]) -> Vec<u8> {
+    // Ladder order: heavies lead, spears back them, lights fill the
+    // middle, archers take the rear ranks (they shoot over everyone).
+    let mut kinds: Vec<u8> = Vec::new();
+    for k in [KIND_HEAVY, KIND_SPEAR, KIND_LIGHT, KIND_ARCHER] {
+        kinds.extend(std::iter::repeat_n(k, comp[k as usize]));
+    }
+    // FL_ARCHER_SCATTER=1: the archer regiments stand spread through
+    // the army, one at the middle of each equal stretch of the
+    // ladder, instead of together in the rear ranks. The scene of the
+    // ten-archer measurement: every archer regiment has its own
+    // neighbours and its own enemy blocks in range.
+    let n_archer = comp[KIND_ARCHER as usize];
+    if std::env::var("FL_ARCHER_SCATTER").is_ok() && n_archer > 0 {
+        let n = kinds.len();
+        let slots: Vec<usize> = (0..n_archer).map(|k| (2 * k + 1) * n / (2 * n_archer)).collect();
+        let mut others = kinds.iter().copied().filter(|&k| k != KIND_ARCHER);
+        kinds = (0..n)
+            .map(|r| if slots.contains(&r) { KIND_ARCHER } else { others.next().unwrap_or(KIND_LIGHT) })
+            .collect();
+    }
+    kinds
+}
+
+/// The cost tables the routes will need, one per width class a regiment
+/// spans across any way it may take, built now rather than in a tick.
+#[inline]
+fn prepare_route_costs(nav: &crate::nav::NavGrid, list: &[GroupData]) {
+    let mut widths: Vec<crate::nav::PlanRequest> = Vec::new();
+    for gd in list {
+        for half_w in [
+            crate::sim::route::half_width(gd, Vec2::Y),
+            crate::sim::route::half_width(gd, Vec2::X),
+            crate::sim::route::half_width_max(gd),
+        ] {
+            widths.push(crate::nav::PlanRequest { g: 0, serial: 0, start: Vec2::ZERO, goal: Vec2::ZERO, half_w });
+        }
+    }
+    nav.prepare_costs(&widths);
 }
 
 #[cfg(test)]
