@@ -155,6 +155,11 @@ pub struct KindMeshes {
     /// keep.
     pub light_last: bool,
     pub cast_last: Option<Mesh>,
+    /// `FL_SPRITE`: the last level is a card (`card_level`) that shows the
+    /// kind's picture in `sprite`, and `fallen_last` is the file's own last
+    /// level, which the dying and the fallen at that level keep.
+    pub sprite: Option<Image>,
+    pub fallen_last: Option<Mesh>,
 }
 
 impl KindMeshes {
@@ -167,6 +172,8 @@ impl KindMeshes {
             clips: Vec::new(),
             light_last: false,
             cast_last: None,
+            sprite: None,
+            fallen_last: None,
         }
     }
 }
@@ -483,7 +490,23 @@ fn import(kind: usize, path: &Path, pulled: bool) -> Fallible<KindMeshes> {
     if l3_light() && !pulled && kind == 0 {
         warn!("FL_L3_LIGHT: the light last level draws only on the GPU path; drawing the file's last level");
     }
-    let light_last = l3_light() && pulled && levels[last].is_some();
+    // FL_SPRITE: the file's last level becomes a card, and keeps only its
+    // shadow casters and the dying and the fallen.
+    let mut sprite = None;
+    let mut fallen_last = None;
+    if sprite_mode() != 0 && pulled && levels[last].is_some() {
+        match sprite_sheet() {
+            Ok(image) => sprite = Some(image),
+            Err(e) => error!("FL_SPRITE: {e}; drawing the file's last level"),
+        }
+    }
+    if sprite.is_some() && let Some(file) = levels[last].take() {
+        levels[last] = Some(card_level(kind, scale, half_height));
+        cast_last = Some(level_mesh(&file));
+        fallen_last = Some(level_mesh(&file));
+        info!("{name}: the last level is a card (FL_SPRITE={})", sprite_mode());
+    }
+    let light_last = l3_light() && sprite.is_none() && pulled && levels[last].is_some();
     if light_last && let Some(file) = levels[last].take() {
         levels[last] = Some(light_last_level(&file, atlas.as_ref(), kind, half_height, name));
         cast_last = Some(level_mesh(&file));
@@ -507,7 +530,79 @@ fn import(kind: usize, path: &Path, pulled: bool) -> Fallible<KindMeshes> {
         clips,
         light_last,
         cast_last,
+        sprite,
+        fallen_last,
     })
+}
+
+/// `FL_SPRITE`: 0 off (the default), 1 every living soldier at the last
+/// level is drawn as a card cut out by a plain discard, 2 the same cut out
+/// by alpha to coverage. GPU path only. Read once, at import. The last
+/// level begins where `FL_LOD_PX` puts it.
+pub fn sprite_mode() -> u32 {
+    static MODE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| crate::util::env_or("FL_SPRITE", 0_u32).min(2))
+}
+
+/// Per kind, the card's quad in the model's metres (x left to right as
+/// the camera sees his front, y from the feet up) and its rect in the
+/// sprite sheet (u from, u to, v of the top, v of the feet): x0, x1, y0,
+/// y1, u0, u1, v0, v1. Printed by tools/sprite_sheet.py for the sheet it
+/// writes.
+const SPRITE_CARDS: [[f32; 8]; NUM_KINDS] = [
+    [-0.5455, 0.6818, 0.0000, 1.8182, 0.01562, 0.12109, 0.37500, 1.00000],
+    [-0.5114, 0.6364, 0.0000, 1.8182, 0.14355, 0.24219, 0.37500, 1.00000],
+    [-0.4318, 0.6250, 0.0000, 2.9091, 0.27539, 0.36621, 0.00000, 1.00000],
+    [-0.4091, 0.4091, 0.0000, 1.8182, 0.40234, 0.47266, 0.37500, 1.00000],
+];
+
+/// The sprite sheet: one row of eight cells, the four kinds' pictures (rgb
+/// colour with the team cloth grey, alpha the cut-out), then the four
+/// kinds' team masks in alpha, the mask of a picture half a sheet to its
+/// right (unit_instancing.wgsl `UNIT_SPRITE`). Read and given its mips as
+/// a model's atlas is. The sheet is a placeholder: tools/sprite_sheet.py
+/// draws it from each kind's nearest level in its rest pose, seen from
+/// the front.
+fn sprite_sheet() -> Fallible<Image> {
+    let path = crate::util::game_root().join("assets/units/sprites.png");
+    let bytes = crate::game_files::read(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+        mipmap_filter: ImageFilterMode::Linear,
+        ..ImageSamplerDescriptor::linear()
+    });
+    let mut image = Image::from_buffer(
+        &bytes,
+        ImageType::MimeType("image/png"),
+        CompressedImageFormats::NONE,
+        true,
+        sampler,
+        RenderAssetUsages::RENDER_WORLD,
+    )
+    .map_err(|e| format!("cannot decode {}: {e}", path.display()))?;
+    if image.texture_descriptor.format != TextureFormat::Rgba8UnormSrgb {
+        return Err(format!("{} decodes to {:?}, it must be 8-bit RGBA", path.display(), image.texture_descriptor.format));
+    }
+    add_mips(&mut image)?;
+    Ok(image)
+}
+
+/// The card: two triangles in the plane of his facing, from `SPRITE_CARDS`
+/// scaled as the model is, feet at `-half_height`. Every corner is on the
+/// body, part 0. The vertex shader turns it to face the camera about the
+/// vertical through his position (unit_instancing.wgsl `sprite_output`).
+fn card_level(kind: usize, scale: f32, half_height: f32) -> Level {
+    let [x0, x1, y0, y1, u0, u1, v0, v1] = SPRITE_CARDS[kind];
+    let corner = |x: f32, y: f32| Vec3::new(scale * x, scale * y - half_height, 0.0);
+    Level {
+        pos: vec![corner(x0, y0), corner(x1, y0), corner(x1, y1), corner(x0, y1)],
+        nrm: vec![Vec3::Z; 4],
+        part: vec![0.0; 4],
+        pivot: vec![-half_height; 4],
+        col: vec![[1.0, 1.0, 1.0, 0.0]; 4],
+        tex: vec![[u0, v1], [u1, v1], [u1, v0], [u0, v0]],
+        skin: Vec::new(),
+        idx: vec![0, 1, 2, 0, 2, 3],
+    }
 }
 
 /// `FL_L3_LIGHT=1`: every imported kind draws its last level from three

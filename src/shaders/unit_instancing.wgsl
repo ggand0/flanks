@@ -179,6 +179,41 @@ fn measure_reach(placed: vec3<f32>) {
 }
 #endif
 
+#ifdef UNIT_SPRITE
+// FL_SPRITE: one corner of a standing soldier's card (unit_glb.rs
+// `card_level`). The list entry is his record (unit_build.wgsl
+// `build_soldier`), which holds his position half his height above his
+// feet, his team colour and his hit flash. The card stands on his feet and
+// turns about the vertical through him to face the camera: the corner's x
+// runs along the camera's right as it sees him, its y straight up. The
+// picture holds its light (tools/sprite_sheet.py), so the
+// corner carries white with no share of the sun.
+fn sprite_output(entry: u32, v: PullVertex) -> VertexOutput {
+    let inst = pull_records[entry & 0x1fffffffu];
+    let p = inst.pos_scale.xyz;
+    var f = view.world_position.xz - p.xz;
+    f = f / max(length(f), 1e-4);
+    let right = vec3<f32>(f.y, 0.0, -f.x);
+    let world = p + right * v.position.x + vec3<f32>(0.0, v.position.y, 0.0);
+    var out: VertexOutput;
+    out.clip_position = position_world_to_clip(world);
+    out.color = vec4<f32>(1.0, 1.0, 1.0, 0.0);
+    // anim.w: the hit flash in [0, 1]; a standing soldier has no death.
+    let flash = clamp(inst.anim.w, 0.0, 1.0);
+    out.packed = vec2<u32>(
+        pack4x8unorm(vec4<f32>(inst.color.rgb, 0.0)),
+        pack4x8unorm(vec4<f32>(flash, 0.0, 0.0, 0.0)),
+    );
+#ifdef UNIT_SHADOW_RECEIVE
+    out.shadow_position = world;
+#endif
+#ifdef UNIT_ATLAS
+    out.atlas_uv = unpack2x16unorm(v.atlas_uv);
+#endif
+    return out;
+}
+#endif
+
 @vertex
 fn vertex_pull(@builtin(vertex_index) index: u32, @builtin(instance_index) instance: u32) -> VertexOutput {
 #ifdef PULL_INDEXED
@@ -205,6 +240,9 @@ fn vertex_pull(@builtin(vertex_index) index: u32, @builtin(instance_index) insta
     }
 #endif
     let v = pull_vertices[corner];
+#ifdef UNIT_SPRITE
+    return sprite_output(entry, v);
+#else
 #ifdef UNIT_POSE_READ
     // The level rides the top two bits and the occlusion check's mark the
     // bit below (unit_build.wgsl `queue_draw`).
@@ -287,6 +325,7 @@ fn vertex_pull(@builtin(vertex_index) index: u32, @builtin(instance_index) insta
     out.packed.y |= ((entry >> 29u) & 1u) << 8u;
 #endif
     return out;
+#endif
 }
 #else
 @vertex
@@ -453,6 +492,25 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // rgb = team colour, a = death darkening.
     let team = unpack4x8unorm(in.packed.x);
     let flash = unpack4x8unorm(in.packed.y).x;
+#ifdef UNIT_SPRITE
+    // FL_SPRITE: the card's picture, rgb its colour and alpha the cut-out,
+    // and half a sheet to its right its team mask in alpha, which tints as
+    // the atlas mask does (unit_glb.rs `sprite_sheet`). A pixel outside the
+    // figure is discarded, or under alpha to coverage covers the samples
+    // its alpha says, sharpened to about a pixel's width.
+    let texel = textureSample(unit_atlas, unit_atlas_sampler, in.atlas_uv);
+    let mask = textureSample(unit_atlas, unit_atlas_sampler, in.atlas_uv + vec2<f32>(0.5, 0.0)).a;
+#ifdef UNIT_SPRITE_A2C
+    let coverage = clamp((texel.a - 0.5) / max(fwidth(texel.a), 1e-4) + 0.5, 0.0, 1.0);
+#else
+    if texel.a < 0.5 {
+        discard;
+    }
+    let coverage = 1.0;
+#endif
+    let tint = mix(vec3<f32>(1.0), team.rgb, clamp(mask / max(texel.a, 1e-3), 0.0, 1.0));
+    var rgb = in.color.rgb * texel.rgb * tint;
+#else
 #ifdef UNIT_ATLAS
     // The atlas mask tints rather than replaces, so cloth keeps its weave
     // under the team colour.
@@ -461,6 +519,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     var rgb = in.color.rgb * texel.rgb * tint;
 #else
     var rgb = in.color.rgb;
+#endif
 #endif
 #ifdef UNIT_SHADOW_RECEIVE
     // The sun's share of the light, less what its shadow takes. A face
@@ -471,5 +530,9 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
 #endif
     rgb = mix(rgb, vec3<f32>(1.0, 1.0, 1.0), flash * 0.8);
     rgb = rgb * (1.0 - 0.45 * team.a);
+#ifdef UNIT_SPRITE
+    return vec4<f32>(rgb, coverage);
+#else
     return vec4<f32>(rgb, 1.0);
+#endif
 }
