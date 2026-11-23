@@ -388,7 +388,7 @@ pub fn apply_damage(
     ctx: &ApplyContext,
     cstats: &mut crate::combat::CombatStats,
     dir_stats: &mut DirTestStats,
-    mut sounds: Option<&mut crate::audio::SoundEvents>,
+    sounds: Option<&mut crate::audio::SoundEvents>,
 ) -> usize {
     let Units {
         pos,
@@ -408,16 +408,6 @@ pub fn apply_damage(
         chain,
         ..
     } = units;
-    let team = &team[..];
-    let kind = &kind[..];
-    let group = &group[..];
-    let wall = ctx.wall;
-    let fat_nocharge = ctx.fat_nocharge;
-    let bounds_min = ctx.bounds_min;
-    let bounds_max = ctx.bounds_max;
-    let combat_scale = ctx.combat_scale;
-    let tick_seed = ctx.tick_seed;
-    let terrain = ctx.terrain;
     let mut events = 0usize;
     {
         let _span = info_span!("damage_apply").entered();
@@ -429,326 +419,496 @@ pub fn apply_damage(
             .map(|g| crate::fatigue::attack_penalty(g.fatigue))
             .collect();
         let broken: Vec<bool> = groups.list.iter().map(|g| g.state.is_broken()).collect();
+        let mut apply = Apply {
+            pos,
+            pos_prev,
+            vel,
+            imposed,
+            team: &team[..],
+            kind: &kind[..],
+            yaw,
+            group: &group[..],
+            hp,
+            target,
+            swing,
+            swing_t,
+            flash,
+            death_t,
+            chain,
+            groups,
+            ctx,
+            cstats,
+            dir_stats,
+            sounds,
+            fat_atk,
+            broken,
+        };
         for buf in buffers.iter_mut() {
             events += buf.len();
             for ev in buf.drain(..) {
-                let (v, a) = (ev.victim as usize, ev.attacker as usize);
-                if v >= hp.len() || a >= hp.len() {
-                    continue;
-                }
-                if hp[v] <= 0.0 || death_t[v] > 0 || team[v] == team[a] {
-                    continue;
-                }
-                let pa = &TYPES[kind[a] as usize];
-                let pv = &TYPES[kind[v] as usize];
-                let fwd = Vec2::new(yaw[v].sin(), yaw[v].cos());
-                let dir = (pos_prev[a].xz() - pos_prev[v].xz()).normalize_or_zero();
-                let along = fwd.dot(dir);
-                let rear = along < -SECTOR_COS_60;
-                let front = along >= SECTOR_COS_60;
-                // Victim's left in the xz plane (facing +Z -> left = +X).
-                let left_side = !front && !rear && dir.dot(Vec2::new(fwd.y, -fwd.x)) > 0.0;
-                let roll = |k: u32| {
-                    crate::units::hash01(
-                        tick_seed
-                            ^ ev.victim.wrapping_mul(k)
-                            ^ ev.attacker.wrapping_mul(0x1656_67B1),
-                    )
-                };
-
-                if ev.warn > 0 {
-                    // The warning of a swing. He answers it if he is free
-                    // to (ready, or past the follow-through of his own
-                    // last blow, not reeling, not already answering
-                    // another) and sees the attacker in front of him
-                    // (within 90 degrees). Routed men answer nothing.
-                    // The counter of his own parried blow he may answer
-                    // from the bind, anywhere in his recovery.
-                    let vs = swing[v];
-                    let state = vs & crate::units::SWING_STATE_MASK;
-                    let free = match state {
-                        crate::units::SWING_READY => true,
-                        crate::units::SWING_RECOVER => {
-                            vs & crate::units::SWING_STAGGERED == 0
-                                && (u16::from(swing_t[v]) + u16::from(pv.windup_ticks)
-                                    <= u16::from(pv.cooldown_ticks)
-                                    || (ev.chain > 0 && target[v] == ev.attacker))
-                        }
-                        _ => false,
-                    };
-                    let share = chain_share(ev.chain);
-                    if !free || share <= 0.0 || along < 0.0 || broken[group[v] as usize] {
-                        continue;
-                    }
-                    // Which answer: the shield meets a blow from its side,
-                    // except when he chooses the parry; a blow from the
-                    // open side, or a man without a shield, parries. A
-                    // counter is never blocked: the parry that earned it
-                    // is answered with the blade or taken on the body.
-                    let shield_side = pv.shield > 0.0 && (front || left_side);
-                    let parry = ev.chain > 0 || !shield_side || roll(0x27D4_EB2F) < parry_share(kind[v] as usize);
-                    // On time: his skill, less what fatigue took from his
-                    // arm. A late answer raises the guard as the blow
-                    // arrives and still costs him the clip; a late parry
-                    // meets the blow with his guard open.
-                    let skill = (pv.defence_skill + fat_atk[group[v] as usize]).max(0.0);
-                    let on_time = roll(0x9E37_79B9) < skill * guard_per_skill() * share;
-                    let (raise, _, len) = guard_timeline(parry);
-                    let wait = if on_time && ev.warn >= raise { ev.warn - raise } else { ev.warn };
-                    swing[v] = crate::units::SWING_DEFEND
-                        | if parry { GUARD_PARRY } else { GUARD_BLOCK }
-                        | (vs & crate::units::SWING_STAGGER_IMMUNE);
-                    swing_t[v] = wait.saturating_add(len);
-                    target[v] = ev.attacker;
-                    chain[v] = ev.chain;
-                    continue;
-                }
-
-                let reach = pa.reach * 1.15;
-                if pos_prev[v].xz().distance_squared(pos_prev[a].xz()) > reach * reach {
-                    continue;
-                }
-                let vt = team[v] as usize;
-                let sector = if front { 0 } else if !rear { 1 } else { 2 };
-                if dir_stats.enabled {
-                    dir_stats.hits[vt][sector] += 1;
-                }
-                let blow_at = (pos[v], pos[a], group[v], group[a]);
-
-                // A raised guard meets the blow: the victim is answering
-                // a swing, his shield or blade is up now, and the blow
-                // comes from within 45 degrees of his front (the swing
-                // he answered, or another that arrived while he was
-                // up). Stopped before the stats say anything. A parry
-                // that stops the blow counters, most of the time: a
-                // stab from the bind, while the
-                // attacker is still recovering. A parry that is not up
-                // yet has his guard open: his skill counts for nothing
-                // against this blow.
-                let v_defending =
-                    swing[v] & crate::units::SWING_STATE_MASK == crate::units::SWING_DEFEND;
-                let v_parrying =
-                    v_defending && swing[v] & crate::units::SWING_STYLE_MASK == GUARD_PARRY;
-                let v_guard_up = v_defending && guard_up(swing[v], swing_t[v]);
-                if v_guard_up && along >= GUARD_COS_45 && !ev.impale {
-                    let outcome = if v_parrying {
-                        // Whether the counter follows (the kernel
-                        // launches it): his skill, less what fatigue
-                        // took from his arm.
-                        let skill = (pv.defence_skill + fat_atk[group[v] as usize]).max(0.0);
-                        if roll(0x2545_F491) < counter_chance(skill) {
-                            swing[v] |= GUARD_STOPPED;
-                            target[v] = ev.attacker;
-                        }
-                        if dir_stats.enabled {
-                            dir_stats.chain[usize::from(chain[v]).min(CHAIN_DEPTHS - 1)] += 1;
-                        }
-                        OUT_PARRIED
-                    } else {
-                        OUT_BLOCKED
-                    };
-                    let material = if v_parrying {
-                        crate::audio::Material::Steel
-                    } else {
-                        crate::audio::Material::Wood
-                    };
-                    blow_sound(&mut sounds, blow_at, material, false);
-                    if dir_stats.enabled {
-                        dir_stats.outcomes[vt][outcome] += 1;
-                    }
-                    continue;
-                }
-
-                // Directional resolution, the points of the land
-                // roll. Sector of the blow against the victim's facing:
-                // defence skill counts in full from the front, half from
-                // the sides and not from the rear; the shield covers front
-                // + LEFT side only (shield arm); armour counts from
-                // everywhere, halved by armour-piercing weapons; the open
-                // side and the back give the blow points of their own. A
-                // soldier struck from behind loses skill+shield entirely:
-                // facing is the defensive resource, and rear charges kill
-                // before morale even moves.
-                // Wall stances are stat points: a shieldwall doubles
-                // down on cover (only where the shield counts — it still
-                // has no back), a braced spearwall strikes harder, and a
-                // braced spearwall VICTIM nullifies the attacker's charge
-                // momentum (points beat momentum).
-                let a_wall = wall[group[a] as usize];
-                let v_wall = wall[group[v] as usize];
-                let mut attack = pa.attack
-                    + fat_atk[group[a] as usize]
-                    + match a_wall {
-                        1 => SHIELDWALL_ATK_PTS,
-                        2 => SPEARWALL_ATK_PTS,
-                        _ => 0.0,
-                    };
-                if ev.charge && !fat_nocharge[group[a] as usize] {
-                    attack += pa.charge_bonus;
-                }
-                // Impalement: he ran onto this spearman's braced point at
-                // speed (integrate's spear-line collision) — his OWN
-                // momentum is the attack bonus, spent against himself.
-                // No stance rules anywhere: a charger who slipped between
-                // the spear lines and reached the wielder gets his full
-                // charge bonus above like anyone else.
-                if ev.impale {
-                    attack += pv.charge_bonus;
-                }
-                if rear {
-                    attack += REAR_PTS;
-                } else if !front && !left_side {
-                    attack += OPEN_SIDE_PTS;
-                }
-                // A staggered man cannot parry (M2TW: no blocking while
-                // staggering — the outnumbered-men snowball): his defence
-                // SKILL is gone until he recovers; the shield still
-                // passively covers and armour always counts. So is the
-                // skill of a man caught with his blade not yet up.
-                let v_staggered = swing[v] & crate::units::SWING_STAGGERED != 0;
-                let skill = if rear || v_staggered || v_parrying {
-                    0.0
-                } else if front {
-                    pv.defence_skill
-                } else {
-                    0.5 * pv.defence_skill
-                };
-                let shield = if front || left_side {
-                    pv.shield + if v_wall == 1 { SHIELDWALL_SHIELD_PTS } else { 0.0 }
-                } else {
-                    0.0
-                };
-                let armour = if pa.ap { pv.armour * 0.5 } else { pv.armour };
-                let d = attack - (skill + armour + shield);
-                if roll(0x85EB_CA6B) >= land_chance(d) {
-                    // The stats turned it. Which defence gets the credit
-                    // is drawn in proportion to the points each put up;
-                    // the sound and the counts read it, the sim never
-                    // does.
-                    let total = skill + shield + armour;
-                    let x = roll(0xC2B2_AE35) * total;
-                    let (outcome, material) = if total <= 0.0 {
-                        (OUT_MISS, None)
-                    } else if x < skill {
-                        (OUT_SKILL, Some(crate::audio::Material::Steel))
-                    } else if x < skill + shield {
-                        (OUT_SHIELD, Some(crate::audio::Material::Wood))
-                    } else {
-                        (OUT_ARMOUR, Some(crate::audio::armour_material(kind[v])))
-                    };
-                    if let Some(m) = material {
-                        blow_sound(&mut sounds, blow_at, m, false);
-                    }
-                    // The render's cue: he twitches away from the side
-                    // the blow came from, unless he is reeling. A man
-                    // whose answer clip is playing shows that instead;
-                    // a kind without the clip shows the twitch.
-                    if !v_staggered && flash[v] < 16 {
-                        let side: u8 = if front { 1 } else if rear { 4 } else if left_side { 2 } else { 3 };
-                        flash[v] = (side << 4) | TWITCH_TICKS;
-                    }
-                    if dir_stats.enabled {
-                        dir_stats.outcomes[vt][outcome] += 1;
-                    }
-                    continue;
-                }
-                let dmg = BASE_DMG[pa.weapon as usize] * ev.jit * combat_scale;
-                hp[v] -= dmg;
-                flash[v] = FLASH_TICKS;
-                let died = hp[v] <= 0.0;
-                if died {
-                    death_t[v] = DEATH_TICKS;
-                    // kills[] counts losses OF that team (overlay semantics).
-                    cstats.kills[team[v] as usize] += 1;
-                    groups.list[group[v] as usize].recent_deaths += 1;
-                    // The attacker's regiment is winning its exchange.
-                    groups.list[group[a] as usize].recent_kills += 1;
-                }
-                // The blow's sound: what it struck.
-                blow_sound(&mut sounds, blow_at, crate::audio::armour_material(kind[v]), died);
-                // Charge impact: momentum becomes a shove and a
-                // stun. Walls barely budge and never stagger; a braced
-                // SPEARWALL additionally reflects the charge bonus onto
-                // the charger (points punish momentum) — the M2TW rule.
-                if !died {
-                    // Impacts always rock their man; an ordinary blow that
-                    // landed stumbles him most of the time.
-                    let certain = ev.charge || ev.impale || debug_stagger();
-                    let p = if certain { 1.0 } else { STAGGER_P0 };
-                    let stumble = roll(0x9E37) < p;
-                    // Bracing is posture physics: a wall hit FRONTALLY has
-                    // its weight planted — quarter knockback, no stagger;
-                    // from the flank or rear it is bodies like any others.
-                    let braced = v_wall != 0 && front;
-                    if ev.charge {
-                        let m_a = pa.mass;
-                        let m_v = pv.mass;
-                        let resist = if braced { WALL_KNOCKBACK_RESIST } else { 1.0 };
-                        if crate::sim::soldier::friction_contact() {
-                            // Under the friction contact the blow is a shove on
-                            // his speed, and into what the contacts put into
-                            // it, so his feet and legs take it back over about
-                            // a third of a second, like any push, and the men
-                            // behind him catch him (sim/soldier.rs
-                            // `held_total`, `shove_speed`). A shove on his
-                            // position in one tick would throw a reeling man
-                            // again at a second blow.
-                            let d = CHARGE_KNOCKBACK * (m_a / (m_a + m_v)) * resist;
-                            let push = -dir * crate::sim::soldier::shove_speed(d, ctx.dt);
-                            vel[v] += Vec3::new(push.x, 0.0, push.y);
-                            imposed[v] = (imposed[v] + push)
-                                .clamp_length_max(crate::sim::soldier::STEP_PACE);
-                        } else {
-                            let shove = -dir * CHARGE_KNOCKBACK * (m_a / (m_a + m_v)) * resist;
-                            let mut nx = (pos[v].x + shove.x).clamp(bounds_min.x, bounds_max.x);
-                            let mut nz = (pos[v].z + shove.y).clamp(bounds_min.y, bounds_max.y);
-                            // Charges can't knock a man into the river or
-                            // through a terrace riser: the shove just dies.
-                            if !terrain.body_free(nx, nz, terrain.body_radius(), shove.x, shove.y) {
-                                nx = pos[v].x;
-                                nz = pos[v].z;
-                            }
-                            pos[v] = Vec3::new(
-                                nx,
-                                terrain.height_at(nx, nz)
-                                    + crate::unit_types::half_height(kind[v] as usize),
-                                nz,
-                            );
-                        }
-                    }
-                    // An impaled runner is STOPPED, not thrown — his
-                    // momentum went into the point; the stagger is the
-                    // stop.
-                    if !braced && stumble {
-                        if swing[v] & crate::units::SWING_STAGGER_IMMUNE != 0 {
-                            // The free pass earned by the last stagger is
-                            // spent absorbing this one.
-                            swing[v] &= !crate::units::SWING_STAGGER_IMMUNE;
-                        } else {
-                            let stun = if certain {
-                                STAGGER_TICKS
-                            } else {
-                                HIT_STAGGER_TICKS
-                            };
-                            // A man in the middle of an answer keeps
-                            // none of it: the blow that got through
-                            // took his guard with it.
-                            let held = if v_defending { 0 } else { swing_t[v] };
-                            swing[v] = crate::units::SWING_RECOVER
-                                | crate::units::SWING_STAGGERED;
-                            swing_t[v] = held.max(stun);
-                        }
-                    }
-                }
-                if dir_stats.enabled {
-                    dir_stats.dmg[vt][sector] += dmg as f64;
-                    dir_stats.outcomes[vt][OUT_LANDED] += 1;
-                    if died {
-                        dir_stats.kills[vt][sector] += 1;
-                    }
-                }
+                apply.event(&ev);
             }
         }
     }
     events
+}
+
+/// The apply's columns, the regiments and the counters it writes, and
+/// the per-regiment numbers it reads, for one tick's events.
+struct Apply<'a, 'c> {
+    pos: &'a mut crate::units::Column<Vec3>,
+    pos_prev: &'a crate::units::Column<Vec3>,
+    vel: &'a mut crate::units::Column<Vec3>,
+    imposed: &'a mut crate::units::Column<Vec2>,
+    team: &'a [u8],
+    kind: &'a [u8],
+    yaw: &'a crate::units::Column<f32>,
+    group: &'a [u32],
+    hp: &'a mut Vec<f32>,
+    target: &'a mut crate::units::Column<u32>,
+    swing: &'a mut crate::units::Column<u8>,
+    swing_t: &'a mut crate::units::Column<u8>,
+    flash: &'a mut crate::units::Column<u8>,
+    death_t: &'a mut crate::units::Column<u8>,
+    chain: &'a mut crate::units::Column<u8>,
+    groups: &'a mut Groups,
+    ctx: &'a ApplyContext<'c>,
+    cstats: &'a mut crate::combat::CombatStats,
+    dir_stats: &'a mut DirTestStats,
+    sounds: Option<&'a mut crate::audio::SoundEvents>,
+    /// Each regiment's fatigue penalty on its attack points.
+    fat_atk: Vec<f32>,
+    broken: Vec<bool>,
+}
+
+/// One blow's geometry against its victim's facing, and its dice.
+struct Blow {
+    v: usize,
+    a: usize,
+    dir: Vec2,
+    along: f32,
+    rear: bool,
+    front: bool,
+    /// From the victim's left (shield) side.
+    left_side: bool,
+    /// The bits the rolls mix: the tick's seed and the two men.
+    tick_seed: u32,
+    victim: u32,
+    attacker: u32,
+}
+
+impl Blow {
+    /// A roll in [0, 1) for this blow, `k` naming which.
+    #[inline]
+    fn roll(&self, k: u32) -> f32 {
+        crate::units::hash01(
+            self.tick_seed
+                ^ self.victim.wrapping_mul(k)
+                ^ self.attacker.wrapping_mul(0x1656_67B1),
+        )
+    }
+}
+
+impl Apply<'_, '_> {
+    /// One event: a warning answered, or a blow whiffed, met by a raised
+    /// guard, turned by the stats or landed.
+    #[inline]
+    fn event(&mut self, ev: &DamageEvent) {
+        let (v, a) = (ev.victim as usize, ev.attacker as usize);
+        if v >= self.hp.len() || a >= self.hp.len() {
+            return;
+        }
+        if self.hp[v] <= 0.0 || self.death_t[v] > 0 || self.team[v] == self.team[a] {
+            return;
+        }
+        let (pos_prev, yaw) = (self.pos_prev, self.yaw);
+        let fwd = Vec2::new(yaw[v].sin(), yaw[v].cos());
+        let dir = (pos_prev[a].xz() - pos_prev[v].xz()).normalize_or_zero();
+        let along = fwd.dot(dir);
+        let rear = along < -SECTOR_COS_60;
+        let front = along >= SECTOR_COS_60;
+        // Victim's left in the xz plane (facing +Z -> left = +X).
+        let left_side = !front && !rear && dir.dot(Vec2::new(fwd.y, -fwd.x)) > 0.0;
+        let blow = Blow {
+            v,
+            a,
+            dir,
+            along,
+            rear,
+            front,
+            left_side,
+            tick_seed: self.ctx.tick_seed,
+            victim: ev.victim,
+            attacker: ev.attacker,
+        };
+
+        if ev.warn > 0 {
+            self.answer(ev, &blow);
+            return;
+        }
+
+        let pa = &TYPES[self.kind[a] as usize];
+        let reach = pa.reach * 1.15;
+        if pos_prev[v].xz().distance_squared(pos_prev[a].xz()) > reach * reach {
+            return;
+        }
+        let vt = self.team[v] as usize;
+        let sector = if front { 0 } else if !rear { 1 } else { 2 };
+        if self.dir_stats.enabled {
+            self.dir_stats.hits[vt][sector] += 1;
+        }
+        let blow_at = (self.pos[v], self.pos[a], self.group[v], self.group[a]);
+
+        // A raised guard meets the blow: the victim is answering
+        // a swing, his shield or blade is up now, and the blow
+        // comes from within 45 degrees of his front (the swing
+        // he answered, or another that arrived while he was
+        // up). Stopped before the stats say anything. A parry
+        // that stops the blow counters, most of the time: a
+        // stab from the bind, while the
+        // attacker is still recovering. A parry that is not up
+        // yet has his guard open: his skill counts for nothing
+        // against this blow.
+        let v_defending =
+            self.swing[v] & crate::units::SWING_STATE_MASK == crate::units::SWING_DEFEND;
+        let v_parrying =
+            v_defending && self.swing[v] & crate::units::SWING_STYLE_MASK == GUARD_PARRY;
+        if self.guard_stops(ev, &blow, blow_at, v_defending, v_parrying) {
+            return;
+        }
+        let Some(v_wall) = self.land_roll(ev, &blow, blow_at, v_parrying) else {
+            return;
+        };
+        let (dmg, died) = self.strike(ev, &blow, blow_at, v_wall, v_defending);
+        if self.dir_stats.enabled {
+            self.dir_stats.dmg[vt][sector] += dmg as f64;
+            self.dir_stats.outcomes[vt][OUT_LANDED] += 1;
+            if died {
+                self.dir_stats.kills[vt][sector] += 1;
+            }
+        }
+    }
+
+    /// The victim's answer to the warning of a swing.
+    #[inline]
+    fn answer(&mut self, ev: &DamageEvent, blow: &Blow) {
+        let Apply { kind, group, target, swing, swing_t, chain, fat_atk, broken, .. } = self;
+        let (v, front, left_side, along) = (blow.v, blow.front, blow.left_side, blow.along);
+        // The warning of a swing. He answers it if he is free
+        // to (ready, or past the follow-through of his own
+        // last blow, not reeling, not already answering
+        // another) and sees the attacker in front of him
+        // (within 90 degrees). Routed men answer nothing.
+        // The counter of his own parried blow he may answer
+        // from the bind, anywhere in his recovery.
+        let pv = &TYPES[kind[v] as usize];
+        let vs = swing[v];
+        let state = vs & crate::units::SWING_STATE_MASK;
+        let free = match state {
+            crate::units::SWING_READY => true,
+            crate::units::SWING_RECOVER => {
+                vs & crate::units::SWING_STAGGERED == 0
+                    && (u16::from(swing_t[v]) + u16::from(pv.windup_ticks)
+                        <= u16::from(pv.cooldown_ticks)
+                        || (ev.chain > 0 && target[v] == ev.attacker))
+            }
+            _ => false,
+        };
+        let share = chain_share(ev.chain);
+        if !free || share <= 0.0 || along < 0.0 || broken[group[v] as usize] {
+            return;
+        }
+        // Which answer: the shield meets a blow from its side,
+        // except when he chooses the parry; a blow from the
+        // open side, or a man without a shield, parries. A
+        // counter is never blocked: the parry that earned it
+        // is answered with the blade or taken on the body.
+        let shield_side = pv.shield > 0.0 && (front || left_side);
+        let parry = ev.chain > 0 || !shield_side || blow.roll(0x27D4_EB2F) < parry_share(kind[v] as usize);
+        // On time: his skill, less what fatigue took from his
+        // arm. A late answer raises the guard as the blow
+        // arrives and still costs him the clip; a late parry
+        // meets the blow with his guard open.
+        let skill = (pv.defence_skill + fat_atk[group[v] as usize]).max(0.0);
+        let on_time = blow.roll(0x9E37_79B9) < skill * guard_per_skill() * share;
+        let (raise, _, len) = guard_timeline(parry);
+        let wait = if on_time && ev.warn >= raise { ev.warn - raise } else { ev.warn };
+        swing[v] = crate::units::SWING_DEFEND
+            | if parry { GUARD_PARRY } else { GUARD_BLOCK }
+            | (vs & crate::units::SWING_STAGGER_IMMUNE);
+        swing_t[v] = wait.saturating_add(len);
+        target[v] = ev.attacker;
+        chain[v] = ev.chain;
+    }
+
+    /// Whether a raised guard stops the blow; its sound and counts if so.
+    #[inline]
+    fn guard_stops(
+        &mut self,
+        ev: &DamageEvent,
+        blow: &Blow,
+        blow_at: (Vec3, Vec3, u32, u32),
+        v_defending: bool,
+        v_parrying: bool,
+    ) -> bool {
+        let Apply { team, kind, group, target, swing, swing_t, chain, fat_atk, dir_stats, sounds, .. } = self;
+        let v = blow.v;
+        let pv = &TYPES[kind[v] as usize];
+        let vt = team[v] as usize;
+        let v_guard_up = v_defending && guard_up(swing[v], swing_t[v]);
+        if v_guard_up && blow.along >= GUARD_COS_45 && !ev.impale {
+            let outcome = if v_parrying {
+                // Whether the counter follows (the kernel
+                // launches it): his skill, less what fatigue
+                // took from his arm.
+                let skill = (pv.defence_skill + fat_atk[group[v] as usize]).max(0.0);
+                if blow.roll(0x2545_F491) < counter_chance(skill) {
+                    swing[v] |= GUARD_STOPPED;
+                    target[v] = ev.attacker;
+                }
+                if dir_stats.enabled {
+                    dir_stats.chain[usize::from(chain[v]).min(CHAIN_DEPTHS - 1)] += 1;
+                }
+                OUT_PARRIED
+            } else {
+                OUT_BLOCKED
+            };
+            let material = if v_parrying {
+                crate::audio::Material::Steel
+            } else {
+                crate::audio::Material::Wood
+            };
+            blow_sound(sounds, blow_at, material, false);
+            if dir_stats.enabled {
+                dir_stats.outcomes[vt][outcome] += 1;
+            }
+            return true;
+        }
+        false
+    }
+
+    /// The land roll: the blow's points against the victim's defence from
+    /// the side it comes from. A blow the stats turn gets its sound, its
+    /// twitch and its count, and gives None; one that lands gives the
+    /// victim's wall stance.
+    #[inline]
+    fn land_roll(
+        &mut self,
+        ev: &DamageEvent,
+        blow: &Blow,
+        blow_at: (Vec3, Vec3, u32, u32),
+        v_parrying: bool,
+    ) -> Option<u8> {
+        let Apply { team, kind, group, swing, flash, fat_atk, dir_stats, sounds, ctx, .. } = self;
+        let (v, a, rear, front, left_side) = (blow.v, blow.a, blow.rear, blow.front, blow.left_side);
+        let (wall, fat_nocharge) = (ctx.wall, ctx.fat_nocharge);
+        let pa = &TYPES[kind[a] as usize];
+        let pv = &TYPES[kind[v] as usize];
+        let vt = team[v] as usize;
+        // Directional resolution, the points of the land
+        // roll. Sector of the blow against the victim's facing:
+        // defence skill counts in full from the front, half from
+        // the sides and not from the rear; the shield covers front
+        // + LEFT side only (shield arm); armour counts from
+        // everywhere, halved by armour-piercing weapons; the open
+        // side and the back give the blow points of their own. A
+        // soldier struck from behind loses skill+shield entirely:
+        // facing is the defensive resource, and rear charges kill
+        // before morale even moves.
+        // Wall stances are stat points: a shieldwall doubles
+        // down on cover (only where the shield counts — it still
+        // has no back), a braced spearwall strikes harder, and a
+        // braced spearwall VICTIM nullifies the attacker's charge
+        // momentum (points beat momentum).
+        let a_wall = wall[group[a] as usize];
+        let v_wall = wall[group[v] as usize];
+        let mut attack = pa.attack
+            + fat_atk[group[a] as usize]
+            + match a_wall {
+                1 => SHIELDWALL_ATK_PTS,
+                2 => SPEARWALL_ATK_PTS,
+                _ => 0.0,
+            };
+        if ev.charge && !fat_nocharge[group[a] as usize] {
+            attack += pa.charge_bonus;
+        }
+        // Impalement: he ran onto this spearman's braced point at
+        // speed (integrate's spear-line collision) — his OWN
+        // momentum is the attack bonus, spent against himself.
+        // No stance rules anywhere: a charger who slipped between
+        // the spear lines and reached the wielder gets his full
+        // charge bonus above like anyone else.
+        if ev.impale {
+            attack += pv.charge_bonus;
+        }
+        if rear {
+            attack += REAR_PTS;
+        } else if !front && !left_side {
+            attack += OPEN_SIDE_PTS;
+        }
+        // A staggered man cannot parry (M2TW: no blocking while
+        // staggering — the outnumbered-men snowball): his defence
+        // SKILL is gone until he recovers; the shield still
+        // passively covers and armour always counts. So is the
+        // skill of a man caught with his blade not yet up.
+        let v_staggered = swing[v] & crate::units::SWING_STAGGERED != 0;
+        let skill = if rear || v_staggered || v_parrying {
+            0.0
+        } else if front {
+            pv.defence_skill
+        } else {
+            0.5 * pv.defence_skill
+        };
+        let shield = if front || left_side {
+            pv.shield + if v_wall == 1 { SHIELDWALL_SHIELD_PTS } else { 0.0 }
+        } else {
+            0.0
+        };
+        let armour = if pa.ap { pv.armour * 0.5 } else { pv.armour };
+        let d = attack - (skill + armour + shield);
+        if blow.roll(0x85EB_CA6B) >= land_chance(d) {
+            // The stats turned it. Which defence gets the credit
+            // is drawn in proportion to the points each put up;
+            // the sound and the counts read it, the sim never
+            // does.
+            let total = skill + shield + armour;
+            let x = blow.roll(0xC2B2_AE35) * total;
+            let (outcome, material) = if total <= 0.0 {
+                (OUT_MISS, None)
+            } else if x < skill {
+                (OUT_SKILL, Some(crate::audio::Material::Steel))
+            } else if x < skill + shield {
+                (OUT_SHIELD, Some(crate::audio::Material::Wood))
+            } else {
+                (OUT_ARMOUR, Some(crate::audio::armour_material(kind[v])))
+            };
+            if let Some(m) = material {
+                blow_sound(sounds, blow_at, m, false);
+            }
+            // The render's cue: he twitches away from the side
+            // the blow came from, unless he is reeling. A man
+            // whose answer clip is playing shows that instead;
+            // a kind without the clip shows the twitch.
+            if !v_staggered && flash[v] < 16 {
+                let side: u8 = if front { 1 } else if rear { 4 } else if left_side { 2 } else { 3 };
+                flash[v] = (side << 4) | TWITCH_TICKS;
+            }
+            if dir_stats.enabled {
+                dir_stats.outcomes[vt][outcome] += 1;
+            }
+            return None;
+        }
+        Some(v_wall)
+    }
+
+    /// A landed blow: the damage, a death, the sound, and on a man who
+    /// lives the charge shove and the stagger. Gives the damage and
+    /// whether he died.
+    #[inline]
+    fn strike(
+        &mut self,
+        ev: &DamageEvent,
+        blow: &Blow,
+        blow_at: (Vec3, Vec3, u32, u32),
+        v_wall: u8,
+        v_defending: bool,
+    ) -> (f32, bool) {
+        let Apply {
+            pos, vel, imposed, team, kind, group, hp, swing, swing_t, flash, death_t, groups, ctx, cstats, sounds, ..
+        } = self;
+        let (v, a, dir, front) = (blow.v, blow.a, blow.dir, blow.front);
+        let (bounds_min, bounds_max, combat_scale, terrain) =
+            (ctx.bounds_min, ctx.bounds_max, ctx.combat_scale, ctx.terrain);
+        let pa = &TYPES[kind[a] as usize];
+        let pv = &TYPES[kind[v] as usize];
+        let dmg = BASE_DMG[pa.weapon as usize] * ev.jit * combat_scale;
+        hp[v] -= dmg;
+        flash[v] = FLASH_TICKS;
+        let died = hp[v] <= 0.0;
+        if died {
+            death_t[v] = DEATH_TICKS;
+            // kills[] counts losses OF that team (overlay semantics).
+            cstats.kills[team[v] as usize] += 1;
+            groups.list[group[v] as usize].recent_deaths += 1;
+            // The attacker's regiment is winning its exchange.
+            groups.list[group[a] as usize].recent_kills += 1;
+        }
+        // The blow's sound: what it struck.
+        blow_sound(sounds, blow_at, crate::audio::armour_material(kind[v]), died);
+        // Charge impact: momentum becomes a shove and a
+        // stun. Walls barely budge and never stagger; a braced
+        // SPEARWALL additionally reflects the charge bonus onto
+        // the charger (points punish momentum) — the M2TW rule.
+        if !died {
+            // Impacts always rock their man; an ordinary blow that
+            // landed stumbles him most of the time.
+            let certain = ev.charge || ev.impale || debug_stagger();
+            let p = if certain { 1.0 } else { STAGGER_P0 };
+            let stumble = blow.roll(0x9E37) < p;
+            // Bracing is posture physics: a wall hit FRONTALLY has
+            // its weight planted — quarter knockback, no stagger;
+            // from the flank or rear it is bodies like any others.
+            let braced = v_wall != 0 && front;
+            if ev.charge {
+                let m_a = pa.mass;
+                let m_v = pv.mass;
+                let resist = if braced { WALL_KNOCKBACK_RESIST } else { 1.0 };
+                if crate::sim::soldier::friction_contact() {
+                    // Under the friction contact the blow is a shove on
+                    // his speed, and into what the contacts put into
+                    // it, so his feet and legs take it back over about
+                    // a third of a second, like any push, and the men
+                    // behind him catch him (sim/soldier.rs
+                    // `held_total`, `shove_speed`). A shove on his
+                    // position in one tick would throw a reeling man
+                    // again at a second blow.
+                    let d = CHARGE_KNOCKBACK * (m_a / (m_a + m_v)) * resist;
+                    let push = -dir * crate::sim::soldier::shove_speed(d, ctx.dt);
+                    vel[v] += Vec3::new(push.x, 0.0, push.y);
+                    imposed[v] = (imposed[v] + push)
+                        .clamp_length_max(crate::sim::soldier::STEP_PACE);
+                } else {
+                    let shove = -dir * CHARGE_KNOCKBACK * (m_a / (m_a + m_v)) * resist;
+                    let mut nx = (pos[v].x + shove.x).clamp(bounds_min.x, bounds_max.x);
+                    let mut nz = (pos[v].z + shove.y).clamp(bounds_min.y, bounds_max.y);
+                    // Charges can't knock a man into the river or
+                    // through a terrace riser: the shove just dies.
+                    if !terrain.body_free(nx, nz, terrain.body_radius(), shove.x, shove.y) {
+                        nx = pos[v].x;
+                        nz = pos[v].z;
+                    }
+                    pos[v] = Vec3::new(
+                        nx,
+                        terrain.height_at(nx, nz)
+                            + crate::unit_types::half_height(kind[v] as usize),
+                        nz,
+                    );
+                }
+            }
+            // An impaled runner is STOPPED, not thrown — his
+            // momentum went into the point; the stagger is the
+            // stop.
+            if !braced && stumble {
+                if swing[v] & crate::units::SWING_STAGGER_IMMUNE != 0 {
+                    // The free pass earned by the last stagger is
+                    // spent absorbing this one.
+                    swing[v] &= !crate::units::SWING_STAGGER_IMMUNE;
+                } else {
+                    let stun = if certain {
+                        STAGGER_TICKS
+                    } else {
+                        HIT_STAGGER_TICKS
+                    };
+                    // A man in the middle of an answer keeps
+                    // none of it: the blow that got through
+                    // took his guard with it.
+                    let held = if v_defending { 0 } else { swing_t[v] };
+                    swing[v] = crate::units::SWING_RECOVER
+                        | crate::units::SWING_STAGGERED;
+                    swing_t[v] = held.max(stun);
+                }
+            }
+        }
+        (dmg, died)
+    }
 }
