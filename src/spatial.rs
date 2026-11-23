@@ -171,6 +171,18 @@ impl SpatialGrid {
             return;
         }
 
+        let cells = self.fit_bounds(positions);
+        self.count(positions);
+        self.merge(cells);
+        self.scatter(positions, vels, teams, kinds, groups, death_t, poses, stood, group_wall);
+    }
+
+    /// The field's bounds, chunk by chunk in parallel, and the grid's
+    /// origin and dimensions from them; sizes the scratch for `n` men.
+    /// Returns the number of cells.
+    #[inline]
+    fn fit_bounds(&mut self, positions: &[Vec3]) -> usize {
+        let n = positions.len();
         // The field's bounds, chunk by chunk in parallel: the smallest and
         // the largest place on each axis are the same in any order.
         let bounds: Vec<(Vec2, Vec2)> = crate::util::sim_scope(|scope| {
@@ -196,15 +208,19 @@ impl SpatialGrid {
             ((span.y / CELL_SIZE) as usize + 1).min(MAX_DIM),
         );
         let cells = self.dims.0 * self.dims.1;
-        let (origin, dims) = (self.origin, self.dims);
 
         let n_chunks = n.div_ceil(REBUILD_CHUNK);
         self.cell_of.resize(n, 0);
         self.hists.resize(n_chunks, Vec::new());
         self.hist_lo.resize(n_chunks, 0);
+        cells
+    }
 
-        // Count pass: per-unit cell index, then per-chunk histograms over
-        // the chunk's span of cells.
+    /// Count pass: per-unit cell index, then per-chunk histograms over
+    /// the chunk's span of cells.
+    #[inline]
+    fn count(&mut self, positions: &[Vec3]) {
+        let (origin, dims) = (self.origin, self.dims);
         crate::util::sim_scope(|scope| {
             for (pos_chunk, ((cell_chunk, hist), hist_lo)) in positions
                 .chunks(REBUILD_CHUNK)
@@ -226,7 +242,12 @@ impl SpatialGrid {
                 });
             }
         });
+    }
 
+    /// Merge: the chunk histograms into the chunks' write cursors, and the
+    /// cell prefix sums.
+    #[inline]
+    fn merge(&mut self, cells: usize) {
         // Merge: rewrite each chunk histogram into that chunk's write
         // cursors, and build the cell prefix sums. Deterministic layout:
         // cell-major, chunk order within a cell. In parallel over runs of
@@ -284,7 +305,24 @@ impl SpatialGrid {
                 });
             }
         });
+    }
 
+    /// Scatter pass: every man's row at his cursor, with his velocity.
+    #[allow(clippy::too_many_arguments)] // parallel SoA columns
+    #[inline]
+    fn scatter(
+        &mut self,
+        positions: &[Vec3],
+        vels: &[Vec3],
+        teams: &[u8],
+        kinds: &[u8],
+        groups: &[u32],
+        death_t: &[u8],
+        poses: &[u8],
+        stood: &[bool],
+        group_wall: &[bool],
+    ) {
+        let n = positions.len();
         // Scatter pass: chunks write their units to precomputed disjoint
         // offsets. SAFETY (SharedOut): the merged cursors partition [0, n),
         // so every slot of `sorted` is written exactly once, by one task.
