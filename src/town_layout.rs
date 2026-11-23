@@ -10,7 +10,7 @@
 //! (`Terrain::blocked_at`). Natural ground is blocked by the step rule
 //! (a 4-neighbour 2 m or more away in height, `terrain::SLOPE_BLOCK`),
 //! which cannot see a kerb, a rail or a stair leaning on a wall. So the
-//! pieces say outright which vertices are open: each piece names its
+//! pieces state outright which vertices are open: each piece names its
 //! clear surface (`Piece::surface`), and a vertex within a cell of a
 //! piece is open when the 2 m square around it meets nothing solid, and
 //! blocked otherwise. The ground beside a vertical face is open: a man
@@ -65,8 +65,7 @@ pub const EAVES: f32 = 6.0;
 pub const TOWERS_X: [f32; 4] = [-152.0, -80.0, 80.0, 152.0];
 /// The stairs' feet (x, m), one per curtain, each rising toward +x.
 pub const STAIRS_X: [f32; 4] = [-124.0, -52.0, 36.0, 108.0];
-/// The stair model's width across the flight (m): 4 m as delivered
-/// (handoff 152), 6 m once the wider one lands (handoff 155).
+/// The stair model's width across the flight (m).
 pub const STAIR_W: f32 = 4.0;
 /// The stair's rail: this thick, along the flight's open side and across
 /// the platform's far end.
@@ -201,10 +200,9 @@ impl Piece {
     }
 
     /// What the world point `p` is on this piece, None off it. The clear
-    /// surfaces are the models' (handoffs 152 and 153): the walk's 6 m
-    /// between the parapet and the kerb, the landing's 7 m, the tower
-    /// passage's 8 m, the gatehouse's 8 m bridge and passages, the stair's
-    /// treads and platform inside its rail.
+    /// surfaces are the models': the walk's 6 m between the parapet and the
+    /// kerb, the landing's 7 m, the tower passage's 8 m, the gatehouse's 8 m
+    /// bridge and passages, the stair's treads and platform inside its rail.
     pub fn surface(&self, p: Vec2) -> Option<Surface> {
         let l = self.local(p);
         let (lo, hi) = self.local_bounds();
@@ -265,8 +263,9 @@ fn curtain(out: &mut Vec<Piece>, a: f32, b: f32) {
     }
 }
 
-/// Every piece of the map `kind`, one with the wall: the wall run west to
-/// east, the stairs, then on the walled town the houses row by row.
+/// Every piece of the map `kind`, a map with the wall: the curtains west
+/// to east, the towers, the gatehouse, the stairs, then on the walled
+/// town the houses row by row.
 pub fn pieces(kind: MapKind) -> Vec<Piece> {
     let mut out = Vec::new();
     // The first wall centres sit 7 m from a tower's centre and 15 m from
@@ -293,8 +292,9 @@ pub fn pieces(kind: MapKind) -> Vec<Piece> {
 }
 
 /// The houses: the grid less the plaza inside the gate and one in eight
-/// for yards. The plaza's sides and the avenue north from it get merchant
-/// and market fronts facing them; the rest stand every way round.
+/// for yards. The plaza's sides get merchant and market fronts facing
+/// it, and the avenue north from it merchant and market houses; the rest
+/// face one of the four ways at random.
 fn houses(out: &mut Vec<Piece>) {
     let mut k = 0u32;
     for row in 0..HOUSE_ROWS {
@@ -316,8 +316,9 @@ fn houses(out: &mut Vec<Piece>) {
                 let kind = if row == 0 { House::Merchant } else { House::Market };
                 (kind, if pos.x > 0.0 { 3 } else { 1 })
             } else if avenue {
-                // Fronts toward the avenue's ends would face a neighbour;
-                // these turn their narrow side to it, so it stays 20 m.
+                // Fronts toward the avenue would put a house's 14 m length
+                // across it; these face its ends, toward a neighbour, so
+                // the avenue stays 20 m wide.
                 let kind = if row % 2 == 0 { House::Merchant } else { House::Market };
                 (kind, if roll(2) < 0.5 { 0 } else { 2 })
             } else {
@@ -525,7 +526,8 @@ impl Lane {
         (p.y - WALL_Z).abs() <= 6.0 && p.x >= self.along.0 && p.x <= self.along.1
     }
 
-    /// The lane's direction and its facing (yaw).
+    /// The yaw of a unit standing on the lane: facing +z, out over the
+    /// wall toward the plain.
     pub fn facing(&self) -> f32 {
         crate::formation::facing_of(Vec2::Y)
     }
@@ -549,7 +551,8 @@ pub mod spots {
     pub const PLAZA: Vec2 = Vec2::new(0.0, -175.0);
     /// The plain at the foot of the climb.
     pub const PLAIN: Vec2 = Vec2::new(0.0, 200.0);
-    /// On the walk of the eastern curtains, east of the second tower.
+    /// On the walk of the eastern curtains, between the towers at x = 80
+    /// and x = 152.
     pub const WALK_EAST: Vec2 = Vec2::new(130.0, WALL_Z);
     /// On the walk of the western curtains, west of the gatehouse.
     pub const WALK_WEST: Vec2 = Vec2::new(-30.0, WALL_Z);

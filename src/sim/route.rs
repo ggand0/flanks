@@ -25,7 +25,7 @@
 //!   straight way there is open. When it is not, he follows the route
 //!   from his own place on it, never past his regiment's frame: the
 //!   farthest point along it he can walk to straight, or else the nearest
-//!   point behind; failing any, he steps round what stands in front of
+//!   point behind; failing any, he steps around what stands in front of
 //!   him. He knows his slot, his regiment's route and the ground ahead of
 //!   him, nothing else.
 //! - A regiment that has arrived keeps its route while it holds at the
@@ -40,7 +40,7 @@
 //!
 //! `FL_PATH=0` turns routes off. `FL_FRAME_SHARE` sets the share of a
 //! regiment's men past a waypoint that moves its frame on (`frame_share`;
-//! 0 turns that way on off). `FL_LOG_ROUTE=1` logs each route event
+//! 0 turns it off). `FL_LOG_ROUTE=1` logs each route event
 //! (`log_route`): an order's end and whether its route stays, a holding
 //! regiment's route dropped, and each move of a frame to a later waypoint.
 
@@ -156,8 +156,8 @@ fn log_route() -> bool {
 
 /// The share of a regiment's living men that moves its frame on once
 /// they are past the waypoint it waits at: a fifth. With a third, the men
-/// already through, sent back to the frame, fill the passage's mouth
-/// before enough are past; with fewer, a few runners move the whole
+/// already through are sent back and fill the passage's mouth before
+/// enough are past; with fewer, a few men ahead of the rest move the whole
 /// regiment's slots.
 const FRAME_SHARE: f32 = 0.2;
 
@@ -165,9 +165,9 @@ const FRAME_SHARE: f32 = 0.2;
 /// waits at that moves the frame on (`update_routes`). The frame's other
 /// two tests read the regiment's centre, and a regiment filing through a
 /// passage narrower than its block stands strung along its route, its
-/// centre short of the passage's far end for good; its head is through.
-/// `FL_FRAME_SHARE` sets it; 0 turns this way on off, and the frame then
-/// moves exactly as it did without it.
+/// centre never reaches the passage's far end; its head is through.
+/// `FL_FRAME_SHARE` sets it; 0 turns it off, and only the two tests on
+/// the centre move the frame.
 pub fn frame_share() -> f32 {
     static S: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
     *S.get_or_init(|| crate::util::env_or("FL_FRAME_SHARE", FRAME_SHARE))
@@ -566,16 +566,17 @@ pub(crate) struct FrameTest {
     pub next: Vec2,
     /// The regiment's centre's distance to `here` (m).
     pub dist: f32,
-    /// The half width both tests use (m): the frame moves on when the
-    /// centre is within it of `here`, or when the straight way to `next`
-    /// is clear for it.
+    /// The half width the two tests on the centre use (m): the frame moves
+    /// on when the centre is within it of `here`, or when the straight way
+    /// to `next` is clear for it.
     pub w: f32,
     pub clear: bool,
 }
 
-/// The advance loop's two tests for the log, mirrored: the same `here`,
-/// `next` and half width, and the straight check from the centre. None
-/// once the frame is at the route's last waypoint.
+/// The advance loop's two tests on the centre for the log, mirrored: the
+/// same `here`, `next` and half width, and the straight check from the
+/// centre. The third, the share of men past the waypoint, is not in it.
+/// None once the frame is at the route's last waypoint.
 pub(crate) fn frame_test(nav: &NavGrid, gd: &GroupData, points: &[Vec2], k: usize, goal: Vec2) -> Option<FrameTest> {
     if k + 1 >= points.len() {
         return None;
@@ -699,7 +700,7 @@ pub(crate) fn plan_all(nav: &NavGrid, jobs: &mut Vec<PlanJob>, out: &mut Vec<Pla
 /// point of its legs up to the frame), the farthest of a few points ahead
 /// he can walk to straight. Failing any, a point behind his place he can
 /// walk to, or else the nearest waypoint behind it he can. Failing that
-/// too, he steps round what stands in front of him, to the side his place
+/// too, he steps around what stands in front of him, to the side his place
 /// on the route lies.
 #[inline]
 pub(crate) fn man_target(
@@ -747,9 +748,9 @@ pub(crate) fn man_target(
         }
     }
     // Back along the route from his place, then the waypoints behind it,
-    // the nearest first. His place is the nearest point in plan, which on
-    // a wall is the walk above a man at its foot: the stair's foot, a
-    // waypoint behind, is where he can go.
+    // the nearest first. His place is the nearest point seen from above,
+    // which on a wall is the walk above a man at its foot: the stair's
+    // foot, a waypoint behind, is where he can go.
     let start = point(leg);
     let back = at.distance(start);
     for &b in &FOLLOW_BACK {
@@ -882,7 +883,7 @@ mod tests {
     fn a_fifth_of_the_living_men_past_its_waypoint_moves_a_frame_on() {
         assert!(share_passed(Some((4, 40, 200)), 4, FRAME_SHARE));
         assert!(!share_passed(Some((4, 39, 200)), 4, FRAME_SHARE));
-        // A count taken at an earlier waypoint says nothing about this one.
+        // A count taken at an earlier waypoint does not move this one.
         assert!(!share_passed(Some((3, 200, 200)), 4, FRAME_SHARE));
         assert!(!share_passed(Some((4, 0, 0)), 4, FRAME_SHARE));
         assert!(!share_passed(None, 4, FRAME_SHARE));

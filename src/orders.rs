@@ -1610,9 +1610,9 @@ mod tests {
     #[test]
     fn a_lane_with_no_room_gives_no_run() {
         let lane = walk();
-        // The play of 2026-11-15: one regiment holds from the gate to the
-        // east end, the next is dragged westward from west of the gate
-        // and needs 174.8 m of the 136 m left.
+        // One regiment holds from the gate to the east end, the next is
+        // dragged westward from west of the gate and needs 174.8 m of the
+        // 136 m left.
         assert_eq!(free_run(&lane, &[(-16.4, 158.4)], -39.3, -1.0, 174.8), None);
         // Wider than the lane itself.
         assert_eq!(free_run(&lane, &[], 0.0, 1.0, lane.along.1 - lane.along.0 + 1.0), None);

@@ -1,5 +1,6 @@
-//! The walled town's models: the wall kit and the four houses, placed from
-//! town_layout.rs's list on the drawn ground. Static, one distance level.
+//! The walled town's models: the wall, its towers, stairs and gatehouse,
+//! and the four houses, placed from town_layout.rs's list on the drawn
+//! ground. Static, one distance level.
 //! The nine GLBs reference three shared atlases by file name
 //! (tools/blender/town/promote_assets.py), so each atlas is decoded once
 //! and one material per atlas serves every instance, which Bevy batches.
@@ -178,7 +179,7 @@ fn read_model(path: &Path, dir: &Path, atlases: &mut HashMap<String, Image>) -> 
         stack.extend(node.children().map(|c| (c, matrix)));
         let Some(mesh) = node.mesh() else { continue };
         if node.skin().is_some() {
-            return Err("town models carry no skin".into());
+            return Err("town models must carry no skin".into());
         }
         for primitive in mesh.primitives() {
             if primitive.mode() != gltf::mesh::Mode::Triangles {

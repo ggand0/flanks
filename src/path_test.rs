@@ -27,8 +27,8 @@
 //!   below it, in bow range of the walk, ordered up to the wall's foot: the
 //!   archers shoot down from the wall, and the enemy's front rank stops
 //!   where the blocked ground begins. The archers' skirmish is off, as a
-//!   player sets it to hold a wall: the run measures the enemy's distance
-//!   straight through the wall.
+//!   player sets it to hold a wall: the skirmish rule measures the
+//!   enemy's distance straight through the wall.
 //! - `FL_TEST_PATH=walls_place` with `FL_MAP=walled_town` or
 //!   `FL_MAP=wall_debug`: placing units on the walk from the plateau behind
 //!   the wall (through the town's streets on the walled town). 200 archers
@@ -47,9 +47,9 @@
 //!   along the walk on the far side of the stair from where it stands, so
 //!   both climb the same stair and cross on it and on the walk. Its log
 //!   adds, per regiment, the men who have never stood on the walk and the
-//!   waypoint its route has reached, so a route stalled at the stair's
-//!   foot, men who never got up and men up but not at their places read
-//!   apart. It has 300 s to arrive.
+//!   waypoint its route has reached, so a route stalled at the stair,
+//!   men who never got up and men up but not at their places can be
+//!   told apart. It has 300 s to arrive.
 //! - `FL_TEST_PATH=walls_long` with `FL_MAP=walled_town` or
 //!   `FL_MAP=wall_debug`: one regiment of 500 archers deployed as one long
 //!   line at the wall's inner foot, across both stairs east of the gate,
@@ -75,11 +75,13 @@
 //!
 //! - where its men stand (on the walk, a stair, a stair's foot, the wall's
 //!   inner face) and how many moved under a metre in those ten seconds;
-//! - where its route's frame waits, and the two tests that would move it
-//!   on: the centre within the regiment's half width of the waypoint, or
-//!   the straight way to the next point clear at that width;
+//! - where its route's frame waits, and the two tests on the regiment's
+//!   centre that would move it on: the centre within the regiment's half
+//!   width of the waypoint, or the straight way to the next point clear
+//!   at that width (the third, a share of its men past the waypoint,
+//!   sim/route.rs `frame_share`, is not shown);
 //! - its order, anchor, facing and spacing, the point the sim lays its
-//!   slots round, and how many of the places round it are off the walk;
+//!   slots around, and how many of the places around it are off the walk;
 //! - the men out, each with the slot and the aim the sim gives him.
 //!
 //! `FL_TEST_DUMP=<file>` writes every watched man's position, height
@@ -178,8 +180,8 @@ struct PathTest {
     dump: Option<std::fs::File>,
     dump_tried: bool,
     /// Per unit, where he stood at the last ten-second line (wall scenes),
-    /// to count the men who really moved: a man pressing on a wall keeps
-    /// a velocity while he stays where he is.
+    /// to count the men who really moved: a man held in a crowd keeps a
+    /// velocity while he stays where he is.
     pos_10s: Vec<Vec2>,
     ordered: bool,
     summary_done: bool,
@@ -617,7 +619,7 @@ fn log_progress(
                 frame()
             );
         }
-        // The point the sim lays this regiment's slots round now.
+        // The point the sim lays this regiment's slots around now.
         let slots_at = sim_frame(&groups, &routes, s.g);
         // On the wall scenes, where the men are on the way up: on the
         // walk, on a stair (flight or platform), on the ground within
@@ -632,7 +634,7 @@ fn log_progress(
             // Men who moved under a metre since the last line, and of them
             // the ones more than `ARRIVED_M` from their places.
             let (mut still, mut still_out) = (0, 0);
-            // The places round the sim's point, and how many are off the walk.
+            // The places around the sim's point, and how many are off the walk.
             let (mut lo, mut hi, mut off_walk) = (Vec2::splat(f32::INFINITY), Vec2::splat(f32::NEG_INFINITY), 0);
             // Where the men on a flight stand across it: their mean offset
             // from the tread's middle toward the wall (m), and the widest.
@@ -676,7 +678,7 @@ fn log_progress(
             );
             info!("[path-test] {} reg {} t={secs:.0}s: {}", s.case, s.g, frame_wait_text(&groups, &routes, s.g));
             info!(
-                "[path-test] {} reg {} t={secs:.0}s: order {}, anchor ({:.1}, {:.1}), facing {:.2} rad, spacing {:?}, slots laid round ({:.1}, {:.1}); places x {:.1} to {:.1}, z {:.1} to {:.1}, {off_walk} of {alive} places off the walk",
+                "[path-test] {} reg {} t={secs:.0}s: order {}, anchor ({:.1}, {:.1}), facing {:.2} rad, spacing {:?}, slots laid around ({:.1}, {:.1}); places x {:.1} to {:.1}, z {:.1} to {:.1}, {off_walk} of {alive} places off the walk",
                 s.case,
                 s.g,
                 if gd.order.is_some() { "on" } else { "done" },
@@ -694,7 +696,7 @@ fn log_progress(
         }
         // Where the men still out stand, every ten seconds once most are
         // in (on the wall scenes, from the start). Each man's slot and aim
-        // are the sim's: round the point it lays the slots round now.
+        // are the sim's: around the point it lays the slots around now.
         if ((0.9..0.99).contains(&share) || walls)
             && ten_s
             && watch
@@ -885,7 +887,7 @@ fn dump_men(
     }
 }
 
-/// The point the sim lays regiment `g`'s slots round this tick, as
+/// The point the sim lays regiment `g`'s slots around this tick, as
 /// sim/job.rs `resolve_orders` hands it to the soldiers' kernel: none for
 /// a regiment standing to shoot or holding a contact frame, else the
 /// route's frame for its goal; the anchor where there is none
@@ -901,7 +903,7 @@ fn sim_frame(groups: &Groups, routes: &crate::sim::route::Routes, g: usize) -> V
 }
 
 /// Where regiment `g`'s frame waits and what would move it on, from the
-/// route's advance tests (sim/route.rs `frame_test`).
+/// route's two advance tests on the centre (sim/route.rs `frame_test`).
 fn frame_wait_text(groups: &Groups, routes: &crate::sim::route::Routes, g: usize) -> String {
     let Some((points, k)) = routes.route_of(g) else {
         return "no route: the men walk straight at their places".into();

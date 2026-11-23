@@ -3036,8 +3036,7 @@ fn face(f: &Field, s: &mut Soldier, st: &mut Step) {
 }
 
 /// `FL_EDGE_STOP=0` leaves a man the velocity an edge of impassable
-/// ground stopped (`slide`): he is then turned to it and keeps it, as
-/// before.
+/// ground stopped (`slide`): he is then turned to it and keeps it.
 fn edge_stop() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| !std::env::var("FL_EDGE_STOP").is_ok_and(|v| v == "0"))
@@ -3069,10 +3068,10 @@ fn slide(f: &Field, i: usize, st: &mut Step) {
     let mut nz = (pos_prev[i].z + new_v.y * dt + corr.y)
         .clamp(bounds_min.y, bounds_max.y);
     // Impassable ground (terrace risers, gorge walls, crater lips, a
-    // wall's edges): wall-slide — keep the axis that stays on walkable
-    // ground, drop the one that doesn't, so crowds flow along the
-    // obstacle. His body stops at the edge, half the distance he keeps
-    // from his neighbours (`body_distance`) out from his centre.
+    // wall's edges): wall-slide, keeping the axis that stays on walkable
+    // ground and dropping the one that doesn't, so crowds flow along the
+    // obstacle. His body stops at the edge, half the body distance
+    // (`Terrain::body_radius`) out from his centre.
     let (px, pz) = (pos_prev[i].x, pos_prev[i].z);
     let r = terrain.body_radius();
     let step = Vec2::new(nx - px, nz - pz);
@@ -3093,9 +3092,9 @@ fn slide(f: &Field, i: usize, st: &mut Step) {
         }
     }
     // An edge across his motion over blocked ground (a crowd pushed him
-    // into the metre at a wall's face, then he walked along it): the step
-    // takes him off it, so he climbs a stair down its middle instead of
-    // with his shoulder on the wall.
+    // against a wall's face, then he walked along it): the step takes him
+    // off it, so he climbs a stair up its middle instead of with his
+    // shoulder on the wall.
     if r > 0.0 {
         let off = terrain.body_overlap(nx, nz, r);
         if off != Vec2::ZERO && !terrain.blocked_at(nx + off.x, nz + off.y) {
@@ -3149,4 +3148,3 @@ mod tests {
         assert_eq!(v, Vec2::new(1.2, 10.0));
     }
 }
-

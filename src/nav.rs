@@ -1196,13 +1196,6 @@ mod tests {
                 n
             };
             let w = WALL_Z;
-            println!(
-                "{kind:?} lanes (open vertices): walk {}, tower passage {}, bridge {}, stair {}",
-                lane(130.0, w - 4.0, w + 4.0),
-                lane(TOWERS_X[2], w - 4.0, w + 4.0),
-                lane(0.0, w - 4.0, w + 4.0),
-                lane(STAIRS_X[2] + 6.0, w - 4.0 - crate::town_layout::STAIR_W, w - 4.0),
-            );
             assert_eq!(lane(130.0, w - 4.0, w + 4.0), 3, "{kind:?}: the walk");
             assert_eq!(lane(TOWERS_X[2], w - 4.0, w + 4.0), 3, "{kind:?}: the tower passage");
             assert_eq!(lane(0.0, w - 4.0, w + 4.0), 3, "{kind:?}: the bridge");
@@ -1241,7 +1234,6 @@ mod tests {
                     assert!(x.abs() > TOWERS_X[3], "{kind:?}: the route crosses the wall line at x {x}");
                 }
             }
-            println!("{kind:?}: plain to plaza: {:.0} m around the wall", plan.length());
         }
     }
 
@@ -1265,4 +1257,3 @@ mod tests {
         assert!(ticks > 5, "{ticks} ticks");
     }
 }
-

@@ -741,7 +741,7 @@ fn stance_of(g: &GroupData) -> u8 {
 }
 
 /// The free ground before a holding regiment's front and behind its rear
-/// (metres), round its block as it stands dressed at its anchor (only a
+/// (metres), around its block as it stands dressed at its anchor (only a
 /// closed holder is measured, so that is its closed anchor). On each
 /// side, the least of: OPEN_ROOM_MAX; of every other regiment with men
 /// whose block reaches across the frontage, that block's gap; and on a
@@ -753,7 +753,7 @@ fn stance_of(g: &GroupData) -> u8 {
 /// The ground costs nothing on a map without blocked ground. Elsewhere it
 /// is at most about (frontage in metres) times (room in metres) mask reads
 /// per side, once per look for a closed holder a friend comes near: 72
-/// lines of up to 61 reads for a block of 50 archers.
+/// lines of up to 61 reads a side for a block 50 files wide.
 fn room_around(groups: &Groups, terrain: &Terrain, h: usize) -> (f32, f32) {
     let hd = &groups.list[h];
     let rect = crate::formation::block_rect_at(hd, hd.anchor);
@@ -764,7 +764,7 @@ fn room_around(groups: &Groups, terrain: &Terrain, h: usize) -> (f32, f32) {
     (ground_room(terrain, &rect, 1.0, front), ground_room(terrain, &rect, -1.0, back))
 }
 
-/// The other regiments' part of `room_around`, round `rect`.
+/// The other regiments' part of `room_around`, around `rect`.
 fn units_room(groups: &Groups, h: usize, rect: &crate::formation::BlockRect) -> (f32, f32) {
     let right = Vec2::new(rect.fwd.y, -rect.fwd.x);
     let (mut front, mut back) = (crate::formation::OPEN_ROOM_MAX, crate::formation::OPEN_ROOM_MAX);
@@ -1896,7 +1896,8 @@ mod tests {
         let want = choose_open(gd, false, false, OPEN_ROOM_MAX, OPEN_ROOM_MAX).expect("a plan");
         assert_eq!((o.files, o.sep, o.pitch, o.across), (want.files, want.sep, want.pitch, want.across));
         assert_eq!((o.front, o.back, o.closed_anchor), (want.front, want.back, want.closed_anchor));
-        // The fewest files to a group: one, its 5.6 m split evenly.
+        // The fewest files to a group: one, the 5.6 m it adds split evenly
+        // front and back.
         assert_eq!(o.files, 1);
         assert!((o.front - 2.8).abs() < 1e-4 && (o.back - 2.8).abs() < 1e-4);
     }

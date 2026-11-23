@@ -312,7 +312,7 @@ impl Terrain {
     /// |gradient| of the height field (rise per meter). Sampled on the
     /// level of `(x, z)` itself: a cliff a metre ahead is blocked ground
     /// (`blocked_at`), not a slope to climb, so a man beside a wall, a
-    /// house or the foot of a stair walks at his flat pace, not a crawl.
+    /// house or the foot of a stair walks at his flat pace.
     #[inline]
     pub fn slope_at(&self, x: f32, z: f32) -> f32 {
         const E: f32 = 1.0;
@@ -415,8 +415,9 @@ impl Terrain {
     }
 
     /// The radius a soldier's body keeps off blocked ground on this map
-    /// (`body_free`): half his distance from his neighbours, or nothing
-    /// where no ground blocks.
+    /// (`body_free`): half the body distance (sim/soldier.rs
+    /// `body_distance`, 1.2 m unless `FL_BODY` sets it), or nothing where
+    /// no ground blocks.
     #[inline]
     pub fn body_radius(&self) -> f32 {
         if self.kind.has_blocked_ground() { crate::sim::soldier::body_distance() * 0.5 } else { 0.0 }
@@ -530,7 +531,7 @@ impl Terrain {
     }
 }
 
-/// Mask rule per vertex: what a structure says where one decides
+/// Mask rule per vertex: what a structure decides where one does
 /// (`open`), else the step rule.
 fn blocked_vertex(
     heights: &[f32],
@@ -981,7 +982,7 @@ pub(crate) fn build_terrain(kind: MapKind) -> Terrain {
     let (ground, open) = if kind.has_wall() {
         let pieces = crate::town_layout::pieces(kind);
         let level = crate::town_layout::level_ground(&mut heights, origin, (verts_x, verts_z), &pieces);
-        info!("terrain: the {} map's wall run stands at {level:.2} m", kind.label());
+        info!("terrain: the {} map's wall stands at {level:.2} m", kind.label());
         let sim = crate::town_layout::sim_ground(&heights, origin, (verts_x, verts_z), &pieces);
         (Some(std::mem::replace(&mut heights, sim.heights)), Some(sim.open))
     } else {

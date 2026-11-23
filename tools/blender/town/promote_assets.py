@@ -1,6 +1,7 @@
-"""Install the approved wall kit and town houses into assets/town/.
+"""Install the wall, tower, stair and gatehouse models and the town houses
+into assets/town/.
 
-Every delivered GLB embeds its whole atlas (4096 by 4096 PNG, about 30 MB),
+Every source GLB embeds its whole atlas (4096 by 4096 PNG, about 30 MB),
 so the nine files would carry two atlases nine times. This copies each
 atlas once and rewrites each GLB to reference it by file name instead of
 embedding it: the image's buffer view is dropped and the binary buffer

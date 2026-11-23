@@ -276,7 +276,7 @@ pub fn least_open_growth(gd: &GroupData, ready: bool, across: bool) -> Option<f3
 /// the depth it adds to the closed block; its growth on each side and its
 /// closed anchor still unset. None when it comes to a single group: the
 /// lanes are the gaps between groups, and one group has none. None for a
-/// regiment on a lane: the lane's rows are all the ground it has.
+/// regiment on the wall's walk: the walk's rows are all the ground it has.
 fn open_layouts(gd: &GroupData, ready: bool, across: bool) -> impl Fn(u8) -> Option<(OpenOrder, f32)> {
     let on_lane = gd.lane;
     let n = gd.count.max(1);
@@ -380,8 +380,8 @@ fn open_anchor(gd: &GroupData) -> Vec2 {
 /// Where a regiment holds its ground: its anchor, or while it stands in
 /// the open order the anchor it had closed. Opening moves the anchor
 /// along the facing so the block grows where it has room; the regiment
-/// has not gone anywhere. An order given since it opened has moved the
-/// anchor for good (`close_order`), and it then holds there.
+/// has not gone anywhere. An order given since it opened sets a new
+/// anchor, which `close_order` keeps, and it then holds there.
 pub fn hold_point(gd: &GroupData) -> Vec2 {
     if gd.spacing == FormSpacing::Open && gd.anchor == open_anchor(gd) {
         gd.open.closed_anchor
@@ -1186,8 +1186,8 @@ pub(crate) fn stands_on_lane(gd: &GroupData, lane: &crate::town_layout::Lane) ->
 /// places in arrival order: the man who steps onto the lane takes the
 /// farthest place still held by a man behind him, and that man takes the
 /// place he had. The men already standing then always hold the far
-/// places, and nobody has to pass anybody along a walk too narrow to
-/// pass on, and the men on the lane keep their order along it. One test
+/// places, so nobody has to pass anybody along a walk too narrow to
+/// pass on. The men on the lane also keep their order along it. One test
 /// per man still on his way and one pass over the men there per tick,
 /// nothing once they are all there; a new order or a fight ends it.
 fn fill_lane_slots(mut units: ResMut<Units>, mut groups: ResMut<Groups>, terrain: Res<crate::terrain::Terrain>) {
@@ -1255,12 +1255,12 @@ fn fill_lane_slots(mut units: ResMut<Units>, mut groups: ResMut<Groups>, terrain
             }
             pending.swap_remove(k);
         }
-        // The men on the lane keep their order along it: the stream at a
-        // stair's doorway shoves a man past it, and the place he took on
-        // the far side would have him pass every man standing between.
-        // Two neighbours in that order whose places cross by more than a
-        // pace swap them, one pass a tick, so the order settles without
-        // two men side by side trading places every tick.
+        // The men on the lane keep their order along it: the crowd at a
+        // stair's head shoves a man past the head, and the place he took
+        // on the far side would have him pass every man standing between.
+        // Two neighbours in that order whose places cross by more than
+        // `LANE_CROSS` swap them, one pass a tick, so the order settles
+        // without two men side by side trading places every tick.
         pending.sort_unstable();
         let mut on: Vec<(f32, usize)> = (0..units.len())
             .filter(|&i| units.group[i] == g as u32 && units.death_t[i] == 0)
@@ -1361,11 +1361,11 @@ mod tests {
         open_order(&mut gd, o);
         assert!((route_end.distance(gd.anchor) - 1.95).abs() < 0.03);
         assert_eq!(hold_point(&gd), route_end);
-        // An order since it opened moves the anchor for good.
+        // An order since it opened sets a new anchor, and it holds there.
         let elsewhere = Vec2::new(60.0, -129.7);
         gd.anchor = elsewhere;
         assert_eq!(hold_point(&gd), elsewhere);
-        // Closed again where it opened, it holds at its anchor as before.
+        // Closed again where it opened, it holds at its closed anchor.
         gd.anchor = open_anchor(&gd);
         close_order(&mut gd);
         assert_eq!(gd.anchor, route_end);
