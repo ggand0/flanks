@@ -2,7 +2,7 @@
 //! and the four houses, placed from town_layout.rs's list on the drawn
 //! ground. Static, one distance level.
 //! The nine GLBs reference three shared atlases by file name
-//! (tools/blender/town/promote_assets.py), so each atlas is decoded once
+//! (tools/blender/town/install_assets.py), so each atlas is decoded once
 //! and one material per atlas serves every instance, which Bevy batches.
 //! Loaded the first time a map with the wall is shown, so other maps pay
 //! nothing.
@@ -206,7 +206,7 @@ fn read_model(path: &Path, dir: &Path, atlases: &mut HashMap<String, Image>) -> 
                 return Err("atlas must use UV0".into());
             }
             let gltf::image::Source::Uri { uri, .. } = texture.texture().source().source() else {
-                return Err("atlas must be a separate file (tools/blender/town/promote_assets.py)".into());
+                return Err("atlas must be a separate file (tools/blender/town/install_assets.py)".into());
             };
             if !atlases.contains_key(uri) {
                 atlases.insert(uri.to_string(), read_atlas(&dir.join(uri))?);

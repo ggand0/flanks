@@ -1,18 +1,29 @@
 """Install the wall, tower, stair and gatehouse models and the town houses
 into assets/town/.
 
-Every source GLB embeds its whole atlas (4096 by 4096 PNG, about 30 MB),
-so the nine files would carry two atlases nine times. This copies each
-atlas once and rewrites each GLB to reference it by file name instead of
-embedding it: the image's buffer view is dropped and the binary buffer
-compacted. Geometry, UVs, normals, materials and node transforms are
-copied byte for byte. Each embedded image must match its atlas file
-exactly (SHA-256), so a GLB and an atlas from different iterations cannot
-be paired.
+Every source GLB embeds the whole atlases it uses (the stone and town
+atlases are 4096 by 4096 PNGs of about 30 MB, the gate's wood atlas 2048
+by 2048), so the nine files would carry the three atlases ten times: the
+stone atlas five times, the town atlas four, the wood atlas once. This
+copies each atlas once and rewrites each GLB to reference it by file name
+instead of embedding it: the image's buffer view is dropped and the
+binary buffer compacted. Geometry, UVs, normals, materials and node
+transforms are copied byte for byte. Each embedded image must match its
+atlas file exactly (SHA-256), so a GLB and an atlas from different
+exports cannot be paired.
+
+The two source folders:
+
+- `--wall`: wall_unit.glb, wall_unit_landing.glb, stair_ramp.glb,
+  drum_tower.glb, gatehouse.glb, wall_stone_atlas.png and
+  gate_wood_atlas.png.
+- `--town`: humble_house_shared.glb, market_house_shared.glb,
+  workshop_house_shared.glb, merchant_house.glb and
+  town_colour_atlas.png.
 
 Run from the game root:
 
-    python3 tools/blender/town/promote_assets.py
+    python3 tools/blender/town/install_assets.py --wall <dir> --town <dir>
 """
 
 import argparse
@@ -23,26 +34,29 @@ import struct
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
-WALL = Path('assets_dev/wall/gatehouse_textured_v1')
-TOWN = Path('assets_dev/town/merchant_textured_v1')
 
-# Source file, installed name.
-MODELS = [
-    (WALL / 'wall_unit.glb', 'wall_unit.glb'),
-    (WALL / 'wall_unit_landing.glb', 'wall_unit_landing.glb'),
-    (WALL / 'stair_ramp.glb', 'stair_ramp.glb'),
-    (WALL / 'drum_tower.glb', 'drum_tower.glb'),
-    (WALL / 'gatehouse.glb', 'gatehouse.glb'),
-    (TOWN / 'humble_house_shared.glb', 'humble_house.glb'),
-    (TOWN / 'market_house_shared.glb', 'market_house.glb'),
-    (TOWN / 'workshop_house_shared.glb', 'workshop_house.glb'),
-    (TOWN / 'merchant_house.glb', 'merchant_house.glb'),
-]
-ATLASES = [
-    WALL / 'wall_stone_atlas.png',
-    WALL / 'gate_wood_atlas.png',
-    TOWN / 'town_colour_atlas.png',
-]
+
+def models(wall, town):
+    """Source file, installed name."""
+    return [
+        (wall / 'wall_unit.glb', 'wall_unit.glb'),
+        (wall / 'wall_unit_landing.glb', 'wall_unit_landing.glb'),
+        (wall / 'stair_ramp.glb', 'stair_ramp.glb'),
+        (wall / 'drum_tower.glb', 'drum_tower.glb'),
+        (wall / 'gatehouse.glb', 'gatehouse.glb'),
+        (town / 'humble_house_shared.glb', 'humble_house.glb'),
+        (town / 'market_house_shared.glb', 'market_house.glb'),
+        (town / 'workshop_house_shared.glb', 'workshop_house.glb'),
+        (town / 'merchant_house.glb', 'merchant_house.glb'),
+    ]
+
+
+def atlases(wall, town):
+    return [
+        wall / 'wall_stone_atlas.png',
+        wall / 'gate_wood_atlas.png',
+        town / 'town_colour_atlas.png',
+    ]
 
 
 def read_glb(path):
@@ -102,17 +116,21 @@ def strip_images(doc, blob, atlas_hashes):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument('--wall', type=Path, required=True,
+                        help='the wall, stair, tower and gatehouse GLBs and atlases')
+    parser.add_argument('--town', type=Path, required=True,
+                        help='the house GLBs and their atlas')
     parser.add_argument('--out', default='assets/town')
     args = parser.parse_args()
     out = ROOT / args.out
     out.mkdir(parents=True, exist_ok=True)
     hashes = {}
-    for atlas in ATLASES:
+    for atlas in atlases(args.wall, args.town):
         source = ROOT / atlas
         hashes[source.name] = hashlib.sha256(source.read_bytes()).hexdigest()
         shutil.copyfile(source, out / source.name)
         print(f"{source.name}: {source.stat().st_size} bytes")
-    for source, name in MODELS:
+    for source, name in models(args.wall, args.town):
         doc, blob = read_glb(ROOT / source)
         blob = strip_images(doc, blob, hashes)
         write_glb(out / name, doc, blob)
