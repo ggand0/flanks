@@ -771,27 +771,24 @@ fn sidestep(i: usize, tick: u32, left_blocked: bool, right_blocked: bool, side_d
 /// soldier's walk comes from `drive` (`join_goal`), and this does neither.
 #[inline]
 pub(super) fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
-    let Field { pos_prev, speed, team, group, broken, wall, engaged, hold, moving, focus, tick, .. } = *f;
-    let i = s.i;
-    let params = &TYPES[st.my_kind];
-    let p = st.p;
-    let gi = st.gi;
-    let dying = st.dying;
-    let routed = st.routed;
-    let committed = st.fight.committed;
-    let memo_valid = st.foe.memo_valid;
-    let join_fp = st.fight.join_fp;
-    let best_idx = st.foe.best_idx;
-    let crowd = st.scan.crowd;
-    let jam = st.walk.jam;
-    let way_blocked = st.sight.way_blocked;
-    let left_blocked = st.sight.left_blocked;
-    let right_blocked = st.sight.right_blocked;
-    let comrade_ahead = st.sight.comrade_ahead;
-    let side_dir = st.sight.side_dir;
     let mut desired = st.desired;
     let mut fade = st.walk.fade;
-    let mut d_surge = Vec2::ZERO;
+    let (close_to, memo_close) = close_target(f, s, st);
+    let d_surge = close_on(f, s, st, close_to, memo_close, &mut desired);
+    join_the_fight(f, s, st, d_surge, &mut desired, &mut fade);
+    st.desired = desired;
+    st.walk.fade = fade;
+}
+
+/// Whom he closes on (`close_in`): his locked swing target, the enemy in
+/// reach, or out of formation in open space the enemy he remembers; and
+/// whether that is the one he remembers.
+#[inline]
+fn close_target(f: &Field, s: &Soldier, st: &Step) -> (u32, bool) {
+    let Field { pos_prev, .. } = *f;
+    let committed = st.fight.committed;
+    let best_idx = st.foe.best_idx;
+    let crowd = st.scan.crowd;
     // Fighters close the last meter to swing range. Only active when an enemy
     // is ALREADY in reach — this is combat execution (like the wind-up foot
     // plant), not steering; it bypasses the jam yield on purpose so front
@@ -809,7 +806,7 @@ pub(super) fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
     // against the chase. Under the friction contact's brake a joining
     // soldier's walk to the enemy he remembers comes from `drive`
     // (`join_goal`), and this does not run for him.
-    let (close_to, memo_close) = if *s.swing & crate::units::SWING_STATE_MASK
+    if *s.swing & crate::units::SWING_STATE_MASK
         != crate::units::SWING_READY
         && (*s.target as usize) < pos_prev.len()
     {
@@ -820,7 +817,29 @@ pub(super) fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
         (*s.target, true)
     } else {
         (u32::MAX, false)
-    };
+    }
+}
+
+/// Closing on `close_to` to his weapon's length, or stepping back to it
+/// from an enemy who has come inside it (`close_in`). Returns the surge
+/// toward him, part of his wish.
+#[inline]
+fn close_on(f: &Field, s: &mut Soldier, st: &Step, close_to: u32, memo_close: bool, desired: &mut Vec2) -> Vec2 {
+    let Field { pos_prev, speed, team, group, broken, wall, engaged, hold, moving, focus, tick, .. } = *f;
+    let i = s.i;
+    let params = &TYPES[st.my_kind];
+    let p = st.p;
+    let gi = st.gi;
+    let dying = st.dying;
+    let routed = st.routed;
+    let committed = st.fight.committed;
+    let jam = st.walk.jam;
+    let way_blocked = st.sight.way_blocked;
+    let left_blocked = st.sight.left_blocked;
+    let right_blocked = st.sight.right_blocked;
+    let comrade_ahead = st.sight.comrade_ahead;
+    let side_dir = st.sight.side_dir;
+    let mut d_surge = Vec2::ZERO;
     // A man sent somewhere by a Move order closes on nobody: he walks on,
     // striking only a man in front of him (the swing above). With his
     // regiment focused on one target he closes on a man of another
@@ -864,7 +883,7 @@ pub(super) fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
                     urge = 0.0;
                     // Waiting; in some windows he sidesteps toward whichever
                     // side is open.
-                    desired += sidestep(i, tick, left_blocked, right_blocked, side_dir);
+                    *desired += sidestep(i, tick, left_blocked, right_blocked, side_dir);
                 }
             }
             let pace = if !memo_close {
@@ -874,7 +893,7 @@ pub(super) fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
             } else {
                 ADVANCE_PACE
             };
-            desired += to_enemy * (pace * urge / dist);
+            *desired += to_enemy * (pace * urge / dist);
             d_surge = to_enemy * (pace * urge / dist);
         } else if !memo_close
             && committed
@@ -892,11 +911,31 @@ pub(super) fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
             let stepping = s.vel.xz().dot(to_enemy) < -0.5 * STEP_PACE * dist;
             let inside = if stepping { fight } else { fight - BACK_SLACK };
             if dist < inside {
-                desired -= to_enemy * (STEP_PACE / dist);
+                *desired -= to_enemy * (STEP_PACE / dist);
                 STEP_BACK_TICKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
     }
+    d_surge
+}
+
+/// Joining his regiment's fight at the jog when he has no enemy to close
+/// on (`close_in`), without the friction contact's brake.
+#[inline]
+fn join_the_fight(f: &Field, s: &Soldier, st: &Step, d_surge: Vec2, desired: &mut Vec2, fade: &mut Vec2) {
+    let Field { tick, .. } = *f;
+    let i = s.i;
+    let p = st.p;
+    let committed = st.fight.committed;
+    let memo_valid = st.foe.memo_valid;
+    let join_fp = st.fight.join_fp;
+    let best_idx = st.foe.best_idx;
+    let jam = st.walk.jam;
+    let way_blocked = st.sight.way_blocked;
+    let left_blocked = st.sight.left_blocked;
+    let right_blocked = st.sight.right_blocked;
+    let comrade_ahead = st.sight.comrade_ahead;
+    let side_dir = st.sight.side_dir;
     // Joining: no enemy to close on, so he heads for the enemy unit his
     // regiment fights, jogging over open ground, walking with a comrade close
     // ahead, waiting or sidestepping when blocked. He picks a soldier to
@@ -914,16 +953,14 @@ pub(super) fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
         let dist = to_fp.length();
         if dist > 1.0 {
             let dir = to_fp / dist;
-            desired = if !way_blocked {
+            *desired = if !way_blocked {
                 let pace = if comrade_ahead { ADVANCE_PACE } else { COMBAT_JOG_PACE };
-                fade = dir * pace * jam;
+                *fade = dir * pace * jam;
                 dir * pace * (1.0 - jam)
             } else {
-                fade = Vec2::ZERO;
+                *fade = Vec2::ZERO;
                 sidestep(i, tick, left_blocked, right_blocked, side_dir)
             };
         }
     }
-    st.desired = desired;
-    st.walk.fade = fade;
 }

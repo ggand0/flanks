@@ -82,7 +82,7 @@ const ROUT_FLEE_FRAC: f32 = 0.9;
 /// to the fight instead (`joins_as_walker`, `join_goal`).
 #[inline]
 pub(super) fn drive(f: &Field, s: &mut Soldier, st: &mut Step) {
-    let Field { terrain, speed, team, home, orders, anchors, paths, .. } = *f;
+    let Field { terrain, speed, home, orders, anchors, .. } = *f;
     let i = s.i;
     let p = st.p;
     let gi = st.gi;
@@ -97,48 +97,12 @@ pub(super) fn drive(f: &Field, s: &mut Soldier, st: &mut Step) {
     // collision is.
     let mut desired = Vec2::ZERO;
     if !dying && routed {
-        // Broken: flee toward the own map edge with a per-unit lateral
-        // scatter — slightly SLOWER than formed pursuers (0.9x): fleeing at
-        // exactly max speed made pursuit a zero-kill treadmill (gap frozen
-        // forever, counts flat for 30-45 s).
-        let flee_z: f32 = if team[i] == 0 { -1.0 } else { 1.0 };
-        let lat = (crate::units::hash01((i as u32).wrapping_mul(17) + 3) - 0.5)
-            * 0.7;
-        let dir = Vec2::new(lat, flee_z).normalize_or_zero();
-        let slope = terrain.slope_at(p.x, p.y);
-        desired = dir
-            * speed[i]
-            * ROUT_FLEE_FRAC
-            * terrain.wade_mult(p.x, p.y)
-            / (1.0 + 3.0 * slope * slope);
+        desired = flee(f, i, p);
     } else if !dying {
         let holding = orders[gi].is_none();
-        let mut goal = orders[gi].unwrap_or(anchors[gi]) + home[i];
+        let goal = orders[gi].unwrap_or(anchors[gi]) + home[i];
         st.walk.place_dist = goal.distance(p);
-        // On a route, a man whose straight way to his slot is blocked
-        // follows the route instead (sim/route.rs); short of the last leg
-        // he keeps his pace. He reads the route every LOOK_TICKS, when he
-        // reaches the point he chose, or when he has none, and walks on
-        // what he chose between reads.
-        let mut through = false;
-        match (paths.routes.get(gi).and_then(Option::as_ref), paths.nav) {
-            (Some(route), Some(nav)) => {
-                let frame = orders[gi].unwrap_or(anchors[gi]);
-                let way = *s.way;
-                let kept = !way.x.is_nan();
-                let at_way = kept && way.x.is_finite() && p.distance_squared(way) < 4.0;
-                if !kept || at_way || (i as u32).wrapping_add(f.tick).is_multiple_of(LOOK_TICKS) {
-                    let (t, th) = crate::sim::route::man_target(nav, terrain, route, frame, p, goal, i);
-                    *s.way = if t == goal && !th { Vec2::INFINITY } else if t == goal { Vec2::NEG_INFINITY } else { t };
-                    (goal, through) = (t, th);
-                } else if way.x.is_infinite() {
-                    through = way.x < 0.0;
-                } else {
-                    (goal, through) = (way, true);
-                }
-            }
-            _ => *s.way = Vec2::NAN,
-        }
+        let (goal, through) = follow_route(f, s, st, goal);
         let to_goal = goal - p;
         let dist = to_goal.length();
         // Hold deadzone: parked units don't jitter around their slot point
@@ -205,6 +169,62 @@ pub(super) fn drive(f: &Field, s: &mut Soldier, st: &mut Step) {
         let arrived = *s.sight & SIGHT_WAY != 0 && *s.stood;
         st.desired = if arrived { Vec2::ZERO } else { join_goal(f, s, st).1 };
     }
+}
+
+/// A broken man's flight (`drive`): his wish toward his own map edge.
+#[inline]
+fn flee(f: &Field, i: usize, p: Vec2) -> Vec2 {
+    let Field { terrain, speed, team, .. } = *f;
+    // Broken: flee toward the own map edge with a per-unit lateral
+    // scatter — slightly SLOWER than formed pursuers (0.9x): fleeing at
+    // exactly max speed made pursuit a zero-kill treadmill (gap frozen
+    // forever, counts flat for 30-45 s).
+    let flee_z: f32 = if team[i] == 0 { -1.0 } else { 1.0 };
+    let lat = (crate::units::hash01((i as u32).wrapping_mul(17) + 3) - 0.5)
+        * 0.7;
+    let dir = Vec2::new(lat, flee_z).normalize_or_zero();
+    let slope = terrain.slope_at(p.x, p.y);
+    dir
+        * speed[i]
+        * ROUT_FLEE_FRAC
+        * terrain.wade_mult(p.x, p.y)
+        / (1.0 + 3.0 * slope * slope)
+}
+
+/// The goal of his walk to his place (`drive`), the route's point when
+/// his regiment has a route, and whether he walks through it.
+#[inline]
+fn follow_route(f: &Field, s: &mut Soldier, st: &Step, goal: Vec2) -> (Vec2, bool) {
+    let Field { terrain, orders, anchors, paths, .. } = *f;
+    let i = s.i;
+    let p = st.p;
+    let gi = st.gi;
+    let mut goal = goal;
+    // On a route, a man whose straight way to his slot is blocked
+    // follows the route instead (sim/route.rs); short of the last leg
+    // he keeps his pace. He reads the route every LOOK_TICKS, when he
+    // reaches the point he chose, or when he has none, and walks on
+    // what he chose between reads.
+    let mut through = false;
+    match (paths.routes.get(gi).and_then(Option::as_ref), paths.nav) {
+        (Some(route), Some(nav)) => {
+            let frame = orders[gi].unwrap_or(anchors[gi]);
+            let way = *s.way;
+            let kept = !way.x.is_nan();
+            let at_way = kept && way.x.is_finite() && p.distance_squared(way) < 4.0;
+            if !kept || at_way || (i as u32).wrapping_add(f.tick).is_multiple_of(LOOK_TICKS) {
+                let (t, th) = crate::sim::route::man_target(nav, terrain, route, frame, p, goal, i);
+                *s.way = if t == goal && !th { Vec2::INFINITY } else if t == goal { Vec2::NEG_INFINITY } else { t };
+                (goal, through) = (t, th);
+            } else if way.x.is_infinite() {
+                through = way.x < 0.0;
+            } else {
+                (goal, through) = (way, true);
+            }
+        }
+        _ => *s.way = Vec2::NAN,
+    }
+    (goal, through)
 }
 
 /// Where a soldier walking to the fight goes (`joins_as_walker`): the way

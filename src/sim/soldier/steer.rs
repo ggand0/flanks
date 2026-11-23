@@ -212,73 +212,9 @@ pub(super) fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
     let jam = st.walk.jam;
     let mut desired = st.desired;
     let friction = friction_contact();
-    // The crowd walk under the friction contact: with bodies overlapping
-    // his own on all four sides he does not sprint, he walks, by the side
-    // pressed least, without a jump. This is the one point every stage's
-    // wish has reached (the drive, the join, the closing in, the sidestep),
-    // so his whole wish with what the crowd's brake took off it put back is
-    // cut to the walk, and both parts by the same share, as if it had been
-    // cut before the brake: the brake and the standing test below see the
-    // walk. A routed soldier flees, a dying one is not steering, and a
-    // regiment in its charge runs by order.
-    let charge_run = charging[gi] && !fat_nocharge[gi];
-    if friction && !dying && !routed && !charge_run {
-        let whole = desired + st.walk.fade;
-        let p4 = st.scan.press4;
-        let cut = press_walk(p4[0].min(p4[1]).min(p4[2]).min(p4[3]), whole, CROWD_WALK);
-        if cut != whole {
-            let k = cut.length() / whole.length();
-            desired *= k;
-            st.walk.fade *= k;
-        }
-    }
-    // Whether he stands, for his bracing next tick (`brace_pairs`) and his
-    // stance (`scan`). The line is his own wish as it comes here, after
-    // every stage that sets it, with what the crowd's brake took off it put
-    // back and the sidestep of his try at a side taken out, before the
-    // paces and caps below, under the speed of a step (`stands`). A push he
-    // gets does not count, and neither does that sidestep: a jammed soldier
-    // who tries a side still stands, or his weight against his own side
-    // would change each time a try begins or ends. A wish at or over the
-    // line makes him a walker. Under it, a soldier under fight footwork
-    // stands at once; a soldier on the walk to his place with nothing else
-    // to do (`on_his_way`) who was walking keeps walking until he arrives
-    // there, within STEP_STOP or parked in the hold deadzone, or until his
-    // own rule tells him to stand where he is: a holding soldier of a
-    // fighting regiment shoved off his mark with a comrade between him and
-    // it, whose wish `hold_the_frame` zeroed (`has_arrived`,
-    // `still_stands`). That holds in the rear ranks of a fighting regiment
-    // too. His wish slides with his distance to his place and crosses the
-    // line some metres out, and the few centimetres a shove moves a jammed
-    // soldier there would else change his weight and stance again and
-    // again.
+    crowd_walk(f, st, friction, &mut desired);
     if friction {
-        let side = st.walk.side;
-        let under = stands(true, Vec2::ZERO, desired + st.walk.fade - side);
-        let stood = if on_his_way(s, st) {
-            let arrived = has_arrived(st.walk.place_dist, st.walk.parked, st.sight.slot_blocked);
-            still_stands(*s.stood, under, arrived)
-        } else if st.fight.joining {
-            // A soldier walking to the fight is a walker until the still
-            // men ahead have stopped him behind a comrade in his way: the
-            // brake has taken his wish under the speed of a step. From
-            // then he stands, and `drive` gives him no wish while that
-            // comrade is in his way.
-            under || (st.sight.way_blocked && stands(true, Vec2::ZERO, desired - side))
-        } else {
-            under
-        };
-        // The tick he leaves his place to join the fight he sets off: a
-        // walker from then, whatever stood him at his place. Else a soldier
-        // who stood within a step of the man ahead when he joined would
-        // count as arrived at once and never close up, and the regiment's
-        // ranks would end at two different spacings.
-        let stood = stood && !(st.fight.set_off && joins_as_walker());
-        // A falling soldier keeps his stood bit as it was when he was
-        // struck (`fall`).
-        if !(dying && fall()) {
-            *s.stood = stood;
-        }
+        keep_stood(s, st, desired);
     }
     // Formation pace: walls advance deliberately (running breaks a wall), the
     // charge phase runs the last stretch home. Broken/dying already excluded
@@ -365,6 +301,89 @@ pub(super) fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
         }
     }
     st.walk.new_v = new_v;
+}
+
+/// The crowd walk (`steer`, CROWD_WALK): his wish cut to a walk when
+/// bodies press on all four sides of him.
+#[inline]
+fn crowd_walk(f: &Field, st: &mut Step, friction: bool, desired: &mut Vec2) {
+    let Field { charging, fat_nocharge, .. } = *f;
+    let gi = st.gi;
+    let dying = st.dying;
+    let routed = st.routed;
+    // The crowd walk under the friction contact: with bodies overlapping
+    // his own on all four sides he does not sprint, he walks, by the side
+    // pressed least, without a jump. This is the one point every stage's
+    // wish has reached (the drive, the join, the closing in, the sidestep),
+    // so his whole wish with what the crowd's brake took off it put back is
+    // cut to the walk, and both parts by the same share, as if it had been
+    // cut before the brake: the brake and the standing test (`keep_stood`)
+    // see the walk. A routed soldier flees, a dying one is not steering, and a
+    // regiment in its charge runs by order.
+    let charge_run = charging[gi] && !fat_nocharge[gi];
+    if friction && !dying && !routed && !charge_run {
+        let whole = *desired + st.walk.fade;
+        let p4 = st.scan.press4;
+        let cut = press_walk(p4[0].min(p4[1]).min(p4[2]).min(p4[3]), whole, CROWD_WALK);
+        if cut != whole {
+            let k = cut.length() / whole.length();
+            *desired *= k;
+            st.walk.fade *= k;
+        }
+    }
+}
+
+/// Whether he stands this tick (`steer`), kept in his stood bit under the
+/// friction contact.
+#[inline]
+fn keep_stood(s: &mut Soldier, st: &Step, desired: Vec2) {
+    let dying = st.dying;
+    // Whether he stands, for his bracing next tick (`brace_pairs`) and his
+    // stance (`scan`). The line is his own wish as it comes here, after
+    // every stage that sets it, with what the crowd's brake took off it put
+    // back and the sidestep of his try at a side taken out, before the
+    // paces and caps of `steer`, under the speed of a step (`stands`). A push he
+    // gets does not count, and neither does that sidestep: a jammed soldier
+    // who tries a side still stands, or his weight against his own side
+    // would change each time a try begins or ends. A wish at or over the
+    // line makes him a walker. Under it, a soldier under fight footwork
+    // stands at once; a soldier on the walk to his place with nothing else
+    // to do (`on_his_way`) who was walking keeps walking until he arrives
+    // there, within STEP_STOP or parked in the hold deadzone, or until his
+    // own rule tells him to stand where he is: a holding soldier of a
+    // fighting regiment shoved off his mark with a comrade between him and
+    // it, whose wish `hold_the_frame` zeroed (`has_arrived`,
+    // `still_stands`). That holds in the rear ranks of a fighting regiment
+    // too. His wish slides with his distance to his place and crosses the
+    // line some metres out, and the few centimetres a shove moves a jammed
+    // soldier there would else change his weight and stance again and
+    // again.
+    let side = st.walk.side;
+    let under = stands(true, Vec2::ZERO, desired + st.walk.fade - side);
+    let stood = if on_his_way(s, st) {
+        let arrived = has_arrived(st.walk.place_dist, st.walk.parked, st.sight.slot_blocked);
+        still_stands(*s.stood, under, arrived)
+    } else if st.fight.joining {
+        // A soldier walking to the fight is a walker until the still
+        // men ahead have stopped him behind a comrade in his way: the
+        // brake has taken his wish under the speed of a step. From
+        // then he stands, and `drive` gives him no wish while that
+        // comrade is in his way.
+        under || (st.sight.way_blocked && stands(true, Vec2::ZERO, desired - side))
+    } else {
+        under
+    };
+    // The tick he leaves his place to join the fight he sets off: a
+    // walker from then, whatever stood him at his place. Else a soldier
+    // who stood within a step of the man ahead when he joined would
+    // count as arrived at once and never close up, and the regiment's
+    // ranks would end at two different spacings.
+    let stood = stood && !(st.fight.set_off && joins_as_walker());
+    // A falling soldier keeps his stood bit as it was when he was
+    // struck (`fall`).
+    if !(dying && fall()) {
+        *s.stood = stood;
+    }
 }
 
 /// Which way he looks: the man he swings at, the enemy in reach when he
