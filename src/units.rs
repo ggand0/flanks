@@ -76,7 +76,7 @@ pub struct Units {
     pub color: Column<[f32; 4]>,
     /// Combat memo (unit index; `u32::MAX` = none): the melee target
     /// while a swing is in flight, and the sparse-fight closing memo
-    /// otherwise (sim/soldier.rs wide acquisition). NEVER cleared, and
+    /// otherwise (sim/soldier/fight.rs wide acquisition). NEVER cleared, and
     /// death-sweep swap-removes reindex units, so it can point at an
     /// arbitrary unit later — every consumer MUST validate on use
     /// (swings re-check at hit time; the closing drive checks team and
@@ -84,7 +84,7 @@ pub struct Units {
     pub target: Column<u32>,
     /// The enemy soldier an archer has aimed at (unit index; `u32::MAX`
     /// = none): picked as his draw starts, shot at the loose, kept by
-    /// some men between shots (sim/soldier.rs `pick_quarry`). Reindexed
+    /// some men between shots (sim/soldier/fight.rs `pick_quarry`). Reindexed
     /// by the death sweep like `target`: validated on use.
     pub quarry: Column<u32>,
     /// Swing state: 0 = Ready, 1 = WindUp, 2 = Recover.
@@ -106,10 +106,10 @@ pub struct Units {
     /// Out of formation: he has left his slot to fight (M2TW keeps this
     /// per soldier, isInFormation). While his regiment is in melee he
     /// does not walk back to his slot; the flag clears when the melee
-    /// ends and the regiment re-forms (sim/soldier.rs).
+    /// ends and the regiment re-forms (sim/soldier/).
     pub out_form: Column<bool>,
     /// What he last saw of the comrades around him and of comrades
-    /// running to the fight (sim/soldier.rs SIGHT_* bits). A man looks
+    /// running to the fight (sim/soldier/mod.rs SIGHT_* bits). A man looks
     /// around every few ticks, not every tick, and acts on what he saw.
     pub sight: Column<u16>,
     /// The depth of the exchange he is answering (sim/damage.rs): 0 a
@@ -125,29 +125,29 @@ pub struct Units {
     /// How far he is into his ready stance, 0 at ease to POSE_READY (the
     /// low four bits), and how far he has turned his shoulders to squeeze
     /// through a crack, 0 square to POSE_READY (the high four bits;
-    /// sim/soldier.rs `pose_level`, `turn_level`): his body is wider in
+    /// sim/soldier/body.rs `pose_level`, `turn_level`): his body is wider in
     /// the stance and narrower turned.
     pub pose: Column<u8>,
-    /// Stuck on his way and trying a side (sim/soldier.rs `try_a_side`,
+    /// Stuck on his way and trying a side (sim/soldier/passing.rs `try_a_side`,
     /// the STUCK_* fields): the ticks he has wanted to walk and not moved
     /// while pressed from ahead, the ticks left of his try, how long he
     /// remembers the side he tried, and that side.
     pub stuck: Column<u16>,
-    /// The opening he saw on his last wide look and walks for (sim/soldier.rs
+    /// The opening he saw on his last wide look and walks for (sim/soldier/passing.rs
     /// `choose_opening`), a point on the ground; NaN when he has none. He
     /// looks wide only every few ticks and keeps what he found between.
     pub aim: Column<Vec2>,
-    /// Under the friction contact (sim/soldier.rs `friction_contact`,
+    /// Under the friction contact (sim/soldier/ `friction_contact`,
     /// `steer`, `integrate`): the speed the contacts have put into him
     /// that his feet have not yet taken back. Zero otherwise.
     pub imposed: Column<Vec2>,
-    /// Under the friction contact: he stood last tick (sim/soldier.rs
+    /// Under the friction contact: he stood last tick (sim/soldier/steer.rs
     /// `steer`): his own wish to move was under the speed of a step. On the
     /// walk to his place with nothing else to do (`on_his_way`), once he has
     /// set off, he stands again only after he has arrived there
     /// (`still_stands`); walking to the fight, once the soldiers ahead have
     /// stopped him. A standing soldier is braced against any body
-    /// (sim/soldier.rs `BRACE`), a walking one only against the other side
+    /// (sim/soldier/body.rs `BRACE`), a walking one only against the other side
     /// (`BRACE_BASIC`).
     pub stood: Column<bool>,
     /// Bumped every time a battle rebuilds this world. A sim tick job
@@ -202,35 +202,8 @@ pub struct UnitsPlugin;
 
 impl Plugin for UnitsPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<Units>()
-            .add_systems(Update, surround_test_log);
+        app.init_resource::<Units>();
     }
-}
-
-/// FL_TEST_SURROUND bookkeeping: per-capita survival of the encircled
-/// pocket (x < 0) vs the line fight (x > 0). Swing combat's acceptance
-/// criterion is the pocket dying clearly faster.
-fn surround_test_log(units: Res<Units>, time: Res<Time>, mut next: Local<f32>) {
-    if std::env::var("FL_TEST_SURROUND").is_err() {
-        return;
-    }
-    let t = time.elapsed_secs();
-    if t < *next {
-        return;
-    }
-    *next = t + 2.0;
-    let mut pocket = 0usize;
-    let mut line = 0usize;
-    for i in 0..units.len() {
-        if units.team[i] == 0 && units.death_t[i] == 0 {
-            if units.pos[i].x < 0.0 {
-                pocket += 1;
-            } else {
-                line += 1;
-            }
-        }
-    }
-    info!("[surround-test] t={t:.0}s blue alive: pocket {pocket}/500, line {line}/500");
 }
 
 /// Cheap deterministic hash -> [0, 1). Used for spawn jitter, color variation,
@@ -341,82 +314,4 @@ pub fn push_unit(
     units.aim.push(Vec2::NAN);
     units.imposed.push(Vec2::ZERO);
     units.stood.push(true);
-}
-
-/// FL_TEST_SURROUND: two equal blue detachments of light infantry, one
-/// fully encircled, one fighting line-against-line, both against the same
-/// odds. The surrounded pocket must die per-capita faster — that is the
-/// acceptance test for swing combat (the old gather model traded 1:1).
-/// Region split for bookkeeping: pocket at x = -200, line at x = +200.
-/// Orange groups get press orders (units advance only under orders). A
-/// block order translates a formation (it never converges one), so the
-/// encirclement is four arc regiments each ordered inward past the pocket.
-pub fn spawn_surround_test(
-    units: &mut Units,
-    terrain: &crate::terrain::Terrain,
-    groups: &mut crate::orders::Groups,
-) {
-    use crate::orders::{GroupData, Order};
-    use crate::unit_types::KIND_LIGHT;
-    let pocket_c = Vec2::new(-200.0, 0.0);
-    let mut seed = spawn_seed(1);
-    let mut list: Vec<GroupData> = Vec::new();
-
-    // Blue pocket (group 0): disc, holds.
-    list.push(GroupData::new(0, KIND_LIGHT, pocket_c, 500));
-    for _ in 0..500 {
-        seed = seed.wrapping_add(1);
-        let a = hash01(seed.wrapping_mul(3) + 1) * std::f32::consts::TAU;
-        let r = 13.0 * hash01(seed.wrapping_mul(3) + 2).sqrt();
-        let (x, z) = (pocket_c.x + r * a.cos(), pocket_c.y + r * a.sin());
-        push_unit(units, terrain, seed, 0, KIND_LIGHT, 0, x, z, pocket_c);
-    }
-    // Orange annulus: four arc regiments (groups 1-4), each pressing its
-    // anchor to the pocket center.
-    for q in 0..4u32 {
-        let a0 = q as f32 * std::f32::consts::FRAC_PI_2;
-        let mid = a0 + std::f32::consts::FRAC_PI_4;
-        let anchor = pocket_c + Vec2::new(mid.cos(), mid.sin()) * 20.5;
-        let g = list.len() as u32;
-        let mut gd = GroupData::new(1, KIND_LIGHT, anchor, 500);
-        gd.order = Some(Order::Move(pocket_c));
-        list.push(gd);
-        for _ in 0..500 {
-            seed = seed.wrapping_add(1);
-            let a = a0 + hash01(seed.wrapping_mul(3) + 1) * std::f32::consts::FRAC_PI_2;
-            let rr = 14.0f32 * 14.0
-                + (27.0f32 * 27.0 - 14.0 * 14.0) * hash01(seed.wrapping_mul(3) + 2);
-            let r = rr.sqrt();
-            let (x, z) = (pocket_c.x + r * a.cos(), pocket_c.y + r * a.sin());
-            push_unit(units, terrain, seed, 1, KIND_LIGHT, g, x, z, anchor);
-        }
-    }
-    // Line fight: blue block (group 5) holds; orange block (group 6)
-    // presses 27 m south through it.
-    let blue_anchor = Vec2::new(200.0, -6.0);
-    let orange_anchor = Vec2::new(200.0, 21.0);
-    let block = |units: &mut Units,
-                 seed: &mut u32,
-                     team: u8,
-                     group: u32,
-                     anchor: Vec2,
-                     depth: f32,
-                     n: usize| {
-        for _ in 0..n {
-            *seed = seed.wrapping_add(1);
-            let x = 200.0 + (hash01(seed.wrapping_mul(3) + 1) - 0.5) * 60.0;
-            let z = anchor.y + (hash01(seed.wrapping_mul(3) + 2) - 0.5) * depth;
-            push_unit(units, terrain, *seed, team, KIND_LIGHT, group, x, z, anchor);
-        }
-    };
-    list.push(GroupData::new(0, KIND_LIGHT, blue_anchor, 500));
-    block(units, &mut seed, 0, 5, blue_anchor, 10.0, 500);
-    let mut press = GroupData::new(1, KIND_LIGHT, orange_anchor, 2000);
-    // Press to CONTACT, not through: the fight must stay frontal (the
-    // pocket is the surrounded case; this is the control).
-    press.order = Some(Order::Move(Vec2::new(orange_anchor.x, 13.0)));
-    list.push(press);
-    block(units, &mut seed, 1, 6, orange_anchor, 40.0, 2000);
-
-    groups.list = list;
 }

@@ -118,7 +118,7 @@ struct Params {
     // length in seconds.
     step_travel: array<vec4<f32>, 4>,
     step_len: array<vec4<f32>, 4>,
-    // soldier.rs STEP_FACE_SPEED, render_units.rs STEP_SETTLE_S, and in
+    // soldier/steer.rs STEP_FACE_SPEED, render_units.rs STEP_SETTLE_S, and in
     // z which kinds have a bow rig: bit k for kind k.
     steps: vec4<f32>,
     // draw_ticks, death_ticks, hit_stagger_ticks, celebrate_base
@@ -701,7 +701,7 @@ fn build_soldier(i: u32) {
     let pos = vec3<f32>(s.px, s.py, s.pz);
     let prev = vec3<f32>(s.qx, s.qy, s.qz);
     let kind = s.a & 0x7fu;
-    // An archer's knife is out (sim/soldier.rs SIGHT_KNIFE).
+    // An archer's knife is out (sim/soldier/mod.rs SIGHT_KNIFE).
     let knife = (s.a & 0x80u) != 0u;
     let swing = (s.a >> 8u) & 0xffu;
     let swing_t = f32((s.a >> 16u) & 0xffu);

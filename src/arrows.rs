@@ -56,7 +56,7 @@ fn wound_share() -> f32 {
 /// Collision tests only run below the tallest body plus this.
 pub(crate) const STRIKE_MARGIN: f32 = 0.3;
 /// How far over his own head an archer's arrow leaves the bow
-/// (sim/soldier.rs). Above the body-hit band's top margin below, or a
+/// (sim/soldier/fight.rs). Above the body-hit band's top margin below, or a
 /// shaft is inside its own shooter at flight-time zero and kills him.
 pub const LAUNCH_OVER_HEAD: f32 = 0.25;
 /// The point an archer aims at on a man, as a share of the man's height.

@@ -156,7 +156,7 @@ pub struct GroupData {
     /// Ticks this regiment has been in a real melee (engaged, with at
     /// least the count gate's share of its men fighting once); 0 when
     /// not. Men out of sight of an enemy join the fight after their own
-    /// delay counted from here (sim/soldier.rs).
+    /// delay counted from here (sim/soldier/).
     pub melee_ticks: u32,
     /// Where the enemy unit this regiment fights stands: its ordered
     /// target if alive and unbroken, else the nearest unbroken enemy
@@ -167,7 +167,7 @@ pub struct GroupData {
     /// soldiers' `form_face`): set while the regiment's melee runs, moved a
     /// tenth of the way to the live mean each tick, kept when nobody fights
     /// for a tick, NaN otherwise. Under the friction contact a joiner behind
-    /// it walks straight ahead up to it (sim/soldier.rs `join_goal`).
+    /// it walks straight ahead up to it (sim/soldier/motion.rs `join_goal`).
     pub fight_line: f32,
     /// In the charge phase: attack order, inside charge range of the
     /// target, not yet in contact, and running at it (frontline.rs).
@@ -199,7 +199,7 @@ pub struct GroupData {
     pub retarget: bool,
     /// An enemy regiment's centroid is within combat-watch range: units
     /// of this regiment scan wider for adjacent enemies (sparse-fight
-    /// acquisition, sim/soldier.rs) and brace when standing.
+    /// acquisition, sim/soldier/fight.rs) and brace when standing.
     pub enemy_near: bool,
     /// Normalized direction to the nearest enemy regiment (ZERO when
     /// none in watch range): standing units face it (brace facing).
@@ -401,7 +401,7 @@ impl GroupData {
 /// target crosses it (`Groups::front_on_outline`), so it stands behind the
 /// friend instead of walking into the friend's ranks toward the target's
 /// centre. On by default under the friction contact and off without it
-/// (sim/soldier.rs `friction_contact`); FL_ATTACK_FRONT=3 turns it on and
+/// (sim/soldier/body.rs `friction_contact`); FL_ATTACK_FRONT=3 turns it on and
 /// any other value turns it off under either contact. Off, every attacker
 /// goes for the target's centre.
 pub(crate) fn attack_front() -> bool {
@@ -441,7 +441,7 @@ impl Groups {
                     // in and the whole regiment piles up on what stops it.
                     // Its places come back to the outline when the charge is
                     // over, and under the friction contact its soldiers do
-                    // not step back to them (sim/soldier.rs `hold_the_frame`).
+                    // not step back to them (sim/soldier/passing.rs `hold_the_frame`).
                     _ if attack_front() => {
                         if gd.charging || gd.crashing {
                             Some(td.centroid)
@@ -595,8 +595,6 @@ impl Plugin for OrdersPlugin {
                         in_state(crate::game_state::GameState::Battle)
                             .and_then(crate::game_state::deploying),
                     ),
-                    test_orders_script,
-                    test_retarget_script,
                     draw_order_gizmos,
                 ),
             )
@@ -606,123 +604,6 @@ impl Plugin for OrdersPlugin {
                     .after(crate::sim::step_sim)
                     .in_set(crate::game_state::SimSet),
             );
-    }
-}
-
-/// When the retarget test fired (the tick), and each retargeted regiment
-/// with its old and new target.
-type RetargetTest = Option<(u32, Vec<(usize, usize, usize)>)>;
-
-/// The mid-fight retarget test. In the Retarget scenario (FL_TEST_RETARGET,
-/// regiments.rs `spawn_retarget_test`), or in any battle with
-/// FL_RETARGET_AT set: that many seconds in (20 in the scenario), every
-/// engaged player regiment is ordered onto the nearest other unbroken
-/// enemy regiment, as a player retargeting mid-fight would. Every 5 s
-/// after, each one's men are counted: striking a man of the old target,
-/// of the new one, and still within 2.5 m of an old-target man, with the
-/// regiment's distance to both. It fires on the sim tick, so two runs of
-/// one binary retarget on the same tick.
-fn test_retarget_script(
-    units: Res<Units>,
-    pipeline: Res<crate::sim::TickPipeline>,
-    mut groups: ResMut<Groups>,
-    mut state: Local<RetargetTest>,
-) {
-    let scenario = std::env::var("FL_TEST_RETARGET").is_ok();
-    let at_s = std::env::var("FL_RETARGET_AT").ok().and_then(|v| v.parse::<f32>().ok());
-    let Some(at) = at_s.or(scenario.then_some(20.0)) else {
-        return;
-    };
-    let tick = pipeline.tick;
-    let secs = tick as f32 / 30.0;
-    if state.is_none() {
-        if secs < at {
-            return;
-        }
-        let mut picks = Vec::new();
-        for g in 0..groups.list.len() {
-            let gd = &groups.list[g];
-            if gd.team != PLAYER_TEAM || gd.count == 0 || !gd.engaged || gd.state.is_broken() {
-                continue;
-            }
-            // The enemy it fights: its target, else the nearest enemy.
-            let near = |skip: Option<usize>| {
-                (0..groups.list.len())
-                    .filter(|&e| {
-                        let eg = &groups.list[e];
-                        eg.team != gd.team && eg.count > 0 && !eg.state.is_broken() && Some(e) != skip
-                    })
-                    .min_by(|&a, &b| {
-                        let da = groups.list[a].centroid.distance_squared(gd.centroid);
-                        let db = groups.list[b].centroid.distance_squared(gd.centroid);
-                        da.total_cmp(&db)
-                    })
-            };
-            let old = match gd.order {
-                Some(Order::Attack(t)) => Some(t as usize),
-                _ => near(None),
-            };
-            let Some(old) = old else { continue };
-            let Some(new) = near(Some(old)) else { continue };
-            picks.push((g, old, new));
-        }
-        for &(g, _, new) in &picks {
-            groups.list[g].order = Some(Order::Attack(new as u32));
-            groups.list[g].auto_order = false;
-        }
-        info!(
-            "[retarget-test] tick {tick} ({secs:.1} s): {} engaged regiments retargeted",
-            picks.len()
-        );
-        *state = Some((tick, picks));
-        return;
-    }
-    let Some((last, picks)) = state.as_mut() else { return };
-    if tick < *last + 150 {
-        return;
-    }
-    *last = tick;
-    // Who each man fights: the man he winds up at, by regiment, and
-    // whether an old-target man stands within 2.5 m of him.
-    let mut near_old = vec![false; units.len()];
-    for &(g, old, _) in picks.iter() {
-        let olds: Vec<Vec2> = (0..units.len())
-            .filter(|&j| units.group[j] as usize == old && units.death_t[j] == 0)
-            .map(|j| Vec2::new(units.pos[j].x, units.pos[j].z))
-            .collect();
-        for (i, near) in near_old.iter_mut().enumerate() {
-            if units.group[i] as usize == g && units.death_t[i] == 0 {
-                let p = Vec2::new(units.pos[i].x, units.pos[i].z);
-                *near = olds.iter().any(|q| q.distance_squared(p) < 2.5 * 2.5);
-            }
-        }
-    }
-    for &(g, old, new) in picks.iter().take(8) {
-        let (mut alive, mut at_old, mut at_new, mut touching_old) = (0, 0, 0, 0);
-        for (i, &near) in near_old.iter().enumerate() {
-            if units.group[i] as usize != g || units.death_t[i] != 0 {
-                continue;
-            }
-            alive += 1;
-            touching_old += near as usize;
-            if units.swing[i] & crate::units::SWING_STATE_MASK == crate::units::SWING_WINDUP {
-                let tg = units.target[i] as usize;
-                if tg < units.len() {
-                    at_old += (units.group[tg] as usize == old) as usize;
-                    at_new += (units.group[tg] as usize == new) as usize;
-                }
-            }
-        }
-        let gd = &groups.list[g];
-        info!(
-            "[retarget-test] t={secs:.0}s reg {g} ({alive} men): striking old {old} {at_old}, new {new} {at_new}; touching old {touching_old}; to old {:.0} m, to new {:.0} m; retarget {} melee {}; old alive {} new alive {}",
-            gd.centroid.distance(groups.list[old].centroid),
-            gd.centroid.distance(groups.list[new].centroid),
-            gd.retarget,
-            gd.melee_ticks,
-            groups.list[old].count,
-            groups.list[new].count
-        );
     }
 }
 
@@ -1351,55 +1232,95 @@ fn issue_order(
     let t = time.elapsed_secs();
 
     if drag.active {
-        let layout = std::mem::take(&mut drag.layout);
-        // The regiments of the selection the drag placed nowhere: a lane
-        // with no room for them. They keep the orders they had.
-        let unplaced = selected
-            .iter()
-            .filter(|&&g| {
-                let gd = &groups.list[g];
-                gd.count > 0 && !gd.state.is_broken() && !layout.iter().any(|p| p.g == g)
-            })
-            .count();
-        if unplaced > 0 {
-            info!("no room on the lane: {unplaced} of {} regiments got no order", selected.len());
-        }
-        if layout.is_empty() {
-            // Nobody placed: no order, and never a click's order instead.
-        } else if deploy.active {
-            deploy_place_line(&mut groups, &mut units, &terrain, layout);
-            cues.write(crate::audio::UiCue::Deploy);
-        } else {
-            for p in &layout {
-                let what = format!(
-                    "line to ({:.1}, {:.1}) facing {:.3} files {}",
-                    p.anchor.x, p.anchor.y, p.facing, p.files
-                );
-                log_order(t, p.g, &groups.list[p.g], &what);
-            }
-            apply_line_order(&mut groups, layout, start, drag.cur);
-            cues.write(crate::audio::UiCue::Move);
-        }
-    } else if deploy.active {
-        // No attack targets while deploying: every click is a placement.
-        let picked: Vec<usize> = selection.picked_controllable(&groups).collect();
-        deploy_move(&mut groups, &mut units, &terrain, routes.grid(), &picked, start);
+        drag_release(&mut groups, &mut units, &terrain, &mut drag, &selected, deploy.active, start, &mut cues, t);
+    } else {
+        click_release(&mut groups, &mut units, &terrain, &routes, &selection, &selected, deploy.active, start, &mut cues, t);
+    }
+    drag.active = false;
+    drag.layout.clear();
+}
+
+/// A drag let go: its line laid out as the preview showed it.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn drag_release(
+    groups: &mut Groups,
+    units: &mut Units,
+    terrain: &Terrain,
+    drag: &mut OrderDrag,
+    selected: &[usize],
+    deploy_active: bool,
+    start: Vec2,
+    cues: &mut MessageWriter<crate::audio::UiCue>,
+    t: f32,
+) {
+    let layout = std::mem::take(&mut drag.layout);
+    // The regiments of the selection the drag placed nowhere: a lane
+    // with no room for them. They keep the orders they had.
+    let unplaced = selected
+        .iter()
+        .filter(|&&g| {
+            let gd = &groups.list[g];
+            gd.count > 0 && !gd.state.is_broken() && !layout.iter().any(|p| p.g == g)
+        })
+        .count();
+    if unplaced > 0 {
+        info!("no room on the lane: {unplaced} of {} regiments got no order", selected.len());
+    }
+    if layout.is_empty() {
+        // Nobody placed: no order, and never a click's order instead.
+    } else if deploy_active {
+        deploy_place_line(groups, units, terrain, layout);
         cues.write(crate::audio::UiCue::Deploy);
-    } else if let Some(e) = enemy_regiment_at(&groups, start) {
-        attack_regiments(&mut groups, &selected, e);
+    } else {
+        for p in &layout {
+            let what = format!(
+                "line to ({:.1}, {:.1}) facing {:.3} files {}",
+                p.anchor.x, p.anchor.y, p.facing, p.files
+            );
+            log_order(t, p.g, &groups.list[p.g], &what);
+        }
+        apply_line_order(groups, layout, start, drag.cur);
+        cues.write(crate::audio::UiCue::Move);
+    }
+}
+
+/// A click let go: a placement while deploying, an attack on the enemy
+/// regiment under it, or a move.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn click_release(
+    groups: &mut Groups,
+    units: &mut Units,
+    terrain: &Terrain,
+    routes: &crate::sim::route::Routes,
+    selection: &Selection,
+    selected: &[usize],
+    deploy_active: bool,
+    start: Vec2,
+    cues: &mut MessageWriter<crate::audio::UiCue>,
+    t: f32,
+) {
+    if deploy_active {
+        // No attack targets while deploying: every click is a placement.
+        let picked: Vec<usize> = selection.picked_controllable(groups).collect();
+        deploy_move(groups, units, terrain, routes.grid(), &picked, start);
+        cues.write(crate::audio::UiCue::Deploy);
+    } else if let Some(e) = enemy_regiment_at(groups, start) {
+        attack_regiments(groups, selected, e);
         cues.write(crate::audio::UiCue::Attack);
         info!(
             "{} regiments ({} units) ATTACK regiment {e}",
             selected.len(),
             selection.count_units,
         );
-        for &g in &selected {
+        for &g in selected {
             let gd = &groups.list[g];
             if gd.order == Some(Order::Attack(e)) && !gd.state.is_broken() {
                 log_order(t, g, gd, &format!("attack g{e}"));
             }
         }
-    } else if !click_order(&mut groups, &terrain, &selected, start) {
+    } else if !click_order(groups, terrain, selected, start) {
         info!("no room on the lane at ({:.0}, {:.0}): {} regiments got no order", start.x, start.y, selected.len());
     } else {
         cues.write(crate::audio::UiCue::Move);
@@ -1412,7 +1333,7 @@ fn issue_order(
         );
         // Each regiment's own destination (the click translated by its
         // offset from the selection's centre) and the facing it took.
-        for &g in &selected {
+        for &g in selected {
             let gd = &groups.list[g];
             if let Some(Order::Move(d)) = gd.order
                 && !gd.state.is_broken()
@@ -1421,8 +1342,6 @@ fn issue_order(
             }
         }
     }
-    drag.active = false;
-    drag.layout.clear();
 }
 
 /// Placement preview while a formation drag is in flight: the drawn line
@@ -1609,137 +1528,6 @@ fn draw_order_gizmos(
             );
             gizmos.line(base, base + Vec3::Y * 10.0, color);
         }
-    }
-}
-
-/// RMS spread of a regiment's living units around its centroid — the
-/// block-coherence metric for the orders test.
-fn regiment_spread(units: &Units, g: u32) -> f32 {
-    let (mut sum, mut c, mut centroid) = (0.0f32, 0usize, Vec2::ZERO);
-    for i in 0..units.len() {
-        if units.group[i] == g && units.death_t[i] == 0 {
-            centroid += Vec2::new(units.pos[i].x, units.pos[i].z);
-            c += 1;
-        }
-    }
-    if c == 0 {
-        return 0.0;
-    }
-    centroid /= c as f32;
-    for i in 0..units.len() {
-        if units.group[i] == g && units.death_t[i] == 0 {
-            sum += Vec2::new(units.pos[i].x, units.pos[i].z).distance_squared(centroid);
-        }
-    }
-    (sum / c as f32).sqrt()
-}
-
-/// FL_TEST_ORDERS=1: regiment cohesion + arrangement-preserving group
-/// moves. Stage 0: enclosure-select regiments (exercises the promote
-/// path), long-march ONE regiment 350 m and compare its RMS spread on
-/// arrival (acceptance: < 1.5x). Stage 1: group-move several regiments
-/// and log how well their relative arrangement survived.
-fn test_orders_script(
-    time: Res<Time>,
-    units: Res<Units>,
-    mut groups: ResMut<Groups>,
-    mut selection: ResMut<Selection>,
-    mut stage: Local<u32>,
-    mut watch: Local<Option<(u32, f32)>>,
-    mut arrangement: Local<Vec<(usize, Vec2)>>,
-) {
-    if std::env::var("FL_TEST_ORDERS").is_err() {
-        return;
-    }
-    let t = time.elapsed_secs();
-    match *stage {
-        0 if t > 5.0 => {
-            // Enclosure stroke around a spot inside the blue army: must
-            // promote to whole regiments.
-            let center = Vec2::new(-150.0, -90.0);
-            let stroke: Vec<Vec2> = (0..28)
-                .map(|k| {
-                    let a = k as f32 / 28.0 * std::f32::consts::TAU;
-                    center + Vec2::new(a.cos(), a.sin()) * 45.0
-                })
-                .collect();
-            select_along_line(&stroke, false, &units, &groups, &mut selection);
-            info!(
-                "[test] enclosure selected {} regiments ({} units)",
-                selection.regiments.iter().filter(|s| **s).count(),
-                selection.count_units
-            );
-            // Long-march the blue regiment nearest the enclosure center.
-            let g = groups
-                .list
-                .iter()
-                .enumerate()
-                .filter(|(_, gr)| gr.team == PLAYER_TEAM && gr.count > 0)
-                .min_by(|a, b| {
-                    a.1.centroid
-                        .distance_squared(center)
-                        .total_cmp(&b.1.centroid.distance_squared(center))
-                })
-                .map(|(g, _)| g as u32)
-                .unwrap();
-            let spread = regiment_spread(&units, g);
-            groups.list[g as usize].order =
-                Some(Order::Move(groups.list[g as usize].centroid + Vec2::new(350.0, 60.0)));
-            *watch = Some((g, spread));
-            info!("[test] regiment {g} long-march ordered, spread at departure {spread:.1} m");
-            selection.regiments.fill(false);
-            selection.count_units = 0;
-            *stage = 1;
-        }
-        1 => {
-            if let Some((g, spread0)) = *watch
-                && groups.list[g as usize].order.is_none()
-            {
-                let spread = regiment_spread(&units, g);
-                info!(
-                    "[test] regiment {g} arrived: spread {spread:.1} m vs {spread0:.1} m at departure (ratio {:.2})",
-                    spread / spread0.max(0.01)
-                );
-                *stage = 2;
-            }
-        }
-        2 if t > 45.0 => {
-            // Group-move: order several blue regiments as one formation.
-            let selected: Vec<usize> = groups
-                .list
-                .iter()
-                .enumerate()
-                .filter(|(_, gr)| gr.team == PLAYER_TEAM && gr.count > 0 && gr.order.is_none())
-                .take(10)
-                .map(|(g, _)| g)
-                .collect();
-            let centroid: Vec2 = selected.iter().map(|&g| groups.list[g].centroid).sum::<Vec2>()
-                / selected.len().max(1) as f32;
-            *arrangement = selected
-                .iter()
-                .map(|&g| (g, groups.list[g].centroid - centroid))
-                .collect();
-            order_regiments(&mut groups, &selected, centroid + Vec2::new(-120.0, -100.0));
-            info!("[test] group-move: {} regiments as one formation", selected.len());
-            *stage = 3;
-        }
-        3 if !arrangement.is_empty()
-            && arrangement.iter().all(|(g, _)| groups.list[*g].order.is_none()) =>
-        {
-            let centroid: Vec2 = arrangement
-                .iter()
-                .map(|(g, _)| groups.list[*g].centroid)
-                .sum::<Vec2>()
-                / arrangement.len() as f32;
-            let err: f32 = arrangement
-                .iter()
-                .map(|(g, off)| (groups.list[*g].centroid - centroid).distance(*off))
-                .sum::<f32>()
-                / arrangement.len() as f32;
-            info!("[test] group-move arrived: mean arrangement error {err:.1} m");
-            *stage = 4;
-        }
-        _ => {}
     }
 }
 

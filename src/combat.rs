@@ -127,34 +127,7 @@ pub fn process_deaths(
                     4.5 + 4.0 * hash01(seed ^ 0x5bd1_e995),
                 ));
             }
-            units.pos.swap_remove(i);
-            units.pos_prev.swap_remove(i);
-            units.vel.swap_remove(i);
-            units.speed.swap_remove(i);
-            units.team.swap_remove(i);
-            units.kind.swap_remove(i);
-            units.yaw.swap_remove(i);
-            units.yaw_prev.swap_remove(i);
-            units.group.swap_remove(i);
-            units.color.swap_remove(i);
-            units.hp.swap_remove(i);
-            units.target.swap_remove(i);
-            units.quarry.swap_remove(i);
-            units.swing.swap_remove(i);
-            units.swing_t.swap_remove(i);
-            units.flash.swap_remove(i);
-            units.death_t.swap_remove(i);
-            units.home.swap_remove(i);
-            units.ammo.swap_remove(i);
-            units.out_form.swap_remove(i);
-            units.sight.swap_remove(i);
-            units.chain.swap_remove(i);
-            units.way.swap_remove(i);
-            units.pose.swap_remove(i);
-            units.stuck.swap_remove(i);
-            units.aim.swap_remove(i);
-            units.imposed.swap_remove(i);
-            units.stood.swap_remove(i);
+            swap_remove_man(&mut units, i);
             moves.swap_remove(i, units.len() + 1);
             // The hole took the last man; a popped tail took nobody.
             if i >= units.len() {
@@ -172,6 +145,46 @@ pub fn process_deaths(
 
     crate::frame_log::tick::units(units.len());
     let _tick_log_count = crate::frame_log::tick::time(crate::frame_log::tick::Part::DeathsCount);
+    count_the_living(&mut stats, &units, len_at_start);
+}
+
+/// Man `i` out of every column: the last man takes his place.
+#[inline]
+fn swap_remove_man(units: &mut Units, i: usize) {
+    units.pos.swap_remove(i);
+    units.pos_prev.swap_remove(i);
+    units.vel.swap_remove(i);
+    units.speed.swap_remove(i);
+    units.team.swap_remove(i);
+    units.kind.swap_remove(i);
+    units.yaw.swap_remove(i);
+    units.yaw_prev.swap_remove(i);
+    units.group.swap_remove(i);
+    units.color.swap_remove(i);
+    units.hp.swap_remove(i);
+    units.target.swap_remove(i);
+    units.quarry.swap_remove(i);
+    units.swing.swap_remove(i);
+    units.swing_t.swap_remove(i);
+    units.flash.swap_remove(i);
+    units.death_t.swap_remove(i);
+    units.home.swap_remove(i);
+    units.ammo.swap_remove(i);
+    units.out_form.swap_remove(i);
+    units.sight.swap_remove(i);
+    units.chain.swap_remove(i);
+    units.way.swap_remove(i);
+    units.pose.swap_remove(i);
+    units.stuck.swap_remove(i);
+    units.aim.swap_remove(i);
+    units.imposed.swap_remove(i);
+    units.stood.swap_remove(i);
+}
+
+/// The living per team, from the last count less the kills and the fled
+/// since, or counted afresh for a new army.
+#[inline]
+fn count_the_living(stats: &mut CombatStats, units: &Units, len_at_start: usize) {
     // The living per team. A man stops living only where a kill is
     // counted (the damage apply, an arrow hit) or where he leaves the field
     // (`fled`, above), and nothing brings a dead man back; men are added
@@ -188,7 +201,7 @@ pub fn process_deaths(
             stats.alive[0] -= lost[0];
             stats.alive[1] -= lost[1];
         }
-        None => stats.alive = count_living(&units),
+        None => stats.alive = count_living(units),
     }
     stats.living_basis = Some(LivingBasis {
         generation: units.generation,

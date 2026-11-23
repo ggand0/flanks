@@ -162,7 +162,7 @@ pub struct GpuSoldier {
     yaw: f32,
     yaw_prev: f32,
     /// kind | knife << 7 | swing << 8 | swing_t << 16 | flash << 24: an
-    /// archer's knife out (sim/soldier.rs SIGHT_KNIFE) in the kind byte's
+    /// archer's knife out (sim/soldier/mod.rs SIGHT_KNIFE) in the kind byte's
     /// top bit.
     a: u32,
     /// group | death_t << 24
@@ -223,7 +223,7 @@ pub struct BuildParams {
     /// length in seconds.
     step_travel: [Vec4; NUM_KINDS],
     step_len: [Vec4; NUM_KINDS],
-    /// soldier.rs STEP_FACE_SPEED, render_units.rs STEP_SETTLE_S.
+    /// soldier/steer.rs STEP_FACE_SPEED, render_units.rs STEP_SETTLE_S.
     steps: Vec4,
     /// draw_ticks, death_ticks, hit_stagger_ticks, celebrate_base
     consts: Vec4,

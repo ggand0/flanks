@@ -919,7 +919,7 @@ fn pose_begin(pos_scale: vec4<f32>, color: vec4<f32>, anim: vec4<f32>, anim2: ve
     let following = within > 1.395 && !cheering;
     let windup = select(select(within, 0.0, following), 0.0, cheering);
     let follow = clamp((within - 1.4) / 0.59, 0.0, 1.0);
-    // A kind with a cut clip draws three styles (soldier.rs): 1 is the
+    // A kind with a cut clip draws three styles (soldier/fight.rs): 1 is the
     // slow cut, which his skeleton plays from the clip at the near levels
     // and his parts play as the overhead swing further out, and 2 is the
     // overhead swing at the stab's pace, which is the code's style 1. A

@@ -422,7 +422,7 @@ impl Terrain {
     }
 
     /// The radius a soldier's body keeps off blocked ground on this map
-    /// (`body_free`): half the body distance (sim/soldier.rs
+    /// (`body_free`): half the body distance (sim/soldier/body.rs
     /// `body_distance`, 1.2 m unless `FL_BODY` sets it), or nothing where
     /// no ground blocks.
     #[inline]

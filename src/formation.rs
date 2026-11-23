@@ -28,7 +28,7 @@ pub const BASE_SPACING: f32 = 1.4;
 /// A kind's slot pitch in normal order: how far apart its men stand.
 /// FL_GAP=k,m,s,a sets it per kind in metres (knights, men-at-arms,
 /// spearmen, bowmen). Never under the separation rest distance at ease
-/// (sim/soldier.rs `sep_ease`): the physics pushes closer slots apart.
+/// (sim/soldier/body.rs `sep_ease`): the physics pushes closer slots apart.
 pub fn gap(kind: u8) -> f32 {
     static GAPS: std::sync::OnceLock<[f32; crate::unit_types::NUM_KINDS]> =
         std::sync::OnceLock::new();
@@ -150,7 +150,7 @@ impl OpenOrder {
 
 impl FormSpacing {
     /// (lateral, depth) slot pitch of a kind in meters. Wall matches the
-    /// tightened separation rest distance (sim/soldier.rs WALL_SEP_RADIUS):
+    /// tightened separation rest distance (sim/soldier/contact.rs WALL_SEP_RADIUS):
     /// slots the physics refuses to hold are lies.
     pub fn pitch(self, kind: u8) -> Vec2 {
         match self {
@@ -163,7 +163,7 @@ impl FormSpacing {
 }
 
 /// The slot pitch of a regiment on a lane (the wall's walk). In normal
-/// order it is the rest distance of two men at ease (sim/soldier.rs
+/// order it is the rest distance of two men at ease (sim/soldier/body.rs
 /// `sep_ease`), the closest two standing men keep without pushing each
 /// other, so the walk holds a rank more than at the field's pitch; the
 /// other spacings keep their own.
@@ -754,196 +754,7 @@ impl Plugin for FormationPlugin {
                         in_state(crate::game_state::GameState::Battle)
                             .and_then(crate::game_state::deploying),
                     ),
-                test_form_script,
-                disorder_log,
             ),
-        );
-    }
-}
-
-/// Mean living-unit distance to slot (`anchor + home`) — how ON their
-/// marks a regiment stands.
-fn slot_error(units: &Units, groups: &Groups, g: usize) -> f32 {
-    let gd = &groups.list[g];
-    let (mut sum, mut n) = (0.0f32, 0usize);
-    for i in 0..units.len() {
-        if units.group[i] as usize == g && units.death_t[i] == 0 {
-            let p = Vec2::new(units.pos[i].x, units.pos[i].z);
-            sum += p.distance(gd.anchor + units.home[i]);
-            n += 1;
-        }
-    }
-    if n == 0 { 0.0 } else { sum / n as f32 }
-}
-
-/// Mean nearest-neighbor distance within a regiment (brute force — test
-/// only). The spacing-mode metric: wall < normal < loose.
-fn regiment_nn(units: &Units, g: usize) -> f32 {
-    let pts: Vec<Vec2> = (0..units.len())
-        .filter(|&i| units.group[i] as usize == g && units.death_t[i] == 0)
-        .map(|i| Vec2::new(units.pos[i].x, units.pos[i].z))
-        .collect();
-    if pts.len() < 2 {
-        return 0.0;
-    }
-    let mut sum = 0.0f32;
-    for (k, p) in pts.iter().enumerate() {
-        let mut best = f32::MAX;
-        for (j, q) in pts.iter().enumerate() {
-            if j != k {
-                best = best.min(p.distance_squared(*q));
-            }
-        }
-        sum += best.sqrt();
-    }
-    sum / pts.len() as f32
-}
-
-/// FL_TEST_FORM=1: the drag-order acceptance, driven through the SAME
-/// line_order path the mouse uses. Stage 0: draw a 120 m line ahead of
-/// four blue regiments. Stage 1 (all arrived): mean slot error must be
-/// small (units stand ON their previewed marks) and the block extents
-/// must match files x pitch. Then one regiment forms the wall, one goes
-/// loose. Stage 2 (+8 s): within-regiment nearest-neighbor spacing must
-/// order wall < normal < loose.
-fn test_form_script(
-    time: Res<Time>,
-    units: Res<Units>,
-    terrain: Res<crate::terrain::Terrain>,
-    mut groups: ResMut<Groups>,
-    mut stage: Local<u32>,
-    mut watch: Local<Vec<usize>>,
-    mut settle_at: Local<f32>,
-) {
-    if std::env::var("FL_TEST_FORM").is_err() {
-        return;
-    }
-    let t = time.elapsed_secs();
-    match *stage {
-        0 if t > 3.0 => {
-            let picked: Vec<usize> = groups
-                .list
-                .iter()
-                .enumerate()
-                .filter(|(_, gd)| gd.team == 0 && gd.count > 0)
-                .take(4)
-                .map(|(g, _)| g)
-                .collect();
-            if picked.len() < 4 {
-                warn!("[form-test] needs >= 4 blue regiments");
-                *stage = 99;
-                return;
-            }
-            let mean: Vec2 = picked.iter().map(|&g| groups.list[g].centroid).sum::<Vec2>()
-                / picked.len() as f32;
-            // A 120 m line 45 m toward the enemy, drawn left to right.
-            let a = mean + Vec2::new(-60.0, 45.0);
-            let b = mean + Vec2::new(60.0, 45.0);
-            // Drag-direction invariance: the same line drawn with the
-            // opposite hand must face the same way (facing follows the
-            // enemy side of the line, not the drag direction). The
-            // reversed order is immediately overwritten by the real one.
-            crate::orders::line_order(&mut groups, &terrain, &picked, b, a);
-            let rev_facing = groups.list[picked[0]].facing;
-            crate::orders::line_order(&mut groups, &terrain, &picked, a, b);
-            let fwd_facing = groups.list[picked[0]].facing;
-            if (rev_facing - fwd_facing).abs() < 0.01 {
-                info!(
-                    "[form-test] drag invariance: fwd {fwd_facing:.2} == rev {rev_facing:.2} -> OK"
-                );
-            } else {
-                warn!(
-                    "[form-test] drag invariance FAILED: fwd {fwd_facing:.2} vs rev {rev_facing:.2}"
-                );
-            }
-            for &g in &picked {
-                info!(
-                    "[form-test] regiment {g}: files {} facing {:.2}",
-                    groups.list[g].files, groups.list[g].facing
-                );
-            }
-            *watch = picked;
-            *stage = 1;
-        }
-        1 if !watch.is_empty()
-            && watch.iter().all(|&g| groups.list[g].order.is_none()) =>
-        {
-            // "Arrived" is a centroid predicate; the tail of a deep
-            // column is still tens of meters out when it fires — give
-            // the ranks time to pour in and dress before measuring.
-            *settle_at = t + 15.0;
-            *stage = 2;
-        }
-        2 if t > *settle_at => {
-            for &g in watch.iter() {
-                let gd = &groups.list[g];
-                let err = slot_error(&units, &groups, g);
-                // Mean angular error of unit yaw vs the ordered facing:
-                // a settled formation must LOOK the way it was told to.
-                let (mut yerr, mut n) = (0.0f32, 0usize);
-                for i in 0..units.len() {
-                    if units.group[i] as usize == g && units.death_t[i] == 0 {
-                        let d = (units.yaw[i] - gd.facing + std::f32::consts::PI)
-                            .rem_euclid(std::f32::consts::TAU)
-                            - std::f32::consts::PI;
-                        yerr += d.abs();
-                        n += 1;
-                    }
-                }
-                let yerr = if n > 0 { yerr / n as f32 } else { 0.0 };
-                info!(
-                    "[form-test] regiment {g} settled: slot err {err:.2} m, facing err {yerr:.2} rad ({} men, files {}) -> {}",
-                    gd.count,
-                    gd.files,
-                    if err < 1.5 && yerr < 0.3 { "OK" } else { "FAIL" }
-                );
-            }
-            // Spacing modes: wall on the first, loose on the second.
-            let (w, l) = (watch[0], watch[1]);
-            groups.list[w].spacing = FormSpacing::Wall;
-            groups.list[w].reform = true;
-            groups.list[l].spacing = FormSpacing::Loose;
-            groups.list[l].reform = true;
-            info!("[form-test] regiment {w} -> wall, regiment {l} -> loose");
-            *settle_at = t + 10.0;
-            *stage = 3;
-        }
-        3 if t > *settle_at => {
-            let nn_wall = regiment_nn(&units, watch[0]);
-            let nn_loose = regiment_nn(&units, watch[1]);
-            let nn_normal = regiment_nn(&units, watch[2]);
-            let ordered = nn_wall < nn_normal - 0.1 && nn_normal < nn_loose - 0.2;
-            info!(
-                "[form-test] spacing nn: wall {nn_wall:.2} < normal {nn_normal:.2} < loose {nn_loose:.2} -> {}",
-                if ordered { "OK" } else { "FAIL" }
-            );
-            *stage = 4;
-        }
-        _ => {}
-    }
-}
-
-/// FL_LOG_DISORDER=1: every 4 s while anyone fights, the mean
-/// disorder (m off the slots) of engaged regiments — the
-/// blocks-stay-blocks number.
-fn disorder_log(groups: Res<Groups>, time: Res<Time>, mut next: Local<f32>) {
-    if std::env::var("FL_LOG_DISORDER").is_err() {
-        return;
-    }
-    let t = time.elapsed_secs();
-    if t < *next {
-        return;
-    }
-    *next = t + 4.0;
-    let (mut disorder, mut regs) = (0.0f32, 0usize);
-    for gd in groups.list.iter().filter(|gd| gd.engaged && gd.count > 0) {
-        disorder += gd.disorder;
-        regs += 1;
-    }
-    if regs > 0 {
-        info!(
-            "[disorder] t={t:.0}s {regs} engaged regiments, mean disorder {:.2} m",
-            disorder / regs as f32
         );
     }
 }
@@ -1009,118 +820,129 @@ pub fn apply_formation_cmd(
         apply_formation_cmd(FormCmd::Melee, selection, groups);
     }
     match cmd {
-        FormCmd::Wall | FormCmd::Loose => {
-            let wall = cmd == FormCmd::Wall;
-            let want = if wall { FormSpacing::Wall } else { FormSpacing::Loose };
-            let picked: Vec<usize> = picked
-                .iter()
-                .copied()
-                .filter(|&g| !(wall && groups.list[g].kind == crate::unit_types::KIND_ARCHER))
-                .collect();
-            if picked.is_empty() {
-                return;
-            }
-            // Toggle as a set: if anyone is not yet in the mode, everyone
-            // enters it; if all are, everyone falls back to close order.
-            // An open regiment's spacing is the one it closes back to.
-            let on = picked.iter().any(|&g| groups.list[g].chosen_spacing() != want);
-            let mut shield = 0;
-            let mut spear = 0;
-            for &g in &picked {
-                let gd = &mut groups.list[g];
-                let spacing = if on { want } else { FormSpacing::Normal };
-                if gd.spacing == FormSpacing::Open {
-                    gd.close_to = spacing;
-                } else {
-                    gd.spacing = spacing;
-                }
-                gd.shape = FormShape::Rect;
-                if gd.files == 0 {
-                    gd.files = default_files(gd.count);
-                }
-                gd.reform = true;
-                match wall_kind(gd) {
-                    1 => shield += 1,
-                    2 => spear += 1,
-                    _ => {}
-                }
-            }
-            if !on {
-                info!("{} regiments back to close order", picked.len());
-            } else if wall {
-                info!("wall formed: {shield} shieldwall, {spear} spearwall regiments");
-            } else {
-                info!("{} regiments to LOOSE order", picked.len());
-            }
-        }
+        FormCmd::Wall | FormCmd::Loose => toggle_spacing(cmd, &picked, groups),
+        FormCmd::Hold => toggle_hold(&picked, groups),
+        FormCmd::FireAtWill | FormCmd::Skirmish | FormCmd::Melee => toggle_archers(cmd, picked, groups),
+    }
+}
 
-        FormCmd::Hold => {
-            // Hold position (defend) vs at ease: held regiments never chase
-            // and never engage on their own — they fight what steps into
-            // reach and nothing else.
-            let on = picked.iter().any(|&g| !groups.list[g].hold);
-            for &g in &picked {
-                groups.list[g].hold = on;
-            }
-            info!(
-                "{} regiments {}",
-                picked.len(),
-                if on { "HOLD POSITION" } else { "AT EASE" }
-            );
+/// Wall or loose order on or off for the picked regiments.
+#[inline]
+fn toggle_spacing(cmd: FormCmd, picked: &[usize], groups: &mut Groups) {
+    let wall = cmd == FormCmd::Wall;
+    let want = if wall { FormSpacing::Wall } else { FormSpacing::Loose };
+    let picked: Vec<usize> = picked
+        .iter()
+        .copied()
+        .filter(|&g| !(wall && groups.list[g].kind == crate::unit_types::KIND_ARCHER))
+        .collect();
+    if picked.is_empty() {
+        return;
+    }
+    // Toggle as a set: if anyone is not yet in the mode, everyone
+    // enters it; if all are, everyone falls back to close order.
+    // An open regiment's spacing is the one it closes back to.
+    let on = picked.iter().any(|&g| groups.list[g].chosen_spacing() != want);
+    let mut shield = 0;
+    let mut spear = 0;
+    for &g in &picked {
+        let gd = &mut groups.list[g];
+        let spacing = if on { want } else { FormSpacing::Normal };
+        if gd.spacing == FormSpacing::Open {
+            gd.close_to = spacing;
+        } else {
+            gd.spacing = spacing;
         }
-
-        FormCmd::FireAtWill | FormCmd::Skirmish | FormCmd::Melee => {
-            // Archer toggles; melee regiments in the selection ignore them.
-            let archers: Vec<usize> = picked
-                .into_iter()
-                .filter(|&g| groups.list[g].kind == crate::unit_types::KIND_ARCHER)
-                .collect();
-            if archers.is_empty() {
-                return;
-            }
-            let on = archers.iter().any(|&g| {
-                let gd = &groups.list[g];
-                match cmd {
-                    FormCmd::FireAtWill => !gd.fire_at_will,
-                    FormCmd::Skirmish => !gd.skirmish,
-                    _ => !gd.melee,
-                }
-            });
-            for &g in &archers {
-                let gd = &mut groups.list[g];
-                match cmd {
-                    FormCmd::FireAtWill => gd.fire_at_will = on,
-                    FormCmd::Skirmish => {
-                        gd.skirmish = on;
-                        // Switching skirmish off mid-run: the run ends
-                        // where the regiment stands and its own order
-                        // comes back.
-                        if !on && gd.skirmishing {
-                            crate::sim::job::end_skirmish(gd);
-                        }
-                    }
-                    _ => {
-                        gd.melee = on;
-                        // Swords out end a run the same way; the bows go
-                        // down with the toggle (sim/job.rs).
-                        if on && gd.skirmishing {
-                            crate::sim::job::end_skirmish(gd);
-                        }
-                    }
-                }
-            }
-            info!(
-                "{} archer regiments {} {}",
-                archers.len(),
-                match cmd {
-                    FormCmd::FireAtWill => "fire-at-will",
-                    FormCmd::Skirmish => "skirmish",
-                    _ => "swords out",
-                },
-                if on { "ON" } else { "OFF" }
-            );
+        gd.shape = FormShape::Rect;
+        if gd.files == 0 {
+            gd.files = default_files(gd.count);
+        }
+        gd.reform = true;
+        match wall_kind(gd) {
+            1 => shield += 1,
+            2 => spear += 1,
+            _ => {}
         }
     }
+    if !on {
+        info!("{} regiments back to close order", picked.len());
+    } else if wall {
+        info!("wall formed: {shield} shieldwall, {spear} spearwall regiments");
+    } else {
+        info!("{} regiments to LOOSE order", picked.len());
+    }
+}
+
+/// Hold position on or off for the picked regiments.
+#[inline]
+fn toggle_hold(picked: &[usize], groups: &mut Groups) {
+    // Hold position (defend) vs at ease: held regiments never chase
+    // and never engage on their own — they fight what steps into
+    // reach and nothing else.
+    let on = picked.iter().any(|&g| !groups.list[g].hold);
+    for &g in picked {
+        groups.list[g].hold = on;
+    }
+    info!(
+        "{} regiments {}",
+        picked.len(),
+        if on { "HOLD POSITION" } else { "AT EASE" }
+    );
+}
+
+/// An archer toggle (fire at will, skirmish, swords out) for the picked
+/// archer regiments.
+#[inline]
+fn toggle_archers(cmd: FormCmd, picked: Vec<usize>, groups: &mut Groups) {
+    // Archer toggles; melee regiments in the selection ignore them.
+    let archers: Vec<usize> = picked
+        .into_iter()
+        .filter(|&g| groups.list[g].kind == crate::unit_types::KIND_ARCHER)
+        .collect();
+    if archers.is_empty() {
+        return;
+    }
+    let on = archers.iter().any(|&g| {
+        let gd = &groups.list[g];
+        match cmd {
+            FormCmd::FireAtWill => !gd.fire_at_will,
+            FormCmd::Skirmish => !gd.skirmish,
+            _ => !gd.melee,
+        }
+    });
+    for &g in &archers {
+        let gd = &mut groups.list[g];
+        match cmd {
+            FormCmd::FireAtWill => gd.fire_at_will = on,
+            FormCmd::Skirmish => {
+                gd.skirmish = on;
+                // Switching skirmish off mid-run: the run ends
+                // where the regiment stands and its own order
+                // comes back.
+                if !on && gd.skirmishing {
+                    crate::sim::job::end_skirmish(gd);
+                }
+            }
+            _ => {
+                gd.melee = on;
+                // Swords out end a run the same way; the bows go
+                // down with the toggle (sim/job.rs).
+                if on && gd.skirmishing {
+                    crate::sim::job::end_skirmish(gd);
+                }
+            }
+        }
+    }
+    info!(
+        "{} archer regiments {} {}",
+        archers.len(),
+        match cmd {
+            FormCmd::FireAtWill => "fire-at-will",
+            FormCmd::Skirmish => "skirmish",
+            _ => "swords out",
+        },
+        if on { "ON" } else { "OFF" }
+    );
 }
 
 /// Consume `reform` requests and run the close-ranks check: a Rect
