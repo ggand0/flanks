@@ -168,6 +168,22 @@ pub struct LodConfig {
     pub px: [[f32; NUM_LODS - 1]; crate::unit_types::NUM_KINDS],
     /// FL_LOD_DEBUG=1: tint soldiers by level.
     pub debug: bool,
+    /// `FL_SPRITE_FROM`: with `FL_SPRITE` on and no `FL_LOD_PX`, the camera
+    /// distance in metres from which a soldier draws the last level, the
+    /// card (unit_glb.rs `sprite_mode`). Default 400.
+    ///
+    /// The level pick works in pixels (a soldier's projected height against
+    /// `px`), so `LodBands::new` turns these metres into the last switch's
+    /// pixel height every frame from the camera's own projection: the height
+    /// of a soldier of the kind at this distance in the current window (rows
+    /// over twice the tangent of half the vertical field of view). The card
+    /// so begins at the same metres at any window size or field of view; at
+    /// 1360 rows and the 45 degree view, 400 m is a 1.7 m man about 7.0 px
+    /// tall, at 2160 rows about 11.1 px. The nearer switches keep their pixel
+    /// heights, so they move with the window as they do without it. The
+    /// shadow casters' level per cascade (`shadow_level`) keeps the plain
+    /// thresholds.
+    pub sprite_from: Option<f32>,
 }
 
 impl Default for LodConfig {
@@ -188,10 +204,23 @@ impl Default for LodConfig {
                 Err(_) => warn!("FL_LOD_PX wants {} comma-separated numbers", NUM_LODS - 1),
             }
         }
+        let lod_px = crate::util::perf_str("FL_LOD_PX").is_some_and(|v| v.trim() != "0");
+        let sprite_from = (crate::unit_glb::sprite_mode() != 0 && !lod_px).then(|| {
+            let m = crate::util::env_or("FL_SPRITE_FROM", 400.0_f32);
+            if m > 0.0 {
+                m
+            } else {
+                warn!("FL_SPRITE_FROM wants a distance in metres above 0, not {m}; the card begins at 400 m");
+                400.0
+            }
+        });
+        if let Some(m) = sprite_from {
+            info!("FL_SPRITE: the card begins {m} m from the camera (FL_SPRITE_FROM)");
+        }
         if std::env::var("FL_LOD").is_ok_and(|v| v == "0") {
             px = [[0.0; NUM_LODS - 1]; crate::unit_types::NUM_KINDS];
         }
-        Self { px, debug: std::env::var("FL_LOD_DEBUG").is_ok() }
+        Self { px, debug: std::env::var("FL_LOD_DEBUG").is_ok(), sprite_from }
     }
 }
 
@@ -233,7 +262,11 @@ impl LodBands {
         for (kind, px) in cfg.px.iter().enumerate() {
             let height = 2.0 * crate::unit_types::half_height(kind);
             for (j, px) in px.iter().enumerate() {
-                if px_per_unit > 0.0 && *px > 0.0 {
+                // FL_SPRITE_FROM: the last switch's pixel height is that of
+                // this kind at the card's distance in this projection.
+                let from = cfg.sprite_from.filter(|_| j == NUM_LODS - 2 && *px > 0.0);
+                let px = from.map_or(*px, |m| height * px_per_unit / m);
+                if px_per_unit > 0.0 && px > 0.0 {
                     // A soldier is `px` tall at this distance.
                     let d = height * px_per_unit / px;
                     bands.plain[kind][j] = d * d;

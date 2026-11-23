@@ -538,7 +538,9 @@ fn import(kind: usize, path: &Path, pulled: bool) -> Fallible<KindMeshes> {
 /// `FL_SPRITE`: 0 off (the default), 1 every living soldier at the last
 /// level is drawn as a card cut out by a plain discard, 2 the same cut out
 /// by alpha to coverage. GPU path only. Read once, at import. The last
-/// level begins where `FL_LOD_PX` puts it.
+/// level then begins `FL_SPRITE_FROM` metres from the camera, 400 by
+/// default (render_units.rs `LodConfig::sprite_from`), unless `FL_LOD_PX`
+/// is given, which sets every switch in pixels as without the card.
 pub fn sprite_mode() -> u32 {
     static MODE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| crate::util::env_or("FL_SPRITE", 0_u32).min(2))
