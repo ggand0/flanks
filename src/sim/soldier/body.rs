@@ -25,6 +25,7 @@ pub(crate) fn body_distance() -> f32 {
 /// inside every neighbour at the fighting line, and every turn or death
 /// there would throw the soldiers around it. The wall clearance and the
 /// places on a walk keep reading `body_distance`.
+#[inline]
 pub(crate) fn ready_body() -> f32 {
     static D: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
     *D.get_or_init(|| {
@@ -92,6 +93,7 @@ pub(crate) const STANCE_FIGHT: u8 = 2;
 /// distances are the same from either side. The pose byte carries the
 /// stance's ramp in its low four bits and the turn of his shoulders in its
 /// high four (`turn_level`).
+#[inline]
 pub(crate) fn pose_level(pose: u8) -> usize {
     RAMP_LEVELS[(pose & POSE_STANCE) as usize] as usize
 }
@@ -109,6 +111,7 @@ pub(crate) fn turn_level(pose: u8) -> usize {
     RAMP_LEVELS[(pose >> POSE_TURN_SHIFT) as usize] as usize
 }
 /// His width level (`widths`): his pose level and his turn level together.
+#[inline]
 pub(crate) fn width_level(pose: u8) -> usize {
     pose_level(pose) + 4 * turn_level(pose)
 }
@@ -129,6 +132,7 @@ pub(crate) struct Width {
 /// brake band toward a man's at ease, a third at each level.
 pub(crate) const WIDTH_LEVELS: usize = 16;
 pub(crate) const SQUEEZE_DEPTH: f32 = 0.5;
+#[inline]
 pub(crate) fn widths() -> &'static [Width; WIDTH_LEVELS] {
     static W: std::sync::OnceLock<[Width; WIDTH_LEVELS]> = std::sync::OnceLock::new();
     W.get_or_init(|| widths_of(body_ease(), ready_body(), crate::unit_types::unit_scale()))
@@ -180,6 +184,7 @@ pub(crate) struct PairWidth {
     pub inv_sep: f32,
     pub hard: f32,
 }
+#[inline]
 pub(crate) fn pair_widths() -> &'static [[PairWidth; WIDTH_LEVELS]; WIDTH_LEVELS] {
     static T: std::sync::OnceLock<[[PairWidth; WIDTH_LEVELS]; WIDTH_LEVELS]> = std::sync::OnceLock::new();
     T.get_or_init(|| std::array::from_fn(|a| std::array::from_fn(|b| pair_width_of(a, 1.0, b, 1.0))))
@@ -232,6 +237,7 @@ pub(crate) fn fall_share(death_t: u8) -> f32 {
 /// A pair of men by their kinds: the mass weight of the push on the
 /// first (2 m_o / (m_i + m_o)) and the other's share of a closing speed
 /// (m_o / (m_i + m_o)).
+#[inline]
 pub(crate) fn mass_pairs() -> &'static [[(f32, f32); crate::unit_types::NUM_KINDS]; crate::unit_types::NUM_KINDS] {
     static T: std::sync::OnceLock<[[(f32, f32); crate::unit_types::NUM_KINDS]; crate::unit_types::NUM_KINDS]> =
         std::sync::OnceLock::new();
@@ -255,6 +261,7 @@ pub(crate) fn mass_pairs() -> &'static [[(f32, f32); crate::unit_types::NUM_KIND
 /// The one thing that stands in for a stance is the bracing: in the
 /// setting apart a man braced against a push (`brace_pairs`) holds his
 /// ground, and the man who walks into him takes most of it.
+#[inline]
 pub(crate) fn friction_contact() -> bool {
     static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *S.get_or_init(|| !std::env::var("FL_CONTACT").is_ok_and(|v| v == "share"))
@@ -347,6 +354,7 @@ fn brace_table(brace: f32, basic: f32) -> BraceTable {
 /// The friction contact's weights of the setting apart, by his kind, the
 /// other's kind, his brace level and the other's: a table read per
 /// overlapping neighbour instead of a division (`pair_widths`).
+#[inline]
 pub(super) fn brace_pairs() -> &'static BraceTable {
     static T: std::sync::OnceLock<BraceTable> = std::sync::OnceLock::new();
     T.get_or_init(|| brace_table(brace(), BRACE_BASIC))
@@ -381,6 +389,7 @@ pub(super) fn brace_level(
 /// Under the friction contact the crowd's brake reads the still men ahead
 /// of his wish (`crowd_still`), against a band half as wide. FL_BRAKE=density
 /// keeps the brake on every neighbour's closeness, as without it.
+#[inline]
 pub(super) fn still_brake() -> bool {
     static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *S.get_or_init(|| friction_contact() && !std::env::var("FL_BRAKE").is_ok_and(|v| v == "density"))

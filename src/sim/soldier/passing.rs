@@ -570,6 +570,7 @@ pub(crate) fn stuck_trying(v: u16) -> u16 {
     if squeezing(v) { 0 } else { (v & STUCK_TRY) >> STUCK_TRY_SHIFT }
 }
 /// Whether he is squeezing through a crack, and for how many ticks.
+#[inline]
 pub(crate) fn squeezing(v: u16) -> bool {
     v & STUCK_SQUEEZE != 0
 }
@@ -631,6 +632,7 @@ const OPEN_SLACK: f32 = 0.02;
 const OPEN_SIDE_KEEP: f32 = 0.2;
 const OPEN_MIN_AHEAD: f32 = 0.3;
 
+#[inline]
 pub(super) fn opening_on() -> bool {
     static O: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *O.get_or_init(|| crate::util::env_or("FL_OPENING", 1u32) != 0)
@@ -675,6 +677,7 @@ impl Row {
 /// across and along his way, its fit (0 none, 1 his depth, 2 his width),
 /// and the picked opening's air across his way with the far side of its
 /// passage along it (the farther of its two men's far sides).
+#[inline]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn openings(
     row: &Row,

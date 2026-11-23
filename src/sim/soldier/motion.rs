@@ -20,6 +20,7 @@ const SEP_PUSH_MAX: f32 = 2.5;
 /// a comrade in his way he stands, braced, with no wish, until a short
 /// step of room opens ahead (`drive`, `steer`). Without that brake he
 /// joins through `close_in`.
+#[inline]
 pub(super) fn joins_as_walker() -> bool {
     still_brake()
 }

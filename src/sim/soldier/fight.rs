@@ -67,6 +67,7 @@ fn join_patience_max() -> f32 {
 
 /// Sight radius for a man of a fighting regiment looking for an enemy
 /// to go to (FL_SEEK_R, meters). A play-testing knob.
+#[inline]
 pub(super) fn seek_radius() -> f32 {
     static R: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
     *R.get_or_init(|| crate::util::env_or("FL_SEEK_R", 15.0))
@@ -78,6 +79,7 @@ pub(super) fn seek_radius() -> f32 {
 /// target's men only. A play-testing knob: M2TW's seek radius is not
 /// known (devlog 0120). At the combat jog a man covers 4 m in 1.4 s, a
 /// quarter second of which is his next look and a second a full turn.
+#[inline]
 pub(super) fn threat_radius() -> f32 {
     static R: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
     *R.get_or_init(|| crate::util::env_or("FL_THREAT_R", 4.0))
@@ -202,8 +204,7 @@ pub(super) fn decide_to_join(f: &Field, s: &mut Soldier, st: &mut Step) {
     let memo_d2 = st.foe.memo_d2;
     let best_idx = st.foe.best_idx;
     let mut desired = st.desired;
-    let committed = st.fight.committed;
-    let mut committed = committed;
+    let mut committed = st.fight.committed;
     // Out of formation with his regiment's melee over, or never begun: he
     // comes back to his slot once he sees no enemy, nobody in reach and no
     // remembered enemy within his closing range (close_in). While his
