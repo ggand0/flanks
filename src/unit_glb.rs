@@ -533,7 +533,7 @@ const WAIST_SHARE: f32 = 0.58;
 /// of the file's last level in the box's height band, least squares on the
 /// logs of the three areas, the silhouettes rasterized at 4 mm. The file's
 /// silhouette counts every triangle up to the top of the head but the
-/// archer's bow, string and arrows. Fitted once to the shipped models: the
+/// archer's bow, string and arrows. Fitted once to the game's models: the
 /// arms make the bodies wider than the trunk the boxes are measured from,
 /// and the brimmed hats make the heads of the man-at-arms and the spearman
 /// narrower than their brims.

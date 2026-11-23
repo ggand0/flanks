@@ -3995,9 +3995,9 @@ fn integrate(f: &Field, s: &mut Soldier, st: &mut Step) {
     );
     // The friction contact: his kept speed is the move he made, and what
     // the setting apart, the field's edge and the step off blocked ground
-    // did to it beyond his legs' speed is added to the total his feet take back. His legs' speed is
-    // the one `slide` left, after an edge he could not pass stopped it, so
-    // a rail's stop is not a push his feet take back.
+    // did to it beyond his legs' speed is added to the total his feet take
+    // back. His legs' speed is the one `slide` left, after an edge he could
+    // not pass stopped it, so a rail's stop is not a push his feet take back.
     if friction_contact() && dt > 0.0 {
         let p = pos_prev[s.i];
         let kept = (next - Vec2::new(p.x, p.z)) / dt;

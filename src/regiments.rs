@@ -2430,7 +2430,8 @@ mod tests {
     }
 
     /// Line Debug lays every rank of both armies with no gap: neighbours'
-    /// outer files one file pitch apart, every man on the field.
+    /// outer files the mean of their file pitches apart, every man on the
+    /// field.
     #[test]
     fn line_debug_ranks_have_no_gaps() {
         let setups = [
