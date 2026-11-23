@@ -28,7 +28,7 @@ pub const BASE_SPACING: f32 = 1.4;
 /// A kind's slot pitch in normal order: how far apart its men stand.
 /// FL_GAP=k,m,s,a sets it per kind in metres (knights, men-at-arms,
 /// spearmen, bowmen). Never under the separation rest distance at ease
-/// (sim/soldier.rs `sep_ease`): the physics pushes closer slots apart.
+/// (sim/soldier/body.rs `sep_ease`): the physics pushes closer slots apart.
 pub fn gap(kind: u8) -> f32 {
     static GAPS: std::sync::OnceLock<[f32; crate::unit_types::NUM_KINDS]> =
         std::sync::OnceLock::new();
@@ -150,7 +150,7 @@ impl OpenOrder {
 
 impl FormSpacing {
     /// (lateral, depth) slot pitch of a kind in meters. Wall matches the
-    /// tightened separation rest distance (sim/soldier.rs WALL_SEP_RADIUS):
+    /// tightened separation rest distance (sim/soldier/contact.rs WALL_SEP_RADIUS):
     /// slots the physics refuses to hold are lies.
     pub fn pitch(self, kind: u8) -> Vec2 {
         match self {
@@ -163,7 +163,7 @@ impl FormSpacing {
 }
 
 /// The slot pitch of a regiment on a lane (the wall's walk). In normal
-/// order it is the rest distance of two men at ease (sim/soldier.rs
+/// order it is the rest distance of two men at ease (sim/soldier/body.rs
 /// `sep_ease`), the closest two standing men keep without pushing each
 /// other, so the walk holds a rank more than at the field's pitch; the
 /// other spacings keep their own.

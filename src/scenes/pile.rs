@@ -28,10 +28,10 @@ impl PileSetup {
     pub const SIX: Self =
         Self { attackers: 6, attacker_files: 0, victim_files: 0, victim_at_ease: false };
     /// A 100-file line at ease hit by one 12-file block: the M2TW test
-    /// of a deep unit hitting a wide one, which wraps it (devlog 0123).
+    /// of a deep unit hitting a wide one, which wraps it.
     pub const WIDE: Self =
         Self { attackers: 1, attacker_files: 12, victim_files: 100, victim_at_ease: true };
-    /// Two regiments engage one at once (devlog 0123).
+    /// Two regiments engage one at once.
     pub const TWO: Self =
         Self { attackers: 2, attacker_files: 0, victim_files: 0, victim_at_ease: false };
 }

@@ -77,7 +77,7 @@ pub(super) fn seek_radius() -> f32 {
 /// regiment fights one ordered target (sim/job.rs `focus`), before he
 /// turns to fight him (FL_THREAT_R, meters). Beyond it he goes after the
 /// target's men only. A play-testing knob: M2TW's seek radius is not
-/// known (devlog 0120). At the combat jog a man covers 4 m in 1.4 s, a
+/// known. At the combat jog a man covers 4 m in 1.4 s, a
 /// quarter second of which is his next look and a second a full turn.
 #[inline]
 pub(super) fn threat_radius() -> f32 {
@@ -573,7 +573,7 @@ fn start_a_swing(f: &Field, s: &mut Soldier, st: &Step, out: &mut ChunkOut) {
     let chosen = if sticky { prev_target } else { best_idx };
     // No eyes in the back of his head: a man only opens on a
     // target in his forward half-plane. Being struck tells him
-    // where to turn (the flash facing below), but it does NOT let
+    // where to turn (the flash facing in `face`), but it does NOT let
     // him swing backward over his shoulder — he attacks once he
     // has turned far enough, at the human turn-speed cap. Without
     // this gate every rear-approached victim counter-wound-up on

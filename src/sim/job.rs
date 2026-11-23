@@ -29,7 +29,7 @@ pub(crate) struct ShootAt {
     /// aim picks one of its living soldiers.
     pub(crate) t: usize,
     /// The men shoot the clear men of the regiment's `search_blocks`
-    /// (sim/mod.rs `clear_members`, sim/soldier.rs `pick_quarry`): the
+    /// (sim/mod.rs `clear_members`, sim/soldier/fight.rs `pick_quarry`): the
     /// target is in melee, or coming for the regiment.
     pub(crate) search: bool,
 }
@@ -62,7 +62,7 @@ impl Default for ArcherScan {
 }
 
 /// Why an archer regiment's men take their knives out this tick
-/// (sim/soldier.rs SIGHT_KNIFE). Empty for every other regiment.
+/// (sim/soldier/mod.rs SIGHT_KNIFE). Empty for every other regiment.
 #[derive(Clone, Default)]
 pub(crate) struct Sidearm {
     /// Its swords-out order: every man's knife is out.
@@ -71,7 +71,7 @@ pub(crate) struct Sidearm {
     /// quiver takes his knife out.
     pub(crate) foe_in_range: bool,
     /// The enemy blocks whose edges may come within a man's knife
-    /// distance of him (soldier.rs KNIFE_EDGE): each man measures his
+    /// distance of him (soldier/contact.rs KNIFE_EDGE): each man measures his
     /// own distance to them.
     pub(crate) blocks: Vec<crate::formation::BlockRect>,
 }
@@ -158,7 +158,7 @@ pub struct TickJob {
     /// (`GroupData::passing`), the choice of opening's reason to run.
     pub(crate) passing: Vec<bool>,
     /// Per regiment: the stance its men are drawn in, which sets their
-    /// width (sim/soldier.rs STANCE_*).
+    /// width (sim/soldier/body.rs STANCE_*).
     pub(crate) stance: Vec<u8>,
     pub(crate) focus: Vec<Option<u32>>,
     pub(crate) engaged: Vec<bool>,
@@ -205,7 +205,7 @@ pub struct TickJob {
     /// only; prep's own, between looks).
     pub(crate) archer_scans: Vec<ArcherScan>,
     /// The clear men of every regiment under search, per regiment, in
-    /// index order: no enemy in their reach (sim/soldier.rs SIGHT_FOE,
+    /// index order: no enemy in their reach (sim/soldier/mod.rs SIGHT_FOE,
     /// as of the last tick) and farther than a shaft's reach from every
     /// block in `clear_blocks`. Prep reads the last run's lists for the
     /// card.
@@ -769,7 +769,7 @@ pub(crate) fn ready_stance(g: &GroupData) -> bool {
     crate::render_units::stance_tier(g) > 0.0 || crate::render_units::wall_signal(g) > 0.0
 }
 
-/// The stance a regiment's men are drawn in (sim/soldier.rs STANCE_*):
+/// The stance a regiment's men are drawn in (sim/soldier/body.rs STANCE_*):
 /// fighting or in a wall, in the ready stance whatever they do; with an
 /// enemy near, attacking or charging, in it while they stand; else at
 /// ease.
@@ -1834,7 +1834,7 @@ fn snapshot_regiments(job: &mut TickJob, groups: &Groups, terrain: &Terrain) {
     let group_broken: Vec<bool> = groups.list.iter().map(|g| g.state.is_broken()).collect();
     let anchors: Vec<Vec2> = groups.list.iter().map(|g| g.anchor).collect();
     // Regiments under a Move order: the order takes them out of any fight
-    // (M2TW's WITHDRAW, devlog 0120). Their men walk where they were sent,
+    // (M2TW's WITHDRAW). Their men walk where they were sent,
     // pushing through what blocks them and striking only whoever stands in
     // front of them; they close on no enemy and go after none they see. A
     // regiment breaking off for a new attack target does the same on its

@@ -37,23 +37,23 @@ pub const META_DYING: u32 = 1 << 3;
 /// otherwise push back out to normal spacing).
 pub const META_WALL: u32 = 1 << 4;
 /// How far the unit is into his ready stance, a 2-bit FIELD (0 at ease
-/// to 3 ready, sim/soldier.rs `pose_level`): read it with `meta_pose`.
+/// to 3 ready, sim/soldier/body.rs `pose_level`): read it with `meta_pose`.
 pub const META_POSE_SHIFT: u32 = 5;
 pub const META_POSE: u32 = 0b11 << META_POSE_SHIFT;
 /// How far the unit has turned his shoulders to squeeze through a crack,
-/// a 2-bit FIELD (0 square to 3 turned, sim/soldier.rs `turn_level`), right
+/// a 2-bit FIELD (0 square to 3 turned, sim/soldier/body.rs `turn_level`), right
 /// above the pose so the two read together as his width level
 /// (`meta_width`).
 pub const META_TURN_SHIFT: u32 = 7;
 pub const META_TURN: u32 = 0b11 << META_TURN_SHIFT;
 /// He stood last tick: his own wish to move was under the speed of a step
-/// (sim/soldier.rs `steer`, the `stood` column). Under the friction contact
+/// (sim/soldier/steer.rs `steer`, the `stood` column). Under the friction contact
 /// a standing soldier is braced against any body (`brace_pairs`).
 pub const META_STOOD: u32 = 1 << 9;
 /// How far a dying soldier is through his fall, a 5-bit FIELD: his death
 /// clock (`death_t`, sim/damage.rs DEATH_TICKS down to 2 while the grid
 /// sees him), 0 for the living. Under the friction contact his body goes
-/// down with it (sim/soldier.rs `fall_share`). Read it with `meta_fall`.
+/// down with it (sim/soldier/body.rs `fall_share`). Read it with `meta_fall`.
 pub const META_FALL_SHIFT: u32 = 10;
 pub const META_FALL: u32 = 0b1_1111 << META_FALL_SHIFT;
 const _: () = assert!((crate::sim::damage::DEATH_TICKS as u32) < 32);
@@ -74,7 +74,7 @@ pub fn meta_pose(meta: u32) -> usize {
 }
 
 /// His width level, the pose and the turn of his shoulders together
-/// (sim/soldier.rs `widths`: pose level + 4 x turn level).
+/// (sim/soldier/body.rs `widths`: pose level + 4 x turn level).
 #[inline]
 pub fn meta_width(meta: u32) -> usize {
     ((meta & (META_POSE | META_TURN)) >> META_POSE_SHIFT) as usize
@@ -476,7 +476,7 @@ impl SpatialGrid {
         self.sorted_vel[r]
     }
 
-    /// The scan's cut over its walk (sim/soldier.rs `scan`): the walk
+    /// The scan's cut over its walk (sim/soldier/contact.rs `scan`): the walk
     /// visits the units of the cells `for_each_candidate` reads for
     /// `center` and `radius`, in the same order, and the rank of every
     /// man it visits who is not `cut.me` and is within his team's cut (not

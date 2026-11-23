@@ -58,7 +58,7 @@ pub mod missile {
     /// M2TW quirk: accuracy does not improve up close).
     pub const SCATTER_SIGMA: f32 = 3.0;
     /// The aim's spread: a shaft lands within this of its aim point in
-    /// each axis (two draws summed, sim/soldier.rs). With the shaft's
+    /// each axis (two draws summed, sim/soldier/fight.rs). With the shaft's
     /// fall through the strike band it gives the distance a target man
     /// must keep from the shooter's friends to be clear (`SIGHT_CLEAR`).
     pub const AIM_SPREAD: f32 = SCATTER_SIGMA * 1.75;

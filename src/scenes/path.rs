@@ -893,7 +893,7 @@ fn dump_men(
 /// sim/job.rs `resolve_orders` hands it to the soldiers' kernel: none for
 /// a regiment standing to shoot or holding a contact frame, else the
 /// route's frame for its goal; the anchor where there is none
-/// (sim/soldier.rs).
+/// (sim/soldier/).
 fn sim_frame(groups: &Groups, routes: &crate::sim::route::Routes, g: usize) -> Vec2 {
     let gd = &groups.list[g];
     let order = if gd.standoff || gd.skirmish_hold.is_some() || gd.contact {

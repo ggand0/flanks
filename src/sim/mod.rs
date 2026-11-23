@@ -2,7 +2,7 @@
 //! columns, never entities. Each tick is a self-contained job (job.rs):
 //! the main thread shares the world's columns into it and kicks it, a
 //! dedicated worker thread rebuilds the collision grid and runs every
-//! soldier through his stages (soldier.rs) in parallel chunks, and the
+//! soldier through his stages (soldier/) in parallel chunks, and the
 //! next fixed tick takes the result, installs its columns and applies
 //! the landed swings in order (damage.rs). Behavior lives in the soldier
 //! stages; this file is the plumbing between the frame and the job.
@@ -297,10 +297,9 @@ pub fn refresh_shared_terrain(terrain: Res<Terrain>, mut shared: ResMut<SharedTe
 /// Run one kinematic tick on the job's data: the regiment runs and the
 /// member lists of the regiments under fire, the grid rebuild, the
 /// density field, then the parallel integrate. No ECS access, so it can
-/// run on any thread. The kernel (`integrate_chunks`) is the long-standing
-/// integrate loop, verbatim: only the binding preamble changed when the
-/// tick became a job. Every scope in here, the grid rebuild's and the
-/// field's included, goes through `util::sim_scope`.
+/// run on any thread. The kernel is `integrate_chunks`. Every scope in
+/// here, the grid rebuild's and the field's included, goes through
+/// `util::sim_scope`.
 fn run_tick_job(job: &mut TickJob) {
     let terrain_arc = job.terrain.clone().expect("terrain snapshot set at prep");
     let terrain: &Terrain = &terrain_arc;
@@ -427,10 +426,10 @@ fn rebuild_beside_products(job: &mut TickJob) -> Instant {
                 }
             }
             // And of every regiment under search, its clear men: no enemy in
-            // his reach (soldier.rs SIGHT_FOE, as of the last tick) and farther
+            // his reach (soldier/mod.rs SIGHT_FOE, as of the last tick) and farther
             // than a shaft's reach from every block of the shooters' side that
             // stands near his (job.rs `clear_blocks`). Ascending, so a kept pick
-            // is found by a binary search (soldier.rs `quarry_ok`).
+            // is found by a binary search (soldier/fight.rs `quarry_ok`).
             let clear_r = job::clear_reach();
             clear_members.resize_with(n_groups, Vec::new);
             for (g, members) in clear_members.iter_mut().enumerate() {

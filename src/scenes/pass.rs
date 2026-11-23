@@ -178,11 +178,6 @@ pub(crate) fn spawn_routpass_test(units: &mut Units, terrain: &Terrain, groups: 
     );
 }
 
-/// FL_TEST_ROUTPASS bookkeeping every 2 s: A's shape while the passer
-/// walks through it, the overlap floor, the passers inside A's
-/// rectangle (its frame about its anchor), and A's men off their file
-/// line (the mean lateral distance to their slots). Watched every
-/// frame: the time from the first passer in to the last out.
 /// FL_PASS_LINE=1: in the normal battle, at 10 s, every player regiment
 /// standing behind its army's median line gets a Move order 120 m toward
 /// the enemy, through the regiments in front of it: the second line
@@ -224,6 +219,11 @@ pub(super) fn pass_line_script(
     info!("[pass-line] {n} rear regiments ordered 120 m through the line in front");
 }
 
+/// FL_TEST_ROUTPASS bookkeeping every 2 s: A's shape while the passer
+/// walks through it, the overlap floor, the passers inside A's
+/// rectangle (its frame about its anchor), and A's men off their file
+/// line (the mean lateral distance to their slots). Watched every
+/// frame: the time from the first passer in to the last out.
 pub(super) fn routpass_test_log(
     units: Res<Units>,
     mut groups: ResMut<crate::orders::Groups>,

@@ -23,8 +23,8 @@ pub(super) struct Shake {
 
 /// A man wanders when he covers WANDER_PATH metres over WANDER_WINDOWS
 /// shake windows and ends within WANDER_NET metres of where he began: the
-/// man who goes to an enemy and back to his slot, over and over (devlog
-/// 0212), whom the turn count misses because he turns about once a second.
+/// man who goes to an enemy and back to his slot, over and over, whom the
+/// turn count misses because he turns about once a second.
 const WANDER_WINDOWS: u32 = 2;
 const WANDER_PATH: f32 = 4.0;
 const WANDER_NET: f32 = 1.5;
@@ -92,7 +92,7 @@ pub(super) fn shake_log(
     let (mut alive, mut hard, mut turns_sum, mut step_sum) = (0u32, 0u32, 0u32, 0.0f32);
     let (mut by_state, mut by_touch) = ([0u32; 3], [0u32; 3]);
     let (mut out_form, mut near_enemy, mut thin) = (0u32, 0u32, 0u32);
-    // Men trying a side right now (sim/soldier.rs `try_a_side`).
+    // Men trying a side right now (sim/soldier/passing.rs `try_a_side`).
     let mut trying = 0u32;
     let mut shakers: Vec<(u8, usize, f32, u32)> = Vec::new();
     for i in 0..n {

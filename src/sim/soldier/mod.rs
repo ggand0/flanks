@@ -483,7 +483,7 @@ fn begin(f: &Field, s: &mut Soldier) -> Step {
     // rout and death bring him back. Fighting takes him out of formation.
     // Keyed on the regiment's melee instead, a man whose regiment had no
     // fight on its clock, with an enemy standing off his flank, went to
-    // him and was pulled back to his slot, over and over (devlog 0212).
+    // him and was pulled back to his slot, over and over.
     let in_melee = fight_point[gi].is_some() && !routed && !dying;
     let may_leave = !routed && !dying && !hold[gi] && !moving[gi];
     if !may_leave {

@@ -25,7 +25,7 @@ fn pile_stays() -> bool {
 /// far look (enemies in sight, comrades running to the fight) keeps the
 /// acquisition's own 1-in-8 rhythm.
 pub(super) const LOOK_TICKS: u32 = 8;
-/// Ring aims set this tick, for the straggler log (regiments.rs).
+/// Ring aims set this tick, for the straggler log (scenes/logs.rs).
 pub(crate) static RING_AIMS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// The ring read (`choose_opening`): how far round him a hemmed man reads
@@ -84,7 +84,6 @@ pub(super) fn choose_opening(f: &Field, s: &mut Soldier, st: &mut Step) {
     // turns his shoulders for it. Only for a man with such a crack in his
     // aim, so a second look at the comrades within the scan's box.
     let taken = fit == 1 && crack_taken(f, i, st, p, wd);
-    // The wide look: nothing near fits and he saw somebody in his way.
     // The ring (FL_OPEN_RING): a man of a holding regiment far from his
     // place with nobody ahead fitting him reads the men all round him within RING_SEE on his look
     // tick, the crack between each two neighbours round the ring, and aims

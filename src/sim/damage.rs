@@ -67,7 +67,7 @@ pub const COUNTER_WINDUP: f32 = 1.0;
 /// When the counter starts, ticks into the parry clip, by kind: from
 /// the first value on, and at the second for sure. Between them the man
 /// has `COUNTER_PER_TICK` per point of defence skill each tick to
-/// launch it (sim/soldier.rs), so the counters of a skilled man come
+/// launch it (sim/soldier/fight.rs), so the counters of a skilled man come
 /// early and spread, a poor man's mostly at the latest. The sword kinds
 /// go from the tick after the blade stops the blow to 0.37 s, through
 /// the deflect at 0.20 s. The spearman's parry is shield-led, so his
@@ -352,7 +352,7 @@ pub struct ApplyContext<'a> {
     pub terrain: &'a Terrain,
     /// The tick's length (s): under the friction contact a charge blow's
     /// shove is the speed a soldier stops from in his own ticks
-    /// (sim/soldier.rs `shove_speed`).
+    /// (sim/soldier/steer.rs `shove_speed`).
     pub dt: f32,
 }
 
@@ -858,7 +858,7 @@ impl Apply<'_, '_> {
                     // his speed, and into what the contacts put into
                     // it, so his feet and legs take it back over about
                     // a third of a second, like any push, and the men
-                    // behind him catch him (sim/soldier.rs
+                    // behind him catch him (sim/soldier/steer.rs
                     // `held_total`, `shove_speed`). A shove on his
                     // position in one tick would throw a reeling man
                     // again at a second blow.

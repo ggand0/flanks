@@ -156,7 +156,7 @@ pub struct GroupData {
     /// Ticks this regiment has been in a real melee (engaged, with at
     /// least the count gate's share of its men fighting once); 0 when
     /// not. Men out of sight of an enemy join the fight after their own
-    /// delay counted from here (sim/soldier.rs).
+    /// delay counted from here (sim/soldier/).
     pub melee_ticks: u32,
     /// Where the enemy unit this regiment fights stands: its ordered
     /// target if alive and unbroken, else the nearest unbroken enemy
@@ -167,7 +167,7 @@ pub struct GroupData {
     /// soldiers' `form_face`): set while the regiment's melee runs, moved a
     /// tenth of the way to the live mean each tick, kept when nobody fights
     /// for a tick, NaN otherwise. Under the friction contact a joiner behind
-    /// it walks straight ahead up to it (sim/soldier.rs `join_goal`).
+    /// it walks straight ahead up to it (sim/soldier/motion.rs `join_goal`).
     pub fight_line: f32,
     /// In the charge phase: attack order, inside charge range of the
     /// target, not yet in contact, and running at it (frontline.rs).
@@ -199,7 +199,7 @@ pub struct GroupData {
     pub retarget: bool,
     /// An enemy regiment's centroid is within combat-watch range: units
     /// of this regiment scan wider for adjacent enemies (sparse-fight
-    /// acquisition, sim/soldier.rs) and brace when standing.
+    /// acquisition, sim/soldier/fight.rs) and brace when standing.
     pub enemy_near: bool,
     /// Normalized direction to the nearest enemy regiment (ZERO when
     /// none in watch range): standing units face it (brace facing).
@@ -401,7 +401,7 @@ impl GroupData {
 /// target crosses it (`Groups::front_on_outline`), so it stands behind the
 /// friend instead of walking into the friend's ranks toward the target's
 /// centre. On by default under the friction contact and off without it
-/// (sim/soldier.rs `friction_contact`); FL_ATTACK_FRONT=3 turns it on and
+/// (sim/soldier/body.rs `friction_contact`); FL_ATTACK_FRONT=3 turns it on and
 /// any other value turns it off under either contact. Off, every attacker
 /// goes for the target's centre.
 pub(crate) fn attack_front() -> bool {
@@ -441,7 +441,7 @@ impl Groups {
                     // in and the whole regiment piles up on what stops it.
                     // Its places come back to the outline when the charge is
                     // over, and under the friction contact its soldiers do
-                    // not step back to them (sim/soldier.rs `hold_the_frame`).
+                    // not step back to them (sim/soldier/passing.rs `hold_the_frame`).
                     _ if attack_front() => {
                         if gd.charging || gd.crashing {
                             Some(td.centroid)

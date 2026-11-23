@@ -547,7 +547,7 @@ impl Spear {
     /// The farthest a foe can be and still count for anything in the scan.
     #[inline]
     fn foe_cut(&self, params: &crate::unit_types::UnitTypeParams) -> f32 {
-        // The farthest a foe can be and still count for anything below: the
+        // The farthest a foe can be and still count for anything in the scan: the
         // widest pair's spring rest, his weapon's reach, or at charge speed a
         // braced spear's point. A friend counts only within SEP_RADIUS.
         let spear_cut = if self.at_charge_speed {

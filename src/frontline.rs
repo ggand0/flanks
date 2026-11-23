@@ -1,6 +1,6 @@
 //! Frontline VISUALIZATION. The "front line" is not a mechanic: it is a
 //! readout of where the two masses physically collide. Units never steer by
-//! it — movement is orders + collision (sim/soldier.rs).
+//! it — movement is orders + collision (sim/soldier/).
 //!
 //! Per fixed tick, on a coarse 8 m grid: splat + blur per-team density,
 //! then marching-squares the phi = 0 contour of phi = blue − orange,
@@ -892,10 +892,10 @@ fn melee_clock(g: usize, group: &mut crate::orders::GroupData, tk: &GroupsTick, 
     // men striking at an enemy ahead, as it stands at contact. Then
     // the frame stays put for the whole fight, as an M2TW formation
     // does: a file with no enemy in front of it holds its slots, and
-    // men who see an enemy go to him themselves (sim/soldier.rs).
+    // men who see an enemy go to him themselves (sim/soldier/).
     // Built from the regiment's own slot geometry, so any width,
     // depth and spacing works.
-    // Melee clock and fight point (sim/soldier.rs joins the men out of
+    // Melee clock and fight point (sim/soldier/fight.rs joins the men out of
     // sight of an enemy to the fight after their own delay). The
     // clock starts at the count gate, so a stray poke does not pull
     // a whole regiment in; M2TW engages a unit when enough enemy
@@ -914,7 +914,7 @@ fn melee_clock(g: usize, group: &mut crate::orders::GroupData, tk: &GroupsTick, 
         group.melee_ticks = group.melee_ticks.saturating_add(1);
     } else {
         // The melee is over: its men come back into formation as each
-        // loses sight of the enemy (sim/soldier.rs decide_to_join). A
+        // loses sight of the enemy (sim/soldier/fight.rs decide_to_join). A
         // regiment with no attack order re-forms where it stands,
         // M2TW's discrete reforming state; an attacker's order lays its
         // slots again.
@@ -933,7 +933,7 @@ fn melee_clock(g: usize, group: &mut crate::orders::GroupData, tk: &GroupsTick, 
         info!("regiment {g} ends its break-off (FL_RETARGET_FOCUS=0)");
     }
     // No fight point without a fight: a Move order takes the regiment
-    // out (M2TW's WITHDRAW, devlog 0120), so its men leave the melee
+    // out (M2TW's WITHDRAW), so its men leave the melee
     // and walk where they were sent.
     // An ordered target stays the fight while it has men, routing
     // too: the regiment pursues it, as its march does (orders.rs
@@ -990,7 +990,7 @@ fn contact_frame(g: usize, group: &mut crate::orders::GroupData, tk: &GroupsTick
     // not wait for a contact frame: a regiment met at ease before its
     // automatic attack order came has no order and so no frame, and
     // under the friction contact its men behind the front walk straight
-    // ahead to this line all the same (sim/soldier.rs `join_goal`).
+    // ahead to this line all the same (sim/soldier/motion.rs `join_goal`).
     if engaged && group.melee_ticks > 0 {
         if line_n > 0 {
             let now = line_sum / line_n as f32;
@@ -1085,7 +1085,7 @@ fn charge_phase(g: usize, group: &mut crate::orders::GroupData, tk: &GroupsTick,
 }
 
 /// With the debug overlay on (F3): each selected regiment's fight point,
-/// where its men with nobody in reach go to join (sim/soldier.rs), as a
+/// where its men with nobody in reach go to join (sim/soldier/), as a
 /// ring on the ground joined to the regiment's centre. A regiment breaking
 /// off for a new target (orders.rs `retarget`) shows its line dashed
 /// toward that target instead, having no fight point.

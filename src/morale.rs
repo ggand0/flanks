@@ -129,7 +129,7 @@ const MORALE_FLANKED: f32 = -6.0;
 /// Minimum radius of the 8-probe flank ring around the centroid (ours).
 /// The live ring is the regiment's own footprint radius + FLANK_MARGIN:
 /// probes must sit OUTSIDE our own mass, or a big block swallows the
-/// ring and encirclement reads as nothing (rout-test regression, 0055).
+/// ring and encirclement reads as nothing (rout-test regression).
 const FLANK_RING_R: f32 = 22.0;
 const FLANK_MARGIN: f32 = 10.0;
 /// Enemy blurred density at a ring probe below which a sector can't be
@@ -222,7 +222,7 @@ pub fn band(gd: &crate::orders::GroupData) -> Band {
 /// Eager from this level up: the measured median of M2TW's `high` state,
 /// the way SHAKEN_AT and WAVER_AT sit at their states' medians. The
 /// engine's two states above it, impetuous and berserk, never occurred
-/// in the captures (devlog 0057), so they get no band.
+/// in the captures, so they get no band.
 const EAGER_AT: f32 = 12.0;
 
 /// The unit panel's morale word, in M2TW's words. battle.txt lists

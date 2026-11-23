@@ -76,7 +76,7 @@ pub struct Units {
     pub color: Column<[f32; 4]>,
     /// Combat memo (unit index; `u32::MAX` = none): the melee target
     /// while a swing is in flight, and the sparse-fight closing memo
-    /// otherwise (sim/soldier.rs wide acquisition). NEVER cleared, and
+    /// otherwise (sim/soldier/fight.rs wide acquisition). NEVER cleared, and
     /// death-sweep swap-removes reindex units, so it can point at an
     /// arbitrary unit later — every consumer MUST validate on use
     /// (swings re-check at hit time; the closing drive checks team and
@@ -84,7 +84,7 @@ pub struct Units {
     pub target: Column<u32>,
     /// The enemy soldier an archer has aimed at (unit index; `u32::MAX`
     /// = none): picked as his draw starts, shot at the loose, kept by
-    /// some men between shots (sim/soldier.rs `pick_quarry`). Reindexed
+    /// some men between shots (sim/soldier/fight.rs `pick_quarry`). Reindexed
     /// by the death sweep like `target`: validated on use.
     pub quarry: Column<u32>,
     /// Swing state: 0 = Ready, 1 = WindUp, 2 = Recover.
@@ -106,10 +106,10 @@ pub struct Units {
     /// Out of formation: he has left his slot to fight (M2TW keeps this
     /// per soldier, isInFormation). While his regiment is in melee he
     /// does not walk back to his slot; the flag clears when the melee
-    /// ends and the regiment re-forms (sim/soldier.rs).
+    /// ends and the regiment re-forms (sim/soldier/).
     pub out_form: Column<bool>,
     /// What he last saw of the comrades around him and of comrades
-    /// running to the fight (sim/soldier.rs SIGHT_* bits). A man looks
+    /// running to the fight (sim/soldier/mod.rs SIGHT_* bits). A man looks
     /// around every few ticks, not every tick, and acts on what he saw.
     pub sight: Column<u16>,
     /// The depth of the exchange he is answering (sim/damage.rs): 0 a
@@ -125,29 +125,29 @@ pub struct Units {
     /// How far he is into his ready stance, 0 at ease to POSE_READY (the
     /// low four bits), and how far he has turned his shoulders to squeeze
     /// through a crack, 0 square to POSE_READY (the high four bits;
-    /// sim/soldier.rs `pose_level`, `turn_level`): his body is wider in
+    /// sim/soldier/body.rs `pose_level`, `turn_level`): his body is wider in
     /// the stance and narrower turned.
     pub pose: Column<u8>,
-    /// Stuck on his way and trying a side (sim/soldier.rs `try_a_side`,
+    /// Stuck on his way and trying a side (sim/soldier/passing.rs `try_a_side`,
     /// the STUCK_* fields): the ticks he has wanted to walk and not moved
     /// while pressed from ahead, the ticks left of his try, how long he
     /// remembers the side he tried, and that side.
     pub stuck: Column<u16>,
-    /// The opening he saw on his last wide look and walks for (sim/soldier.rs
+    /// The opening he saw on his last wide look and walks for (sim/soldier/passing.rs
     /// `choose_opening`), a point on the ground; NaN when he has none. He
     /// looks wide only every few ticks and keeps what he found between.
     pub aim: Column<Vec2>,
-    /// Under the friction contact (sim/soldier.rs `friction_contact`,
+    /// Under the friction contact (sim/soldier/ `friction_contact`,
     /// `steer`, `integrate`): the speed the contacts have put into him
     /// that his feet have not yet taken back. Zero otherwise.
     pub imposed: Column<Vec2>,
-    /// Under the friction contact: he stood last tick (sim/soldier.rs
+    /// Under the friction contact: he stood last tick (sim/soldier/steer.rs
     /// `steer`): his own wish to move was under the speed of a step. On the
     /// walk to his place with nothing else to do (`on_his_way`), once he has
     /// set off, he stands again only after he has arrived there
     /// (`still_stands`); walking to the fight, once the soldiers ahead have
     /// stopped him. A standing soldier is braced against any body
-    /// (sim/soldier.rs `BRACE`), a walking one only against the other side
+    /// (sim/soldier/body.rs `BRACE`), a walking one only against the other side
     /// (`BRACE_BASIC`).
     pub stood: Column<bool>,
     /// Bumped every time a battle rebuilds this world. A sim tick job
