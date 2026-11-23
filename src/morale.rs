@@ -299,49 +299,8 @@ pub fn update_morale(
     deaths_ema.resize(n, 0.0);
     kills_ema.resize(n, 0.0);
 
-    // Leadership: every army is LED (a captain when no general). The
-    // command regiment is assigned once — the first heavy regiment
-    // (the captain rides with the armor), else the first alive.
-    for t in 0..2u8 {
-        if !groups.list.iter().any(|g| g.leader && g.team == t) {
-            let pick = groups
-                .list
-                .iter()
-                .position(|g| g.team == t && g.count > 0 && g.kind == crate::unit_types::KIND_HEAVY)
-                .or_else(|| groups.list.iter().position(|g| g.team == t && g.count > 0));
-            if let Some(i) = pick {
-                groups.list[i].leader = true;
-            }
-        }
-    }
-    // Army-wide leadership term per team: +2 while the command regiment
-    // stands; when it breaks, the death shock then the permanent loss.
-    // A rallied command regiment takes back up its standard.
-    let mut leader_term = [0.0f32; 2];
-    for t in 0..2usize {
-        let standing = groups
-            .list
-            .iter()
-            .any(|g| g.leader && g.team == t as u8 && g.count > 0 && !g.state.is_broken());
-        if standing {
-            if leader_lost[t] != 0 {
-                info!("team {t} commander returns to the field");
-            }
-            leader_lost[t] = 0;
-            leader_term[t] = LEADER_ALIVE;
-        } else if groups.list.iter().any(|g| g.leader && g.team == t as u8) {
-            if leader_lost[t] == 0 {
-                leader_lost[t] = *tick;
-                info!("team {t} LOSES ITS COMMANDER");
-            }
-            let since = (*tick - leader_lost[t]) as f32 * dt;
-            leader_term[t] = if since < LEADER_SHOCK_S {
-                LEADER_SHOCK
-            } else {
-                LEADER_LOST_PERM
-            };
-        }
-    }
+    assign_leaders(&mut groups);
+    let leader_term = leader_terms(&groups, &mut leader_lost, *tick, dt);
 
     // Snapshot broken/steady centroids for the neighbor terms (state
     // from last tick is fine — morale contagion is not latency-sensitive).
@@ -372,153 +331,12 @@ pub fn update_morale(
             continue;
         }
         let params = &TYPES[g.kind as usize];
-
-        // Smoothed melee exchange (deaths suffered vs kills made, per
-        // second): raw per-tick tallies are unreadable spikes.
-        let k = (dt / EXCHANGE_TAU).min(1.0);
-        deaths_ema[gi] += (g.recent_deaths as f32 / dt - deaths_ema[gi]) * k;
-        kills_ema[gi] += (g.recent_kills as f32 / dt - kills_ema[gi]) * k;
-        g.recent_deaths = 0;
-        g.recent_kills = 0;
-
-        // --- The modifier sum: identical for steady and routing
-        // regiments — the level IS the state of mind; the state machine
-        // below just reads it.
         let f = &mut readout.0[gi];
-        *f = MoraleFactors::default();
-        f.base = params.base_morale;
-
-        // Casualties: permanent for the battle, but a plateau, not a
-        // pump — when the killing stops, the penalty stops growing.
-        let lost = 1.0 - g.count as f32 / g.initial_count.max(1) as f32;
-        f.casualties = casualty_penalty(lost);
-
-        // Winning/losing the melee exchange.
-        let dr = deaths_ema[gi] / g.count as f32;
-        let kr = kills_ema[gi] / g.count as f32;
-        let total = dr + kr;
-        if total > 1e-6 {
-            let net = (kr - dr) / total;
-            let intensity = (total / EXCHANGE_FULL_RATE).min(1.0);
-            f.exchange = net
-                * intensity
-                * if net < 0.0 {
-                    -EXCHANGE_LOSING
-                } else {
-                    EXCHANGE_WINNING
-                };
-        }
-
-        // Outflanked. 8 probes on a ring around the centroid; a sector
-        // is hostile only where enemy mass DOMINATES own mass (see
-        // FLANK_DOMINANCE — absolute density alone made every line
-        // fight read as encircled). The largest hostile-free arc is the
-        // safe side: a full frontal contact (3 adjacent sectors) scores
-        // exactly 0, a pincer ~0.4, encirclement 1.
-        let ring_r = (g.radius + FLANK_MARGIN).max(FLANK_RING_R);
-        let mut hostile = [false; 8];
-        let mut any_hostile = false;
-        for (s, h) in hostile.iter_mut().enumerate() {
-            let a = s as f32 / 8.0 * std::f32::consts::TAU;
-            let p = g.centroid + Vec2::new(a.cos(), a.sin()) * ring_r;
-            let e = field.density(1 - g.team, p);
-            *h = e > FLANK_T && e > field.density(g.team, p) * FLANK_DOMINANCE;
-            any_hostile |= *h;
-        }
-        let mut safe_run = 0usize;
-        let mut run = 0usize;
-        for s in 0..16 {
-            if hostile[s % 8] {
-                run = 0;
-            } else {
-                run += 1;
-                safe_run = safe_run.max(run);
-            }
-        }
-        let safe_arc = safe_run.min(8) as f32 * 45.0;
-        let flanked01 = ((225.0 - safe_arc) / 225.0).clamp(0.0, 1.0);
+        exchange(g, f, &mut deaths_ema[gi], &mut kills_ema[gi], dt, params);
+        let (flanked01, any_hostile) = flank_ring(g, &field);
         f.flanked01 = flanked01;
-
-        // Locally outnumbered (blurred density ratio at the centroid):
-        // minor and hard to trigger — a clogged line is NOT panic.
-        let own = field.density(g.team, g.centroid);
-        let enemy = field.density(1 - g.team, g.centroid);
-        let outnumbered = enemy / (own + 0.1) > 3.0;
-
-        // Discipline damps the SHOCK terms (flanked, contagion,
-        // outnumbered) — the documented M2TW discipline semantic;
-        // casualties and exhaustion spare no one.
-        let disc = params.discipline;
-        f.flanked = MORALE_FLANKED * flanked01 * disc;
-        f.outnumbered = if outnumbered {
-            MORALE_OUTNUMBERED * disc
-        } else {
-            0.0
-        };
-
-        // Routing friendlies nearby shake resolve; routing ENEMIES in
-        // view lift it. Both use the documented class weighting and
-        // saturate at two weighted units — discipline decides how much
-        // each router COUNTS (rout_weight), so no extra multiplier here.
-        // One pass over the routers: [enemy, own] weighted sums.
-        let mut routers = [0.0f32; 2];
-        for (t, k, c) in broken_centroids {
-            if c.distance_squared(g.centroid) < NEIGHBOR_R2 {
-                routers[(*t == g.team) as usize] += rout_weight(g.kind, *k);
-            }
-        }
-        f.contagion = routers[1].min(CONTAGION_SAT) * CONTAGION_PER;
-        f.rout_enemies = routers[0].min(CONTAGION_SAT) * ROUT_ENEMY_PER;
-
-        // Steady friends nearby secure the flanks — full +4 with three
-        // of them and a quiet ring, eroded as the ring turns hostile.
-        let friends = steady_centroids
-            .iter()
-            .filter(|(i, t, c)| {
-                *i != gi && *t == g.team && c.distance_squared(g.centroid) < NEIGHBOR_R2
-            })
-            .count()
-            .min(3);
-        f.support = SUPPORT_MAX * friends as f32 / 3.0 * (1.0 - flanked01);
-
-        // Calm: no enemy anywhere near. This is also the rally pull —
-        // a regiment that outruns its pursuers finds its feet again.
-        if !any_hostile && !g.engaged && !g.enemy_near {
-            f.no_enemy = NO_ENEMY_BONUS;
-        }
-
-        // Fighting in disarray: the formation-shape term, engaged only —
-        // a scattered regiment dressing its ranks in peace is fine, the
-        // same scatter in melee is how formations die.
-        if g.engaged {
-            let disorder01 =
-                ((g.disorder - DISORDER_FREE) / (DISORDER_FULL - DISORDER_FREE)).clamp(0.0, 1.0);
-            f.disorder = MORALE_DISORDER * disorder01;
-        }
-
-        // Weary men waver (MTW1 fatigue table).
-        f.fatigue = crate::fatigue::morale_penalty(g.fatigue);
-
-        // Braced walls stand.
-        if crate::formation::wall_kind(g) != 0 {
-            f.wall = WALL_BONUS;
-        }
-
-        // The army's commander: present, freshly fallen, or lost. His
-        // own regiment stands on the measured +8 as well.
-        f.leader = leader_term[g.team as usize];
-        if g.leader && !g.state.is_broken() {
-            f.leader += LEADER_SELF;
-        }
-
-        // The rout lock: a broken regiment carries a heavy penalty that
-        // decays, so it keeps running until it has genuinely collected
-        // itself (measured -50 on break; the engine holds it flat).
-        if let RegState::Routing { since } = g.state {
-            let elapsed = (*tick - since) as f32 * dt;
-            let k = 1.0 - (elapsed / ROUT_LOCK_DECAY_S).clamp(0.0, 1.0);
-            f.rout_lock = ROUT_LOCK * k;
-        }
+        shock_terms(gi, g, f, &field, params, broken_centroids, steady_centroids);
+        calm_terms(g, f, any_hostile, leader_term[g.team as usize], *tick, dt);
 
         let eff = f.base
             + f.casualties
@@ -535,51 +353,297 @@ pub fn update_morale(
             + f.leader
             + f.rout_lock;
         g.morale = eff;
+        change_state(gi, g, eff, *tick, dt);
+    }
+}
 
-        match g.state {
-            RegState::Steady => {
-                if eff <= ROUT_AT && !g.steadfast {
-                    let held = g.break_ticks as f32 * dt;
-                    if held >= BREAK_HOLD_S {
-                        g.state = RegState::Routing { since: *tick };
-                        g.order = None;
-                        g.break_ticks = 0;
-                        info!(
-                            "regiment {gi} BREAKS at morale {eff:.1} ({} of {} left)",
-                            g.count, g.initial_count
-                        );
-                    } else {
-                        g.break_ticks = g.break_ticks.saturating_add(1);
-                    }
-                } else {
-                    g.break_ticks = 0;
-                }
+/// Leadership: every army is LED (a captain when no general). The
+/// command regiment is assigned once — the first heavy regiment (the
+/// captain rides with the armor), else the first alive.
+#[inline]
+fn assign_leaders(groups: &mut Groups) {
+    for t in 0..2u8 {
+        if !groups.list.iter().any(|g| g.leader && g.team == t) {
+            let pick = groups
+                .list
+                .iter()
+                .position(|g| g.team == t && g.count > 0 && g.kind == crate::unit_types::KIND_HEAVY)
+                .or_else(|| groups.list.iter().position(|g| g.team == t && g.count > 0));
+            if let Some(i) = pick {
+                groups.list[i].leader = true;
             }
-            RegState::Routing { since } => {
-                if (g.count as f32) < g.initial_count as f32 * SHATTER_FRAC {
-                    g.state = RegState::Shattered;
-                    info!("regiment {gi} shatters");
-                } else if (*tick - since) as f32 * dt > RALLY_DELAY && eff > RALLY_AT {
-                    // The situation genuinely improved: clear of enemies,
-                    // contagion faded, the level climbed back. Rally.
-                    g.state = RegState::Steady;
-                    g.anchor = g.centroid;
-                    // Re-dress the ranks where the rout ended, facing
-                    // back the way they fled from.
-                    g.facing = if g.team == 0 {
-                        0.0
-                    } else {
-                        std::f32::consts::PI
-                    };
-                    g.reform = true;
-                    info!(
-                        "regiment {gi} rallies at morale {eff:.1} ({} left)",
-                        g.count
-                    );
-                }
-            }
-            RegState::Shattered => {}
         }
+    }
+}
+
+/// Army-wide leadership term per team: +2 while the command regiment
+/// stands; when it breaks, the death shock then the permanent loss. A
+/// rallied command regiment takes back up its standard.
+#[inline]
+fn leader_terms(groups: &Groups, leader_lost: &mut [u32; 2], tick: u32, dt: f32) -> [f32; 2] {
+    let mut leader_term = [0.0f32; 2];
+    for t in 0..2usize {
+        let standing = groups
+            .list
+            .iter()
+            .any(|g| g.leader && g.team == t as u8 && g.count > 0 && !g.state.is_broken());
+        if standing {
+            if leader_lost[t] != 0 {
+                info!("team {t} commander returns to the field");
+            }
+            leader_lost[t] = 0;
+            leader_term[t] = LEADER_ALIVE;
+        } else if groups.list.iter().any(|g| g.leader && g.team == t as u8) {
+            if leader_lost[t] == 0 {
+                leader_lost[t] = tick;
+                info!("team {t} LOSES ITS COMMANDER");
+            }
+            let since = (tick - leader_lost[t]) as f32 * dt;
+            leader_term[t] = if since < LEADER_SHOCK_S {
+                LEADER_SHOCK
+            } else {
+                LEADER_LOST_PERM
+            };
+        }
+    }
+    leader_term
+}
+
+/// The smoothed melee exchange, the casualties and the base level: the
+/// first factors of a fresh sum.
+#[inline]
+fn exchange(
+    g: &mut crate::orders::GroupData,
+    f: &mut MoraleFactors,
+    deaths_ema: &mut f32,
+    kills_ema: &mut f32,
+    dt: f32,
+    params: &crate::unit_types::UnitTypeParams,
+) {
+    // Smoothed melee exchange (deaths suffered vs kills made, per
+    // second): raw per-tick tallies are unreadable spikes.
+    let k = (dt / EXCHANGE_TAU).min(1.0);
+    *deaths_ema += (g.recent_deaths as f32 / dt - *deaths_ema) * k;
+    *kills_ema += (g.recent_kills as f32 / dt - *kills_ema) * k;
+    g.recent_deaths = 0;
+    g.recent_kills = 0;
+
+    // --- The modifier sum: identical for steady and routing
+    // regiments — the level IS the state of mind; the state machine
+    // below just reads it.
+    *f = MoraleFactors::default();
+    f.base = params.base_morale;
+
+    // Casualties: permanent for the battle, but a plateau, not a
+    // pump — when the killing stops, the penalty stops growing.
+    let lost = 1.0 - g.count as f32 / g.initial_count.max(1) as f32;
+    f.casualties = casualty_penalty(lost);
+
+    // Winning/losing the melee exchange.
+    let dr = *deaths_ema / g.count as f32;
+    let kr = *kills_ema / g.count as f32;
+    let total = dr + kr;
+    if total > 1e-6 {
+        let net = (kr - dr) / total;
+        let intensity = (total / EXCHANGE_FULL_RATE).min(1.0);
+        f.exchange = net
+            * intensity
+            * if net < 0.0 {
+                -EXCHANGE_LOSING
+            } else {
+                EXCHANGE_WINNING
+            };
+    }
+}
+
+/// The flank ring: the share of the ring that is hostile, 0 to 1, and
+/// whether any sector is.
+#[inline]
+fn flank_ring(g: &crate::orders::GroupData, field: &InfluenceField) -> (f32, bool) {
+    // Outflanked. 8 probes on a ring around the centroid; a sector
+    // is hostile only where enemy mass DOMINATES own mass (see
+    // FLANK_DOMINANCE — absolute density alone made every line
+    // fight read as encircled). The largest hostile-free arc is the
+    // safe side: a full frontal contact (3 adjacent sectors) scores
+    // exactly 0, a pincer ~0.4, encirclement 1.
+    let ring_r = (g.radius + FLANK_MARGIN).max(FLANK_RING_R);
+    let mut hostile = [false; 8];
+    let mut any_hostile = false;
+    for (s, h) in hostile.iter_mut().enumerate() {
+        let a = s as f32 / 8.0 * std::f32::consts::TAU;
+        let p = g.centroid + Vec2::new(a.cos(), a.sin()) * ring_r;
+        let e = field.density(1 - g.team, p);
+        *h = e > FLANK_T && e > field.density(g.team, p) * FLANK_DOMINANCE;
+        any_hostile |= *h;
+    }
+    let mut safe_run = 0usize;
+    let mut run = 0usize;
+    for s in 0..16 {
+        if hostile[s % 8] {
+            run = 0;
+        } else {
+            run += 1;
+            safe_run = safe_run.max(run);
+        }
+    }
+    let safe_arc = safe_run.min(8) as f32 * 45.0;
+    let flanked01 = ((225.0 - safe_arc) / 225.0).clamp(0.0, 1.0);
+    (flanked01, any_hostile)
+}
+
+/// The shock terms (outnumbered, flanked, routers in view) and the
+/// support of steady friends.
+#[inline]
+fn shock_terms(
+    gi: usize,
+    g: &crate::orders::GroupData,
+    f: &mut MoraleFactors,
+    field: &InfluenceField,
+    params: &crate::unit_types::UnitTypeParams,
+    broken_centroids: &[(u8, u8, Vec2)],
+    steady_centroids: &[(usize, u8, Vec2)],
+) {
+    let flanked01 = f.flanked01;
+    // Locally outnumbered (blurred density ratio at the centroid):
+    // minor and hard to trigger — a clogged line is NOT panic.
+    let own = field.density(g.team, g.centroid);
+    let enemy = field.density(1 - g.team, g.centroid);
+    let outnumbered = enemy / (own + 0.1) > 3.0;
+
+    // Discipline damps the SHOCK terms (flanked, contagion,
+    // outnumbered) — the documented M2TW discipline semantic;
+    // casualties and exhaustion spare no one.
+    let disc = params.discipline;
+    f.flanked = MORALE_FLANKED * flanked01 * disc;
+    f.outnumbered = if outnumbered {
+        MORALE_OUTNUMBERED * disc
+    } else {
+        0.0
+    };
+
+    // Routing friendlies nearby shake resolve; routing ENEMIES in
+    // view lift it. Both use the documented class weighting and
+    // saturate at two weighted units — discipline decides how much
+    // each router COUNTS (rout_weight), so no extra multiplier here.
+    // One pass over the routers: [enemy, own] weighted sums.
+    let mut routers = [0.0f32; 2];
+    for (t, k, c) in broken_centroids {
+        if c.distance_squared(g.centroid) < NEIGHBOR_R2 {
+            routers[(*t == g.team) as usize] += rout_weight(g.kind, *k);
+        }
+    }
+    f.contagion = routers[1].min(CONTAGION_SAT) * CONTAGION_PER;
+    f.rout_enemies = routers[0].min(CONTAGION_SAT) * ROUT_ENEMY_PER;
+
+    // Steady friends nearby secure the flanks — full +4 with three
+    // of them and a quiet ring, eroded as the ring turns hostile.
+    let friends = steady_centroids
+        .iter()
+        .filter(|(i, t, c)| {
+            *i != gi && *t == g.team && c.distance_squared(g.centroid) < NEIGHBOR_R2
+        })
+        .count()
+        .min(3);
+    f.support = SUPPORT_MAX * friends as f32 / 3.0 * (1.0 - flanked01);
+}
+
+/// The calm, disorder, fatigue, wall, leadership and rout lock terms.
+#[inline]
+fn calm_terms(
+    g: &crate::orders::GroupData,
+    f: &mut MoraleFactors,
+    any_hostile: bool,
+    leader_term: f32,
+    tick: u32,
+    dt: f32,
+) {
+    // Calm: no enemy anywhere near. This is also the rally pull —
+    // a regiment that outruns its pursuers finds its feet again.
+    if !any_hostile && !g.engaged && !g.enemy_near {
+        f.no_enemy = NO_ENEMY_BONUS;
+    }
+
+    // Fighting in disarray: the formation-shape term, engaged only —
+    // a scattered regiment dressing its ranks in peace is fine, the
+    // same scatter in melee is how formations die.
+    if g.engaged {
+        let disorder01 =
+            ((g.disorder - DISORDER_FREE) / (DISORDER_FULL - DISORDER_FREE)).clamp(0.0, 1.0);
+        f.disorder = MORALE_DISORDER * disorder01;
+    }
+
+    // Weary men waver (MTW1 fatigue table).
+    f.fatigue = crate::fatigue::morale_penalty(g.fatigue);
+
+    // Braced walls stand.
+    if crate::formation::wall_kind(g) != 0 {
+        f.wall = WALL_BONUS;
+    }
+
+    // The army's commander: present, freshly fallen, or lost. His
+    // own regiment stands on the measured +8 as well.
+    f.leader = leader_term;
+    if g.leader && !g.state.is_broken() {
+        f.leader += LEADER_SELF;
+    }
+
+    // The rout lock: a broken regiment carries a heavy penalty that
+    // decays, so it keeps running until it has genuinely collected
+    // itself (measured -50 on break; the engine holds it flat).
+    if let RegState::Routing { since } = g.state {
+        let elapsed = (tick - since) as f32 * dt;
+        let k = 1.0 - (elapsed / ROUT_LOCK_DECAY_S).clamp(0.0, 1.0);
+        f.rout_lock = ROUT_LOCK * k;
+    }
+}
+
+/// The state machine on the level: a steady regiment breaks, a routing
+/// one shatters or rallies.
+#[inline]
+fn change_state(gi: usize, g: &mut crate::orders::GroupData, eff: f32, tick: u32, dt: f32) {
+    match g.state {
+        RegState::Steady => {
+            if eff <= ROUT_AT && !g.steadfast {
+                let held = g.break_ticks as f32 * dt;
+                if held >= BREAK_HOLD_S {
+                    g.state = RegState::Routing { since: tick };
+                    g.order = None;
+                    g.break_ticks = 0;
+                    info!(
+                        "regiment {gi} BREAKS at morale {eff:.1} ({} of {} left)",
+                        g.count, g.initial_count
+                    );
+                } else {
+                    g.break_ticks = g.break_ticks.saturating_add(1);
+                }
+            } else {
+                g.break_ticks = 0;
+            }
+        }
+        RegState::Routing { since } => {
+            if (g.count as f32) < g.initial_count as f32 * SHATTER_FRAC {
+                g.state = RegState::Shattered;
+                info!("regiment {gi} shatters");
+            } else if (tick - since) as f32 * dt > RALLY_DELAY && eff > RALLY_AT {
+                // The situation genuinely improved: clear of enemies,
+                // contagion faded, the level climbed back. Rally.
+                g.state = RegState::Steady;
+                g.anchor = g.centroid;
+                // Re-dress the ranks where the rout ended, facing
+                // back the way they fled from.
+                g.facing = if g.team == 0 {
+                    0.0
+                } else {
+                    std::f32::consts::PI
+                };
+                g.reform = true;
+                info!(
+                    "regiment {gi} rallies at morale {eff:.1} ({} left)",
+                    g.count
+                );
+            }
+        }
+        RegState::Shattered => {}
     }
 }
 
