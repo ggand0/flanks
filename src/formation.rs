@@ -445,6 +445,7 @@ pub fn blob_radius(n: usize) -> f32 {
 /// Returns the living member indices so callers (the deployment teleport)
 /// don't rescan the unit buffer for the set this already built.
 pub fn assign_slots(units: &mut Units, g: u32, gd: &mut GroupData) -> Vec<u32> {
+    gd.slots_dealt = gd.slots_dealt.wrapping_add(1);
     // (unit index, forward coord, lateral coord) relative to the anchor.
     let fwd = facing_dir(gd.facing);
     let right = Vec2::new(fwd.y, -fwd.x);
@@ -1126,6 +1127,7 @@ pub fn apply_formation_cmd(
 /// regiment that lost enough men since it last formed compacts its grid
 /// (only out of contact — nobody dresses ranks mid-melee).
 fn apply_reforms(mut units: ResMut<Units>, mut groups: ResMut<Groups>, mut tick: Local<u32>) {
+    let _tick_log = crate::frame_log::tick::time(crate::frame_log::tick::Part::Reforms);
     *tick = tick.wrapping_add(1);
     for g in 0..groups.list.len() {
         let gd = &mut groups.list[g];
@@ -1226,6 +1228,9 @@ fn fill_lane_slots(mut units: ResMut<Units>, mut groups: ResMut<Groups>, terrain
             _ => gd.anchor,
         };
         let Some(LaneFill::Pending(pending)) = &mut gd.lane_fill else { continue };
+        // Whether a place changed hands this tick: its slots are dealt
+        // again (`GroupData::slots_dealt`), as by `assign_slots`.
+        let mut dealt = false;
         let mut k = 0;
         while k < pending.len() {
             let i = pending[k] as usize;
@@ -1252,6 +1257,7 @@ fn fill_lane_slots(mut units: ResMut<Units>, mut groups: ResMut<Groups>, terrain
                 let (a, b) = (units.home[i], units.home[far]);
                 units.home[i] = b;
                 units.home[far] = a;
+                dealt = true;
             }
             pending.swap_remove(k);
         }
@@ -1274,7 +1280,11 @@ fn fill_lane_slots(mut units: ResMut<Units>, mut groups: ResMut<Groups>, terrain
                 let (ha, hb) = (units.home[a], units.home[b]);
                 units.home[a] = hb;
                 units.home[b] = ha;
+                dealt = true;
             }
+        }
+        if dealt {
+            gd.slots_dealt = gd.slots_dealt.wrapping_add(1);
         }
         if pending.is_empty() {
             info!("regiment {g}: its men have all taken their places on the lane");

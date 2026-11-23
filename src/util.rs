@@ -38,6 +38,68 @@ pub fn env_or<T: std::str::FromStr + Copy>(key: &str, default: T) -> T {
         .unwrap_or(default)
 }
 
+/// `FL_PERF`: sets of switches that trade picture detail for frame time,
+/// turned on with one variable. Each switch reads its own variable first;
+/// only where that is unset does the chosen set give its value, so
+/// `FL_PERF=2 FL_FLAT_LIGHT=23` is set 2 with set 1's flat light.
+///
+/// - `FL_PERF=1`: `FL_LOD_HIDDEN=1 FL_FALLEN_COARSE=1 FL_RECEIVE_LODS=1
+///   FL_FLAT_LIGHT=23`
+/// - `FL_PERF=2`: as 1 with `FL_FLAT_LIGHT=123` and the level thresholds
+///   at soldier heights of 61.2, 27.2 and 5.1 px for every kind,
+///   `FL_LOD_PX=61.2,27.2,5.1` (about 36, 16 and 3 px per metre for a
+///   1.7 m soldier)
+///
+/// Unset or 0: none.
+const PERF_SETS: [&[(&str, &str)]; 2] = [
+    &[
+        ("FL_LOD_HIDDEN", "1"),
+        ("FL_FALLEN_COARSE", "1"),
+        ("FL_RECEIVE_LODS", "1"),
+        ("FL_FLAT_LIGHT", "23"),
+    ],
+    &[
+        ("FL_LOD_HIDDEN", "1"),
+        ("FL_FALLEN_COARSE", "1"),
+        ("FL_RECEIVE_LODS", "1"),
+        ("FL_FLAT_LIGHT", "123"),
+        ("FL_LOD_PX", "61.2,27.2,5.1"),
+    ],
+];
+
+/// The `FL_PERF` set in force, logged the first time it is asked for.
+fn perf_set() -> &'static [(&'static str, &'static str)] {
+    static SET: OnceLock<&'static [(&'static str, &'static str)]> = OnceLock::new();
+    SET.get_or_init(|| {
+        let n = env_or("FL_PERF", 0_usize);
+        let Some(set) = n.checked_sub(1).and_then(|i| PERF_SETS.get(i)) else {
+            return &[];
+        };
+        let on: Vec<String> = set
+            .iter()
+            .map(|(key, value)| match std::env::var(key) {
+                Ok(own) => format!("{key}={own} (its own variable)"),
+                Err(_) => format!("{key}={value}"),
+            })
+            .collect();
+        bevy::log::info!("FL_PERF={n}: {}", on.join(" "));
+        set
+    })
+}
+
+/// A switch's variable, or else the value the `FL_PERF` set gives it.
+pub fn perf_str(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .or_else(|| perf_set().iter().find(|(k, _)| *k == key).map(|(_, v)| v.to_string()))
+}
+
+/// As `env_or`, for a switch that `FL_PERF` can set: its own variable,
+/// else the set's value, else `default`.
+pub fn perf_or<T: std::str::FromStr + Copy>(key: &str, default: T) -> T {
+    perf_str(key).and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
 thread_local! {
     static SIM_WORKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }

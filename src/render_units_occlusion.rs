@@ -79,6 +79,52 @@ pub fn bound_check() -> bool {
     check_level() > 0
 }
 
+/// `FL_LOD_HIDDEN`: a living soldier the test did not hide, whose body the
+/// men in front keep hidden, draws one level coarser than his held level
+/// (unit_build.wgsl `body_state`). His body box
+/// runs from just above his feet to `top` metres above them, `half` metres
+/// either side of him. Mode 0 off, 1 for the held level 2 only (the far men,
+/// of whom a helmet of a few pixels shows), 2 for level 1 too, 3 for level 0
+/// too. Hidden frames raise his count by one, up to twice `hold`, and
+/// showing frames take one off; he goes coarse when it reaches `hold` and
+/// back when it is at 0, so a frame of a gap does not flip him. A man
+/// whose body shows about half the time walks the count up and down; the
+/// hold of 96 frames brings the changes of mesh down to one per coarse
+/// man every 18 s or so in the 200k clash seen from the west flank (27 a frame
+/// against 238 at a hold of 12, for the same men drawn coarser and the
+/// same frame rate). One who comes into view is back within 192 frames.
+/// His held level and his shadow do not change. The rule reads the depth
+/// pyramid, which the probe (render_units_gpu.rs `OcclusionProbe`) builds
+/// every frame only while the vertex runs it and the occlusion test save
+/// pay for it; between the probes every man holds his count and his mesh,
+/// and a probe steps his count by the frames since the last one, so the
+/// rule moves in time whether or not the pyramid is built every frame.
+/// `FL_LOD_HIDDEN_TOP`, `FL_LOD_HIDDEN_HALF` and `FL_LOD_HIDDEN_HOLD` tune it.
+#[derive(Clone, Copy, Debug)]
+pub struct LodHidden {
+    pub mode: u32,
+    pub top: f32,
+    pub half: f32,
+    pub hold: u32,
+}
+
+/// Read once.
+pub fn lod_hidden() -> LodHidden {
+    static CFG: std::sync::OnceLock<LodHidden> = std::sync::OnceLock::new();
+    *CFG.get_or_init(|| {
+        let cfg = LodHidden {
+            mode: crate::util::perf_or("FL_LOD_HIDDEN", 0_u32).min(3),
+            top: crate::util::env_or("FL_LOD_HIDDEN_TOP", 1.0_f32).max(0.2),
+            half: crate::util::env_or("FL_LOD_HIDDEN_HALF", 0.15_f32).max(0.01),
+            hold: crate::util::env_or("FL_LOD_HIDDEN_HOLD", 96_u32).clamp(1, 255),
+        };
+        if cfg.mode != 0 {
+            info!("FL_LOD_HIDDEN: {cfg:?}");
+        }
+        cfg
+    })
+}
+
 /// The box the test projects, per kind, in the soldier's facing frame
 /// from his record position (half his height above his feet): forward,
 /// back, sideways either way, up, down, in metres. One for the standing,
@@ -93,30 +139,100 @@ pub struct Bound {
 }
 
 /// The farthest any drawn corner reached under `FL_OCCLUDE_CHECK`, plus
-/// 15 cm, rounded up to 5 cm. Measured 2026-10-13 over three battles in the
-/// low flank view: 40k for four minutes with the clips and again with
-/// `FL_CLIPS=0`, and 8k for five and a half minutes. The man-at-arms plays
-/// the knight's clips and takes the knight's box. The spearman's spear
-/// reaches 3 m ahead, and a fallen one's spear into the ground. The
-/// standing reach down passes the feet: a crouch lowers the whole figure.
+/// 15 cm, rounded up to 5 cm. Measured over three battles in the low flank
+/// view (40k for four minutes with the clips and again with `FL_CLIPS=0`,
+/// and 8k for five and a half minutes), and over the 200k clash for four
+/// minutes on the friction contact in the mid-air
+/// view from the west and in the low flank view on both contact paths, the
+/// charge test, and the archer sandbox with the archers in melee, with their
+/// swords out, and as the target. A box holds the farthest reach of all of
+/// them. The man-at-arms plays the knight's clips and takes the knight's
+/// box. The spearman's spear reaches 3 m ahead, 1.55 m to the side when a
+/// twitch turns him, and a fallen one's spear into the ground. The standing
+/// reach down passes the feet: a crouch lowers the whole figure. The second
+/// box of a kind also holds a body (`FL_SETTLED_BOX=0` tests one with it).
 pub const BOUNDS: [[Bound; 2]; NUM_KINDS] = {
     const KNIGHT: [Bound; 2] = [
-        Bound { fwd: 1.85, back: 2.0, side: 1.55, up: 1.85, down: 1.45 },
+        Bound { fwd: 2.0, back: 2.05, side: 1.55, up: 1.85, down: 1.45 },
         Bound { fwd: 2.05, back: 1.85, side: 2.25, up: 1.75, down: 2.2 },
     ];
     [
         KNIGHT,
         KNIGHT,
         [
-            Bound { fwd: 3.2, back: 1.6, side: 0.8, up: 2.25, down: 1.45 },
+            Bound { fwd: 3.2, back: 1.6, side: 1.7, up: 2.25, down: 1.5 },
             Bound { fwd: 3.25, back: 2.8, side: 2.95, up: 2.1, down: 3.5 },
         ],
         [
-            Bound { fwd: 1.65, back: 1.5, side: 0.8, up: 1.7, down: 1.45 },
-            Bound { fwd: 1.85, back: 1.8, side: 1.9, up: 1.65, down: 1.8 },
+            Bound { fwd: 1.65, back: 1.55, side: 1.0, up: 1.7, down: 1.45 },
+            Bound { fwd: 1.85, back: 1.8, side: 1.9, up: 1.7, down: 1.8 },
         ],
     ]
 };
+
+/// The box a settled body (a corpse record, his fall played out) is tested
+/// with, per kind and way he fell (`Flat`), measured as `BOUNDS` is: the
+/// farthest any drawn corner of a corpse record reached under
+/// `FL_OCCLUDE_CHECK`, plus 15 cm, rounded up to 5 cm. A body lies on the
+/// ground along the way he fell, so its box is flat and reaches out on one
+/// side only: under a packed crowd seen low it hides behind the standing
+/// men. Measured over the 200k clash for four minutes on the friction
+/// contact in the mid-air view from the west and in the low flank
+/// view on both contact paths, the charge test, and the archer sandbox with
+/// the archers in melee, with their swords out, and as the target. Down
+/// reaches up to 2.01 m below the record position, more than a body on
+/// flat ground needs; why was not looked into.
+pub const SETTLED: [[Flat; 4]; NUM_KINDS] = [
+    // knight: forward, back, side 2, side 3
+    [
+        Flat { fwd: 1.85, back: 0.2, right: 0.8, left: 0.65, up: 0.15, down: 2.15 },
+        Flat { fwd: 0.25, back: 1.85, right: 0.8, left: 0.65, up: 0.3, down: 1.4 },
+        Flat { fwd: 1.2, back: 0.3, right: 0.2, left: 1.85, up: 0.15, down: 1.6 },
+        Flat { fwd: 1.2, back: 0.3, right: 1.85, left: 0.2, up: 0.15, down: 1.7 },
+    ],
+    // man-at-arms: forward, back, side 2, side 3
+    [
+        Flat { fwd: 1.85, back: 0.2, right: 0.75, left: 0.65, up: 0.15, down: 2.2 },
+        Flat { fwd: 0.2, back: 1.8, right: 0.75, left: 0.65, up: 0.35, down: 1.35 },
+        Flat { fwd: 1.2, back: 0.35, right: 0.2, left: 1.85, up: 0.15, down: 1.55 },
+        Flat { fwd: 1.2, back: 0.35, right: 1.85, left: 0.2, up: 0.15, down: 1.65 },
+    ],
+    // spearman: forward, back, side 2, side 3
+    [
+        Flat { fwd: 2.95, back: 0.2, right: 0.75, left: 0.55, up: 0.15, down: 1.5 },
+        Flat { fwd: 0.2, back: 2.8, right: 0.75, left: 0.55, up: 0.15, down: 1.35 },
+        Flat { fwd: 0.55, back: 0.35, right: 0.2, left: 2.95, up: 0.15, down: 1.55 },
+        Flat { fwd: 0.5, back: 0.35, right: 2.85, left: 0.2, up: 0.15, down: 1.65 },
+    ],
+    // archer: forward, back, side 2, side 3
+    [
+        Flat { fwd: 1.85, back: 0.2, right: 0.55, left: 0.55, up: 0.15, down: 1.5 },
+        Flat { fwd: 0.25, back: 1.8, right: 0.55, left: 0.55, up: 0.15, down: 1.35 },
+        Flat { fwd: 0.4, back: 0.45, right: 0.2, left: 1.85, up: 0.15, down: 1.5 },
+        Flat { fwd: 0.4, back: 0.45, right: 1.9, left: 0.2, up: 0.15, down: 1.6 },
+    ],
+];
+
+/// A settled body's box in his facing frame, from his record position:
+/// forward, back, right (+x), left, up, down, in metres. The four of a kind
+/// are the ways he fell: forward, back, and to either side
+/// (unit_build.wgsl `fall_way`).
+#[derive(Clone, Copy, Debug)]
+pub struct Flat {
+    pub fwd: f32,
+    pub back: f32,
+    pub right: f32,
+    pub left: f32,
+    pub up: f32,
+    pub down: f32,
+}
+
+/// `FL_SETTLED_BOX=0`: a settled body is tested with the falling box
+/// instead, to set the two boxes side by side. Read once.
+pub fn settled_box() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::util::env_or("FL_SETTLED_BOX", 1_u32) != 0)
+}
 
 /// The most levels the pyramid keeps: level k's texel covers 2^(k+1)
 /// pixels, 4096 at the last.

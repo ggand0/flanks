@@ -184,6 +184,24 @@ struct Params {
     bound_fall: array<vec4<f32>, 4>,
     bound_down_live: vec4<f32>,
     bound_down_fall: vec4<f32>,
+    // FL_LOD_HIDDEN (render_units_occlusion.rs): x the mode (0 off, 1 the
+    // held level 2, 2 also level 1, 3 also level 0), y the hold
+    // (`body_state`), w the frames since the last frame with a pyramid, the
+    // step of each man's count. z bit 0 under FL_FALLEN_FAR (render_units.rs
+    // `fallen_far`): a body at level 2 draws at level 3; bits 1 and 2 the
+    // FL_FALLEN_COARSE mode (`fallen_coarse`): 1 a body past level 0 draws
+    // a level coarser, 2 every body.
+    lod_hidden: vec4<u32>,
+    // The body box: x its half-width, y its top above his feet, z its
+    // bottom above his feet, in metres.
+    body_box: vec4<f32>,
+    // Per kind, half the standing height: his feet lie that far below his
+    // record position.
+    half_height: vec4<f32>,
+    // The box of a settled body (a corpse record), two entries per kind
+    // and way he fell ((kind * 4 + fall) * 2): forward, back, right, left,
+    // then up and down (`fall_way`).
+    bound_settled: array<vec4<f32>, 32>,
 };
 
 struct DrawArgs {
@@ -205,15 +223,19 @@ struct DrawArgs {
 // and depth bin (`BIN_COUNTER`) the soldiers in it, which `finalize` turns
 // into the bin's first slot in the bucket's list, then the far levels'
 // pose slots per kind, then per bucket the soldiers the occlusion test hid
-// (`HIDDEN_COUNTER`).
-@group(0) @binding(6) var<storage, read_write> counts: array<atomic<u32>, 2121>;
+// (`HIDDEN_COUNTER`), then per bucket of his held level the soldiers drawn
+// a level coarser because his body was hidden (`COARSER_COUNTER`), then the
+// drawn soldiers the rule sent coarser or back this frame (`FLIP_COUNTER`).
+@group(0) @binding(6) var<storage, read_write> counts: array<atomic<u32>, 2138>;
 // 0..16 the camera's buckets, 16..32 the casters as in `counts`, 32 the
 // selection rings, 33..37 the pose pass's dispatch per kind (x, y, z).
 @group(0) @binding(7) var<storage, read_write> args: array<DrawArgs, 37>;
 // Copied back to the CPU by Bevy's readback plugin: the 32 counts, the
 // frame stamp and the soldier count, 1 if the occlusion test ran, one
-// spare, the 16 caster counts, the 16 hidden counts.
-@group(0) @binding(8) var<storage, read_write> readback: array<u32, 68>;
+// spare, the 16 caster counts, the 16 hidden counts, the 16 counts of the
+// soldiers drawn a level coarser per bucket of their held level, the
+// rule's flips.
+@group(0) @binding(8) var<storage, read_write> readback: array<u32, 85>;
 // Per pose slot, the record it poses, in one region per kind.
 @group(0) @binding(9) var<storage, read_write> pose_src: array<u32>;
 // Five words per list, 0..16 the camera's buckets and 16..32 the casters as
@@ -293,6 +315,19 @@ const BIN_COUNTER: u32 = 53u;
 const POSE_FAR_COUNTER: u32 = BIN_COUNTER + 16u * DEPTH_BINS;
 // Per bucket, the soldiers in the frustum the occlusion test hid.
 const HIDDEN_COUNTER: u32 = POSE_FAR_COUNTER + 4u;
+// Per bucket of his held level, the soldiers drawn a level coarser
+// (`body_state`).
+const COARSER_COUNTER: u32 = HIDDEN_COUNTER + 16u;
+// `Smooth::lod` holds the held level in its low byte and, under
+// FL_LOD_HIDDEN, his body count in the ten bits above it and his coarse
+// latch in the bit above those (`body_state`).
+const LOD_MASK: u32 = 0xffu;
+const BODY_SHIFT: u32 = 8u;
+const BODY_MASK: u32 = 0x3ffu;
+const BODY_COARSE: u32 = 0x400u;
+const COARSER_BIT: u32 = BODY_COARSE << BODY_SHIFT;
+// The soldiers whose drawn level the rule changed this frame, either way.
+const FLIP_COUNTER: u32 = COARSER_COUNTER + 16u;
 // Texels per axis the occlusion test reads at most: it reads the finest
 // level where the box spans this many.
 const OCCLUDE_SPAN: u32 = 8u;
@@ -343,13 +378,42 @@ fn culled(p: vec3<f32>) -> bool {
 // projected with last frame's camera, his nearest point behind the farthest
 // depth of every pixel the box covers. A box partly off last frame's
 // screen, or reaching past the camera's near plane, is never hidden.
-fn occluded(p: vec3<f32>, yaw: f32, kind: u32, fallen: bool) -> bool {
+// `state`: STANDING, FALLING (dying), or SETTLED plus the way a corpse
+// record fell (`fall_way`).
+fn occluded(p: vec3<f32>, yaw: f32, kind: u32, state: u32) -> bool {
+    if state >= SETTLED {
+        let k = (kind * 4u + state - SETTLED) * 2u;
+        let v = params.bound_settled[k + 1u];
+        return box_hidden(p, yaw, params.bound_settled[k], v.x, v.y);
+    }
     var b = params.bound_live[kind];
     var down = params.bound_down_live[kind];
-    if fallen {
+    if state == FALLING {
         b = params.bound_fall[kind];
         down = params.bound_down_fall[kind];
     }
+    return box_hidden(p, yaw, b.xyzz, b.w, down);
+}
+
+const STANDING: u32 = 0u;
+const FALLING: u32 = 1u;
+const SETTLED: u32 = 2u;
+
+// The way a man falls, from his seed, as unit_pose.wgsl `put_common` picks
+// it: 0 forward, 1 back, 2 and 3 to either side (2 the side its topple
+// angle turns negative toward). A corpse record keeps his seed.
+fn fall_way(seed: f32) -> u32 {
+    let dvar = fract(seed * 13.73);
+    if dvar < 0.62 {
+        return select(0u, 1u, dvar > 0.45);
+    }
+    return select(3u, 2u, dvar < 0.81);
+}
+
+// Whether a box around `p` in the frame of `yaw` was hidden last frame:
+// `b` its reach forward, back, right and left, then `up` and `down`, all
+// from `p`.
+fn box_hidden(p: vec3<f32>, yaw: f32, b: vec4<f32>, up: f32, down: f32) -> bool {
     // The world directions of his forward (+z) and his right (+x), as
     // unit_pose.wgsl `rot_y` turns them.
     let f = vec2<f32>(sin(yaw), cos(yaw));
@@ -359,8 +423,8 @@ fn occluded(p: vec3<f32>, yaw: f32, kind: u32, fallen: bool) -> bool {
     var near = 0.0;
     for (var k = 0u; k < 8u; k++) {
         let lz = select(-b.y, b.x, (k & 1u) != 0u);
-        let lx = select(-b.z, b.z, (k & 2u) != 0u);
-        let ly = select(-down, b.w, (k & 4u) != 0u);
+        let lx = select(-b.w, b.z, (k & 2u) != 0u);
+        let ly = select(-down, up, (k & 4u) != 0u);
         let w = p + vec3<f32>(r.x * lx + f.x * lz, ly, r.y * lx + f.y * lz);
         let c = params.occlude_clip * vec4<f32>(w, 1.0);
         // Reversed depth: z over w grows toward the camera and passes 1
@@ -412,13 +476,13 @@ fn occluded(p: vec3<f32>, yaw: f32, kind: u32, fallen: bool) -> bool {
 const DRAWN: u32 = 0u;
 const HIDDEN: u32 = 1u;
 const MARKED: u32 = 2u;
-fn occlusion(bucket: u32, p: vec3<f32>, yaw: f32, kind: u32, fallen: bool) -> u32 {
+fn occlusion(bucket: u32, p: vec3<f32>, yaw: f32, kind: u32, state: u32) -> u32 {
     // FL_OCCLUDE_CHECK=2 marks every soldier the test reads, to show the
     // mark works.
     if params.occlude.w == 2u && params.occlude.y != 0u {
         return MARKED;
     }
-    if params.occlude.y == 0u || !occluded(p, yaw, kind, fallen) {
+    if params.occlude.y == 0u || !occluded(p, yaw, kind, state) {
         return DRAWN;
     }
     atomicAdd(&counts[HIDDEN_COUNTER + bucket], 1u);
@@ -426,6 +490,53 @@ fn occlusion(bucket: u32, p: vec3<f32>, yaw: f32, kind: u32, fallen: bool) -> u3
         return HIDDEN;
     }
     return select(DRAWN, MARKED, params.occlude.w != 0u);
+}
+
+// FL_LOD_HIDDEN: a living soldier's body count and his coarse latch, from
+// `prev`, last frame's (the count in the low ten bits, the latch in
+// BODY_COARSE). His body box runs from just above his feet to the box's top,
+// a small square around him. A frame with it hidden adds the frames since
+// the last frame with a pyramid to the count, up to twice the hold; a frame
+// with it showing takes them off. The latch
+// closes when the count reaches the hold and opens when it is back at 0, so
+// a man whose body is hidden most of the time keeps his coarse mesh, and one
+// who comes into view is back at his held level within twice the hold. A
+// soldier the whole-man test hid has his body hidden too: every kind's
+// whole-man box holds the body box. Both clear on a camera cut, at a level
+// the mode leaves alone (mode 1 the held level 2 only, 2 also level 1, 3
+// also level 0), and while he dies. On a frame without last frame's pyramid
+// (between the probes of render_units_gpu.rs `OcclusionProbe`, the first
+// frame) both hold.
+fn body_state(prev: u32, lod: u32, p: vec3<f32>, yaw: f32, kind: u32, occl: u32, dying: bool) -> u32 {
+    if dying || lod >= NUM_LODS - 1u || lod + params.lod_hidden.x < NUM_LODS - 1u || params.occlude.z != 0u {
+        return 0u;
+    }
+    if params.occlude.y == 0u {
+        return prev & (BODY_MASK | BODY_COARSE);
+    }
+    var hidden = occl == HIDDEN;
+    if !hidden {
+        let bb = params.body_box;
+        let feet = params.half_height[kind];
+        hidden = box_hidden(p, yaw, vec4<f32>(bb.x), bb.y - feet, feet - bb.z);
+    }
+    // The step is the frames since the last frame with a pyramid: 1 while
+    // it is built every frame, a probe's gap between probes.
+    let hold = params.lod_hidden.y;
+    let step = max(params.lod_hidden.w, 1u);
+    var count = prev & BODY_MASK;
+    if hidden {
+        count = min(count + step, 2u * hold);
+    } else {
+        count -= min(count, step);
+    }
+    var coarse = prev & BODY_COARSE;
+    if count >= hold {
+        coarse = BODY_COARSE;
+    } else if count == 0u {
+        coarse = 0u;
+    }
+    return count | coarse;
 }
 
 // Gait cycles per second at this ground speed (gait.rs `rate`).
@@ -739,14 +850,37 @@ fn build_soldier(i: u32) {
     // keeps his held level for when he comes back, and casts by the plain
     // thresholds. One hidden behind nearer things keeps his level up to
     // date, so he comes back at it.
+    //
+    // FL_LOD_HIDDEN: a soldier whose body has been hidden behind the men in
+    // front for `lod_hidden.y` frames draws a level coarser (`draw_lod`).
+    // His held level, its hysteresis and his shadow stay as they are. Out
+    // of view his count clears.
     var lod = level(params.bands[kind * 3u + 2u], d2);
+    var draw_lod = lod;
     var occl = DRAWN;
     if in_view {
         let fine = level(params.bands[kind * 3u], d2);
         let coarse = level(params.bands[kind * 3u + 1u], d2);
-        sm.lod = clamp(sm.lod, fine, coarse);
-        lod = sm.lod;
-        occl = occlusion(kind * NUM_LODS + lod, position, yaw, kind, death_t > 0.0);
+        lod = clamp(sm.lod & LOD_MASK, fine, coarse);
+        draw_lod = lod;
+        occl = occlusion(kind * NUM_LODS + lod, position, yaw, kind, select(STANDING, FALLING, death_t > 0.0));
+        var body = 0u;
+        if params.lod_hidden.x != 0u {
+            body = body_state(sm.lod >> BODY_SHIFT, lod, position, yaw, kind, occl, death_t > 0.0);
+            if (body & BODY_COARSE) != 0u {
+                draw_lod = lod + 1u;
+            }
+            // A drawn soldier the rule sends coarser or back this frame. A
+            // change of his held level moves his mesh by the plain rule, and
+            // a latch it clears is not counted.
+            if occl != HIDDEN && lod == (sm.lod & LOD_MASK)
+                && ((body & BODY_COARSE) << BODY_SHIFT) != (sm.lod & COARSER_BIT) {
+                atomicAdd(&counts[FLIP_COUNTER], 1u);
+            }
+        }
+        sm.lod = lod | (body << BODY_SHIFT);
+    } else {
+        sm.lod &= LOD_MASK;
     }
     let visible = in_view && occl != HIDDEN;
     var casts = 0u;
@@ -818,9 +952,16 @@ fn build_soldier(i: u32) {
     if !visible && casts == 0u {
         return;
     }
-    let entry = list_entry(kind, i, lod);
+    // A caster's pose slot is posed for his held level, as his shadow
+    // needs; it holds his part pose at every level, so a coarser draw reads
+    // it as well. A soldier who casts nothing is posed for the level he
+    // draws at, which spares the skeleton of a near soldier drawn far.
+    let entry = list_entry(kind, i, select(draw_lod, lod, casts != 0u));
     if visible {
-        queue_draw(i, kind * NUM_LODS + lod, entry, lod, dot(d, d), occl == MARKED);
+        queue_draw(i, kind * NUM_LODS + draw_lod, entry, draw_lod, dot(d, d), occl == MARKED);
+        if draw_lod != lod {
+            atomicAdd(&counts[COARSER_COUNTER + kind * NUM_LODS + lod], 1u);
+        }
     }
     append_casters(casts, kind, entry);
 }
@@ -861,10 +1002,21 @@ fn build_corpse(j: u32, t: u32) {
     let d = position - params.cam_pos;
     let d2 = dot(d, d) * jitter * jitter;
     let lod = level(params.bands[kind * 3u + 2u], d2);
+    // FL_FALLEN_FAR: a far body draws at the last level. FL_FALLEN_COARSE:
+    // 1 a body past level 0 draws a level coarser, 2 every body, the last
+    // level at most. He casts by the level his distance gives him, `lod`.
+    var draw_lod = lod;
+    if (params.lod_hidden.z & 1u) != 0u && lod == NUM_LODS - 2u {
+        draw_lod = NUM_LODS - 1u;
+    }
+    let coarse = (params.lod_hidden.z >> 1u) & 3u;
+    if coarse == 2u || (coarse == 1u && lod > 0u) {
+        draw_lod = min(lod + 1u, NUM_LODS - 1u);
+    }
     let in_view = !culled(position);
     var occl = DRAWN;
     if in_view {
-        occl = occlusion(kind * NUM_LODS + lod, position, rec.anim.x, kind, true);
+        occl = occlusion(kind * NUM_LODS + draw_lod, position, rec.anim.x, kind, SETTLED + fall_way(rec.color.a));
     }
     let visible = in_view && occl != HIDDEN;
     var casts = 0u;
@@ -874,11 +1026,13 @@ fn build_corpse(j: u32, t: u32) {
     if !visible && casts == 0u {
         return;
     }
-    let entry = list_entry(kind, ridx, lod);
+    // A casting body is posed for his distance level, as his shadow needs
+    // (`build_soldier`).
+    let entry = list_entry(kind, ridx, select(draw_lod, lod, casts != 0u));
     if visible {
-        let bucket = kind * NUM_LODS + lod;
+        let bucket = kind * NUM_LODS + draw_lod;
         atomicAdd(&counts[16u + bucket], 1u);
-        queue_draw(t, bucket, entry, lod, dot(d, d), occl == MARKED);
+        queue_draw(t, bucket, entry, draw_lod, dot(d, d), occl == MARKED);
     }
     append_casters(casts, kind, entry);
 }
@@ -968,6 +1122,7 @@ fn finalize(@builtin(local_invocation_index) b: u32) {
     readback[b] = count;
     readback[16u + b] = fallen;
     readback[52u + b] = atomicLoad(&counts[HIDDEN_COUNTER + b]);
+    readback[68u + b] = atomicLoad(&counts[COARSER_COUNTER + b]);
     if b < 4u {
         let posed = atomicLoad(&counts[POSE_COUNTER + b]) + atomicLoad(&counts[POSE_FAR_COUNTER + b]);
         args[POSE_ARG + b] = DrawArgs((posed + 63u) / 64u, 1u, 1u, 0u);
@@ -977,6 +1132,7 @@ fn finalize(@builtin(local_invocation_index) b: u32) {
         readback[33u] = params.n;
         // Whether the occlusion test ran this frame.
         readback[34u] = select(0u, 1u, params.occlude.y != 0u);
+        readback[84u] = atomicLoad(&counts[FLIP_COUNTER]);
         // Six corners per ring (two triangles).
         args[RING_ARG] = DrawArgs(atomicLoad(&counts[RING_COUNTER]) * 6u, 1u, 0u, 0u);
     }

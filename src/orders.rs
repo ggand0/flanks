@@ -162,6 +162,13 @@ pub struct GroupData {
     /// target if alive and unbroken, else the nearest unbroken enemy
     /// regiment. None when not in melee or in hold (guard) mode.
     pub fight_point: Option<Vec2>,
+    /// Where its men fighting an enemy ahead stand along its forward
+    /// (frontline.rs; the axis is `formation::facing_dir(facing)`, the
+    /// soldiers' `form_face`): set while the regiment's melee runs, moved a
+    /// tenth of the way to the live mean each tick, kept when nobody fights
+    /// for a tick, NaN otherwise. Under the friction contact a joiner behind
+    /// it walks straight ahead up to it (sim/soldier.rs `join_goal`).
+    pub fight_line: f32,
     /// In the charge phase: attack order, inside charge range of the
     /// target, not yet in contact, and running at it (frontline.rs).
     /// Drives the charge pace, the sprint pose and the charge cries.
@@ -225,6 +232,12 @@ pub struct GroupData {
     /// apply pass): recent_kills vs recent_deaths is the winning/losing-
     /// melee morale factor.
     pub recent_kills: u32,
+    /// How many times this regiment's slots have been dealt, by
+    /// `formation::assign_slots` or by `formation::fill_lane_slots` when
+    /// men on a lane trade places, which is every write of its men's
+    /// `home` after the kick: the tick job's regiment sums (frontline.rs)
+    /// hold only while it is the count they were taken with.
+    pub slots_dealt: u32,
     // --- ranged (archer regiments only; dead flags for melee kinds) ---
     /// Fire-at-will (M2TW default ON): with no explicit target order,
     /// the regiment's bows engage the nearest enemy block in range.
@@ -336,6 +349,7 @@ impl GroupData {
             contact_lateral: 0.0,
             melee_ticks: 0,
             fight_point: None,
+            fight_line: f32::NAN,
             charging: false,
             crashing: false,
             crash_ticks: 0,
@@ -356,6 +370,7 @@ impl GroupData {
             state: RegState::Steady,
             recent_deaths: 0,
             recent_kills: 0,
+            slots_dealt: 0,
             fire_at_will: true,
             melee: false,
             skirmish: kind == crate::unit_types::KIND_ARCHER,
@@ -381,6 +396,22 @@ impl GroupData {
     }
 }
 
+/// The attack front: an attacker with a living friend between it and its
+/// target lays its front rank on the enemy's outline where the line to the
+/// target crosses it (`Groups::front_on_outline`), so it stands behind the
+/// friend instead of walking into the friend's ranks toward the target's
+/// centre. On by default under the friction contact and off without it
+/// (sim/soldier.rs `friction_contact`); FL_ATTACK_FRONT=3 turns it on and
+/// any other value turns it off under either contact. Off, every attacker
+/// goes for the target's centre.
+pub(crate) fn attack_front() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("FL_ATTACK_FRONT") {
+        Ok(v) => v == "3",
+        Err(_) => crate::sim::soldier::friction_contact(),
+    })
+}
+
 #[derive(Resource, Default)]
 pub struct Groups {
     pub list: Vec<GroupData>,
@@ -403,11 +434,123 @@ impl Groups {
                 }
                 match gd.fire_place {
                     Some(p) if gd.standoff_target == Some(t) => Some(p),
+                    // With a friend between, on the enemy's outline where
+                    // the line to the target crosses it. A regiment in its
+                    // charge or its crash goes for the target itself, as a
+                    // direct attack does, so every one of its soldiers runs
+                    // in and the whole regiment piles up on what stops it.
+                    // Its places come back to the outline when the charge is
+                    // over, and under the friction contact its soldiers do
+                    // not step back to them (sim/soldier.rs `hold_the_frame`).
+                    _ if attack_front() => {
+                        if gd.charging || gd.crashing {
+                            Some(td.centroid)
+                        } else {
+                            Some(self.front_on_outline(g, t as usize).map_or(td.centroid, |(goal, _)| goal))
+                        }
+                    }
                     _ => Some(td.centroid),
                 }
             }
         }
     }
+
+    /// The attack front: for regiment `g` attacking `t`, None when no
+    /// living friend stands between them (`outline_contact`), else (the
+    /// goal, the contact point).
+    pub(crate) fn front_on_outline(&self, g: usize, t: usize) -> Option<(Vec2, Vec2)> {
+        self.outline_contact(g, t)
+            .and_then(|(goal, point, friend)| friend.then_some((goal, point)))
+    }
+
+    /// The attack front: for regiment `g` attacking `t`, (the goal on the
+    /// outline, the contact point, whether a living friend stands between
+    /// them), whatever the friend test finds; None only when the two
+    /// centroids coincide. Only `front_on_outline` sends a regiment to this
+    /// goal, and only with a friend between; the F3 view draws it either
+    /// way. "Between": the friend's centroid lies in the corridor from
+    /// `g`'s centroid to `t`'s, ahead of `g`'s centroid and short of `t`'s,
+    /// no further to the side of the line than half `g`'s block width
+    /// across it (`sim::route::half_width`). The contact point is where the
+    /// line from `g`'s centroid to `t`'s centroid first crosses the outline
+    /// of the nearest enemy regiment on the way (`t`, or a living enemy
+    /// whose centroid lies in the same corridor; nearest = the smallest
+    /// distance along the line to its outline, `outline_entry`). The goal
+    /// is on the line, `g`'s own half depth (`formation::front_offset`)
+    /// short of the contact point, so `g`'s front rank stands on it.
+    pub(crate) fn outline_contact(&self, g: usize, t: usize) -> Option<(Vec2, Vec2, bool)> {
+        let gd = &self.list[g];
+        let td = &self.list[t];
+        let a = gd.centroid;
+        let len = (td.centroid - a).length();
+        if len < 1e-3 {
+            return None;
+        }
+        let d = (td.centroid - a) / len;
+        let across = Vec2::new(-d.y, d.x);
+        let half = crate::sim::route::half_width(gd, d);
+        let in_corridor = |c: Vec2| {
+            let s = (c - a).dot(d);
+            s > 0.0 && s < len && (c - a).dot(across).abs() < half
+        };
+        let friend = self
+            .list
+            .iter()
+            .enumerate()
+            .any(|(f, fd)| f != g && fd.team == gd.team && fd.count > 0 && in_corridor(fd.centroid));
+        let mut edge = outline_entry(td, a, d);
+        for (h, hd) in self.list.iter().enumerate() {
+            if h != t && hd.team != gd.team && hd.count > 0 && in_corridor(hd.centroid) {
+                edge = edge.min(outline_entry(hd, a, d));
+            }
+        }
+        Some((a + d * (edge - crate::formation::front_offset(gd)), a + d * edge, friend))
+    }
+}
+
+/// The attack front: how far along the line from `a` in the unit
+/// direction `d` it first meets regiment `hd`'s outline. The outline is
+/// the formation code's own block (`formation::block_rect`: about the
+/// centroid, turned to the facing, files and ranks at the spacing as the
+/// block stands, open order included; a blob or a block with no files a
+/// disc of its footprint radius) without its metre of margin, so its
+/// front edge is the front rank (`formation::front_offset`), its sides
+/// the flank files and its back the rear rank. A line that misses the
+/// outline (only for an enemy beside the line, never the target, which
+/// the line runs to) meets it where the outline's nearest corner stands
+/// along the line. Negative when `a` stands inside the outline.
+pub(crate) fn outline_entry(hd: &GroupData, a: Vec2, d: Vec2) -> f32 {
+    let r = crate::formation::block_rect(hd);
+    let p = a - r.centre;
+    if r.fwd == Vec2::ZERO {
+        let b = p.dot(d);
+        let disc = b * b - (p.length_squared() - r.half_w * r.half_w);
+        if disc >= 0.0 {
+            return -b - disc.sqrt();
+        }
+        return -b - r.half_w;
+    }
+    let half_w = (r.half_w - 1.0).max(0.0);
+    let half_d = (r.half_d - 1.0).max(0.0);
+    let right = Vec2::new(r.fwd.y, -r.fwd.x);
+    let (px, pz, dx, dz) = (p.dot(right), p.dot(r.fwd), d.dot(right), d.dot(r.fwd));
+    let mut lo = f32::NEG_INFINITY;
+    let mut hi = f32::INFINITY;
+    for (q, v, h) in [(px, dx, half_w), (pz, dz, half_d)] {
+        if v.abs() < 1e-6 {
+            if q.abs() > h {
+                lo = f32::INFINITY;
+            }
+            continue;
+        }
+        let (s1, s2) = ((-h - q) / v, (h - q) / v);
+        lo = lo.max(s1.min(s2));
+        hi = hi.min(s1.max(s2));
+    }
+    if lo <= hi && hi >= 0.0 {
+        return lo;
+    }
+    -p.dot(d) - (dx.abs() * half_w + dz.abs() * half_d)
 }
 
 /// One regiment's placement on a drawn order line.
@@ -622,7 +765,7 @@ pub fn order_regiments(groups: &mut Groups, selected: &[usize], target: Vec2) {
 /// march to the point on the wall itself.
 pub fn click_order(groups: &mut Groups, terrain: &Terrain, selected: &[usize], target: Vec2) -> bool {
     if lane_at(terrain, target).is_some() {
-        let layout = line_layout(groups, terrain, selected, target, target, Vec2::ZERO);
+        let layout = line_layout(groups, terrain, selected, target, target, Vec2::ZERO, false);
         if layout.is_empty() {
             return false;
         }
@@ -682,7 +825,9 @@ fn enemy_regiment_at(groups: &Groups, p: Vec2) -> Option<u32> {
 /// with the hand that draws). A zero hint (script callers with no
 /// camera) falls back to the enemy side of the line, then to facing
 /// away from where the selection stands. Regiments keep their
-/// left-to-right order along the line to minimize crossing.
+/// left-to-right order along the line to minimize crossing. With `tight`
+/// the blocks stand side by side with no gap between them, as one
+/// continuous line (the player holds Ctrl); a drag on a lane ignores it.
 fn line_layout(
     groups: &Groups,
     terrain: &Terrain,
@@ -690,6 +835,7 @@ fn line_layout(
     a: Vec2,
     b: Vec2,
     face_hint: Vec2,
+    tight: bool,
 ) -> Vec<LinePlacement> {
     let picked: Vec<usize> = selected
         .iter()
@@ -750,20 +896,51 @@ fn line_layout(
     segs.sort_unstable_by(|x, y| x.1.total_cmp(&y.1));
 
     let total: usize = picked.iter().map(|&g| groups.list[g].count).sum();
-    let mut placements = Vec::with_capacity(segs.len());
-    let mut off = 0.0;
-    for (g, _) in segs {
+    // Each regiment's files and the distance of its centre along the line
+    // from `a`.
+    let mut blocks: Vec<(usize, u32, f32)> = Vec::with_capacity(segs.len());
+    if tight {
+        // No gaps: each block is `files` pitches wide and starts where the
+        // one before it ends, so the outer files of two neighbours stand
+        // half of each one's pitch from their shared edge. The whole run
+        // is centred on the drag's midpoint.
+        let mut run = 0.0;
+        for &(g, _) in &segs {
+            let gd = &groups.list[g];
+            let share = len * gd.count as f32 / total as f32;
+            let pitch = gd.chosen_spacing().pitch(gd.kind);
+            let files = ((share / pitch.x).round() as u32).clamp(1, gd.count as u32);
+            let width = files as f32 * pitch.x;
+            blocks.push((g, files, run + width * 0.5));
+            run += width;
+        }
+        let shift = (len - run) * 0.5;
+        for block in &mut blocks {
+            block.2 += shift;
+        }
+    } else {
+        // Each block is centred in its share, LINE_REG_GAP and the
+        // rounding's leftover between it and the next.
+        let mut off = 0.0;
+        for &(g, _) in &segs {
+            let gd = &groups.list[g];
+            let share = len * gd.count as f32 / total as f32;
+            let pitch = gd.chosen_spacing().pitch(gd.kind);
+            let files = (((share - LINE_REG_GAP) / pitch.x).floor() as u32)
+                .clamp(1, gd.count as u32);
+            blocks.push((g, files, off + share * 0.5));
+            off += share;
+        }
+    }
+    let mut placements = Vec::with_capacity(blocks.len());
+    for (g, files, centre) in blocks {
         let gd = &groups.list[g];
-        let share = len * gd.count as f32 / total as f32;
         let pitch = gd.chosen_spacing().pitch(gd.kind);
-        let files = (((share - LINE_REG_GAP) / pitch.x).floor() as u32)
-            .clamp(1, gd.count as u32);
         let ranks = (gd.count as u32).div_ceil(files);
         // Front rank ON the drawn line; the block center sits behind it.
-        let line_pos = a + dir * (off + share * 0.5);
+        let line_pos = a + dir * centre;
         let anchor = line_pos - fwd * ((ranks - 1) as f32 * 0.5 * pitch.y);
         placements.push(LinePlacement { g, anchor, facing, files, lane: false });
-        off += share;
     }
     placements
 }
@@ -933,7 +1110,7 @@ fn apply_line_order(groups: &mut Groups, layout: Vec<LinePlacement>, a: Vec2, b:
 /// script uses this — one code path for the mouse and the test). No
 /// camera here: facing falls back to the enemy-side rule.
 pub fn line_order(groups: &mut Groups, terrain: &Terrain, selected: &[usize], a: Vec2, b: Vec2) {
-    let layout = line_layout(groups, terrain, selected, a, b, Vec2::ZERO);
+    let layout = line_layout(groups, terrain, selected, a, b, Vec2::ZERO, false);
     if !layout.is_empty() {
         apply_line_order(groups, layout, a, b);
     }
@@ -1097,6 +1274,7 @@ fn draw_deploy_zone(terrain: Res<Terrain>, mut gizmos: Gizmos) {
 #[allow(clippy::too_many_arguments)] // bevy system params
 fn issue_order(
     buttons: Res<ButtonInput<MouseButton>>,
+    keys: Res<ButtonInput<KeyCode>>,
     window: Query<&Window, With<PrimaryWindow>>,
     camera: Query<(&Camera, &GlobalTransform)>,
     terrain: Res<Terrain>,
@@ -1156,7 +1334,11 @@ fn issue_order(
             let right_g = Vec2::new(cam_right.x, cam_right.z).normalize_or_zero();
             let hand = (cur - start).dot(right_g);
             let face_hint = fwd_g * if hand >= 0.0 { 1.0 } else { -1.0 };
-            drag.layout = line_layout(&groups, &terrain, &selected, start, cur, face_hint);
+            // Ctrl held: the blocks stand with no gap between them. Read
+            // every frame, so the preview follows the key and the release
+            // applies the layout last shown.
+            let tight = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
+            drag.layout = line_layout(&groups, &terrain, &selected, start, cur, face_hint, tight);
             if deploy.active {
                 clamp_layout_to_zone(&groups, &mut drag.layout, &terrain, routes.grid());
             }
@@ -1357,6 +1539,7 @@ pub fn halt_selected(selection: &Selection, groups: &mut Groups, t: f32) {
 /// ends when the target regiment is wiped (hold in place there). Uses the
 /// centroid refreshed by the frontline pass each tick.
 pub fn clear_arrived_orders(mut groups: ResMut<Groups>) {
+    let _tick_log = crate::frame_log::tick::time(crate::frame_log::tick::Part::ClearOrders);
     let counts: Vec<usize> = groups.list.iter().map(|g| g.count).collect();
     for (g, group) in groups.list.iter_mut().enumerate() {
         match group.order {
@@ -1663,6 +1846,126 @@ mod tests {
         assert_eq!(gd.files, 40);
         let (a, b) = (run_of(&groups.list[0]), run_of(gd));
         assert!(b.0 >= lane.along.0 - 0.01 && b.1 + LINE_REG_GAP <= a.0 + 0.01, "the runs {b:?} and {a:?}");
+    }
+
+    /// A regiment in block order standing at `at`.
+    fn regiment(kind: u8, men: usize, at: Vec2, spacing: crate::formation::FormSpacing) -> GroupData {
+        let mut gd = GroupData::new(0, kind, at, men);
+        gd.shape = FormShape::Rect;
+        gd.files = crate::formation::default_files(men);
+        gd.centroid = at;
+        gd.spacing = spacing;
+        gd
+    }
+
+    /// A drag along x from -half to half on open ground, with the
+    /// regiments' places as (distance along the line from its start,
+    /// width of `files` pitches, files).
+    fn drag_x(groups: &Groups, half: f32, tight: bool) -> Vec<(f32, f32, u32)> {
+        let terrain = crate::terrain::build_terrain(crate::terrain::MapKind::Grassland);
+        let picked: Vec<usize> = (0..groups.list.len()).collect();
+        let (a, b) = (Vec2::new(-half, 0.0), Vec2::new(half, 0.0));
+        let layout = line_layout(groups, &terrain, &picked, a, b, Vec2::ZERO, tight);
+        assert_eq!(layout.len(), groups.list.len());
+        layout
+            .iter()
+            .map(|p| {
+                let gd = &groups.list[p.g];
+                let pitch = gd.chosen_spacing().pitch(gd.kind);
+                // The front rank stands on the drawn line.
+                let ranks = (gd.count as u32).div_ceil(p.files);
+                assert!((p.anchor.y.abs() - (ranks - 1) as f32 * 0.5 * pitch.y).abs() < 1e-3);
+                (p.anchor.x + half, p.files as f32 * pitch.x, p.files)
+            })
+            .collect()
+    }
+
+    /// Neighbouring blocks touch: their centres are half the sum of their
+    /// widths apart, and the run is centred on the drag's midpoint.
+    fn assert_tight(places: &[(f32, f32, u32)], len: f32) {
+        for w in places.windows(2) {
+            let (gap, need) = (w[1].0 - w[0].0, 0.5 * (w[0].1 + w[1].1));
+            assert!((gap - need).abs() < 1e-3, "centres {gap} apart, widths need {need}");
+        }
+        let first = places.first().unwrap();
+        let last = places.last().unwrap();
+        let mid = 0.5 * ((first.0 - 0.5 * first.1) + (last.0 + 0.5 * last.1));
+        assert!((mid - 0.5 * len).abs() < 1e-3, "the run's middle {mid} is off the drag's {}", 0.5 * len);
+    }
+
+    fn three_heavies() -> Groups {
+        let normal = crate::formation::FormSpacing::Normal;
+        Groups {
+            list: [-40.0, 0.0, 40.0]
+                .map(|x| regiment(crate::unit_types::KIND_HEAVY, 120, Vec2::new(x, -20.0), normal))
+                .into(),
+        }
+    }
+
+    /// Without Ctrl each regiment's block is centred in its share of the
+    /// drag, with LINE_REG_GAP taken off its files.
+    #[test]
+    fn a_line_without_ctrl_keeps_its_gaps() {
+        let groups = three_heavies();
+        let pitch = crate::formation::FormSpacing::Normal.pitch(crate::unit_types::KIND_HEAVY).x;
+        let files = ((40.0 - LINE_REG_GAP) / pitch).floor() as u32;
+        let places = drag_x(&groups, 60.0, false);
+        for (place, centre) in places.iter().zip([20.0, 60.0, 100.0]) {
+            assert_eq!(place.2, files);
+            assert!((place.0 - centre).abs() < 1e-4, "centre {} for {centre}", place.0);
+        }
+    }
+
+    #[test]
+    fn a_line_with_ctrl_has_no_gaps() {
+        let groups = three_heavies();
+        let places = drag_x(&groups, 60.0, true);
+        let pitch = crate::formation::FormSpacing::Normal.pitch(crate::unit_types::KIND_HEAVY).x;
+        for place in &places {
+            assert_eq!(place.2, (40.0 / pitch).round() as u32);
+        }
+        assert_tight(&places, 120.0);
+    }
+
+    /// Regiments of different pitches: each block is its own files times
+    /// its own pitch wide, and still none has a gap to the next.
+    #[test]
+    fn a_line_with_ctrl_has_no_gaps_across_pitches() {
+        use crate::formation::FormSpacing;
+        let groups = Groups {
+            list: vec![
+                regiment(crate::unit_types::KIND_HEAVY, 120, Vec2::new(-40.0, -20.0), FormSpacing::Normal),
+                regiment(crate::unit_types::KIND_HEAVY, 80, Vec2::new(0.0, -20.0), FormSpacing::Loose),
+                regiment(crate::unit_types::KIND_ARCHER, 100, Vec2::new(40.0, -20.0), FormSpacing::Normal),
+            ],
+        };
+        let pitch = |g: usize| groups.list[g].chosen_spacing().pitch(groups.list[g].kind).x;
+        assert!((pitch(0) - pitch(1)).abs() > 0.5, "the two spacings differ in pitch");
+        let places = drag_x(&groups, 75.0, true);
+        assert_tight(&places, 150.0);
+    }
+
+    /// A drag far shorter than the men need: one file each, side by side.
+    #[test]
+    fn a_short_line_with_ctrl_has_no_gaps() {
+        let groups = three_heavies();
+        let places = drag_x(&groups, 3.0, true);
+        assert!(places.iter().all(|p| p.2 >= 1));
+        assert_tight(&places, 6.0);
+    }
+
+    /// Ctrl changes nothing on the wall's walk.
+    #[test]
+    fn a_lane_drag_ignores_ctrl() {
+        let terrain = crate::terrain::build_terrain(crate::terrain::MapKind::WallDebug);
+        let behind = Vec2::new(0.0, crate::town_layout::WALL_Z - 50.0);
+        let groups = Groups { list: vec![archers(200, behind), archers(200, behind + Vec2::X)] };
+        let (a, b) = (Vec2::new(0.0, crate::town_layout::WALL_Z), Vec2::new(60.0, crate::town_layout::WALL_Z));
+        let key = |p: &LinePlacement| (p.g, p.anchor.to_array(), p.facing, p.files, p.lane);
+        let loose: Vec<_> = line_layout(&groups, &terrain, &[0, 1], a, b, Vec2::ZERO, false).iter().map(key).collect();
+        let tight: Vec<_> = line_layout(&groups, &terrain, &[0, 1], a, b, Vec2::ZERO, true).iter().map(key).collect();
+        assert!(!loose.is_empty() && loose.iter().all(|p| p.4), "the drag is a lane's");
+        assert_eq!(loose, tight);
     }
 
     /// Bowmen told to shoot from the walk keep their run: nobody else is

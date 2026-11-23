@@ -339,6 +339,7 @@ fn give_orders(
     mut test: ResMut<PathTest>,
     terrain: Res<Terrain>,
 ) {
+    let _tick_log = crate::frame_log::tick::time(crate::frame_log::tick::Part::PathOrders);
     // The second order of a regiment whose first has its verdict.
     if let Some((g, case, line)) = test.then
         && test.subjects.iter().any(|s| s.g == g && s.reported)
@@ -500,6 +501,7 @@ fn log_progress(
     mut test: ResMut<PathTest>,
     mut frames: ResMut<FrameWatch>,
 ) {
+    let _tick_log = crate::frame_log::tick::time(crate::frame_log::tick::Part::PathLog);
     if !test.ordered {
         return;
     }

@@ -663,6 +663,7 @@ const CONTROLS: [(&str, &[(&str, &str)]); 4] = [
         &[
             ("Right click", "Move, or attack"),
             ("Right drag", "Form a line"),
+            ("Ctrl + right drag", "Form a line with no gaps"),
             ("Backspace", "Halt"),
             ("F", "Shield or spear wall"),
             ("L", "Loose formation"),

@@ -39,6 +39,12 @@ use job::{prepare_tick, regiment_runs, TickJob, CHUNK};
 #[derive(Resource, Default)]
 pub struct RegimentRuns {
     pub runs: Vec<Vec<(u32, u32)>>,
+    /// The taken job's sums per regiment (frontline.rs `update_groups`),
+    /// the inputs it took them with, and whether they hold for this tick:
+    /// a job was taken and no write copied a column they read.
+    pub(crate) job_sums: Vec<crate::frontline::RegimentSums>,
+    pub(crate) job_inputs: crate::frontline::SumInputs,
+    pub(crate) job_sums_valid: bool,
 }
 
 impl RegimentRuns {
@@ -63,7 +69,7 @@ pub struct SimStats {
     pub step_ms: f32,
     /// Density splat + blur + contour (frontline.rs), per tick.
     pub field_ms: f32,
-    /// Last nn_audit sweep cost (runs every ~2 s).
+    /// Last neighbour audit's cost in the tick job (runs every 2 s).
     pub audit_ms: f32,
     /// Landed-swing events this tick (damage apply pass).
     pub events: usize,
@@ -143,7 +149,9 @@ impl Default for TickWorker {
             .spawn(move || {
                 crate::util::mark_sim_worker();
                 while let Ok(mut job) = jobs.recv() {
+                    let start = crate::frame_log::job_start();
                     run_tick_job(&mut job);
+                    crate::frame_log::job_end(start);
                     if results.send(job).is_err() {
                         return;
                     }
@@ -197,7 +205,12 @@ impl TickPipeline {
         );
         self.in_flight = false;
         let worker = self.worker.as_ref().expect("worker exists while a job is in flight");
-        Some(worker.from_worker.lock().unwrap().recv().expect("sim tick worker alive"))
+        let tick_log_wait = crate::frame_log::tick::time(crate::frame_log::tick::Part::TakeWait);
+        let start = crate::frame_log::take_start();
+        let job = worker.from_worker.lock().unwrap().recv().expect("sim tick worker alive");
+        crate::frame_log::take_end(start);
+        drop(tick_log_wait);
+        Some(job)
     }
 }
 
@@ -216,6 +229,7 @@ pub fn take_tick(
     field: Option<ResMut<InfluenceField>>,
     mut stats: ResMut<SimStats>,
 ) {
+    let _tick_log = crate::frame_log::tick::time(crate::frame_log::tick::Part::Take);
     // A job computed from an older world (a new battle started while it
     // ran) carries indices that mean nothing here: recycle its buffers
     // and drop the result.
@@ -230,11 +244,20 @@ pub fn take_tick(
     pipeline.field_from_job = false;
     match taken {
         Some(mut job) => {
+            // The job's regiment sums hold when it took them for every
+            // regiment and every column they read is still the buffer it
+            // read: a write while the job held a column copied it.
+            runs.job_sums_valid = job.sums_wanted
+                && job.sum_inputs.len() == groups.list.len()
+                && job.group_sums.len() == groups.list.len()
+                && job.shares_sum_columns(&units);
             // The run is over: let go of the shared columns now, so the
             // systems between here and the install (a regiment closing
             // ranks writes `home`) write in place instead of copying.
             job.release_inputs();
             std::mem::swap(&mut runs.runs, &mut job.reg_runs);
+            std::mem::swap(&mut runs.job_sums, &mut job.group_sums);
+            std::mem::swap(&mut runs.job_inputs, &mut job.sum_inputs);
             if let Some(mut field) = field {
                 std::mem::swap(&mut *field, &mut job.field);
                 pipeline.field_from_job = true;
@@ -244,6 +267,7 @@ pub fn take_tick(
         }
         None => {
             regiment_runs(&units.group, groups.list.len(), &mut runs.runs);
+            runs.job_sums_valid = false;
         }
     }
 }
@@ -264,6 +288,7 @@ fn pipeline_enabled() -> bool {
 pub struct SharedTerrain(pub Option<std::sync::Arc<Terrain>>);
 
 pub fn refresh_shared_terrain(terrain: Res<Terrain>, mut shared: ResMut<SharedTerrain>) {
+    let _tick_log = crate::frame_log::tick::time(crate::frame_log::tick::Part::Terrain);
     if terrain.is_changed() || shared.0.is_none() {
         shared.0 = Some(std::sync::Arc::new(terrain.clone()));
     }
@@ -277,23 +302,7 @@ pub fn refresh_shared_terrain(terrain: Res<Terrain>, mut shared: ResMut<SharedTe
 /// became a job. Every scope in here, the grid rebuild's and the field's
 /// included, goes through `util::sim_scope`.
 fn run_tick_job(job: &mut TickJob) {
-    if let Some(slot) = &job.pack {
-        let columns = crate::render_units_gpu::PackColumns {
-            pos: &job.pos_in,
-            pos_prev: &job.pos_prev_in,
-            yaw: &job.yaw_in,
-            yaw_prev: &job.yaw_prev_in,
-            kind: &job.kind,
-            swing: &job.swing_in,
-            swing_t: &job.swing_t_in,
-            flash: &job.flash_in,
-            group: &job.group,
-            death_t: &job.death_t_in,
-            sight: &job.sight_in,
-            color: &job.color_in,
-        };
-        slot.pack((job.generation, job.tick), &columns, job.hit_flash);
-    }
+    let (generation, hit_flash) = (job.generation, job.hit_flash);
     let terrain_arc = job.terrain.clone().expect("terrain snapshot set at prep");
     let terrain: &Terrain = &terrain_arc;
     let dt = job.dt;
@@ -325,6 +334,8 @@ fn run_tick_job(job: &mut TickJob) {
         pose_in,
         stuck_in,
         aim_in,
+        imposed_in,
+        stood_in,
         quarry_in,
         pos_out,
         vel,
@@ -343,6 +354,8 @@ fn run_tick_job(job: &mut TickJob) {
         pose,
         stuck,
         aim,
+        imposed,
+        stood,
         quarry,
         orders,
         anchors,
@@ -355,6 +368,7 @@ fn run_tick_job(job: &mut TickJob) {
         engaged,
         contact,
         fight_point,
+        fight_line,
         melee_ticks,
         hold,
         threat,
@@ -388,6 +402,13 @@ fn run_tick_job(job: &mut TickJob) {
         plans,
         routes,
         nav,
+        audit,
+        pack,
+        pos_prev_in,
+        color_in,
+        group_sums,
+        sum_inputs,
+        sums_wanted,
         ..
     } = job;
 
@@ -401,55 +422,128 @@ fn run_tick_job(job: &mut TickJob) {
     let death_t_in = &death_t_in[..];
     let n_groups = orders.len();
 
-    // The regiment runs, and from them the living members of every
-    // regiment under fire, in index order.
-    regiment_runs(group, n_groups, reg_runs);
-    target_members.resize_with(n_groups, Vec::new);
-    for (g, members) in target_members.iter_mut().enumerate() {
-        members.clear();
-        if targeted[g] {
-            for &(s, e) in &reg_runs[g] {
-                members.extend((s..e).filter(|&i| death_t_in[i as usize] == 0));
-            }
-        }
+    // The grid rebuild, and beside it, as tasks of the same pool that fill
+    // the gaps between the rebuild's passes: the render snapshot (first,
+    // the frame asks for it soonest), the regiment runs and members, and
+    // the density field. None reads what another writes, and the kernel
+    // below needs all four done. The rebuild and the field are timed on
+    // their own: each its own work from its start to its end, while the
+    // others run beside it.
+    let field_wanted = *field_wanted;
+    let (targeted, searched, clear_blocks) = (&targeted[..], &searched[..], &clear_blocks[..]);
+    let sight_snap = &sight_in[..];
+    let slot = pack.as_ref();
+    let (runs_out, target_out, clear_out, field_out) = (&mut *reg_runs, &mut *target_members, &mut *clear_members, &mut *field);
+    // Each regiment's sums for `update_groups` (frontline.rs), from the
+    // columns as kicked: as soon as the runs exist, a task per few
+    // regiments joins the pool's other work beside the rebuild.
+    let sum_cols = crate::frontline::SumColumns {
+        pos: pos_prev,
+        home,
+        death_t: death_t_in,
+        vel: &vel_in[..],
+        swing: &swing_in[..],
+        target: &target_in[..],
+        group,
+    };
+    let sum_inputs = &*sum_inputs;
+    // Prep stored the inputs of every regiment it snapshotted; anything
+    // else leaves no sums, and update_groups sums every regiment itself.
+    *sums_wanted &= sum_inputs.len() == n_groups;
+    if *sums_wanted {
+        group_sums.resize_with(n_groups, Default::default);
     }
-    // And of every regiment under search, its clear men: no enemy in
-    // his reach (soldier.rs SIGHT_FOE, as of the last tick) and farther
-    // than a shaft's reach from every block of the shooters' side that
-    // stands near his (job.rs `clear_blocks`). Ascending, so a kept pick
-    // is found by a binary search (soldier.rs `quarry_ok`).
-    let clear_r = job::clear_reach();
-    clear_members.resize_with(n_groups, Vec::new);
-    for (g, members) in clear_members.iter_mut().enumerate() {
-        members.clear();
-        if searched[g] {
-            let near = &clear_blocks[g];
-            for &(s, e) in &reg_runs[g] {
-                members.extend((s..e).filter(|&i| {
-                    let i = i as usize;
-                    if death_t_in[i] != 0 || sight_in[i] & soldier::SIGHT_FOE != 0 {
-                        return false;
+    let sums_out: Vec<&mut [crate::frontline::RegimentSums]> = if *sums_wanted {
+        group_sums.chunks_mut(crate::frontline::REGIMENTS_PER_TASK).collect()
+    } else {
+        Vec::new()
+    };
+    let field_took: Vec<f32> = crate::util::sim_scope(|scope| {
+        if let Some(slot) = slot {
+            let columns = crate::render_units_gpu::PackColumns {
+                pos: pos_prev,
+                pos_prev: &pos_prev_in[..],
+                yaw: yaw_snap,
+                yaw_prev: &yaw_prev_in[..],
+                kind,
+                swing: &swing_in[..],
+                swing_t: &swing_t_in[..],
+                flash: &flash_in[..],
+                group,
+                death_t: death_t_in,
+                sight: sight_snap,
+                color: &color_in[..],
+            };
+            scope.spawn(async move {
+                slot.pack((generation, tick), &columns, hit_flash);
+                -1.0
+            });
+        }
+        let (reg_runs, target_members, clear_members) = (runs_out, target_out, clear_out);
+        scope.spawn(async move {
+            // The regiment runs, and from them the living members of every
+            // regiment under fire, in index order.
+            regiment_runs(group, n_groups, reg_runs);
+            let reg_runs = shared(reg_runs);
+            for (k, out) in sums_out.into_iter().enumerate() {
+                scope.spawn(async move {
+                    let first = k * crate::frontline::REGIMENTS_PER_TASK;
+                    for (j, sums) in out.iter_mut().enumerate() {
+                        *sums = sum_inputs.sums(&sum_cols, &reg_runs[first + j], first + j);
                     }
-                    let p = Vec2::new(pos_prev[i].x, pos_prev[i].z);
-                    near.iter().all(|b| b.distance(p) > clear_r)
-                }));
+                    -1.0
+                });
             }
+            target_members.resize_with(n_groups, Vec::new);
+            for (g, members) in target_members.iter_mut().enumerate() {
+                members.clear();
+                if targeted[g] {
+                    for &(s, e) in &reg_runs[g] {
+                        members.extend((s..e).filter(|&i| death_t_in[i as usize] == 0));
+                    }
+                }
+            }
+            // And of every regiment under search, its clear men: no enemy in
+            // his reach (soldier.rs SIGHT_FOE, as of the last tick) and farther
+            // than a shaft's reach from every block of the shooters' side that
+            // stands near his (job.rs `clear_blocks`). Ascending, so a kept pick
+            // is found by a binary search (soldier.rs `quarry_ok`).
+            let clear_r = job::clear_reach();
+            clear_members.resize_with(n_groups, Vec::new);
+            for (g, members) in clear_members.iter_mut().enumerate() {
+                members.clear();
+                if searched[g] {
+                    let near = &clear_blocks[g];
+                    for &(s, e) in &reg_runs[g] {
+                        members.extend((s..e).filter(|&i| {
+                            let i = i as usize;
+                            if death_t_in[i] != 0 || sight_snap[i] & soldier::SIGHT_FOE != 0 {
+                                return false;
+                            }
+                            let p = Vec2::new(pos_prev[i].x, pos_prev[i].z);
+                            near.iter().all(|b| b.distance(p) > clear_r)
+                        }));
+                    }
+                }
+            }
+            -1.0
+        });
+        if field_wanted {
+            let field = field_out;
+            scope.spawn(async move {
+                let _span = info_span!("density_field").entered();
+                let t = Instant::now();
+                field.rebuild(pos_prev, team);
+                t.elapsed().as_secs_f32() * 1000.0
+            });
         }
-    }
-
-    let t0 = Instant::now();
-    {
         let _span = info_span!("grid_rebuild").entered();
-        grid.rebuild(pos_prev, &vel_in[..], team, kind, group, death_t_in, &pose_in[..], group_wall);
-    }
-    let t1 = Instant::now();
-    *grid_ms = (t1 - t0).as_secs_f32() * 1000.0;
-    if *field_wanted {
-        let _span = info_span!("density_field").entered();
-        field.rebuild(pos_prev, team);
-    }
+        let t0 = Instant::now();
+        grid.rebuild(pos_prev, &vel_in[..], team, kind, group, death_t_in, &pose_in[..], &stood_in[..], group_wall);
+        *grid_ms = t0.elapsed().as_secs_f32() * 1000.0;
+    });
     let t2 = Instant::now();
-    *field_ms = (t2 - t1).as_secs_f32() * 1000.0;
+    *field_ms = field_took.iter().copied().fold(0.0, f32::max);
 
     let grid = &*grid;
     let orders = &orders[..];
@@ -463,6 +557,7 @@ fn run_tick_job(job: &mut TickJob) {
     let engaged = &engaged[..];
     let contact = &contact[..];
     let fight_point = &fight_point[..];
+    let fight_line = &fight_line[..];
     let melee_ticks = &melee_ticks[..];
     let hold = &hold[..];
     let threat = &threat[..];
@@ -498,6 +593,7 @@ fn run_tick_job(job: &mut TickJob) {
         engaged,
         contact,
         fight_point,
+        fight_line,
         melee_ticks,
         hold,
         threat,
@@ -538,6 +634,8 @@ fn run_tick_job(job: &mut TickJob) {
     let pose_in = &pose_in[..];
     let stuck_in = &stuck_in[..];
     let aim_in = &aim_in[..];
+    let imposed_in = &imposed_in[..];
+    let stood_in = &stood_in[..];
     let quarry_in = &quarry_in[..];
     // The map edges a router leaves the field at (combat.rs), widened by
     // the charge knockback the apply pass can still add to a position:
@@ -567,11 +665,13 @@ fn run_tick_job(job: &mut TickJob) {
             .zip(quarry.chunks_mut(CHUNK))
             .zip(stuck.chunks_mut(CHUNK))
             .zip(aim.chunks_mut(CHUNK))
+            .zip(imposed.chunks_mut(CHUNK))
+            .zip(stood.chunks_mut(CHUNK))
             .enumerate()
         {
-            let (((((((((((((((((((pos, vel), yaw), yaw_prev), target), swing), swing_t), flash),
-                death_t), events), ammo), arrows), out_form), sight), way), chain), pose), quarry), stuck), aim) =
-                chunk;
+            let (((((((((((((((((((((pos, vel), yaw), yaw_prev), target), swing), swing_t), flash),
+                death_t), events), ammo), arrows), out_form), sight), way), chain), pose), quarry), stuck), aim),
+                imposed), stood) = chunk;
             let start = ci * CHUNK;
             let end = start + pos.len();
             scope.spawn(async move {
@@ -593,6 +693,8 @@ fn run_tick_job(job: &mut TickJob) {
                 quarry.copy_from_slice(&quarry_in[start..end]);
                 stuck.copy_from_slice(&stuck_in[start..end]);
                 aim.copy_from_slice(&aim_in[start..end]);
+                imposed.copy_from_slice(&imposed_in[start..end]);
+                stood.copy_from_slice(&stood_in[start..end]);
                 let rows = soldier::Rows {
                     start,
                     pos: &mut *pos,
@@ -613,6 +715,8 @@ fn run_tick_job(job: &mut TickJob) {
                     quarry,
                     stuck,
                     aim,
+                    imposed,
+                    stood,
                 };
                 events.clear();
                 let mut out = soldier::ChunkOut { events, arrows };
@@ -654,6 +758,9 @@ fn run_tick_job(job: &mut TickJob) {
         }
         None => plans.clear(),
     }
+    // The neighbour audit's sums on its ticks, from this tick's grid and
+    // start positions; the tick count goes up by one at the install.
+    *audit = diag::audit_tick(tick.wrapping_add(1)).then(|| diag::neighbour_sums(grid, pos_prev));
 }
 
 #[allow(clippy::too_many_arguments)] // bevy system params
@@ -676,6 +783,8 @@ pub fn step_sim(
     mut sounds: Option<ResMut<crate::audio::SoundEvents>>,
     mut routes: ResMut<route::Routes>,
 ) {
+    let _frame_log = crate::frame_log::time_step();
+    let _tick_log = crate::frame_log::tick::time(crate::frame_log::tick::Part::Step);
     let finished = pipeline.taken.take();
     if units.pos.is_empty() {
         return;
@@ -685,6 +794,7 @@ pub fn step_sim(
     let mut job = match finished {
         Some(job) => job,
         None => {
+            let _tick_log_inline = crate::frame_log::tick::time(crate::frame_log::tick::Part::StepInline);
             let Some(terrain_arc) = shared_terrain.0.as_ref() else {
                 return;
             };
@@ -702,6 +812,8 @@ pub fn step_sim(
             );
             // update_field rebuilt the resource inline this tick.
             job.field_wanted = false;
+            // update_groups summed this tick itself.
+            job.sums_wanted = false;
             run_tick_job(&mut job);
             job
         }
@@ -714,6 +826,7 @@ pub fn step_sim(
     // buffers: no copy, no allocation. pos_prev <- the state at tick
     // start (the job's shared position column), pos <- the new
     // kinematics.
+    let tick_log_install = crate::frame_log::tick::time(crate::frame_log::tick::Part::StepInstall);
     job.release_inputs();
     {
         let u = &mut *units;
@@ -730,7 +843,8 @@ pub fn step_sim(
             vel <- vel, yaw <- yaw, yaw_prev <- yaw_prev, target <- target, swing <- swing,
             swing_t <- swing_t, flash <- flash, death_t <- death_t, ammo <- ammo,
             out_form <- out_form, sight <- sight, way <- way, chain <- chain,
-            pose <- pose, quarry <- quarry, stuck <- stuck, aim <- aim
+            pose <- pose, quarry <- quarry, stuck <- stuck, aim <- aim,
+            imposed <- imposed, stood <- stood
         );
     }
     // The sweep's candidates (combat.rs), ascending.
@@ -746,6 +860,8 @@ pub fn step_sim(
     stats.grid_ms = job.grid_ms;
     stats.step_ms = job.step_ms;
     diag::log_step(&mut stats, job.step_ms, job.grid_ms, units.pos.len());
+    drop(tick_log_install);
+    let tick_log_damage = crate::frame_log::tick::time(crate::frame_log::tick::Part::StepDamage);
     stats.events = damage::apply_damage(
         &mut damage.0,
         &mut units,
@@ -758,16 +874,28 @@ pub fn step_sim(
             combat_scale: job.combat_scale,
             tick_seed: job.tick_seed,
             terrain: &terrain,
+            dt: job.dt,
         },
         &mut cstats,
         &mut dir_stats,
         sounds.as_deref_mut(),
     );
+    drop(tick_log_damage);
 
     pipeline.tick = pipeline.tick.wrapping_add(1);
     let tick = pipeline.tick;
-    if tick.is_multiple_of(60) {
-        diag::neighbour_audit(&mut stats, &grid, &units.pos[..], &units.pos_prev[..]);
+    let audit = job.audit.take();
+    if diag::audit_tick(tick) {
+        let _frame_log = crate::frame_log::time_audit();
+        let _tick_log_audit = crate::frame_log::tick::time(crate::frame_log::tick::Part::StepAudit);
+        // The job's sums. When it left none (prepared under another tick
+        // count), or a write between the kick and the install made the
+        // start positions a copy, they are taken here from the same grid
+        // and these positions.
+        let sums = audit
+            .filter(|sums| sums.of(&units.pos_prev[..]))
+            .unwrap_or_else(|| diag::neighbour_sums(&grid, &units.pos_prev[..]));
+        diag::audit_stats(&mut stats, &sums, &units.pos[..], &units.pos_prev[..]);
     }
     diag::fingerprint(tick, &units);
     diag::spike_line(&stats, tick, units.pos.len());
@@ -799,12 +927,15 @@ pub fn kick_tick(
     ),
     mut routes: ResMut<route::Routes>,
 ) {
+    let _frame_log = crate::frame_log::time_kick();
+    let _tick_log = crate::frame_log::tick::time(crate::frame_log::tick::Part::Kick);
     if !pipeline_enabled() || units.pos.is_empty() || pipeline.in_flight {
         return;
     }
     let Some(terrain_arc) = shared_terrain.0.as_ref() else {
         return;
     };
+    let tick_log_prep = crate::frame_log::tick::time(crate::frame_log::tick::Part::KickPrep);
     let mut job = pipeline.scratch.take().unwrap_or_default();
     prepare_tick(
         &mut job,
@@ -818,6 +949,11 @@ pub fn kick_tick(
         pipeline.tick,
     );
     job.field_wanted = true;
+    // What the regiment sums read of each regiment, as the job sees it.
+    job.sum_inputs = crate::frontline::sum_inputs(&groups, Some(&routes));
+    job.sums_wanted = true;
+    drop(tick_log_prep);
+    let _tick_log_send = crate::frame_log::tick::time(crate::frame_log::tick::Part::KickSend);
     // The render snapshot of the columns as kicked: the job packs it on
     // the sim's pool while the frame runs, instead of the frame packing
     // the same columns after Update (render_units_gpu.rs).
@@ -830,9 +966,146 @@ pub fn kick_tick(
     pipeline.in_flight = true;
 }
 
+/// A finished exclusive borrow, read from then on by tasks running at the same time.
+fn shared<T>(r: &mut T) -> &T {
+    r
+}
+
 fn toggle_debug_viz(keys: Res<ButtonInput<KeyCode>>, mut viz: ResMut<DebugViz>) {
     if keys.just_pressed(KeyCode::KeyG) {
         viz.0 = !viz.0;
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy::math::Vec3Swizzles;
+    use crate::orders::{GroupData, Order};
+    use crate::terrain::{build_terrain, MapKind};
+    use crate::unit_types::KIND_LIGHT;
+
+    /// One tick computed by the job and installed as `step_sim` installs it,
+    /// with no damage applied: nobody is hurt, staggered or killed.
+    fn step(
+        job: &mut TickJob,
+        units: &mut Units,
+        groups: &mut Groups,
+        routes: &mut route::Routes,
+        terrain: &std::sync::Arc<Terrain>,
+        tick: u32,
+    ) {
+        let tracks = crate::arrows::RegTracks::default();
+        prepare_tick(job, units, groups, &tracks, routes, terrain, 1.0 / 30.0, 1.0, tick);
+        job.field_wanted = false;
+        job.sums_wanted = false;
+        run_tick_job(job);
+        job.release_inputs();
+        let u = &mut *units;
+        macro_rules! install {
+            ($($col:ident <- $out:ident),*) => {$(
+                let released = u.$col.install(std::mem::take(&mut job.$out));
+                job.$out = std::sync::Arc::try_unwrap(released).unwrap_or_default();
+            )*};
+        }
+        let tick_start = u.pos.install(std::mem::take(&mut job.pos_out));
+        let released = u.pos_prev.install_shared(tick_start);
+        job.pos_out = std::sync::Arc::try_unwrap(released).unwrap_or_default();
+        install!(
+            vel <- vel, yaw <- yaw, yaw_prev <- yaw_prev, target <- target, swing <- swing,
+            swing_t <- swing_t, flash <- flash, death_t <- death_t, ammo <- ammo,
+            out_form <- out_form, sight <- sight, way <- way, chain <- chain,
+            pose <- pose, quarry <- quarry, stuck <- stuck, aim <- aim,
+            imposed <- imposed, stood <- stood
+        );
+    }
+
+    /// The bracing scene under the friction contact: a holding line of 8
+    /// files by 4 ranks of light infantry in its ready stance and fighting,
+    /// and a column of 2 files by 8 ranks of enemy light infantry under a
+    /// Move order to 20 m behind the line, starting 4 m before it. Both
+    /// regiments' `engaged` is set by hand (the regiment state
+    /// `update_groups` keeps is not run here), and both start fully in the
+    /// ready stance, so only the Move order tells the walkers from the line.
+    /// It prints how far the line was carried, how many walkers got behind
+    /// its rear rank and the closest two men came. Run it once per brace:
+    /// FL_BRACE=1 cargo test -- --ignored --nocapture bracing_scene
+    #[test]
+    #[ignore]
+    fn bracing_scene() {
+        assert!(
+            soldier::friction_contact(),
+            "the bracing scene runs under the friction contact only: leave FL_CONTACT unset"
+        );
+        bevy::tasks::ComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
+        bevy::tasks::AsyncComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
+        let terrain = std::sync::Arc::new(build_terrain(MapKind::Grassland));
+        let mut units = Units::default();
+        let pitch = crate::formation::FormSpacing::Normal.pitch(KIND_LIGHT);
+        let (files, ranks) = (8, 4);
+        let line_anchor = Vec2::new(0.0, 0.0);
+        for r in 0..ranks {
+            for f in 0..files {
+                let x = (f as f32 - 0.5 * (files - 1) as f32) * pitch.x;
+                let z = -(r as f32) * pitch.y;
+                crate::units::push_unit(&mut units, &terrain, (r * files + f) as u32, 0, KIND_LIGHT, 0, x, z, line_anchor);
+            }
+        }
+        let n_line = units.pos.len();
+        let (col_files, col_ranks) = (2, 8);
+        let col_anchor = Vec2::new(0.0, 4.0 + 0.5 * (col_ranks - 1) as f32 * pitch.y);
+        for r in 0..col_ranks {
+            for f in 0..col_files {
+                let x = (f as f32 - 0.5 * (col_files - 1) as f32) * pitch.x;
+                let z = 4.0 + r as f32 * pitch.y;
+                crate::units::push_unit(&mut units, &terrain, 1000 + (r * col_files + f) as u32, 1, KIND_LIGHT, 1, x, z, col_anchor);
+            }
+        }
+        let n = units.pos.len();
+        units.pose.install(vec![soldier::POSE_READY; n]);
+        let mut line = GroupData::new(0, KIND_LIGHT, line_anchor, n_line);
+        line.engaged = true;
+        let mut column = GroupData::new(1, KIND_LIGHT, col_anchor, n - n_line);
+        column.engaged = true;
+        column.order = Some(Order::Move(col_anchor - Vec2::new(0.0, 4.0 + 20.0 + col_anchor.y)));
+        let mut groups = Groups { list: vec![line, column] };
+        let mut routes = route::Routes::default();
+        let mut job = TickJob::default();
+        let start: Vec<Vec2> = units.pos.iter().map(|p| p.xz()).collect();
+        let rear = -((ranks - 1) as f32) * pitch.y;
+        let ticks = 300;
+        let mut closest = f32::INFINITY;
+        for tick in 0..ticks {
+            step(&mut job, &mut units, &mut groups, &mut routes, &terrain, tick);
+            for a in 0..n {
+                for b in a + 1..n {
+                    closest = closest.min(units.pos[a].xz().distance(units.pos[b].xz()));
+                }
+            }
+            if tick == ticks / 2 || tick == ticks - 1 {
+                let mut levels = [[0u32; 4]; 2];
+                for (i, &p) in units.pose.iter().enumerate() {
+                    levels[(i >= n_line) as usize][soldier::pose_level(p)] += 1;
+                }
+                println!("tick {tick}: pose levels 0..3, line {:?}, walkers {:?}", levels[0], levels[1]);
+            }
+        }
+        let carried: Vec<f32> = (0..n_line).map(|i| units.pos[i].xz().distance(start[i])).collect();
+        let mean = carried.iter().sum::<f32>() / n_line as f32;
+        let most = carried.iter().fold(0.0f32, |m, &c| m.max(c));
+        let behind = (n_line..n).filter(|&i| units.pos[i].z < rear).count();
+        let mut closest_end = f32::INFINITY;
+        for a in 0..n {
+            for b in a + 1..n {
+                closest_end = closest_end.min(units.pos[a].xz().distance(units.pos[b].xz()));
+            }
+        }
+        let brace = std::env::var("FL_BRACE").unwrap_or_else(|_| "default".into());
+        println!(
+            "FL_BRACE={brace}, {ticks} ticks: line carried {mean:.3} m on average, {most:.3} m at most; \
+             {behind} of {} walkers behind the rear rank; closest pair {closest:.3} m over the run, {closest_end:.3} m at the end",
+            n - n_line
+        );
+        assert!(units.pos.iter().all(|p| p.is_finite()));
+    }
+}

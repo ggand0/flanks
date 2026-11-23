@@ -46,6 +46,7 @@ struct InspectText;
 struct TicksThisFrame(u32);
 
 fn count_sim_tick(mut ticks: ResMut<TicksThisFrame>) {
+    let _tick_log = crate::frame_log::tick::time(crate::frame_log::tick::Part::CountTick);
     ticks.0 += 1;
 }
 
@@ -65,6 +66,7 @@ struct FramePacing {
 }
 
 fn fixed_begin(mut pacing: ResMut<FramePacing>) {
+    crate::frame_log::tick::step_begin();
     pacing.fixed_start = Some(std::time::Instant::now());
 }
 
@@ -72,6 +74,7 @@ fn fixed_end(mut pacing: ResMut<FramePacing>) {
     if let Some(t0) = pacing.fixed_start.take() {
         pacing.fixed_this_frame += t0.elapsed().as_secs_f32() * 1000.0;
     }
+    crate::frame_log::tick::step_end();
 }
 
 /// Runs once per frame in Update, after this frame's fixed ticks: the
@@ -166,10 +169,15 @@ pub struct OverlayPlugin;
 
 impl Plugin for OverlayPlugin {
     fn build(&self, app: &mut App) {
-        app.add_plugins((
-            FrameTimeDiagnosticsPlugin::default(),
-            RenderDiagnosticsPlugin,
-        ))
+        // FL_RENDER_DIAG=0: no Bevy GPU pass timings and counters, for
+        // measuring what recording them costs; those passes record into
+        // nothing (their recorder is None). With shadows on, the periodic
+        // log still prints `render/sun_shadows/elapsed_gpu`, which has its
+        // own timer (render_units_shadow.rs `ShadowPassTimer`).
+        if crate::util::env_or("FL_RENDER_DIAG", 1_u32) != 0 {
+            app.add_plugins(RenderDiagnosticsPlugin);
+        }
+        app.add_plugins(FrameTimeDiagnosticsPlugin::default())
             .add_systems(Startup, (spawn_overlay, spawn_stats_line, spawn_inspect_panel))
             .add_systems(
                 OnEnter(crate::game_state::GameState::Battle),
@@ -583,7 +591,7 @@ fn update_overlay(
     groups: Res<Groups>,
     selection: Res<Selection>,
     combat: Res<CombatStats>,
-    render_counts: Res<RenderCounts>,
+    mut render_counts: ResMut<RenderCounts>,
     arrows: Res<crate::arrows::Arrows>,
     outcome: Res<crate::ai::BattleOutcome>,
     mut query: Query<&mut Text, With<OverlayText>>,
@@ -591,8 +599,11 @@ fn update_overlay(
     mut log_timer: Local<f32>,
     mut pacing: ResMut<FramePacing>,
     mut phases: ResMut<FramePhases>,
-    viz: Res<crate::sim::DebugViz>,
-    contact_on: Res<crate::sim::contact_viz::ContactViz>,
+    (viz, contact_on, settings): (
+        Res<crate::sim::DebugViz>,
+        Res<crate::sim::contact_viz::ContactViz>,
+        Res<crate::settings::Settings>,
+    ),
 ) {
     let (frame_ms, fps) = frame_rate(&diagnostics);
     let contact = if crate::sim::contact_viz::contact_viz_on(&contact_on, &viz) {
@@ -601,42 +612,47 @@ fn update_overlay(
         String::new()
     };
 
-    let banner = match outcome.0 {
-        Some(0) => "\n=== VICTORY: the enemy army is broken ===",
-        Some(1) => "\n=== DEFEAT: your army is broken ===",
-        Some(2) => "\n=== MUTUAL DESTRUCTION ===",
-        _ => "",
-    };
-    for mut text in &mut query {
-        text.0 = format!(
-            "{fps:>5.0} fps  {frame_ms:.2} ms\n{} units, drawn {} [{}] lod {:?} + {} fallen (frustum culled)\nsim tick: grid {:.2} ms, step {:.2} ms, field {:.2} ms, audit {:.2} ms | sync {:.2} ms\n{} groups ({} engaged, {} broken), {} selected\nblue {} ({} lost, {} fled)  orange {} ({} lost, {} fled){banner}",
-            units.len(),
-            render_counts.drawn,
-            render_counts
-                .bucket_drawn
-                .iter()
-                .map(|n| n.to_string())
-                .collect::<Vec<_>>()
-                .join("/"),
-            render_counts.lod_drawn,
-            render_counts.corpses_drawn,
-            stats.grid_ms,
-            stats.step_ms,
-            stats.field_ms,
-            stats.audit_ms,
-            render_counts.sync_ms,
-            groups.list.len(),
-            groups.list.iter().filter(|g| g.engaged).count(),
-            groups.list.iter().filter(|g| g.state.is_broken()).count(),
-            selection.count_units,
-            combat.alive[0],
-            combat.kills[0],
-            combat.fled[0],
-            combat.alive[1],
-            combat.kills[1],
-            combat.fled[1],
-        );
-        text.0.push_str(&contact);
+    // Only while the readouts show (`show_overlay`, the same frame): a
+    // write marks the text changed, and Bevy then measures, lays out and
+    // shapes it again, hidden or not.
+    if settings.interface.overlay == crate::settings::Overlay::Full {
+        let banner = match outcome.0 {
+            Some(0) => "\n=== VICTORY: the enemy army is broken ===",
+            Some(1) => "\n=== DEFEAT: your army is broken ===",
+            Some(2) => "\n=== MUTUAL DESTRUCTION ===",
+            _ => "",
+        };
+        for mut text in &mut query {
+            text.0 = format!(
+                "{fps:>5.0} fps  {frame_ms:.2} ms\n{} units, drawn {} [{}] lod {:?} + {} fallen (frustum culled)\nsim tick: grid {:.2} ms, step {:.2} ms, field {:.2} ms, audit {:.2} ms | sync {:.2} ms\n{} groups ({} engaged, {} broken), {} selected\nblue {} ({} lost, {} fled)  orange {} ({} lost, {} fled){banner}",
+                units.len(),
+                render_counts.drawn,
+                render_counts
+                    .bucket_drawn
+                    .iter()
+                    .map(|n| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join("/"),
+                render_counts.lod_drawn,
+                render_counts.corpses_drawn,
+                stats.grid_ms,
+                stats.step_ms,
+                stats.field_ms,
+                stats.audit_ms,
+                render_counts.sync_ms,
+                groups.list.len(),
+                groups.list.iter().filter(|g| g.engaged).count(),
+                groups.list.iter().filter(|g| g.state.is_broken()).count(),
+                selection.count_units,
+                combat.alive[0],
+                combat.kills[0],
+                combat.fled[0],
+                combat.alive[1],
+                combat.kills[1],
+                combat.fled[1],
+            );
+            text.0.push_str(&contact);
+        }
     }
 
     // Periodic log so FPS is verifiable from a headless-ish run. GPU pass
@@ -688,10 +704,22 @@ fn update_overlay(
         let occlude = crate::render_units_occlusion::mode();
         if occlude != crate::render_units_occlusion::OccludeMode::Off {
             // In count mode the hidden are drawn all the same.
+            let built = crate::render_units_gpu::PYRAMID_FRAMES
+                .each_ref()
+                .map(|n| n.swap(0, std::sync::atomic::Ordering::Relaxed));
             info!(
-                "  unit occlusion ({occlude:?}): hidden per level {:?}, the living and the fallen",
-                render_counts.hidden
+                "  unit occlusion ({occlude:?}): hidden per level {:?}, the living and the fallen; pyramid on {} of {} frames",
+                render_counts.hidden, built[0], built[1]
             );
+        }
+        if crate::render_units_occlusion::lod_hidden().mode != 0 {
+            info!(
+                "  lod hidden: drawn a level coarser per held level {:?}, flips a frame {:.1}",
+                render_counts.coarser,
+                render_counts.flips as f32 / render_counts.flip_frames.max(1) as f32
+            );
+            render_counts.flips = 0;
+            render_counts.flip_frames = 0;
         }
         let pacing = &mut *pacing;
         info!(

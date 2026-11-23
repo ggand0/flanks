@@ -280,7 +280,7 @@ impl Plugin for FrontlinePlugin {
                     .before(crate::sim::step_sim)
                     .in_set(crate::game_state::SimSet),
             )
-            .add_systems(Update, (draw_front_gizmos, draw_fight_points, test_front_script));
+            .add_systems(Update, (draw_front_gizmos, draw_fight_points, draw_attack_front, test_front_script));
     }
 }
 
@@ -297,6 +297,7 @@ fn update_field(
     pipeline: Res<crate::sim::TickPipeline>,
     mut stats: ResMut<crate::sim::SimStats>,
 ) {
+    let _tick_log = crate::frame_log::tick::time(crate::frame_log::tick::Part::Field);
     if pipeline.field_from_job {
         return;
     }
@@ -331,7 +332,8 @@ fn retarget_focus() -> bool {
 }
 
 /// One regiment's sums over its men, in index order.
-struct RegimentSums {
+#[derive(Clone, Default)]
+pub(crate) struct RegimentSums {
     pos: Vec2,
     count: usize,
     home: Vec2,
@@ -368,7 +370,161 @@ struct RegimentSums {
 
 /// Regiments per pool task in `update_groups`: a task sums about 16k men
 /// rather than a regiment's thousand.
-const REGIMENTS_PER_TASK: usize = 16;
+pub(crate) const REGIMENTS_PER_TASK: usize = 16;
+
+/// The soldier columns the sums read: the live ones on the main thread,
+/// the tick job's shared copies of the same buffers in the job.
+#[derive(Clone, Copy)]
+pub(crate) struct SumColumns<'a> {
+    pub(crate) pos: &'a [Vec3],
+    pub(crate) home: &'a [Vec2],
+    pub(crate) death_t: &'a [u8],
+    pub(crate) vel: &'a [Vec3],
+    pub(crate) swing: &'a [u8],
+    pub(crate) target: &'a [u32],
+    pub(crate) group: &'a [u32],
+}
+
+impl<'a> SumColumns<'a> {
+    fn of(units: &'a Units) -> Self {
+        Self {
+            pos: &units.pos[..],
+            home: &units.home[..],
+            death_t: &units.death_t[..],
+            vel: &units.vel[..],
+            swing: &units.swing[..],
+            target: &units.target[..],
+            group: &units.group[..],
+        }
+    }
+}
+
+/// What the sums read of each regiment besides its men: its centroid and
+/// home bias from the last tick, its forward vector, its attack target,
+/// whether it is an archer regiment, how many times its slots have been
+/// dealt (`GroupData::slots_dealt`, which stands for its men's `home`),
+/// the blocks of the open friends within its reach, and the line its
+/// waiting route frame is passed at (sim/route.rs `frame_line`: the
+/// waypoint's index, the waypoint and the leg's direction after it), if
+/// it has one. Built the same way at the kick, for the job, and in
+/// `update_groups`: a regiment whose inputs are the same bits in both
+/// takes the job's sums.
+#[derive(Default)]
+pub(crate) struct SumInputs {
+    cents: Vec<Vec2>,
+    bias: Vec<Vec2>,
+    fwd: Vec<Vec2>,
+    target: Vec<Option<u32>>,
+    bows: Vec<bool>,
+    slots: Vec<u32>,
+    open: Vec<Vec<(u32, BlockRect)>>,
+    lines: Vec<Option<(u32, Vec2, Vec2)>>,
+}
+
+impl SumInputs {
+    pub(crate) fn len(&self) -> usize {
+        self.cents.len()
+    }
+
+    /// Regiment `g`'s inputs are the same bits here and in `other`.
+    fn same(&self, other: &SumInputs, g: usize) -> bool {
+        let v = |a: Vec2, b: Vec2| a.x.to_bits() == b.x.to_bits() && a.y.to_bits() == b.y.to_bits();
+        let r = |a: &BlockRect, b: &BlockRect| {
+            v(a.centre, b.centre)
+                && v(a.fwd, b.fwd)
+                && a.half_w.to_bits() == b.half_w.to_bits()
+                && a.half_d.to_bits() == b.half_d.to_bits()
+        };
+        v(self.cents[g], other.cents[g])
+            && v(self.bias[g], other.bias[g])
+            && v(self.fwd[g], other.fwd[g])
+            && self.target[g] == other.target[g]
+            && self.bows[g] == other.bows[g]
+            && self.slots[g] == other.slots[g]
+            && self.open[g].len() == other.open[g].len()
+            && self.open[g].iter().zip(&other.open[g]).all(|((h, a), (k, b))| h == k && r(a, b))
+            && match (self.lines[g], other.lines[g]) {
+                (None, None) => true,
+                (Some((k, here, dir)), Some((j, there, way))) => k == j && v(here, there) && v(dir, way),
+                _ => false,
+            }
+    }
+
+    /// Regiment `g`'s sums over its men.
+    pub(crate) fn sums(&self, cols: &SumColumns, runs: &[(u32, u32)], g: usize) -> RegimentSums {
+        let regiment = (self.cents[g], self.bias[g], self.fwd[g], self.target[g], self.bows[g]);
+        let line = self.lines[g].map(|(_, here, dir)| (here, dir));
+        regiment_sums(cols, runs, regiment, &self.open[g], line)
+    }
+}
+
+/// Every regiment's inputs to the sums, from the regiments and their
+/// routes as they stand.
+pub(crate) fn sum_inputs(groups: &Groups, routes: Option<&crate::sim::route::Routes>) -> SumInputs {
+    // The disorder in the sums measures the block's shape, not its
+    // travel: each man's distance from his slot, measured from the
+    // regiment's own centroid. That centroid is last tick's; 33 ms old is
+    // nothing next to the 2 s smoothing. A block marching in step scores
+    // about 0 m, a block broken up in melee several metres.
+    let cents: Vec<Vec2> = groups.list.iter().map(|g| g.centroid).collect();
+    let bias: Vec<Vec2> = groups.list.iter().map(|g| g.home_bias).collect();
+    // The contact frame's input (the frame in `update_groups`): each
+    // regiment's forward vector. The sums take from it the regiment's
+    // front-most slot and the depth of its men fighting an enemy ahead of
+    // the frame.
+    let fwd: Vec<Vec2> = groups
+        .list
+        .iter()
+        .map(|g| crate::formation::facing_dir(g.facing))
+        .collect();
+    let target: Vec<Option<u32>> = groups
+        .list
+        .iter()
+        .map(|g| match g.order {
+            Some(crate::orders::Order::Attack(t)) => Some(t),
+            _ => None,
+        })
+        .collect();
+    let bows: Vec<bool> = groups.list.iter().map(|g| g.kind == crate::unit_types::KIND_ARCHER).collect();
+    let slots: Vec<u32> = groups.list.iter().map(|g| g.slots_dealt).collect();
+    // Every regiment counts its men inside each open friend's block that
+    // one of them could be in: the friend within the regiment's reach
+    // (its farthest man last tick, plus a step). A regiment whose men are
+    // all far from every open friend lists none and tests nothing.
+    // The open regiments first, usually none: then nothing below runs.
+    let open_regs: Vec<(u32, &crate::orders::GroupData, BlockRect, f32)> = groups
+        .list
+        .iter()
+        .enumerate()
+        .filter(|(_, hd)| hd.count > 0 && hd.spacing == crate::formation::FormSpacing::Open)
+        .map(|(h, hd)| (h as u32, hd, crate::formation::block_rect(hd), crate::formation::block_bound(hd)))
+        .collect();
+    let open: Vec<Vec<(u32, BlockRect)>> = groups
+        .list
+        .iter()
+        .enumerate()
+        .map(|(g, gd)| {
+            if gd.count == 0 || open_regs.is_empty() {
+                return Vec::new();
+            }
+            open_regs
+                .iter()
+                .filter(|(h, hd, _, bound)| {
+                    *h as usize != g
+                        && hd.team == gd.team
+                        && hd.centroid.distance(gd.centroid) <= gd.reach + 1.0 + bound
+                })
+                .map(|(h, _, rect, _)| (*h, *rect))
+                .collect()
+        })
+        .collect();
+    // The line each waiting route frame is passed at: the men beyond it
+    // are counted with the sums, for the regiments that have one.
+    let lines: Vec<Option<(u32, Vec2, Vec2)>> = (0..groups.list.len())
+        .map(|g| routes?.frame_line(g, groups.goal(g)?))
+        .collect();
+    SumInputs { cents, bias, fwd, target, bows, slots, open, lines }
+}
 
 /// One regiment's sums over its men, walking its runs in index order. `pc`
 /// and `pb` are its centroid and home bias from the last tick, `f` its
@@ -378,7 +534,7 @@ const REGIMENTS_PER_TASK: usize = 16;
 /// there is none, and `line` the waypoint its route frame waits at with
 /// the unit direction of the leg after it, if it has one.
 fn regiment_sums(
-    units: &Units,
+    units: &SumColumns,
     runs: &[(u32, u32)],
     (pc, pb, f, tg, bows): (Vec2, Vec2, Vec2, Option<u32>, bool),
     open: &[(u32, BlockRect)],
@@ -450,11 +606,11 @@ fn regiment_sums(
             {
                 a.fight_n += 1;
                 let ti = units.target[i] as usize;
-                let at_target = ti < units.len() && Some(units.group[ti]) == tg;
+                let at_target = ti < units.pos.len() && Some(units.group[ti]) == tg;
                 if at_target {
                     a.target_fight_n += 1;
                 }
-                if ti < units.len() {
+                if ti < units.pos.len() {
                     let d = Vec2::new(units.pos[ti].x - p.x, units.pos[ti].z - p.y);
                     if d.dot(f) > 0.5 * d.length() {
                         a.line_sum += p.dot(f);
@@ -477,90 +633,43 @@ fn update_groups(
     mut groups: ResMut<Groups>,
     routes: Option<Res<crate::sim::route::Routes>>,
 ) {
+    let _tick_log = crate::frame_log::tick::time(crate::frame_log::tick::Part::Groups);
     let n = groups.list.len();
-    // Disorder measures SHAPE coherence, not travel: deviation from the
-    // slot relative to the regiment's own centroid (last tick's — 33 ms
-    // stale is nothing at 2 s smoothing). A rigid march scores ~0; a
-    // block churned up by melee scores meters.
-    let prev_cents: Vec<Vec2> = groups.list.iter().map(|g| g.centroid).collect();
-    let prev_bias: Vec<Vec2> = groups.list.iter().map(|g| g.home_bias).collect();
-    // Contact frame inputs (see the frame below): each regiment's
-    // forward vector, its front-most slot, and the depth of the men
-    // fighting an enemy ahead of the frame.
-    let fwd: Vec<Vec2> = groups
-        .list
-        .iter()
-        .map(|g| crate::formation::facing_dir(g.facing))
-        .collect();
-    let attack_target: Vec<Option<u32>> = groups
-        .list
-        .iter()
-        .map(|g| match g.order {
-            Some(crate::orders::Order::Attack(t)) => Some(t),
-            _ => None,
-        })
-        .collect();
-    let bows: Vec<bool> = groups.list.iter().map(|g| g.kind == crate::unit_types::KIND_ARCHER).collect();
-    // Every regiment counts its men inside each open friend's block that
-    // one of them could be in: the friend within the regiment's reach
-    // (its farthest man last tick, plus a step). A regiment whose men are
-    // all far from every open friend lists none and tests nothing.
-    // The open regiments first, usually none: then nothing below runs.
-    let open_regs: Vec<(u32, &crate::orders::GroupData, BlockRect, f32)> = groups
-        .list
-        .iter()
-        .enumerate()
-        .filter(|(_, hd)| hd.count > 0 && hd.spacing == crate::formation::FormSpacing::Open)
-        .map(|(h, hd)| (h as u32, hd, crate::formation::block_rect(hd), crate::formation::block_bound(hd)))
-        .collect();
-    let open: Vec<Vec<(u32, BlockRect)>> = groups
-        .list
-        .iter()
-        .enumerate()
-        .map(|(g, gd)| {
-            if gd.count == 0 || open_regs.is_empty() {
-                return Vec::new();
-            }
-            open_regs
-                .iter()
-                .filter(|(h, hd, _, bound)| {
-                    *h as usize != g
-                        && hd.team == gd.team
-                        && hd.centroid.distance(gd.centroid) <= gd.reach + 1.0 + bound
-                })
-                .map(|(h, _, rect, _)| (*h, *rect))
-                .collect()
-        })
-        .collect();
-    // The line each waiting route frame is passed at (sim/route.rs
-    // `frame_line`): the men beyond it are counted with the sums, for the
-    // regiments that have one.
-    let frame_lines: Vec<Option<(u32, Vec2, Vec2)>> = (0..n)
-        .map(|g| routes.as_ref()?.frame_line(g, groups.goal(g)?))
-        .collect();
-    // The sums over the men, a pool task per few regiments, each regiment's
-    // runs walked in index order: the same additions in the same order as
-    // one scan of the army, regiment by regiment, so the same bits. Bevy's
-    // scope returns the tasks' results in spawn order.
+    let inputs = sum_inputs(&groups, routes.as_deref());
+    // The sums over the men. The tick job took them from the columns it
+    // was kicked with, which are the columns here (sim/mod.rs `take_tick`
+    // checks that no write copied one of them), walking the same runs in
+    // the same order, so the same bits. A regiment whose own inputs
+    // changed since the kick (an order, a facing, an opening, its slots
+    // dealt again, its route frame's line) is summed here instead, and
+    // so is every regiment when the job left no sums: a pool task per few
+    // regiments, each regiment's runs walked in index order, the same
+    // additions in the same order as one scan of the army, regiment by
+    // regiment. Bevy's scope returns the tasks' results in spawn order.
+    let from_job: Vec<bool> = (0..n).map(|g| runs.job_sums_valid && inputs.same(&runs.job_inputs, g)).collect();
     let units = &*units;
+    let cols = SumColumns::of(units);
     let runs = &*runs;
-    let (prev_cents_r, prev_bias_r, fwd_r, target_r, bows_r, open_r, lines_r) =
-        (&prev_cents, &prev_bias, &fwd, &attack_target, &bows, &open, &frame_lines);
-    let batches: Vec<Vec<RegimentSums>> = bevy::tasks::ComputeTaskPool::get().scope(|scope| {
-        for first in (0..n).step_by(REGIMENTS_PER_TASK) {
-            scope.spawn(async move {
-                (first..n.min(first + REGIMENTS_PER_TASK))
-                    .map(|g| {
-                        let regiment =
-                            (prev_cents_r[g], prev_bias_r[g], fwd_r[g], target_r[g], bows_r[g]);
-                        let line = lines_r[g].map(|(_, here, dir)| (here, dir));
-                        regiment_sums(units, runs.of(g), regiment, &open_r[g], line)
-                    })
-                    .collect::<Vec<RegimentSums>>()
-            });
-        }
-    });
-    let sums: Vec<RegimentSums> = batches.into_iter().flatten().collect();
+    let (inputs_r, cols_r) = (&inputs, &cols);
+    let tick_log_sums = crate::frame_log::tick::time(crate::frame_log::tick::Part::GroupsSums);
+    let missing: Vec<usize> = (0..n).filter(|&g| !from_job[g]).collect();
+    let batches: Vec<Vec<RegimentSums>> = if missing.is_empty() {
+        Vec::new()
+    } else {
+        bevy::tasks::ComputeTaskPool::get().scope(|scope| {
+            for batch in missing.chunks(REGIMENTS_PER_TASK) {
+                scope.spawn(async move {
+                    batch.iter().map(|&g| inputs_r.sums(cols_r, runs.of(g), g)).collect::<Vec<RegimentSums>>()
+                });
+            }
+        })
+    };
+    let mut computed = batches.into_iter().flatten();
+    let sums: Vec<RegimentSums> = (0..n)
+        .map(|g| if from_job[g] { runs.job_sums[g].clone() } else { computed.next().expect("a sum per missing regiment") })
+        .collect();
+    drop(tick_log_sums);
+    let SumInputs { cents: prev_cents, fwd, target: attack_target, open, lines: frame_lines, .. } = inputs;
     let counts: Vec<usize> = sums.iter().map(|a| a.count).collect();
     let fighting: Vec<bool> = sums.iter().map(|a| a.fight_n > 0).collect();
     let cents: Vec<Vec2> = sums
@@ -776,6 +885,22 @@ fn update_groups(
             group.contact = false;
             info!("regiment {g} releases its contact frame");
         }
+        // Its fighting line, live, for as long as its melee runs: a tenth
+        // of the way to where its men striking at an enemy ahead stand now,
+        // set outright the first time; kept while nobody strikes. It does
+        // not wait for a contact frame: a regiment met at ease before its
+        // automatic attack order came has no order and so no frame, and
+        // under the friction contact its men behind the front walk straight
+        // ahead to this line all the same (sim/soldier.rs `join_goal`).
+        if engaged && group.melee_ticks > 0 {
+            if line_n > 0 {
+                let now = line_sum / line_n as f32;
+                group.fight_line =
+                    if group.fight_line.is_nan() { now } else { group.fight_line + (now - group.fight_line) * 0.1 };
+            }
+        } else {
+            group.fight_line = f32::NAN;
+        }
         group.engaged = engaged;
 
         // How fast the regiment's centre closes on its attack target: the
@@ -809,8 +934,15 @@ fn update_groups(
             // ammo, the same order is a real knife charge and flags
             // like one.
             let t = t as usize;
+            // Under the friction contact a regiment in range of any
+            // unbroken enemy regiment (`hostile_near`, the same 60 m)
+            // counts as in range too: one ordered onto an enemy unit
+            // behind the enemy's front runs into the front unit first, and
+            // that run is a charge too.
+            let near = cents[t].distance(group.centroid) < CHARGE_RANGE
+                || (crate::sim::soldier::friction_contact() && group.hostile_near);
             counts[t] > 0
-                && cents[t].distance(group.centroid) < CHARGE_RANGE
+                && near
                 && !(group.kind == crate::unit_types::KIND_ARCHER
                     && group.ammo_left > 0
                     && !group.melee)
@@ -894,6 +1026,124 @@ fn draw_fight_points(
                 d += 4.0;
             }
         }
+    }
+}
+
+/// With the attack front on (orders.rs `attack_front`) and the debug
+/// overlay on (F3), for each selected regiment under an attack order with
+/// a living target. The contact point is where the line from the
+/// regiment's centre to its target's centre first crosses an enemy outline
+/// (orders.rs `outline_contact`), drawn as a ring with a post joined to
+/// the regiment's centre, with the enemy outline it was cut against in
+/// orange. With a friend between, the regiment is sent there: the ring
+/// is bright yellow and the regiment's own outline where it will stand
+/// (at its goal, facing along the line) is cyan. With no friend between,
+/// the regiment is still sent to its target's centre: the ring is dim
+/// yellow, and a red ring with a post marks the real goal (`Groups::goal`)
+/// with the regiment's outline there dashed in red. A regiment holding a
+/// contact frame also shows the frame (its block about the frame's
+/// anchor, where its slots stand instead of any goal) in white. Outlines
+/// are the formation code's block without its metre of margin, the
+/// outline `outline_entry` cuts. FL_ATTACK_FRONT_VIZ=1 draws it for
+/// every attacking regiment, F3 and selection or not. Draws only.
+fn draw_attack_front(
+    settings: Res<crate::settings::Settings>,
+    selection: Res<crate::orders::Selection>,
+    groups: Res<crate::orders::Groups>,
+    terrain: Res<Terrain>,
+    mut gizmos: Gizmos,
+) {
+    static ALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let all = *ALL.get_or_init(|| std::env::var("FL_ATTACK_FRONT_VIZ").is_ok_and(|v| v == "1"));
+    if !crate::orders::attack_front() || !(all || settings.interface.debug_overlay()) {
+        return;
+    }
+    const RING: Color = Color::srgb(1.0, 0.95, 0.1);
+    const RING_DIM: Color = Color::srgb(0.55, 0.5, 0.08);
+    const OWN: Color = Color::srgb(0.2, 0.95, 1.0);
+    const ENEMY: Color = Color::srgb(1.0, 0.55, 0.1);
+    const GOAL: Color = Color::srgb(1.0, 0.1, 0.1);
+    const FRAME: Color = Color::WHITE;
+    let lift = |p: Vec2, up: f32| Vec3::new(p.x, terrain.height_at(p.x, p.y) + up, p.y);
+    let flat = |p: Vec3| Isometry3d::new(p, Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2));
+    // A block outline about `centre` facing `fwd`, half sizes without the margin.
+    let outline = |centre: Vec2, fwd: Vec2, half_w: f32, half_d: f32| {
+        let right = Vec2::new(fwd.y, -fwd.x);
+        let corner = |sw: f32, sd: f32| lift(centre + right * (sw * half_w) + fwd * (sd * half_d), 0.4);
+        [corner(-1.0, 1.0), corner(1.0, 1.0), corner(1.0, -1.0), corner(-1.0, -1.0), corner(-1.0, 1.0)]
+    };
+    // Regiment `gd`'s block about `centre`, facing `fwd` (its own facing
+    // when ZERO), in `color`; `dash` draws its edges 2 m on, 2 m off, so
+    // an outline drawn on the same place still shows between the dashes.
+    let block = |gizmos: &mut Gizmos, gd: &crate::orders::GroupData, centre: Vec2, fwd: Vec2, color: Color, dash: bool| {
+        let r = crate::formation::block_rect_at(gd, centre);
+        if r.fwd == Vec2::ZERO {
+            gizmos.circle(flat(lift(centre, 0.4)), r.half_w, color);
+            return;
+        }
+        let f = if fwd == Vec2::ZERO { r.fwd } else { fwd };
+        let corners = outline(centre, f, (r.half_w - 1.0).max(0.0), (r.half_d - 1.0).max(0.0));
+        if !dash {
+            gizmos.linestrip(corners, color);
+            return;
+        }
+        for edge in corners.windows(2) {
+            let (p, q) = (edge[0], edge[1]);
+            let len = p.distance(q);
+            let dir = (q - p) / len.max(1e-3);
+            let mut s = 0.0;
+            while s < len {
+                gizmos.line(p + dir * s, p + dir * (s + 2.0).min(len), color);
+                s += 4.0;
+            }
+        }
+    };
+    // A ring with a post at `p`, joined to `from`.
+    let marker = |gizmos: &mut Gizmos, from: Vec3, p: Vec2, radius: f32, color: Color| {
+        gizmos.line(from, lift(p, 2.0), color);
+        gizmos.line(lift(p, 0.4), lift(p, 2.0), color);
+        gizmos.circle(flat(lift(p, 0.4)), radius, color);
+    };
+    for (g, gd) in groups.list.iter().enumerate() {
+        if gd.count == 0 || !(all || selection.regiments.get(g).copied().unwrap_or(false)) {
+            continue;
+        }
+        let Some(crate::orders::Order::Attack(t)) = gd.order else { continue };
+        let t = t as usize;
+        if groups.list.get(t).is_none_or(|td| td.count == 0) {
+            continue;
+        }
+        let a = gd.centroid;
+        let from = lift(a, 2.0);
+        if gd.contact {
+            block(&mut gizmos, gd, gd.anchor, Vec2::ZERO, FRAME, false);
+        }
+        let Some((goal, point, friend)) = groups.outline_contact(g, t) else { continue };
+        let d = (groups.list[t].centroid - a).normalize_or_zero();
+        if friend {
+            // Where the regiment will stand: its block at the goal, facing along the line.
+            block(&mut gizmos, gd, goal, d, OWN, false);
+        } else if let Some(real) = groups.goal(g) {
+            // Where the regiment is really sent: its target's centre.
+            block(&mut gizmos, gd, real, d, GOAL, true);
+            marker(&mut gizmos, from, real, 2.5, GOAL);
+        }
+        // The enemy outline the point was cut against: the living enemy
+        // whose outline the line meets at the contact point's distance.
+        let edge = (point - a).dot(d);
+        let cut = groups
+            .list
+            .iter()
+            .filter(|hd| hd.team != gd.team && hd.count > 0)
+            .min_by(|x, y| {
+                let ex = (crate::orders::outline_entry(x, a, d) - edge).abs();
+                let ey = (crate::orders::outline_entry(y, a, d) - edge).abs();
+                ex.total_cmp(&ey)
+            });
+        if let Some(hd) = cut {
+            block(&mut gizmos, hd, hd.centroid, Vec2::ZERO, ENEMY, false);
+        }
+        marker(&mut gizmos, from, point, 1.5, if friend { RING } else { RING_DIM });
     }
 }
 
@@ -1036,9 +1286,10 @@ mod tests {
         units.death_t[6] = 1;
         let runs = [(0u32, places.len() as u32)];
         let regiment = (Vec2::ZERO, Vec2::ZERO, Vec2::Y, None, false);
-        let with = regiment_sums(&units, &runs, regiment, &[], Some((here, dir)));
+        let cols = SumColumns::of(&units);
+        let with = regiment_sums(&cols, &runs, regiment, &[], Some((here, dir)));
         assert_eq!((with.past, with.living), (3, 6));
-        let without = regiment_sums(&units, &runs, regiment, &[], None);
+        let without = regiment_sums(&cols, &runs, regiment, &[], None);
         assert_eq!((without.past, without.living), (0, 0));
         // The other sums do not depend on the line.
         assert_eq!((with.count, with.pos), (without.count, without.pos));

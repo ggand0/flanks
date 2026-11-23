@@ -19,6 +19,18 @@ pub struct CombatStats {
     pub alive: [usize; 2],
     /// Routed units that escaped off their own map edge (not kills).
     pub fled: [u64; 2],
+    /// What `alive` was last counted against (`process_deaths`).
+    living_basis: Option<LivingBasis>,
+}
+
+/// The world `alive` was counted in, its size after that tick's sweep,
+/// and the kills and fled at that moment.
+#[derive(Clone, Copy)]
+struct LivingBasis {
+    generation: u64,
+    len: usize,
+    kills: [u64; 2],
+    fled: [u64; 2],
 }
 
 pub struct CombatPlugin;
@@ -45,6 +57,9 @@ pub fn process_deaths(
     (pipeline, runs): (Res<crate::sim::TickPipeline>, Res<crate::sim::RegimentRuns>),
 ) {
     let _span = info_span!("process_deaths").entered();
+    let len_at_start = units.len();
+    let _tick_log = crate::frame_log::tick::time(crate::frame_log::tick::Part::Deaths);
+    let tick_log_sweep = crate::frame_log::tick::time(crate::frame_log::tick::Part::DeathsSweep);
     let (edge_min, edge_max) = (terrain.min().y + 8.0, terrain.max().y - 8.0);
     let mut craters: Vec<(Vec2, f32)> = Vec::new();
     // Slots the dead leave in formed regiments, filled after the sweep.
@@ -138,6 +153,8 @@ pub fn process_deaths(
             units.pose.swap_remove(i);
             units.stuck.swap_remove(i);
             units.aim.swap_remove(i);
+            units.imposed.swap_remove(i);
+            units.stood.swap_remove(i);
             moves.swap_remove(i, units.len() + 1);
             // The hole took the last man; a popped tail took nobody.
             if i >= units.len() {
@@ -148,14 +165,48 @@ pub fn process_deaths(
     for (c, r) in craters {
         terrain.carve_crater(c, r, r * 0.4);
     }
+    drop(tick_log_sweep);
+    let tick_log_fill = crate::frame_log::tick::time(crate::frame_log::tick::Part::DeathsFill);
     fill_vacated_slots(&mut units, &groups, &vacated, &runs, &moves);
+    drop(tick_log_fill);
 
-    stats.alive = [0, 0];
+    crate::frame_log::tick::units(units.len());
+    let _tick_log_count = crate::frame_log::tick::time(crate::frame_log::tick::Part::DeathsCount);
+    // The living per team. A man stops living only where a kill is
+    // counted (the damage apply, an arrow hit) or where he leaves the field
+    // (`fled`, above), and nothing brings a dead man back; men are added
+    // only when a battle is built, which starts a new `generation` and
+    // these stats over. So, for the army last counted, the living are the
+    // last count less the kills and the fled since.
+    let basis = stats
+        .living_basis
+        .filter(|b| b.generation == units.generation && b.len == len_at_start);
+    match basis {
+        Some(b) => {
+            let lost = |t: usize| (stats.kills[t] - b.kills[t] + stats.fled[t] - b.fled[t]) as usize;
+            let lost = [lost(0), lost(1)];
+            stats.alive[0] -= lost[0];
+            stats.alive[1] -= lost[1];
+        }
+        None => stats.alive = count_living(&units),
+    }
+    stats.living_basis = Some(LivingBasis {
+        generation: units.generation,
+        len: units.len(),
+        kills: stats.kills,
+        fled: stats.fled,
+    });
+}
+
+/// The living per team, counted over the whole army.
+fn count_living(units: &Units) -> [usize; 2] {
+    let mut alive = [0, 0];
     for (&t, &d) in units.team.iter().zip(&units.death_t[..]) {
         if d == 0 {
-            stats.alive[t as usize] += 1;
+            alive[t as usize] += 1;
         }
     }
+    alive
 }
 
 /// Where the death sweep's swap-removes took each man: positions in the

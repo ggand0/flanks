@@ -72,9 +72,11 @@ pub fn cpu_sweep(cfg: Res<GpuSyncConfig>) -> bool {
 
 /// Words of the counts readback: 16 bucket totals, 16 fallen per bucket,
 /// the frame stamp, the soldier count, 1 if the occlusion test ran, one
-/// spare, the 16 caster list counts (cascade * 4 + kind), then the 16
-/// bucket counts of soldiers the occlusion test hid.
-const READBACK_WORDS: usize = 68;
+/// spare, the 16 caster list counts (cascade * 4 + kind), the 16 bucket
+/// counts of soldiers the occlusion test hid, then per bucket of their held
+/// level the soldiers drawn a level coarser (`FL_LOD_HIDDEN`), then the
+/// soldiers the rule sent coarser or back that frame.
+const READBACK_WORDS: usize = 85;
 
 /// Sun shadow cascades the build fills caster lists for, Bevy's maximum.
 pub const MAX_CASCADES: usize = bevy::pbr::MAX_CASCADES_PER_LIGHT;
@@ -106,9 +108,17 @@ const DEPTH_BIN_SPAN: f32 = 24.0;
 /// Build counters: per bucket the soldiers and the fallen, the caster
 /// lists, the ring count, the pose slots taken per kind, per bucket its
 /// depth bins, the far levels' pose slots per kind, then per bucket the
-/// soldiers the occlusion test hid.
-const COUNTERS: usize =
-    2 * NUM_BUCKETS + CASTER_LISTS + 1 + NUM_KINDS + NUM_BUCKETS * DEPTH_BINS + NUM_KINDS + NUM_BUCKETS;
+/// soldiers the occlusion test hid, then per held level the soldiers drawn
+/// a level coarser, then the soldiers the rule sent coarser or back.
+const COUNTERS: usize = 2 * NUM_BUCKETS
+    + CASTER_LISTS
+    + 1
+    + NUM_KINDS
+    + NUM_BUCKETS * DEPTH_BINS
+    + NUM_KINDS
+    + NUM_BUCKETS
+    + NUM_BUCKETS
+    + 1;
 
 /// Storage buffers the build pass binds (`init_gpu_unit_pipelines`), more
 /// than any other unit pass. A device that allows fewer per stage keeps the
@@ -279,6 +289,22 @@ pub struct BuildParams {
     bound_fall: [Vec4; NUM_KINDS],
     bound_down_live: Vec4,
     bound_down_fall: Vec4,
+    /// `FL_LOD_HIDDEN` (render_units_occlusion.rs): x the mode, y the hold,
+    /// w the frames since the last frame the test read a pyramid (the step
+    /// of each man's count). z bit 0 under `FL_FALLEN_FAR`, bits 1 and 2 the
+    /// `FL_FALLEN_COARSE` mode (render_units.rs `fallen_far`,
+    /// `fallen_coarse`).
+    lod_hidden: UVec4,
+    /// The body box: x its half-width, y its top above his feet, z its
+    /// bottom above his feet, in metres.
+    body_box: Vec4,
+    /// Per kind, half the standing height: the feet lie that far below the
+    /// record position (unit_glb.rs drops the model so).
+    half_height: Vec4,
+    /// The box a settled body is tested with (render_units_occlusion.rs
+    /// `SETTLED`), two entries per kind and way he fell: forward, back,
+    /// right, left, then up and down.
+    bound_settled: [Vec4; NUM_KINDS * 4 * 2],
 }
 
 /// The pose pass uniform (`Params` in unit_pose_pass.wgsl).
@@ -287,10 +313,29 @@ struct PoseParams {
     src_base: UVec4,
     stride: UVec4,
     cap: UVec4,
+    /// Per kind, how a man drawn at the last level is posed
+    /// (`pose_body_mode`): 0 in full, 1 for his body alone, 2 for his body
+    /// alone with every slot it leaves out filled with 1e30. Not 0 only
+    /// where the kind's last level is all body (`PullMeshGpu::body_only`).
+    body: UVec4,
+}
+
+/// A man whose pose source level is the last one casts no shadow, so his
+/// pose is read only by the last level's mesh (unit_pose.wgsl
+/// `pose_write`).
+const _: () = assert!(CAST_LODS < NUM_LODS - 1, "a man drawn at the last level casts no shadow");
+
+/// `FL_POSE_BODY`: 1 (the default) poses a man drawn at a body-only last
+/// level for his body alone, 0 poses him in full, 2 as 1 with the slots
+/// it leaves out filled with 1e30, to show any corner that reads one.
+/// Read once.
+fn pose_body_mode() -> u32 {
+    static MODE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| crate::util::env_or("FL_POSE_BODY", 1_u32).min(2))
 }
 
 const _: () = assert!(NUM_KINDS == 4, "BuildParams and PoseParams pack per-kind values in vec4s");
-const _: () = assert!(COUNTERS == 2121, "unit_build.wgsl sizes `counts` for 2121");
+const _: () = assert!(COUNTERS == 2138, "unit_build.wgsl sizes `counts` for 2138");
 const _: () = assert!(DEPTH_BINS == 128, "unit_build.wgsl has 128 depth bins per bucket");
 const _: () = assert!(NUM_BUCKETS == 16, "unit_build.wgsl sizes its counters for 16 buckets");
 const _: () = assert!(MAX_CASCADES == 4, "unit_build.wgsl sizes its cascades for 4");
@@ -326,9 +371,10 @@ pub struct GpuFrameInput {
 }
 
 /// Whether the occlusion test pays for its depth pyramid, main world side.
-/// While the last test hid fewer vertex runs than the pyramid costs, the
+/// While the last test saved fewer vertex runs than the pyramid costs (the
+/// soldiers it hid, and those `FL_LOD_HIDDEN` drew a level coarser), the
 /// pyramid is built only every `PROBE_EVERY` frames and the test runs on
-/// the frame after: a probe. Once a probe hides more, it is built every
+/// the frame after: a probe. Once a probe saves more, it is built every
 /// frame. Seen from above, each rank's heads stand higher on screen than
 /// the rank in front, so an army hides almost none of itself, and there the
 /// probes cost a sixteenth of the pass. Cull mode only: count mode and the
@@ -339,7 +385,16 @@ pub struct OcclusionProbe {
     active: bool,
     /// Frames since the pyramid was last built.
     since: u32,
+    /// Frames since the last frame the test could read a pyramid, and
+    /// whether this frame's predecessor built one.
+    since_test: u32,
+    built_last: bool,
 }
+
+/// Frames the main world asked for the depth pyramid and frames it built
+/// the frame parameters, since the overlay's last log line.
+pub static PYRAMID_FRAMES: [std::sync::atomic::AtomicU32; 2] =
+    [std::sync::atomic::AtomicU32::new(0), std::sync::atomic::AtomicU32::new(0)];
 
 /// Frames between probes.
 const PROBE_EVERY: u32 = 16;
@@ -475,6 +530,7 @@ fn pack_soldier_snapshot(
     if !units.is_changed() {
         return;
     }
+    let _frame_log = crate::frame_log::time_pack();
     let t0 = std::time::Instant::now();
     if let Some(((key, columns), slot)) = due
         && units.last_changed() == columns
@@ -721,6 +777,8 @@ fn build_frame_params(
         p.order = DEPTH_BINS as f32 / DEPTH_BIN_SPAN;
     }
     occlusion_params(&mut p, rts.single().ok(), &mut last_rts, terrain.is_changed());
+    p.lod_hidden.z =
+        crate::render_units::fallen_far() as u32 | (crate::render_units::fallen_coarse() << 1);
     frame.build_pyramid = false;
     if p.occlude.x != 0 {
         use crate::render_units_occlusion::{OccludeMode, mode};
@@ -729,8 +787,21 @@ fn build_frame_params(
         if every_frame || probe.active || probe.since >= PROBE_EVERY {
             probe.since = 0;
             frame.build_pyramid = true;
+            PYRAMID_FRAMES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+        PYRAMID_FRAMES[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // `FL_LOD_HIDDEN` steps each man's count by the frames since the
+        // last frame the test read a pyramid, so under probing the rule
+        // moves in time and not in probes. A gap longer than a probe's (a
+        // cut, a resize, the start) counts as one probe.
+        probe.since_test += 1;
+        if probe.built_last {
+            p.lod_hidden.w = probe.since_test.min(PROBE_EVERY);
+            probe.since_test = 0;
+        }
+        probe.built_last = frame.build_pyramid;
     }
+    crate::frame_log::set_frame_params(p.alpha, p.occlude.z != 0, frame.build_pyramid);
     // The sun's cascades for this camera, as the shadow pass draws them
     // this frame. A soldier casts into a cascade when the ground his shadow
     // can fall on is in view at depths the cascade serves, with the level
@@ -794,7 +865,7 @@ fn occlusion_params(
     last: &mut Option<crate::camera::RtsCamera>,
     new_terrain: bool,
 ) {
-    use crate::render_units_occlusion::{BOUNDS, OccludeMode, mode};
+    use crate::render_units_occlusion::{BOUNDS, OccludeMode, SETTLED, mode, settled_box};
     if mode() == OccludeMode::Off || p.cull == 0 {
         return;
     }
@@ -815,13 +886,34 @@ fn occlusion_params(
         p.occlude.z = 1;
     }
     *last = cam.cloned();
+    let hidden = crate::render_units_occlusion::lod_hidden();
+    if hidden.mode != 0 {
+        p.lod_hidden = UVec4::new(hidden.mode, hidden.hold, 0, 0);
+        p.body_box = Vec4::new(hidden.half, hidden.top, BODY_CLEAR, 0.0);
+        p.half_height = Vec4::from_array(std::array::from_fn(crate::unit_types::half_height));
+    }
     for (kind, [live, fall]) in BOUNDS.iter().enumerate() {
         p.bound_live[kind] = Vec4::new(live.fwd, live.back, live.side, live.up);
         p.bound_fall[kind] = Vec4::new(fall.fwd, fall.back, fall.side, fall.up);
         p.bound_down_live[kind] = live.down;
         p.bound_down_fall[kind] = fall.down;
+        // `FL_SETTLED_BOX=0` tests a settled body with the falling box.
+        for (way, s) in SETTLED[kind].iter().enumerate() {
+            let k = (kind * 4 + way) * 2;
+            if settled_box() {
+                p.bound_settled[k] = Vec4::new(s.fwd, s.back, s.right, s.left);
+                p.bound_settled[k + 1] = Vec4::new(s.up, s.down, 0.0, 0.0);
+            } else {
+                p.bound_settled[k] = Vec4::new(fall.fwd, fall.back, fall.side, fall.side);
+                p.bound_settled[k + 1] = Vec4::new(fall.up, fall.down, 0.0, 0.0);
+            }
+        }
     }
 }
+
+/// How far above his feet a soldier's body box starts, in metres: clear of
+/// the ground and the grass between the feet of the man in front.
+const BODY_CLEAR: f32 = 0.1;
 
 /// A camera cut, for the occlusion test: the focus or the distance moved
 /// more than this share of the distance in a frame. The fastest pan, with
@@ -846,8 +938,9 @@ pub struct ReachReadback {
     handle: Handle<ShaderBuffer>,
 }
 
-/// Words of the reach buffer: per kind, standing then fallen, five reaches.
-const REACH_WORDS: usize = NUM_KINDS * 2 * 5;
+/// Words of the reach buffer: per kind, standing, dying, then settled by
+/// the way he fell, six reaches each.
+const REACH_WORDS: usize = NUM_KINDS * 6 * 6;
 
 fn setup_reach_readback(mut commands: Commands, mut buffers: ResMut<Assets<ShaderBuffer>>) {
     if !crate::render_units_occlusion::bound_check() {
@@ -882,14 +975,23 @@ fn on_reach_readback(event: On<ReadbackComplete>, mut since: Local<u32>) {
         return;
     }
     for kind in 0..NUM_KINDS {
-        for (state, name) in ["standing", "fallen"].into_iter().enumerate() {
-            let r = &reach[(kind * 2 + state) * 5..][..5];
-            let b = crate::render_units_occlusion::BOUNDS[kind][state];
-            let bound = [b.fwd, b.back, b.side, b.up, b.down];
+        let names = ["standing", "dying", "settled forward", "settled back", "settled side 2", "settled side 3"];
+        for (state, name) in names.into_iter().enumerate() {
+            let r = &reach[(kind * 6 + state) * 6..][..6];
+            let bound = match state {
+                0 | 1 => {
+                    let b = crate::render_units_occlusion::BOUNDS[kind][state];
+                    [b.fwd, b.back, b.side, b.side, b.up, b.down]
+                }
+                _ => {
+                    let s = crate::render_units_occlusion::SETTLED[kind][state - 2];
+                    [s.fwd, s.back, s.right, s.left, s.up, s.down]
+                }
+            };
             let out = r.iter().zip(bound).any(|(r, b)| *r > b);
             info!(
-                "  [occlude check] kind {kind} {name}: reach fwd {:.2} back {:.2} side {:.2} up {:.2} down {:.2} | box {:.2} {:.2} {:.2} {:.2} {:.2}{}",
-                r[0], r[1], r[2], r[3], r[4], bound[0], bound[1], bound[2], bound[3], bound[4],
+                "  [occlude check] kind {kind} {name}: reach fwd {:.2} back {:.2} right {:.2} left {:.2} up {:.2} down {:.2} | box {:.2} {:.2} {:.2} {:.2} {:.2} {:.2}{}",
+                r[0], r[1], r[2], r[3], r[4], r[5], bound[0], bound[1], bound[2], bound[3], bound[4], bound[5],
                 if out { " OUTSIDE THE BOX" } else { "" }
             );
         }
@@ -942,17 +1044,26 @@ fn on_counts_readback(
     counts.hidden = std::array::from_fn(|lod| {
         words[52..68].iter().skip(lod).step_by(NUM_LODS).map(|&n| n as usize).sum()
     });
-    // A frame the test ran on: the vertex runs it saved, at least one per
-    // vertex of each hidden soldier's level, decide the next probe.
+    counts.coarser = std::array::from_fn(|lod| {
+        words[68..84].iter().skip(lod).step_by(NUM_LODS).map(|&n| n as usize).sum()
+    });
+    counts.flips += words[84] as usize;
+    counts.flip_frames += 1;
+    // A frame the test ran on: the vertex runs it saved decide the next
+    // probe, at least one per vertex of each hidden soldier's level, and for
+    // each soldier `FL_LOD_HIDDEN` drew a level coarser the vertices his held
+    // level has over the one he was drawn at.
     if words[34] != 0 {
-        let runs: f32 = meshes
-            .iter()
-            .map(|m| {
-                let verts = m.indexed.as_ref().map_or(m.corners.len(), |i| i.vertices.len());
-                words[52 + m.bucket] as f32 * verts as f32
-            })
+        let mut verts = [0.0f32; NUM_BUCKETS];
+        for m in &meshes {
+            verts[m.bucket] = m.indexed.as_ref().map_or(m.corners.len(), |i| i.vertices.len()) as f32;
+        }
+        let hidden: f32 = (0..NUM_BUCKETS).map(|b| words[52 + b] as f32 * verts[b]).sum();
+        let coarser: f32 = (0..NUM_BUCKETS)
+            .filter(|b| b % NUM_LODS < NUM_LODS - 1)
+            .map(|b| words[68 + b] as f32 * (verts[b] - verts[b + 1]).max(0.0))
             .sum();
-        probe.active = runs >= PROBE_RUNS;
+        probe.active = hidden + coarser >= PROBE_RUNS;
     }
     // The sun shadow casters per cascade, one count per kind, about every
     // two seconds next to the periodic log.
@@ -1025,10 +1136,15 @@ struct PullVertex {
 pub struct PullMesh {
     corners: Vec<PullVertex>,
     indexed: Option<IndexedMesh>,
+    /// The same triangles welded for the sun's cascades alone
+    /// (`weld_cast`), which `indexed` stands in for when it is `None`.
+    cast: Option<IndexedMesh>,
     bucket: usize,
     /// The level carries joints and weights (unit_glb.rs `ATTRIBUTE_SKIN`),
     /// so its draw shader compiles the skinning instead of the part chain.
     skinned: bool,
+    /// The light last level (`from_mesh`).
+    light: bool,
 }
 
 /// A level drawn indexed: its vertices, and its index list repeated for
@@ -1043,6 +1159,9 @@ struct IndexedMesh {
     /// The atlas coordinate rides on each triangle's first vertex and is not
     /// interpolated (`weld`).
     flat_atlas: bool,
+    /// Each triangle's first vertex carries its three corner normals, and
+    /// the triangle takes the mean of their lights at that vertex (`weld`).
+    flat_light: bool,
 }
 
 impl IndexedMesh {
@@ -1055,8 +1174,56 @@ impl IndexedMesh {
             indices,
             group,
             flat_atlas,
+            flat_light: false,
         }
     }
+}
+
+/// The detail levels named by the digits of the variable `key`, as in
+/// `FL_FLAT_LIGHT=23`, or by `FL_PERF`'s set when the variable is unset
+/// (util.rs `perf_str`). Empty names none, and so does 0 in effect: level 0
+/// never samples one atlas point per triangle.
+fn level_set(key: &str) -> [bool; NUM_LODS] {
+    let digits = crate::util::perf_str(key).unwrap_or_default();
+    std::array::from_fn(|lod| digits.contains(char::from(b'0' + lod as u8)))
+}
+
+/// `FL_FLAT_LIGHT=<levels>`: the levels whose triangles are lit once each,
+/// at their first vertex (`weld`). Read once, as the meshes are welded at
+/// load.
+fn flat_light_levels() -> [bool; NUM_LODS] {
+    static SET: std::sync::OnceLock<[bool; NUM_LODS]> = std::sync::OnceLock::new();
+    *SET.get_or_init(|| level_set("FL_FLAT_LIGHT"))
+}
+
+/// `FL_ATLAS_POINT=<levels>`: the levels that sample one atlas point per
+/// triangle, its centroid's, where the file gives each corner its own.
+/// Read once, at load.
+fn atlas_point_levels() -> [bool; NUM_LODS] {
+    static SET: std::sync::OnceLock<[bool; NUM_LODS]> = std::sync::OnceLock::new();
+    *SET.get_or_init(|| level_set("FL_ATLAS_POINT"))
+}
+
+/// A unit direction in 32 bits: its octahedral projection, x and y as
+/// unorm16 (unit_instancing.wgsl `oct_decode`). A zero direction packs as
+/// up.
+fn oct_encode(n: [f32; 3]) -> u32 {
+    let n = Vec3::from(n).normalize_or(Vec3::Y);
+    let p = Vec2::new(n.x, n.y) / (n.x.abs() + n.y.abs() + n.z.abs());
+    let p = if n.z < 0.0 {
+        let sign = Vec2::new(if p.x >= 0.0 { 1.0 } else { -1.0 }, if p.y >= 0.0 { 1.0 } else { -1.0 });
+        (Vec2::ONE - Vec2::new(p.y.abs(), p.x.abs())) * sign
+    } else {
+        p
+    };
+    pack_unorm16((p * 0.5 + 0.5).into())
+}
+
+/// The three corner normals a provoking vertex carries under
+/// `FL_FLAT_LIGHT`, in its 12-byte normal field as three `oct_encode`
+/// words, the provoking corner's own first.
+fn pack_normals(n: [[f32; 3]; 3]) -> [f32; 3] {
+    n.map(|n| f32::from_bits(oct_encode(n)))
 }
 
 /// Corners per vertex from which a level draws indexed under
@@ -1106,22 +1273,36 @@ fn welded_levels() -> bool {
 /// fragment sees stays what the expanded corners gave it. The far levels
 /// go from three vertex shader runs per triangle to 1.3 to 1.55 (L1 and
 /// L2) under a 16-entry cache.
-fn weld(corners: &[PullVertex]) -> IndexedMesh {
+///
+/// With `flat_light` (`FL_FLAT_LIGHT`) a flat-atlas level's provoking vertex
+/// also carries the triangle's three corner normals (`pack_normals`), the
+/// triangle takes the mean of their three lights, computed at that vertex
+/// alone (`@interpolate(flat, first)`), so it keeps the mean brightness the
+/// blended corner light gives it, and the normal leaves the weld: every
+/// vertex then starts one triangle. The other corners that reuse the vertex
+/// take its first normal, which only offsets where the sun's shadow is
+/// sampled. The vertex colour leaves the weld too and rides on the
+/// provoking vertex, the corner of the triangle it stands for, since the
+/// lit colour is taken from that vertex alone: a corner of the light last
+/// level touches faces of three colours.
+fn weld(corners: &[PullVertex], flat_light: bool) -> IndexedMesh {
     let flat_atlas = corners
         .chunks(3)
         .all(|t| t[1].atlas_uv == t[0].atlas_uv && t[2].atlas_uv == t[0].atlas_uv);
+    let flat_light = flat_atlas && flat_light;
     let key = |v: &PullVertex| -> [u32; 12] {
         let f = f32::to_bits;
+        let n = |x: f32| if flat_light { 0 } else { x.to_bits() };
         [
             f(v.position[0]),
             f(v.position[1]),
             f(v.position[2]),
             f(v.part),
-            f(v.normal[0]),
-            f(v.normal[1]),
-            f(v.normal[2]),
+            n(v.normal[0]),
+            n(v.normal[1]),
+            n(v.normal[2]),
             f(v.pivot),
-            v.color,
+            if flat_light { 0 } else { v.color },
             if flat_atlas { 0 } else { v.atlas_uv },
             v.skin,
             f(v.weight),
@@ -1145,27 +1326,75 @@ fn weld(corners: &[PullVertex]) -> IndexedMesh {
         for t in order {
             let tri = [list[3 * t], list[3 * t + 1], list[3 * t + 2]];
             let atlas = corners[3 * t].atlas_uv;
-            let first = match (0..3).find(|&k| !provokes[tri[k] as usize]) {
+            let (first, k) = match (0..3).find(|&k| !provokes[tri[k] as usize]) {
                 Some(k) => {
                     one.extend([tri[k], tri[(k + 1) % 3], tri[(k + 2) % 3]]);
-                    tri[k]
+                    (tri[k], k)
                 }
                 None => {
                     vertices.push(vertices[tri[0] as usize]);
                     provokes.push(false);
                     let dup = vertices.len() as u32 - 1;
                     one.extend([dup, tri[1], tri[2]]);
-                    dup
+                    (dup, 0)
                 }
             };
             provokes[first as usize] = true;
             vertices[first as usize].atlas_uv = atlas;
+            if flat_light {
+                let corner = |j: usize| corners[3 * t + (k + j) % 3].normal;
+                vertices[first as usize].normal = pack_normals([corner(0), corner(1), corner(2)]);
+                vertices[first as usize].color = corners[3 * t + k].color;
+            }
+        }
+        // A vertex that starts no triangle keeps its own normal, packed.
+        if flat_light {
+            for (v, _) in vertices.iter_mut().zip(&provokes).filter(|(_, p)| !**p) {
+                v.normal = pack_normals([v.normal; 3]);
+            }
         }
     } else {
         one.extend(order.into_iter().flat_map(|t| [list[3 * t], list[3 * t + 1], list[3 * t + 2]]));
     }
     let group = (GROUP_INDICES / one.len().max(1)).clamp(1, MAX_GROUP as usize) as u32;
-    IndexedMesh::grouped(vertices, &one, group, flat_atlas)
+    let mut m = IndexedMesh::grouped(vertices, &one, group, flat_atlas);
+    m.flat_light = flat_light;
+    m
+}
+
+/// The shadow casters draw a depth-only mesh of their own (`weld_cast`).
+/// Read once: `FL_SHADOW_MESH=0` casts with the camera's mesh.
+fn cast_meshes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::util::env_or("FL_SHADOW_MESH", 1_u32) != 0)
+}
+
+/// The level's corners welded for the sun's cascades, which keep depth
+/// alone: a corner is placed from its position, part, pivot, skin and
+/// weight (unit_pose.wgsl `place`), and nothing it carries besides reaches
+/// a shadow map, so the normal, the colour and the atlas point leave the
+/// weld and no triangle needs a provoking vertex of its own. The same
+/// triangles, each with its corners in the same order, ordered for vertex
+/// reuse.
+fn weld_cast(corners: &[PullVertex]) -> IndexedMesh {
+    let key = |v: &PullVertex| -> [u32; 7] {
+        let f = f32::to_bits;
+        [f(v.position[0]), f(v.position[1]), f(v.position[2]), f(v.part), f(v.pivot), v.skin, f(v.weight)]
+    };
+    let mut slots = bevy::platform::collections::HashMap::<[u32; 7], u32>::default();
+    let mut vertices: Vec<PullVertex> = Vec::new();
+    let list: Vec<u32> = corners
+        .iter()
+        .map(|c| {
+            *slots.entry(key(c)).or_insert_with(|| {
+                vertices.push(*c);
+                vertices.len() as u32 - 1
+            })
+        })
+        .collect();
+    let one: Vec<u32> = tipsify(&list, vertices.len(), VERTEX_CACHE);
+    let group = (GROUP_INDICES / one.len().max(1)).clamp(1, MAX_GROUP as usize) as u32;
+    IndexedMesh::grouped(vertices, &one, group, false)
 }
 
 /// The same triangles, reordered so each one mostly reuses vertices the
@@ -1275,28 +1504,101 @@ fn pack_unorm16(v: [f32; 2]) -> u32 {
 }
 
 impl PullMesh {
-    pub fn from_mesh(mesh: &Mesh, bucket: usize) -> Option<Self> {
+    /// `cast_source`: the mesh the level's shadow casters draw instead of
+    /// `mesh`. `light`: the level is the light last level (unit_glb.rs
+    /// `light_last_level`), which takes its colour from the vertex colour
+    /// word as that level packs it.
+    pub fn from_mesh(mesh: &Mesh, bucket: usize, cast_source: Option<&Mesh>, light: bool) -> Option<Self> {
         use bevy::mesh::VertexAttributeValues as V;
-        let Some(V::Float32x3(pos)) = mesh.attribute(Mesh::ATTRIBUTE_POSITION) else {
-            return None;
-        };
-        let Some(V::Float32x3(nrm)) = mesh.attribute(Mesh::ATTRIBUTE_NORMAL) else {
-            return None;
-        };
-        let Some(V::Float32x2(uv)) = mesh.attribute(Mesh::ATTRIBUTE_UV_0) else {
-            return None;
-        };
-        let Some(V::Float32x4(col)) = mesh.attribute(Mesh::ATTRIBUTE_COLOR) else {
-            return None;
-        };
+        let (records, skinned) = pull_vertices(mesh)?;
         let Some(V::Float32x2(atlas_uv)) = mesh.attribute(Mesh::ATTRIBUTE_UV_1) else {
             return None;
         };
-        let skin = match mesh.attribute(crate::unit_glb::ATTRIBUTE_SKIN) {
-            Some(V::Float32x2(skin)) => Some(skin),
-            _ => None,
+        let vertex = |i: usize| records[i];
+        let indices = mesh.indices()?;
+        let mut corners: Vec<PullVertex> = indices.iter().map(vertex).collect();
+        // Under FL_ATLAS_POINT a level that interpolates its atlas then
+        // welds as a flat-atlas level.
+        let interpolated = corners
+            .chunks(3)
+            .any(|t| t[1].atlas_uv != t[0].atlas_uv || t[2].atlas_uv != t[0].atlas_uv);
+        if interpolated && atlas_point_levels()[bucket % NUM_LODS] {
+            let list: Vec<usize> = indices.iter().collect();
+            for (t, tri) in corners.chunks_mut(3).enumerate() {
+                let centroid: Vec2 = list[3 * t..3 * t + 3].iter().map(|&i| Vec2::from(atlas_uv[i])).sum();
+                let point = pack_unorm16((centroid / 3.0).into());
+                tri.iter_mut().for_each(|c| c.atlas_uv = point);
+            }
+        }
+        let indexed = if welded_levels() {
+            let m = weld(&corners, flat_light_levels()[bucket % NUM_LODS]);
+            info!(
+                "unit bucket {bucket}: {} triangles on {} welded vertices, {} soldiers per instance{}{}{}",
+                corners.len() / 3,
+                m.vertices.len(),
+                m.group,
+                if m.flat_atlas { ", atlas point per triangle" } else { "" },
+                if m.flat_light { ", light per triangle" } else { "" },
+                if light { ", the light last level" } else { "" }
+            );
+            Some(m)
+        } else {
+            (corners.len() as f32 >= INDEXED_REUSE * records.len() as f32).then(|| {
+                let list: Vec<u32> = indices.iter().map(|i| i as u32).collect();
+                let one = tipsify(&list, records.len(), VERTEX_CACHE);
+                IndexedMesh::grouped(records.clone(), &one, 1, false)
+            })
         };
-        let vertex = |i: usize| PullVertex {
+        let cast_corners = cast_source.and_then(|m| {
+            let (records, _) = pull_vertices(m)?;
+            Some(m.indices()?.iter().map(|i| records[i]).collect::<Vec<_>>())
+        });
+        let cast = (welded_levels() && cast_meshes()).then(|| {
+            let m = weld_cast(cast_corners.as_deref().unwrap_or(&corners));
+            info!(
+                "unit bucket {bucket}: its shadow casters on {} vertices, {} soldiers per instance",
+                m.vertices.len(),
+                m.group
+            );
+            m
+        });
+        Some(Self {
+            corners,
+            indexed,
+            cast,
+            bucket,
+            skinned,
+            light,
+        })
+    }
+}
+
+/// A mesh's vertices as the pulled draw reads them, and whether it carries
+/// a skin. Any `Mesh` with position, normal, the part/pivot UV, vertex
+/// colour and the atlas UV qualifies.
+fn pull_vertices(mesh: &Mesh) -> Option<(Vec<PullVertex>, bool)> {
+    use bevy::mesh::VertexAttributeValues as V;
+    let Some(V::Float32x3(pos)) = mesh.attribute(Mesh::ATTRIBUTE_POSITION) else {
+        return None;
+    };
+    let Some(V::Float32x3(nrm)) = mesh.attribute(Mesh::ATTRIBUTE_NORMAL) else {
+        return None;
+    };
+    let Some(V::Float32x2(uv)) = mesh.attribute(Mesh::ATTRIBUTE_UV_0) else {
+        return None;
+    };
+    let Some(V::Float32x4(col)) = mesh.attribute(Mesh::ATTRIBUTE_COLOR) else {
+        return None;
+    };
+    let Some(V::Float32x2(atlas_uv)) = mesh.attribute(Mesh::ATTRIBUTE_UV_1) else {
+        return None;
+    };
+    let skin = match mesh.attribute(crate::unit_glb::ATTRIBUTE_SKIN) {
+        Some(V::Float32x2(skin)) => Some(skin),
+        _ => None,
+    };
+    let records = (0..pos.len())
+        .map(|i| PullVertex {
             position: pos[i],
             part: uv[i][0],
             normal: nrm[i],
@@ -1305,33 +1607,9 @@ impl PullMesh {
             atlas_uv: pack_unorm16(atlas_uv[i]),
             skin: skin.map_or(0, |s| s[i][0] as u32),
             weight: skin.map_or(0.0, |s| s[i][1]),
-        };
-        let indices = mesh.indices()?;
-        let corners: Vec<PullVertex> = indices.iter().map(vertex).collect();
-        let indexed = if welded_levels() {
-            let m = weld(&corners);
-            info!(
-                "unit bucket {bucket}: {} triangles on {} welded vertices, {} soldiers per instance{}",
-                corners.len() / 3,
-                m.vertices.len(),
-                m.group,
-                if m.flat_atlas { ", atlas point per triangle" } else { "" }
-            );
-            Some(m)
-        } else {
-            (corners.len() as f32 >= INDEXED_REUSE * pos.len() as f32).then(|| {
-                let list: Vec<u32> = indices.iter().map(|i| i as u32).collect();
-                let one = tipsify(&list, pos.len(), VERTEX_CACHE);
-                IndexedMesh::grouped((0..pos.len()).map(vertex).collect(), &one, 1, false)
-            })
-        };
-        Some(Self {
-            corners,
-            indexed,
-            bucket,
-            skinned: skin.is_some(),
         })
-    }
+        .collect();
+    Some((records, skin.is_some()))
 }
 
 /// Render-world side of `PullMesh`: the corners in a storage buffer.
@@ -1340,12 +1618,19 @@ pub struct PullMeshGpu {
     vertices: Buffer,
     /// The indexed form: its vertices (storage) and its group list.
     indexed: Option<(Buffer, Buffer)>,
+    /// The same for the shadow casters (`PullMesh::cast`), else `indexed`.
+    cast: Option<(Buffer, Buffer)>,
     /// Corners per soldier (the level's index count).
     pub count: u32,
     pub bucket: usize,
     pub shape: DrawShape,
+    /// How the shadow casters draw: `shape`, or the shape of `cast`.
+    pub cast_shape: DrawShape,
     /// As `PullMesh::skinned`.
     pub skinned: bool,
+    /// Every corner is on the body, part 0: the vertex shader reads only
+    /// the pose slots `pose_begin` writes (unit_pose.wgsl `pose_write`).
+    pub body_only: bool,
 }
 
 /// How a bucket's level draws. `group` 0: expanded corners, one plain draw
@@ -1357,6 +1642,10 @@ pub struct DrawShape {
     pub verts: u32,
     /// The atlas coordinate is flat, from each triangle's first vertex.
     pub flat_atlas: bool,
+    /// Each triangle takes the light of its first vertex (`weld`).
+    pub flat_light: bool,
+    /// The light last level's colour (`PullMesh::light`).
+    pub light_level: bool,
 }
 
 /// Uploads each pulled bucket's mesh once. The render entity persists,
@@ -1372,7 +1661,7 @@ fn extract_pull_meshes(
         if uploaded.contains(e) {
             continue;
         }
-        let indexed = mesh.indexed.as_ref().map(|m| {
+        let upload = |m: &IndexedMesh| {
             (
                 render_device.create_buffer_with_data(&BufferInitDescriptor {
                     label: Some("unit pull mesh vertices"),
@@ -1385,12 +1674,20 @@ fn extract_pull_meshes(
                     usage: BufferUsages::INDEX,
                 }),
             )
-        });
-        let shape = mesh.indexed.as_ref().map_or(DrawShape::default(), |m| DrawShape {
-            group: m.group,
-            verts: m.vertices.len() as u32,
-            flat_atlas: m.flat_atlas,
-        });
+        };
+        let shape_of = |m: Option<&IndexedMesh>| {
+            m.map_or(DrawShape::default(), |m| DrawShape {
+                group: m.group,
+                verts: m.vertices.len() as u32,
+                flat_atlas: m.flat_atlas,
+                flat_light: m.flat_light,
+                light_level: false,
+            })
+        };
+        let indexed = mesh.indexed.as_ref().map(upload);
+        let cast = mesh.cast.as_ref().map(upload);
+        let shape = DrawShape { light_level: mesh.light, ..shape_of(mesh.indexed.as_ref()) };
+        let cast_shape = shape_of(mesh.cast.as_ref().or(mesh.indexed.as_ref()));
         commands.entity(e).insert(PullMeshGpu {
             vertices: render_device.create_buffer_with_data(&BufferInitDescriptor {
                 label: Some("unit pull mesh"),
@@ -1398,10 +1695,13 @@ fn extract_pull_meshes(
                 usage: BufferUsages::STORAGE,
             }),
             indexed,
+            cast,
             count: mesh.corners.len() as u32,
             bucket: mesh.bucket,
             shape,
+            cast_shape,
             skinned: mesh.skinned,
+            body_only: mesh.corners.iter().all(|c| c.part < 0.5),
         });
     }
 }
@@ -1413,6 +1713,8 @@ pub struct PulledBucketGpu {
     pub bind_group: BindGroup,
     /// The index list of an indexed camera draw (`PullMeshGpu::indexed`).
     pub index: Option<Buffer>,
+    /// The index list of the shadow casters' draw (`PullMeshGpu::cast`).
+    pub shadow_index: Option<Buffer>,
     /// The same group for drawing into each sun shadow cascade: it binds
     /// that cascade's set of the bucket table, so the bucket's draw reads
     /// the cascade's caster list for its kind.
@@ -1811,10 +2113,12 @@ pub(crate) fn prepare_gpu_units(
     gpu_buffers: Res<RenderAssets<GpuShaderBuffer>>,
     globals: Res<GlobalsBuffer>,
     pyramid: Res<crate::render_units_occlusion::UnitDepthPyramid>,
+    mut body_logged: Local<Option<UVec4>>,
 ) {
     if !input.enabled {
         return;
     }
+    let _frame_log = crate::frame_log::time_prepare(input.fresh);
     let t0 = std::time::Instant::now();
     let n = input.n as usize;
     let kind_needed = input.kind_counts.map(|c| c as usize);
@@ -1905,15 +2209,16 @@ pub(crate) fn prepare_gpu_units(
     }
 
     // The bucket table: the camera's set, then one set per cascade whose
-    // every level of a kind points at the cascade's caster list for it.
+    // every level of a kind points at the cascade's caster list for it. The
+    // casters draw the same triangles, grouped as their own mesh is.
     let mut info = [[[0u32; 4]; NUM_BUCKETS]; 1 + MAX_CASCADES];
     for mesh in &meshes {
         let b = mesh.bucket;
         let stride = alloc.pose_stride[b / NUM_LODS];
-        let group = mesh.shape.group;
-        info[0][b] = [alloc.bases[b], mesh.count, stride, group];
+        info[0][b] = [alloc.bases[b], mesh.count, stride, mesh.shape.group];
         for c in 0..MAX_CASCADES {
-            info[1 + c][b] = [alloc.shadow_bases[c][b / NUM_LODS], mesh.count, stride, group];
+            let base = alloc.shadow_bases[c][b / NUM_LODS];
+            info[1 + c][b] = [base, mesh.count, stride, mesh.cast_shape.group];
         }
     }
     queue.write_buffer(&alloc.bucket_info, 0, bytemuck::cast_slice(&info));
@@ -1927,7 +2232,7 @@ pub(crate) fn prepare_gpu_units(
     let cast_with = |field: usize| {
         input.shadow_levels.map(|levels| {
             UVec4::from_array(std::array::from_fn(|kind| {
-                info[0][kind * NUM_LODS + levels[kind] as usize][field]
+                info[1][kind * NUM_LODS + levels[kind] as usize][field]
             }))
         })
     };
@@ -1951,10 +2256,24 @@ pub(crate) fn prepare_gpu_units(
     buffers.params.write_buffer(&device, &queue);
     buffers.threads = n as u32 + input.corpse_len.iter().sum::<u32>();
     buffers.pose_pass = input.pose_pass;
+    // Per kind, whether a man drawn at the last level is posed for his
+    // body alone: only where that level's mesh is uploaded and all body.
+    let mut body = [0u32; NUM_KINDS];
+    for mesh in &meshes {
+        if mesh.bucket % NUM_LODS == NUM_LODS - 1 && mesh.body_only {
+            body[mesh.bucket / NUM_LODS] = pose_body_mode();
+        }
+    }
+    let body = UVec4::from_array(body);
+    if *body_logged != Some(body) {
+        *body_logged = Some(body);
+        info!("unit pose: the last level posed for the body alone per kind {:?}", body.to_array());
+    }
     buffers.pose_params.set(PoseParams {
         src_base: UVec4::from_array(alloc.pose_src_base),
         stride: UVec4::from_array(alloc.pose_stride),
         cap: UVec4::from_array(alloc.pose_cap),
+        body,
     });
     buffers.pose_params.write_buffer(&device, &queue);
 
@@ -2120,9 +2439,14 @@ fn prepare_pull_bind_groups(
         let (view, sampler, atlas_settled) = custom_pipeline.atlas_for(atlas, &images);
         let layout = pipeline_cache.get_bind_group_layout(&custom_pipeline.pull_layout);
         // Set 0 of the bucket table is the camera's, set 1 + c cascade c's.
-        // An indexed level draws indexed into every one of them.
+        // An indexed level draws indexed into every one of them, the
+        // cascades from the casters' own mesh where it has one.
         let group = |set: u64| {
-            let corners = match &mesh.indexed {
+            let indexed = match set {
+                0 => mesh.indexed.as_ref(),
+                _ => mesh.cast.as_ref().or(mesh.indexed.as_ref()),
+            };
+            let corners = match indexed {
                 Some((vertices, _)) => vertices,
                 None => &mesh.vertices,
             };
@@ -2154,6 +2478,7 @@ fn prepare_pull_bind_groups(
         commands.entity(entity).insert(PulledBucketGpu {
             bind_group: group(0),
             index: mesh.indexed.as_ref().map(|(_, indices)| indices.clone()),
+            shadow_index: mesh.cast.as_ref().or(mesh.indexed.as_ref()).map(|(_, indices)| indices.clone()),
             shadow: (1..=MAX_CASCADES as u64).map(group).collect(),
             generation: buffers.generation,
             atlas_settled,
@@ -2328,8 +2653,14 @@ impl Plugin for GpuUnitRenderPlugin {
 }
 
 /// Which bucket entity draws pulled: every unit bucket in GPU mode.
-pub fn pull_mesh_for(mesh: &Mesh, bucket: &InstanceBucket, cfg: &GpuSyncConfig) -> Option<PullMesh> {
-    cfg.enabled.then(|| PullMesh::from_mesh(mesh, bucket.0)).flatten()
+pub fn pull_mesh_for(
+    mesh: &Mesh,
+    bucket: &InstanceBucket,
+    cfg: &GpuSyncConfig,
+    cast_source: Option<&Mesh>,
+    light: bool,
+) -> Option<PullMesh> {
+    cfg.enabled.then(|| PullMesh::from_mesh(mesh, bucket.0, cast_source, light)).flatten()
 }
 
 #[cfg(test)]
@@ -2440,7 +2771,7 @@ mod tests {
                 weight: 0.0,
             })
             .collect();
-        let m = weld(&corners);
+        let m = weld(&corners, false);
         assert!(m.flat_atlas);
         let per = corners.len();
         assert_eq!(m.indices.len(), per * m.group as usize);
@@ -2463,6 +2794,33 @@ mod tests {
         assert_eq!(firsts.len(), per / 3);
     }
 
+    /// The octahedral normal words decode, as the shader does it, to within
+    /// 1e-3 of the directions packed.
+    #[test]
+    fn oct_normals_round_trip() {
+        let decode = |w: u32| -> Vec3 {
+            let p = Vec2::new((w & 0xffff) as f32, (w >> 16) as f32) / 65535.0 * 2.0 - Vec2::ONE;
+            let mut n = Vec3::new(p.x, p.y, 1.0 - p.x.abs() - p.y.abs());
+            let t = (-n.z).max(0.0);
+            n.x += if n.x >= 0.0 { -t } else { t };
+            n.y += if n.y >= 0.0 { -t } else { t };
+            n.normalize()
+        };
+        let mut worst = 0.0f32;
+        for i in 0..40 {
+            for j in 0..80 {
+                let theta = std::f32::consts::PI * (i as f32 + 0.5) / 40.0;
+                let phi = std::f32::consts::TAU * j as f32 / 80.0;
+                let n = Vec3::new(theta.sin() * phi.cos(), theta.sin() * phi.sin(), theta.cos());
+                worst = worst.max((decode(oct_encode(n.into())) - n).length());
+            }
+        }
+        for n in [Vec3::X, Vec3::Y, Vec3::Z, -Vec3::X, -Vec3::Y, -Vec3::Z] {
+            worst = worst.max((decode(oct_encode(n.into())) - n).length());
+        }
+        assert!(worst < 1e-3, "worst {worst}");
+    }
+
     /// A level whose atlas coordinate varies across a triangle keeps it
     /// interpolated and welds only corners that agree in everything.
     #[test]
@@ -2482,9 +2840,45 @@ mod tests {
             corner(2.0, 3), corner(1.0, 2), corner(3.0, 4),
             corner(3.0, 9), corner(1.0, 2), corner(0.0, 1),
         ];
-        let m = weld(&corners);
+        let m = weld(&corners, false);
         assert!(!m.flat_atlas);
         // Corner (3, 9) differs from (3, 4) in its atlas coordinate only.
         assert_eq!(m.vertices.len(), 5);
+    }
+
+    #[test]
+    fn weld_cast_keeps_every_triangle_and_its_winding() {
+        let corner = |x: f32, z: f32, normal: f32, atlas: u32| PullVertex {
+            position: [x, 0.0, z],
+            part: 0.0,
+            normal: [normal, 1.0, 0.0],
+            pivot: 0.0,
+            color: atlas,
+            atlas_uv: atlas,
+            skin: 0,
+            weight: 0.0,
+        };
+        // Two triangles on four positions, each corner with its own normal,
+        // colour and atlas point.
+        let corners = [
+            corner(0.0, 0.0, 0.0, 1), corner(1.0, 0.0, 0.1, 2), corner(0.0, 1.0, 0.2, 3),
+            corner(1.0, 0.0, 0.3, 4), corner(1.0, 1.0, 0.4, 5), corner(0.0, 1.0, 0.5, 6),
+        ];
+        let m = weld_cast(&corners);
+        assert_eq!(m.vertices.len(), 4);
+        let at = |i: u32| m.vertices[i as usize].position;
+        let mut tris: Vec<[[f32; 3]; 3]> =
+            m.indices[..corners.len()].chunks(3).map(|t| [at(t[0]), at(t[1]), at(t[2])]).collect();
+        // Each triangle is one of the input's, its corners in the same
+        // cyclic order.
+        for t in corners.chunks(3) {
+            let want = [t[0].position, t[1].position, t[2].position];
+            let k = tris
+                .iter()
+                .position(|got| (0..3).any(|r| (0..3).all(|j| got[(j + r) % 3] == want[j])))
+                .expect("a triangle of the input");
+            tris.remove(k);
+        }
+        assert!(tris.is_empty());
     }
 }

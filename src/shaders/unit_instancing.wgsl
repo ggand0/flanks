@@ -48,8 +48,22 @@ struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     // rgb = the lit vertex colour: part material blended with the team
     // colour, times the sun and the sky. a = the sun's share of that
-    // light, the part the shadow takes away.
+    // light, the part the shadow takes away. Under UNIT_LIGHT_FLAT each
+    // triangle takes it from its first vertex, which carries the
+    // triangle's three corner normals (render_units_gpu.rs `weld`).
+#ifdef UNIT_LIGHT_FLAT
+    @location(0) @interpolate(flat, first) color: vec4<f32>,
+#else
+#ifdef UNIT_CENTROID
+    // FL_CENTROID=1 (render_units.rs `centroid_defs`): under multisampling
+    // a fragment of a triangle smaller than a pixel reads the blended
+    // light at a sample the triangle covers, not at the pixel centre
+    // outside it, where the blend runs past its corners' values.
+    @location(0) @interpolate(perspective, centroid) color: vec4<f32>,
+#else
     @location(0) color: vec4<f32>,
+#endif
+#endif
     // Per instance, so flat. x = team colour, unorm8 rgb, and the death
     // darkening in the top byte; y = the hit flash, unorm8 in the low byte,
     // and under FL_OCCLUDE_CHECK the occlusion mark in bit 8.
@@ -132,10 +146,12 @@ struct PullVertex {
 @group(3) @binding(3) var<storage, read> pull_buckets: array<vec4<u32>>;
 
 #ifdef UNIT_BOUND_CHECK
-// FL_OCCLUDE_CHECK (render_units_occlusion.rs): per kind, standing then
-// dying or fallen, how far any drawn corner reached from his position in
-// his facing frame: forward, back, sideways, up, down, as float bits.
-@group(3) @binding(10) var<storage, read_write> bound_reach: array<atomic<u32>, 40>;
+// FL_OCCLUDE_CHECK (render_units_occlusion.rs): per kind, standing, dying,
+// then settled (a corpse record, his death played out) by the way he fell
+// (forward, back, either side), how far any drawn corner reached from his
+// position in his facing frame: forward, back, right, left, up, down, as
+// float bits.
+@group(3) @binding(10) var<storage, read_write> bound_reach: array<atomic<u32>, 144>;
 
 fn measure_reach(placed: vec3<f32>) {
     let d = placed - pose_at(P_POS).xyz;
@@ -143,13 +159,23 @@ fn measure_reach(placed: vec3<f32>) {
     // unit_pose.wgsl `rot_y` turned his frame by cos, sin: turn it back.
     let x = d.x * yaw.x - d.z * yaw.y;
     let z = d.x * yaw.y + d.z * yaw.x;
-    let fallen = select(0u, 1u, pose_at(P_DEATH).w > 0.0);
-    let base = ((#{PULL_BUCKET}u / 4u) * 2u + fallen) * 5u;
+    // A corpse record's death has played out to 1; a dying man's stops
+    // a tick short of it (combat.rs freezes him at his last tick).
+    // The way he fell from his topple (unit_pose.wgsl `put_common`): about
+    // x forward or back by the sign of its sine, about z to either side.
+    let topple = pose_at(P_DEATH);
+    var state = select(0u, 1u, topple.w > 0.0);
+    if topple.w > 0.999 {
+        let neg = topple.y < 0.0;
+        state = 2u + select(select(0u, 1u, neg), select(3u, 2u, neg), topple.z > 1.5);
+    }
+    let base = ((#{PULL_BUCKET}u / 4u) * 6u + state) * 6u;
     atomicMax(&bound_reach[base], bitcast<u32>(max(z, 0.0)));
     atomicMax(&bound_reach[base + 1u], bitcast<u32>(max(-z, 0.0)));
-    atomicMax(&bound_reach[base + 2u], bitcast<u32>(abs(x)));
-    atomicMax(&bound_reach[base + 3u], bitcast<u32>(max(d.y, 0.0)));
-    atomicMax(&bound_reach[base + 4u], bitcast<u32>(max(-d.y, 0.0)));
+    atomicMax(&bound_reach[base + 2u], bitcast<u32>(max(x, 0.0)));
+    atomicMax(&bound_reach[base + 3u], bitcast<u32>(max(-x, 0.0)));
+    atomicMax(&bound_reach[base + 4u], bitcast<u32>(max(d.y, 0.0)));
+    atomicMax(&bound_reach[base + 5u], bitcast<u32>(max(-d.y, 0.0)));
 }
 #endif
 
@@ -187,7 +213,29 @@ fn vertex_pull(@builtin(vertex_index) index: u32, @builtin(instance_index) insta
     let inst = pull_records[entry & 0x1fffffffu];
     pose_begin(inst.pos_scale, inst.color, inst.anim, inst.anim2, globals.time, false);
 #endif
+#ifdef UNIT_LIGHT_FLAT
+    // The normal field holds the triangle's three corner normals
+    // (render_units_gpu.rs `pack_normals`), all three turned by this
+    // corner's pose in the one `place`. A part-posed level's triangle lies
+    // on one part, so that is its corners' own turn; on a skinned level the
+    // other two corners' joints can differ a little, and their normals take
+    // this corner's turn.
+    let words = bitcast<vec3<u32>>(v.normal);
+    let placed = place(
+        v.position,
+        oct_decode(words.x),
+        v.part,
+        v.pivot,
+        v.skin,
+        v.weight,
+        oct_decode(words.y),
+        oct_decode(words.z),
+    );
+    let second = placed.second;
+    let third = placed.third;
+#else
     let placed = place(v.position, v.normal, v.part, v.pivot, v.skin, v.weight);
+#endif
 #ifdef UNIT_BOUND_CHECK
     measure_reach(placed.position);
 #endif
@@ -207,15 +255,32 @@ fn vertex_pull(@builtin(vertex_index) index: u32, @builtin(instance_index) insta
         rgb = rgb * 0.4 + tint * 0.6;
     }
 #endif
+#ifdef UNIT_LIGHT_LEVEL
+    // The light last level (unit_glb.rs `light_last_level`): rgb holds the
+    // square root of the linear colour, a the team tint mask, which tints
+    // as the atlas mask does.
+    let face = unpack4x8unorm(v.color);
+    let v_color = vec4<f32>(face.rgb * face.rgb * mix(vec3<f32>(1.0), rgb, face.a), 0.0);
+#else
+    let v_color = unpack4x8unorm(v.color);
+#endif
     var out = unit_output(
         placed.position,
         placed.normal,
-        unpack4x8unorm(v.color),
+        v_color,
         rgb,
         pose_at(P_DEATH).w,
         team.w,
         unpack2x16unorm(v.atlas_uv),
     );
+#ifdef UNIT_LIGHT_FLAT
+    // The triangle's light is the mean of its three corners' lights, the
+    // mean the blended corner light gives it.
+    let light = (sky_and_sun(normalize(placed.normal)) + sky_and_sun(normalize(second))
+        + sky_and_sun(normalize(third))) / 3.0;
+    let base = mix(v_color.rgb, rgb, v_color.a);
+    out.color = vec4<f32>(base * (light.x + light.y), light.y / (light.x + light.y));
+#endif
 #ifdef UNIT_BOUND_CHECK
     // A soldier the occlusion test hid draws flat magenta (unit_build.wgsl
     // `occlusion`).
@@ -227,7 +292,23 @@ fn vertex_pull(@builtin(vertex_index) index: u32, @builtin(instance_index) insta
 @vertex
 fn vertex(vertex: Vertex) -> VertexOutput {
     pose_begin(vertex.i_pos_scale, vertex.i_color, vertex.i_anim, vertex.i_anim2, globals.time, false);
+#ifdef UNIT_LIGHT_FLAT
+    // A flat-lit batch drawn through `vertex_pull` gives its fragment stage
+    // UNIT_LIGHT_FLAT but not VERTEX_PULL, so that stage builds this entry
+    // point under UNIT_LIGHT_FLAT too; the batch never draws with it.
+    let placed = place(
+        vertex.position,
+        vertex.normal,
+        vertex.part_pivot.x,
+        vertex.part_pivot.y,
+        0u,
+        0.0,
+        vertex.normal,
+        vertex.normal,
+    );
+#else
     let placed = place(vertex.position, vertex.normal, vertex.part_pivot.x, vertex.part_pivot.y, 0u, 0.0);
+#endif
     let team = pose_at(P_TEAM);
     return unit_output(
         placed.position,
@@ -264,11 +345,14 @@ fn unit_output(
     out.clip_position.z = min(out.clip_position.z, out.clip_position.w);
 #endif
     // Lambert from the scene's sun, so shading and shadow agree, over a
-    // hemispheric ambient brighter from above. Normals are per face
-    // (turned with the pose in `place`), so per-vertex light is exact.
+    // hemispheric ambient brighter from above, at the corner's normal
+    // turned with the pose in `place`. Most triangles of the model files
+    // have different normals at their corners, so the light is blended
+    // across the face, except under UNIT_LIGHT_FLAT (`vertex_pull`).
     let n = normalize(normal);
-    let sky = 0.30 + 0.20 * (0.5 + 0.5 * n.y);
-    let direct = 0.65 * max(dot(n, sun.direction_to_light.xyz), 0.0);
+    let light = sky_and_sun(n);
+    let sky = light.x;
+    let direct = light.y;
     // Part material blended with the team color (a = team amount), lit.
     // The fragment takes the shadow off the sun's share, then the hit
     // flash lerps toward white and death darkens.
@@ -285,6 +369,25 @@ fn unit_output(
     out.atlas_uv = atlas_uv;
 #endif
     return out;
+}
+
+// The light at a unit normal: x the hemispheric sky, brighter from above,
+// y the sun's Lambert term.
+fn sky_and_sun(n: vec3<f32>) -> vec2<f32> {
+    let sky = 0.30 + 0.20 * (0.5 + 0.5 * n.y);
+    let direct = 0.65 * max(dot(n, sun.direction_to_light.xyz), 0.0);
+    return vec2<f32>(sky, direct);
+}
+
+// A unit direction from its octahedral word: x and y of the projection as
+// unorm16 (render_units_gpu.rs `oct_encode`).
+fn oct_decode(word: u32) -> vec3<f32> {
+    let p = unpack2x16unorm(word) * 2.0 - 1.0;
+    var n = vec3<f32>(p.x, p.y, 1.0 - abs(p.x) - abs(p.y));
+    let t = max(-n.z, 0.0);
+    n.x += select(t, -t, n.x >= 0.0);
+    n.y += select(t, -t, n.y >= 0.0);
+    return normalize(n);
 }
 
 // Depth along the camera's view axis, negative in front of it.

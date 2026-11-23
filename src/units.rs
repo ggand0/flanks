@@ -137,6 +137,19 @@ pub struct Units {
     /// `choose_opening`), a point on the ground; NaN when he has none. He
     /// looks wide only every few ticks and keeps what he found between.
     pub aim: Column<Vec2>,
+    /// Under the friction contact (sim/soldier.rs `friction_contact`,
+    /// `steer`, `integrate`): the speed the contacts have put into him
+    /// that his feet have not yet taken back. Zero otherwise.
+    pub imposed: Column<Vec2>,
+    /// Under the friction contact: he stood last tick (sim/soldier.rs
+    /// `steer`): his own wish to move was under the speed of a step. On the
+    /// walk to his place with nothing else to do (`on_his_way`), once he has
+    /// set off, he stands again only after he has arrived there
+    /// (`still_stands`); walking to the fight, once the soldiers ahead have
+    /// stopped him. A standing soldier is braced against any body
+    /// (sim/soldier.rs `BRACE`), a walking one only against the other side
+    /// (`BRACE_BASIC`).
+    pub stood: Column<bool>,
     /// Bumped every time a battle rebuilds this world. A sim tick job
     /// computed from an older world carries indices that mean nothing
     /// here: sim/mod.rs drops it instead of installing it.
@@ -326,6 +339,8 @@ pub fn push_unit(
     units.pose.push(0);
     units.stuck.push(0);
     units.aim.push(Vec2::NAN);
+    units.imposed.push(Vec2::ZERO);
+    units.stood.push(true);
 }
 
 /// FL_TEST_SURROUND: two equal blue detachments of light infantry, one

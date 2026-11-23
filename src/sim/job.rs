@@ -11,8 +11,13 @@ use crate::spatial::SpatialGrid;
 use crate::terrain::Terrain;
 use crate::units::Units;
 
-/// Soldiers per parallel kernel task.
-pub(crate) const CHUNK: usize = 2048;
+/// Soldiers per parallel kernel task. Every man's tick is his own and
+/// the chunks' lists (landed swings, arrows, the sweep's candidates) are
+/// read back in chunk order, which is index order whatever the size, so
+/// the size changes only the share of the work: chunks this small leave
+/// the threads little to wait for at the kernel's end, when the last
+/// chunks of a crush are still running.
+pub(crate) const CHUNK: usize = 512;
 
 /// What an archer regiment's bows shoot at this tick (regiment-level
 /// fire solution, resolved in `prepare_tick`).
@@ -109,6 +114,8 @@ pub struct TickJob {
     pub(crate) pose_in: Arc<Vec<u8>>,
     pub(crate) stuck_in: Arc<Vec<u16>>,
     pub(crate) aim_in: Arc<Vec<Vec2>>,
+    pub(crate) imposed_in: Arc<Vec<Vec2>>,
+    pub(crate) stood_in: Arc<Vec<bool>>,
     pub(crate) quarry_in: Arc<Vec<u32>>,
     // Read only to pack the render snapshot.
     pub(crate) pos_prev_in: Arc<Vec<Vec3>>,
@@ -138,6 +145,8 @@ pub struct TickJob {
     pub(crate) pose: Vec<u8>,
     pub(crate) stuck: Vec<u16>,
     pub(crate) aim: Vec<Vec2>,
+    pub(crate) imposed: Vec<Vec2>,
+    pub(crate) stood: Vec<bool>,
     pub(crate) quarry: Vec<u32>,
     // Per-regiment command snapshot, taken at prep.
     pub(crate) orders: Vec<Option<Vec2>>,
@@ -155,6 +164,8 @@ pub struct TickJob {
     pub(crate) engaged: Vec<bool>,
     pub(crate) contact: Vec<bool>,
     pub(crate) fight_point: Vec<Option<Vec2>>,
+    /// Per regiment, its fighting line along `form_face` (NaN none).
+    pub(crate) fight_line: Vec<f32>,
     pub(crate) melee_ticks: Vec<u32>,
     pub(crate) hold: Vec<bool>,
     pub(crate) threat: Vec<Vec2>,
@@ -204,6 +215,13 @@ pub struct TickJob {
     /// `update_field` already rebuilt the resource this tick).
     pub(crate) field: crate::frontline::InfluenceField,
     pub(crate) field_wanted: bool,
+    /// Each regiment's sums for `update_groups` (frontline.rs), taken
+    /// beside the grid rebuild from the inputs `kick_tick` stored in
+    /// `sum_inputs`. `sums_wanted` is false on the inline path, where
+    /// `update_groups` already summed.
+    pub(crate) group_sums: Vec<crate::frontline::RegimentSums>,
+    pub(crate) sum_inputs: crate::frontline::SumInputs,
+    pub(crate) sums_wanted: bool,
     /// Men whose death countdown reached its last tick, ascending.
     pub(crate) dead: Vec<u32>,
     /// Living men standing near or beyond their own map edge, ascending:
@@ -224,6 +242,9 @@ pub struct TickJob {
     pub(crate) grid_ms: f32,
     pub(crate) step_ms: f32,
     pub(crate) field_ms: f32,
+    /// The neighbour audit's sums (sim/diag.rs), on the ticks it runs;
+    /// taken at the install.
+    pub(crate) audit: Option<crate::sim::diag::NeighbourSums>,
     // Routes (sim/route.rs): the plans asked for at prep, planned after
     // the kernel, and each regiment's route with the grid its men read.
     pub(crate) plan_requests: Vec<crate::sim::route::PlanJob>,
@@ -233,6 +254,22 @@ pub struct TickJob {
 }
 
 impl TickJob {
+    /// Every column the regiment sums read is still the buffer this job
+    /// was kicked with: no write copied it while the job held it. Called
+    /// at the take, before the job lets go of them.
+    pub(crate) fn shares_sum_columns(&self, units: &Units) -> bool {
+        fn same<T>(a: &Arc<Vec<T>>, b: &Vec<T>) -> bool {
+            std::ptr::eq(Arc::as_ptr(a), b)
+        }
+        same(&self.pos_in, &units.pos)
+            && same(&self.home, &units.home)
+            && same(&self.death_t_in, &units.death_t)
+            && same(&self.vel_in, &units.vel)
+            && same(&self.swing_in, &units.swing)
+            && same(&self.target_in, &units.target)
+            && same(&self.group, &units.group)
+    }
+
     /// Release the job's handles on the shared columns. Called the moment
     /// a finished job is taken (and again, harmlessly, at the install):
     /// nothing reads them once the run is over, and a column nobody else
@@ -261,6 +298,8 @@ impl TickJob {
         self.pose_in = Default::default();
         self.stuck_in = Default::default();
         self.aim_in = Default::default();
+        self.imposed_in = Default::default();
+        self.stood_in = Default::default();
         self.quarry_in = Default::default();
         self.pos_prev_in = Default::default();
         self.color_in = Default::default();
@@ -438,6 +477,8 @@ fn share_columns(job: &mut TickJob, units: &Units) {
     job.pose_in = units.pose.share();
     job.stuck_in = units.stuck.share();
     job.aim_in = units.aim.share();
+    job.imposed_in = units.imposed.share();
+    job.stood_in = units.stood.share();
     job.quarry_in = units.quarry.share();
     job.pos_prev_in = units.pos_prev.share();
     job.color_in = units.color.share();
@@ -464,6 +505,8 @@ fn share_columns(job: &mut TickJob, units: &Units) {
     fit(&mut job.pose, n);
     fit(&mut job.stuck, n);
     fit(&mut job.aim, n);
+    fit(&mut job.imposed, n);
+    fit(&mut job.stood, n);
     fit(&mut job.quarry, n);
 }
 
@@ -1744,6 +1787,7 @@ fn snapshot_regiments(job: &mut TickJob, groups: &Groups, terrain: &Terrain) {
     let contact: Vec<bool> = groups.list.iter().map(|g| g.contact).collect();
     // Where each regiment in melee has its fight, and for how long.
     let fight_point: Vec<Option<Vec2>> = groups.list.iter().map(|g| g.fight_point).collect();
+    let fight_line: Vec<f32> = groups.list.iter().map(|g| g.fight_line).collect();
     let melee_ticks: Vec<u32> = groups.list.iter().map(|g| g.melee_ticks).collect();
 
     // Hold-position leash: units of a held regiment close only the last
@@ -1814,6 +1858,7 @@ fn snapshot_regiments(job: &mut TickJob, groups: &Groups, terrain: &Terrain) {
     job.engaged = engaged;
     job.contact = contact;
     job.fight_point = fight_point;
+    job.fight_line = fight_line;
     job.melee_ticks = melee_ticks;
     job.hold = hold;
     job.threat = threat;

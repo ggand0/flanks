@@ -54,7 +54,7 @@ impl Plugin for RtsCameraPlugin {
         // Input only in battle (still active while paused, M2TW style)
         // and never under the settings modal; the transform apply keeps
         // running so the menu/results backdrop stays valid.
-        app.add_systems(Startup, spawn_camera).add_systems(
+        app.add_systems(Startup, (spawn_camera, cpu_clusters)).add_systems(
             Update,
             (
                 control_camera.run_if(
@@ -75,12 +75,13 @@ fn spawn_camera(mut commands: Commands) {
     if crate::render_units_occlusion::mode() != crate::render_units_occlusion::OccludeMode::Off {
         depth_usage |= bevy::render::render_resource::TextureUsages::TEXTURE_BINDING;
     }
-    commands.spawn((
+    let aa = post_aa();
+    let mut camera = commands.spawn((
         Camera3d {
             depth_texture_usages: depth_usage.into(),
             ..default()
         },
-        msaa(),
+        msaa(aa),
         // Required: the unit renderer issues direct (non-indirect) draws.
         NoIndirectDrawing,
         RtsCamera {
@@ -98,12 +99,66 @@ fn spawn_camera(mut commands: Commands) {
             lift: 0.0,
         },
     ));
+    if !bevy_clusters() {
+        camera.insert(bevy::light::cluster::ClusterConfig::None);
+    }
+    match aa {
+        PostAa::None => {}
+        PostAa::Fxaa => {
+            camera.insert(bevy::anti_alias::fxaa::Fxaa::default());
+        }
+        PostAa::Smaa => {
+            camera.insert(bevy::anti_alias::smaa::Smaa::default());
+        }
+    }
+}
+
+/// `FL_CLUSTER=1` keeps Bevy's light clustering. Unset, the scene has
+/// no point or spot light to cluster (the sun is not clustered), so the
+/// camera has no clusters and Bevy's clustering pass on the GPU is off
+/// (`cpu_clusters`). A point or spot light needs it back. Read once.
+fn bevy_clusters() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::util::env_or("FL_CLUSTER", 0_u32) != 0)
+}
+
+/// Turns Bevy's GPU light clustering off unless `FL_CLUSTER=1`: its
+/// passes run every frame for every camera, even with no light to
+/// cluster. Bevy then takes its CPU path, which finds no light and
+/// uploads empty cluster buffers into the same view bindings.
+fn cpu_clusters(settings: Option<ResMut<bevy::light::cluster::GlobalClusterSettings>>) {
+    if let Some(mut settings) = settings
+        && !bevy_clusters()
+    {
+        settings.gpu_clustering = None;
+        info!("light clusters: none on the camera and Bevy's GPU clustering off (FL_CLUSTER=1 keeps them)");
+    }
+}
+
+/// An anti-aliasing pass over the finished image, after tonemapping.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PostAa {
+    None,
+    Fxaa,
+    Smaa,
+}
+
+/// `FL_AA=fxaa` or `FL_AA=smaa`: Bevy's FXAA or SMAA over the 3D view.
+/// Unset or any other value, none.
+fn post_aa() -> PostAa {
+    match std::env::var("FL_AA").as_deref() {
+        Ok("fxaa") => PostAa::Fxaa,
+        Ok("smaa") => PostAa::Smaa,
+        _ => PostAa::None,
+    }
 }
 
 /// Samples per pixel of the 3D view: Bevy's default 4, or `FL_MSAA=1`
-/// (off), 2 or 8 for A/B runs.
-fn msaa() -> Msaa {
-    match crate::util::env_or("FL_MSAA", 4_u32) {
+/// (off), 2 or 8 for A/B runs. With a pass over the finished image
+/// (`post_aa`) and `FL_MSAA` unset, 1.
+fn msaa(aa: PostAa) -> Msaa {
+    let default = if aa == PostAa::None { 4_u32 } else { 1 };
+    match crate::util::env_or("FL_MSAA", default) {
         1 => Msaa::Off,
         2 => Msaa::Sample2,
         8 => Msaa::Sample8,

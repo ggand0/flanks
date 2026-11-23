@@ -22,11 +22,32 @@ const SEP_PUSH_MAX: f32 = 2.5;
 /// his ready stance (at ease `body_ease`). A soldier is 0.75 to 1.1 m
 /// across with his arms, shield and weapon. Never more than a pair's own
 /// rest distance, so the men of a wall keep their 1.05 m files.
+/// The contact between two soldiers reads it through `ready_body`.
 /// FL_BODY=<metres> sets it, up to the separation distance.
 const BODY_DISTANCE: f32 = 1.2;
 pub(crate) fn body_distance() -> f32 {
     static D: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
     *D.get_or_init(|| crate::util::env_or("FL_BODY", BODY_DISTANCE).clamp(0.5, SEP_RADIUS))
+}
+/// The body of a soldier in his ready stance in the contact between two
+/// soldiers (`widths`): under the friction contact (`friction_contact`)
+/// it is the body at ease (BODY_EASE, as FL_BODY_EASE sets it), and
+/// `body_distance` without it. Under the friction contact a soldier stops
+/// pushing into still soldiers when they are at his width with arms and
+/// shield (BRAKE_NEAR, 0.9 m). A ready body wider than that would stand
+/// inside every neighbour at the fighting line, and every turn or death
+/// there would throw the soldiers around it. The wall clearance and the
+/// places on a walk keep reading `body_distance`.
+pub(crate) fn ready_body() -> f32 {
+    static D: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *D.get_or_init(|| {
+        ready_body_of(friction_contact(), crate::util::env_or("FL_BODY_EASE", BODY_EASE), body_distance())
+    })
+}
+/// `ready_body` from its inputs: under the friction contact the body at
+/// ease, else the body distance.
+fn ready_body_of(friction: bool, ease: f32, body: f32) -> f32 {
+    (if friction { ease } else { body }).clamp(0.5, SEP_RADIUS)
 }
 /// Crowd-density yield: a man's drive fades to nothing as the crowd around
 /// him (his neighbours' closeness summed, one each at a touch) rises
@@ -53,13 +74,15 @@ pub(crate) fn crowd_brake() -> (f32, f32) {
 }
 /// The body distance at ease: a man standing, walking or running with
 /// his arms down is narrower than one in his ready stance with weapon
-/// and shield up (BODY_DISTANCE). The spring rest at ease stays the same
-/// 0.2 m over the body (`Width`). FL_BODY_EASE=<metres> sets it, up to
-/// the body in the ready stance.
+/// and shield up (`ready_body`); under the friction contact the two are
+/// the same. The spring rest at ease stays the same 0.2 m over the body
+/// (`Width`): it is measured from BODY_DISTANCE, not from the body in the
+/// ready stance. FL_BODY_EASE=<metres> sets it, up to the body in the
+/// ready stance.
 const BODY_EASE: f32 = 0.9;
 pub(crate) fn body_ease() -> f32 {
     static D: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-    *D.get_or_init(|| crate::util::env_or("FL_BODY_EASE", BODY_EASE).clamp(0.5, body_distance()))
+    *D.get_or_init(|| crate::util::env_or("FL_BODY_EASE", BODY_EASE).clamp(0.5, ready_body()))
 }
 /// The spring rest at ease (metres).
 pub(crate) fn sep_ease() -> f32 {
@@ -121,35 +144,38 @@ pub(crate) const WIDTH_LEVELS: usize = 16;
 pub(crate) const SQUEEZE_DEPTH: f32 = 0.5;
 pub(crate) fn widths() -> &'static [Width; WIDTH_LEVELS] {
     static W: std::sync::OnceLock<[Width; WIDTH_LEVELS]> = std::sync::OnceLock::new();
-    W.get_or_init(|| {
-        let scale = crate::unit_types::unit_scale();
-        let pose = |level: usize| {
-            let t = level as f32 / 3.0;
-            let mix = |ease: f32, ready: f32| ease * (1.0 - t) + ready * t;
-            let body = mix(body_ease(), body_distance());
-            let sep = mix(sep_ease(), SEP_RADIUS);
-            let at = |d: f32| 6.0 * (1.0 - (d * scale).min(sep) / sep);
-            Width {
-                body,
-                sep,
-                slow: at(mix(body_ease() + 0.1, BRAKE_FAR)),
-                stop: at(mix(body_ease() - 0.2, BRAKE_NEAR)),
-            }
-        };
-        std::array::from_fn(|level| {
-            let (w, turn) = (pose(level % 4), level / 4);
-            if turn == 0 {
-                return w;
-            }
-            let (t, ease) = (turn as f32 / 3.0, pose(0));
-            let mix = |square: f32, turned: f32| square + (turned - square) * t;
-            Width {
-                body: mix(w.body, SQUEEZE_DEPTH),
-                sep: mix(w.sep, SQUEEZE_DEPTH),
-                slow: mix(w.slow, ease.slow),
-                stop: mix(w.stop, ease.stop),
-            }
-        })
+    W.get_or_init(|| widths_of(body_ease(), ready_body(), crate::unit_types::unit_scale()))
+}
+/// The width levels from the body at ease, the body in the ready stance
+/// and the unit scale (`widths`).
+fn widths_of(body_ease: f32, ready_body: f32, scale: f32) -> [Width; WIDTH_LEVELS] {
+    let sep_ease = body_ease + SEP_RADIUS - BODY_DISTANCE;
+    let pose = |level: usize| {
+        let t = level as f32 / 3.0;
+        let mix = |ease: f32, ready: f32| ease * (1.0 - t) + ready * t;
+        let body = mix(body_ease, ready_body);
+        let sep = mix(sep_ease, SEP_RADIUS);
+        let at = |d: f32| 6.0 * (1.0 - (d * scale).min(sep) / sep);
+        Width {
+            body,
+            sep,
+            slow: at(mix(body_ease + 0.1, BRAKE_FAR)),
+            stop: at(mix(body_ease - 0.2, BRAKE_NEAR)),
+        }
+    };
+    std::array::from_fn(|level| {
+        let (w, turn) = (pose(level % 4), level / 4);
+        if turn == 0 {
+            return w;
+        }
+        let (t, ease) = (turn as f32 / 3.0, pose(0));
+        let mix = |square: f32, turned: f32| square + (turned - square) * t;
+        Width {
+            body: mix(w.body, SQUEEZE_DEPTH),
+            sep: mix(w.sep, SQUEEZE_DEPTH),
+            slow: mix(w.slow, ease.slow),
+            stop: mix(w.stop, ease.stop),
+        }
     })
 }
 /// A pair of men by their width levels: their spring rest, its inverse,
@@ -169,18 +195,62 @@ pub(crate) struct PairWidth {
 }
 pub(crate) fn pair_widths() -> &'static [[PairWidth; WIDTH_LEVELS]; WIDTH_LEVELS] {
     static T: std::sync::OnceLock<[[PairWidth; WIDTH_LEVELS]; WIDTH_LEVELS]> = std::sync::OnceLock::new();
-    T.get_or_init(|| {
-        let w = widths();
-        std::array::from_fn(|a| {
-            std::array::from_fn(|b| {
-                let mut sep = 0.5 * (w[a].sep + w[b].sep);
-                let hard = (0.5 * (w[a].body + w[b].body)).min(sep);
-                sep += (hard - sep) * ((a / 4).max(b / 4) as f32 / 3.0);
-                PairWidth { sep, inv_sep: 1.0 / sep, hard }
-            })
-        })
-    })
+    T.get_or_init(|| std::array::from_fn(|a| std::array::from_fn(|b| pair_width_of(a, 1.0, b, 1.0))))
 }
+/// A pair of men by their width levels and the share of his body each
+/// still has (`fall_share`, 1 for a living soldier): each man's body and
+/// spring rest times his share, then the pair's as in the table. A share
+/// of 1 is the table's entry to the bit. The same from either side.
+#[inline]
+pub(crate) fn pair_width_of(a: usize, share_a: f32, b: usize, share_b: f32) -> PairWidth {
+    pair_of(widths(), a, share_a, b, share_b)
+}
+/// `pair_width_of` on a given set of width levels.
+#[inline]
+fn pair_of(w: &[Width; WIDTH_LEVELS], a: usize, share_a: f32, b: usize, share_b: f32) -> PairWidth {
+    let mut sep = 0.5 * (w[a].sep * share_a + w[b].sep * share_b);
+    let hard = (0.5 * (w[a].body * share_a + w[b].body * share_b)).min(sep);
+    sep += (hard - sep) * ((a / 4).max(b / 4) as f32 / 3.0);
+    PairWidth { sep, inv_sep: 1.0 / sep, hard }
+}
+/// Under the friction contact, a soldier who is struck down falls over his
+/// death clock instead of in single ticks. While he dies he keeps the
+/// weight he had when he was struck: his stance, the turn of his shoulders
+/// and his stood bit stay as they were (`scan`, `try_a_side`, `steer`), and
+/// he is braced in the setting apart as a living soldier in that state
+/// (`brace_level`). And his body goes down: its width and spring rest
+/// shrink with the share of his death clock that is left, whole on his
+/// first tick down and nothing on his last (`fall_share`), so the men
+/// around him close over the place he fell a little each tick, and nothing
+/// overlaps him when he is swept. Without the friction contact a dying
+/// soldier weighs nothing from the tick he is struck and his whole body
+/// stays until it is swept.
+#[inline]
+pub(crate) fn fall() -> bool {
+    friction_contact()
+}
+/// The share of his body a soldier still has, from his death clock as the
+/// grid carries it (spatial.rs META_FALL): 1 alive and on his first tick
+/// down (DEATH_TICKS), falling a step a tick to nothing on his last tick
+/// in the grid (2: on the tick his clock reaches 1 he is swept). Both
+/// soldiers of a pair read it from the same clock, so they read the same.
+#[inline]
+pub(crate) fn fall_share(death_t: u8) -> f32 {
+    const LAST: u8 = 2;
+    if death_t == 0 {
+        return 1.0;
+    }
+    (death_t.saturating_sub(LAST) as f32 / (crate::sim::damage::DEATH_TICKS - LAST) as f32).min(1.0)
+}
+/// The widest pair's spring rest over the pair table (`pair_widths`),
+/// for the scan's cut of its foes.
+fn widest_rest() -> f32 {
+    static R: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *R.get_or_init(|| pair_widths().iter().flatten().fold(0.0f32, |r, w| r.max(w.sep)))
+}
+/// The scan's cut of its foes (`scan`): metres past the farthest a foe can
+/// be and still count, far above the float rounding of a position on the map.
+const CUT_MARGIN: f32 = 0.01;
 /// A pair of men by their kinds: the mass weight of the push on the
 /// first (2 m_o / (m_i + m_o)) and the other's share of a closing speed
 /// (m_o / (m_i + m_o)).
@@ -196,14 +266,308 @@ pub(crate) fn mass_pairs() -> &'static [[(f32, f32); crate::unit_types::NUM_KIND
         })
     })
 }
-/// The contact between a man and the body he runs into. By default the
-/// two share the closing speed by weight (half each between equal men),
-/// so a shove travels through a press and a deep mass pushes a line.
-/// FL_CONTACT=wall plays the soft wall instead: the runner's legs lose
-/// the closing speed over his give and the man hit is handed none of it.
+/// The contact between a man and the body he runs into when the friction
+/// contact is off. FL_CONTACT=share: the two share the closing speed by
+/// weight (half each between equal men), so a shove travels through a
+/// press and a deep mass pushes a line. FL_CONTACT=wall plays the soft
+/// wall instead: the runner's legs lose the closing speed over his give
+/// and the man hit is handed none of it.
 fn share_contact() -> bool {
     static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *S.get_or_init(|| !std::env::var("FL_CONTACT").is_ok_and(|v| v == "wall"))
+}
+/// The friction contact, on by default; FL_CONTACT=share or FL_CONTACT=wall
+/// turns it off (`share_contact`). No spring between men, no grip, no
+/// stance and no contact speed. The setting apart moves him, his kept
+/// speed is where he ended up, and what the contacts put into that speed
+/// his feet take back at FEET (`steer`, `integrate`).
+/// The one thing that stands in for a stance is the bracing: in the
+/// setting apart a man braced against a push (`brace_pairs`) holds his
+/// ground, and the man who walks into him takes most of it.
+pub(crate) fn friction_contact() -> bool {
+    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *S.get_or_init(|| !std::env::var("FL_CONTACT").is_ok_and(|v| v == "share" || v == "wall"))
+}
+/// Under the friction contact, how many times his weight a man braced
+/// against a push counts for when two bodies are set apart: his feet are
+/// planted and his weight is behind his shield, so the man who walks into
+/// him is the one who gives. He is braced as far as he is in his ready
+/// stance (`pose_level`, a third of the way at each level) while he stands
+/// (`steer`, the `stood` column), whatever his regiment's order. He
+/// becomes a walker when his own wish to move reaches the speed of a step.
+/// On the walk to his place with nothing else to do (`on_his_way`), in a
+/// fighting regiment's rear ranks too, he stands again only once he has
+/// arrived there, within STEP_STOP, or his own rule tells him to stand
+/// where he is (`has_arrived`, `still_stands`); a soldier under fight
+/// footwork stands again as soon as his wish drops under that speed. So a
+/// jammed soldier on his way, whose wish slides with the few centimetres a
+/// shove moves him, does not change his weight back and forth. The
+/// sidestep of a jammed soldier's try at a side (`try_a_side`) is not part
+/// of that wish: trying a side, a standing soldier still stands. This is
+/// the standing bracing, the one that meets a charge, and it counts
+/// against any body. A walking soldier does not have it (he may have the
+/// walking bracing against the other side, `BRACE_BASIC`), and neither
+/// does a dying man unless he falls over his death clock (`fall`),
+/// keeping what he had. A push does not take him out of it, only his own
+/// walking does. This is a man bracing his body, not a spearwall's braced
+/// points. FL_BRACE=<number> sets it, from 1 (his own weight, as without
+/// it) to 20.
+const BRACE: f32 = 4.0;
+fn brace() -> f32 {
+    static B: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *B.get_or_init(|| crate::util::env_or("FL_BRACE", BRACE).clamp(1.0, 20.0))
+}
+/// Whether a walker on the walk to his place has stopped walking: he is
+/// there, within STEP_STOP; he is a holding soldier parked inside the hold
+/// deadzone (`drive`); or his own rule told him to stand where he is this
+/// tick (`told_to_stand`: `hold_the_frame` zeroed his wish, a holding
+/// soldier of a fighting regiment with a comrade between him and his
+/// mark). A wish that is merely small is not arrival.
+#[inline]
+fn has_arrived(place_dist: f32, parked: bool, told_to_stand: bool) -> bool {
+    place_dist <= STEP_STOP || parked || told_to_stand
+}
+/// Whether a soldier on the walk to his place stands this tick, for his
+/// bracing and his stance: a wish at or over the speed of a step makes him
+/// a walker; under it a standing soldier still stands, and a walking one
+/// stands again only when he has arrived at his place.
+#[inline]
+fn still_stands(was_stood: bool, wish_under_line: bool, arrived: bool) -> bool {
+    wish_under_line && (was_stood || arrived)
+}
+/// Under the friction contact, the walking bracing: how many times his
+/// weight a soldier in his ready stance counts for against a body of the
+/// other side while he walks or runs. He keeps his weight behind his
+/// shield as he goes, so an enemy who walks into him does not pass through
+/// him as through a walker. Against his own side a walking soldier weighs
+/// as a walker. It is by his pose level as `BRACE` is, and a soldier whose
+/// regiment is under a Move order (sim/job.rs `moving`) or a dying soldier
+/// does not have it (a falling one keeps it, `fall`). A soldier who stands
+/// has the standing bracing (`BRACE`) against every body instead. Both
+/// sides have it alike: it reads only whether the two bodies are of one
+/// side.
+const BRACE_BASIC: f32 = 4.0;
+/// His brace level in a pair: 0 not braced (weight 1); 1 to 3 standing,
+/// braced by his pose level (`BRACE`); 4 to 6 walking, braced against the
+/// other side by his pose level, 4 + pose level - 1 (`BRACE_BASIC`).
+const BRACE_LEVELS: usize = 7;
+/// Where the walking bracing's levels start (`BRACE_LEVELS`).
+const BRACE_BASIC_FROM: usize = 4;
+/// How many times his mass a man at brace level `b` counts for: standing,
+/// 1 + (brace - 1) x pose level / 3; walking, 1 + (basic - 1) x pose
+/// level / 3.
+fn brace_mult(b: usize, brace: f32, basic: f32) -> f32 {
+    if b < BRACE_BASIC_FROM {
+        1.0 + (brace - 1.0) * b as f32 / 3.0
+    } else {
+        1.0 + (basic - 1.0) * (b - BRACE_BASIC_FROM + 1) as f32 / 3.0
+    }
+}
+/// The weight of the setting apart on a man of mass `mi` at brace level
+/// `bi` from one of mass `mo` at level `bo`, with a fully braced man
+/// counting `brace` (standing) or `basic` (walking) times his mass:
+/// 2 m_o / (m_i + m_o) over the braced masses. Two men braced alike share
+/// it by their own masses, exactly as `mass_pairs`, so the weights of a
+/// pair sum to 2 whatever their levels.
+fn brace_weight(mi: f32, mo: f32, bi: usize, bo: usize, brace: f32, basic: f32) -> f32 {
+    if bi == bo {
+        return 2.0 * mo / (mi + mo);
+    }
+    let (mi, mo) = (mi * brace_mult(bi, brace, basic), mo * brace_mult(bo, brace, basic));
+    2.0 * mo / (mi + mo)
+}
+/// 4 kinds x 4 kinds x 7 levels x 7 levels of f32: 3,136 bytes, read by
+/// one row (his kind, his level) per soldier.
+type BraceTable =
+    [[[[f32; BRACE_LEVELS]; BRACE_LEVELS]; crate::unit_types::NUM_KINDS]; crate::unit_types::NUM_KINDS];
+fn brace_table(brace: f32, basic: f32) -> BraceTable {
+    std::array::from_fn(|a| {
+        std::array::from_fn(|o| {
+            std::array::from_fn(|bi| {
+                std::array::from_fn(|bo| brace_weight(TYPES[a].mass, TYPES[o].mass, bi, bo, brace, basic))
+            })
+        })
+    })
+}
+/// The friction contact's weights of the setting apart, by his kind, the
+/// other's kind, his brace level and the other's: a table read per
+/// overlapping neighbour instead of a division (`pair_widths`).
+fn brace_pairs() -> &'static BraceTable {
+    static T: std::sync::OnceLock<BraceTable> = std::sync::OnceLock::new();
+    T.get_or_init(|| brace_table(brace(), BRACE_BASIC))
+}
+/// A soldier's brace level in a pair under the friction contact, from what
+/// both soldiers of the pair read alike in the grid: standing (`stood`),
+/// his pose level against anyone; walking, against the other side
+/// (`cross`) and not under a Move order, the walking bracing's level for
+/// his pose; else 0. A dying soldier is 0, unless he falls over his death
+/// clock (`fall`): then he is braced as a living soldier in the same
+/// state. `moving` is called only when the walking bracing could count,
+/// so a neighbour's regiment is read only then.
+#[inline]
+fn brace_level(
+    pose_lv: usize,
+    stood: bool,
+    dying: bool,
+    fall: bool,
+    cross: bool,
+    moving: impl FnOnce() -> bool,
+) -> usize {
+    if dying && !fall {
+        0
+    } else if stood {
+        pose_lv
+    } else if cross && pose_lv > 0 && !moving() {
+        BRACE_BASIC_FROM + pose_lv - 1
+    } else {
+        0
+    }
+}
+/// Under the friction contact the crowd's brake reads the still men ahead
+/// of his wish (`crowd_still`), against a band half as wide. FL_BRAKE=density
+/// keeps the brake on every neighbour's closeness, as without it.
+fn still_brake() -> bool {
+    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *S.get_or_init(|| friction_contact() && !std::env::var("FL_BRAKE").is_ok_and(|v| v == "density"))
+}
+/// Under the friction contact's brake a soldier out of formation with no
+/// enemy in his reach walks to the fight like any walker: his wish to go
+/// to the enemy he remembers, straight ahead to his regiment's fighting
+/// line, or to his regiment's fight is made in `drive` (`join_goal`) in
+/// place of the walk to his slot, so the scan reads the men ahead of him
+/// on that way, and the still men ahead stop him there (`yield_to_crowd`)
+/// as they stop every walker. He does not wait at arm's length behind a
+/// comrade and move up in hops. Once the men ahead have stopped him behind
+/// a comrade in his way he stands, braced, with no wish, until a short
+/// step of room opens ahead (`drive`, `steer`). Without that brake he
+/// joins through `close_in`.
+fn joins_as_walker() -> bool {
+    still_brake()
+}
+/// The room (m) a standing joiner wants behind the man ahead before he
+/// steps up: his look calls a comrade "in his way" only within a ready
+/// body plus this (`look_around`), so he steps up once a short step of
+/// room has opened, and from formation spacing every rank first closes up
+/// to the bodies ahead.
+const JOIN_ROOM: f32 = 0.3;
+/// The enemy he remembers (`target` at the tick's start) as one still to
+/// go for: a living index of the other team within his sight plus a
+/// metre, and with his regiment focused on one target, a man of it or
+/// one within his threat distance. Returns the squared distance to him
+/// (f32::MAX for an index out of range or of his own team) and whether he
+/// counts. The scan's `memo_valid` and the join in `drive` both read it.
+#[inline]
+fn remembered_foe(f: &Field, i: usize, p: Vec2, gi: usize, memo: usize) -> (f32, bool) {
+    let Field { pos_prev, team, group, focus, .. } = *f;
+    if memo >= pos_prev.len() || team[memo] == team[i] {
+        return (f32::MAX, false);
+    }
+    let d2 = pos_prev[memo].xz().distance_squared(p);
+    let ok = d2 < (seek_radius() + 1.0) * (seek_radius() + 1.0)
+        && focus[gi].is_none_or(|t| group[memo] == t || d2 < threat_radius() * threat_radius());
+    (d2, ok)
+}
+/// Under the friction contact, a soldier surrounded by bodies does not
+/// sprint, he walks: with other bodies overlapping his own on all four
+/// sides his wish is this long at most (m/s, a human walk), and he goes at
+/// his full speed once a side of him is free (`steer`). How far he is
+/// surrounded is read from the side that is pressed least (`press_shares`,
+/// CROWD_DEPTH), so the wish goes over from his full speed to the walk
+/// without a jump.
+const CROWD_WALK: f32 = 1.5;
+/// How deep another body is in his own, from the touch (the pair's body
+/// distance) on, at which it presses on him in full for the crowd walk (m).
+/// Of the soldiers running in a packed mass, 85 in 100 have a body at
+/// least this deep in theirs on every side; of the soldiers moving on a
+/// stair or a wall crossing, 2 to 12 in 100.
+const CROWD_DEPTH: f32 = 0.1;
+/// How much of a body lies on each of his four sides about his wish
+/// (ahead, behind, left, right): 1 within 30 degrees of the side's
+/// direction, falling to nothing at 60 degrees, so a body between two
+/// sides counts in part for both and none of the four jumps as it moves
+/// around him. `n` is the unit vector from the body to him, `wish_dir` his
+/// wish's direction.
+#[inline]
+fn press_shares(n: Vec2, wish_dir: Vec2) -> [f32; 4] {
+    let along = -n.dot(wish_dir);
+    let lat = wish_dir.y * n.x - wish_dir.x * n.y;
+    let share = |c: f32| ((c - 0.5) * (1.0 / (0.866_025_4 - 0.5))).clamp(0.0, 1.0);
+    [share(along), share(-along), share(lat), share(-lat)]
+}
+/// His wish in a press: `surrounded` is how deep the least pressed of his
+/// four sides is in a body (0 free, 1 in full). Free, his wish is
+/// untouched; surrounded in full it is the walk at most; between the two
+/// its length lies between them. The direction is kept, and a wish under
+/// the walk is untouched.
+#[inline]
+fn press_walk(surrounded: f32, wish: Vec2, walk: f32) -> Vec2 {
+    let len = wish.length();
+    if surrounded <= 0.0 || len <= walk {
+        wish
+    } else {
+        wish * ((len + (walk - len) * surrounded.min(1.0)) / len)
+    }
+}
+/// The friction contact's feet: each tick they take back up to this much
+/// (m/s^2) of the speed the contacts have put into him.
+const FEET: f32 = 7.0;
+/// The still-man brake's crawl (m/s): a man ahead who moved along the
+/// reader's way at this speed or faster last tick counts nothing.
+const CRAWL: f32 = 0.3;
+/// The feet's take this tick: up to FEET x dt along what the contacts put
+/// into his speed.
+#[inline]
+fn feet_take(imposed: Vec2, dt: f32) -> Vec2 {
+    let il = imposed.length();
+    if il > 1e-12 { imposed * (il.min(FEET * dt) / il) } else { Vec2::ZERO }
+}
+/// How still a man ahead stands for the brake: 1 when he stood or came at
+/// the reader, nothing when he moved along the reader's way at CRAWL.
+#[inline]
+fn still_weight(o_vel: Vec2, wish_dir: Vec2) -> f32 {
+    (1.0 - o_vel.dot(wish_dir) / CRAWL).clamp(0.0, 1.0)
+}
+/// Whether a man of a regiment standing ready stands, below the speed of
+/// his steps. Under the friction contact it is where he is trying to go,
+/// so a push he gets does not take him out of the ready stance and only
+/// his own walking does; else it is how fast he moved last tick. For his
+/// bracing (`steer`) that wish leaves out the sidestep of a soldier's try
+/// at a side. It is the line a wish crosses, not yet whether he stands:
+/// on the walk to his place with nothing else to do a walker stays one
+/// until he arrives (`still_stands`).
+#[inline]
+fn stands(friction: bool, kept: Vec2, wish: Vec2) -> bool {
+    let v = if friction { wish } else { kept };
+    v.length_squared() < STEP_FACE_SPEED * STEP_FACE_SPEED
+}
+/// Whether his wish this tick is the drive to his place and nothing else
+/// (`still_stands`): alive and not broken, his regiment not in its melee
+/// (so no joining), himself in formation, no enemy in his reach or in his
+/// mind, and no blow, parry or draw under way. His regiment may be
+/// engaged: a soldier in the rear ranks of a fighting regiment with no
+/// enemy in reach or in mind walks to his place like any other. Fight
+/// footwork (`close_in`, `decide_to_join`, `swing`) steers only a soldier
+/// this is false for; `hold_the_frame` may still stop him where he stands,
+/// which ends his walk (`has_arrived`). The scan reads it before
+/// `decide_to_join` and `swing` run, so it sees his formation and his
+/// swing as they were kept from last tick.
+#[inline]
+fn on_his_way(s: &Soldier, st: &Step) -> bool {
+    !st.dying
+        && !st.routed
+        && !st.in_melee
+        && !st.committed
+        && st.join_fp.is_none()
+        && st.best_idx == u32::MAX
+        && !st.memo_valid
+        && *s.swing & crate::units::SWING_STATE_MASK == crate::units::SWING_READY
+}
+/// What the contacts have put into his speed and his feet have not taken
+/// back, after this tick's step: the old total plus the kept speed less
+/// the legs' speed, never more than a step's pace.
+#[inline]
+fn held_total(imposed: Vec2, kept: Vec2, legs_v: Vec2) -> Vec2 {
+    (imposed + (kept - legs_v)).clamp_length_max(STEP_PACE)
 }
 const STEER_GAIN: f32 = 3.0;
 const MAX_ACCEL: f32 = 50.0;
@@ -214,6 +578,47 @@ const MAX_ACCEL: f32 = 50.0;
 /// and stop as one body. The spring's push and the contact are not legs
 /// and keep MAX_ACCEL.
 pub(crate) const LEG_ACCEL: f32 = 4.0;
+/// How far a lone soldier who wants no speed (a staggered man, `steer`)
+/// goes from a speed `u` before he is at rest, ticking his stopping rule
+/// under the friction contact: each tick his feet take FEET x dt off what
+/// a contact put into his speed, which starts at `u` held to STEP_PACE
+/// (`held_total`), and then his legs brake toward zero, STEER_GAIN times
+/// his speed but LEG_ACCEL at most. Once his feet are done and his legs
+/// are under their cap his speed falls by the same share every tick, and
+/// what is left of the way is that geometric sum.
+fn rest_distance(u: f32, dt: f32) -> f32 {
+    let mut v = u;
+    let mut held = u.min(STEP_PACE);
+    let mut way = 0.0;
+    while held > 0.0 || STEER_GAIN * v > LEG_ACCEL {
+        let cut = held.min(FEET * dt);
+        v -= cut;
+        held -= cut;
+        v -= (STEER_GAIN * v).clamp(-LEG_ACCEL, LEG_ACCEL) * dt;
+        way += v * dt;
+    }
+    way + v * (1.0 - STEER_GAIN * dt) / STEER_GAIN
+}
+/// The speed at which a lone soldier who wants no speed comes to rest `d`
+/// metres on (`rest_distance`): under the friction contact the charge
+/// blow's shove on his speed, which knocks him back as far as the one-tick
+/// jump without it moves him (sim/damage.rs).
+/// The way grows with the speed, so the speed is found by halving.
+pub(crate) fn shove_speed(d: f32, dt: f32) -> f32 {
+    if d <= 0.0 || dt <= 0.0 {
+        return 0.0;
+    }
+    let mut hi = 1.0;
+    while rest_distance(hi, dt) < d && hi < 1000.0 {
+        hi *= 2.0;
+    }
+    let mut lo = 0.0;
+    for _ in 0..40 {
+        let mid = 0.5 * (lo + hi);
+        if rest_distance(mid, dt) < d { lo = mid } else { hi = mid }
+    }
+    0.5 * (lo + hi)
+}
 /// Facing turn smoothing (fraction/s of the remaining angle) — the
 /// settle behavior for SMALL corrections.
 const YAW_RATE: f32 = 10.0;
@@ -240,6 +645,38 @@ const CORR_GAIN: f32 = 0.15;
 const CORR_MAX: f32 = 0.1;
 /// Units slow down proportionally inside this distance to the target.
 const ARRIVE_RADIUS: f32 = 35.0;
+
+/// The share of his pace a soldier wants at `dist` metres from where he
+/// walks to, slowing over the last `arrive` metres. A soldier on a route
+/// (`through`) keeps his pace, and so does a soldier whose regiment is in
+/// its charge (`charge_run`): he runs on until bodies stop him.
+fn arrive_share(dist: f32, arrive: f32, through: bool, charge_run: bool) -> f32 {
+    if through || charge_run { 1.0 } else { (dist / arrive).min(1.0) }
+}
+
+/// Under the friction contact a soldier of a regiment in its charge does
+/// not slow for his place: his regiment's places lie at the enemy's
+/// outline, often inside a friend that fights there, and he would slow to
+/// a walk short of that friend's back while the charge cry plays.
+fn charge_runs_home() -> bool {
+    friction_contact()
+}
+/// Under the friction contact the soldiers of a regiment under an Attack
+/// order do not step backward to their places (`hold_the_frame`), so a
+/// regiment that ran in behind a friend stays piled up.
+fn pile_stays() -> bool {
+    friction_contact()
+}
+/// Under the friction contact a soldier of a regiment in its charge keeps
+/// his whole wish to run in: the soldiers ahead of him do not fade it
+/// (`yield_to_crowd`), so the regiment does not halt as one when its first
+/// soldiers touch a standing friend. The still men ahead still slow his
+/// body as they slow anyone's (`body_jam`, `steer`): he runs until he
+/// reaches them and then presses on them, so two charging regiments do not
+/// run through each other's ranks.
+fn charge_runs_in() -> bool {
+    friction_contact()
+}
 /// How close to his slot a parked man stands without stepping (metres):
 /// rigid slots sit exactly at the separation rest distance, so a dressed
 /// rank is force-free and can afford a tight tolerance; with 1.5 the
@@ -314,15 +751,21 @@ fn own_spread(i: usize) -> f32 {
     0.7 + 0.6 * crate::units::hash01((i as u32).wrapping_mul(0x51ED).wrapping_add(77))
 }
 
-/// A man of a regiment in melee who sees no enemy joins the fight when
-/// he sees the comrade beside him run toward it: in each half-second
-/// window he reacts with this chance (FL_JOIN_REACT overrides), so the
-/// line rolls up from the contact outward, a man at a time, as in
-/// M2TW when a deep unit hits a wide line. Once going he keeps going.
+/// When a soldier still in formation reacts to an enemy he sees, or to a
+/// comrade of his regiment going to the fight. Under the rule of joining
+/// as a walker (`joins_as_walker`) he leaves at once: the chance is 1, and
+/// the only spread left is his look, which comes every few ticks in his
+/// own rhythm. Without that rule he reacts with a chance of 0.2 in each
+/// half-second window, so the line rolls up from the contact outward, a
+/// man at a time. FL_JOIN_REACT=<chance> sets the chance under either.
+/// Once going he keeps going.
 const JOIN_WINDOW: u32 = 15;
 fn join_react_chance() -> f32 {
     static P: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-    *P.get_or_init(|| crate::util::env_or("FL_JOIN_REACT", 0.2_f32).clamp(0.0, 1.0))
+    *P.get_or_init(|| {
+        let chance = if joins_as_walker() { 1.0_f32 } else { 0.2_f32 };
+        crate::util::env_or("FL_JOIN_REACT", chance).clamp(0.0, 1.0)
+    })
 }
 /// Ground speed toward the fight that reads as "going to it". A regiment
 /// starts a charge only when its centre closes on its target this fast
@@ -466,6 +909,9 @@ pub(crate) struct Field<'a> {
     pub engaged: &'a [bool],
     pub contact: &'a [bool],
     pub fight_point: &'a [Option<Vec2>],
+    /// Per regiment, its fighting line along `form_face` (NaN none;
+    /// orders.rs `fight_line`).
+    pub fight_line: &'a [f32],
     pub melee_ticks: &'a [u32],
     pub hold: &'a [bool],
     pub threat: &'a [Vec2],
@@ -519,6 +965,9 @@ pub(crate) struct Soldier<'a> {
     pub quarry: &'a mut u32,
     pub stuck: &'a mut u16,
     pub aim: &'a mut Vec2,
+    pub imposed: &'a mut Vec2,
+    /// He stood last tick (`steer`); read by the scan, then written anew.
+    pub stood: &'a mut bool,
 }
 
 /// The rows of one chunk of soldiers, in index order.
@@ -542,6 +991,8 @@ pub(crate) struct Rows<'a> {
     pub quarry: &'a mut [u32],
     pub stuck: &'a mut [u16],
     pub aim: &'a mut [Vec2],
+    pub imposed: &'a mut [Vec2],
+    pub stood: &'a mut [bool],
 }
 
 /// What a chunk emits beside its rows: landed swings and loosed arrows.
@@ -574,10 +1025,18 @@ struct Step {
     /// His share by weight of a closing speed on them (the shared speed).
     overlap_share: f32,
     crowd: f32,
+    /// The still men ahead of him (the friction contact's brake): the
+    /// neighbours within the spring on the half-plane ahead of his wish,
+    /// by their closeness and by how little they moved along his way.
+    crowd_still: f32,
     /// The crowd ahead of him on his way: the neighbours within the
     /// spring whose direction is within 60 degrees of his wish, by their
     /// closeness (`try_a_side`).
     ahead: f32,
+    /// How deep a body is in his on each of his four sides about his wish
+    /// (ahead, behind, left, right; 0 none, 1 in full; `press_shares`, the
+    /// crowd walk in `steer`).
+    press4: [f32; 4],
     /// The crowd at which his drive starts to fade and is gone, for his
     /// width (`Width`).
     brake: (f32, f32),
@@ -593,6 +1052,18 @@ struct Step {
     may_leave: bool,
     committed: bool,
     join_fp: Option<Vec2>,
+    /// He walks to the fight (`joins_as_walker`): out of formation with no
+    /// enemy in his reach, his wish from `drive` is the way to the enemy
+    /// he remembers, to his regiment's fighting line or to its fight, not
+    /// to his slot (`join_goal`).
+    joining: bool,
+    /// He left his place to join the fight on this tick (`decide_to_join`):
+    /// he sets off as a walker, so his stood bit is cleared (`steer`) and he
+    /// walks up to the men ahead before he stands again (`drive`).
+    set_off: bool,
+    /// His wish to his slot from `drive`, kept when the join replaced it,
+    /// for the tick he comes back into formation (`decide_to_join`).
+    slot_wish: Vec2,
     // What he remembers and sees.
     memo_valid: bool,
     memo_d2: f32,
@@ -609,7 +1080,22 @@ struct Step {
     face_target: Option<Vec2>,
     /// His drive before the crowd's brake faded it (`try_a_side`).
     wish: Vec2,
+    /// What the crowd's brake has taken off his wish since `yield_to_crowd`,
+    /// so that `desired + fade` is his own wish unfaded (`steer`).
+    fade: Vec2,
+    /// The sidestep of his try at a side (`try_a_side`), part of `desired`;
+    /// left out of whether he stands (`steer`).
+    side: Vec2,
+    /// How far he is from his place (`drive`): his regiment's order or
+    /// anchor plus his slot, never a route's waypoint; and whether he is a
+    /// holding soldier inside the hold deadzone. Either within STEP_STOP or
+    /// parked, he has arrived (`steer`).
+    place_dist: f32,
+    parked: bool,
     jam: f32,
+    /// The press's hold on his body this tick (`steer`): the brake's value
+    /// before a charge takes his own stopping away.
+    body_jam: f32,
     new_v: Vec2,
     /// Where his step ends on the ground plane (`slide`).
     next: Vec2,
@@ -637,6 +1123,8 @@ struct Step {
 
 /// Run every soldier of a chunk through his tick.
 pub(crate) fn tick_chunk(f: &Field, rows: Rows, out: &mut ChunkOut) {
+    // The scan's scratch: the ranks of a man's candidates within its cut.
+    let mut cands: Vec<u32> = Vec::new();
     for j in 0..rows.pos.len() {
         let mut s = Soldier {
             i: rows.start + j,
@@ -658,17 +1146,19 @@ pub(crate) fn tick_chunk(f: &Field, rows: Rows, out: &mut ChunkOut) {
             quarry: &mut rows.quarry[j],
             stuck: &mut rows.stuck[j],
             aim: &mut rows.aim[j],
+            imposed: &mut rows.imposed[j],
+            stood: &mut rows.stood[j],
         };
         let mut st = begin(f, &mut s);
         drive(f, &mut s, &mut st);
-        scan(f, &mut s, &mut st, out);
+        scan(f, &mut s, &mut st, out, &mut cands);
         look_around(f, &mut s, &mut st);
         choose_opening(f, &mut s, &mut st);
         hold_the_frame(f, &mut st);
         acquire(f, &mut s, &mut st);
         decide_to_join(f, &mut s, &mut st);
         swing(f, &mut s, &mut st, out);
-        yield_to_crowd(&mut st);
+        yield_to_crowd(f, &mut st);
         try_a_side(f, &mut s, &mut st);
         close_in(f, &mut s, &mut st);
         steer(f, &mut s, &mut st);
@@ -742,7 +1232,9 @@ fn begin(f: &Field, s: &mut Soldier) -> Step {
         overlap_vel: Vec2::ZERO,
         overlap_share: 0.0,
         crowd: 0.0,
+        crowd_still: 0.0,
         ahead: 0.0,
+        press4: [0.0; 4],
         brake: (0.0, 0.0),
         best_idx: u32::MAX,
         sticky: false,
@@ -755,6 +1247,9 @@ fn begin(f: &Field, s: &mut Soldier) -> Step {
         may_leave,
         committed,
         join_fp,
+        joining: false,
+        set_off: false,
+        slot_wish: Vec2::ZERO,
         memo_valid: false,
         memo_d2: f32::MAX,
         memo_dir: Vec2::ZERO,
@@ -768,7 +1263,12 @@ fn begin(f: &Field, s: &mut Soldier) -> Step {
         back_blocked: false,
         face_target: None,
         wish: Vec2::ZERO,
+        fade: Vec2::ZERO,
+        side: Vec2::ZERO,
+        place_dist: f32::INFINITY,
+        parked: false,
         jam: 0.0,
+        body_jam: 0.0,
         new_v: Vec2::ZERO,
         next: Vec2::ZERO,
         open_on: false,
@@ -787,7 +1287,9 @@ fn begin(f: &Field, s: &mut Soldier) -> Step {
 /// Where he wants to go on his own account: a broken man flees for his
 /// map edge, a formed man walks to his slot under his regiment's order, at
 /// a pace set by slope and water, with a deadzone so a parked man does not
-/// jitter and a step that finishes once begun.
+/// jitter and a step that finishes once begun. Under the friction
+/// contact's brake a man out of formation with nobody in his reach walks
+/// to the fight instead (`joins_as_walker`, `join_goal`).
 #[inline]
 fn drive(f: &Field, s: &mut Soldier, st: &mut Step) {
     let Field { terrain, speed, team, home, orders, anchors, paths, .. } = *f;
@@ -822,6 +1324,7 @@ fn drive(f: &Field, s: &mut Soldier, st: &mut Step) {
     } else if !dying {
         let holding = orders[gi].is_none();
         let mut goal = orders[gi].unwrap_or(anchors[gi]) + home[i];
+        st.place_dist = goal.distance(p);
         // On a route, a man whose straight way to his slot is blocked
         // follows the route instead (sim/route.rs); short of the last leg
         // he keeps his pace. He reads the route every LOOK_TICKS, when he
@@ -854,7 +1357,8 @@ fn drive(f: &Field, s: &mut Soldier, st: &mut Step) {
         let stepping = s.vel.xz().length_squared()
             > (0.5 * STEP_PACE) * (0.5 * STEP_PACE);
         let deadzone = if stepping { STEP_STOP } else { HOLD_DEADZONE };
-        if !(holding && dist < deadzone) {
+        st.parked = holding && dist < deadzone;
+        if !st.parked {
             // Slope penalty: steep ground is slow ground. Wading the river is
             // slow too (the bridge deck is dry: full speed).
             let slope = terrain.slope_at(p.x, p.y);
@@ -864,11 +1368,14 @@ fn drive(f: &Field, s: &mut Soldier, st: &mut Step) {
             } else {
                 (1.0, ARRIVE_RADIUS)
             };
+            // In his regiment's charge (as `steer` gives the charge pace;
+            // dying and routed men never come here).
+            let charge_run = charge_runs_home() && f.charging[gi] && !f.fat_nocharge[gi];
             let mut desired_speed = speed[i]
                 * slope_mult
                 * terrain.wade_mult(p.x, p.y)
                 * gain
-                * if through { 1.0 } else { (dist / arrive).min(1.0) };
+                * arrive_share(dist, arrive, through, charge_run);
             if holding {
                 desired_speed = desired_speed
                     .max(STEP_PACE * slope_mult * terrain.wade_mult(p.x, p.y));
@@ -879,6 +1386,114 @@ fn drive(f: &Field, s: &mut Soldier, st: &mut Step) {
         }
     }
     st.desired = desired;
+    // Out of formation, with no enemy in his reach last tick and no blow
+    // under way, he walks to the fight instead of to his slot
+    // (`joins_as_walker`): the scan then reads the men ahead of him on
+    // that way, and the brake stops him at the still men ahead like any
+    // walker. His slot wish is kept for the tick he comes back into
+    // formation.
+    if joins_as_walker()
+        && !dying
+        && !routed
+        && st.committed
+        && *s.sight & SIGHT_FOE == 0
+        && *s.swing & crate::units::SWING_STATE_MASK == crate::units::SWING_READY
+    {
+        st.slot_wish = desired;
+        st.joining = true;
+        // Arrived at the men ahead: a comrade in his way by his last look
+        // and himself standing since the still men ahead stopped him
+        // (`steer` sets his stood bit then), he stands with no wish until
+        // a step of room opens ahead (JOIN_ROOM). His own standing is
+        // read, never his speed: in a packed regiment the bodies around
+        // him move him more than a centimetre a tick, and read from his
+        // speed that push would make him a walker again, unbraced, and the
+        // ranks behind a front would shake. A joiner who kept his wish
+        // while the soldiers ahead hold him would never brace, and any
+        // creep ahead would let the rear walk into the backs ahead and
+        // drift back.
+        let arrived = *s.sight & SIGHT_WAY != 0 && *s.stood;
+        st.desired = if arrived { Vec2::ZERO } else { join_goal(f, s, st).1 };
+    }
+}
+
+/// Where a soldier walking to the fight goes (`joins_as_walker`): the way
+/// (a unit vector, zero for none) and his wish along it. `drive` makes his
+/// wish from it and `look_around` looks along the way, so his looks and
+/// his facing follow the way he walks. In this order:
+/// - an enemy he remembers (`remembered_foe`) within the short look
+///   (WIDE_ACQUIRE_R): toward him;
+/// - his regiment facing a way and holding a fighting line, and himself
+///   more than a ready body behind that line along the facing
+///   (`behind_the_line`): straight ahead along the facing, so a fighting
+///   regiment's rear walks up as a block and not as a clump about one
+///   point;
+/// - the enemy he remembers within his closing range: toward him;
+/// - his regiment's fight point while more than a metre off;
+/// - else nowhere.
+///
+/// Toward an enemy he goes at the jog over open ground more than
+/// JOG_BEYOND from him, else at the advance, slowing over his last 0.8 m
+/// and standing at his own stopping distance, between nine tenths of his
+/// reach and just inside it. Straight ahead and to the fight point he goes
+/// at the jog, or at the advance with a comrade ahead. "A comrade ahead" is
+/// his last look (`look_around`).
+#[inline]
+fn join_goal(f: &Field, s: &Soldier, st: &Step) -> (Vec2, Vec2) {
+    let Field { pos_prev, engaged, hold, form_face, fight_line, .. } = *f;
+    let i = s.i;
+    let p = st.p;
+    let gi = st.gi;
+    let ahead = *s.sight & SIGHT_AHEAD != 0;
+    let memo = *s.target as usize;
+    let (d2, counts) = remembered_foe(f, i, p, gi, memo);
+    let dist = d2.sqrt();
+    let to_foe = |max_close: f32| {
+        let params = &TYPES[st.my_kind];
+        let to_enemy = pos_prev[memo].xz() - p;
+        let dir = to_enemy / dist.max(1e-6);
+        let own = crate::units::hash01((i as u32).wrapping_mul(0x3C1B) ^ 0x51F7);
+        let fight = FIGHT_SHARE * params.reach;
+        let stop = fight + 0.8 * (params.reach - fight) * own;
+        if dist <= stop || dist >= max_close {
+            return (dir, Vec2::ZERO);
+        }
+        let urge = ((dist - stop) / 0.8).clamp(0.0, 1.0);
+        let pace = if dist > JOG_BEYOND && !ahead { COMBAT_JOG_PACE } else { ADVANCE_PACE };
+        (dir, to_enemy * (pace * urge / dist))
+    };
+    let look = if engaged[gi] { seek_radius() } else { WIDE_ACQUIRE_R };
+    let max_close = if hold[gi] { 2.2 } else { look + 1.0 };
+    if counts && dist < WIDE_ACQUIRE_R {
+        return to_foe(max_close);
+    }
+    let face = form_face[gi];
+    let line = fight_line[gi];
+    if behind_the_line(face, line, p, ready_body()) {
+        let pace = if ahead { ADVANCE_PACE } else { COMBAT_JOG_PACE };
+        return (face, face * pace);
+    }
+    if counts {
+        return to_foe(max_close);
+    }
+    if let Some(fp) = st.join_fp {
+        let to_fp = fp - p;
+        let d = to_fp.length();
+        if d > 1.0 {
+            let pace = if ahead { ADVANCE_PACE } else { COMBAT_JOG_PACE };
+            return (to_fp / d, to_fp * (pace / d));
+        }
+        return (to_fp.normalize_or_zero(), Vec2::ZERO);
+    }
+    (Vec2::ZERO, Vec2::ZERO)
+}
+
+/// Whether a soldier at `p` stands more than `body` behind his regiment's
+/// fighting line `line` along its facing `face` (`join_goal`): never with
+/// no facing or no line (NaN).
+#[inline]
+fn behind_the_line(face: Vec2, line: f32, p: Vec2, body: f32) -> bool {
+    face != Vec2::ZERO && !line.is_nan() && line - p.dot(face) > body
 }
 
 /// The fused neighbour scan every man runs every tick over the 2 m box:
@@ -887,7 +1502,7 @@ fn drive(f: &Field, s: &mut Soldier, st: &mut Step) {
 /// fights), and, at charge speed against a spearwall, the braced point his
 /// body runs onto, which is a damage event from the spearman.
 #[inline]
-fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
+fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut, cands: &mut Vec<u32>) {
     let Field {
         grid,
         speed,
@@ -902,6 +1517,7 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
         anchors,
         home,
         passing,
+        moving,
         ..
     } = *f;
     let i = s.i;
@@ -910,17 +1526,25 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
     let gi = st.gi;
     let dying = st.dying;
     // Fused neighbor scan: separation physics + nearest living enemy in reach
-    // (swing targeting). Scalar over cache-ordered SortedUnits — an 8-wide
-    // SIMD variant measured slower here: candidate runs are too short for
-    // lane occupancy.
+    // (swing targeting), over the grid's cache-ordered units within the cut.
     let mut push = Vec2::ZERO;
     let mut corr = Vec2::ZERO;
     let mut overlap_vel = Vec2::ZERO;
     let mut overlap_share = 0.0f32;
     let mut overlap = 0.0f32;
     let mut crowd = 0.0f32;
+    let mut crowd_still = 0.0f32;
     let mut ahead = 0.0f32;
     let wish_dir = st.desired.normalize_or_zero();
+    // The still men ahead are read only for the friction contact's brake,
+    // and only by a man who wishes to go somewhere.
+    let still_on = still_brake() && st.desired.length_squared() >= 1e-12;
+    // The sides pressed against him, for the crowd walk under the
+    // friction contact: only a soldier who wishes to go somewhere has sides
+    // about his wish.
+    let sides_on = friction_contact() && st.desired.length_squared() >= 1e-12;
+    let mut press4 = [0.0f32; 4];
+    let inv_depth = 1.0 / CROWD_DEPTH;
     let my_team_bit = (team[i] as u32) * crate::spatial::META_TEAM;
     let my_wall = wall[gi] != 0;
     // His width and each neighbour's by their poses and the turn of their
@@ -960,6 +1584,29 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
     let (mut side_left, mut side_right) = (false, false);
     let pairs = &pair_widths()[my_level];
     let masses = &mass_pairs()[st.my_kind];
+    // Under the friction contact the setting apart weighs each man by how
+    // braced he is (`brace_pairs`): his own level from his pose and his
+    // stood bit at the tick's start, the ones the grid carries for him, and
+    // each neighbour's from the grid, so both men of a pair read the same
+    // two levels. The walking bracing counts only against the other side
+    // (`brace_level`), so his level against a friend and against a foe are
+    // kept apart.
+    let friction = friction_contact();
+    // A falling soldier's own share of his body, from his clock at the
+    // tick's start as the grid carries it (his own column has already
+    // counted down this tick, `begin`).
+    let fall_on = fall();
+    let my_share = if fall_on { fall_share(f.death_snap[i]) } else { 1.0 };
+    let my_stood = *s.stood;
+    let (my_brace_same, my_brace_cross) = if friction {
+        (
+            brace_level(pose_lv, my_stood, dying, fall_on, false, || moving[gi]),
+            brace_level(pose_lv, my_stood, dying, fall_on, true, || moving[gi]),
+        )
+    } else {
+        (0, 0)
+    };
+    let braces = if friction { Some(&brace_pairs()[st.my_kind]) } else { None };
     let gain = CORR_GAIN;
     let reach2 = params.reach * params.reach;
     let prev_target = *s.target;
@@ -985,19 +1632,43 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
     } else {
         QUERY_RADIUS.max(params.reach)
     };
-    grid.for_each_candidate_vel(p, scan_r, |o, o_vel| {
-        if o.idx as usize == i {
-            return;
-        }
+    // The farthest a foe can be and still count for anything below: the
+    // widest pair's spring rest, his weapon's reach, or at charge speed a
+    // braced spear's point. A friend counts only within SEP_RADIUS.
+    let spear_cut = if at_charge_speed {
+        (spear_reach * spear_reach + SPEAR_LINE_HALF_W * SPEAR_LINE_HALF_W).sqrt()
+    } else {
+        0.0
+    };
+    let foe_cut = widest_rest().max(params.reach).max(spear_cut) + CUT_MARGIN;
+    // First the candidates within the cut, by rank, in the walk's order:
+    // in a press, whether each passes is hard to predict, so each is written and
+    // kept by the test's outcome instead of by a branch on it. A friend
+    // beyond SEP_RADIUS can touch nothing of his, and most of a scan's
+    // candidates in a press are such men (the cells span more than the
+    // circle); a foe beyond `foe_cut` fails every foe test. The box stays
+    // `scan_r`'s, which the look around him reads again (`look_around`).
+    cands.clear();
+    cands.reserve(grid.box_len(p, scan_r));
+    let cut = crate::spatial::KeepCut {
+        team_bit: my_team_bit,
+        me: i as u32,
+        same_cut2: SEP_RADIUS * SEP_RADIUS,
+        foe_cut2: foe_cut * foe_cut,
+    };
+    // SAFETY: `box_len` counts every man of the box the walk visits, and
+    // the list has room for all of them; the first `n_kept` are written.
+    unsafe {
+        let n_kept = grid.kept_in_box(p, scan_r, &cut, cands.as_mut_ptr());
+        cands.set_len(n_kept);
+    }
+    let sorted = grid.sorted();
+    for &o_rank in cands.iter() {
+        let o = &sorted[o_rank as usize];
+        let o_vel = grid.sorted_vel(o_rank as usize);
         let d = p - o.xz();
         let d2 = d.length_squared();
-        // A friend beyond the widest spring rest can touch nothing of his:
-        // out before any of the pair's work. Most of a scan's candidates
-        // in a press are such men (the cells span more than the circle).
         let same = (o.meta & crate::spatial::META_TEAM) == my_team_bit;
-        if same && d2 >= SEP_RADIUS * SEP_RADIUS {
-            return;
-        }
         let enemy = !same && (o.meta & crate::spatial::META_DYING) == 0;
         if enemy && d2 < reach2 {
             sticky |= o.idx == prev_target;
@@ -1066,9 +1737,21 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
                 }
             }
         }
-        let pair = &pairs[crate::spatial::meta_width(o.meta)];
+        // A pair with a falling soldier in it (`fall`) is as far apart as
+        // what is left of his body: each man's body and rest by his share,
+        // a wall pair's rest too. Two living soldiers read the table.
+        let o_dying = (o.meta & crate::spatial::META_DYING) != 0;
+        let falling = fall_on && (dying | o_dying);
+        let fallen;
+        let (pair, wall_rest) = if falling {
+            let o_share = fall_share(crate::spatial::meta_fall(o.meta));
+            fallen = pair_width_of(my_level, my_share, crate::spatial::meta_width(o.meta), o_share);
+            (&fallen, WALL_SEP_RADIUS * (0.5 * (my_share + o_share)))
+        } else {
+            (&pairs[crate::spatial::meta_width(o.meta)], WALL_SEP_RADIUS)
+        };
         let (sep_r, inv_sep, hard) = if !cross && my_wall && (o.meta & crate::spatial::META_WALL) != 0 {
-            (WALL_SEP_RADIUS, 1.0 / WALL_SEP_RADIUS, pair.hard.min(WALL_SEP_RADIUS))
+            (wall_rest, 1.0 / wall_rest, pair.hard.min(wall_rest))
         } else {
             (pair.sep, pair.inv_sep, pair.hard)
         };
@@ -1078,13 +1761,42 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
             let len = d2.sqrt();
             let inv_len = 1.0 / len;
             let w = 1.0 - len * inv_sep;
+            if len < hard && sides_on {
+                // The crowd walk: how deep this body is in his, on the
+                // sides of him it lies on (`d` points from it to him).
+                let depth = ((hard - len) * inv_depth).min(1.0);
+                let shares = press_shares(d * inv_len, wish_dir);
+                for q in 0..4 {
+                    press4[q] = press4[q].max(depth * shares[q]);
+                }
+            }
             if len < hard {
                 // Overlap is resolved POSITIONALLY only. A hard force boost
                 // here as well made packed crowds oscillate at the
                 // acceleration cap, two solvers fighting over the same
                 // overlap, every frame.
                 let back = (hard - len) * gain * mw;
-                corr += d * (back * inv_len);
+                // The friction contact sets him apart by the braced
+                // weights; what the contact speed reads below stays by
+                // the plain ones.
+                let set = match braces {
+                    Some(braces) => {
+                        // `moving` is read only for a walking foe
+                        // (`brace_level`).
+                        let o_brace = brace_level(
+                            crate::spatial::meta_pose(o.meta),
+                            (o.meta & crate::spatial::META_STOOD) != 0,
+                            o_dying,
+                            fall_on,
+                            cross,
+                            || moving[crate::spatial::meta_group(o.meta)],
+                        );
+                        let my_brace = if cross { my_brace_cross } else { my_brace_same };
+                        (hard - len) * gain * braces[crate::spatial::meta_kind(o.meta)][my_brace][o_brace]
+                    }
+                    None => back,
+                };
+                corr += d * (set * inv_len);
                 overlap_vel += o_vel * back;
                 overlap_share += share * back;
                 overlap += back;
@@ -1096,8 +1808,15 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
             // slot-keeping is never faded by the settled enemies one stride
             // away, which made a line yield and stay ragged.
             crowd += w;
+            // The still men ahead: a neighbour on the half-plane ahead of
+            // his wish (`d` points from the neighbour to him), by how little
+            // he moved along it last tick.
+            if still_on {
+                let on = (d.dot(wish_dir) < 0.0) as u32 as f32;
+                crowd_still += w * on * still_weight(o_vel, wish_dir);
+            }
         }
-    });
+    }
 
     // Ran onto a braced spear: the collision is a damage event from the
     // SPEARMAN, resolved with everything else in the serial apply (which also
@@ -1128,23 +1847,56 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
             *s.sight &= !SIGHT_FOE;
         }
     }
+    // The enemy he remembers, if still in sight: he tracks him while he has
+    // no enemy in reach, and seeing him is what makes a man still in
+    // formation react. A man fighting someone in reach out of formation needs
+    // neither, and skips the lookup.
+    // With his regiment focused on one target (sim/job.rs `focus`), a man
+    // of another regiment is remembered only within his threat distance:
+    // one who is not on him he lets go, and follows his orders. Read here
+    // rather than in `look_around` so that his stance below knows whether
+    // he is on his way to his place (`on_his_way`).
+    let memo = prev_target as usize;
+    let (memo_d2, memo_valid) = if (best_idx == u32::MAX && !dying && !st.routed)
+        || (st.in_melee && !st.committed)
+    {
+        remembered_foe(f, i, p, gi, memo)
+    } else {
+        (f32::MAX, false)
+    };
+    st.memo_valid = memo_valid;
+    st.memo_d2 = memo_d2;
+    st.best_idx = best_idx;
     // His stance for the next tick, as he is drawn: into the ready stance
     // while his regiment fights, while it stands ready and he stands (the
-    // pose pass's guard, below the speed of his steps), or with an enemy
-    // in his reach; else back at ease, walking or running. A step of the
-    // ramp a tick.
+    // pose pass's guard, below the speed of his steps; under the friction
+    // contact a push does not count, only his own wish to walk, `stands`),
+    // or with an enemy in his reach; else back at ease, walking or
+    // running. A step of the ramp a tick. Under the friction contact a
+    // soldier on the walk to his place with nothing else to do who was a
+    // walker last tick (`steer` keeps it in `stood` until he arrives,
+    // `still_stands`) is on his way and stays at ease, whatever his wish
+    // this tick. In a fighting regiment (STANCE_FIGHT) every soldier is
+    // ready, walking or standing, so a walker there is in the ready stance,
+    // his weight his own against his side and the walking bracing against
+    // the other side.
     let ready = match stance[gi] {
         STANCE_FIGHT => true,
-        STANCE_READY => s.vel.xz().length_squared() < STEP_FACE_SPEED * STEP_FACE_SPEED,
+        STANCE_READY => {
+            stands(friction, s.vel.xz(), st.desired) && !(friction && !*s.stood && on_his_way(s, st))
+        }
         _ => false,
     };
-    let stance_ramp = *s.pose & POSE_STANCE;
-    let stance_ramp = if ready || best_idx != u32::MAX {
-        (stance_ramp + 1).min(POSE_READY)
-    } else {
-        stance_ramp.saturating_sub(1)
-    };
-    *s.pose = (*s.pose & !POSE_STANCE) | stance_ramp;
+    // A falling soldier keeps the stance he was struck in (`fall`).
+    if !(dying && fall_on) {
+        let stance_ramp = *s.pose & POSE_STANCE;
+        let stance_ramp = if ready || best_idx != u32::MAX {
+            (stance_ramp + 1).min(POSE_READY)
+        } else {
+            stance_ramp.saturating_sub(1)
+        };
+        *s.pose = (*s.pose & !POSE_STANCE) | stance_ramp;
+    }
     st.brake = (mine.slow, mine.stop);
     // An archer's knife: out while his regiment has its swords out, and
     // for a few seconds after an enemy came close to him, one in his
@@ -1171,7 +1923,9 @@ fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
         st.overlap_share = overlap_share / overlap;
     }
     st.crowd = crowd;
+    st.crowd_still = crowd_still;
     st.ahead = ahead;
+    st.press4 = press4;
     st.best_idx = best_idx;
     st.sticky = sticky;
     st.prev_target = prev_target;
@@ -1484,7 +2238,7 @@ fn choose_opening(f: &Field, s: &mut Soldier, st: &mut Step) {
 /// look.
 #[inline]
 fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
-    let Field { grid, pos_prev, team, group, orders, engaged, focus, tick, .. } = *f;
+    let Field { grid, pos_prev, orders, engaged, tick, .. } = *f;
     let i = s.i;
     let p = st.p;
     let gi = st.gi;
@@ -1494,42 +2248,29 @@ fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
     let committed = st.committed;
     let join_fp = st.join_fp;
     let desired = st.desired;
-    let prev_target = st.prev_target;
     let best_idx = st.best_idx;
     let scan_r = st.scan_r;
     let my_team_bit = st.my_team_bit;
-    // The enemy he remembers, if still in sight: he tracks him while he has
-    // no enemy in reach, and seeing him is what makes a man still in
-    // formation react. A man fighting someone in reach out of formation needs
-    // neither, and skips the lookup.
-    // With his regiment focused on one target (sim/job.rs `focus`), a man
-    // of another regiment is remembered only within his threat distance:
-    // one who is not on him he lets go, and follows his orders.
-    let memo = prev_target as usize;
-    let mut memo_d2 = f32::MAX;
-    let memo_valid = ((best_idx == u32::MAX && !dying && !routed)
-        || (in_melee && !committed))
-        && memo < pos_prev.len()
-        && team[memo] != team[i]
-        && {
-            let d2 = pos_prev[memo].xz().distance_squared(p);
-            memo_d2 = d2;
-            d2 < (seek_radius() + 1.0) * (seek_radius() + 1.0)
-                && focus[gi].is_none_or(|t| {
-                    group[memo] == t || d2 < threat_radius() * threat_radius()
-                })
-        };
+    // The enemy he remembers, as the scan read it (`scan`).
+    let memo = st.prev_target as usize;
+    let memo_valid = st.memo_valid;
     // Which way he is going: to that enemy, else to his regiment's fight.
-    let memo_dir = if memo_valid {
+    // A man walking to the fight with nobody in reach looks along the way
+    // he walks (`join_goal`): straight ahead, to an enemy or to the fight.
+    let memo_dir = if joins_as_walker() && committed && best_idx == u32::MAX && !dying && !routed {
+        join_goal(f, s, st).0
+    } else if memo_valid {
         (pos_prev[memo].xz() - p).normalize_or_zero()
     } else if let Some(fp) = join_fp {
         (fp - p).normalize_or_zero()
     } else {
         Vec2::ZERO
     };
-    // The blocking test toward a holding man's own mark.
+    // The blocking test toward a holding man's own mark. A man walking to
+    // the fight (`joining`) has his slot wish kept apart; the test reads
+    // that, so it stays about his mark.
     let slot_dir = if orders[gi].is_none() && engaged[gi] && !routed {
-        desired.normalize_or_zero()
+        if st.joining { st.slot_wish.normalize_or_zero() } else { desired.normalize_or_zero() }
     } else {
         Vec2::ZERO
     };
@@ -1552,6 +2293,10 @@ fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
     let look_lanes = memo_dir != Vec2::ZERO && best_idx == u32::MAX && !dying && !routed;
     let watch_go = in_melee && !committed && !memo_valid;
     let slot_on = slot_dir != Vec2::ZERO;
+    // A joiner's comrade "in his way" stands within a ready body plus a
+    // short step of room (JOIN_ROOM); for everyone else, and for his
+    // sides and mark, within SEP_RADIUS.
+    let way_r = if st.joining { ready_body() + JOIN_ROOM } else { SEP_RADIUS };
     if (i as u32).wrapping_add(tick).is_multiple_of(LOOK_TICKS) {
         let mut seen = 0u16;
         if look_lanes || watch_go || slot_on {
@@ -1574,7 +2319,7 @@ fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
                 let away = going > 0.5;
                 let ahead = comrade & look_lanes & ((-d).dot(memo_dir) > reach) & !away;
                 ahead_any |= ahead;
-                way |= ahead & near;
+                way |= ahead & (d2 < way_r * way_r);
                 // A comrade of his own regiment close by, running to the
                 // fight: the sight that makes him follow.
                 go |= comrade
@@ -1627,8 +2372,6 @@ fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
     let comrade_ahead = *s.sight & SIGHT_AHEAD != 0;
     let slot_blocked = *s.sight & SIGHT_MARK != 0;
     st.back_blocked = *s.sight & SIGHT_BACK != 0;
-    st.memo_valid = memo_valid;
-    st.memo_d2 = memo_d2;
     st.memo_dir = memo_dir;
     st.side_dir = side_dir;
     st.watch_go = watch_go;
@@ -1889,7 +2632,10 @@ fn try_a_side(f: &Field, s: &mut Soldier, st: &mut Step) {
         && want > 0.5;
     if !going {
         *s.stuck = 0;
-        turn_shoulders(s);
+        // A falling soldier keeps the turn of his shoulders (`fall`).
+        if !(st.dying && fall()) {
+            turn_shoulders(s);
+        }
         return;
     }
     let dir = wish / want;
@@ -1915,6 +2661,7 @@ fn try_a_side(f: &Field, s: &mut Soldier, st: &mut Step) {
         // His legs at their full effort along his wish: he pushes with
         // all he has, at a walk at most (`steer`).
         st.desired = wish;
+        st.fade = Vec2::ZERO;
     } else if trying > 0 {
         trying -= 1;
         // The way ahead clear after the first TRY_MIN ticks: the step is
@@ -1924,6 +2671,7 @@ fn try_a_side(f: &Field, s: &mut Soldier, st: &mut Step) {
         }
         let side = if left { left_dir } else { -left_dir };
         st.desired += side * STEP_PACE;
+        st.side = side * STEP_PACE;
         mem = SIDE_MEMORY;
     } else {
         // Stuck: pressed, and not even stepping. Under half his wish
@@ -1986,14 +2734,16 @@ fn turn_shoulders(s: &mut Soldier) {
 
 /// Two things a man in melee does not do for his slot: step back away
 /// from his regiment's fight to dress, or press into the comrade between
-/// him and his mark.
+/// him and his mark. A man walking to the fight (`joining`) is not going
+/// to his slot, so neither touches his wish; they act on his kept slot
+/// wish, for the tick he comes back into formation.
 #[inline]
 fn hold_the_frame(f: &Field, st: &mut Step) {
-    let Field { contact, form_face, .. } = *f;
+    let Field { contact, form_face, orders, moving, .. } = *f;
     let gi = st.gi;
     let routed = st.routed;
     let slot_blocked = st.slot_blocked;
-    let mut desired = st.desired;
+    let mut desired = if st.joining { st.slot_wish } else { st.desired };
     // A regiment fighting on its contact frame never steps backward, away
     // from its fight, to dress its ranks: a man ahead of his mark (bunched up
     // behind a stopped front, or shoved forward) stays; he only steps forward
@@ -2001,7 +2751,12 @@ fn hold_the_frame(f: &Field, st: &mut Step) {
     // reopen its ranks the moment it made contact. A regiment struck from
     // behind has its fight at its back, so it keeps stepping back to hold its
     // ground.
-    if contact[gi] && !routed && form_face[gi] != Vec2::ZERO {
+    // Under the friction contact the same holds for a regiment under an
+    // Attack order that has not reached its fight yet: its soldiers who
+    // ran in and piled up behind a friend stay where they are, they do not
+    // walk backward to their places and open the pile again (`pile_stays`).
+    let attacking = pile_stays() && orders[gi].is_some() && !moving[gi];
+    if (contact[gi] || attacking) && !routed && form_face[gi] != Vec2::ZERO {
         let back = desired.dot(form_face[gi]);
         if back < 0.0 {
             desired -= form_face[gi] * back;
@@ -2014,7 +2769,11 @@ fn hold_the_frame(f: &Field, st: &mut Step) {
     if slot_blocked {
         desired = Vec2::ZERO;
     }
-    st.desired = desired;
+    if st.joining {
+        st.slot_wish = desired;
+    } else {
+        st.desired = desired;
+    }
 }
 
 /// The far look, every eighth tick: a pressing man with nobody in reach
@@ -2113,7 +2872,8 @@ fn acquire(f: &Field, s: &mut Soldier, st: &mut Step) {
 /// Leaving formation to fight, in his own time: a chance per half-second
 /// window while he sees an enemy or a comrade going, and patience as the
 /// backstop. Once out he never dresses on his slot while he sees an enemy
-/// or his regiment's melee runs.
+/// or his regiment's melee runs. A man walking to the fight keeps the
+/// wish `drive` gave him until an enemy is in his reach.
 #[inline]
 fn decide_to_join(f: &Field, s: &mut Soldier, st: &mut Step) {
     let Field { melee_ticks, engaged, tick, .. } = *f;
@@ -2168,14 +2928,22 @@ fn decide_to_join(f: &Field, s: &mut Soldier, st: &mut Step) {
         if react || (in_melee && melee_ticks[gi] as f32 > patience) {
             committed = true;
             *s.out_form = true;
+            st.set_off = true;
         }
     }
     // Out of formation he never dresses on his slot: he fights, goes for an
     // enemy he sees, heads for the fight, or stands where he is when
     // blocked. Inferring this from his speed made a man who slowed down run
-    // back to his slot and come out again, over and over.
-    if committed {
+    // back to his slot and come out again, over and over. A man walking to
+    // the fight (`joining`) keeps that walk from `drive` until an enemy is
+    // in his reach this tick; then he fights (`close_in`). A man who came
+    // back into formation this tick walks to his slot again.
+    if committed && (!st.joining || best_idx != u32::MAX) {
         desired = Vec2::ZERO;
+        st.joining = false;
+    } else if st.joining && !committed {
+        desired = st.slot_wish;
+        st.joining = false;
     }
     st.committed = committed;
     st.desired = desired;
@@ -2609,7 +3377,7 @@ fn pick_quarry(
 /// clamped, and in a packed crowd the drive fades out so the mass cannot
 /// keep compressing itself.
 #[inline]
-fn yield_to_crowd(st: &mut Step) {
+fn yield_to_crowd(f: &Field, st: &mut Step) {
     let crowd = st.crowd;
     let mut corr = st.corr;
     let mut push = st.push;
@@ -2632,12 +3400,30 @@ fn yield_to_crowd(st: &mut Step) {
     // keep compressing itself; `jam` (0 = free, 1 = packed) also damps the
     // response below.
     let (slow, stop) = st.brake;
-    let jam = ((crowd - slow) / (stop - slow)).clamp(0.0, 1.0);
+    let jam = if still_brake() {
+        // The friction contact's brake: the still men ahead of him against
+        // a band half as wide, for that smaller count.
+        let (slow, stop) = (0.5 * slow, 0.5 * stop);
+        ((st.crowd_still - slow) / (stop - slow)).clamp(0.0, 1.0)
+    } else {
+        ((crowd - slow) / (stop - slow)).clamp(0.0, 1.0)
+    };
+    // A soldier of a regiment in its charge keeps his whole wish to run in
+    // (`charge_runs_in`): the soldiers ahead of him do not fade it. Else the
+    // first soldiers to reach a standing friend stand, the rank behind them
+    // stands for them, and the whole regiment halts within a second of the
+    // first touch. His body is still slowed by the still men ahead as
+    // anyone's is (`body_jam`).
+    let pressed = jam;
+    let runs_in = charge_runs_in() && f.charging[st.gi] && !f.fat_nocharge[st.gi] && !st.dying && !st.routed;
+    let jam = if runs_in { 0.0 } else { jam };
     st.wish = desired;
+    st.fade = desired * jam;
     desired *= 1.0 - jam;
     st.corr = corr;
     st.push = push;
     st.jam = jam;
+    st.body_jam = if runs_in { pressed } else { jam };
     st.desired = desired;
 }
 
@@ -2666,7 +3452,8 @@ fn sidestep(i: usize, tick: u32, left_blocked: bool, right_blocked: bool, side_d
 /// With nobody in reach, going to the enemy he
 /// remembers through open ground (waiting behind a comrade, sidestepping
 /// now and then), or, with nobody to close on, joining his regiment's
-/// fight at the jog.
+/// fight at the jog. Under the friction contact's brake a joining
+/// soldier's walk comes from `drive` (`join_goal`), and this does neither.
 #[inline]
 fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
     let Field { pos_prev, speed, team, group, broken, wall, engaged, hold, moving, focus, tick, .. } = *f;
@@ -2688,6 +3475,7 @@ fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
     let comrade_ahead = st.comrade_ahead;
     let side_dir = st.side_dir;
     let mut desired = st.desired;
+    let mut fade = st.fade;
     let mut d_surge = Vec2::ZERO;
     // Fighters close the last meter to swing range. Only active when an enemy
     // is ALREADY in reach — this is combat execution (like the wind-up foot
@@ -2703,7 +3491,9 @@ fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
     // range" — a legitimate closing target regardless of identity. Only a
     // man out of formation goes to a remembered enemy: a formed man seeing
     // one leaves formation first (decide_to_join), so the slot never pulls
-    // against the chase.
+    // against the chase. Under the friction contact's brake a joining
+    // soldier's walk to the enemy he remembers comes from `drive`
+    // (`join_goal`), and this does not run for him.
     let (close_to, memo_close) = if *s.swing & crate::units::SWING_STATE_MASK
         != crate::units::SWING_READY
         && (*s.target as usize) < pos_prev.len()
@@ -2711,7 +3501,7 @@ fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
         (*s.target, false)
     } else if best_idx != u32::MAX {
         (best_idx, false)
-    } else if crowd < st.brake.0 && committed {
+    } else if !joins_as_walker() && crowd < st.brake.0 && committed {
         (*s.target, true)
     } else {
         (u32::MAX, false)
@@ -2795,8 +3585,10 @@ fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
     // Joining: no enemy to close on, so he heads for the enemy unit his
     // regiment fights, jogging over open ground, walking with a comrade close
     // ahead, waiting or sidestepping when blocked. He picks a soldier to
-    // fight once one is in sight (the acquisition above).
-    if committed
+    // fight once one is in sight (the acquisition above). Under the friction
+    // contact's brake this walk comes from `drive` (`join_goal`) instead.
+    if !joins_as_walker()
+        && committed
         && !memo_valid
         && let Some(fp) = join_fp
         && best_idx == u32::MAX
@@ -2809,19 +3601,24 @@ fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
             let dir = to_fp / dist;
             desired = if !way_blocked {
                 let pace = if comrade_ahead { ADVANCE_PACE } else { COMBAT_JOG_PACE };
+                fade = dir * pace * jam;
                 dir * pace * (1.0 - jam)
             } else {
+                fade = Vec2::ZERO;
                 sidestep(i, tick, left_blocked, right_blocked, side_dir)
             };
         }
     }
     st.desired = desired;
+    st.fade = fade;
 }
 
 /// From drive to velocity: the wall and charge paces, fatigue, the
 /// stagger, the crowd's damping, a standing man's grip on the ground and
 /// his stance against a squeeze, the acceleration and speed caps, and the
-/// give of his legs at a body he runs into.
+/// give of his legs at a body he runs into. Under the friction contact:
+/// the crowd walk and whether he stands, the feet's take and his legs
+/// alone, the damping and the speed cap.
 #[inline]
 fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
     let Field { speed, orders, wall, charging, fat_speed, fat_nocharge, dt, .. } = *f;
@@ -2835,6 +3632,75 @@ fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
     let push = st.push;
     let jam = st.jam;
     let mut desired = st.desired;
+    let friction = friction_contact();
+    // The crowd walk under the friction contact: with bodies overlapping
+    // his own on all four sides he does not sprint, he walks, by the side
+    // pressed least, without a jump. This is the one point every stage's
+    // wish has reached (the drive, the join, the closing in, the sidestep),
+    // so his whole wish with what the crowd's brake took off it put back is
+    // cut to the walk, and both parts by the same share, as if it had been
+    // cut before the brake: the brake and the standing test below see the
+    // walk. A routed soldier flees, a dying one is not steering, and a
+    // regiment in its charge runs by order.
+    let charge_run = charging[gi] && !fat_nocharge[gi];
+    if friction && !dying && !routed && !charge_run {
+        let whole = desired + st.fade;
+        let p4 = st.press4;
+        let cut = press_walk(p4[0].min(p4[1]).min(p4[2]).min(p4[3]), whole, CROWD_WALK);
+        if cut != whole {
+            let k = cut.length() / whole.length();
+            desired *= k;
+            st.fade *= k;
+        }
+    }
+    // Whether he stands, for his bracing next tick (`brace_pairs`) and his
+    // stance (`scan`). The line is his own wish as it comes here, after
+    // every stage that sets it, with what the crowd's brake took off it put
+    // back and the sidestep of his try at a side taken out, before the
+    // paces and caps below, under the speed of a step (`stands`). A push he
+    // gets does not count, and neither does that sidestep: a jammed soldier
+    // who tries a side still stands, or his weight against his own side
+    // would change each time a try begins or ends. A wish at or over the
+    // line makes him a walker. Under it, a soldier under fight footwork
+    // stands at once; a soldier on the walk to his place with nothing else
+    // to do (`on_his_way`) who was walking keeps walking until he arrives
+    // there, within STEP_STOP or parked in the hold deadzone, or until his
+    // own rule tells him to stand where he is: a holding soldier of a
+    // fighting regiment shoved off his mark with a comrade between him and
+    // it, whose wish `hold_the_frame` zeroed (`has_arrived`,
+    // `still_stands`). That holds in the rear ranks of a fighting regiment
+    // too. His wish slides with his distance to his place and crosses the
+    // line some metres out, and the few centimetres a shove moves a jammed
+    // soldier there would else change his weight and stance again and
+    // again.
+    if friction {
+        let side = st.side;
+        let under = stands(true, Vec2::ZERO, desired + st.fade - side);
+        let stood = if on_his_way(s, st) {
+            let arrived = has_arrived(st.place_dist, st.parked, st.slot_blocked);
+            still_stands(*s.stood, under, arrived)
+        } else if st.joining {
+            // A soldier walking to the fight is a walker until the still
+            // men ahead have stopped him behind a comrade in his way: the
+            // brake has taken his wish under the speed of a step. From
+            // then he stands, and `drive` gives him no wish while that
+            // comrade is in his way.
+            under || (st.way_blocked && stands(true, Vec2::ZERO, desired - side))
+        } else {
+            under
+        };
+        // The tick he leaves his place to join the fight he sets off: a
+        // walker from then, whatever stood him at his place. Else a soldier
+        // who stood within a step of the man ahead when he joined would
+        // count as arrived at once and never close up, and the regiment's
+        // ranks would end at two different spacings.
+        let stood = stood && !(st.set_off && joins_as_walker());
+        // A falling soldier keeps his stood bit as it was when he was
+        // struck (`fall`).
+        if !(dying && fall()) {
+            *s.stood = stood;
+        }
+    }
     // Formation pace: walls advance deliberately (running breaks a wall), the
     // charge phase runs the last stretch home. Broken/dying already excluded
     // from both states by construction.
@@ -2851,7 +3717,14 @@ fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
         desired = Vec2::ZERO;
     }
 
-    let v = s.vel.xz();
+    let mut v = s.vel.xz();
+    if friction {
+        // His feet take back part of what the contacts put into his speed,
+        // off his speed and off the total alike, before his legs act.
+        let cut = feet_take(*s.imposed, dt);
+        v -= cut;
+        *s.imposed -= cut;
+    }
     // Jammed units stop shoving entirely: at full jam the crowd is
     // quasi-static and overlap resolution is purely positional — force-based
     // separation in a wedged mass only produces bang-bang oscillation.
@@ -2862,12 +3735,14 @@ fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
     // stance takes the first STANCE of a net squeeze the same way: he gives
     // ground only to what is beyond it. A man holding his place keeps the
     // grip while he steps back to it.
+    // Under the friction contact there is no spring, grip or stance: his
+    // legs alone move him, and the setting apart is applied in full.
     let standing = desired.length_squared() < 1e-6;
-    if standing || planted {
+    if !friction && (standing || planted) {
         let pl = push_a.length();
         push_a *= if pl > STAND_GRIP { (pl - STAND_GRIP) / pl } else { 0.0 };
     }
-    if standing && st.overlap_depth > 0.0 && *s.swing & crate::units::SWING_STAGGERED == 0 {
+    if !friction && standing && st.overlap_depth > 0.0 && *s.swing & crate::units::SWING_STAGGERED == 0 {
         st.corr *= ((st.overlap_depth - STANCE) / st.overlap_depth).max(0.0);
     }
     let mut legs = (desired - v) * STEER_GAIN;
@@ -2875,7 +3750,7 @@ fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
     if l2 > LEG_ACCEL * LEG_ACCEL {
         legs *= LEG_ACCEL / l2.sqrt();
     }
-    let mut accel = legs + push_a;
+    let mut accel = if friction { legs } else { legs + push_a };
     let a2 = accel.length_squared();
     if a2 > MAX_ACCEL * MAX_ACCEL {
         accel *= MAX_ACCEL / a2.sqrt();
@@ -2884,7 +3759,7 @@ fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
     let mut new_v = v + accel * dt;
     // Viscous damping in the press: bleeds the spring energy that otherwise
     // ping-pongs between neighbors every tick.
-    new_v *= 1.0 - 0.4 * jam;
+    new_v *= 1.0 - 0.4 * st.body_jam;
     // Slight overspeed under crowd pressure; a man squeezing through a
     // crack goes at a walk at most.
     let vmax = if squeezing(*s.stuck) { SQUEEZE_CAP } else { speed[i] * 1.15 };
@@ -2901,8 +3776,8 @@ fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
     // none at the give, never carrying him past it in one tick, and never
     // more than his own speed into them, so a column on the march is not
     // held up; the man he hits is handed nothing and is moved by the
-    // setting apart alone, as pressure.
-    let dir = st.overlap_dir;
+    // setting apart alone, as pressure. The friction contact has neither.
+    let dir = if friction { Vec2::ZERO } else { st.overlap_dir };
     if dir != Vec2::ZERO && share_contact() {
         let into = (new_v - st.overlap_vel).dot(-dir);
         if into > 0.0 {
@@ -3109,7 +3984,7 @@ fn slide(f: &Field, i: usize, st: &mut Step) {
 /// down on the terrain where the step ended.
 #[inline]
 fn integrate(f: &Field, s: &mut Soldier, st: &mut Step) {
-    let Field { terrain, kind, .. } = *f;
+    let Field { terrain, pos_prev, kind, dt, .. } = *f;
     let (new_v, next) = (st.new_v, st.next);
     *s.vel = Vec3::new(new_v.x, 0.0, new_v.y);
     *s.pos = Vec3::new(
@@ -3117,11 +3992,209 @@ fn integrate(f: &Field, s: &mut Soldier, st: &mut Step) {
         terrain.height_at(next.x, next.y) + crate::unit_types::half_height(kind[s.i] as usize),
         next.y,
     );
+    // The friction contact: his kept speed is the move he made, and what
+    // the setting apart, the field's edge and the step off blocked ground
+    // did to it beyond his legs' speed is added to the total his feet take
+    // back. His legs' speed is the one `slide` left, after an edge he could
+    // not pass stopped it, so a rail's stop is not a push his feet take back.
+    if friction_contact() && dt > 0.0 {
+        let p = pos_prev[s.i];
+        let kept = (next - Vec2::new(p.x, p.z)) / dt;
+        *s.vel = Vec3::new(kept.x, 0.0, kept.y);
+        *s.imposed = held_total(*s.imposed, kept, new_v);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A lone man shoved at `shove_speed(d)` who wants no speed, stepped
+    /// tick by tick with his feet and his legs, comes to rest d metres on.
+    #[test]
+    fn a_shoved_man_comes_to_rest_at_the_shove_distance() {
+        let dt = 1.0 / 30.0;
+        for d in [0.1125_f32, 0.225, 0.45, 0.675] {
+            let u = shove_speed(d, dt);
+            let mut v = Vec2::new(u, 0.0);
+            let mut imposed = v.clamp_length_max(STEP_PACE);
+            let mut x = Vec2::ZERO;
+            for _ in 0..600 {
+                let cut = feet_take(imposed, dt);
+                v -= cut;
+                imposed -= cut;
+                let mut legs = -v * STEER_GAIN;
+                if legs.length() > LEG_ACCEL {
+                    legs *= LEG_ACCEL / legs.length();
+                }
+                v += legs * dt;
+                x += v * dt;
+            }
+            assert!(v.length() < 1e-3, "{d}: still moving at {}", v.length());
+            assert!((x.length() - d).abs() < 0.03, "{d}: at rest {} on at {u} m/s", x.length());
+        }
+    }
+
+    /// A soldier walking to his place slows over the last metres; one on a
+    /// route, or in his regiment's charge, keeps his whole pace up to it.
+    #[test]
+    fn a_charging_soldier_does_not_slow_for_his_place() {
+        assert_eq!(arrive_share(70.0, ARRIVE_RADIUS, false, false), 1.0);
+        assert!((arrive_share(10.0, ARRIVE_RADIUS, false, false) - 10.0 / ARRIVE_RADIUS).abs() < 1e-6);
+        assert_eq!(arrive_share(10.0, ARRIVE_RADIUS, true, false), 1.0);
+        assert_eq!(arrive_share(10.0, ARRIVE_RADIUS, false, true), 1.0);
+        assert_eq!(arrive_share(0.5, ARRIVE_RADIUS, false, true), 1.0);
+    }
+
+    /// A soldier with a side free keeps his full wish; surrounded in full
+    /// he walks, the same way; half surrounded his wish lies half way; a
+    /// wish under the walk is untouched.
+    #[test]
+    fn press_walk_goes_from_the_full_wish_to_the_walk() {
+        let wish = Vec2::new(6.0, 8.0);
+        assert_eq!(press_walk(0.0, wish, 1.5), wish);
+        let cut = press_walk(1.0, wish, 1.5);
+        assert!((cut.length() - 1.5).abs() < 1e-5);
+        assert!((cut.normalize() - wish.normalize()).length() < 1e-6);
+        let half = press_walk(0.5, wish, 1.5);
+        assert!((half.length() - 5.75).abs() < 1e-5);
+        let slow = Vec2::new(0.6, -0.8);
+        assert_eq!(press_walk(1.0, slow, 1.5), slow);
+    }
+
+    /// A body straight ahead, behind, left and right lies on its own side
+    /// in full; one between two sides lies on both in part and on the far
+    /// sides not at all. `n` points from the body to him, his wish is +y.
+    #[test]
+    fn press_shares_split_a_body_between_the_sides() {
+        let wish = Vec2::Y;
+        assert_eq!(press_shares(Vec2::new(0.0, -1.0), wish), [1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(press_shares(Vec2::new(0.0, 1.0), wish), [0.0, 1.0, 0.0, 0.0]);
+        let left = press_shares(Vec2::new(1.0, 0.0), wish);
+        let right = press_shares(Vec2::new(-1.0, 0.0), wish);
+        assert_eq!(left[0] + left[1], 0.0);
+        assert_eq!(right[0] + right[1], 0.0);
+        assert_eq!(left[2] + left[3], 1.0);
+        assert_eq!(right[2] + right[3], 1.0);
+        assert_ne!(left[2], right[2]);
+        let d = std::f32::consts::FRAC_1_SQRT_2;
+        let between = press_shares(Vec2::new(-d, -d), wish);
+        assert!(between[0] > 0.4 && between[0] < 0.7);
+        assert_eq!(between[1], 0.0);
+        assert!((between[2] + between[3] - between[0]).abs() < 1e-6);
+    }
+
+    /// The feet take FEET x dt along the total, or the whole of a smaller
+    /// total, and nothing of none.
+    #[test]
+    fn feet_take_is_capped_along_the_total() {
+        let dt = 1.0 / 30.0;
+        let big = Vec2::new(0.6, -0.8);
+        let cut = feet_take(big, dt);
+        assert!((cut.length() - FEET * dt).abs() < 1e-6);
+        assert!((cut.normalize() - big.normalize()).length() < 1e-6);
+        let small = Vec2::new(0.05, 0.0);
+        assert_eq!(feet_take(small, dt), small);
+        assert_eq!(feet_take(Vec2::ZERO, dt), Vec2::ZERO);
+    }
+
+    /// Without the friction contact a man stands by his kept speed; with
+    /// it a man pushed at 2 m/s who wishes to go nowhere stands, and a still
+    /// man who wishes to walk at 3 m/s does not.
+    #[test]
+    fn stands_reads_the_wish_under_friction() {
+        let fast = Vec2::new(2.0, 0.0);
+        let walk = Vec2::new(0.0, 3.0);
+        assert!(!stands(false, fast, Vec2::ZERO));
+        assert!(stands(false, Vec2::ZERO, walk));
+        assert!(stands(false, Vec2::new(0.5, 0.0), walk));
+        assert!(stands(true, fast, Vec2::ZERO));
+        assert!(!stands(true, Vec2::ZERO, walk));
+    }
+
+    /// A jammed soldier who waits at under a step's pace still stands while
+    /// he tries a side: the sidestep at STEP_PACE across his wish takes the
+    /// wish over the step's speed, and `steer` leaves it out.
+    #[test]
+    fn a_sidestep_does_not_make_him_a_walker() {
+        let wish = Vec2::new(0.0, 0.9);
+        let side = Vec2::new(STEP_PACE, 0.0);
+        assert!(stands(true, Vec2::ZERO, wish));
+        assert!(!stands(true, Vec2::ZERO, wish + side));
+        assert!(stands(true, Vec2::ZERO, wish + side - side));
+    }
+
+    /// On the walk to his place: a walker whose wish has dropped
+    /// under the speed of a step far from his place still walks; arriving
+    /// within STEP_STOP he stands; a standing soldier shoved 5 cm stays
+    /// standing; a wish over the line makes him a walker. A jammed soldier
+    /// shoved back and forth 5 cm across the distance where his wish
+    /// crosses the line changes once, not every time. A walker told to
+    /// stand where he is (his wish zeroed, a comrade between him and his
+    /// mark) stands though he is far from his place, and walks again once
+    /// his wish reaches the line; a walker whose wish is merely small has
+    /// not arrived.
+    #[test]
+    fn a_walker_stands_again_only_at_his_place() {
+        // The drive's wish of a soldier of 6 m/s at `d` metres from his place.
+        let wish = |d: f32| Vec2::new(0.0, 6.0 * (d / ARRIVE_RADIUS).min(1.0));
+        let under = |d: f32| stands(true, Vec2::ZERO, wish(d));
+        let arrived = |d: f32| has_arrived(d, false, false);
+        assert!(has_arrived(0.3, false, false));
+        assert!(has_arrived(5.0, true, false));
+        assert!(!has_arrived(0.4, false, false));
+        // Told to stand 5 m from his place: his wish is zero, he stands.
+        let told = has_arrived(5.0, false, true);
+        assert!(told && stands(true, Vec2::ZERO, Vec2::ZERO));
+        assert!(still_stands(false, stands(true, Vec2::ZERO, Vec2::ZERO), told));
+        // The way clears: his wish back over the line, he walks again.
+        assert!(!still_stands(true, under(10.0), arrived(10.0)));
+        // Merely slowed to a crawl 5 m out, not told to stand: he walks on.
+        assert!(!still_stands(false, stands(true, Vec2::ZERO, Vec2::new(0.0, 0.1)), arrived(5.0)));
+        assert!(under(5.0) && !arrived(5.0));
+        assert!(!still_stands(false, under(5.0), arrived(5.0)));
+        assert!(still_stands(false, under(0.3), arrived(0.3)));
+        assert!(still_stands(true, under(5.05), arrived(5.05)));
+        assert!(still_stands(true, under(4.95), arrived(4.95)));
+        assert!(!under(10.0));
+        assert!(!still_stands(true, under(10.0), arrived(10.0)));
+        assert!(!still_stands(false, under(10.0), arrived(10.0)));
+        // The line is at 35 x 1.05 / 6 = 6.125 m.
+        let mut stood = true;
+        let mut changes = 0;
+        for k in 0..60 {
+            let d = if k % 2 == 0 { 6.10 } else { 6.15 };
+            let next = still_stands(stood, under(d), arrived(d));
+            changes += (next != stood) as u32;
+            stood = next;
+        }
+        assert_eq!(changes, 1);
+        assert!(!stood);
+    }
+
+    /// A man ahead who stood or came at the reader counts in full, one who
+    /// moved along the reader's way at CRAWL or faster not at all, one at
+    /// half the crawl half.
+    #[test]
+    fn still_weight_reads_the_move_along_the_way() {
+        let wish = Vec2::new(0.0, 1.0);
+        assert_eq!(still_weight(Vec2::ZERO, wish), 1.0);
+        assert_eq!(still_weight(Vec2::new(0.0, -1.0), wish), 1.0);
+        assert_eq!(still_weight(Vec2::new(0.0, CRAWL), wish), 0.0);
+        assert_eq!(still_weight(Vec2::new(0.0, 2.0), wish), 0.0);
+        assert!((still_weight(Vec2::new(5.0, 0.5 * CRAWL), wish) - 0.5).abs() < 1e-6);
+    }
+
+    /// The total gains the kept speed less the legs' speed and stops at a
+    /// step's pace.
+    #[test]
+    fn held_total_adds_the_contact_and_caps_it() {
+        let t = held_total(Vec2::new(0.1, 0.0), Vec2::new(1.0, 0.2), Vec2::new(1.0, 0.0));
+        assert!((t - Vec2::new(0.1, 0.2)).length() < 1e-6);
+        let t = held_total(Vec2::new(0.7, 0.0), Vec2::new(0.0, 0.0), Vec2::new(-1.0, 0.0));
+        assert!((t.length() - STEP_PACE).abs() < 1e-6);
+        assert!(t.x > 0.0 && t.y == 0.0);
+    }
 
     /// A man pushed at a rail on z while he climbs along x: the rail
     /// stops the z of his step, and his velocity keeps only the climb.
@@ -3139,6 +4212,277 @@ mod tests {
     fn a_velocity_away_from_the_edge_stays() {
         let v = stopped_velocity(Vec2::new(1.2, -0.5), Vec2::new(0.04, 0.02), false, true);
         assert_eq!(v, Vec2::new(1.2, -0.5));
+    }
+
+    /// The (standing, walking) strengths the table tests run over.
+    const BRACE_CASES: [(f32, f32); 6] =
+        [(1.0, 1.0), (BRACE, 1.0), (BRACE, BRACE_BASIC), (BRACE, 2.0), (20.0, 20.0), (1.0, 20.0)];
+
+    /// Two men braced alike, or any two with both strengths 1, share the
+    /// setting apart exactly as the plain mass weights do, to the bit.
+    #[test]
+    fn equal_bracing_is_the_plain_mass_weight() {
+        let plain = mass_pairs();
+        for (brace, basic) in BRACE_CASES {
+            let t = brace_table(brace, basic);
+            for (ta, pa) in t.iter().zip(plain) {
+                for (tao, pao) in ta.iter().zip(pa) {
+                    for (b, row) in tao.iter().enumerate() {
+                        assert_eq!(row[b].to_bits(), pao.0.to_bits());
+                    }
+                }
+            }
+        }
+        let t = brace_table(1.0, 1.0);
+        for (ta, pa) in t.iter().zip(plain) {
+            for (tao, pao) in ta.iter().zip(pa) {
+                for w in tao.iter().flatten() {
+                    assert_eq!(w.to_bits(), pao.0.to_bits());
+                }
+            }
+        }
+    }
+
+    /// The grid's stood bit sits above the turn of his shoulders, the fall
+    /// field between it and his regiment, and no field reads another; the
+    /// regiment keeps 17 bits.
+    #[test]
+    fn the_stood_bit_and_the_fall_field_leave_the_width_and_the_regiment_alone() {
+        use crate::spatial::{
+            META_FALL_SHIFT, META_GROUP_SHIFT, META_POSE_SHIFT, META_STOOD, META_TURN_SHIFT, meta_fall, meta_group,
+            meta_width,
+        };
+        assert_eq!(META_STOOD, 1 << 9);
+        assert_eq!(META_FALL_SHIFT, 10);
+        assert_eq!(META_GROUP_SHIFT, 15);
+        let g = (1u32 << (32 - META_GROUP_SHIFT)) - 1;
+        for stood in [false, true] {
+            for d in [0, 2, 9, crate::sim::damage::DEATH_TICKS as u32, 31] {
+                let meta = (3 << META_POSE_SHIFT)
+                    | (2 << META_TURN_SHIFT)
+                    | (stood as u32 * META_STOOD)
+                    | (d << META_FALL_SHIFT)
+                    | (g << META_GROUP_SHIFT);
+                assert_eq!(meta_width(meta), 3 + 4 * 2);
+                assert_eq!(meta_group(meta), g as usize);
+                assert_eq!((meta & META_STOOD) != 0, stood);
+                assert_eq!(meta_fall(meta), d as u8);
+            }
+        }
+    }
+
+    /// A living soldier has his whole body; a falling one has it whole on his
+    /// first tick down, half of it half way through his clock, and nothing
+    /// on his last tick in the grid, a sixteenth less each tick.
+    #[test]
+    fn the_fall_takes_his_body_down_over_his_death_clock() {
+        let first = crate::sim::damage::DEATH_TICKS;
+        assert_eq!(fall_share(0), 1.0);
+        assert_eq!(fall_share(first), 1.0);
+        assert_eq!(fall_share((first + 2) / 2), 0.5);
+        assert_eq!(fall_share(2), 0.0);
+        for d in 3..=first {
+            let step = fall_share(d) - fall_share(d - 1);
+            assert!((step - 1.0 / (first - 2) as f32).abs() < 1e-6, "{d}");
+        }
+    }
+
+    /// Under the friction contact the body in the ready stance is the body
+    /// at ease, at every pose level; without it, it is the body distance.
+    #[test]
+    fn the_ready_body_under_friction_is_the_body_at_ease() {
+        let ready = ready_body_of(true, BODY_EASE, BODY_DISTANCE);
+        assert_eq!(ready, BODY_EASE);
+        let w = widths_of(BODY_EASE, ready, 1.0);
+        for (level, w) in w[..4].iter().enumerate() {
+            assert_eq!(w.body.to_bits(), BODY_EASE.to_bits(), "{level}");
+        }
+        assert_eq!(ready_body_of(false, BODY_EASE, BODY_DISTANCE), BODY_DISTANCE);
+    }
+
+    /// A pair with a falling soldier in it is as far apart on his first tick
+    /// down as two living soldiers, to the bit, and closes to the living
+    /// soldier's half alone on his last; the pair reads the same from either
+    /// side, and at every share between it lies between the two.
+    #[test]
+    #[allow(clippy::needless_range_loop)] // the indices are kinds and levels of more than one table
+    fn a_falling_body_closes_to_the_living_half() {
+        let w = widths();
+        let table = pair_widths();
+        let first = crate::sim::damage::DEATH_TICKS;
+        for a in 0..WIDTH_LEVELS {
+            for b in 0..WIDTH_LEVELS {
+                let whole = pair_width_of(a, 1.0, b, fall_share(first));
+                assert_eq!(whole.sep.to_bits(), table[a][b].sep.to_bits());
+                assert_eq!(whole.inv_sep.to_bits(), table[a][b].inv_sep.to_bits());
+                assert_eq!(whole.hard.to_bits(), table[a][b].hard.to_bits());
+                let gone = pair_width_of(a, 1.0, b, fall_share(2));
+                let hard = (0.5 * w[a].body).min(0.5 * w[a].sep);
+                let sep = 0.5 * w[a].sep + (hard - 0.5 * w[a].sep) * ((a / 4).max(b / 4) as f32 / 3.0);
+                assert!((gone.hard - hard).abs() < 1e-6, "{a} {b}");
+                assert!((gone.sep - sep).abs() < 1e-6, "{a} {b}");
+                for d in 2..=first {
+                    let one = pair_width_of(a, 1.0, b, fall_share(d));
+                    let other = pair_width_of(b, fall_share(d), a, 1.0);
+                    assert_eq!(one.sep.to_bits(), other.sep.to_bits());
+                    assert_eq!(one.hard.to_bits(), other.hard.to_bits());
+                    assert!(one.hard <= table[a][b].hard && one.hard >= gone.hard - 1e-6);
+                }
+            }
+        }
+    }
+
+    /// Falling, a dying soldier is braced as a living one with the same
+    /// pose, stood bit and side; without the fall he is not braced at all.
+    #[test]
+    fn a_falling_soldier_keeps_his_brace() {
+        for p in 0..4 {
+            for stood in [false, true] {
+                for cross in [false, true] {
+                    for moving in [false, true] {
+                        let living = brace_level(p, stood, false, false, cross, || moving);
+                        let falling = brace_level(p, stood, true, true, cross, || moving);
+                        let fallen = brace_level(p, stood, true, false, cross, || moving);
+                        assert_eq!(falling, living, "{p} {stood} {cross} {moving}");
+                        assert_eq!(fallen, 0);
+                        assert_eq!(brace_level(p, stood, false, true, cross, || moving), living);
+                    }
+                }
+            }
+        }
+    }
+
+    /// A fully braced man against an unbraced one of his own kind takes
+    /// 2 / (1 + BRACE) of the setting apart and the other 2 BRACE / (1 + BRACE);
+    /// the same with BRACE_BASIC for a fully braced walking man.
+    #[test]
+    fn a_braced_man_takes_little_of_the_setting_apart() {
+        let t = brace_table(BRACE, BRACE_BASIC);
+        let full_walk = BRACE_BASIC_FROM + 2;
+        for (k, tk) in t.iter().enumerate() {
+            let own = &tk[k];
+            assert!((own[3][0] - 2.0 / (1.0 + BRACE)).abs() < 1e-6);
+            assert!((own[0][3] - 2.0 * BRACE / (1.0 + BRACE)).abs() < 1e-6);
+            assert!((own[full_walk][0] - 2.0 / (1.0 + BRACE_BASIC)).abs() < 1e-6);
+            assert!((own[0][full_walk] - 2.0 * BRACE_BASIC / (1.0 + BRACE_BASIC)).abs() < 1e-6);
+        }
+    }
+
+    /// For any pair, whatever their kinds and levels: the two weights sum
+    /// to 2, as the plain weights do, so the pair is set apart by the same
+    /// distance in all; and each man's braced mass times his weight is the
+    /// other's, as m_i w_i = m_o w_o holds for the plain weights.
+    #[test]
+    fn a_pair_is_set_apart_by_the_same_distance_in_all() {
+        for (brace, basic) in BRACE_CASES {
+            let t = brace_table(brace, basic);
+            let braced = |k: usize, b: usize| TYPES[k].mass * brace_mult(b, brace, basic);
+            for (a, ta) in t.iter().enumerate() {
+                for (o, tao) in ta.iter().enumerate() {
+                    for (bi, row) in tao.iter().enumerate() {
+                        for (bo, &wi) in row.iter().enumerate() {
+                            let wo = t[o][a][bo][bi];
+                            assert!((wi + wo - 2.0).abs() < 1e-5, "{a} {o} {bi} {bo}: {wi} + {wo}");
+                            let (mi, mo) = (braced(a, bi), braced(o, bo));
+                            assert!((mi * wi - mo * wo).abs() < 1e-4 * mi.max(mo), "{a} {o} {bi} {bo}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The standing levels are the one-strength table, to the bit; and with
+    /// the walking bracing at 1 its levels weigh as level 0 against anyone,
+    /// to the bit.
+    #[test]
+    #[allow(clippy::needless_range_loop)] // the indices are kinds and levels of more than one table
+    fn the_standing_levels_are_one_strength_and_a_walking_bracing_of_1_is_none() {
+        for brace in [1.0, BRACE, 20.0] {
+            let one = |mi: f32, mo: f32, bi: usize, bo: usize| {
+                if bi == bo {
+                    return 2.0 * mo / (mi + mo);
+                }
+                let braced = |m: f32, b: usize| m * (1.0 + (brace - 1.0) * b as f32 / 3.0);
+                let (mi, mo) = (braced(mi, bi), braced(mo, bo));
+                2.0 * mo / (mi + mo)
+            };
+            for basic in [1.0, BRACE_BASIC, 20.0] {
+                let t = brace_table(brace, basic);
+                for a in 0..crate::unit_types::NUM_KINDS {
+                    for o in 0..crate::unit_types::NUM_KINDS {
+                        for bi in 0..BRACE_BASIC_FROM {
+                            for bo in 0..BRACE_BASIC_FROM {
+                                let w = one(TYPES[a].mass, TYPES[o].mass, bi, bo);
+                                assert_eq!(t[a][o][bi][bo].to_bits(), w.to_bits(), "{a} {o} {bi} {bo}");
+                            }
+                        }
+                    }
+                }
+            }
+            let t = brace_table(brace, 1.0);
+            for a in 0..crate::unit_types::NUM_KINDS {
+                for o in 0..crate::unit_types::NUM_KINDS {
+                    for p in 0..3 {
+                        for bo in 0..BRACE_LEVELS {
+                            let walk = t[a][o][BRACE_BASIC_FROM + p][bo];
+                            let bo0 = if bo >= BRACE_BASIC_FROM { 0 } else { bo };
+                            assert_eq!(walk.to_bits(), t[a][o][0][bo0].to_bits(), "{a} {o} {p} {bo}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Standing, a soldier has his pose level against anyone; walking, the
+    /// walking bracing's level for his pose only against the other side,
+    /// only in a ready pose, not under a Move order; dying, nothing. With
+    /// both bracings at the same strength a fully braced walking soldier
+    /// weighs as a standing one.
+    #[test]
+    #[allow(clippy::needless_range_loop)] // the indices are kinds and levels of more than one table
+    fn the_two_bracings_by_side_and_standing() {
+        for p in 0..4 {
+            for moving in [false, true] {
+                for cross in [false, true] {
+                    assert_eq!(brace_level(p, true, false, false, cross, || moving), p);
+                    let walk = if cross && !moving && p > 0 { BRACE_BASIC_FROM + p - 1 } else { 0 };
+                    assert_eq!(brace_level(p, false, false, false, cross, || moving), walk, "{p} {moving} {cross}");
+                    for stood in [false, true] {
+                        assert_eq!(brace_level(p, stood, true, false, cross, || moving), 0);
+                    }
+                }
+            }
+        }
+        // `moving` is not read for a standing soldier or a friend.
+        assert_eq!(brace_level(2, true, false, false, true, || unreachable!()), 2);
+        assert_eq!(brace_level(2, false, false, false, false, || unreachable!()), 0);
+        let t = brace_table(BRACE, BRACE);
+        for a in 0..crate::unit_types::NUM_KINDS {
+            for o in 0..crate::unit_types::NUM_KINDS {
+                assert!((t[a][o][BRACE_BASIC_FROM + 2][0] - t[a][o][3][0]).abs() < 1e-6);
+                assert!((t[a][o][BRACE_BASIC_FROM + 2][3] - t[a][o][3][3]).abs() < 1e-6);
+            }
+        }
+    }
+
+    /// A joiner more than a ready body behind his regiment's fighting line
+    /// along its facing walks straight ahead; within a ready body of it, past
+    /// it, or with no line or no facing he does not.
+    #[test]
+    fn a_joiner_walks_straight_ahead_only_from_behind_the_line() {
+        let face = Vec2::new(0.0, 1.0);
+        let body = 0.9;
+        assert!(behind_the_line(face, 10.0, Vec2::new(3.0, 5.0), body));
+        assert!(behind_the_line(face, 10.0, Vec2::new(-40.0, 9.0), body));
+        assert!(!behind_the_line(face, 10.0, Vec2::new(0.0, 9.1), body));
+        assert!(!behind_the_line(face, 10.0, Vec2::new(0.0, 12.0), body));
+        assert!(!behind_the_line(face, f32::NAN, Vec2::new(0.0, 0.0), body));
+        assert!(!behind_the_line(Vec2::ZERO, 10.0, Vec2::new(0.0, 0.0), body));
+        let east = Vec2::new(1.0, 0.0);
+        assert!(behind_the_line(east, -20.0, Vec2::new(-25.0, 100.0), body));
+        assert!(!behind_the_line(east, -20.0, Vec2::new(-20.5, 100.0), body));
     }
 
     /// An axis no edge stopped keeps its speed whatever the step.

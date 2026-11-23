@@ -65,6 +65,13 @@ pub struct RenderCounts {
     /// occlusion test hid (render_units_occlusion.rs). In count mode they
     /// are drawn all the same.
     pub hidden: [usize; NUM_LODS],
+    /// Per held level, the living drawn a level coarser because the men in
+    /// front hid their body (`FL_LOD_HIDDEN`, render_units_occlusion.rs).
+    pub coarser: [usize; NUM_LODS],
+    /// The soldiers the same rule sent coarser or back, summed over the
+    /// frames read back since the overlay's last log line, and those frames.
+    pub flips: usize,
+    pub flip_frames: usize,
     /// Cost of sync_instance_data this frame (cull + bucket build).
     pub sync_ms: f32,
     /// FL_GPU_CHECK: what the CPU sweep would have drawn on recent frames,
@@ -166,14 +173,15 @@ pub struct LodConfig {
 impl Default for LodConfig {
     /// FL_LOD=0 draws everything at L0 (the pre-LOD renderer, for A/B
     /// checks). FL_LOD_PX=a,b,c overrides the thresholds, as soldier
-    /// heights in pixels, for feel passes.
+    /// heights in pixels, for feel passes, and `FL_LOD_PX=0` keeps the
+    /// defaults; `FL_PERF=2` sets it (util.rs `perf_str`).
     fn default() -> Self {
         let mut px: [[f32; NUM_LODS - 1]; crate::unit_types::NUM_KINDS] =
             std::array::from_fn(|kind| {
                 let height = 2.0 * crate::unit_types::half_height(kind);
                 LOD_PX_PER_M.map(|per_m| per_m * height)
             });
-        if let Ok(v) = std::env::var("FL_LOD_PX") {
+        if let Some(v) = crate::util::perf_str("FL_LOD_PX").filter(|v| v.trim() != "0") {
             let parsed: Vec<f32> = v.split(',').filter_map(|t| t.trim().parse().ok()).collect();
             match <[f32; NUM_LODS - 1]>::try_from(parsed) {
                 Ok(p) => px = [p; crate::unit_types::NUM_KINDS],
@@ -294,6 +302,29 @@ pub(crate) fn shadow_level(cfg: &LodConfig, kind: usize, texel: f32) -> usize {
         .unwrap_or(0)
 }
 
+/// `FL_FALLEN_FAR=1`: a body whose level by the plain thresholds is 2 (137 m
+/// and farther at 1360 rows, 5 to 21 px) draws at level 3. A look change,
+/// off by default: late in a battle the fallen are the largest share of
+/// what is drawn. Bodies at levels 0 and 1 and every shadow are as without
+/// it. Read once.
+pub(crate) fn fallen_far() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::util::env_or("FL_FALLEN_FAR", 0_u32) != 0)
+}
+
+/// `FL_FALLEN_COARSE`: 1 draws a body whose distance gives him level 1 or
+/// 2 one level coarser and a level-0 body at his own level, since near the
+/// camera the coarser body is plainly cruder; 2 draws every body one level
+/// coarser, the last level at most, for measuring; 0, the default, none
+/// (`FL_PERF` can set it, util.rs `perf_or`).
+/// A look change. A body casts by the level his distance gives him, and a
+/// casting body is posed for it. With `FL_FALLEN_FAR` on too, a level-2
+/// body draws at level 3 as with this alone. Read once.
+pub(crate) fn fallen_coarse() -> u32 {
+    static MODE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| crate::util::perf_or("FL_FALLEN_COARSE", 0_u32).min(2))
+}
+
 /// Per-kind corpse cap (ring-buffered: oldest bodies fade from the field).
 pub const CORPSE_CAP: usize = 25_000;
 
@@ -372,13 +403,15 @@ pub static PREPARE_US: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU
 pub static RENDER_US: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 #[derive(Resource, Default)]
-struct RenderFrameClock(Option<std::time::Instant>);
+pub(crate) struct RenderFrameClock(Option<std::time::Instant>);
 
 fn render_frame_begin(mut clock: ResMut<RenderFrameClock>) {
     clock.0 = Some(std::time::Instant::now());
+    crate::frame_log::render_begin();
 }
 
-fn render_frame_end(clock: Res<RenderFrameClock>) {
+pub(crate) fn render_frame_end(clock: Res<RenderFrameClock>) {
+    crate::frame_log::render_end();
     if let Some(t0) = clock.0 {
         RENDER_US.store(
             t0.elapsed().as_micros() as u32,
@@ -504,7 +537,7 @@ fn setup_unit_mesh(
     // NotShadowCaster: Bevy's own shadow queue would find no material on
     // these entities. They cast through render_units_shadow.rs instead.
     for kind in 0..crate::unit_types::NUM_KINDS {
-        let model = crate::unit_glb::kind_lods(kind);
+        let model = crate::unit_glb::kind_lods(kind, gpu.enabled);
         let lods = model.lods;
         let mut rig = model.rig;
         // The gait pose is built on the leg this mesh has, or about half
@@ -527,7 +560,9 @@ fn setup_unit_mesh(
             let bucket = InstanceBucket(bucket_of(kind, lod));
             // GPU mode: the bucket also carries its expanded mesh for the
             // pulled draw. Its instance data stays, and stays empty.
-            let pulled = pull_mesh_for(&mesh, &bucket, &gpu);
+            let last = lod == NUM_LODS - 1;
+            let cast_source = model.cast_last.as_ref().filter(|_| last);
+            let pulled = pull_mesh_for(&mesh, &bucket, &gpu, cast_source, last && model.light_last);
             let mut entity = commands.spawn((
                 Mesh3d(meshes.add(mesh)),
                 InstanceMaterialData::default(),
@@ -1601,7 +1636,9 @@ impl PullPipelineKey {
             skinned: pull_mesh.skinned && pull_mesh.bucket % NUM_LODS < crate::render_units_gpu::SKEL_LODS,
             shape: DrawShape {
                 flat_atlas: false,
-                ..pull_mesh.shape
+                flat_light: false,
+                light_level: false,
+                ..pull_mesh.cast_shape
             },
         }
     }
@@ -1646,6 +1683,34 @@ fn receive_defs(descriptor: &mut RenderPipelineDescriptor, receive: bool) {
         descriptor.vertex.shader_defs.push("UNIT_SHADOW_RECEIVE".into());
         if let Some(fragment) = descriptor.fragment.as_mut() {
             fragment.shader_defs.push("UNIT_SHADOW_RECEIVE".into());
+        }
+    }
+}
+
+/// `FL_CENTROID=1`: the blended corner light is read at a sample the
+/// triangle covers instead of at the pixel centre (unit_instancing.wgsl
+/// `UNIT_CENTROID`), for measuring how much of the distant soldiers' bright
+/// specks comes from a triangle smaller than a pixel. Off by default.
+/// Every stage and pipeline of the process takes the same value, so it
+/// is not part of any pipeline key. Read once, and logged when on.
+fn centroid() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = crate::util::env_or("FL_CENTROID", 0_u32) != 0;
+        if on {
+            bevy::log::info!("unit light read at a covered sample (centroid)");
+        }
+        on
+    })
+}
+
+/// The vertex and fragment stages must agree on how the light is
+/// interpolated, so both get the UNIT_CENTROID shader def.
+fn centroid_defs(descriptor: &mut RenderPipelineDescriptor) {
+    if centroid() {
+        descriptor.vertex.shader_defs.push("UNIT_CENTROID".into());
+        if let Some(fragment) = descriptor.fragment.as_mut() {
+            fragment.shader_defs.push("UNIT_CENTROID".into());
         }
     }
 }
@@ -1695,8 +1760,18 @@ impl SpecializedRenderPipeline for CustomPipeline {
                 fragment.shader_defs.push("UNIT_ATLAS_FLAT".into());
             }
         }
+        if key.shape.flat_light {
+            descriptor.vertex.shader_defs.push("UNIT_LIGHT_FLAT".into());
+            if let Some(fragment) = descriptor.fragment.as_mut() {
+                fragment.shader_defs.push("UNIT_LIGHT_FLAT".into());
+            }
+        }
+        if key.shape.light_level {
+            descriptor.vertex.shader_defs.push("UNIT_LIGHT_LEVEL".into());
+        }
         atlas_defs(&mut descriptor, key.atlas);
         receive_defs(&mut descriptor, key.receive);
+        centroid_defs(&mut descriptor);
         descriptor.set_layout(3, self.pull_layout.clone());
         descriptor
     }
@@ -1744,6 +1819,7 @@ impl SpecializedMeshPipeline for CustomPipeline {
         descriptor.fragment.as_mut().unwrap().shader = self.shader.clone();
         atlas_defs(&mut descriptor, key.atlas);
         receive_defs(&mut descriptor, key.receive);
+        centroid_defs(&mut descriptor);
         descriptor.set_layout(3, self.bucket_layout.clone());
         Ok(descriptor)
     }

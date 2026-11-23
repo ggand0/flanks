@@ -24,7 +24,7 @@ pub const CHUNK_CELLS: usize = 32;
 /// The battlefields in the menu's Map row. At launch a setup's map wins
 /// (an `FL_SETUP` file, or the Demo's with `FL_DEMO=1`), then
 /// `FL_MAP=big_grassland`, `hill`, `big_hill`, `walled_town`, `wall_debug`,
-/// `classic`, `river`, `sandbox`, `obstacles` or `town`.
+/// `line_debug`, `classic`, `river`, `sandbox`, `obstacles` or `town`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub enum MapKind {
     /// Broad pasture shoulders around an open lowland: the default.
@@ -42,6 +42,10 @@ pub enum MapKind {
     /// The walled town's wall on the same ground, with no houses: a field
     /// for watching units on the wall, its stairs and its walk.
     WallDebug,
+    /// The grassland again, where both armies deploy each rank of
+    /// regiments with no gap between them (regiments.rs), a field for
+    /// watching two unbroken lines meet.
+    LineDebug,
     /// The 0.1.0 heightfield: rolling noise with ridged peaks, no river.
     Classic,
     /// Experimental: the same noise with terraces, a river and a bridge.
@@ -69,6 +73,7 @@ impl MapKind {
             Ok("big_hill") => Self::BigHill,
             Ok("walled_town") => Self::WalledTown,
             Ok("wall_debug") => Self::WallDebug,
+            Ok("line_debug") => Self::LineDebug,
             Ok("river") => Self::River,
             Ok("classic") => Self::Classic,
             Ok("sandbox") => Self::Sandbox,
@@ -86,6 +91,7 @@ impl MapKind {
             Self::BigHill => "Big Hill",
             Self::WalledTown => "Walled Town",
             Self::WallDebug => "Wall Debug",
+            Self::LineDebug => "Line Debug",
             Self::Classic => "Classic",
             Self::River => "River",
             Self::Sandbox => "Sandbox",
@@ -119,13 +125,14 @@ impl MapKind {
     }
 
     /// Every map, in the menu's order.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Grassland,
         Self::BigGrassland,
         Self::Hill,
         Self::BigHill,
         Self::WalledTown,
         Self::WallDebug,
+        Self::LineDebug,
         Self::Classic,
         Self::River,
         Self::Sandbox,
@@ -637,7 +644,14 @@ impl Plugin for TerrainPlugin {
             .add_systems(Startup, spawn_chunks)
             .add_systems(
                 Update,
-                (rebuild_map.in_set(MapRebuild), crater_tool, auto_test_craters, remesh_dirty).chain(),
+                (
+                    rebuild_map.in_set(MapRebuild),
+                    crater_tool,
+                    auto_test_craters,
+                    remesh_dirty,
+                    decide_terrain_casting,
+                )
+                    .chain(),
             );
     }
 }
@@ -927,7 +941,7 @@ pub(crate) fn build_terrain(kind: MapKind) -> Terrain {
                 heights[z * verts_x + x] = big_grassland_height(p);
                 continue;
             }
-            if matches!(kind, MapKind::Grassland | MapKind::Sandbox) {
+            if matches!(kind, MapKind::Grassland | MapKind::Sandbox | MapKind::LineDebug) {
                 heights[z * verts_x + x] = classic_height(p);
                 continue;
             }
@@ -1031,11 +1045,18 @@ fn ground_texture(assets: &AssetServer, path: &'static str) -> Handle<Image> {
             settings.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
                 address_mode_u: address_mode,
                 address_mode_v: address_mode,
-                anisotropy_clamp: 8,
+                anisotropy_clamp: ground_anisotropy(),
                 ..ImageSamplerDescriptor::linear()
             });
         })
         .load(path)
+}
+
+/// The ground textures' anisotropy clamp: 8, or `FL_GROUND_ANISO` from 1
+/// to 16, for measuring. Read once.
+fn ground_anisotropy() -> u16 {
+    static N: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
+    *N.get_or_init(|| crate::util::env_or("FL_GROUND_ANISO", 8_u16).clamp(1, 16))
 }
 
 fn ground_base() -> StandardMaterial {
@@ -1052,7 +1073,7 @@ fn ground_base() -> StandardMaterial {
 fn ground_layers(assets: &AssetServer, images: &mut Assets<Image>, terrain: &Terrain) -> GroundLayers {
     let hill = terrain.kind.on_hill();
     let authored = hill
-        || matches!(terrain.kind, MapKind::Grassland | MapKind::BigGrassland | MapKind::Sandbox | MapKind::Town);
+        || matches!(terrain.kind, MapKind::Grassland | MapKind::BigGrassland | MapKind::Sandbox | MapKind::LineDebug | MapKind::Town);
     GroundLayers {
         pasture: ground_texture(
             assets,
@@ -1208,6 +1229,103 @@ fn spawn_chunk_meshes(
             if let Some(aabb) = aabb {
                 e.insert(aabb);
             }
+            if terrain_shadow_switch() == Some(false) {
+                e.insert(bevy::light::NotShadowCaster);
+            }
+        }
+    }
+}
+
+/// `FL_TERRAIN_SHADOW`: unset, the ground casts the sun's shadow only where
+/// it can shadow anything (`decide_terrain_casting`); `1` always, `0`
+/// never, for measuring. The ground receives every shadow either way. Read
+/// once.
+fn terrain_shadow_switch() -> Option<bool> {
+    static ON: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FL_TERRAIN_SHADOW").ok().and_then(|v| v.parse::<u32>().ok()).map(|v| v != 0))
+}
+
+/// The steepest rise of any triangle toward the sun: over a step `d` along
+/// the ground toward the sun (`toward_sun` without its height, unit
+/// length), how much the triangle's plane climbs. A face standing upright
+/// rises without bound. A point of the ground, or anything standing on it,
+/// is in the ground's shadow only if somewhere the ground climbs toward the
+/// sun faster than the sun's ray does, `toward_sun.y` over its horizontal
+/// length.
+fn steepest_rise_toward(positions: &[[f32; 3]], indices: &[u32], toward_sun: Vec3) -> f32 {
+    let d = Vec2::new(toward_sun.x, toward_sun.z).normalize_or_zero();
+    let mut steepest = f32::NEG_INFINITY;
+    for t in indices.chunks_exact(3) {
+        let [a, b, c] = [t[0], t[1], t[2]].map(|i| Vec3::from(positions[i as usize]));
+        let mut n = (b - a).cross(c - a);
+        if n.y < 0.0 {
+            n = -n;
+        }
+        let across = Vec2::new(n.x, n.z);
+        if across == Vec2::ZERO {
+            steepest = steepest.max(0.0);
+            continue;
+        }
+        if n.y <= 1e-6 * n.length() {
+            return f32::INFINITY;
+        }
+        // The plane's height is (k - n_xz . p) / n_y, so its slope along d
+        // is -(n_xz . d) / n_y.
+        steepest = steepest.max(-across.dot(d) / n.y);
+    }
+    steepest
+}
+
+/// The ground casts the sun's shadow only where it can shadow anything:
+/// on a map where no triangle rises toward the sun as steeply as 0.98 of
+/// the sun's own slope, the sun's rays to every point on or above the
+/// ground stay clear of it, and the chunks skip the shadow maps. Decided
+/// again when a chunk is spawned or remeshed or the sun turns.
+fn decide_terrain_casting(
+    mut commands: Commands,
+    chunks: Res<TerrainChunks>,
+    meshes: Res<Assets<Mesh>>,
+    mut mesh_events: MessageReader<AssetEvent<Mesh>>,
+    added: Query<(), Added<GroundChunk>>,
+    sun: Query<Ref<Transform>, With<DirectionalLight>>,
+    ground: Query<Entity, With<GroundChunk>>,
+) {
+    let remeshed = mesh_events.read().any(|e| match e {
+        AssetEvent::Modified { id } => chunks.meshes.iter().any(|h| h.id() == *id),
+        _ => false,
+    });
+    if terrain_shadow_switch().is_some() {
+        return;
+    }
+    let Ok(sun) = sun.single() else { return };
+    if !(remeshed || !added.is_empty() || sun.is_changed()) || ground.is_empty() {
+        return;
+    }
+    let toward_sun = sun.back().as_vec3();
+    let limit = 0.98 * toward_sun.y / Vec2::new(toward_sun.x, toward_sun.z).length();
+    let mut steepest = f32::NEG_INFINITY;
+    for handle in &chunks.meshes {
+        let Some(mesh) = meshes.get(handle) else { return };
+        let Some(bevy::mesh::VertexAttributeValues::Float32x3(positions)) = mesh.attribute(Mesh::ATTRIBUTE_POSITION)
+        else {
+            continue;
+        };
+        let indices: Vec<u32> = match mesh.indices() {
+            Some(indices) => indices.iter().map(|i| i as u32).collect(),
+            None => (0..positions.len() as u32).collect(),
+        };
+        steepest = steepest.max(steepest_rise_toward(positions, &indices, toward_sun));
+    }
+    let casts = steepest >= limit;
+    info!(
+        "terrain shadow: steepest rise toward the sun {steepest:.3} against the limit {limit:.3}, the ground {}",
+        if casts { "casts" } else { "casts no shadow" }
+    );
+    for e in &ground {
+        if casts {
+            commands.entity(e).remove::<bevy::light::NotShadowCaster>();
+        } else {
+            commands.entity(e).insert(bevy::light::NotShadowCaster);
         }
     }
 }
@@ -1541,6 +1659,40 @@ mod tests {
     use super::*;
     use bevy::mesh::VertexAttributeValues;
 
+    /// A ramp climbing toward the sun more steeply than the sun stands
+    /// rises past the limit, and the same ramp falling toward the sun
+    /// does not, under the scene's sun.
+    #[test]
+    fn a_ramp_casts_only_when_it_climbs_toward_the_sun() {
+        let toward_sun = crate::sun_rotation() * Vec3::Z;
+        assert!(toward_sun.y > 0.0, "the sun stands above the ground");
+        let along = Vec2::new(toward_sun.x, toward_sun.z);
+        let sun_slope = toward_sun.y / along.length();
+        let d = along.normalize();
+        let side = Vec2::new(-d.y, d.x);
+        // A 1 m square ramp whose height climbs `slope` per metre along d.
+        let ramp = |slope: f32| -> Vec<[f32; 3]> {
+            [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
+                .map(|(u, v)| {
+                    let p = d * u + side * v;
+                    [p.x, slope * u, p.y]
+                })
+                .to_vec()
+        };
+        let quad = [0, 1, 2, 0, 2, 3];
+        let limit = 0.98 * sun_slope;
+        let up = steepest_rise_toward(&ramp(1.5 * sun_slope), &quad, toward_sun);
+        assert!(up >= limit, "{up} against {limit}");
+        assert!((up - 1.5 * sun_slope).abs() < 1e-4);
+        let down = steepest_rise_toward(&ramp(-1.5 * sun_slope), &quad, toward_sun);
+        assert!(down < limit, "{down} against {limit}");
+        // A gentle climb toward the sun stays under the limit.
+        assert!(steepest_rise_toward(&ramp(0.5 * sun_slope), &quad, toward_sun) < limit);
+        // An upright face rises without bound.
+        let wall = vec![[0.0, 0.0, 0.0], [side.x, 0.0, side.y], [side.x, 1.0, side.y]];
+        assert_eq!(steepest_rise_toward(&wall, &[0, 1, 2], toward_sun), f32::INFINITY);
+    }
+
     const CHUNKS_X: usize = 16;
     const CHUNKS_Z: usize = 12;
     const VERTS_X: usize = CHUNKS_X * CHUNK_CELLS + 1;
@@ -1873,6 +2025,7 @@ mod tests {
             MapKind::BigGrassland,
             MapKind::River,
             MapKind::Sandbox,
+            MapKind::LineDebug,
             MapKind::Grassland,
         ] {
             app.world_mut().write_message(MapChanged(kind));

@@ -96,6 +96,18 @@ impl Default for ShadowReceiveLevels {
     }
 }
 
+/// `FL_RECEIVE_LODS=n`: only the levels below n receive the sun's
+/// shadow, on top of the distance rule of `ShadowReceiveLevels`. Unset or
+/// 0, every level the distance rule lets in. `FL_PERF` can set it (util.rs
+/// `perf_or`). Read once.
+fn receive_lods() -> usize {
+    static BELOW: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BELOW.get_or_init(|| match crate::util::perf_or("FL_RECEIVE_LODS", NUM_LODS) {
+        0 => NUM_LODS,
+        n => n,
+    })
+}
+
 #[allow(clippy::type_complexity)] // bevy system params
 fn update_sun_uniform(
     camera: Query<(Entity, &Camera, &Projection), With<Camera3d>>,
@@ -126,8 +138,9 @@ fn update_sun_uniform(
             };
             let bands = LodBands::new(&lod_cfg, px_per_unit);
             let reach = config.bounds.last().copied().unwrap_or(0.0);
+            let below = receive_lods();
             for (lod, on) in levels.iter_mut().enumerate() {
-                *on = bands.level_start(lod) < reach;
+                *on = bands.level_start(lod) < reach && lod < below;
             }
             u.params = Vec4::new(
                 1.0,
@@ -446,7 +459,7 @@ impl<P: PhaseItem> RenderCommand<P> for DrawCasterList {
         let kind = pulled.bucket as usize / NUM_LODS;
         let list = NUM_BUCKETS + cascade_index * NUM_KINDS + kind;
         pass.set_bind_group(3, group, &[]);
-        match &pulled.index {
+        match &pulled.shadow_index {
             Some(index) => {
                 pass.set_index_buffer(index.slice(..), IndexFormat::Uint32);
                 pass.draw_indexed_indirect(&alloc.indexed_args, list as u64 * 20);

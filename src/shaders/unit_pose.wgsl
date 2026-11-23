@@ -655,6 +655,8 @@ fn p_skel() -> u32 {
 // The levels a skinned kind poses by its skeleton (render_units_gpu.rs
 // SKEL_LODS): L0 and L1. Further out he poses by his parts.
 const SKEL_LODS: u32 = 2u;
+// The last detail level (render_units.rs NUM_LODS - 1).
+const LAST_LOD: u32 = 3u;
 // A skinned kind's clips, by slot (unit_glb.rs `SKEL_CLIPS`).
 const CLIP_STAND: u32 = 0u;
 const CLIP_READY: u32 = 1u;
@@ -720,6 +722,12 @@ struct Corner {
 struct Placed {
     position: vec3<f32>,
     normal: vec3<f32>,
+#ifdef UNIT_LIGHT_FLAT
+    // Two more directions turned by the same steps as `normal`: a flat-lit
+    // triangle's other corner normals (unit_instancing.wgsl `vertex_pull`).
+    second: vec3<f32>,
+    third: vec3<f32>,
+#endif
 };
 
 #ifdef UNIT_POSE_READ
@@ -1787,9 +1795,15 @@ fn put_skeleton() {
 }
 
 // The whole pose of the soldier with this instance record, into the slots
-// from `base` on. His part pose always: his shadow draws by his parts at
-// every distance, and so do his far levels. His joints as well when his
-// level (`lod`) plays the clips.
+// from `base` on. His part pose, but for the case below: his shadow draws
+// by his parts at every distance, and so do his far levels. His joints as
+// well when his level (`lod`) plays the clips.
+// `body` not 0: his kind's last level is all body, part 0
+// (render_units_gpu.rs `PoseParams::body`). Drawn there he casts no
+// shadow, and a part-0 corner of a level without a skin reads only the
+// slots `pose_begin` writes (P_POS, P_YAW, P_TURN, P_HIP, P_DEATH and
+// P_TEAM) and, on a bow rig kind, P_KNIFE, so the rest is left out. With
+// `body` 2 every slot left out holds 1e30.
 fn pose_write(
     base: u32,
     pos_scale: vec4<f32>,
@@ -1798,10 +1812,24 @@ fn pose_write(
     anim2: vec4<f32>,
     time: f32,
     lod: u32,
+    body: u32,
 ) {
     pose_base = base;
     let skel = rig.skel.params.x > 0u && lod < SKEL_LODS;
     pose_begin(pos_scale, color, anim, anim2, time, skel);
+    if body != 0u && lod == LAST_LOD {
+        let bow_rig = rig.bow.params.w > 0.5;
+        if body == 2u {
+            let end = p_skel() + rig.skel.params.x;
+            for (var k = P_LEG; k < end; k++) {
+                pose_put(k, vec4<f32>(1e30));
+            }
+        }
+        if bow_rig {
+            pose_put(P_KNIFE, vec4<f32>(select(0.0, 1.0, pre.knife), 0.0, 0.0, 0.0));
+        }
+        return;
+    }
     put_simple();
     // The fallen keep the legs they fell with (`place`).
     if pre.leg > 0.0 {
@@ -1868,7 +1896,9 @@ fn put_away(part: f32) -> bool {
 // Where a corner of the mesh lands in the world, posed: its rest position
 // and normal in the soldier's local space, its body part and the part's
 // pivot height. On a skinned kind, `skin` is its joint pair, a + 256 * b,
-// and `weight` the share of b.
+// and `weight` the share of b. Under UNIT_LIGHT_FLAT it also takes two
+// more rest directions and turns them by every step that turns the
+// normal.
 fn place(
     rest: vec3<f32>,
     rest_normal: vec3<f32>,
@@ -1876,12 +1906,20 @@ fn place(
     pivot_height: f32,
     skin: u32,
     weight: f32,
+#ifdef UNIT_LIGHT_FLAT
+    second_rest: vec3<f32>,
+    third_rest: vec3<f32>,
+#endif
 ) -> Placed {
     let bow_rig = rig.bow.params.w > 0.5;
     // The bow or the knife an archer has put away gathers at his
     // position: its triangles have no area and draw nothing.
     if bow_rig && put_away(part_id) {
+#ifdef UNIT_LIGHT_FLAT
+        return Placed(pose_at(P_POS).xyz, rest_normal, second_rest, third_rest);
+#else
         return Placed(pose_at(P_POS).xyz, rest_normal);
+#endif
     }
     // The knife moves with the hand that holds it.
     let held = select(part_id, 10.0, abs(part_id - 20.0) < 0.5);
@@ -1890,6 +1928,10 @@ fn place(
     let pivot = corner.pivot;
     var local = corner.position;
     var normal = corner.normal;
+#ifdef UNIT_LIGHT_FLAT
+    var second = second_rest;
+    var third = third_rest;
+#endif
 
     // --- Part animation (rotations around the part pivot) ---
     // A skinned level's shader (UNIT_SKINNED, with the pose pass) compiles
@@ -1910,6 +1952,10 @@ fn place(
     }
     local = joint_org(jb) + qrot(q, local - rig.skel.joints[b].xyz) * joint_scale(jb);
     normal = qrot(q, normal);
+#ifdef UNIT_LIGHT_FLAT
+    second = qrot(q, second);
+    third = qrot(q, third);
+#endif
 #else
     if bow_rig && (abs(part - 1.0) < 0.5 || abs(part - 6.0) < 0.5 || (part > 7.5 && part < 19.5)) {
 #ifdef UNIT_POSE_READ
@@ -1933,6 +1979,10 @@ fn place(
         let at = pose_at(P_BOW + 2u * k + 1u);
         local = at.xyz + qrot(turn, local) * at.w;
         normal = qrot(turn, normal);
+#ifdef UNIT_LIGHT_FLAT
+        second = qrot(turn, second);
+        third = qrot(turn, third);
+#endif
     } else if rig.chain > 0.5 && (abs(part - rig.arm) < 0.5 || (part > 7.5 && part < 10.5)) {
 #ifdef UNIT_POSE_READ
         let r = pose_at(P_RIG + chain_slot(part));
@@ -1943,6 +1993,10 @@ fn place(
         let yz = vec2<f32>(local.y * r.x + local.z * r.y, -local.y * r.y + local.z * r.x) + r.zw;
         local = vec3<f32>(local.x, yz.x, yz.y);
         normal = pitch_normal_cs(normal, r.x, r.y);
+#ifdef UNIT_LIGHT_FLAT
+        second = pitch_normal_cs(second, r.x, r.y);
+        third = pitch_normal_cs(third, r.x, r.y);
+#endif
     } else if rig.arm > 0.5 && (abs(part - 8.0) < 0.5 || abs(part - rig.arm) < 0.5) {
 #ifndef UNIT_POSE_READ
         put_rig_arm();
@@ -1953,6 +2007,10 @@ fn place(
         let slash = pose_at(P_RIG + 3u);
         local = rot_y(local, slash.x, slash.y);
         normal = rot_y(normal, slash.x, slash.y);
+#ifdef UNIT_LIGHT_FLAT
+        second = rot_y(second, slash.x, slash.y);
+        third = rot_y(third, slash.x, slash.y);
+#endif
         // Past the elbow the forearm turns, blended over a band so the
         // sleeve bends. The weapon turns with the hand.
         let upper = rig.elbow - rig.shoulder;
@@ -1969,6 +2027,10 @@ fn place(
             total += slash.z;
         }
         normal = pitch_normal(normal, total);
+#ifdef UNIT_LIGHT_FLAT
+        second = pitch_normal(second, total);
+        third = pitch_normal(third, total);
+#endif
     } else if part > 6.5 && part < 7.5 {
 #ifndef UNIT_POSE_READ
         put_simple();
@@ -1976,6 +2038,10 @@ fn place(
         let m = pose_at(P_MISC);
         local = pitch_about_cs(local, 0.0, m.y, m.z);
         normal = pitch_normal_cs(normal, m.y, m.z);
+#ifdef UNIT_LIGHT_FLAT
+        second = pitch_normal_cs(second, m.y, m.z);
+        third = pitch_normal_cs(third, m.y, m.z);
+#endif
     } else if part > 5.5 && part < 6.5 {
 #ifndef UNIT_POSE_READ
         put_simple();
@@ -1983,6 +2049,10 @@ fn place(
         let a = pose_at(P_ARMS2);
         local = pitch_about_cs(local, pivot, a.x, a.y);
         normal = pitch_normal_cs(normal, a.x, a.y);
+#ifdef UNIT_LIGHT_FLAT
+        second = pitch_normal_cs(second, a.x, a.y);
+        third = pitch_normal_cs(third, a.x, a.y);
+#endif
     } else if part > 4.5 && part < 5.5 {
 #ifndef UNIT_POSE_READ
         put_simple();
@@ -1990,8 +2060,16 @@ fn place(
         let s = pose_at(P_SHIELD);
         local = pitch_about_cs(local, pivot, s.x, s.y);
         normal = pitch_normal_cs(normal, s.x, s.y);
+#ifdef UNIT_LIGHT_FLAT
+        second = pitch_normal_cs(second, s.x, s.y);
+        third = pitch_normal_cs(third, s.x, s.y);
+#endif
         local = rot_y(local, s.z, s.w);
         normal = rot_y(normal, s.z, s.w);
+#ifdef UNIT_LIGHT_FLAT
+        second = rot_y(second, s.z, s.w);
+        third = rot_y(third, s.z, s.w);
+#endif
         local.y += pose_at(P_MISC).x;
     } else if part > 3.5 && part < 4.5 {
 #ifndef UNIT_POSE_READ
@@ -2000,6 +2078,10 @@ fn place(
         let a = pose_at(P_ARMS);
         local = pitch_about_cs(local, pivot, a.z, a.w);
         normal = pitch_normal_cs(normal, a.z, a.w);
+#ifdef UNIT_LIGHT_FLAT
+        second = pitch_normal_cs(second, a.z, a.w);
+        third = pitch_normal_cs(third, a.z, a.w);
+#endif
     } else if part > 1.5 && part < 3.5 {
         // Corpses carry no leg length and keep the legs they fell with.
         let leg = pose_at(P_TURN).w;
@@ -2015,6 +2097,10 @@ fn place(
 #endif
             local = pitch_about_cs(local, pivot, l.x, l.y);
             normal = pitch_normal_cs(normal, l.x, l.y);
+#ifdef UNIT_LIGHT_FLAT
+            second = pitch_normal_cs(second, l.x, l.y);
+            third = pitch_normal_cs(third, l.x, l.y);
+#endif
             let down = clamp((pivot - corner.position.y) / leg, 0.0, 1.0);
             let knee = KNEE * leg;
             let kz = knee * l.y;
@@ -2022,11 +2108,19 @@ fn place(
             let bend = -l.z * smoothstep(KNEE - 0.1, KNEE + 0.1, down);
             local = pitch_about_at(local, ky, kz, bend);
             normal = pitch_normal(normal, bend);
+#ifdef UNIT_LIGHT_FLAT
+            second = pitch_normal(second, bend);
+            third = pitch_normal(third, bend);
+#endif
             // The foot turns about the ankle to the pitch the pose asks for.
             let shank = (ANKLE - KNEE) * leg;
             let foot = l.w * smoothstep(ANKLE - 0.06, ANKLE + 0.02, down);
             local = pitch_about_at(local, ky - shank * shin.x, kz + shank * shin.y, foot);
             normal = pitch_normal(normal, foot);
+#ifdef UNIT_LIGHT_FLAT
+            second = pitch_normal(second, foot);
+            third = pitch_normal(third, foot);
+#endif
         }
     } else if part > 0.5 {
 #ifndef UNIT_POSE_READ
@@ -2036,8 +2130,16 @@ fn place(
         let slash = pose_at(P_ARMS2);
         local = rot_y(local, slash.z, slash.w);
         normal = rot_y(normal, slash.z, slash.w);
+#ifdef UNIT_LIGHT_FLAT
+        second = rot_y(second, slash.z, slash.w);
+        third = rot_y(third, slash.z, slash.w);
+#endif
         local = pitch_about_cs(local, pivot, a.x, a.y);
         normal = pitch_normal_cs(normal, a.x, a.y);
+#ifdef UNIT_LIGHT_FLAT
+        second = pitch_normal_cs(second, a.x, a.y);
+        third = pitch_normal_cs(third, a.x, a.y);
+#endif
     }
 #endif
 
@@ -2049,6 +2151,10 @@ fn place(
     if bow_rig && (part < 0.5 || (part > 1.5 && part < 3.5)) {
         local = rot_y(local, hip.x, hip.y);
         normal = rot_y(normal, hip.x, hip.y);
+#ifdef UNIT_LIGHT_FLAT
+        second = rot_y(second, hip.x, hip.y);
+        third = rot_y(third, hip.x, hip.y);
+#endif
     }
 #endif
 
@@ -2070,6 +2176,10 @@ fn place(
         }
         local = rot_y(local, c, s);
         normal = rot_y(normal, c, s);
+#ifdef UNIT_LIGHT_FLAT
+        second = rot_y(second, c, s);
+        third = rot_y(third, c, s);
+#endif
         local.x += turn.z * w;
     }
 #endif
@@ -2087,6 +2197,12 @@ fn place(
         local = vec3<f32>(local.x, sfy * sca - local.z * ssa - rig.half, sfy * ssa + local.z * sca);
         normal =
             vec3<f32>(normal.x, normal.y * sca - normal.z * ssa, normal.y * ssa + normal.z * sca);
+#ifdef UNIT_LIGHT_FLAT
+        second =
+            vec3<f32>(second.x, second.y * sca - second.z * ssa, second.y * ssa + second.z * sca);
+        third =
+            vec3<f32>(third.x, third.y * sca - third.z * ssa, third.y * ssa + third.z * sca);
+#endif
     }
 
     // Death: the topple about the feet.
@@ -2099,22 +2215,42 @@ fn place(
             local = vec3<f32>(local.x, fy * ca - local.z * sa - rig.half, fy * sa + local.z * ca);
             normal =
                 vec3<f32>(normal.x, normal.y * ca - normal.z * sa, normal.y * sa + normal.z * ca);
+#ifdef UNIT_LIGHT_FLAT
+            second =
+                vec3<f32>(second.x, second.y * ca - second.z * sa, second.y * sa + second.z * ca);
+            third =
+                vec3<f32>(third.x, third.y * ca - third.z * sa, third.y * sa + third.z * ca);
+#endif
         } else {
             local = vec3<f32>(local.x * ca + fy * sa, fy * ca - local.x * sa - rig.half, local.z);
             normal =
                 vec3<f32>(normal.x * ca + normal.y * sa, normal.y * ca - normal.x * sa, normal.z);
+#ifdef UNIT_LIGHT_FLAT
+            second =
+                vec3<f32>(second.x * ca + second.y * sa, second.y * ca - second.x * sa, second.z);
+            third =
+                vec3<f32>(third.x * ca + third.y * sa, third.y * ca - third.x * sa, third.z);
+#endif
         }
     }
 
     // Face yaw (0 = +Z): rotate position and normal.
     local = rot_y(local, yaw.x, yaw.y);
     normal = rot_y(normal, yaw.x, yaw.y);
+#ifdef UNIT_LIGHT_FLAT
+    second = rot_y(second, yaw.x, yaw.y);
+    third = rot_y(third, yaw.x, yaw.y);
+#endif
 
     let at = pose_at(P_POS);
     var scale = 1.0;
     if part > 6.5 && part < 7.5 {
         scale = pose_at(P_MISC).w;
     }
+#ifdef UNIT_LIGHT_FLAT
+    return Placed(local * scale + at.xyz + vec3<f32>(0.0, at.w, 0.0), normal, second, third);
+#else
     return Placed(local * scale + at.xyz + vec3<f32>(0.0, at.w, 0.0), normal);
+#endif
 }
 #endif

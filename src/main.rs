@@ -12,6 +12,7 @@ mod camera;
 mod combat;
 mod fatigue;
 mod formation;
+mod frame_log;
 mod gait;
 mod frontline;
 mod game_files;
@@ -195,6 +196,7 @@ fn main() {
             unit_cards::UnitCardsPlugin,
             balance::BalancePlugin,
             picker::PickerPlugin,
+            frame_log::FrameLogPlugin,
         ))
         .insert_resource(Time::<Fixed>::from_hz(30.0))
         // A frame that overruns makes the fixed clock owe catch-up sim
@@ -235,6 +237,11 @@ fn log_task_pools() {
     );
 }
 
+/// The sun's rotation: it shines along its -Z, so toward the sun is its +Z.
+pub(crate) fn sun_rotation() -> Quat {
+    Quat::from_euler(EulerRot::YXZ, 0.7, -0.75, 0.0)
+}
+
 /// Sun; terrain chunks come from TerrainPlugin.
 fn setup_world(mut commands: Commands, settings: Res<settings::Settings>) {
     commands.spawn((
@@ -248,7 +255,7 @@ fn setup_world(mut commands: Commands, settings: Res<settings::Settings>) {
             ..default()
         },
         // Lowish sun: flat-shaded relief needs directional contrast.
-        Transform::from_rotation(Quat::from_euler(EulerRot::YXZ, 0.7, -0.75, 0.0)),
+        Transform::from_rotation(sun_rotation()),
         // Three cascades out to 280 m, split at 40 and 106 m. The first
         // covers the close-up, where a soldier's shadow at his feet needs
         // the finest texels. Soldiers stop casting at about 100 m, where

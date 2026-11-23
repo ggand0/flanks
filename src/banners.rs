@@ -165,6 +165,15 @@ fn spawn_banners(
     });
 }
 
+/// A bar's fill at `share` of its width, anchored left; written only when
+/// it differs.
+fn set_fill(mut t: Mut<Transform>, share: f32) {
+    let mut want = *t;
+    want.scale.x = (BAR_W * share).max(0.001);
+    want.translation.x = -BAR_W * (1.0 - share) / 2.0;
+    t.set_if_neq(want);
+}
+
 #[allow(clippy::too_many_arguments)] // bevy system params
 fn update_banners(
     groups: Res<Groups>,
@@ -183,54 +192,59 @@ fn update_banners(
     let billboard = Quat::from_rotation_y(cam.yaw);
     let dist_scale = (cam.distance * 0.013).clamp(0.8, 3.2);
 
+    // Every write compares first: a write marks the component changed, and
+    // Bevy then propagates the transform and visibility and takes the mesh
+    // again, for each of the 200 banners and their bars, every frame.
     for (banner, mut tf, mut vis) in &mut roots {
         let Some(gd) = groups.list.get(banner.group) else {
-            *vis = Visibility::Hidden;
+            vis.set_if_neq(Visibility::Hidden);
             continue;
         };
         if gd.count == 0 || !viz.0 {
-            *vis = Visibility::Hidden;
+            vis.set_if_neq(Visibility::Hidden);
             continue;
         }
-        *vis = Visibility::Visible;
+        vis.set_if_neq(Visibility::Visible);
         let broken = gd.state.is_broken();
 
-        tf.translation = Vec3::new(
-            gd.centroid.x,
-            terrain.height_at(gd.centroid.x, gd.centroid.y) + 0.6,
-            gd.centroid.y,
-        );
-        tf.rotation = billboard;
         let mut s = dist_scale;
         if !broken && crate::morale::band(gd) == crate::morale::Band::Wavering {
             // About to break: the whole banner trembles.
             s *= 1.0 + 0.07 * (time.elapsed_secs() * 7.0).sin();
         }
-        tf.scale = Vec3::splat(s);
+        tf.set_if_neq(Transform {
+            translation: Vec3::new(
+                gd.centroid.x,
+                terrain.height_at(gd.centroid.x, gd.centroid.y) + 0.6,
+                gd.centroid.y,
+            ),
+            rotation: billboard,
+            scale: Vec3::splat(s),
+        });
 
         // Left-anchored bar fills.
         let morale = crate::morale::morale01(gd);
-        if let Ok((mut t, _)) = parts.get_mut(banner.morale_fill) {
-            t.scale.x = (BAR_W * morale).max(0.001);
-            t.translation.x = -BAR_W * (1.0 - morale) / 2.0;
+        if let Ok((t, _)) = parts.get_mut(banner.morale_fill) {
+            set_fill(t, morale);
         }
         let strength = (gd.count as f32 / gd.initial_count.max(1) as f32).clamp(0.0, 1.0);
-        if let Ok((mut t, _)) = parts.get_mut(banner.strength_fill) {
-            t.scale.x = (BAR_W * strength).max(0.001);
-            t.translation.x = -BAR_W * (1.0 - strength) / 2.0;
+        if let Ok((t, _)) = parts.get_mut(banner.strength_fill) {
+            set_fill(t, strength);
         }
 
         if let Ok((_, mut v)) = parts.get_mut(banner.sel_marker) {
-            *v = if selection
-                .regiments
-                .get(banner.group)
-                .copied()
-                .unwrap_or(false)
-            {
-                Visibility::Inherited
-            } else {
-                Visibility::Hidden
-            };
+            v.set_if_neq(
+                if selection
+                    .regiments
+                    .get(banner.group)
+                    .copied()
+                    .unwrap_or(false)
+                {
+                    Visibility::Inherited
+                } else {
+                    Visibility::Hidden
+                },
+            );
         }
 
         // Broken regiments fly a gray flag.

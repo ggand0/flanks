@@ -353,6 +353,7 @@ pub fn update_routes(
     mut units: ResMut<crate::units::Units>,
     pipeline: Res<crate::sim::TickPipeline>,
 ) {
+    let _tick_log = crate::frame_log::tick::time(crate::frame_log::tick::Part::Routes);
     if !enabled() {
         return;
     }

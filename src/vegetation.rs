@@ -53,7 +53,7 @@ fn respawn_vegetation(
         commands.entity(e).despawn();
     }
     match terrain.kind {
-        MapKind::Grassland => {
+        MapKind::Grassland | MapKind::LineDebug => {
             let specs: Vec<_> = trees.0.iter().map(|tree| (tree.name, tree.reach)).collect();
             let planting = grassland_planting(&specs, &terrain, crate::regiments::army_gap());
             spawn_planting(&mut commands, &terrain, &trees, &planting);
@@ -61,7 +61,8 @@ fn respawn_vegetation(
                 .iter()
                 .map(|stand| (stand.name, Some((stand.trees, stand.shrubs))))
                 .collect();
-            planting.log(&specs, "grassland", &groups);
+            let map = if terrain.kind == MapKind::LineDebug { "line_debug" } else { "grassland" };
+            planting.log(&specs, map, &groups);
         }
         MapKind::Sandbox => {
             for &(name, x, z, yaw, scale) in SANDBOX_COMPOSITION {

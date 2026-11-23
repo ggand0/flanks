@@ -288,6 +288,7 @@ pub fn update_morale(
     mut broken_centroids: Local<Vec<(u8, u8, Vec2)>>,
     mut steady_centroids: Local<Vec<(usize, u8, Vec2)>>,
 ) {
+    let _tick_log = crate::frame_log::tick::time(crate::frame_log::tick::Part::Morale);
     *tick += 1;
     let dt = time.delta_secs();
     if dt <= 0.0 {
