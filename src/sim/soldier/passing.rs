@@ -58,7 +58,7 @@ pub(super) fn side_pref(i: usize, stuck: u16) -> (f32, f32) {
 /// fighting men keep their own footwork.
 #[inline]
 pub(super) fn choose_opening(f: &Field, s: &mut Soldier, st: &mut Step) {
-    let Field { grid, orders, tick, anchors, home, .. } = *f;
+    let Field { orders, tick, anchors, home, .. } = *f;
     let i = s.i;
     let going = st.open.open_on && st.foe.best_idx == u32::MAX && !st.foe.memo_valid;
     let ring_flag = *s.sight & SIGHT_RING != 0;
@@ -83,29 +83,7 @@ pub(super) fn choose_opening(f: &Field, s: &mut Soldier, st: &mut Step) {
     // He may still aim at a taken crack, which is following, but never
     // turns his shoulders for it. Only for a man with such a crack in his
     // aim, so a second look at the comrades within the scan's box.
-    let mut taken = false;
-    if fit == 1 {
-        let (lo, hi, far) = st.open.near_span;
-        let my_team_bit = st.scan.my_team_bit;
-        let widths = widths();
-        grid.for_each_candidate(p, QUERY_RADIUS, |o| {
-            if taken
-                || o.idx as usize == i
-                || (o.meta & crate::spatial::META_TEAM) != my_team_bit
-                || (o.meta & crate::spatial::META_DYING) != 0
-            {
-                return;
-            }
-            let to = o.xz() - p;
-            let along = to.dot(wd);
-            if along <= OPEN_AHEAD || to.length_squared() >= QUERY_RADIUS * QUERY_RADIUS {
-                return;
-            }
-            let lat = wd.x * to.y - wd.y * to.x;
-            let r = 0.5 * widths[crate::spatial::meta_pose(o.meta)].body;
-            taken = along - r < far && lat + r > lo && lat - r < hi;
-        });
-    }
+    let taken = fit == 1 && crack_taken(f, i, st, p, wd);
     // The wide look: nothing near fits and he saw somebody in his way.
     // The ring (FL_OPEN_RING): a man of a holding regiment far from his
     // place with nobody ahead fitting him reads the men all round him within RING_SEE on his look
@@ -121,156 +99,10 @@ pub(super) fn choose_opening(f: &Field, s: &mut Soldier, st: &mut Step) {
     let hemmed = open_ring()
         && orders[st.gi].is_none()
         && (anchors[st.gi] + home[i]).distance_squared(p) > TRY_FROM_SLOT * TRY_FROM_SLOT;
-    let mut ring_aim = false;
-    if fit == 0 && st.open.saw && hemmed && look {
-        let my_team_bit = st.scan.my_team_bit;
-        let widths = widths();
-        let mut men: [(f32, Vec2, f32); 16] = [(0.0, Vec2::ZERO, 0.0); 16];
-        let mut n = 0usize;
-        let mut own = 0usize;
-        grid.for_each_candidate_vel(p, RING_SEE, |o, o_vel| {
-            if n == men.len()
-                || o.idx as usize == i
-                || (o.meta & crate::spatial::META_TEAM) != my_team_bit
-                || (o.meta & crate::spatial::META_DYING) != 0
-            {
-                return;
-            }
-            let to = o.xz() - p;
-            if to.length_squared() >= RING_SEE * RING_SEE {
-                return;
-            }
-            let holding = orders[crate::spatial::meta_group(o.meta)].is_none();
-            if !holding && o_vel.dot(wd) > QUEUE_SPEED {
-                return;
-            }
-            let ang = (wd.x * to.y - wd.y * to.x).atan2(to.dot(wd));
-            men[n] = (ang, to, 0.5 * widths[crate::spatial::meta_pose(o.meta)].body);
-            n += 1;
-            own += usize::from(crate::spatial::meta_group(o.meta) == st.gi);
-        });
-        // Hemmed in: men on every side of him, no open side wider than
-        // RING_OPEN_SPAN, and most of them another regiment's. A man in a
-        // lane or at a block's edge has an open side and walks; a man
-        // inside his own block (an attacking block the moment it arrives)
-        // is among his comrades; the ring is for the man left in a cell of
-        // another regiment's planted men.
-        let mut open_span = std::f32::consts::TAU;
-        if n >= 3 {
-            men[..n].sort_by(|a, b| a.0.total_cmp(&b.0));
-            open_span = (0..n)
-                .map(|k| if k + 1 == n { men[0].0 + std::f32::consts::TAU - men[k].0 } else { men[k + 1].0 - men[k].0 })
-                .fold(0.0f32, f32::max);
-        }
-        if n >= 3 && open_span <= RING_OPEN_SPAN && 2 * own < n {
-            let mut best = f32::INFINITY;
-            let mut best_point = Vec2::ZERO;
-            let mut best_fit = 0u8;
-            for k in 0..n {
-                let (a0, q0, h0) = men[k];
-                let (a1, q1, h1) = men[(k + 1) % n];
-                let span = if k + 1 == n { a1 + std::f32::consts::TAU - a0 } else { a1 - a0 };
-                let (point, wf) = if span > std::f32::consts::FRAC_PI_2 {
-                    // Open ground between them: the way between at the
-                    // nearer man's distance.
-                    let mid = a0 + 0.5 * span;
-                    let dir = wd * mid.cos() + perp * mid.sin();
-                    (dir * q0.length().min(q1.length()).max(st.open.sep0), 2u8)
-                } else {
-                    let chord = q1 - q0;
-                    let len = chord.length();
-                    let air = len - h0 - h1;
-                    let wf = if air >= st.open.body0 - OPEN_SLACK {
-                        2
-                    } else if air >= SQUEEZE_DEPTH {
-                        1
-                    } else {
-                        0
-                    };
-                    if wf == 0 || len < 1e-3 {
-                        continue;
-                    }
-                    (q0 + chord * ((h0 + 0.5 * air) / len), wf)
-                };
-                let off = (wd.x * point.y - wd.y * point.x).atan2(point.dot(wd)).abs();
-                let cost = off + if wf == 1 { SQUEEZE_DETOUR } else { 0.0 };
-                if cost < best {
-                    best = cost;
-                    best_point = point;
-                    best_fit = wf;
-                }
-            }
-            if best_fit > 0 {
-                *s.aim = p + best_point;
-                v = (v & !STUCK_WIDE_DEPTH) | ((best_fit == 1) as u16 * STUCK_WIDE_DEPTH);
-                ring_aim = true;
-                RING_AIMS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-        }
-    }
+    let ring_aim = fit == 0 && st.open.saw && hemmed && look && read_the_ring(f, s, st, p, wd, perp, &mut v);
     // The wide look: nothing near fits and he saw somebody in his way.
     if fit == 0 && !ring_aim && st.open.saw && look {
-        let (pref, coin) = side_pref(i, v);
-        let my_team_bit = st.scan.my_team_bit;
-        let widths = widths();
-        let read = |o: &crate::spatial::SortedUnit, o_vel: Vec2| -> Option<(f32, f32, f32)> {
-            if o.idx as usize == i
-                || (o.meta & crate::spatial::META_TEAM) != my_team_bit
-                || (o.meta & crate::spatial::META_DYING) != 0
-            {
-                return None;
-            }
-            let to = o.xz() - p;
-            let along = to.dot(wd);
-            if along <= OPEN_AHEAD || to.length_squared() >= OPEN_FAR * OPEN_FAR {
-                return None;
-            }
-            let holding = orders[crate::spatial::meta_group(o.meta)].is_none();
-            if !holding && o_vel.dot(wd) > QUEUE_SPEED {
-                return None;
-            }
-            let lat = wd.x * to.y - wd.y * to.x;
-            Some((along, lat, 0.5 * widths[crate::spatial::meta_pose(o.meta)].body))
-        };
-        // One pass over the grid: the comrades in his sight into a buffer,
-        // then the nearest and the row from it. Two passes cost 3.0 ms of
-        // the 200k step; the buffer overflowing (a press denser than
-        // WIDE_SEEN men in 4 m) falls back to the second pass.
-        let mut wide_at = f32::INFINITY;
-        let mut seen: [(f32, f32, f32); WIDE_SEEN] = [(0.0, 0.0, 0.0); WIDE_SEEN];
-        let mut n_seen = 0usize;
-        let mut overflow = false;
-        grid.for_each_candidate_vel(p, OPEN_FAR, |o, o_vel| {
-            if let Some(m) = read(o, o_vel) {
-                wide_at = wide_at.min(m.0);
-                if n_seen < WIDE_SEEN {
-                    seen[n_seen] = m;
-                    n_seen += 1;
-                } else {
-                    overflow = true;
-                }
-            }
-        });
-        let mut wide = Row::default();
-        if overflow {
-            grid.for_each_candidate_vel(p, OPEN_FAR, |o, o_vel| {
-                if let Some((along, lat, half)) = read(o, o_vel)
-                    && along < wide_at + OPEN_BAND
-                {
-                    wide.add(lat, half, along);
-                }
-            });
-        } else {
-            for &(along, lat, half) in &seen[..n_seen] {
-                if along < wide_at + OPEN_BAND {
-                    wide.add(lat, half, along);
-                }
-            }
-        }
-        let (w_lat, w_along, w_fit, _) =
-            openings(&wide, wide_at, OPEN_FAR, st.open.body0, SQUEEZE_DEPTH, true, pref, coin);
-        *s.aim = if w_fit > 0 { p + wd * w_along + perp * w_lat } else { Vec2::NAN };
-        v = (v & !STUCK_WIDE_DEPTH) | ((w_fit == 1) as u16 * STUCK_WIDE_DEPTH);
+        wide_look(f, s, st, p, wd, perp, &mut v);
     }
     // A near fit wins; else the wide aim while it is still ahead of him,
     // or a ring aim within RING_SEE whichever way it lies, until he is on
@@ -312,6 +144,198 @@ pub(super) fn choose_opening(f: &Field, s: &mut Soldier, st: &mut Step) {
     *s.stuck = v;
 }
 
+/// Whether the near crack that fits only his depth is taken (`choose_opening`).
+#[inline]
+fn crack_taken(f: &Field, i: usize, st: &Step, p: Vec2, wd: Vec2) -> bool {
+    let Field { grid, .. } = *f;
+    let mut taken = false;
+
+    let (lo, hi, far) = st.open.near_span;
+    let my_team_bit = st.scan.my_team_bit;
+    let widths = widths();
+    grid.for_each_candidate(p, QUERY_RADIUS, |o| {
+        if taken
+            || o.idx as usize == i
+            || (o.meta & crate::spatial::META_TEAM) != my_team_bit
+            || (o.meta & crate::spatial::META_DYING) != 0
+        {
+            return;
+        }
+        let to = o.xz() - p;
+        let along = to.dot(wd);
+        if along <= OPEN_AHEAD || to.length_squared() >= QUERY_RADIUS * QUERY_RADIUS {
+            return;
+        }
+        let lat = wd.x * to.y - wd.y * to.x;
+        let r = 0.5 * widths[crate::spatial::meta_pose(o.meta)].body;
+        taken = along - r < far && lat + r > lo && lat - r < hi;
+    });
+    taken
+}
+
+/// The ring read (`choose_opening`): the crack round a hemmed man nearest
+/// his way that fits him, as his aim. Returns whether he aims at one.
+#[inline]
+fn read_the_ring(f: &Field, s: &mut Soldier, st: &Step, p: Vec2, wd: Vec2, perp: Vec2, v: &mut u16) -> bool {
+    let Field { grid, orders, .. } = *f;
+    let i = s.i;
+    let mut ring_aim = false;
+    let my_team_bit = st.scan.my_team_bit;
+    let widths = widths();
+    let mut men: [(f32, Vec2, f32); 16] = [(0.0, Vec2::ZERO, 0.0); 16];
+    let mut n = 0usize;
+    let mut own = 0usize;
+    grid.for_each_candidate_vel(p, RING_SEE, |o, o_vel| {
+        if n == men.len()
+            || o.idx as usize == i
+            || (o.meta & crate::spatial::META_TEAM) != my_team_bit
+            || (o.meta & crate::spatial::META_DYING) != 0
+        {
+            return;
+        }
+        let to = o.xz() - p;
+        if to.length_squared() >= RING_SEE * RING_SEE {
+            return;
+        }
+        let holding = orders[crate::spatial::meta_group(o.meta)].is_none();
+        if !holding && o_vel.dot(wd) > QUEUE_SPEED {
+            return;
+        }
+        let ang = (wd.x * to.y - wd.y * to.x).atan2(to.dot(wd));
+        men[n] = (ang, to, 0.5 * widths[crate::spatial::meta_pose(o.meta)].body);
+        n += 1;
+        own += usize::from(crate::spatial::meta_group(o.meta) == st.gi);
+    });
+    // Hemmed in: men on every side of him, no open side wider than
+    // RING_OPEN_SPAN, and most of them another regiment's. A man in a
+    // lane or at a block's edge has an open side and walks; a man
+    // inside his own block (an attacking block the moment it arrives)
+    // is among his comrades; the ring is for the man left in a cell of
+    // another regiment's planted men.
+    let mut open_span = std::f32::consts::TAU;
+    if n >= 3 {
+        men[..n].sort_by(|a, b| a.0.total_cmp(&b.0));
+        open_span = (0..n)
+            .map(|k| if k + 1 == n { men[0].0 + std::f32::consts::TAU - men[k].0 } else { men[k + 1].0 - men[k].0 })
+            .fold(0.0f32, f32::max);
+    }
+    if n >= 3 && open_span <= RING_OPEN_SPAN && 2 * own < n {
+        let mut best = f32::INFINITY;
+        let mut best_point = Vec2::ZERO;
+        let mut best_fit = 0u8;
+        for k in 0..n {
+            let (a0, q0, h0) = men[k];
+            let (a1, q1, h1) = men[(k + 1) % n];
+            let span = if k + 1 == n { a1 + std::f32::consts::TAU - a0 } else { a1 - a0 };
+            let (point, wf) = if span > std::f32::consts::FRAC_PI_2 {
+                // Open ground between them: the way between at the
+                // nearer man's distance.
+                let mid = a0 + 0.5 * span;
+                let dir = wd * mid.cos() + perp * mid.sin();
+                (dir * q0.length().min(q1.length()).max(st.open.sep0), 2u8)
+            } else {
+                let chord = q1 - q0;
+                let len = chord.length();
+                let air = len - h0 - h1;
+                let wf = if air >= st.open.body0 - OPEN_SLACK {
+                    2
+                } else if air >= SQUEEZE_DEPTH {
+                    1
+                } else {
+                    0
+                };
+                if wf == 0 || len < 1e-3 {
+                    continue;
+                }
+                (q0 + chord * ((h0 + 0.5 * air) / len), wf)
+            };
+            let off = (wd.x * point.y - wd.y * point.x).atan2(point.dot(wd)).abs();
+            let cost = off + if wf == 1 { SQUEEZE_DETOUR } else { 0.0 };
+            if cost < best {
+                best = cost;
+                best_point = point;
+                best_fit = wf;
+            }
+        }
+        if best_fit > 0 {
+            *s.aim = p + best_point;
+            *v = (*v & !STUCK_WIDE_DEPTH) | ((best_fit == 1) as u16 * STUCK_WIDE_DEPTH);
+            ring_aim = true;
+            RING_AIMS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    ring_aim
+}
+
+/// The wide look (`choose_opening`): out to OPEN_FAR, the opening in the
+/// row nearest him that fits him, as his aim.
+#[inline]
+fn wide_look(f: &Field, s: &mut Soldier, st: &Step, p: Vec2, wd: Vec2, perp: Vec2, v: &mut u16) {
+    let Field { grid, orders, .. } = *f;
+    let i = s.i;
+    let (pref, coin) = side_pref(i, *v);
+    let my_team_bit = st.scan.my_team_bit;
+    let widths = widths();
+    let read = |o: &crate::spatial::SortedUnit, o_vel: Vec2| -> Option<(f32, f32, f32)> {
+        if o.idx as usize == i
+            || (o.meta & crate::spatial::META_TEAM) != my_team_bit
+            || (o.meta & crate::spatial::META_DYING) != 0
+        {
+            return None;
+        }
+        let to = o.xz() - p;
+        let along = to.dot(wd);
+        if along <= OPEN_AHEAD || to.length_squared() >= OPEN_FAR * OPEN_FAR {
+            return None;
+        }
+        let holding = orders[crate::spatial::meta_group(o.meta)].is_none();
+        if !holding && o_vel.dot(wd) > QUEUE_SPEED {
+            return None;
+        }
+        let lat = wd.x * to.y - wd.y * to.x;
+        Some((along, lat, 0.5 * widths[crate::spatial::meta_pose(o.meta)].body))
+    };
+    // One pass over the grid: the comrades in his sight into a buffer,
+    // then the nearest and the row from it. Two passes cost 3.0 ms of
+    // the 200k step; the buffer overflowing (a press denser than
+    // WIDE_SEEN men in 4 m) falls back to the second pass.
+    let mut wide_at = f32::INFINITY;
+    let mut seen: [(f32, f32, f32); WIDE_SEEN] = [(0.0, 0.0, 0.0); WIDE_SEEN];
+    let mut n_seen = 0usize;
+    let mut overflow = false;
+    grid.for_each_candidate_vel(p, OPEN_FAR, |o, o_vel| {
+        if let Some(m) = read(o, o_vel) {
+            wide_at = wide_at.min(m.0);
+            if n_seen < WIDE_SEEN {
+                seen[n_seen] = m;
+                n_seen += 1;
+            } else {
+                overflow = true;
+            }
+        }
+    });
+    let mut wide = Row::default();
+    if overflow {
+        grid.for_each_candidate_vel(p, OPEN_FAR, |o, o_vel| {
+            if let Some((along, lat, half)) = read(o, o_vel)
+                && along < wide_at + OPEN_BAND
+            {
+                wide.add(lat, half, along);
+            }
+        });
+    } else {
+        for &(along, lat, half) in &seen[..n_seen] {
+            if along < wide_at + OPEN_BAND {
+                wide.add(lat, half, along);
+            }
+        }
+    }
+    let (w_lat, w_along, w_fit, _) =
+        openings(&wide, wide_at, OPEN_FAR, st.open.body0, SQUEEZE_DEPTH, true, pref, coin);
+    *s.aim = if w_fit > 0 { p + wd * w_along + perp * w_lat } else { Vec2::NAN };
+    *v = (*v & !STUCK_WIDE_DEPTH) | ((w_fit == 1) as u16 * STUCK_WIDE_DEPTH);
+}
+
 /// What he remembers and what he sees of his comrades: the enemy he
 /// remembers if still in sight, the way he is going, and every eighth tick
 /// a look at the men around him (a comrade in his way, to his left or
@@ -321,7 +345,7 @@ pub(super) fn choose_opening(f: &Field, s: &mut Soldier, st: &mut Step) {
 /// look.
 #[inline]
 pub(super) fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
-    let Field { grid, pos_prev, orders, engaged, tick, .. } = *f;
+    let Field { pos_prev, orders, engaged, tick, .. } = *f;
     let i = s.i;
     let p = st.p;
     let gi = st.gi;
@@ -332,8 +356,6 @@ pub(super) fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
     let join_fp = st.fight.join_fp;
     let desired = st.desired;
     let best_idx = st.foe.best_idx;
-    let scan_r = st.scan.scan_r;
-    let my_team_bit = st.scan.my_team_bit;
     // The enemy he remembers, as the scan read it (`scan`).
     let memo = st.foe.prev_target as usize;
     let memo_valid = st.foe.memo_valid;
@@ -383,67 +405,11 @@ pub(super) fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
     if (i as u32).wrapping_add(tick).is_multiple_of(LOOK_TICKS) {
         let mut seen = 0u16;
         if look_lanes || watch_go || slot_on {
-            let (mut way, mut left, mut right, mut ahead_any, mut mark, mut go) =
-                (false, false, false, false, false, false);
-            // Branch-free: neighbors of both teams interleave in a melee, and
-            // branching on each one mispredicts.
-            grid.for_each_candidate_vel(p, scan_r, |o, ov| {
-                let comrade = (o.idx as usize != i)
-                    & ((o.meta & crate::spatial::META_TEAM) == my_team_bit);
-                let d = p - o.xz();
-                let d2 = d.length_squared();
-                let reach = 0.707 * d2.sqrt();
-                let near = d2 < SEP_RADIUS * SEP_RADIUS;
-                let going = ov.dot(memo_dir);
-                // A comrade ahead: he walks up to him instead of jogging, and
-                // at arm's length the man blocks his way. One already walking
-                // away the same way is neither: men heading for the same
-                // fight move together instead of each waiting for the next.
-                let away = going > 0.5;
-                let ahead = comrade & look_lanes & ((-d).dot(memo_dir) > reach) & !away;
-                ahead_any |= ahead;
-                way |= ahead & (d2 < way_r * way_r);
-                // A comrade of his own regiment close by, running to the
-                // fight: the sight that makes him follow.
-                go |= comrade
-                    & watch_go
-                    & (crate::spatial::meta_group(o.meta) == gi)
-                    & (going > GOING_SPEED);
-                let lateral = (-d).dot(side_dir);
-                let beside = comrade & look_lanes & near;
-                left |= beside & (lateral > reach);
-                right |= beside & (lateral < -reach);
-                mark |= comrade & slot_on & near & ((-d).dot(slot_dir) > reach);
-            });
-            seen = (way as u16 * SIGHT_WAY)
-                | (left as u16 * SIGHT_LEFT)
-                | (right as u16 * SIGHT_RIGHT)
-                | (ahead_any as u16 * SIGHT_AHEAD)
-                | (mark as u16 * SIGHT_MARK)
-                | (go as u16 * SIGHT_GO);
+            let ways = OnHisWay { memo_dir, side_dir, slot_dir, look_lanes, watch_go, slot_on, way_r };
+            seen = look_on_his_way(f, i, st, &ways);
         }
         if fighter {
-            // The room he has to fight the enemy in reach: a comrade close
-            // to either side of his way to the enemy, and any man close
-            // behind him.
-            let (mut left, mut right, mut back) = (false, false, false);
-            grid.for_each_candidate(p, scan_r, |o| {
-                let other = o.idx as usize != i;
-                let comrade = other & ((o.meta & crate::spatial::META_TEAM) == my_team_bit);
-                let to = o.xz() - p;
-                let d2 = to.length_squared();
-                let len = d2.sqrt();
-                let quarter = 0.707 * len;
-                let near = d2 < SEP_RADIUS * SEP_RADIUS;
-                let along = to.dot(fight_dir);
-                let lateral = to.dot(side_dir);
-                left |= comrade & near & (lateral > quarter);
-                right |= comrade & near & (lateral < -quarter);
-                back |= other & near & (along < -quarter);
-            });
-            seen |= (left as u16 * SIGHT_LEFT)
-                | (right as u16 * SIGHT_RIGHT)
-                | (back as u16 * SIGHT_BACK);
+            seen |= look_at_the_room(f, i, st, fight_dir, side_dir);
         }
         *s.sight = (*s.sight
             & (SIGHT_GO_FAR | SIGHT_FOE | SIGHT_KNIFE_COUNT | SIGHT_KNIFE))
@@ -463,6 +429,104 @@ pub(super) fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
     st.sight.right_blocked = right_blocked;
     st.sight.comrade_ahead = comrade_ahead;
     st.sight.slot_blocked = slot_blocked;
+}
+
+/// What his look on his way looks for (`look_around`): the way he is
+/// going, his sides and the way to his mark, whether he looks for a lane,
+/// watches his comrades go or tests his mark, and how near a comrade in
+/// his way stands.
+#[derive(Clone, Copy)]
+struct OnHisWay {
+    memo_dir: Vec2,
+    side_dir: Vec2,
+    slot_dir: Vec2,
+    look_lanes: bool,
+    watch_go: bool,
+    slot_on: bool,
+    way_r: f32,
+}
+
+/// His look at the comrades around him on his way (`look_around`): the
+/// sight bits of a comrade in his way, to his left or right, ahead,
+/// between him and his mark, and running to the fight.
+#[inline]
+fn look_on_his_way(f: &Field, i: usize, st: &Step, ways: &OnHisWay) -> u16 {
+    let Field { grid, .. } = *f;
+    let OnHisWay { memo_dir, side_dir, slot_dir, look_lanes, watch_go, slot_on, way_r } = *ways;
+    let p = st.p;
+    let gi = st.gi;
+    let scan_r = st.scan.scan_r;
+    let my_team_bit = st.scan.my_team_bit;
+    let (mut way, mut left, mut right, mut ahead_any, mut mark, mut go) =
+        (false, false, false, false, false, false);
+    // Branch-free: neighbors of both teams interleave in a melee, and
+    // branching on each one mispredicts.
+    grid.for_each_candidate_vel(p, scan_r, |o, ov| {
+        let comrade = (o.idx as usize != i)
+            & ((o.meta & crate::spatial::META_TEAM) == my_team_bit);
+        let d = p - o.xz();
+        let d2 = d.length_squared();
+        let reach = 0.707 * d2.sqrt();
+        let near = d2 < SEP_RADIUS * SEP_RADIUS;
+        let going = ov.dot(memo_dir);
+        // A comrade ahead: he walks up to him instead of jogging, and
+        // at arm's length the man blocks his way. One already walking
+        // away the same way is neither: men heading for the same
+        // fight move together instead of each waiting for the next.
+        let away = going > 0.5;
+        let ahead = comrade & look_lanes & ((-d).dot(memo_dir) > reach) & !away;
+        ahead_any |= ahead;
+        way |= ahead & (d2 < way_r * way_r);
+        // A comrade of his own regiment close by, running to the
+        // fight: the sight that makes him follow.
+        go |= comrade
+            & watch_go
+            & (crate::spatial::meta_group(o.meta) == gi)
+            & (going > GOING_SPEED);
+        let lateral = (-d).dot(side_dir);
+        let beside = comrade & look_lanes & near;
+        left |= beside & (lateral > reach);
+        right |= beside & (lateral < -reach);
+        mark |= comrade & slot_on & near & ((-d).dot(slot_dir) > reach);
+    });
+    (way as u16 * SIGHT_WAY)
+        | (left as u16 * SIGHT_LEFT)
+        | (right as u16 * SIGHT_RIGHT)
+        | (ahead_any as u16 * SIGHT_AHEAD)
+        | (mark as u16 * SIGHT_MARK)
+        | (go as u16 * SIGHT_GO)
+}
+
+/// The room he has to fight the enemy in reach (`look_around`): the
+/// sight bits of a comrade close to either side of his way to the enemy
+/// and of any man close behind him.
+#[inline]
+fn look_at_the_room(f: &Field, i: usize, st: &Step, fight_dir: Vec2, side_dir: Vec2) -> u16 {
+    let Field { grid, .. } = *f;
+    let p = st.p;
+    let scan_r = st.scan.scan_r;
+    let my_team_bit = st.scan.my_team_bit;
+    // The room he has to fight the enemy in reach: a comrade close
+    // to either side of his way to the enemy, and any man close
+    // behind him.
+    let (mut left, mut right, mut back) = (false, false, false);
+    grid.for_each_candidate(p, scan_r, |o| {
+        let other = o.idx as usize != i;
+        let comrade = other & ((o.meta & crate::spatial::META_TEAM) == my_team_bit);
+        let to = o.xz() - p;
+        let d2 = to.length_squared();
+        let len = d2.sqrt();
+        let quarter = 0.707 * len;
+        let near = d2 < SEP_RADIUS * SEP_RADIUS;
+        let along = to.dot(fight_dir);
+        let lateral = to.dot(side_dir);
+        left |= comrade & near & (lateral > quarter);
+        right |= comrade & near & (lateral < -quarter);
+        back |= other & near & (along < -quarter);
+    });
+    (left as u16 * SIGHT_LEFT)
+        | (right as u16 * SIGHT_RIGHT)
+        | (back as u16 * SIGHT_BACK)
 }
 
 /// Stuck ticks before a man tries a side (half a second); how long a try
