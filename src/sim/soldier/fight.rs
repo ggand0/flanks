@@ -271,330 +271,27 @@ pub(super) fn decide_to_join(f: &Field, s: &mut Soldier, st: &mut Step) {
 /// and a ready man's choice of target in his forward half-plane.
 #[inline]
 pub(super) fn swing(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut) {
-    let Field { terrain, pos_prev, speed, team, group, broken, shoot_at, target_members, blocks, tick_seed, .. } = *f;
-    let i = s.i;
     let params = &TYPES[st.my_kind];
-    let p = st.p;
-    let gi = st.gi;
-    let dying = st.dying;
-    let routed = st.routed;
-    let sticky = st.foe.sticky;
-    let prev_target = st.foe.prev_target;
-    let best_idx = st.foe.best_idx;
-    let my_kind = st.my_kind;
     let mut desired = st.desired;
     // Swing state machine. All writes are to this unit's own row; damage goes
     // through the chunk event buffer.
     let mut face_target = None;
-    if !dying {
+    if !st.dying {
         match *s.swing & crate::units::SWING_STATE_MASK {
             crate::units::SWING_WINDUP
                 if *s.swing & crate::units::SWING_RANGED != 0 =>
             {
-                // Drawing the bow: feet planted, eyes on the target block.
-                // A man whose knife came out lets the draw go.
-                desired = Vec2::ZERO;
-                let knife = *s.sight & SIGHT_KNIFE != 0;
-                if let Some(shot) = shoot_at[gi].as_ref().filter(|_| !knife) {
-                    let q = *s.quarry as usize;
-                    face_target =
-                        Some(if q < pos_prev.len() { pos_prev[q].xz() } else { shot.c });
-                    if *s.swing_t == 0 {
-                        let h = |k: u32| {
-                            crate::units::hash01(
-                                tick_seed
-                                    ^ (i as u32).wrapping_mul(k).wrapping_add(k),
-                            )
-                        };
-                        // Aim: the man he drew at (every man has his own
-                        // aim target) while he lives, else another man of
-                        // the block; the footprint-disc spot stands in only
-                        // if every member died this tick. Then the range-
-                        // INDEPENDENT landing scatter and a lead for the
-                        // block's drift over the flight.
-                        let members = &target_members[shot.t];
-                        let q = *s.quarry as usize;
-                        let base = if q < pos_prev.len()
-                            && team[q] != team[i]
-                            && f.death_snap[q] == 0
-                        {
-                            pos_prev[q].xz()
-                        } else if members.is_empty() {
-                            let ang =
-                                h(0x1F3B) * std::f32::consts::TAU;
-                            let rad = shot.r * 0.85 * h(0x2E5D).sqrt();
-                            shot.c + Vec2::new(ang.cos(), ang.sin()) * rad
-                        } else {
-                            let m = members[(h(0x1F3B)
-                                * members.len() as f32)
-                                as usize
-                                % members.len()]
-                                as usize;
-                            pos_prev[m].xz()
-                        };
-                        let sigma = crate::unit_types::missile::AIM_SPREAD;
-                        let mut aim = base
-                            + Vec2::new(
-                                (h(0x3B7F) + h(0x45A3) - 1.0) * sigma,
-                                (h(0x5DC1) + h(0x6B8D) - 1.0) * sigma,
-                            );
-                        aim += shot.vel * (aim.distance(p) / 30.0);
-                        // Launch above the body-hit band (arrows.rs): a
-                        // shaft leaving at head height is inside its own
-                        // shooter's hit cylinder at flight-time zero and
-                        // kills him.
-                        let over = crate::unit_types::half_height(my_kind)
-                            + crate::arrows::LAUNCH_OVER_HEAD;
-                        let from = Vec3::new(p.x, pos_prev[i].y + over, p.y);
-                        let to = Vec3::new(
-                            aim.x,
-                            terrain.height_at(aim.x, aim.y)
-                                + crate::arrows::AIM_HEIGHT * crate::unit_types::tallest(),
-                            aim.y,
-                        );
-                        out.arrows.push(crate::arrows::ArrowSpawn {
-                            pos: from,
-                            vel: crate::arrows::solve_launch(
-                                from,
-                                to,
-                                &blocks[team[i] as usize],
-                                terrain,
-                            ),
-                            team: team[i],
-                            group: group[i],
-                        });
-                        *s.ammo = s.ammo.saturating_sub(1);
-                        *s.swing = crate::units::SWING_RECOVER;
-                        // Reload: the M2TW volley cycle is animation-bound at
-                        // ~10 s; the jitter keeps later volleys ragged.
-                        *s.swing_t =
-                            (crate::unit_types::missile::RELOAD_TICKS as f32
-                                * (0.8 + 0.25 * h(0x77F1)))
-                                .min(255.0)
-                                as u8;
-                    } else {
-                        *s.swing_t -= 1;
-                    }
-                } else {
-                    // Target gone mid-draw, or the knife out: ease off and
-                    // reassess shortly.
-                    *s.swing = crate::units::SWING_RECOVER;
-                    *s.swing_t = crate::unit_types::missile::CANCEL_TICKS;
-                }
+                face_target = draw(f, s, st, out, &mut desired);
             }
-            crate::units::SWING_WINDUP => {
-                // Feet planted while winding up — EXCEPT against a routing
-                // target: the cut-down happens at a run, or the runner is 3 m
-                // gone by the strike tick and every blow whiffs (the pursuit
-                // treadmill).
-                let t = *s.target as usize;
-                let target_routed =
-                    t < pos_prev.len() && broken[group[t] as usize];
-                if !target_routed {
-                    desired *= 0.25;
-                }
-                if t < pos_prev.len() {
-                    face_target = Some(pos_prev[t].xz());
-                }
-                if *s.swing_t == 0 {
-                    // Strike lands; validity (still alive, still in reach,
-                    // still an enemy) is checked in the apply pass — a dodged
-                    // or dead target is a whiff. A cut lands harder.
-                    let cut = params.is_cut(*s.swing);
-                    let mut jit =
-                        0.85 + 0.3 * crate::units::hash01(tick_seed ^ (i as u32));
-                    if cut {
-                        jit *= params.cut_weight();
-                    }
-                    out.events.push(DamageEvent {
-                        victim: *s.target,
-                        attacker: i as u32,
-                        jit,
-                        charge: *s.swing & crate::units::SWING_CHARGE != 0,
-                        impale: false,
-                        warn: 0,
-                        chain: 0,
-                    });
-                    *s.swing = crate::units::SWING_RECOVER;
-                    let cjit = (1.0 - crate::unit_types::COOLDOWN_JITTER)
-                        + 2.0
-                            * crate::unit_types::COOLDOWN_JITTER
-                            * crate::units::hash01(
-                                tick_seed ^ (i as u32).wrapping_mul(0x9E37),
-                            );
-                    *s.swing_t = (params.cooldown_ticks as f32 * cjit) as u8;
-                    if cut {
-                        *s.swing_t = (*s.swing_t).max(params.cut_return_ticks);
-                    }
-                } else {
-                    *s.swing_t -= 1;
-                }
-            }
-            crate::units::SWING_DEFEND => {
-                // Answering a swing he saw coming (sim/damage.rs): feet
-                // planted, eyes on the attacker, the shield or the blade
-                // up to meet the blow, then back on guard. The damage
-                // apply set this and may end it early: a parry that
-                // stopped the blow turns into the counter's wind-up.
-                desired *= 0.25;
-                let t = *s.target as usize;
-                if t < pos_prev.len() {
-                    face_target = Some(pos_prev[t].xz());
-                }
-                // A parry that stopped the blow counters: a stab at
-                // the man he parried. In his kind's window he launches
-                // it with a chance each tick by his skill, at the
-                // window's end for sure.
-                let stopped = *s.swing & crate::sim::damage::GUARD_STOPPED != 0;
-                let elapsed = crate::sim::damage::PARRY_LEN.saturating_sub(*s.swing_t);
-                let (from, by) = crate::sim::damage::COUNTER_WINDOW[st.my_kind];
-                let launch = stopped
-                    && elapsed >= from
-                    && (elapsed >= by
-                        || crate::units::hash01(tick_seed ^ (i as u32).wrapping_mul(0x7F4A_7C15))
-                            < params.defence_skill * crate::sim::damage::counter_per_tick());
-                if launch {
-                    *s.swing = crate::units::SWING_WINDUP
-                        | (*s.swing & crate::units::SWING_STAGGER_IMMUNE);
-                    *s.swing_t = ((params.windup_ticks as f32
-                        * crate::sim::damage::counter_windup())
-                        .ceil() as u8)
-                        .clamp(1, params.windup_ticks);
-                    // The man he parried is warned like any target, one
-                    // deeper in the exchange: he may answer from the
-                    // bind, with less chance each time (sim/damage.rs).
-                    out.events.push(DamageEvent {
-                        victim: *s.target,
-                        attacker: i as u32,
-                        jit: 0.0,
-                        charge: false,
-                        impale: false,
-                        warn: *s.swing_t,
-                        chain: s.chain.saturating_add(1),
-                    });
-                } else if *s.swing_t == 0 {
-                    *s.swing = crate::units::SWING_READY
-                        | (*s.swing & crate::units::SWING_STAGGER_IMMUNE);
-                } else {
-                    *s.swing_t -= 1;
-                }
-            }
-            crate::units::SWING_RECOVER => {
-                if *s.swing_t == 0 {
-                    // A stagger that just wore off leaves one free pass
-                    // against the next one (anti-stunlock); a plain recovery
-                    // carries an unspent pass forward.
-                    let immune = if *s.swing
-                        & crate::units::SWING_STAGGERED
-                        != 0
-                    {
-                        crate::units::SWING_STAGGER_IMMUNE
-                    } else {
-                        *s.swing & crate::units::SWING_STAGGER_IMMUNE
-                    };
-                    *s.swing = crate::units::SWING_READY | immune;
-                } else {
-                    *s.swing_t -= 1;
-                }
-            }
-            _ => {
-                // Ready: pick a target from the scan. Stick with the previous
-                // one when still in reach (duels), else nearest. Routing
-                // units never start attacks (they still defend nothing —
-                // pursuit is free hits).
-                let chosen = if sticky { prev_target } else { best_idx };
-                // No eyes in the back of his head: a man only opens on a
-                // target in his forward half-plane. Being struck tells him
-                // where to turn (the flash facing below), but it does NOT let
-                // him swing backward over his shoulder — he attacks once he
-                // has turned far enough, at the human turn-speed cap. Without
-                // this gate every rear-approached victim counter-wound-up on
-                // proximity and was face-on before the first blow landed; the
-                // rear sector never fired in practice.
-                let aware = chosen != u32::MAX && {
-                    let t = chosen as usize;
-                    t < pos_prev.len() && {
-                        let to_t = pos_prev[t].xz() - p;
-                        let fwd = Vec2::new(
-                            s.yaw.sin(),
-                            s.yaw.cos(),
-                        );
-                        fwd.dot(to_t) >= 0.0
-                    }
-                };
-                if chosen != u32::MAX && !routed && aware {
-                    *s.target = chosen;
-                    // Arriving at speed = a charging blow: momentum converts
-                    // to damage + a bigger lunge (render reads the flag).
-                    let v2 = s.vel.xz().length_squared();
-                    let cs = speed[i] * CHARGE_SPEED_FRAC;
-                    // Attack style for this swing: 0 = stab, 1 = the classic
-                    // overhead swing (2 = slash exists in the shader but
-                    // benched). A kind with a cut draws 1 as its slow cut;
-                    // its 2 is the overhead swing at the stab's pace, drawn
-                    // once the overhead is a clip of its own (the code's
-                    // swing over the guard turns the blade sideways). Spears
-                    // only ever thrust, and a charging man with a cut stabs:
-                    // a slow cut at a run carries him into the man before it
-                    // lands.
-                    let charge = v2 > cs * cs;
-                    let style = if my_kind
-                        == crate::unit_types::KIND_SPEAR as usize
-                        || (charge && params.cut_windup_ticks > 0)
-                    {
-                        0
-                    } else {
-                        (crate::units::hash01(
-                            tick_seed ^ (i as u32).wrapping_mul(0x51ED),
-                        ) * 2.0) as u8
-                    };
-                    let style = style << crate::units::SWING_STYLE_SHIFT;
-                    *s.swing = if charge {
-                        crate::units::SWING_WINDUP
-                            | crate::units::SWING_CHARGE
-                            | style
-                    } else {
-                        crate::units::SWING_WINDUP | style
-                    };
-                    *s.swing_t = params.windup_for(*s.swing);
-                    // The target is told of the swing now, so that he
-                    // can answer it with a block or a parry timed to the
-                    // strike (sim/damage.rs).
-                    out.events.push(DamageEvent {
-                        victim: chosen,
-                        attacker: i as u32,
-                        jit: 0.0,
-                        charge: false,
-                        impale: false,
-                        warn: *s.swing_t,
-                        chain: 0,
-                    });
-                } else if my_kind == crate::unit_types::KIND_ARCHER as usize
-                    && !routed
-                    && *s.ammo > 0
-                    && *s.sight & SIGHT_KNIFE == 0
-                    && s.vel.xz().length_squared() < 4.0
-                    && let Some(shot) = &shoot_at[gi]
-                    && let Some(q) = pick_quarry(f, s, p, gi, shot)
-                {
-                    // Nock and draw at his man (foot archers shoot standing
-                    // only; the speed test keeps a marching or skirmishing
-                    // man's bow on his back). Style bits stay 0: the stab
-                    // pull-back IS the string draw.
-                    *s.quarry = q;
-                    *s.swing = crate::units::SWING_WINDUP
-                        | crate::units::SWING_RANGED;
-                    *s.swing_t = crate::unit_types::missile::DRAW_TICKS
-                        + (crate::units::hash01(
-                            tick_seed ^ (i as u32).wrapping_mul(0x2C9F),
-                        ) * 20.0) as u8;
-                }
-            }
+            crate::units::SWING_WINDUP => face_target = wind_up(f, s, st, out, &mut desired),
+            crate::units::SWING_DEFEND => face_target = defend(f, s, st, out, &mut desired),
+            crate::units::SWING_RECOVER => recover(s),
+            _ => start_a_swing(f, s, st, out),
         }
         // A reloading archer contacted in melee drops the reload: he defends
         // at knife tempo instead of standing through the 8 s bow cycle.
-        if my_kind == crate::unit_types::KIND_ARCHER as usize
-            && best_idx != u32::MAX
+        if st.my_kind == crate::unit_types::KIND_ARCHER as usize
+            && st.foe.best_idx != u32::MAX
             && *s.swing & crate::units::SWING_STATE_MASK
                 == crate::units::SWING_RECOVER
             && *s.swing_t > params.cooldown_ticks
@@ -604,6 +301,361 @@ pub(super) fn swing(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOu
     }
     st.desired = desired;
     st.fight.face_target = face_target;
+}
+
+/// Drawing the bow at the man he picked, with his feet planted, and the
+/// loose when the draw is done; with the target gone or his knife out he
+/// lets the draw go. Returns where he looks.
+#[inline]
+fn draw(f: &Field, s: &mut Soldier, st: &Step, out: &mut ChunkOut, desired: &mut Vec2) -> Option<Vec2> {
+    let Field { pos_prev, shoot_at, .. } = *f;
+    let gi = st.gi;
+    let mut face_target = None;
+    // Drawing the bow: feet planted, eyes on the target block.
+    // A man whose knife came out lets the draw go.
+    *desired = Vec2::ZERO;
+    let knife = *s.sight & SIGHT_KNIFE != 0;
+    if let Some(shot) = shoot_at[gi].as_ref().filter(|_| !knife) {
+        let q = *s.quarry as usize;
+        face_target =
+            Some(if q < pos_prev.len() { pos_prev[q].xz() } else { shot.c });
+        if *s.swing_t == 0 {
+            loose(f, s, st, out, shot);
+        } else {
+            *s.swing_t -= 1;
+        }
+    } else {
+        // Target gone mid-draw, or the knife out: ease off and
+        // reassess shortly.
+        *s.swing = crate::units::SWING_RECOVER;
+        *s.swing_t = crate::unit_types::missile::CANCEL_TICKS;
+    }
+    face_target
+}
+
+/// The loose: an arrow at the man he drew at, scattered and led for his
+/// block's drift, and the reload.
+#[inline]
+fn loose(f: &Field, s: &mut Soldier, st: &Step, out: &mut ChunkOut, shot: &crate::sim::job::ShootAt) {
+    let Field { terrain, pos_prev, team, group, target_members, blocks, tick_seed, .. } = *f;
+    let i = s.i;
+    let p = st.p;
+    let my_kind = st.my_kind;
+    let h = |k: u32| {
+        crate::units::hash01(
+            tick_seed
+                ^ (i as u32).wrapping_mul(k).wrapping_add(k),
+        )
+    };
+    // Aim: the man he drew at (every man has his own
+    // aim target) while he lives, else another man of
+    // the block; the footprint-disc spot stands in only
+    // if every member died this tick. Then the range-
+    // INDEPENDENT landing scatter and a lead for the
+    // block's drift over the flight.
+    let members = &target_members[shot.t];
+    let q = *s.quarry as usize;
+    let base = if q < pos_prev.len()
+        && team[q] != team[i]
+        && f.death_snap[q] == 0
+    {
+        pos_prev[q].xz()
+    } else if members.is_empty() {
+        let ang =
+            h(0x1F3B) * std::f32::consts::TAU;
+        let rad = shot.r * 0.85 * h(0x2E5D).sqrt();
+        shot.c + Vec2::new(ang.cos(), ang.sin()) * rad
+    } else {
+        let m = members[(h(0x1F3B)
+            * members.len() as f32)
+            as usize
+            % members.len()]
+            as usize;
+        pos_prev[m].xz()
+    };
+    let sigma = crate::unit_types::missile::AIM_SPREAD;
+    let mut aim = base
+        + Vec2::new(
+            (h(0x3B7F) + h(0x45A3) - 1.0) * sigma,
+            (h(0x5DC1) + h(0x6B8D) - 1.0) * sigma,
+        );
+    aim += shot.vel * (aim.distance(p) / 30.0);
+    // Launch above the body-hit band (arrows.rs): a
+    // shaft leaving at head height is inside its own
+    // shooter's hit cylinder at flight-time zero and
+    // kills him.
+    let over = crate::unit_types::half_height(my_kind)
+        + crate::arrows::LAUNCH_OVER_HEAD;
+    let from = Vec3::new(p.x, pos_prev[i].y + over, p.y);
+    let to = Vec3::new(
+        aim.x,
+        terrain.height_at(aim.x, aim.y)
+            + crate::arrows::AIM_HEIGHT * crate::unit_types::tallest(),
+        aim.y,
+    );
+    out.arrows.push(crate::arrows::ArrowSpawn {
+        pos: from,
+        vel: crate::arrows::solve_launch(
+            from,
+            to,
+            &blocks[team[i] as usize],
+            terrain,
+        ),
+        team: team[i],
+        group: group[i],
+    });
+    *s.ammo = s.ammo.saturating_sub(1);
+    *s.swing = crate::units::SWING_RECOVER;
+    // Reload: the M2TW volley cycle is animation-bound at
+    // ~10 s; the jitter keeps later volleys ragged.
+    *s.swing_t =
+        (crate::unit_types::missile::RELOAD_TICKS as f32
+            * (0.8 + 0.25 * h(0x77F1)))
+            .min(255.0)
+            as u8;
+}
+
+/// A wind-up and its strike: feet planted, eyes on the target, and on the
+/// last tick the blow as a damage event. Returns where he looks.
+#[inline]
+fn wind_up(f: &Field, s: &mut Soldier, st: &Step, out: &mut ChunkOut, desired: &mut Vec2) -> Option<Vec2> {
+    let Field { pos_prev, group, broken, tick_seed, .. } = *f;
+    let i = s.i;
+    let params = &TYPES[st.my_kind];
+    let mut face_target = None;
+    // Feet planted while winding up — EXCEPT against a routing
+    // target: the cut-down happens at a run, or the runner is 3 m
+    // gone by the strike tick and every blow whiffs (the pursuit
+    // treadmill).
+    let t = *s.target as usize;
+    let target_routed =
+        t < pos_prev.len() && broken[group[t] as usize];
+    if !target_routed {
+        *desired *= 0.25;
+    }
+    if t < pos_prev.len() {
+        face_target = Some(pos_prev[t].xz());
+    }
+    if *s.swing_t == 0 {
+        // Strike lands; validity (still alive, still in reach,
+        // still an enemy) is checked in the apply pass — a dodged
+        // or dead target is a whiff. A cut lands harder.
+        let cut = params.is_cut(*s.swing);
+        let mut jit =
+            0.85 + 0.3 * crate::units::hash01(tick_seed ^ (i as u32));
+        if cut {
+            jit *= params.cut_weight();
+        }
+        out.events.push(DamageEvent {
+            victim: *s.target,
+            attacker: i as u32,
+            jit,
+            charge: *s.swing & crate::units::SWING_CHARGE != 0,
+            impale: false,
+            warn: 0,
+            chain: 0,
+        });
+        *s.swing = crate::units::SWING_RECOVER;
+        let cjit = (1.0 - crate::unit_types::COOLDOWN_JITTER)
+            + 2.0
+                * crate::unit_types::COOLDOWN_JITTER
+                * crate::units::hash01(
+                    tick_seed ^ (i as u32).wrapping_mul(0x9E37),
+                );
+        *s.swing_t = (params.cooldown_ticks as f32 * cjit) as u8;
+        if cut {
+            *s.swing_t = (*s.swing_t).max(params.cut_return_ticks);
+        }
+    } else {
+        *s.swing_t -= 1;
+    }
+    face_target
+}
+
+/// Answering a swing he saw coming, and the counter of a parry that
+/// stopped the blow. Returns where he looks.
+#[inline]
+fn defend(f: &Field, s: &mut Soldier, st: &Step, out: &mut ChunkOut, desired: &mut Vec2) -> Option<Vec2> {
+    let Field { pos_prev, tick_seed, .. } = *f;
+    let i = s.i;
+    let params = &TYPES[st.my_kind];
+    let mut face_target = None;
+    // Answering a swing he saw coming (sim/damage.rs): feet
+    // planted, eyes on the attacker, the shield or the blade
+    // up to meet the blow, then back on guard. The damage
+    // apply set this and may end it early: a parry that
+    // stopped the blow turns into the counter's wind-up.
+    *desired *= 0.25;
+    let t = *s.target as usize;
+    if t < pos_prev.len() {
+        face_target = Some(pos_prev[t].xz());
+    }
+    // A parry that stopped the blow counters: a stab at
+    // the man he parried. In his kind's window he launches
+    // it with a chance each tick by his skill, at the
+    // window's end for sure.
+    let stopped = *s.swing & crate::sim::damage::GUARD_STOPPED != 0;
+    let elapsed = crate::sim::damage::PARRY_LEN.saturating_sub(*s.swing_t);
+    let (from, by) = crate::sim::damage::COUNTER_WINDOW[st.my_kind];
+    let launch = stopped
+        && elapsed >= from
+        && (elapsed >= by
+            || crate::units::hash01(tick_seed ^ (i as u32).wrapping_mul(0x7F4A_7C15))
+                < params.defence_skill * crate::sim::damage::counter_per_tick());
+    if launch {
+        *s.swing = crate::units::SWING_WINDUP
+            | (*s.swing & crate::units::SWING_STAGGER_IMMUNE);
+        *s.swing_t = ((params.windup_ticks as f32
+            * crate::sim::damage::counter_windup())
+            .ceil() as u8)
+            .clamp(1, params.windup_ticks);
+        // The man he parried is warned like any target, one
+        // deeper in the exchange: he may answer from the
+        // bind, with less chance each time (sim/damage.rs).
+        out.events.push(DamageEvent {
+            victim: *s.target,
+            attacker: i as u32,
+            jit: 0.0,
+            charge: false,
+            impale: false,
+            warn: *s.swing_t,
+            chain: s.chain.saturating_add(1),
+        });
+    } else if *s.swing_t == 0 {
+        *s.swing = crate::units::SWING_READY
+            | (*s.swing & crate::units::SWING_STAGGER_IMMUNE);
+    } else {
+        *s.swing_t -= 1;
+    }
+    face_target
+}
+
+/// The recovery after a blow, a shot or a stagger, back to ready.
+#[inline]
+fn recover(s: &mut Soldier) {
+    if *s.swing_t == 0 {
+        // A stagger that just wore off leaves one free pass
+        // against the next one (anti-stunlock); a plain recovery
+        // carries an unspent pass forward.
+        let immune = if *s.swing
+            & crate::units::SWING_STAGGERED
+            != 0
+        {
+            crate::units::SWING_STAGGER_IMMUNE
+        } else {
+            *s.swing & crate::units::SWING_STAGGER_IMMUNE
+        };
+        *s.swing = crate::units::SWING_READY | immune;
+    } else {
+        *s.swing_t -= 1;
+    }
+}
+
+/// A ready man: a swing at the enemy in reach he faces, or an archer's
+/// draw at a man of the block his regiment shoots at.
+#[inline]
+fn start_a_swing(f: &Field, s: &mut Soldier, st: &Step, out: &mut ChunkOut) {
+    let Field { pos_prev, speed, shoot_at, tick_seed, .. } = *f;
+    let i = s.i;
+    let params = &TYPES[st.my_kind];
+    let p = st.p;
+    let gi = st.gi;
+    let routed = st.routed;
+    let sticky = st.foe.sticky;
+    let prev_target = st.foe.prev_target;
+    let best_idx = st.foe.best_idx;
+    let my_kind = st.my_kind;
+    // Ready: pick a target from the scan. Stick with the previous
+    // one when still in reach (duels), else nearest. Routing
+    // units never start attacks (they still defend nothing —
+    // pursuit is free hits).
+    let chosen = if sticky { prev_target } else { best_idx };
+    // No eyes in the back of his head: a man only opens on a
+    // target in his forward half-plane. Being struck tells him
+    // where to turn (the flash facing below), but it does NOT let
+    // him swing backward over his shoulder — he attacks once he
+    // has turned far enough, at the human turn-speed cap. Without
+    // this gate every rear-approached victim counter-wound-up on
+    // proximity and was face-on before the first blow landed; the
+    // rear sector never fired in practice.
+    let aware = chosen != u32::MAX && {
+        let t = chosen as usize;
+        t < pos_prev.len() && {
+            let to_t = pos_prev[t].xz() - p;
+            let fwd = Vec2::new(
+                s.yaw.sin(),
+                s.yaw.cos(),
+            );
+            fwd.dot(to_t) >= 0.0
+        }
+    };
+    if chosen != u32::MAX && !routed && aware {
+        *s.target = chosen;
+        // Arriving at speed = a charging blow: momentum converts
+        // to damage + a bigger lunge (render reads the flag).
+        let v2 = s.vel.xz().length_squared();
+        let cs = speed[i] * CHARGE_SPEED_FRAC;
+        // Attack style for this swing: 0 = stab, 1 = the classic
+        // overhead swing (2 = slash exists in the shader but
+        // benched). A kind with a cut draws 1 as its slow cut;
+        // its 2 is the overhead swing at the stab's pace, drawn
+        // once the overhead is a clip of its own (the code's
+        // swing over the guard turns the blade sideways). Spears
+        // only ever thrust, and a charging man with a cut stabs:
+        // a slow cut at a run carries him into the man before it
+        // lands.
+        let charge = v2 > cs * cs;
+        let style = if my_kind
+            == crate::unit_types::KIND_SPEAR as usize
+            || (charge && params.cut_windup_ticks > 0)
+        {
+            0
+        } else {
+            (crate::units::hash01(
+                tick_seed ^ (i as u32).wrapping_mul(0x51ED),
+            ) * 2.0) as u8
+        };
+        let style = style << crate::units::SWING_STYLE_SHIFT;
+        *s.swing = if charge {
+            crate::units::SWING_WINDUP
+                | crate::units::SWING_CHARGE
+                | style
+        } else {
+            crate::units::SWING_WINDUP | style
+        };
+        *s.swing_t = params.windup_for(*s.swing);
+        // The target is told of the swing now, so that he
+        // can answer it with a block or a parry timed to the
+        // strike (sim/damage.rs).
+        out.events.push(DamageEvent {
+            victim: chosen,
+            attacker: i as u32,
+            jit: 0.0,
+            charge: false,
+            impale: false,
+            warn: *s.swing_t,
+            chain: 0,
+        });
+    } else if my_kind == crate::unit_types::KIND_ARCHER as usize
+        && !routed
+        && *s.ammo > 0
+        && *s.sight & SIGHT_KNIFE == 0
+        && s.vel.xz().length_squared() < 4.0
+        && let Some(shot) = &shoot_at[gi]
+        && let Some(q) = pick_quarry(f, s, p, gi, shot)
+    {
+        // Nock and draw at his man (foot archers shoot standing
+        // only; the speed test keeps a marching or skirmishing
+        // man's bow on his back). Style bits stay 0: the stab
+        // pull-back IS the string draw.
+        *s.quarry = q;
+        *s.swing = crate::units::SWING_WINDUP
+            | crate::units::SWING_RANGED;
+        *s.swing_t = crate::unit_types::missile::DRAW_TICKS
+            + (crate::units::hash01(
+                tick_seed ^ (i as u32).wrapping_mul(0x2C9F),
+            ) * 20.0) as u8;
+    }
 }
 
 /// The share of the archers who keep shooting at the same man while he
