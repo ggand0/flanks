@@ -390,90 +390,9 @@ pub fn update_routes(
     routes.outgoing.append(&mut unfinished);
 
     for g in 0..n {
-        let gd = &groups.list[g];
-        if gd.order != routes.per[g].order {
-            routes.per[g].order = gd.order;
-            if gd.order.is_none() {
-                // Arrived: the route stays while the regiment holds at its
-                // end.
-                let kept = match &routes.per[g].state {
-                    State::Ready(r) | State::Pending { old: Some(r), .. } => {
-                        let last = r.points.len() - 1;
-                        (r.points[last].distance(crate::formation::hold_point(gd)) < 1.0)
-                            .then(|| Arc::new(Route { points: r.points.clone(), k: last }))
-                    }
-                    _ => None,
-                };
-                if log_route() {
-                    let a = crate::formation::hold_point(gd);
-                    let what = match &routes.per[g].state {
-                        State::Ready(r) | State::Pending { old: Some(r), .. } => {
-                            let end = r.points[r.points.len() - 1];
-                            if kept.is_some() {
-                                format!("route kept at its end ({:.1}, {:.1})", end.x, end.y)
-                            } else {
-                                format!(
-                                    "route dropped: its end ({:.1}, {:.1}) is {:.2} m from where it holds",
-                                    end.x,
-                                    end.y,
-                                    end.distance(a)
-                                )
-                            }
-                        }
-                        _ => "it had no route".to_string(),
-                    };
-                    info!("[route] tick {tick} regiment {g}: order ended, it holds at ({:.1}, {:.1}); {what}", a.x, a.y);
-                }
-                // Coming round obstacles has mixed up the ranks: the men
-                // take the nearest places in them. Done here, between the
-                // install and the next job, so the next job reads the new
-                // slots whether the tick is pipelined or inline.
-                // Not while its men are still filing onto a lane: their
-                // places are handed out as they arrive (formation.rs
-                // `fill_lane_slots`).
-                if kept.is_some()
-                    && groups.list[g].count > 0
-                    && !groups.list[g].state.is_broken()
-                    && groups.list[g].lane_fill.is_none()
-                {
-                    crate::formation::assign_slots(&mut units, g as u32, &mut groups.list[g]);
-                }
-                routes.per[g].state = kept.map_or(State::None, State::Ready);
-                continue;
-            }
-            match groups.goal(g) {
-                Some(goal) if gd.count > 0 => {
-                    let start = gd.centroid;
-                    let w = half_width(gd, goal - start);
-                    if nav.straight_ok(start, goal, w) {
-                        routes.per[g].state = State::None;
-                    } else {
-                        request(routes, g, start, goal, w);
-                    }
-                }
-                _ => routes.per[g].state = State::None,
-            }
-            continue;
-        }
-        // An attack order whose target has gone behind something, or has
-        // moved off the end of its route.
-        if let Some(Order::Attack(_)) = gd.order
-            && (tick + g as u32).is_multiple_of(ATTACK_RECHECK)
-            && let Some(goal) = groups.goal(g)
-        {
-            let start = gd.centroid;
-            let w = half_width(gd, goal - start);
-            let r = &routes.per[g];
-            let replan = match r.state {
-                State::None => !nav.straight_ok(start, goal, w),
-                State::Ready(_) => goal.distance(r.planned_goal) > w.max(crate::terrain::CELL * 4.0),
-                State::Pending { .. } => false,
-            };
-            if replan {
-                request(routes, g, start, goal, w);
-            }
-        }
+        notice_order(routes, &mut groups, &mut units, &nav, g, tick);
     }
+
 
     // Each frame along its route: on to the next waypoint once the
     // regiment's centre is within its half width of this one, or the
@@ -482,66 +401,7 @@ pub fn update_routes(
     // goes once it holds elsewhere; opening its ranks is not that
     // (`formation::hold_point`).
     for g in 0..n {
-        let gd = &groups.list[g];
-        let Some(goal) = groups.goal(g) else {
-            if let State::Ready(r) = &routes.per[g].state
-                && r.points[r.points.len() - 1].distance(crate::formation::hold_point(gd)) >= 1.0
-            {
-                if log_route() {
-                    let (a, end) = (crate::formation::hold_point(gd), r.points[r.points.len() - 1]);
-                    info!(
-                        "[route] tick {tick} regiment {g}: it holds at ({:.1}, {:.1}), {:.2} m from its route's end ({:.1}, {:.1}): route dropped",
-                        a.x,
-                        a.y,
-                        end.distance(a),
-                        end.x,
-                        end.y
-                    );
-                }
-                routes.per[g].state = State::None;
-            }
-            continue;
-        };
-        let State::Ready(route) = &routes.per[g].state else { continue };
-        let mut k = route.k;
-        let last = route.points.len() - 1;
-        let w = half_width(gd, goal - gd.centroid);
-        // How the last step was passed, for the log.
-        let mut passed = "";
-        while k < last {
-            let next = next_point(&route.points, k, goal);
-            let here = route.points[k];
-            let near = gd.centroid.distance(here) <= w;
-            if near || nav.straight_ok(gd.centroid, next, w) {
-                passed = if near { "near" } else { "clear" };
-                k += 1;
-            } else if share_passed(gd.frame_past, k, frame_share()) {
-                // The regiment's centre is short of the waypoint and the
-                // way on is too narrow for its block, but enough of its
-                // men are past it: it is filing through.
-                passed = "share";
-                k += 1;
-            } else {
-                break;
-            }
-        }
-        if k != route.k {
-            if log_route() {
-                let c = gd.centroid;
-                let men = match gd.frame_past {
-                    Some((at, n, of)) if at as usize == route.k => format!("; {n} of {of} men past waypoint {at}"),
-                    _ => String::new(),
-                };
-                info!(
-                    "[route] tick {tick} regiment {g}: frame from waypoint {} to {k} of {last}; centre ({:.1}, {:.1}), half width {w:.2} m; passed by: {passed}{men}",
-                    route.k,
-                    c.x,
-                    c.y
-                );
-            }
-            let points = route.points.clone();
-            routes.per[g].state = State::Ready(Arc::new(Route { points, k }));
-        }
+        advance_frame(routes, &groups, &nav, g, tick);
     }
 
     // The searches the next job carries: the unfinished first, then new
@@ -549,6 +409,168 @@ pub fn update_routes(
     while routes.outgoing.len() < PLANS_PER_TICK {
         let Some(req) = routes.queue.pop_front() else { break };
         routes.outgoing.push(PlanJob { req, search: None });
+    }
+}
+
+/// A new order, an arrival or a moving attack target: the route kept,
+/// dropped, asked for, or asked for again.
+#[inline]
+fn notice_order(
+    routes: &mut Routes,
+    groups: &mut Groups,
+    units: &mut crate::units::Units,
+    nav: &crate::nav::NavGrid,
+    g: usize,
+    tick: u32,
+) {
+    let gd = &groups.list[g];
+    if gd.order != routes.per[g].order {
+        routes.per[g].order = gd.order;
+        if gd.order.is_none() {
+            // Arrived: the route stays while the regiment holds at its
+            // end.
+            let kept = match &routes.per[g].state {
+                State::Ready(r) | State::Pending { old: Some(r), .. } => {
+                    let last = r.points.len() - 1;
+                    (r.points[last].distance(crate::formation::hold_point(gd)) < 1.0)
+                        .then(|| Arc::new(Route { points: r.points.clone(), k: last }))
+                }
+                _ => None,
+            };
+            if log_route() {
+                let a = crate::formation::hold_point(gd);
+                let what = match &routes.per[g].state {
+                    State::Ready(r) | State::Pending { old: Some(r), .. } => {
+                        let end = r.points[r.points.len() - 1];
+                        if kept.is_some() {
+                            format!("route kept at its end ({:.1}, {:.1})", end.x, end.y)
+                        } else {
+                            format!(
+                                "route dropped: its end ({:.1}, {:.1}) is {:.2} m from where it holds",
+                                end.x,
+                                end.y,
+                                end.distance(a)
+                            )
+                        }
+                    }
+                    _ => "it had no route".to_string(),
+                };
+                info!("[route] tick {tick} regiment {g}: order ended, it holds at ({:.1}, {:.1}); {what}", a.x, a.y);
+            }
+            // Coming round obstacles has mixed up the ranks: the men
+            // take the nearest places in them. Done here, between the
+            // install and the next job, so the next job reads the new
+            // slots whether the tick is pipelined or inline.
+            // Not while its men are still filing onto a lane: their
+            // places are handed out as they arrive (formation.rs
+            // `fill_lane_slots`).
+            if kept.is_some()
+                && groups.list[g].count > 0
+                && !groups.list[g].state.is_broken()
+                && groups.list[g].lane_fill.is_none()
+            {
+                crate::formation::assign_slots(units, g as u32, &mut groups.list[g]);
+            }
+            routes.per[g].state = kept.map_or(State::None, State::Ready);
+            return;
+        }
+        match groups.goal(g) {
+            Some(goal) if gd.count > 0 => {
+                let start = gd.centroid;
+                let w = half_width(gd, goal - start);
+                if nav.straight_ok(start, goal, w) {
+                    routes.per[g].state = State::None;
+                } else {
+                    request(routes, g, start, goal, w);
+                }
+            }
+            _ => routes.per[g].state = State::None,
+        }
+        return;
+    }
+    // An attack order whose target has gone behind something, or has
+    // moved off the end of its route.
+    if let Some(Order::Attack(_)) = gd.order
+        && (tick + g as u32).is_multiple_of(ATTACK_RECHECK)
+        && let Some(goal) = groups.goal(g)
+    {
+        let start = gd.centroid;
+        let w = half_width(gd, goal - start);
+        let r = &routes.per[g];
+        let replan = match r.state {
+            State::None => !nav.straight_ok(start, goal, w),
+            State::Ready(_) => goal.distance(r.planned_goal) > w.max(crate::terrain::CELL * 4.0),
+            State::Pending { .. } => false,
+        };
+        if replan {
+            request(routes, g, start, goal, w);
+        }
+    }
+}
+
+/// The regiment's frame along its route, on to the next waypoint when it
+/// is passed; a holding regiment's route dropped once it holds elsewhere.
+#[inline]
+fn advance_frame(routes: &mut Routes, groups: &Groups, nav: &crate::nav::NavGrid, g: usize, tick: u32) {
+    let gd = &groups.list[g];
+    let Some(goal) = groups.goal(g) else {
+        if let State::Ready(r) = &routes.per[g].state
+            && r.points[r.points.len() - 1].distance(crate::formation::hold_point(gd)) >= 1.0
+        {
+            if log_route() {
+                let (a, end) = (crate::formation::hold_point(gd), r.points[r.points.len() - 1]);
+                info!(
+                    "[route] tick {tick} regiment {g}: it holds at ({:.1}, {:.1}), {:.2} m from its route's end ({:.1}, {:.1}): route dropped",
+                    a.x,
+                    a.y,
+                    end.distance(a),
+                    end.x,
+                    end.y
+                );
+            }
+            routes.per[g].state = State::None;
+        }
+        return;
+    };
+    let State::Ready(route) = &routes.per[g].state else { return };
+    let mut k = route.k;
+    let last = route.points.len() - 1;
+    let w = half_width(gd, goal - gd.centroid);
+    // How the last step was passed, for the log.
+    let mut passed = "";
+    while k < last {
+        let next = next_point(&route.points, k, goal);
+        let here = route.points[k];
+        let near = gd.centroid.distance(here) <= w;
+        if near || nav.straight_ok(gd.centroid, next, w) {
+            passed = if near { "near" } else { "clear" };
+            k += 1;
+        } else if share_passed(gd.frame_past, k, frame_share()) {
+            // The regiment's centre is short of the waypoint and the
+            // way on is too narrow for its block, but enough of its
+            // men are past it: it is filing through.
+            passed = "share";
+            k += 1;
+        } else {
+            break;
+        }
+    }
+    if k != route.k {
+        if log_route() {
+            let c = gd.centroid;
+            let men = match gd.frame_past {
+                Some((at, n, of)) if at as usize == route.k => format!("; {n} of {of} men past waypoint {at}"),
+                _ => String::new(),
+            };
+            info!(
+                "[route] tick {tick} regiment {g}: frame from waypoint {} to {k} of {last}; centre ({:.1}, {:.1}), half width {w:.2} m; passed by: {passed}{men}",
+                route.k,
+                c.x,
+                c.y
+            );
+        }
+        let points = route.points.clone();
+        routes.per[g].state = State::Ready(Arc::new(Route { points, k }));
     }
 }
 
