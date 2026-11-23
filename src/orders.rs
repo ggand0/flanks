@@ -1232,55 +1232,95 @@ fn issue_order(
     let t = time.elapsed_secs();
 
     if drag.active {
-        let layout = std::mem::take(&mut drag.layout);
-        // The regiments of the selection the drag placed nowhere: a lane
-        // with no room for them. They keep the orders they had.
-        let unplaced = selected
-            .iter()
-            .filter(|&&g| {
-                let gd = &groups.list[g];
-                gd.count > 0 && !gd.state.is_broken() && !layout.iter().any(|p| p.g == g)
-            })
-            .count();
-        if unplaced > 0 {
-            info!("no room on the lane: {unplaced} of {} regiments got no order", selected.len());
-        }
-        if layout.is_empty() {
-            // Nobody placed: no order, and never a click's order instead.
-        } else if deploy.active {
-            deploy_place_line(&mut groups, &mut units, &terrain, layout);
-            cues.write(crate::audio::UiCue::Deploy);
-        } else {
-            for p in &layout {
-                let what = format!(
-                    "line to ({:.1}, {:.1}) facing {:.3} files {}",
-                    p.anchor.x, p.anchor.y, p.facing, p.files
-                );
-                log_order(t, p.g, &groups.list[p.g], &what);
-            }
-            apply_line_order(&mut groups, layout, start, drag.cur);
-            cues.write(crate::audio::UiCue::Move);
-        }
-    } else if deploy.active {
-        // No attack targets while deploying: every click is a placement.
-        let picked: Vec<usize> = selection.picked_controllable(&groups).collect();
-        deploy_move(&mut groups, &mut units, &terrain, routes.grid(), &picked, start);
+        drag_release(&mut groups, &mut units, &terrain, &mut drag, &selected, deploy.active, start, &mut cues, t);
+    } else {
+        click_release(&mut groups, &mut units, &terrain, &routes, &selection, &selected, deploy.active, start, &mut cues, t);
+    }
+    drag.active = false;
+    drag.layout.clear();
+}
+
+/// A drag let go: its line laid out as the preview showed it.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn drag_release(
+    groups: &mut Groups,
+    units: &mut Units,
+    terrain: &Terrain,
+    drag: &mut OrderDrag,
+    selected: &[usize],
+    deploy_active: bool,
+    start: Vec2,
+    cues: &mut MessageWriter<crate::audio::UiCue>,
+    t: f32,
+) {
+    let layout = std::mem::take(&mut drag.layout);
+    // The regiments of the selection the drag placed nowhere: a lane
+    // with no room for them. They keep the orders they had.
+    let unplaced = selected
+        .iter()
+        .filter(|&&g| {
+            let gd = &groups.list[g];
+            gd.count > 0 && !gd.state.is_broken() && !layout.iter().any(|p| p.g == g)
+        })
+        .count();
+    if unplaced > 0 {
+        info!("no room on the lane: {unplaced} of {} regiments got no order", selected.len());
+    }
+    if layout.is_empty() {
+        // Nobody placed: no order, and never a click's order instead.
+    } else if deploy_active {
+        deploy_place_line(groups, units, terrain, layout);
         cues.write(crate::audio::UiCue::Deploy);
-    } else if let Some(e) = enemy_regiment_at(&groups, start) {
-        attack_regiments(&mut groups, &selected, e);
+    } else {
+        for p in &layout {
+            let what = format!(
+                "line to ({:.1}, {:.1}) facing {:.3} files {}",
+                p.anchor.x, p.anchor.y, p.facing, p.files
+            );
+            log_order(t, p.g, &groups.list[p.g], &what);
+        }
+        apply_line_order(groups, layout, start, drag.cur);
+        cues.write(crate::audio::UiCue::Move);
+    }
+}
+
+/// A click let go: a placement while deploying, an attack on the enemy
+/// regiment under it, or a move.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn click_release(
+    groups: &mut Groups,
+    units: &mut Units,
+    terrain: &Terrain,
+    routes: &crate::sim::route::Routes,
+    selection: &Selection,
+    selected: &[usize],
+    deploy_active: bool,
+    start: Vec2,
+    cues: &mut MessageWriter<crate::audio::UiCue>,
+    t: f32,
+) {
+    if deploy_active {
+        // No attack targets while deploying: every click is a placement.
+        let picked: Vec<usize> = selection.picked_controllable(groups).collect();
+        deploy_move(groups, units, terrain, routes.grid(), &picked, start);
+        cues.write(crate::audio::UiCue::Deploy);
+    } else if let Some(e) = enemy_regiment_at(groups, start) {
+        attack_regiments(groups, selected, e);
         cues.write(crate::audio::UiCue::Attack);
         info!(
             "{} regiments ({} units) ATTACK regiment {e}",
             selected.len(),
             selection.count_units,
         );
-        for &g in &selected {
+        for &g in selected {
             let gd = &groups.list[g];
             if gd.order == Some(Order::Attack(e)) && !gd.state.is_broken() {
                 log_order(t, g, gd, &format!("attack g{e}"));
             }
         }
-    } else if !click_order(&mut groups, &terrain, &selected, start) {
+    } else if !click_order(groups, terrain, selected, start) {
         info!("no room on the lane at ({:.0}, {:.0}): {} regiments got no order", start.x, start.y, selected.len());
     } else {
         cues.write(crate::audio::UiCue::Move);
@@ -1293,7 +1333,7 @@ fn issue_order(
         );
         // Each regiment's own destination (the click translated by its
         // offset from the selection's centre) and the facing it took.
-        for &g in &selected {
+        for &g in selected {
             let gd = &groups.list[g];
             if let Some(Order::Move(d)) = gd.order
                 && !gd.state.is_broken()
@@ -1302,8 +1342,6 @@ fn issue_order(
             }
         }
     }
-    drag.active = false;
-    drag.layout.clear();
 }
 
 /// Placement preview while a formation drag is in flight: the drawn line
