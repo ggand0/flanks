@@ -1418,7 +1418,11 @@ fn spawn_routpass_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups
         let x = 0.5 * width + off + half_depth(n, passer_kind);
         spawn_regiment(units, terrain, &mut list, 0, passer_kind, Vec2::new(x, 0.0), n, -1.0);
         let c = list.len() - 1;
-        list[c].order = Some(crate::orders::Order::Move(Vec2::new(-70.0, 0.0)));
+        // FL_ROUTPASS_CROSS_GOAL=<x>: where across A the crosser is sent,
+        // -70 by default. Farther, -150 for example, it does not arrive
+        // while its soldiers are still in A.
+        let goal_x: f32 = crate::util::env_or("FL_ROUTPASS_CROSS_GOAL", -70.0);
+        list[c].order = Some(crate::orders::Order::Move(Vec2::new(goal_x, 0.0)));
         list[c].auto_order = true;
     }
     let cross_g = cross.map(|_| list.len() - 1);
