@@ -359,6 +359,11 @@ struct RegimentSums {
     target_fight_n: u32,
     target_line_sum: f32,
     target_line_n: u32,
+    /// With a route frame waiting at a waypoint: the living men beyond
+    /// the line through it across the next leg, and the living men
+    /// (`GroupData::frame_past`).
+    past: u32,
+    living: u32,
 }
 
 /// Regiments per pool task in `update_groups`: a task sums about 16k men
@@ -368,14 +373,16 @@ const REGIMENTS_PER_TASK: usize = 16;
 /// One regiment's sums over its men, walking its runs in index order. `pc`
 /// and `pb` are its centroid and home bias from the last tick, `f` its
 /// forward vector, `tg` its attack target, `bows` whether it is an archer
-/// regiment, the only kind whose lead and velocity anything reads, and
+/// regiment, the only kind whose lead and velocity anything reads,
 /// `open` the blocks of the open friends within its reach, empty when
-/// there is none.
+/// there is none, and `line` the waypoint its route frame waits at with
+/// the unit direction of the leg after it, if it has one.
 fn regiment_sums(
     units: &Units,
     runs: &[(u32, u32)],
     (pc, pb, f, tg, bows): (Vec2, Vec2, Vec2, Option<u32>, bool),
     open: &[(u32, BlockRect)],
+    line: Option<(Vec2, Vec2)>,
 ) -> RegimentSums {
     let mut a = RegimentSums {
         pos: Vec2::ZERO,
@@ -396,6 +403,8 @@ fn regiment_sums(
         target_fight_n: 0,
         target_line_sum: 0.0,
         target_line_n: 0,
+        past: 0,
+        living: 0,
     };
     for &(s, e) in runs {
         for i in s as usize..e as usize {
@@ -414,6 +423,12 @@ fn regiment_sums(
                 for (k, (_, rect)) in open.iter().enumerate() {
                     a.inside[k] += u32::from(rect.distance(p) == 0.0);
                 }
+            }
+            if let Some((here, dir)) = line
+                && units.death_t[i] == 0
+            {
+                a.living += 1;
+                a.past += u32::from((p - here).dot(dir) > 0.0);
             }
             let d2 = (p - pc).length_squared();
             a.r2 += d2;
@@ -460,6 +475,7 @@ fn update_groups(
     units: Res<Units>,
     runs: Res<crate::sim::RegimentRuns>,
     mut groups: ResMut<Groups>,
+    routes: Option<Res<crate::sim::route::Routes>>,
 ) {
     let n = groups.list.len();
     // Disorder measures SHAPE coherence, not travel: deviation from the
@@ -516,14 +532,20 @@ fn update_groups(
                 .collect()
         })
         .collect();
+    // The line each waiting route frame is passed at (sim/route.rs
+    // `frame_line`): the men beyond it are counted with the sums, for the
+    // regiments that have one.
+    let frame_lines: Vec<Option<(u32, Vec2, Vec2)>> = (0..n)
+        .map(|g| routes.as_ref()?.frame_line(g, groups.goal(g)?))
+        .collect();
     // The sums over the men, a pool task per few regiments, each regiment's
     // runs walked in index order: the same additions in the same order as
     // one scan of the army, regiment by regiment, so the same bits. Bevy's
     // scope returns the tasks' results in spawn order.
     let units = &*units;
     let runs = &*runs;
-    let (prev_cents_r, prev_bias_r, fwd_r, target_r, bows_r, open_r) =
-        (&prev_cents, &prev_bias, &fwd, &attack_target, &bows, &open);
+    let (prev_cents_r, prev_bias_r, fwd_r, target_r, bows_r, open_r, lines_r) =
+        (&prev_cents, &prev_bias, &fwd, &attack_target, &bows, &open, &frame_lines);
     let batches: Vec<Vec<RegimentSums>> = bevy::tasks::ComputeTaskPool::get().scope(|scope| {
         for first in (0..n).step_by(REGIMENTS_PER_TASK) {
             scope.spawn(async move {
@@ -531,7 +553,8 @@ fn update_groups(
                     .map(|g| {
                         let regiment =
                             (prev_cents_r[g], prev_bias_r[g], fwd_r[g], target_r[g], bows_r[g]);
-                        regiment_sums(units, runs.of(g), regiment, &open_r[g])
+                        let line = lines_r[g].map(|(_, here, dir)| (here, dir));
+                        regiment_sums(units, runs.of(g), regiment, &open_r[g], line)
                     })
                     .collect::<Vec<RegimentSums>>()
             });
@@ -549,6 +572,7 @@ fn update_groups(
 
     for (g, group) in groups.list.iter_mut().enumerate() {
         group.count = counts[g];
+        group.frame_past = frame_lines[g].map(|(k, _, _)| (k, sums[g].past, sums[g].living));
         if counts[g] == 0 {
             group.engaged = false;
             group.engage_hold = 0;
@@ -987,5 +1011,36 @@ fn test_front_script(
             *stage = 3;
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// With a route frame waiting at a waypoint, the sums count the
+    /// living men beyond the line through it across the next leg, and the
+    /// living; without one they count nothing.
+    #[test]
+    fn the_sums_count_the_living_men_past_a_waiting_frames_waypoint() {
+        let terrain = crate::terrain::build_terrain(crate::terrain::MapKind::Grassland);
+        let mut units = Units::default();
+        // The waypoint at (10, 0), the next leg toward +z: a man is past
+        // it when he stands at z over 0, wherever he stands along x.
+        let (here, dir) = (Vec2::new(10.0, 0.0), Vec2::Y);
+        let places = [(10.0, 4.0), (40.0, 0.5), (-30.0, 2.0), (10.0, -0.5), (12.0, -6.0), (10.0, 0.0), (9.0, 3.0)];
+        for (k, &(x, z)) in places.iter().enumerate() {
+            crate::units::push_unit(&mut units, &terrain, k as u32, 0, 0, 0, x, z, Vec2::ZERO);
+        }
+        // The last man is past the line but dying: not counted.
+        units.death_t[6] = 1;
+        let runs = [(0u32, places.len() as u32)];
+        let regiment = (Vec2::ZERO, Vec2::ZERO, Vec2::Y, None, false);
+        let with = regiment_sums(&units, &runs, regiment, &[], Some((here, dir)));
+        assert_eq!((with.past, with.living), (3, 6));
+        let without = regiment_sums(&units, &runs, regiment, &[], None);
+        assert_eq!((without.past, without.living), (0, 0));
+        // The other sums do not depend on the line.
+        assert_eq!((with.count, with.pos), (without.count, without.pos));
     }
 }

@@ -23,8 +23,8 @@ pub const CHUNK_CELLS: usize = 32;
 
 /// The battlefields in the menu's Map row. At launch a setup's map wins
 /// (an `FL_SETUP` file, or the Demo's with `FL_DEMO=1`), then
-/// `FL_MAP=big_grassland`, `hill`, `big_hill`, `classic`, `river`,
-/// `sandbox`, `obstacles` or `town`.
+/// `FL_MAP=big_grassland`, `hill`, `big_hill`, `walled_town`, `wall_debug`,
+/// `classic`, `river`, `sandbox`, `obstacles` or `town`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub enum MapKind {
     /// Broad pasture shoulders around an open lowland: the default.
@@ -36,6 +36,12 @@ pub enum MapKind {
     Hill,
     /// The hill layout at twice the ground dimensions and height.
     BigHill,
+    /// The hill's ground with a stone wall across the plateau and a town
+    /// behind it (town_layout.rs).
+    WalledTown,
+    /// The walled town's wall on the same ground, with no houses: a field
+    /// for watching units on the wall, its stairs and its walk.
+    WallDebug,
     /// The 0.1.0 heightfield: rolling noise with ridged peaks, no river.
     Classic,
     /// Experimental: the same noise with terraces, a river and a bridge.
@@ -61,6 +67,8 @@ impl MapKind {
             Ok("big_grassland") => Self::BigGrassland,
             Ok("hill") => Self::Hill,
             Ok("big_hill") => Self::BigHill,
+            Ok("walled_town") => Self::WalledTown,
+            Ok("wall_debug") => Self::WallDebug,
             Ok("river") => Self::River,
             Ok("classic") => Self::Classic,
             Ok("sandbox") => Self::Sandbox,
@@ -76,6 +84,8 @@ impl MapKind {
             Self::BigGrassland => "Big Grassland",
             Self::Hill => "Hill",
             Self::BigHill => "Big Hill",
+            Self::WalledTown => "Walled Town",
+            Self::WallDebug => "Wall Debug",
             Self::Classic => "Classic",
             Self::River => "River",
             Self::Sandbox => "Sandbox",
@@ -90,17 +100,32 @@ impl MapKind {
     }
 
     /// Maps whose steep faces are impassable: the river map's terraces and
-    /// gorges, and the obstacle map's blocks. The others never block.
+    /// gorges, the obstacle and town maps' blocks and walls, and the stone
+    /// wall's pieces. The others never block.
     pub const fn has_blocked_ground(self) -> bool {
-        matches!(self, Self::River | Self::Obstacles | Self::Town)
+        matches!(self, Self::River | Self::Obstacles | Self::Town) || self.has_wall()
+    }
+
+    /// Maps with the stone wall of town_layout.rs across the hill's
+    /// plateau: its pieces make the sim's ground, its walk is a lane for
+    /// orders and the defenders stand behind it.
+    pub const fn has_wall(self) -> bool {
+        matches!(self, Self::WalledTown | Self::WallDebug)
+    }
+
+    /// Maps on the hill's heightmap.
+    const fn on_hill(self) -> bool {
+        matches!(self, Self::Hill | Self::BigHill) || self.has_wall()
     }
 
     /// Every map, in the menu's order.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 9] = [
         Self::Grassland,
         Self::BigGrassland,
         Self::Hill,
         Self::BigHill,
+        Self::WalledTown,
+        Self::WallDebug,
         Self::Classic,
         Self::River,
         Self::Sandbox,
@@ -137,14 +162,25 @@ pub struct MapRebuild;
 
 #[derive(Resource, Clone)]
 pub struct Terrain {
-    /// Vertex heights, row-major [z][x].
+    /// Vertex heights, row-major [z][x]: what the sim walks on, shoots
+    /// over and plans on.
     heights: Vec<f32>,
+    /// The drawn ground where it differs from `heights`: on the maps with
+    /// the wall (`MapKind::has_wall`) the ground under the wall and the
+    /// houses, which the sim's copy raises by the pieces. None on every
+    /// other map.
+    ground: Option<Vec<f32>>,
     verts_x: usize,
     verts_z: usize,
     /// Impassable vertices (terrace risers, gorge walls, crater lips),
     /// same grid as `heights`. All-false unless the map has blocked
     /// ground (`MapKind::has_blocked_ground`).
     blocked: Vec<bool>,
+    /// Vertices whose open or blocked state a structure decides instead
+    /// of the step rule: the wall's and the houses' pieces (town_layout.rs
+    /// `sim_ground`). None on the maps without the wall, and None per
+    /// vertex where the step rule holds.
+    open: Option<Vec<Option<bool>>>,
     pub kind: MapKind,
     /// True on maps without a river:
     /// skips the river carve, terraces, ground variety, and every
@@ -174,6 +210,11 @@ impl Terrain {
         &self.heights
     }
 
+    /// The drawn ground's vertex heights, laid out as `heights`.
+    pub fn ground_heights(&self) -> &[f32] {
+        self.ground.as_deref().unwrap_or(&self.heights)
+    }
+
     pub fn min(&self) -> Vec2 {
         self.origin
     }
@@ -188,10 +229,53 @@ impl Terrain {
         self.heights[z * self.verts_x + x]
     }
 
+    /// The drawn ground's height at a vertex.
+    #[inline]
+    fn g(&self, x: usize, z: usize) -> f32 {
+        self.ground_heights()[z * self.verts_x + x]
+    }
+
+    /// Bilinear sample of the drawn ground: where the town's models stand.
+    pub fn ground_at(&self, x: f32, z: f32) -> f32 {
+        let g = (Vec2::new(x, z) - self.origin) / CELL;
+        let gx = g.x.clamp(0.0, (self.verts_x - 2) as f32);
+        let gz = g.y.clamp(0.0, (self.verts_z - 2) as f32);
+        let (x0, z0) = (gx as usize, gz as usize);
+        let (fx, fz) = (gx - x0 as f32, gz - z0 as f32);
+        let a = self.g(x0, z0) + (self.g(x0 + 1, z0) - self.g(x0, z0)) * fx;
+        let b = self.g(x0, z0 + 1) + (self.g(x0 + 1, z0 + 1) - self.g(x0, z0 + 1)) * fx;
+        a + (b - a) * fz
+    }
+
     /// Bilinear height sample, clamped to the field. The bridge deck
     /// overrides the carved channel so units walk ON the bridge.
+    ///
+    /// On maps with blocked ground a cell can span a cliff: a wall's face,
+    /// a terrace riser, the side of a stair. A point stands on the level
+    /// of its nearest vertex (the vertex `blocked_at` reads), so a corner
+    /// a cliff's height (`SLOPE_BLOCK` over one cell) above or below that
+    /// vertex counts at the vertex's own height. Cliffs are then vertical
+    /// at the cell's middle instead of a ramp across it that a soldier
+    /// beside a wall would be drawn halfway up.
     #[inline]
     pub fn height_at(&self, x: f32, z: f32) -> f32 {
+        self.height_on(x, z, None)
+    }
+
+    /// The height of the nearest vertex: the level a man at `(x, z)`
+    /// stands on.
+    #[inline]
+    fn level_at(&self, x: f32, z: f32) -> f32 {
+        let g = (Vec2::new(x, z) - self.origin) / CELL;
+        let gx = (g.x.round() as usize).min(self.verts_x - 1);
+        let gz = (g.y.round() as usize).min(self.verts_z - 1);
+        self.h(gx, gz)
+    }
+
+    /// `height_at` on a given level: corners a cliff above or below
+    /// `level` count at `level`. None takes the nearest vertex's own.
+    #[inline]
+    fn height_on(&self, x: f32, z: f32, level: Option<f32>) -> f32 {
         if !self.classic && bridge_deck_contains(x, z) {
             return river_water_level(z) + BRIDGE_DECK_LIFT;
         }
@@ -202,23 +286,40 @@ impl Terrain {
         let z0 = gz as usize;
         let fx = gx - x0 as f32;
         let fz = gz - z0 as f32;
-        let h00 = self.h(x0, z0);
-        let h10 = self.h(x0 + 1, z0);
-        let h01 = self.h(x0, z0 + 1);
-        let h11 = self.h(x0 + 1, z0 + 1);
+        let mut h00 = self.h(x0, z0);
+        let mut h10 = self.h(x0 + 1, z0);
+        let mut h01 = self.h(x0, z0 + 1);
+        let mut h11 = self.h(x0 + 1, z0 + 1);
+        if self.kind.has_blocked_ground() {
+            let level = level.unwrap_or(match (fx >= 0.5, fz >= 0.5) {
+                (false, false) => h00,
+                (true, false) => h10,
+                (false, true) => h01,
+                (true, true) => h11,
+            });
+            for h in [&mut h00, &mut h10, &mut h01, &mut h11] {
+                if (*h - level).abs() >= SLOPE_BLOCK * CELL {
+                    *h = level;
+                }
+            }
+        }
         h00 * (1.0 - fx) * (1.0 - fz)
             + h10 * fx * (1.0 - fz)
             + h01 * (1.0 - fx) * fz
             + h11 * fx * fz
     }
 
-    /// |gradient| of the height field (rise per meter).
+    /// |gradient| of the height field (rise per meter). Sampled on the
+    /// level of `(x, z)` itself: a cliff a metre ahead is blocked ground
+    /// (`blocked_at`), not a slope to climb, so a man beside a wall, a
+    /// house or the foot of a stair walks at his flat pace.
     #[inline]
     pub fn slope_at(&self, x: f32, z: f32) -> f32 {
         const E: f32 = 1.0;
-        let h = self.height_at(x, z);
-        let dx = (self.height_at(x + E, z) - h) / E;
-        let dz = (self.height_at(x, z + E) - h) / E;
+        let level = self.kind.has_blocked_ground().then(|| self.level_at(x, z));
+        let h = self.height_on(x, z, level);
+        let dx = (self.height_on(x + E, z, level) - h) / E;
+        let dz = (self.height_on(x, z + E, level) - h) / E;
         (dx * dx + dz * dz).sqrt()
     }
 
@@ -235,6 +336,91 @@ impl Terrain {
         let gx = (g.x.round() as usize).min(self.verts_x - 1);
         let gz = (g.y.round() as usize).min(self.verts_z - 1);
         self.blocked[gz * self.verts_x + gx]
+    }
+
+    /// A body of radius `r` at `(x, z)` moving by `(dx, dz)` has its
+    /// centre and its leading edge on open ground: it stops with its edge,
+    /// not its centre, at a wall, a kerb or a stair's rail, and can always
+    /// move away from one. A radius of zero is the centre alone, one mask
+    /// read: the maps with no blocked ground pass that.
+    #[inline]
+    pub fn body_free(&self, x: f32, z: f32, r: f32, dx: f32, dz: f32) -> bool {
+        if self.blocked_at(x, z) {
+            return false;
+        }
+        r == 0.0
+            || ((dx == 0.0 || !self.blocked_at(x + r.copysign(dx), z))
+                && (dz == 0.0 || !self.blocked_at(x, z + r.copysign(dz))))
+    }
+
+    /// How far a body of radius `r` at `(x, z)` overlaps blocked ground
+    /// across either axis, as the shift that takes it off: an edge over a
+    /// blocked vertex moves back to the boundary half a cell before that
+    /// vertex. Zero where both edges of an axis are clear, or both
+    /// blocked (nothing to move toward). Four mask reads.
+    #[inline]
+    pub fn body_overlap(&self, x: f32, z: f32, r: f32) -> Vec2 {
+        let mut out = Vec2::ZERO;
+        for axis in 0..2 {
+            let (hi, lo) = if axis == 0 { (x + r, x - r) } else { (z + r, z - r) };
+            let o = if axis == 0 { self.origin.x } else { self.origin.y };
+            let at = |e: f32| if axis == 0 { self.blocked_at(e, z) } else { self.blocked_at(x, e) };
+            match (at(hi), at(lo)) {
+                (true, false) => {
+                    let v = ((hi - o) / CELL).round();
+                    let shift = o + (v - 0.5) * CELL - hi;
+                    if axis == 0 { out.x = shift } else { out.y = shift }
+                }
+                (false, true) => {
+                    let v = ((lo - o) / CELL).round();
+                    let shift = o + (v + 0.5) * CELL - lo;
+                    if axis == 0 { out.x = shift } else { out.y = shift }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// The nearest open vertex to `p` within `max_r` metres, `p` itself
+    /// when its own vertex is open; None with no open vertex that near.
+    /// A man placed on blocked ground (a spawn or a deployment whose
+    /// block overlaps a wall's foot) stands there instead, since a man
+    /// whose centre is on a blocked vertex could never move again.
+    pub fn nearest_open(&self, p: Vec2, max_r: f32) -> Option<Vec2> {
+        if !self.blocked_at(p.x, p.y) {
+            return Some(p);
+        }
+        let g = ((p - self.origin) / CELL).round();
+        let (cx, cz) = (g.x as i64, g.y as i64);
+        let reach = (max_r / CELL).ceil() as i64;
+        let mut best: Option<(f32, Vec2)> = None;
+        for dz in -reach..=reach {
+            for dx in -reach..=reach {
+                let (x, z) = (cx + dx, cz + dz);
+                if x < 0 || z < 0 || x >= self.verts_x as i64 || z >= self.verts_z as i64 {
+                    continue;
+                }
+                if self.blocked[z as usize * self.verts_x + x as usize] {
+                    continue;
+                }
+                let v = self.origin + Vec2::new(x as f32, z as f32) * CELL;
+                let d = v.distance_squared(p);
+                if d <= max_r * max_r && best.is_none_or(|b| d < b.0) {
+                    best = Some((d, v));
+                }
+            }
+        }
+        best.map(|b| b.1)
+    }
+
+    /// The radius a soldier's body keeps off blocked ground on this map
+    /// (`body_free`): half the body distance (sim/soldier.rs
+    /// `body_distance`, 1.2 m unless `FL_BODY` sets it), or nothing where
+    /// no ground blocks.
+    #[inline]
+    pub fn body_radius(&self) -> f32 {
+        if self.kind.has_blocked_ground() { crate::sim::soldier::body_distance() * 0.5 } else { 0.0 }
     }
 
     /// Wading slow multiplier: WADE_SLOW inside the channel, 1.0 on
@@ -276,6 +462,9 @@ impl Terrain {
                     continue;
                 };
                 self.heights[z * self.verts_x + x] += dh;
+                if let Some(ground) = &mut self.ground {
+                    ground[z * self.verts_x + x] += dh;
+                }
             }
         }
         // Refresh the blocked mask over the touched area (one vertex of
@@ -289,7 +478,7 @@ impl Terrain {
             for z in bz0..=bz1 {
                 for x in bx0..=bx1 {
                     self.blocked[z * self.verts_x + x] =
-                        vertex_blocked(&self.heights, self.grid_verts(), x, z);
+                        blocked_vertex(&self.heights, self.open.as_deref(), self.grid_verts(), x, z);
                 }
             }
         }
@@ -342,7 +531,22 @@ impl Terrain {
     }
 }
 
-/// Mask rule per vertex: a face steeper than SLOPE_BLOCK against any
+/// Mask rule per vertex: what a structure decides where one does
+/// (`open`), else the step rule.
+fn blocked_vertex(
+    heights: &[f32],
+    open: Option<&[Option<bool>]>,
+    dims: (usize, usize),
+    x: usize,
+    z: usize,
+) -> bool {
+    match open.and_then(|o| o[z * dims.0 + x]) {
+        Some(open) => !open,
+        None => vertex_blocked(heights, dims, x, z),
+    }
+}
+
+/// The step rule per vertex: a face steeper than SLOPE_BLOCK against any
 /// 4-neighbor (terrace risers, gorge walls, crater lips). The river
 /// itself is wadeable and never blocks.
 fn vertex_blocked(heights: &[f32], (verts_x, verts_z): (usize, usize), x: usize, z: usize) -> bool {
@@ -692,7 +896,7 @@ pub(crate) fn build_terrain(kind: MapKind) -> Terrain {
         -(verts_x as f32 - 1.0) * CELL * 0.5,
         -(verts_z as f32 - 1.0) * CELL * 0.5,
     );
-    let hill = if matches!(kind, MapKind::Hill | MapKind::BigHill) {
+    let hill = if kind.on_hill() {
         let path = crate::util::game_root().join("assets/terrain/hill.json");
         let source = FileHeightMap::load(&path).unwrap_or_else(|e| panic!("hill terrain: {e}"));
         assert_eq!((source.width, source.height), MapKind::Hill.grid_verts(),
@@ -775,11 +979,20 @@ pub(crate) fn build_terrain(kind: MapKind) -> Terrain {
     if kind == MapKind::Town {
         crate::obstacle_map::raise_blocks(&mut heights, origin, (verts_x, verts_z), &crate::obstacle_map::town_blocks());
     }
+    let (ground, open) = if kind.has_wall() {
+        let pieces = crate::town_layout::pieces(kind);
+        let level = crate::town_layout::level_ground(&mut heights, origin, (verts_x, verts_z), &pieces);
+        info!("terrain: the {} map's wall stands at {level:.2} m", kind.label());
+        let sim = crate::town_layout::sim_ground(&heights, origin, (verts_x, verts_z), &pieces);
+        (Some(std::mem::replace(&mut heights, sim.heights)), Some(sim.open))
+    } else {
+        (None, None)
+    };
     let mut blocked = vec![false; verts_x * verts_z];
     if kind.has_blocked_ground() {
         for z in 0..verts_z {
             for x in 0..verts_x {
-                blocked[z * verts_x + x] = vertex_blocked(&heights, (verts_x, verts_z), x, z);
+                blocked[z * verts_x + x] = blocked_vertex(&heights, open.as_deref(), (verts_x, verts_z), x, z);
             }
         }
     }
@@ -793,9 +1006,11 @@ pub(crate) fn build_terrain(kind: MapKind) -> Terrain {
     );
     Terrain {
         heights,
+        ground,
         verts_x,
         verts_z,
         blocked,
+        open,
         kind,
         classic,
         origin,
@@ -835,11 +1050,9 @@ fn ground_base() -> StandardMaterial {
 /// Pasture maps use authored colour layouts and natural grass detail.
 /// The other maps derive coverage from their relief and stony slopes.
 fn ground_layers(assets: &AssetServer, images: &mut Assets<Image>, terrain: &Terrain) -> GroundLayers {
-    let hill = matches!(terrain.kind, MapKind::Hill | MapKind::BigHill);
-    let authored = matches!(
-        terrain.kind,
-        MapKind::Grassland | MapKind::BigGrassland | MapKind::Hill | MapKind::BigHill | MapKind::Sandbox | MapKind::Town
-    );
+    let hill = terrain.kind.on_hill();
+    let authored = hill
+        || matches!(terrain.kind, MapKind::Grassland | MapKind::BigGrassland | MapKind::Sandbox | MapKind::Town);
     GroundLayers {
         pasture: ground_texture(
             assets,
@@ -917,7 +1130,7 @@ fn rebuild_map(
     }
     let t0 = Instant::now();
     *terrain = build_terrain(kind);
-    chunks.original_heights.clone_from(&terrain.heights);
+    chunks.original_heights = terrain.ground_heights().to_vec();
     let material = materials.add(GroundMaterial {
         base: ground_base(),
         extension: ground_layers(&assets, &mut images, &terrain),
@@ -965,7 +1178,7 @@ fn spawn_chunks(
         .copied()
         .map(|path| ground_texture(&assets, path))
         .collect();
-    chunks.original_heights.clone_from(&terrain.heights);
+    chunks.original_heights = terrain.ground_heights().to_vec();
     spawn_chunk_meshes(&mut commands, &terrain, &mut meshes, &mut chunks);
 }
 
@@ -1005,8 +1218,8 @@ fn ground_normal(terrain: &Terrain, x: usize, z: usize) -> Vec3 {
     let xp = (x + 1).min(terrain.verts_x - 1);
     let zm = z.saturating_sub(1);
     let zp = (z + 1).min(terrain.verts_z - 1);
-    let dx = (terrain.h(xp, z) - terrain.h(xm, z)) / ((xp - xm) as f32 * CELL);
-    let dz = (terrain.h(x, zp) - terrain.h(x, zm)) / ((zp - zm) as f32 * CELL);
+    let dx = (terrain.g(xp, z) - terrain.g(xm, z)) / ((xp - xm) as f32 * CELL);
+    let dz = (terrain.g(x, zp) - terrain.g(x, zm)) / ((zp - zm) as f32 * CELL);
     Vec3::new(-dx, 1.0, -dz).normalize()
 }
 
@@ -1047,11 +1260,11 @@ fn ground_coverage(terrain: &Terrain) -> Image {
             let broad = cover_noise(q / Vec2::new(145.0, 85.0) + Vec2::splat(7.3));
             let patches = cover_noise(q / 31.0 + Vec2::splat(37.8));
             let flecks = cover_noise(q / 7.0 + Vec2::splat(91.1));
-            let neighbors = terrain.h(x.saturating_sub(48), z)
-                + terrain.h((x + 48).min(terrain.verts_x - 1), z)
-                + terrain.h(x, z.saturating_sub(48))
-                + terrain.h(x, (z + 48).min(terrain.verts_z - 1));
-            let relief = terrain.h(x, z) - neighbors * 0.25;
+            let neighbors = terrain.g(x.saturating_sub(48), z)
+                + terrain.g((x + 48).min(terrain.verts_x - 1), z)
+                + terrain.g(x, z.saturating_sub(48))
+                + terrain.g(x, (z + 48).min(terrain.verts_z - 1));
+            let relief = terrain.g(x, z) - neighbors * 0.25;
             let dry = (0.52 + broad * 0.28 + patches * 0.08 + relief * 0.07).clamp(0.0, 1.0);
             let soil = smoothstep(0.52, 0.82, dry + patches * 0.16) * 0.5;
             let variation = (0.5 + flecks * 0.08 + patches * 0.06).clamp(0.0, 1.0);
@@ -1078,7 +1291,7 @@ fn ground_coverage(terrain: &Terrain) -> Image {
 /// RGBA carries an unused channel, crater exposure, stone and bank dampness.
 fn ground_weights(terrain: &Terrain, original: &[f32], x: usize, z: usize, n: Vec3) -> [f32; 4] {
     let p = terrain.origin + Vec2::new(x as f32, z as f32) * CELL;
-    let h = terrain.h(x, z);
+    let h = terrain.g(x, z);
     let slope = n.xz().length() / n.y.max(0.001);
     let disturbed = smoothstep(0.03, 0.65, (h - original[z * terrain.verts_x + x]).abs());
     let mut soil = disturbed;
@@ -1141,7 +1354,7 @@ fn build_band_mesh(terrain: &Terrain, cx: usize, cz: usize) -> Mesh {
             let (x, z) = (vx0 + dx, vz0 + dz);
             let wp = |xx: usize, zz: usize| -> Vec3 {
                 let w = terrain.origin + Vec2::new(xx as f32, zz as f32) * CELL;
-                Vec3::new(w.x, terrain.h(xx, zz), w.y)
+                Vec3::new(w.x, terrain.g(xx, zz), w.y)
             };
             let p00 = wp(x, z);
             let p10 = wp(x + 1, z);
@@ -1197,7 +1410,7 @@ fn build_chunk_mesh(terrain: &Terrain, original: &[f32], cx: usize, cz: usize) -
             let (x, z) = (vx0 + dx, vz0 + dz);
             let p = terrain.origin + Vec2::new(x as f32, z as f32) * CELL;
             let n = ground_normal(terrain, x, z);
-            positions.push([p.x, terrain.h(x, z), p.y]);
+            positions.push([p.x, terrain.g(x, z), p.y]);
             normals.push(n.to_array());
             weights.push(ground_weights(terrain, original, x, z, n));
         }
@@ -1378,9 +1591,11 @@ mod tests {
         }
         Terrain {
             heights,
+            ground: None,
             verts_x: VERTS_X,
             verts_z: VERTS_Z,
             blocked: vec![false; VERTS_X * VERTS_Z],
+            open: None,
             kind: MapKind::Grassland,
             classic: true,
             origin: Vec2::ZERO,
@@ -1678,7 +1893,7 @@ mod tests {
             let chunks = world.resource::<TerrainChunks>();
             let terrain = world.resource::<Terrain>();
             assert_eq!(chunks.meshes.len(), count);
-            assert_eq!(chunks.original_heights, terrain.heights);
+            assert_eq!(chunks.original_heights, terrain.ground_heights());
             let last = world
                 .resource::<Assets<Mesh>>()
                 .get(chunks.meshes.last().unwrap())

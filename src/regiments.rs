@@ -27,6 +27,22 @@ pub fn army_gap() -> f32 {
     crate::util::env_or("FL_ARMY_GAP", 60.0)
 }
 
+/// The z the no-man's land is centred on and its depth, on the map
+/// `kind`. A map with the stone wall puts the player's army (team 0) on
+/// the plateau behind it (in the town, on the walled town), its front
+/// 10 m north of the wall's line so the first ranks stand at the wall's
+/// inner foot, and the enemy on the plain south of z = 150; FL_ARMY_GAP
+/// still sets the depth there, around the same centre. Every other map
+/// centres the gap on the field.
+pub fn army_lines(kind: crate::terrain::MapKind) -> (f32, f32) {
+    if kind.has_wall() {
+        let (north, south) = (crate::town_layout::WALL_Z - 10.0, 150.0);
+        ((north + south) * 0.5, crate::util::env_or("FL_ARMY_GAP", south - north))
+    } else {
+        (0.0, army_gap())
+    }
+}
+
 /// The corners of the field the army layout fills: the terrain's bounds,
 /// or with FL_ARMY_FIELD=WxD (metres) a field of that size centred on the
 /// map and clipped to it. FL_ARMY_FIELD=1024x768 packs a big map's armies
@@ -372,8 +388,10 @@ pub fn do_spawn_battle(
     // needs more ranks than fit, widen the ranks and shrink the x pitch.
     let (field_min, field_max) = army_field(terrain);
     let usable_w = (field_max.x - field_min.x) - 2.0 * SIDE_MARGIN;
-    let army_gap = army_gap();
-    let usable_d = field_max.y - EDGE_MARGIN - army_gap / 2.0;
+    let (centre, army_gap) = army_lines(terrain.kind);
+    // The shallower side's depth behind its front.
+    let usable_d = (field_max.y - EDGE_MARGIN - army_gap / 2.0 - centre)
+        .min(-field_min.y - EDGE_MARGIN - army_gap / 2.0 + centre);
     let max_ranks = (((usable_d - block_d) / (block_d + REG_GAP)).floor() as usize + 1).max(1);
     let per_rank = ((usable_w / (block_w + REG_GAP)).floor() as usize)
         .max(n_regs.div_ceil(max_ranks))
@@ -456,14 +474,15 @@ pub fn do_spawn_battle(
         }
         let n_regs = kinds.len();
         let dir: f32 = if team == 0 { -1.0 } else { 1.0 };
-        let rank_z = |rank: usize| dir * (army_gap / 2.0 + block_d / 2.0 + rank as f32 * (block_d + REG_GAP));
+        let rank_z = |rank: usize| centre + dir * (army_gap / 2.0 + block_d / 2.0 + rank as f32 * (block_d + REG_GAP));
         // A regiment whose planned slot stands on blocked ground (a wall,
         // a house, a roof) takes the next free slot in the spare ranks
         // behind the army instead: full-width ranks, walked file by file,
         // out to the field's edge.
         let planned_ranks = n_regs.div_ceil(per_rank);
         let mut spare = planned_ranks * per_rank;
-        let deepest = field_max.y - EDGE_MARGIN - block_d / 2.0;
+        let past_edge =
+            |z: f32| z < field_min.y + EDGE_MARGIN + block_d / 2.0 || z > field_max.y - EDGE_MARGIN - block_d / 2.0;
         for (r, &kind) in kinds.iter().enumerate() {
             let rank = r / per_rank;
             let file = r % per_rank;
@@ -476,7 +495,7 @@ pub fn do_spawn_battle(
                     let (rank, file) = (spare / per_rank, spare % per_rank);
                     spare += 1;
                     let z = rank_z(rank);
-                    if z.abs() > deepest {
+                    if past_edge(z) {
                         warn!("regiment layout: no open ground left for a regiment; placed on its planned slot");
                         break;
                     }
@@ -1379,8 +1398,9 @@ fn spawn_routpass_test(units: &mut Units, terrain: &Terrain, groups: &mut Groups
         // FL_ROUTPASS_OPEN=1: A stands in the open order from the start.
         if g == 0 && std::env::var("FL_ROUTPASS_OPEN").is_ok_and(|v| v == "1") {
             let room = crate::formation::OPEN_ROOM_MAX;
-            let o = crate::formation::choose_open(gd, false, false, room, room);
-            crate::formation::open_order(gd, o);
+            if let Some(o) = crate::formation::choose_open(gd, false, false, room, room) {
+                crate::formation::open_order(gd, o);
+            }
         }
         for i in crate::formation::assign_slots(units, g as u32, gd) {
             let i = i as usize;
