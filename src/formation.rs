@@ -820,118 +820,129 @@ pub fn apply_formation_cmd(
         apply_formation_cmd(FormCmd::Melee, selection, groups);
     }
     match cmd {
-        FormCmd::Wall | FormCmd::Loose => {
-            let wall = cmd == FormCmd::Wall;
-            let want = if wall { FormSpacing::Wall } else { FormSpacing::Loose };
-            let picked: Vec<usize> = picked
-                .iter()
-                .copied()
-                .filter(|&g| !(wall && groups.list[g].kind == crate::unit_types::KIND_ARCHER))
-                .collect();
-            if picked.is_empty() {
-                return;
-            }
-            // Toggle as a set: if anyone is not yet in the mode, everyone
-            // enters it; if all are, everyone falls back to close order.
-            // An open regiment's spacing is the one it closes back to.
-            let on = picked.iter().any(|&g| groups.list[g].chosen_spacing() != want);
-            let mut shield = 0;
-            let mut spear = 0;
-            for &g in &picked {
-                let gd = &mut groups.list[g];
-                let spacing = if on { want } else { FormSpacing::Normal };
-                if gd.spacing == FormSpacing::Open {
-                    gd.close_to = spacing;
-                } else {
-                    gd.spacing = spacing;
-                }
-                gd.shape = FormShape::Rect;
-                if gd.files == 0 {
-                    gd.files = default_files(gd.count);
-                }
-                gd.reform = true;
-                match wall_kind(gd) {
-                    1 => shield += 1,
-                    2 => spear += 1,
-                    _ => {}
-                }
-            }
-            if !on {
-                info!("{} regiments back to close order", picked.len());
-            } else if wall {
-                info!("wall formed: {shield} shieldwall, {spear} spearwall regiments");
-            } else {
-                info!("{} regiments to LOOSE order", picked.len());
-            }
-        }
+        FormCmd::Wall | FormCmd::Loose => toggle_spacing(cmd, &picked, groups),
+        FormCmd::Hold => toggle_hold(&picked, groups),
+        FormCmd::FireAtWill | FormCmd::Skirmish | FormCmd::Melee => toggle_archers(cmd, picked, groups),
+    }
+}
 
-        FormCmd::Hold => {
-            // Hold position (defend) vs at ease: held regiments never chase
-            // and never engage on their own — they fight what steps into
-            // reach and nothing else.
-            let on = picked.iter().any(|&g| !groups.list[g].hold);
-            for &g in &picked {
-                groups.list[g].hold = on;
-            }
-            info!(
-                "{} regiments {}",
-                picked.len(),
-                if on { "HOLD POSITION" } else { "AT EASE" }
-            );
+/// Wall or loose order on or off for the picked regiments.
+#[inline]
+fn toggle_spacing(cmd: FormCmd, picked: &[usize], groups: &mut Groups) {
+    let wall = cmd == FormCmd::Wall;
+    let want = if wall { FormSpacing::Wall } else { FormSpacing::Loose };
+    let picked: Vec<usize> = picked
+        .iter()
+        .copied()
+        .filter(|&g| !(wall && groups.list[g].kind == crate::unit_types::KIND_ARCHER))
+        .collect();
+    if picked.is_empty() {
+        return;
+    }
+    // Toggle as a set: if anyone is not yet in the mode, everyone
+    // enters it; if all are, everyone falls back to close order.
+    // An open regiment's spacing is the one it closes back to.
+    let on = picked.iter().any(|&g| groups.list[g].chosen_spacing() != want);
+    let mut shield = 0;
+    let mut spear = 0;
+    for &g in &picked {
+        let gd = &mut groups.list[g];
+        let spacing = if on { want } else { FormSpacing::Normal };
+        if gd.spacing == FormSpacing::Open {
+            gd.close_to = spacing;
+        } else {
+            gd.spacing = spacing;
         }
-
-        FormCmd::FireAtWill | FormCmd::Skirmish | FormCmd::Melee => {
-            // Archer toggles; melee regiments in the selection ignore them.
-            let archers: Vec<usize> = picked
-                .into_iter()
-                .filter(|&g| groups.list[g].kind == crate::unit_types::KIND_ARCHER)
-                .collect();
-            if archers.is_empty() {
-                return;
-            }
-            let on = archers.iter().any(|&g| {
-                let gd = &groups.list[g];
-                match cmd {
-                    FormCmd::FireAtWill => !gd.fire_at_will,
-                    FormCmd::Skirmish => !gd.skirmish,
-                    _ => !gd.melee,
-                }
-            });
-            for &g in &archers {
-                let gd = &mut groups.list[g];
-                match cmd {
-                    FormCmd::FireAtWill => gd.fire_at_will = on,
-                    FormCmd::Skirmish => {
-                        gd.skirmish = on;
-                        // Switching skirmish off mid-run: the run ends
-                        // where the regiment stands and its own order
-                        // comes back.
-                        if !on && gd.skirmishing {
-                            crate::sim::job::end_skirmish(gd);
-                        }
-                    }
-                    _ => {
-                        gd.melee = on;
-                        // Swords out end a run the same way; the bows go
-                        // down with the toggle (sim/job.rs).
-                        if on && gd.skirmishing {
-                            crate::sim::job::end_skirmish(gd);
-                        }
-                    }
-                }
-            }
-            info!(
-                "{} archer regiments {} {}",
-                archers.len(),
-                match cmd {
-                    FormCmd::FireAtWill => "fire-at-will",
-                    FormCmd::Skirmish => "skirmish",
-                    _ => "swords out",
-                },
-                if on { "ON" } else { "OFF" }
-            );
+        gd.shape = FormShape::Rect;
+        if gd.files == 0 {
+            gd.files = default_files(gd.count);
+        }
+        gd.reform = true;
+        match wall_kind(gd) {
+            1 => shield += 1,
+            2 => spear += 1,
+            _ => {}
         }
     }
+    if !on {
+        info!("{} regiments back to close order", picked.len());
+    } else if wall {
+        info!("wall formed: {shield} shieldwall, {spear} spearwall regiments");
+    } else {
+        info!("{} regiments to LOOSE order", picked.len());
+    }
+}
+
+/// Hold position on or off for the picked regiments.
+#[inline]
+fn toggle_hold(picked: &[usize], groups: &mut Groups) {
+    // Hold position (defend) vs at ease: held regiments never chase
+    // and never engage on their own — they fight what steps into
+    // reach and nothing else.
+    let on = picked.iter().any(|&g| !groups.list[g].hold);
+    for &g in picked {
+        groups.list[g].hold = on;
+    }
+    info!(
+        "{} regiments {}",
+        picked.len(),
+        if on { "HOLD POSITION" } else { "AT EASE" }
+    );
+}
+
+/// An archer toggle (fire at will, skirmish, swords out) for the picked
+/// archer regiments.
+#[inline]
+fn toggle_archers(cmd: FormCmd, picked: Vec<usize>, groups: &mut Groups) {
+    // Archer toggles; melee regiments in the selection ignore them.
+    let archers: Vec<usize> = picked
+        .into_iter()
+        .filter(|&g| groups.list[g].kind == crate::unit_types::KIND_ARCHER)
+        .collect();
+    if archers.is_empty() {
+        return;
+    }
+    let on = archers.iter().any(|&g| {
+        let gd = &groups.list[g];
+        match cmd {
+            FormCmd::FireAtWill => !gd.fire_at_will,
+            FormCmd::Skirmish => !gd.skirmish,
+            _ => !gd.melee,
+        }
+    });
+    for &g in &archers {
+        let gd = &mut groups.list[g];
+        match cmd {
+            FormCmd::FireAtWill => gd.fire_at_will = on,
+            FormCmd::Skirmish => {
+                gd.skirmish = on;
+                // Switching skirmish off mid-run: the run ends
+                // where the regiment stands and its own order
+                // comes back.
+                if !on && gd.skirmishing {
+                    crate::sim::job::end_skirmish(gd);
+                }
+            }
+            _ => {
+                gd.melee = on;
+                // Swords out end a run the same way; the bows go
+                // down with the toggle (sim/job.rs).
+                if on && gd.skirmishing {
+                    crate::sim::job::end_skirmish(gd);
+                }
+            }
+        }
+    }
+    info!(
+        "{} archer regiments {} {}",
+        archers.len(),
+        match cmd {
+            FormCmd::FireAtWill => "fire-at-will",
+            FormCmd::Skirmish => "skirmish",
+            _ => "swords out",
+        },
+        if on { "ON" } else { "OFF" }
+    );
 }
 
 /// Consume `reform` requests and run the close-ranks check: a Rect
