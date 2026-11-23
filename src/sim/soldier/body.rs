@@ -331,8 +331,10 @@ fn brace_weight(mi: f32, mo: f32, bi: usize, bo: usize, brace: f32, basic: f32) 
 }
 /// 4 kinds x 4 kinds x 7 levels x 7 levels of f32: 3,136 bytes, read by
 /// one row (his kind, his level) per soldier.
-pub(super) type BraceTable =
-    [[[[f32; BRACE_LEVELS]; BRACE_LEVELS]; crate::unit_types::NUM_KINDS]; crate::unit_types::NUM_KINDS];
+pub(super) type BraceTable = [BraceRow; crate::unit_types::NUM_KINDS];
+/// One kind's row of the table: by the other's kind, his level and the
+/// other's.
+pub(super) type BraceRow = [[[f32; BRACE_LEVELS]; BRACE_LEVELS]; crate::unit_types::NUM_KINDS];
 fn brace_table(brace: f32, basic: f32) -> BraceTable {
     std::array::from_fn(|a| {
         std::array::from_fn(|o| {

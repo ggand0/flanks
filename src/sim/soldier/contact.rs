@@ -100,147 +100,101 @@ pub(crate) const SPEAR_LINE_HALF_W: f32 = 0.35;
 /// separation pushes and overlap corrections, the crowd around him, the
 /// nearest living enemy in his weapon's reach (sticky to the one he already
 /// fights), and, at charge speed against a spearwall, the braced point his
-/// body runs onto, which is a damage event from the spearman.
+/// body runs onto, which is a damage event from the spearman. One loop over
+/// his neighbours does every job: the contact between bodies (`Contact`),
+/// the crowd around him (`Crowd`), the enemy in his reach (`Reach`), the
+/// spear points (`Spear`) and the obstacles for the choice of opening
+/// (`Obstacles`).
 #[inline]
 pub(super) fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut, cands: &mut Vec<u32>) {
-    let Field {
-        grid,
-        speed,
-        team,
-        yaw_snap,
-        wall,
-        stance,
-        faces_spearwall,
-        tick_seed,
-        orders,
-        engaged,
-        anchors,
-        home,
-        passing,
-        moving,
-        ..
-    } = *f;
     let i = s.i;
     let params = &TYPES[st.my_kind];
     let p = st.p;
-    let gi = st.gi;
     let dying = st.dying;
     // Fused neighbor scan: separation physics + nearest living enemy in reach
     // (swing targeting), over the grid's cache-ordered units within the cut.
-    let mut push = Vec2::ZERO;
-    let mut corr = Vec2::ZERO;
-    let mut overlap_vel = Vec2::ZERO;
-    let mut overlap_share = 0.0f32;
-    let mut overlap = 0.0f32;
-    let mut crowd = 0.0f32;
-    let mut crowd_still = 0.0f32;
-    let mut ahead = 0.0f32;
     let wish_dir = st.desired.normalize_or_zero();
-    // The still men ahead are read only for the friction contact's brake,
-    // and only by a man who wishes to go somewhere.
-    let still_on = still_brake() && st.desired.length_squared() >= 1e-12;
-    // The sides pressed against him, for the crowd walk under the
-    // friction contact: only a soldier who wishes to go somewhere has sides
-    // about his wish.
-    let sides_on = friction_contact() && st.desired.length_squared() >= 1e-12;
-    let mut press4 = [0.0f32; 4];
-    let inv_depth = 1.0 / CROWD_DEPTH;
-    let my_team_bit = (team[i] as u32) * crate::spatial::META_TEAM;
-    let my_wall = wall[gi] != 0;
+    let my_team_bit = (f.team[i] as u32) * crate::spatial::META_TEAM;
     // His width and each neighbour's by their poses and the turn of their
     // shoulders at the tick's start, the pair's rest, its inverse and its
     // overlap distance from a table, and the pair's mass weights by kind.
     let widths = widths();
-    let squeeze_on = squeezing(*s.stuck);
     let pose_lv = pose_level(*s.pose);
     let my_level = width_level(*s.pose);
-    let mine = &widths[my_level];
-    // The choice of opening's read (`choose_opening`): only a man walking
-    // somewhere, not fighting, reads the comrades ahead; a man squeezing
-    // feels the bodies at his sides.
-    let body0 = widths[pose_lv].body;
-    let far = (anchors[gi] + home[i]).distance_squared(p) > TRY_FROM_SLOT * TRY_FROM_SLOT;
-    let walking = orders[gi].is_some() || far;
-    // Only a man with a reason to pick an opening: his regiment walking
-    // through a friend that opened for it, or himself a straggler of a
-    // holding regiment. Read for every walking man, it costs 5.6 ms of
-    // the 200k step in a front battle where nobody passes anyone.
-    let reason = passing[gi] || (orders[gi].is_none() && far);
-    let open_on = opening_on()
-        && walking
-        && reason
-        && !engaged[gi]
-        && !dying
-        && !st.routed
-        && !st.in_melee
-        && !st.committed
-        && st.join_fp.is_none()
-        && st.desired.length_squared() > 0.25;
-    // Every obstacle within his reach is in the row nearest him (the band
-    // reaches past OPEN_SEE), so the scan keeps the nearest two on each
-    // side as it goes.
-    let mut row = Row::default();
-    let mut row_at = f32::INFINITY;
-    let (mut side_left, mut side_right) = (false, false);
-    let pairs = &pair_widths()[my_level];
-    let masses = &mass_pairs()[st.my_kind];
-    // Under the friction contact the setting apart weighs each man by how
-    // braced he is (`brace_pairs`): his own level from his pose and his
-    // stood bit at the tick's start, the ones the grid carries for him, and
-    // each neighbour's from the grid, so both men of a pair read the same
-    // two levels. The walking bracing counts only against the other side
-    // (`brace_level`), so his level against a friend and against a foe are
-    // kept apart.
     let friction = friction_contact();
-    // A falling soldier's own share of his body, from his clock at the
-    // tick's start as the grid carries it (his own column has already
-    // counted down this tick, `begin`).
     let fall_on = fall();
-    let my_share = if fall_on { fall_share(f.death_snap[i]) } else { 1.0 };
-    let my_stood = *s.stood;
-    let (my_brace_same, my_brace_cross) = if friction {
-        (
-            brace_level(pose_lv, my_stood, dying, fall_on, false, || moving[gi]),
-            brace_level(pose_lv, my_stood, dying, fall_on, true, || moving[gi]),
-        )
-    } else {
-        (0, 0)
-    };
-    let braces = if friction { Some(&brace_pairs()[st.my_kind]) } else { None };
-    let gain = CORR_GAIN;
-    let reach2 = params.reach * params.reach;
-    let prev_target = *s.target;
-    let mut best_d2 = f32::MAX;
-    let mut best_idx = u32::MAX;
-    let mut sticky = false;
-    // Moving at charge speed with unspent momentum: braced enemy spears in
-    // the path are a collision hazard, and the scan must see out to SPEAR
-    // reach, not just mine. A man already run through (flash; a twitch
-    // code of 16 up is a render cue, not a wound) or reeling is not
-    // re-impaled every tick: a spear is a point, not an aura.
-    let spear_reach = TYPES[crate::unit_types::KIND_SPEAR as usize].reach;
-    let cs = speed[i] * CHARGE_SPEED_FRAC;
-    let at_charge_speed = faces_spearwall[team[i] as usize]
-        && !dying
-        && (*s.flash == 0 || *s.flash >= 16)
-        && *s.swing & crate::units::SWING_STAGGERED == 0
-        && s.vel.xz().length_squared() > cs * cs;
-    let mut impale_idx = u32::MAX;
-    let mut impale_d = f32::MAX;
-    let scan_r = if at_charge_speed {
-        QUERY_RADIUS.max(params.reach).max(spear_reach)
-    } else {
-        QUERY_RADIUS.max(params.reach)
-    };
-    // The farthest a foe can be and still count for anything below: the
-    // widest pair's spring rest, his weapon's reach, or at charge speed a
-    // braced spear's point. A friend counts only within SEP_RADIUS.
-    let spear_cut = if at_charge_speed {
-        (spear_reach * spear_reach + SPEAR_LINE_HALF_W * SPEAR_LINE_HALF_W).sqrt()
-    } else {
-        0.0
-    };
-    let foe_cut = widest_rest().max(params.reach).max(spear_cut) + CUT_MARGIN;
+    let mut contact = Contact::new(f, s, st, my_level, pose_lv, friction, fall_on);
+    let mut crowd = Crowd::new(st, wish_dir, friction);
+    let mut reach = Reach::new(params, *s.target);
+    let mut spear = Spear::new(f, s, dying);
+    let mut obstacles = Obstacles::new(f, s, st, wish_dir, widths[pose_lv].body, widths);
+    let scan_r = spear.scan_radius(params);
+    gather_candidates(f.grid, p, i, my_team_bit, scan_r, spear.foe_cut(params), cands);
+    let grid = f.grid;
+    let sorted = grid.sorted();
+    for &o_rank in cands.iter() {
+        let o = &sorted[o_rank as usize];
+        let o_vel = grid.sorted_vel(o_rank as usize);
+        let d = p - o.xz();
+        let d2 = d.length_squared();
+        let same = (o.meta & crate::spatial::META_TEAM) == my_team_bit;
+        let o_dying = (o.meta & crate::spatial::META_DYING) != 0;
+        let n = Near { o, o_vel, d, d2, same, o_dying, enemy: !same && !o_dying };
+        reach.see(&n);
+        spear.see(&n, f.yaw_snap);
+        obstacles.see(&n);
+        let (sep_r, inv_sep, hard) = contact.rest(&n);
+        if d2 < sep_r * sep_r && d2 > 1e-8 {
+            let len = d2.sqrt();
+            let inv_len = 1.0 / len;
+            let w = 1.0 - len * inv_sep;
+            contact.touch(&n, len, inv_len, w, hard);
+            crowd.count(&n, len, inv_len, w, hard);
+        }
+    }
+    spear.impale(f, i, out);
+    mark_foe_in_reach(s, dying, reach.best_idx);
+    recall_foe(f, st, i, reach.best_idx, reach.prev_target);
+    ramp_stance(f, s, st, friction, fall_on, reach.best_idx);
+    let mine = &widths[my_level];
+    st.brake = (mine.slow, mine.stop);
+    draw_knife(f, s, st, reach.best_idx);
+    contact.hand_on(st);
+    crowd.hand_on(st);
+    reach.hand_on(st);
+    st.impale_idx = spear.impale_idx;
+    st.at_charge_speed = spear.at_charge_speed;
+    st.scan_r = scan_r;
+    st.my_team_bit = my_team_bit;
+    obstacles.hand_on(s, st, widths[pose_lv].sep);
+}
+
+/// One neighbour as the scan reads him: his row in the grid and his
+/// velocity at the tick's start, `d` from him to the scanning man and its
+/// square, whether he is of the man's team, whether he is dying, and
+/// whether he is a living enemy.
+struct Near<'a> {
+    o: &'a crate::spatial::SortedUnit,
+    o_vel: Vec2,
+    d: Vec2,
+    d2: f32,
+    same: bool,
+    o_dying: bool,
+    enemy: bool,
+}
+
+/// The candidates of his scan within the cut, by rank, in the walk's
+/// order.
+#[inline]
+fn gather_candidates(
+    grid: &crate::spatial::SpatialGrid,
+    p: Vec2,
+    i: usize,
+    my_team_bit: u32,
+    scan_r: f32,
+    foe_cut: f32,
+    cands: &mut Vec<u32>,
+) {
     // First the candidates within the cut, by rank, in the walk's order:
     // in a press, whether each passes is hard to predict, so each is written and
     // kept by the test's outcome instead of by a branch on it. A friend
@@ -262,25 +216,359 @@ pub(super) fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut
         let n_kept = grid.kept_in_box(p, scan_r, &cut, cands.as_mut_ptr());
         cands.set_len(n_kept);
     }
-    let sorted = grid.sorted();
-    for &o_rank in cands.iter() {
-        let o = &sorted[o_rank as usize];
-        let o_vel = grid.sorted_vel(o_rank as usize);
-        let d = p - o.xz();
-        let d2 = d.length_squared();
-        let same = (o.meta & crate::spatial::META_TEAM) == my_team_bit;
-        let enemy = !same && (o.meta & crate::spatial::META_DYING) == 0;
-        if enemy && d2 < reach2 {
-            sticky |= o.idx == prev_target;
-            if d2 < best_d2 {
-                best_d2 = d2;
-                best_idx = o.idx;
+}
+
+/// The contact between bodies (`scan`): every neighbour within the pair's
+/// spring rest pushes him away by their masses, every body that overlaps
+/// his sets him back by the overlap correction, by their masses or under
+/// the friction contact by how braced each man is, and the bodies he
+/// overlaps give the velocity and his share by weight of the shared speed.
+struct Contact<'a> {
+    pairs: &'a [PairWidth; WIDTH_LEVELS],
+    masses: &'a [(f32, f32); crate::unit_types::NUM_KINDS],
+    braces: Option<&'a BraceRow>,
+    moving: &'a [bool],
+    my_level: usize,
+    my_share: f32,
+    my_wall: bool,
+    my_brace_same: usize,
+    my_brace_cross: usize,
+    dying: bool,
+    fall_on: bool,
+    push: Vec2,
+    corr: Vec2,
+    overlap_vel: Vec2,
+    overlap_share: f32,
+    overlap: f32,
+}
+
+impl<'a> Contact<'a> {
+    /// His side of every pair: his width level, his share of his body, his
+    /// wall stance and his brace levels.
+    #[inline]
+    fn new(
+        f: &Field<'a>,
+        s: &Soldier,
+        st: &Step,
+        my_level: usize,
+        pose_lv: usize,
+        friction: bool,
+        fall_on: bool,
+    ) -> Self {
+        let Field { wall, moving, .. } = *f;
+        let gi = st.gi;
+        let dying = st.dying;
+        // Under the friction contact the setting apart weighs each man by how
+        // braced he is (`brace_pairs`): his own level from his pose and his
+        // stood bit at the tick's start, the ones the grid carries for him, and
+        // each neighbour's from the grid, so both men of a pair read the same
+        // two levels. The walking bracing counts only against the other side
+        // (`brace_level`), so his level against a friend and against a foe are
+        // kept apart.
+        // A falling soldier's own share of his body, from his clock at the
+        // tick's start as the grid carries it (his own column has already
+        // counted down this tick, `begin`).
+        let my_share = if fall_on { fall_share(f.death_snap[s.i]) } else { 1.0 };
+        let my_stood = *s.stood;
+        let (my_brace_same, my_brace_cross) = if friction {
+            (
+                brace_level(pose_lv, my_stood, dying, fall_on, false, || moving[gi]),
+                brace_level(pose_lv, my_stood, dying, fall_on, true, || moving[gi]),
+            )
+        } else {
+            (0, 0)
+        };
+        Contact {
+            pairs: &pair_widths()[my_level],
+            masses: &mass_pairs()[st.my_kind],
+            braces: if friction { Some(&brace_pairs()[st.my_kind]) } else { None },
+            moving,
+            my_level,
+            my_share,
+            my_wall: wall[gi] != 0,
+            my_brace_same,
+            my_brace_cross,
+            dying,
+            fall_on,
+            push: Vec2::ZERO,
+            corr: Vec2::ZERO,
+            overlap_vel: Vec2::ZERO,
+            overlap_share: 0.0,
+            overlap: 0.0,
+        }
+    }
+
+    /// The pair's spring rest, its inverse and the distance under which
+    /// their bodies overlap.
+    #[inline(always)]
+    fn rest(&self, n: &Near) -> (f32, f32, f32) {
+        let o = n.o;
+        // Two same-team units both in a wall STANCE rest shoulder to shoulder
+        // (symmetric predicate: both sides compute the same radius). Ordinary
+        // ranks keep parade spacing even while fighting — the seams between
+        // files are what enemy bodies flow into.
+        let cross = !n.same;
+        // No packing rule for fighting regiments: M2TW keeps its formation
+        // grid during melee, and observably loosens it. The fighting crowd's
+        // spacing is slots plus body collision, nothing else. A
+        // shoulder-to-shoulder press rest for fighting pairs sealed the very
+        // seams the intermix needs: a pressed front's gaps shrank to about
+        // 1.05 m against 0.95 m bodies and symmetric fights collapsed to a
+        // two-rank duel line. It must not come back.
+        // A pair with a falling soldier in it (`fall`) is as far apart as
+        // what is left of his body: each man's body and rest by his share,
+        // a wall pair's rest too. Two living soldiers read the table.
+        let falling = self.fall_on && (self.dying | n.o_dying);
+        let fallen;
+        let (pair, wall_rest) = if falling {
+            let o_share = fall_share(crate::spatial::meta_fall(o.meta));
+            fallen = pair_width_of(self.my_level, self.my_share, crate::spatial::meta_width(o.meta), o_share);
+            (&fallen, WALL_SEP_RADIUS * (0.5 * (self.my_share + o_share)))
+        } else {
+            (&self.pairs[crate::spatial::meta_width(o.meta)], WALL_SEP_RADIUS)
+        };
+        if !cross && self.my_wall && (o.meta & crate::spatial::META_WALL) != 0 {
+            (wall_rest, 1.0 / wall_rest, pair.hard.min(wall_rest))
+        } else {
+            (pair.sep, pair.inv_sep, pair.hard)
+        }
+    }
+
+    /// A neighbour within the pair's rest, `len` from him: his push, and
+    /// with the bodies overlapping, the correction and the overlap's
+    /// velocity and share.
+    #[inline(always)]
+    fn touch(&mut self, n: &Near, len: f32, inv_len: f32, w: f32, hard: f32) {
+        let o = n.o;
+        let d = n.d;
+        let cross = !n.same;
+        // Mass-weighted: heavies shove lights aside.
+        let (mw, share) = self.masses[crate::spatial::meta_kind(o.meta)];
+        if len < hard {
+            // Overlap is resolved POSITIONALLY only. A hard force boost
+            // here as well made packed crowds oscillate at the
+            // acceleration cap, two solvers fighting over the same
+            // overlap, every frame.
+            let back = (hard - len) * CORR_GAIN * mw;
+            // The friction contact sets him apart by the braced
+            // weights; what the contact speed reads below stays by
+            // the plain ones.
+            let set = match self.braces {
+                Some(braces) => {
+                    // `moving` is read only for a walking foe
+                    // (`brace_level`).
+                    let o_brace = brace_level(
+                        crate::spatial::meta_pose(o.meta),
+                        (o.meta & crate::spatial::META_STOOD) != 0,
+                        n.o_dying,
+                        self.fall_on,
+                        cross,
+                        || self.moving[crate::spatial::meta_group(o.meta)],
+                    );
+                    let my_brace = if cross { self.my_brace_cross } else { self.my_brace_same };
+                    (hard - len) * CORR_GAIN * braces[crate::spatial::meta_kind(o.meta)][my_brace][o_brace]
+                }
+                None => back,
+            };
+            self.corr += d * (set * inv_len);
+            self.overlap_vel += n.o_vel * back;
+            self.overlap_share += share * back;
+            self.overlap += back;
+        }
+        self.push += d * (w * mw * inv_len);
+    }
+
+    /// The push and the correction, and the overlap's velocity and share as
+    /// means over the overlap.
+    #[inline]
+    fn hand_on(&self, st: &mut Step) {
+        st.push = self.push;
+        st.corr = self.corr;
+        if self.overlap > 0.0 {
+            st.overlap_vel = self.overlap_vel / self.overlap;
+            st.overlap_share = self.overlap_share / self.overlap;
+        }
+    }
+}
+
+/// The crowd around him (`scan`): how close his neighbours stand within
+/// the pair's rest (`crowd`), the crowd ahead of him on his way (`ahead`),
+/// the still men ahead (`crowd_still`, the friction contact's brake) and
+/// how deep a body is in his on each of his four sides about his wish
+/// (`press4`, the crowd walk).
+struct Crowd {
+    wish_dir: Vec2,
+    still_on: bool,
+    sides_on: bool,
+    inv_depth: f32,
+    crowd: f32,
+    crowd_still: f32,
+    ahead: f32,
+    press4: [f32; 4],
+}
+
+impl Crowd {
+    #[inline]
+    fn new(st: &Step, wish_dir: Vec2, friction: bool) -> Self {
+        // The still men ahead are read only for the friction contact's brake,
+        // and only by a man who wishes to go somewhere.
+        let still_on = still_brake() && st.desired.length_squared() >= 1e-12;
+        // The sides pressed against him, for the crowd walk under the
+        // friction contact: only a soldier who wishes to go somewhere has sides
+        // about his wish.
+        let sides_on = friction && st.desired.length_squared() >= 1e-12;
+        Crowd {
+            wish_dir,
+            still_on,
+            sides_on,
+            inv_depth: 1.0 / CROWD_DEPTH,
+            crowd: 0.0,
+            crowd_still: 0.0,
+            ahead: 0.0,
+            press4: [0.0; 4],
+        }
+    }
+
+    /// A neighbour within the pair's rest, `len` from him.
+    #[inline(always)]
+    fn count(&mut self, n: &Near, len: f32, inv_len: f32, w: f32, hard: f32) {
+        let d = n.d;
+        let wish_dir = self.wish_dir;
+        if len < hard && self.sides_on {
+            // The crowd walk: how deep this body is in his, on the
+            // sides of him it lies on (`d` points from it to him).
+            let depth = ((hard - len) * self.inv_depth).min(1.0);
+            let shares = press_shares(d * inv_len, wish_dir);
+            let press4 = &mut self.press4;
+            for q in 0..4 {
+                press4[q] = press4[q].max(depth * shares[q]);
             }
         }
+        self.ahead += w * (d.dot(wish_dir) < -0.5 * len) as u32 as f32;
+        // Jam density: COMPRESSED pairs only — a neighbor resting AT his
+        // pair's rest distance contests nothing, so a formed man's
+        // slot-keeping is never faded by the settled enemies one stride
+        // away, which made a line yield and stay ragged.
+        self.crowd += w;
+        // The still men ahead: a neighbour on the half-plane ahead of
+        // his wish (`d` points from the neighbour to him), by how little
+        // he moved along it last tick.
+        if self.still_on {
+            let on = (d.dot(wish_dir) < 0.0) as u32 as f32;
+            self.crowd_still += w * on * still_weight(n.o_vel, wish_dir);
+        }
+    }
+
+    #[inline]
+    fn hand_on(&self, st: &mut Step) {
+        st.crowd = self.crowd;
+        st.crowd_still = self.crowd_still;
+        st.ahead = self.ahead;
+        st.press4 = self.press4;
+    }
+}
+
+/// The enemy in his weapon's reach (`scan`): the nearest living one, and
+/// whether the one he fought last tick (`prev_target`) is still in reach,
+/// which keeps him on that one (sticky).
+struct Reach {
+    reach2: f32,
+    prev_target: u32,
+    best_d2: f32,
+    best_idx: u32,
+    sticky: bool,
+}
+
+impl Reach {
+    #[inline]
+    fn new(params: &crate::unit_types::UnitTypeParams, prev_target: u32) -> Self {
+        Reach { reach2: params.reach * params.reach, prev_target, best_d2: f32::MAX, best_idx: u32::MAX, sticky: false }
+    }
+
+    #[inline(always)]
+    fn see(&mut self, n: &Near) {
+        if n.enemy && n.d2 < self.reach2 {
+            self.sticky |= n.o.idx == self.prev_target;
+            if n.d2 < self.best_d2 {
+                self.best_d2 = n.d2;
+                self.best_idx = n.o.idx;
+            }
+        }
+    }
+
+    #[inline]
+    fn hand_on(&self, st: &mut Step) {
+        st.best_idx = self.best_idx;
+        st.sticky = self.sticky;
+        st.prev_target = self.prev_target;
+    }
+}
+
+/// The braced spear points he runs onto (`scan`): moving at charge speed
+/// at a side with a spearwall on the field, the nearest leveled point his
+/// body crosses this tick.
+struct Spear {
+    at_charge_speed: bool,
+    spear_reach: f32,
+    vel: Vec2,
+    impale_idx: u32,
+    impale_d: f32,
+}
+
+impl Spear {
+    #[inline]
+    fn new(f: &Field, s: &Soldier, dying: bool) -> Self {
+        let Field { speed, team, faces_spearwall, .. } = *f;
+        let i = s.i;
+        // Moving at charge speed with unspent momentum: braced enemy spears in
+        // the path are a collision hazard, and the scan must see out to SPEAR
+        // reach, not just mine. A man already run through (flash; a twitch
+        // code of 16 up is a render cue, not a wound) or reeling is not
+        // re-impaled every tick: a spear is a point, not an aura.
+        let spear_reach = TYPES[crate::unit_types::KIND_SPEAR as usize].reach;
+        let cs = speed[i] * CHARGE_SPEED_FRAC;
+        let at_charge_speed = faces_spearwall[team[i] as usize]
+            && !dying
+            && (*s.flash == 0 || *s.flash >= 16)
+            && *s.swing & crate::units::SWING_STAGGERED == 0
+            && s.vel.xz().length_squared() > cs * cs;
+        Spear { at_charge_speed, spear_reach, vel: s.vel.xz(), impale_idx: u32::MAX, impale_d: f32::MAX }
+    }
+
+    /// The radius of his scan's box: the base, his weapon's reach, and at
+    /// charge speed a braced spear's.
+    #[inline]
+    fn scan_radius(&self, params: &crate::unit_types::UnitTypeParams) -> f32 {
+        if self.at_charge_speed {
+            QUERY_RADIUS.max(params.reach).max(self.spear_reach)
+        } else {
+            QUERY_RADIUS.max(params.reach)
+        }
+    }
+
+    /// The farthest a foe can be and still count for anything in the scan.
+    #[inline]
+    fn foe_cut(&self, params: &crate::unit_types::UnitTypeParams) -> f32 {
+        // The farthest a foe can be and still count for anything below: the
+        // widest pair's spring rest, his weapon's reach, or at charge speed a
+        // braced spear's point. A friend counts only within SEP_RADIUS.
+        let spear_cut = if self.at_charge_speed {
+            (self.spear_reach * self.spear_reach + SPEAR_LINE_HALF_W * SPEAR_LINE_HALF_W).sqrt()
+        } else {
+            0.0
+        };
+        widest_rest().max(params.reach).max(spear_cut) + CUT_MARGIN
+    }
+
+    #[inline(always)]
+    fn see(&mut self, n: &Near, yaw_snap: &[f32]) {
+        let o = n.o;
+        let d = n.d;
+        let spear_reach = self.spear_reach;
         // Spear-line collision: he is a braced enemy spearman, and my body is
         // crossing his leveled point while I close at speed.
-        if at_charge_speed
-            && enemy
+        if self.at_charge_speed
+            && n.enemy
             && (o.meta & crate::spatial::META_WALL) != 0
             && crate::spatial::meta_kind(o.meta)
                 == crate::unit_types::KIND_SPEAR as usize
@@ -290,156 +578,170 @@ pub(super) fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut
             let rel = d; // spearman -> me (d = p - o.xz())
             let fwd_d = rel.dot(f);
             let lat = (rel.x * f.y - rel.y * f.x).abs();
-            let closing = s.vel.xz().dot(d) < 0.0;
+            let closing = self.vel.dot(d) < 0.0;
             if fwd_d > SPEAR_POINT_MIN
                 && fwd_d < spear_reach
                 && lat < SPEAR_LINE_HALF_W
                 && closing
-                && fwd_d < impale_d
+                && fwd_d < self.impale_d
             {
-                impale_d = fwd_d;
-                impale_idx = o.idx;
-            }
-        }
-        // Two same-team units both in a wall STANCE rest shoulder to shoulder
-        // (symmetric predicate: both sides compute the same radius). Ordinary
-        // ranks keep parade spacing even while fighting — the seams between
-        // files are what enemy bodies flow into.
-        let cross = (o.meta & crate::spatial::META_TEAM) != my_team_bit;
-        // No packing rule for fighting regiments: M2TW keeps its formation
-        // grid during melee, and observably loosens it. The fighting crowd's
-        // spacing is slots plus body collision, nothing else. A
-        // shoulder-to-shoulder press rest for fighting pairs sealed the very
-        // seams the intermix needs: a pressed front's gaps shrank to about
-        // 1.05 m against 0.95 m bodies and symmetric fights collapsed to a
-        // two-rank duel line. It must not come back.
-        // The comrades ahead for the choice of opening: a queue (a man of
-        // a regiment under an order moving his way) is not an obstacle; a
-        // holding man always is.
-        if same && (o.meta & crate::spatial::META_DYING) == 0 && (open_on | squeeze_on) {
-            let to = -d;
-            let along = to.dot(wish_dir);
-            let lat = wish_dir.x * to.y - wish_dir.y * to.x;
-            let o_body = widths[crate::spatial::meta_pose(o.meta)].body;
-            if open_on && along > OPEN_AHEAD {
-                let holding = orders[crate::spatial::meta_group(o.meta)].is_none();
-                let queue = !holding && o_vel.dot(wish_dir) > QUEUE_SPEED;
-                if !queue {
-                    row.add(lat, 0.5 * o_body, along);
-                    row_at = row_at.min(along);
-                }
-            }
-            if squeeze_on {
-                let near = 0.5 * (body0 + o_body) - BETWEEN_SLACK;
-                if d2 < near * near && along.abs() < 1.0 {
-                    side_left |= lat > 0.0;
-                    side_right |= lat < 0.0;
-                }
-            }
-        }
-        // A pair with a falling soldier in it (`fall`) is as far apart as
-        // what is left of his body: each man's body and rest by his share,
-        // a wall pair's rest too. Two living soldiers read the table.
-        let o_dying = (o.meta & crate::spatial::META_DYING) != 0;
-        let falling = fall_on && (dying | o_dying);
-        let fallen;
-        let (pair, wall_rest) = if falling {
-            let o_share = fall_share(crate::spatial::meta_fall(o.meta));
-            fallen = pair_width_of(my_level, my_share, crate::spatial::meta_width(o.meta), o_share);
-            (&fallen, WALL_SEP_RADIUS * (0.5 * (my_share + o_share)))
-        } else {
-            (&pairs[crate::spatial::meta_width(o.meta)], WALL_SEP_RADIUS)
-        };
-        let (sep_r, inv_sep, hard) = if !cross && my_wall && (o.meta & crate::spatial::META_WALL) != 0 {
-            (wall_rest, 1.0 / wall_rest, pair.hard.min(wall_rest))
-        } else {
-            (pair.sep, pair.inv_sep, pair.hard)
-        };
-        if d2 < sep_r * sep_r && d2 > 1e-8 {
-            // Mass-weighted: heavies shove lights aside.
-            let (mw, share) = masses[crate::spatial::meta_kind(o.meta)];
-            let len = d2.sqrt();
-            let inv_len = 1.0 / len;
-            let w = 1.0 - len * inv_sep;
-            if len < hard && sides_on {
-                // The crowd walk: how deep this body is in his, on the
-                // sides of him it lies on (`d` points from it to him).
-                let depth = ((hard - len) * inv_depth).min(1.0);
-                let shares = press_shares(d * inv_len, wish_dir);
-                for q in 0..4 {
-                    press4[q] = press4[q].max(depth * shares[q]);
-                }
-            }
-            if len < hard {
-                // Overlap is resolved POSITIONALLY only. A hard force boost
-                // here as well made packed crowds oscillate at the
-                // acceleration cap, two solvers fighting over the same
-                // overlap, every frame.
-                let back = (hard - len) * gain * mw;
-                // The friction contact sets him apart by the braced
-                // weights; what the contact speed reads below stays by
-                // the plain ones.
-                let set = match braces {
-                    Some(braces) => {
-                        // `moving` is read only for a walking foe
-                        // (`brace_level`).
-                        let o_brace = brace_level(
-                            crate::spatial::meta_pose(o.meta),
-                            (o.meta & crate::spatial::META_STOOD) != 0,
-                            o_dying,
-                            fall_on,
-                            cross,
-                            || moving[crate::spatial::meta_group(o.meta)],
-                        );
-                        let my_brace = if cross { my_brace_cross } else { my_brace_same };
-                        (hard - len) * gain * braces[crate::spatial::meta_kind(o.meta)][my_brace][o_brace]
-                    }
-                    None => back,
-                };
-                corr += d * (set * inv_len);
-                overlap_vel += o_vel * back;
-                overlap_share += share * back;
-                overlap += back;
-            }
-            push += d * (w * mw * inv_len);
-            ahead += w * (d.dot(wish_dir) < -0.5 * len) as u32 as f32;
-            // Jam density: COMPRESSED pairs only — a neighbor resting AT his
-            // pair's rest distance contests nothing, so a formed man's
-            // slot-keeping is never faded by the settled enemies one stride
-            // away, which made a line yield and stay ragged.
-            crowd += w;
-            // The still men ahead: a neighbour on the half-plane ahead of
-            // his wish (`d` points from the neighbour to him), by how little
-            // he moved along it last tick.
-            if still_on {
-                let on = (d.dot(wish_dir) < 0.0) as u32 as f32;
-                crowd_still += w * on * still_weight(o_vel, wish_dir);
+                self.impale_d = fwd_d;
+                self.impale_idx = o.idx;
             }
         }
     }
 
-    // Ran onto a braced spear: the collision is a damage event from the
-    // SPEARMAN, resolved with everything else in the serial apply (which also
-    // stops the runner). One point, one wound — the nearest line crossed this
-    // tick.
-    if impale_idx != u32::MAX {
-        let jit = 0.85
-            + 0.3
-                * crate::units::hash01(
-                    tick_seed ^ (i as u32).wrapping_mul(0x7A31),
-                );
-        out.events.push(DamageEvent {
-            victim: i as u32,
-            attacker: impale_idx,
-            jit,
-            charge: false,
-            impale: true,
-            warn: 0,
-            chain: 0,
-        });
+    /// Ran onto a braced spear: the wound, a damage event from the spearman.
+    #[inline]
+    fn impale(&self, f: &Field, i: usize, out: &mut ChunkOut) {
+        // Ran onto a braced spear: the collision is a damage event from the
+        // SPEARMAN, resolved with everything else in the serial apply (which also
+        // stops the runner). One point, one wound — the nearest line crossed this
+        // tick.
+        if self.impale_idx != u32::MAX {
+            let jit = 0.85
+                + 0.3
+                    * crate::units::hash01(
+                        f.tick_seed ^ (i as u32).wrapping_mul(0x7A31),
+                    );
+            out.events.push(DamageEvent {
+                victim: i as u32,
+                attacker: self.impale_idx,
+                jit,
+                charge: false,
+                impale: true,
+                warn: 0,
+                chain: 0,
+            });
+        }
     }
-    // His mark for the archers (sim/mod.rs `clear_members`): every tick
-    // whether an enemy stands in his reach.
+}
+
+/// The obstacles for the choice of opening and the squeeze (`scan`): the
+/// row nearest him of the comrades ahead who are not a queue he follows,
+/// and, while he squeezes, whether a body is at each of his sides.
+struct Obstacles<'a> {
+    open_on: bool,
+    squeeze_on: bool,
+    wish_dir: Vec2,
+    body0: f32,
+    widths: &'a [Width; WIDTH_LEVELS],
+    orders: &'a [Option<Vec2>],
+    row: Row,
+    row_at: f32,
+    side_left: bool,
+    side_right: bool,
+}
+
+impl<'a> Obstacles<'a> {
+    #[inline]
+    fn new(
+        f: &Field<'a>,
+        s: &Soldier,
+        st: &Step,
+        wish_dir: Vec2,
+        body0: f32,
+        widths: &'a [Width; WIDTH_LEVELS],
+    ) -> Self {
+        // The choice of opening's read (`choose_opening`): only a man walking
+        // somewhere, not fighting, reads the comrades ahead; a man squeezing
+        // feels the bodies at his sides.
+        // Every obstacle within his reach is in the row nearest him (the band
+        // reaches past OPEN_SEE), so the scan keeps the nearest two on each
+        // side as it goes.
+        Obstacles {
+            open_on: reads_openings(f, s, st),
+            squeeze_on: squeezing(*s.stuck),
+            wish_dir,
+            body0,
+            widths,
+            orders: f.orders,
+            row: Row::default(),
+            row_at: f32::INFINITY,
+            side_left: false,
+            side_right: false,
+        }
+    }
+
+    #[inline(always)]
+    fn see(&mut self, n: &Near) {
+        let o = n.o;
+        let wish_dir = self.wish_dir;
+        // The comrades ahead for the choice of opening: a queue (a man of
+        // a regiment under an order moving his way) is not an obstacle; a
+        // holding man always is.
+        if n.same && (o.meta & crate::spatial::META_DYING) == 0 && (self.open_on | self.squeeze_on) {
+            let to = -n.d;
+            let along = to.dot(wish_dir);
+            let lat = wish_dir.x * to.y - wish_dir.y * to.x;
+            let o_body = self.widths[crate::spatial::meta_pose(o.meta)].body;
+            if self.open_on && along > OPEN_AHEAD {
+                let holding = self.orders[crate::spatial::meta_group(o.meta)].is_none();
+                let queue = !holding && n.o_vel.dot(wish_dir) > QUEUE_SPEED;
+                if !queue {
+                    self.row.add(lat, 0.5 * o_body, along);
+                    self.row_at = self.row_at.min(along);
+                }
+            }
+            if self.squeeze_on {
+                let near = 0.5 * (self.body0 + o_body) - BETWEEN_SLACK;
+                if n.d2 < near * near && along.abs() < 1.0 {
+                    self.side_left |= lat > 0.0;
+                    self.side_right |= lat < 0.0;
+                }
+            }
+        }
+    }
+
+    /// His normal body and spring, whether he saw an obstacle and the
+    /// opening he found among them, and whether a body is at both sides.
+    #[inline]
+    fn hand_on(&self, s: &Soldier, st: &mut Step, sep0: f32) {
+        st.open_on = self.open_on;
+        st.body0 = self.body0;
+        st.sep0 = sep0;
+        st.saw = self.row_at.is_finite();
+        if self.open_on && st.saw {
+            let (pref, coin) = side_pref(s.i, *s.stuck);
+            let (aim_lat, aim_along, fit, span) =
+                openings(&self.row, self.row_at, OPEN_SEE, self.body0, SQUEEZE_DEPTH, false, pref, coin);
+            st.near = (aim_lat, aim_along, fit);
+            st.near_span = span;
+        }
+        st.between = self.side_left && self.side_right;
+    }
+}
+
+/// Whether he reads the comrades ahead for the choice of opening this tick.
+#[inline]
+fn reads_openings(f: &Field, s: &Soldier, st: &Step) -> bool {
+    let Field { orders, engaged, anchors, home, passing, .. } = *f;
+    let i = s.i;
+    let gi = st.gi;
+    let p = st.p;
+    let far = (anchors[gi] + home[i]).distance_squared(p) > TRY_FROM_SLOT * TRY_FROM_SLOT;
+    let walking = orders[gi].is_some() || far;
+    // Only a man with a reason to pick an opening: his regiment walking
+    // through a friend that opened for it, or himself a straggler of a
+    // holding regiment. Read for every walking man, it costs 5.6 ms of
+    // the 200k step in a front battle where nobody passes anyone.
+    let reason = passing[gi] || (orders[gi].is_none() && far);
+    opening_on()
+        && walking
+        && reason
+        && !engaged[gi]
+        && !st.dying
+        && !st.routed
+        && !st.in_melee
+        && !st.committed
+        && st.join_fp.is_none()
+        && st.desired.length_squared() > 0.25
+}
+
+/// His mark for the archers (sim/mod.rs `clear_members`): every tick
+/// whether an enemy stands in his reach.
+#[inline]
+fn mark_foe_in_reach(s: &mut Soldier, dying: bool, best_idx: u32) {
     if !dying {
         if best_idx != u32::MAX {
             *s.sight |= SIGHT_FOE;
@@ -447,6 +749,12 @@ pub(super) fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut
             *s.sight &= !SIGHT_FOE;
         }
     }
+}
+
+/// The enemy he remembers (`remembered_foe`), read when he has nobody in
+/// reach or is a formed man of a fighting regiment.
+#[inline]
+fn recall_foe(f: &Field, st: &mut Step, i: usize, best_idx: u32, prev_target: u32) {
     // The enemy he remembers, if still in sight: he tracks him while he has
     // no enemy in reach, and seeing him is what makes a man still in
     // formation react. A man fighting someone in reach out of formation needs
@@ -457,16 +765,22 @@ pub(super) fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut
     // rather than in `look_around` so that his stance below knows whether
     // he is on his way to his place (`on_his_way`).
     let memo = prev_target as usize;
-    let (memo_d2, memo_valid) = if (best_idx == u32::MAX && !dying && !st.routed)
+    let (memo_d2, memo_valid) = if (best_idx == u32::MAX && !st.dying && !st.routed)
         || (st.in_melee && !st.committed)
     {
-        remembered_foe(f, i, p, gi, memo)
+        remembered_foe(f, i, st.p, st.gi, memo)
     } else {
         (f32::MAX, false)
     };
     st.memo_valid = memo_valid;
     st.memo_d2 = memo_d2;
     st.best_idx = best_idx;
+}
+
+/// His stance for the next tick, a step of the ramp toward ready or back
+/// at ease.
+#[inline]
+fn ramp_stance(f: &Field, s: &mut Soldier, st: &Step, friction: bool, fall_on: bool, best_idx: u32) {
     // His stance for the next tick, as he is drawn: into the ready stance
     // while his regiment fights, while it stands ready and he stands (the
     // pose pass's guard, below the speed of his steps; under the friction
@@ -480,7 +794,7 @@ pub(super) fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut
     // ready, walking or standing, so a walker there is in the ready stance,
     // his weight his own against his side and the walking bracing against
     // the other side.
-    let ready = match stance[gi] {
+    let ready = match f.stance[st.gi] {
         STANCE_FIGHT => true,
         STANCE_READY => {
             stands(friction, s.vel.xz(), st.desired) && !(friction && !*s.stood && on_his_way(s, st))
@@ -488,7 +802,7 @@ pub(super) fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut
         _ => false,
     };
     // A falling soldier keeps the stance he was struck in (`fall`).
-    if !(dying && fall_on) {
+    if !(st.dying && fall_on) {
         let stance_ramp = *s.pose & POSE_STANCE;
         let stance_ramp = if ready || best_idx != u32::MAX {
             (stance_ramp + 1).min(POSE_READY)
@@ -497,16 +811,22 @@ pub(super) fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut
         };
         *s.pose = (*s.pose & !POSE_STANCE) | stance_ramp;
     }
-    st.brake = (mine.slow, mine.stop);
+}
+
+/// An archer's knife, out or away for the next tick.
+#[inline]
+fn draw_knife(f: &Field, s: &mut Soldier, st: &Step, best_idx: u32) {
+    let i = s.i;
+    let gi = st.gi;
     // An archer's knife: out while his regiment has its swords out, and
     // for a few seconds after an enemy came close to him, one in his
     // reach, an enemy block's edge within KNIFE_EDGE of him, or with his
     // quiver empty an enemy block in his regiment's bow range.
-    if !dying && st.my_kind == crate::unit_types::KIND_ARCHER as usize {
+    if !st.dying && st.my_kind == crate::unit_types::KIND_ARCHER as usize {
         let arm = &f.sidearm[gi];
         let close = best_idx != u32::MAX
             || (*s.ammo == 0 && arm.foe_in_range)
-            || arm.blocks.iter().any(|b| b.distance(p) <= KNIFE_EDGE);
+            || arm.blocks.iter().any(|b| b.distance(st.p) <= KNIFE_EDGE);
         let mut count = (*s.sight & SIGHT_KNIFE_COUNT) >> SIGHT_KNIFE_SHIFT;
         if close {
             count = KNIFE_HOLD;
@@ -516,34 +836,6 @@ pub(super) fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut
         let out = if arm.swords || count > 0 { SIGHT_KNIFE } else { 0 };
         *s.sight = (*s.sight & !(SIGHT_KNIFE_COUNT | SIGHT_KNIFE)) | count << SIGHT_KNIFE_SHIFT | out;
     }
-    st.push = push;
-    st.corr = corr;
-    if overlap > 0.0 {
-        st.overlap_vel = overlap_vel / overlap;
-        st.overlap_share = overlap_share / overlap;
-    }
-    st.crowd = crowd;
-    st.crowd_still = crowd_still;
-    st.ahead = ahead;
-    st.press4 = press4;
-    st.best_idx = best_idx;
-    st.sticky = sticky;
-    st.prev_target = prev_target;
-    st.impale_idx = impale_idx;
-    st.at_charge_speed = at_charge_speed;
-    st.scan_r = scan_r;
-    st.my_team_bit = my_team_bit;
-    st.open_on = open_on;
-    st.body0 = body0;
-    st.sep0 = widths[pose_lv].sep;
-    st.saw = row_at.is_finite();
-    if open_on && st.saw {
-        let (pref, coin) = side_pref(i, *s.stuck);
-        let (aim_lat, aim_along, fit, span) = openings(&row, row_at, OPEN_SEE, body0, SQUEEZE_DEPTH, false, pref, coin);
-        st.near = (aim_lat, aim_along, fit);
-        st.near_span = span;
-    }
-    st.between = side_left && side_right;
 }
 
 #[cfg(test)]
