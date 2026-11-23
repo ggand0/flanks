@@ -107,11 +107,11 @@ pub(super) fn acquire(f: &Field, s: &mut Soldier, st: &mut Step) {
     let gi = st.gi;
     let dying = st.dying;
     let routed = st.routed;
-    let best_idx = st.best_idx;
-    let crowd = st.crowd;
-    let watch_go = st.watch_go;
-    let memo_dir = st.memo_dir;
-    let my_team_bit = st.my_team_bit;
+    let best_idx = st.foe.best_idx;
+    let crowd = st.scan.crowd;
+    let watch_go = st.sight.watch_go;
+    let memo_dir = st.sight.memo_dir;
+    let my_team_bit = st.scan.my_team_bit;
     // Sparse-fight acquisition (see WIDE_ACQUIRE_R): a pressing unit with an
     // empty scan and open space around it memoizes a farther enemy in
     // `target` so the closing drive below can restore contact. Gated hard
@@ -195,14 +195,14 @@ pub(super) fn acquire(f: &Field, s: &mut Soldier, st: &mut Step) {
 pub(super) fn decide_to_join(f: &Field, s: &mut Soldier, st: &mut Step) {
     let Field { melee_ticks, engaged, tick, .. } = *f;
     let i = s.i;
-    let in_melee = st.in_melee;
-    let may_leave = st.may_leave;
+    let in_melee = st.fight.in_melee;
+    let may_leave = st.fight.may_leave;
     let gi = st.gi;
-    let memo_valid = st.memo_valid;
-    let memo_d2 = st.memo_d2;
-    let best_idx = st.best_idx;
+    let memo_valid = st.foe.memo_valid;
+    let memo_d2 = st.foe.memo_d2;
+    let best_idx = st.foe.best_idx;
     let mut desired = st.desired;
-    let committed = st.committed;
+    let committed = st.fight.committed;
     let mut committed = committed;
     // Out of formation with his regiment's melee over, or never begun: he
     // comes back to his slot once he sees no enemy, nobody in reach and no
@@ -245,7 +245,7 @@ pub(super) fn decide_to_join(f: &Field, s: &mut Soldier, st: &mut Step) {
         if react || (in_melee && melee_ticks[gi] as f32 > patience) {
             committed = true;
             *s.out_form = true;
-            st.set_off = true;
+            st.fight.set_off = true;
         }
     }
     // Out of formation he never dresses on his slot: he fights, goes for an
@@ -255,14 +255,14 @@ pub(super) fn decide_to_join(f: &Field, s: &mut Soldier, st: &mut Step) {
     // the fight (`joining`) keeps that walk from `drive` until an enemy is
     // in his reach this tick; then he fights (`close_in`). A man who came
     // back into formation this tick walks to his slot again.
-    if committed && (!st.joining || best_idx != u32::MAX) {
+    if committed && (!st.fight.joining || best_idx != u32::MAX) {
         desired = Vec2::ZERO;
-        st.joining = false;
-    } else if st.joining && !committed {
-        desired = st.slot_wish;
-        st.joining = false;
+        st.fight.joining = false;
+    } else if st.fight.joining && !committed {
+        desired = st.fight.slot_wish;
+        st.fight.joining = false;
     }
-    st.committed = committed;
+    st.fight.committed = committed;
     st.desired = desired;
 }
 
@@ -278,9 +278,9 @@ pub(super) fn swing(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOu
     let gi = st.gi;
     let dying = st.dying;
     let routed = st.routed;
-    let sticky = st.sticky;
-    let prev_target = st.prev_target;
-    let best_idx = st.best_idx;
+    let sticky = st.foe.sticky;
+    let prev_target = st.foe.prev_target;
+    let best_idx = st.foe.best_idx;
     let my_kind = st.my_kind;
     let mut desired = st.desired;
     // Swing state machine. All writes are to this unit's own row; damage goes
@@ -603,7 +603,7 @@ pub(super) fn swing(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOu
         }
     }
     st.desired = desired;
-    st.face_target = face_target;
+    st.fight.face_target = face_target;
 }
 
 /// The share of the archers who keep shooting at the same man while he
@@ -726,19 +726,19 @@ pub(super) fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
     let gi = st.gi;
     let dying = st.dying;
     let routed = st.routed;
-    let committed = st.committed;
-    let memo_valid = st.memo_valid;
-    let join_fp = st.join_fp;
-    let best_idx = st.best_idx;
-    let crowd = st.crowd;
-    let jam = st.jam;
-    let way_blocked = st.way_blocked;
-    let left_blocked = st.left_blocked;
-    let right_blocked = st.right_blocked;
-    let comrade_ahead = st.comrade_ahead;
-    let side_dir = st.side_dir;
+    let committed = st.fight.committed;
+    let memo_valid = st.foe.memo_valid;
+    let join_fp = st.fight.join_fp;
+    let best_idx = st.foe.best_idx;
+    let crowd = st.scan.crowd;
+    let jam = st.walk.jam;
+    let way_blocked = st.sight.way_blocked;
+    let left_blocked = st.sight.left_blocked;
+    let right_blocked = st.sight.right_blocked;
+    let comrade_ahead = st.sight.comrade_ahead;
+    let side_dir = st.sight.side_dir;
     let mut desired = st.desired;
-    let mut fade = st.fade;
+    let mut fade = st.walk.fade;
     let mut d_surge = Vec2::ZERO;
     // Fighters close the last meter to swing range. Only active when an enemy
     // is ALREADY in reach — this is combat execution (like the wind-up foot
@@ -764,7 +764,7 @@ pub(super) fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
         (*s.target, false)
     } else if best_idx != u32::MAX {
         (best_idx, false)
-    } else if !joins_as_walker() && crowd < st.brake.0 && committed {
+    } else if !joins_as_walker() && crowd < st.scan.brake.0 && committed {
         (*s.target, true)
     } else {
         (u32::MAX, false)
@@ -827,7 +827,7 @@ pub(super) fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
         } else if !memo_close
             && committed
             && wall[gi] == 0
-            && !st.back_blocked
+            && !st.sight.back_blocked
             && *s.swing & crate::units::SWING_STATE_MASK != crate::units::SWING_WINDUP
             && !broken[group[close_to as usize] as usize]
             && dist > 1e-3
@@ -873,5 +873,5 @@ pub(super) fn close_in(f: &Field, s: &mut Soldier, st: &mut Step) {
         }
     }
     st.desired = desired;
-    st.fade = fade;
+    st.walk.fade = fade;
 }

@@ -85,11 +85,11 @@ pub(super) fn stands(friction: bool, kept: Vec2, wish: Vec2) -> bool {
 pub(super) fn on_his_way(s: &Soldier, st: &Step) -> bool {
     !st.dying
         && !st.routed
-        && !st.in_melee
-        && !st.committed
-        && st.join_fp.is_none()
-        && st.best_idx == u32::MAX
-        && !st.memo_valid
+        && !st.fight.in_melee
+        && !st.fight.committed
+        && st.fight.join_fp.is_none()
+        && st.foe.best_idx == u32::MAX
+        && !st.foe.memo_valid
         && *s.swing & crate::units::SWING_STATE_MASK == crate::units::SWING_READY
 }
 /// What the contacts have put into his speed and his feet have not taken
@@ -207,9 +207,9 @@ pub(super) fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
     let routed = st.routed;
     // Holding his place: his regiment has no order and he is not broken,
     // dying, in its melee or out of formation for a fight.
-    let planted = orders[gi].is_none() && !dying && !routed && !st.in_melee && !st.committed;
-    let push = st.push;
-    let jam = st.jam;
+    let planted = orders[gi].is_none() && !dying && !routed && !st.fight.in_melee && !st.fight.committed;
+    let push = st.scan.push;
+    let jam = st.walk.jam;
     let mut desired = st.desired;
     let friction = friction_contact();
     // The crowd walk under the friction contact: with bodies overlapping
@@ -223,13 +223,13 @@ pub(super) fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
     // regiment in its charge runs by order.
     let charge_run = charging[gi] && !fat_nocharge[gi];
     if friction && !dying && !routed && !charge_run {
-        let whole = desired + st.fade;
-        let p4 = st.press4;
+        let whole = desired + st.walk.fade;
+        let p4 = st.scan.press4;
         let cut = press_walk(p4[0].min(p4[1]).min(p4[2]).min(p4[3]), whole, CROWD_WALK);
         if cut != whole {
             let k = cut.length() / whole.length();
             desired *= k;
-            st.fade *= k;
+            st.walk.fade *= k;
         }
     }
     // Whether he stands, for his bracing next tick (`brace_pairs`) and his
@@ -253,18 +253,18 @@ pub(super) fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
     // soldier there would else change his weight and stance again and
     // again.
     if friction {
-        let side = st.side;
-        let under = stands(true, Vec2::ZERO, desired + st.fade - side);
+        let side = st.walk.side;
+        let under = stands(true, Vec2::ZERO, desired + st.walk.fade - side);
         let stood = if on_his_way(s, st) {
-            let arrived = has_arrived(st.place_dist, st.parked, st.slot_blocked);
+            let arrived = has_arrived(st.walk.place_dist, st.walk.parked, st.sight.slot_blocked);
             still_stands(*s.stood, under, arrived)
-        } else if st.joining {
+        } else if st.fight.joining {
             // A soldier walking to the fight is a walker until the still
             // men ahead have stopped him behind a comrade in his way: the
             // brake has taken his wish under the speed of a step. From
             // then he stands, and `drive` gives him no wish while that
             // comrade is in his way.
-            under || (st.way_blocked && stands(true, Vec2::ZERO, desired - side))
+            under || (st.sight.way_blocked && stands(true, Vec2::ZERO, desired - side))
         } else {
             under
         };
@@ -273,7 +273,7 @@ pub(super) fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
         // who stood within a step of the man ahead when he joined would
         // count as arrived at once and never close up, and the regiment's
         // ranks would end at two different spacings.
-        let stood = stood && !(st.set_off && joins_as_walker());
+        let stood = stood && !(st.fight.set_off && joins_as_walker());
         // A falling soldier keeps his stood bit as it was when he was
         // struck (`fall`).
         if !(dying && fall()) {
@@ -321,8 +321,8 @@ pub(super) fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
         let pl = push_a.length();
         push_a *= if pl > STAND_GRIP { (pl - STAND_GRIP) / pl } else { 0.0 };
     }
-    if !friction && standing && st.overlap_depth > 0.0 && *s.swing & crate::units::SWING_STAGGERED == 0 {
-        st.corr *= ((st.overlap_depth - STANCE) / st.overlap_depth).max(0.0);
+    if !friction && standing && st.scan.overlap_depth > 0.0 && *s.swing & crate::units::SWING_STAGGERED == 0 {
+        st.scan.corr *= ((st.scan.overlap_depth - STANCE) / st.scan.overlap_depth).max(0.0);
     }
     let mut legs = (desired - v) * STEER_GAIN;
     let l2 = legs.length_squared();
@@ -338,7 +338,7 @@ pub(super) fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
     let mut new_v = v + accel * dt;
     // Viscous damping in the press: bleeds the spring energy that otherwise
     // ping-pongs between neighbors every tick.
-    new_v *= 1.0 - 0.4 * st.body_jam;
+    new_v *= 1.0 - 0.4 * st.walk.body_jam;
     // Slight overspeed under crowd pressure; a man squeezing through a
     // crack goes at a walk at most.
     let vmax = if squeezing(*s.stuck) { SQUEEZE_CAP } else { speed[i] * 1.15 };
@@ -351,20 +351,20 @@ pub(super) fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
     // movement, and each of the two does the same, so a runner and the man
     // he hits move on together and a shove travels through a press. The
     // friction contact does not have it.
-    let dir = if friction { Vec2::ZERO } else { st.overlap_dir };
+    let dir = if friction { Vec2::ZERO } else { st.scan.overlap_dir };
     if dir != Vec2::ZERO {
-        let into = (new_v - st.overlap_vel).dot(-dir);
+        let into = (new_v - st.scan.overlap_vel).dot(-dir);
         if into > 0.0 {
             // A man holding his place loses less of it: his feet take the
             // first part of the shove.
-            let mut lost = into * st.overlap_share;
+            let mut lost = into * st.scan.overlap_share;
             if planted {
                 lost = (lost - STAND_GRIP * dt * own_spread(i)).max(0.0);
             }
             new_v += dir * lost;
         }
     }
-    st.new_v = new_v;
+    st.walk.new_v = new_v;
 }
 
 /// Which way he looks: the man he swings at, the enemy in reach when he
@@ -379,11 +379,11 @@ pub(super) fn face(f: &Field, s: &mut Soldier, st: &mut Step) {
     let gi = st.gi;
     let dying = st.dying;
     let routed = st.routed;
-    let committed = st.committed;
-    let memo_dir = st.memo_dir;
-    let best_idx = st.best_idx;
-    let face_target = st.face_target;
-    let new_v = st.new_v;
+    let committed = st.fight.committed;
+    let memo_dir = st.sight.memo_dir;
+    let best_idx = st.foe.best_idx;
+    let face_target = st.fight.face_target;
+    let new_v = st.walk.new_v;
     // Facing priority: locked wind-up target > nearest enemy in reach >
     // movement direction. Fighters keep eyes on the enemy even while the
     // crowd shoves them; only routing/unengaged units face their velocity.
@@ -500,8 +500,8 @@ fn stopped_velocity(v: Vec2, step: Vec2, stop_x: bool, stop_z: bool) -> Vec2 {
 #[inline]
 pub(super) fn slide(f: &Field, i: usize, st: &mut Step) {
     let Field { terrain, pos_prev, dt, bounds_min, bounds_max, .. } = *f;
-    let new_v = st.new_v;
-    let corr = st.corr;
+    let new_v = st.walk.new_v;
+    let corr = st.scan.corr;
     let mut nx = (pos_prev[i].x + new_v.x * dt + corr.x)
         .clamp(bounds_min.x, bounds_max.x);
     let mut nz = (pos_prev[i].z + new_v.y * dt + corr.y)
@@ -527,7 +527,7 @@ pub(super) fn slide(f: &Field, i: usize, st: &mut Step) {
             (true, true)
         };
         if edge_stop() {
-            st.new_v = stopped_velocity(new_v, step, stop_x, stop_z);
+            st.walk.new_v = stopped_velocity(new_v, step, stop_x, stop_z);
         }
     }
     // An edge across his motion over blocked ground (a crowd pushed him
@@ -541,7 +541,7 @@ pub(super) fn slide(f: &Field, i: usize, st: &mut Step) {
             nz = (nz + off.y).clamp(bounds_min.y, bounds_max.y);
         }
     }
-    st.next = Vec2::new(nx, nz);
+    st.walk.next = Vec2::new(nx, nz);
 }
 
 /// The step taken: his velocity kept for the next tick, and his body set
@@ -549,7 +549,7 @@ pub(super) fn slide(f: &Field, i: usize, st: &mut Step) {
 #[inline]
 pub(super) fn integrate(f: &Field, s: &mut Soldier, st: &mut Step) {
     let Field { terrain, pos_prev, kind, dt, .. } = *f;
-    let (new_v, next) = (st.new_v, st.next);
+    let (new_v, next) = (st.walk.new_v, st.walk.next);
     *s.vel = Vec3::new(new_v.x, 0.0, new_v.y);
     *s.pos = Vec3::new(
         next.x,

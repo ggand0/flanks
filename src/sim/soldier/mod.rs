@@ -61,7 +61,6 @@ const SIGHT_RING: u16 = 1 << 9;
 const SIGHT_KNIFE_COUNT: u16 = 0x1f << SIGHT_KNIFE_SHIFT;
 pub(crate) const SIGHT_KNIFE: u16 = 1 << 15;
 
-/// Global damage multiplier. FL_COMBAT_SCALE overrides (fast test battles).
 /// What every soldier reads and none writes: the job's shared inputs.
 #[derive(Clone, Copy)]
 pub(crate) struct Field<'a> {
@@ -185,7 +184,8 @@ pub(crate) struct ChunkOut<'a> {
     pub arrows: &'a mut Vec<crate::arrows::ArrowSpawn>,
 }
 
-/// What one stage of a soldier's tick hands the next.
+/// What one stage of a soldier's tick hands the next: who he is and his
+/// wish at the top, the rest grouped by the stage that writes it.
 struct Step {
     /// His position at the tick's start, on the ground plane.
     p: Vec2,
@@ -196,7 +196,25 @@ struct Step {
     routed: bool,
     /// Where he wants to go, as a velocity; stages add to it and scale it.
     desired: Vec2,
-    // The scan.
+    /// What the scan measured around him (`scan`, the overlap read in
+    /// `yield_to_crowd`).
+    scan: Scanned,
+    /// The enemy in his reach and the one he remembers (`scan`).
+    foe: Foe,
+    /// What he sees of his comrades and the way he is going (`look_around`).
+    sight: Sight,
+    /// The choice of opening and the squeeze (`scan`, `choose_opening`).
+    open: Opening,
+    /// His regiment's melee and his part in it (`begin`, `drive`,
+    /// `decide_to_join`, `swing`).
+    fight: Fight,
+    /// From his wish to his step (`drive`, `yield_to_crowd`, `try_a_side`,
+    /// `steer`, `slide`).
+    walk: Walk,
+}
+
+/// What the scan measured around him.
+struct Scanned {
     push: Vec2,
     corr: Vec2,
     /// Which way the overlap correction points, before its deadband and
@@ -224,14 +242,109 @@ struct Step {
     /// The crowd at which his drive starts to fade and is gone, for his
     /// width (`Width`).
     brake: (f32, f32),
+    scan_r: f32,
+    my_team_bit: u32,
+}
+impl Scanned {
+    /// Nothing measured yet.
+    const NONE: Scanned = Scanned {
+        push: Vec2::ZERO,
+        corr: Vec2::ZERO,
+        overlap_dir: Vec2::ZERO,
+        overlap_depth: 0.0,
+        overlap_vel: Vec2::ZERO,
+        overlap_share: 0.0,
+        crowd: 0.0,
+        crowd_still: 0.0,
+        ahead: 0.0,
+        press4: [0.0; 4],
+        brake: (0.0, 0.0),
+        scan_r: 0.0,
+        my_team_bit: 0,
+    };
+}
+
+/// The enemy in his reach and the one he remembers.
+struct Foe {
     best_idx: u32,
     sticky: bool,
     prev_target: u32,
-    impale_idx: u32,
-    at_charge_speed: bool,
-    scan_r: f32,
-    my_team_bit: u32,
-    // His regiment's melee and his part in it.
+    memo_valid: bool,
+    memo_d2: f32,
+}
+impl Foe {
+    /// Nobody in reach and nobody remembered.
+    const NONE: Foe =
+        Foe { best_idx: u32::MAX, sticky: false, prev_target: u32::MAX, memo_valid: false, memo_d2: f32::MAX };
+}
+
+/// What he remembers and sees.
+struct Sight {
+    memo_dir: Vec2,
+    side_dir: Vec2,
+    watch_go: bool,
+    way_blocked: bool,
+    left_blocked: bool,
+    right_blocked: bool,
+    comrade_ahead: bool,
+    slot_blocked: bool,
+    back_blocked: bool,
+}
+impl Sight {
+    /// Nothing seen yet.
+    const NONE: Sight = Sight {
+        memo_dir: Vec2::ZERO,
+        side_dir: Vec2::ZERO,
+        watch_go: false,
+        way_blocked: false,
+        left_blocked: false,
+        right_blocked: false,
+        comrade_ahead: false,
+        slot_blocked: false,
+        back_blocked: false,
+    };
+}
+
+/// The choice of opening and the squeeze (`choose_opening`,
+/// `try_a_side`): whether he reads the comrades ahead this tick, his
+/// normal body and spring (not squeezed), whether the scan saw an
+/// obstacle ahead and the opening it found among them (across and
+/// along his way, its fit), a body at each of his sides, and the
+/// opening he aims at (its fit: 0 none, 1 his depth, 2 his width;
+/// `gap`: it fits his depth only; `gap_near`: that crack within his
+/// spring).
+struct Opening {
+    open_on: bool,
+    body0: f32,
+    sep0: f32,
+    saw: bool,
+    near: (f32, f32, u8),
+    /// The near opening's air across his way and the far side of its
+    /// passage along it (`choose_opening`'s taken crack).
+    near_span: (f32, f32, f32),
+    between: bool,
+    aim_fit: u8,
+    gap: bool,
+    gap_near: bool,
+}
+impl Opening {
+    /// No opening read.
+    const NONE: Opening = Opening {
+        open_on: false,
+        body0: 0.0,
+        sep0: 0.0,
+        saw: false,
+        near: (0.0, 0.0, 0),
+        near_span: (0.0, 0.0, 0.0),
+        between: false,
+        aim_fit: 0,
+        gap: false,
+        gap_near: false,
+    };
+}
+
+/// His regiment's melee and his part in it.
+struct Fight {
     in_melee: bool,
     may_leave: bool,
     committed: bool,
@@ -248,20 +361,12 @@ struct Step {
     /// His wish to his slot from `drive`, kept when the join replaced it,
     /// for the tick he comes back into formation (`decide_to_join`).
     slot_wish: Vec2,
-    // What he remembers and sees.
-    memo_valid: bool,
-    memo_d2: f32,
-    memo_dir: Vec2,
-    side_dir: Vec2,
-    watch_go: bool,
-    way_blocked: bool,
-    left_blocked: bool,
-    right_blocked: bool,
-    comrade_ahead: bool,
-    slot_blocked: bool,
-    back_blocked: bool,
-    // The swing and the steering.
+    /// Where the swing turns him (`swing`, `face`).
     face_target: Option<Vec2>,
+}
+
+/// From his wish to his step.
+struct Walk {
     /// His drive before the crowd's brake faded it (`try_a_side`).
     wish: Vec2,
     /// What the crowd's brake has taken off his wish since `yield_to_crowd`,
@@ -283,26 +388,20 @@ struct Step {
     new_v: Vec2,
     /// Where his step ends on the ground plane (`slide`).
     next: Vec2,
-    // The choice of opening and the squeeze (`choose_opening`,
-    // `try_a_side`): whether he reads the comrades ahead this tick, his
-    // normal body and spring (not squeezed), whether the scan saw an
-    // obstacle ahead and the opening it found among them (across and
-    // along his way, its fit), a body at each of his sides, and the
-    // opening he aims at (its fit: 0 none, 1 his depth, 2 his width;
-    // `gap`: it fits his depth only; `gap_near`: that crack within his
-    // spring).
-    open_on: bool,
-    body0: f32,
-    sep0: f32,
-    saw: bool,
-    near: (f32, f32, u8),
-    /// The near opening's air across his way and the far side of its
-    /// passage along it (`choose_opening`'s taken crack).
-    near_span: (f32, f32, f32),
-    between: bool,
-    aim_fit: u8,
-    gap: bool,
-    gap_near: bool,
+}
+impl Walk {
+    /// No wish and no step yet, and no place.
+    const NONE: Walk = Walk {
+        wish: Vec2::ZERO,
+        fade: Vec2::ZERO,
+        side: Vec2::ZERO,
+        place_dist: f32::INFINITY,
+        parked: false,
+        jam: 0.0,
+        body_jam: 0.0,
+        new_v: Vec2::ZERO,
+        next: Vec2::ZERO,
+    };
 }
 
 /// Run every soldier of a chunk through his tick.
@@ -409,61 +508,20 @@ fn begin(f: &Field, s: &mut Soldier) -> Step {
         dying,
         routed,
         desired: Vec2::ZERO,
-        push: Vec2::ZERO,
-        corr: Vec2::ZERO,
-        overlap_dir: Vec2::ZERO,
-        overlap_depth: 0.0,
-        overlap_vel: Vec2::ZERO,
-        overlap_share: 0.0,
-        crowd: 0.0,
-        crowd_still: 0.0,
-        ahead: 0.0,
-        press4: [0.0; 4],
-        brake: (0.0, 0.0),
-        best_idx: u32::MAX,
-        sticky: false,
-        prev_target: u32::MAX,
-        impale_idx: u32::MAX,
-        at_charge_speed: false,
-        scan_r: 0.0,
-        my_team_bit: 0,
-        in_melee,
-        may_leave,
-        committed,
-        join_fp,
-        joining: false,
-        set_off: false,
-        slot_wish: Vec2::ZERO,
-        memo_valid: false,
-        memo_d2: f32::MAX,
-        memo_dir: Vec2::ZERO,
-        side_dir: Vec2::ZERO,
-        watch_go: false,
-        way_blocked: false,
-        left_blocked: false,
-        right_blocked: false,
-        comrade_ahead: false,
-        slot_blocked: false,
-        back_blocked: false,
-        face_target: None,
-        wish: Vec2::ZERO,
-        fade: Vec2::ZERO,
-        side: Vec2::ZERO,
-        place_dist: f32::INFINITY,
-        parked: false,
-        jam: 0.0,
-        body_jam: 0.0,
-        new_v: Vec2::ZERO,
-        next: Vec2::ZERO,
-        open_on: false,
-        body0: 0.0,
-        sep0: 0.0,
-        saw: false,
-        near: (0.0, 0.0, 0),
-        near_span: (0.0, 0.0, 0.0),
-        between: false,
-        aim_fit: 0,
-        gap: false,
-        gap_near: false,
+        scan: Scanned::NONE,
+        foe: Foe::NONE,
+        sight: Sight::NONE,
+        open: Opening::NONE,
+        fight: Fight {
+            in_melee,
+            may_leave,
+            committed,
+            join_fp,
+            joining: false,
+            set_off: false,
+            slot_wish: Vec2::ZERO,
+            face_target: None,
+        },
+        walk: Walk::NONE,
     }
 }

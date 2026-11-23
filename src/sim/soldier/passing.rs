@@ -60,7 +60,7 @@ pub(super) fn side_pref(i: usize, stuck: u16) -> (f32, f32) {
 pub(super) fn choose_opening(f: &Field, s: &mut Soldier, st: &mut Step) {
     let Field { grid, orders, tick, anchors, home, .. } = *f;
     let i = s.i;
-    let going = st.open_on && st.best_idx == u32::MAX && !st.memo_valid;
+    let going = st.open.open_on && st.foe.best_idx == u32::MAX && !st.foe.memo_valid;
     let ring_flag = *s.sight & SIGHT_RING != 0;
     *s.sight &= !SIGHT_RING;
     if !going {
@@ -73,7 +73,7 @@ pub(super) fn choose_opening(f: &Field, s: &mut Soldier, st: &mut Step) {
     let perp = Vec2::new(-wd.y, wd.x);
     let mut v = *s.stuck;
     // The near read, from the scan.
-    let (mut aim_lat, mut aim_along, mut fit) = st.near;
+    let (mut aim_lat, mut aim_along, mut fit) = st.open.near;
     if fit > 0 {
         *s.aim = Vec2::NAN;
     }
@@ -85,8 +85,8 @@ pub(super) fn choose_opening(f: &Field, s: &mut Soldier, st: &mut Step) {
     // aim, so a second look at the comrades within the scan's box.
     let mut taken = false;
     if fit == 1 {
-        let (lo, hi, far) = st.near_span;
-        let my_team_bit = st.my_team_bit;
+        let (lo, hi, far) = st.open.near_span;
+        let my_team_bit = st.scan.my_team_bit;
         let widths = widths();
         grid.for_each_candidate(p, QUERY_RADIUS, |o| {
             if taken
@@ -122,8 +122,8 @@ pub(super) fn choose_opening(f: &Field, s: &mut Soldier, st: &mut Step) {
         && orders[st.gi].is_none()
         && (anchors[st.gi] + home[i]).distance_squared(p) > TRY_FROM_SLOT * TRY_FROM_SLOT;
     let mut ring_aim = false;
-    if fit == 0 && st.saw && hemmed && look {
-        let my_team_bit = st.my_team_bit;
+    if fit == 0 && st.open.saw && hemmed && look {
+        let my_team_bit = st.scan.my_team_bit;
         let widths = widths();
         let mut men: [(f32, Vec2, f32); 16] = [(0.0, Vec2::ZERO, 0.0); 16];
         let mut n = 0usize;
@@ -175,12 +175,12 @@ pub(super) fn choose_opening(f: &Field, s: &mut Soldier, st: &mut Step) {
                     // nearer man's distance.
                     let mid = a0 + 0.5 * span;
                     let dir = wd * mid.cos() + perp * mid.sin();
-                    (dir * q0.length().min(q1.length()).max(st.sep0), 2u8)
+                    (dir * q0.length().min(q1.length()).max(st.open.sep0), 2u8)
                 } else {
                     let chord = q1 - q0;
                     let len = chord.length();
                     let air = len - h0 - h1;
-                    let wf = if air >= st.body0 - OPEN_SLACK {
+                    let wf = if air >= st.open.body0 - OPEN_SLACK {
                         2
                     } else if air >= SQUEEZE_DEPTH {
                         1
@@ -209,9 +209,9 @@ pub(super) fn choose_opening(f: &Field, s: &mut Soldier, st: &mut Step) {
         }
     }
     // The wide look: nothing near fits and he saw somebody in his way.
-    if fit == 0 && !ring_aim && st.saw && look {
+    if fit == 0 && !ring_aim && st.open.saw && look {
         let (pref, coin) = side_pref(i, v);
-        let my_team_bit = st.my_team_bit;
+        let my_team_bit = st.scan.my_team_bit;
         let widths = widths();
         let read = |o: &crate::spatial::SortedUnit, o_vel: Vec2| -> Option<(f32, f32, f32)> {
             if o.idx as usize == i
@@ -267,7 +267,8 @@ pub(super) fn choose_opening(f: &Field, s: &mut Soldier, st: &mut Step) {
                 }
             }
         }
-        let (w_lat, w_along, w_fit, _) = openings(&wide, wide_at, OPEN_FAR, st.body0, SQUEEZE_DEPTH, true, pref, coin);
+        let (w_lat, w_along, w_fit, _) =
+            openings(&wide, wide_at, OPEN_FAR, st.open.body0, SQUEEZE_DEPTH, true, pref, coin);
         *s.aim = if w_fit > 0 { p + wd * w_along + perp * w_lat } else { Vec2::NAN };
         v = (v & !STUCK_WIDE_DEPTH) | ((w_fit == 1) as u16 * STUCK_WIDE_DEPTH);
     }
@@ -292,9 +293,9 @@ pub(super) fn choose_opening(f: &Field, s: &mut Soldier, st: &mut Step) {
             *s.aim = Vec2::NAN;
         }
     }
-    st.aim_fit = fit;
-    st.gap = fit == 1 && !taken;
-    st.gap_near = st.gap && aim_along < st.sep0;
+    st.open.aim_fit = fit;
+    st.open.gap = fit == 1 && !taken;
+    st.open.gap_near = st.open.gap && aim_along < st.open.sep0;
     if fit > 0 {
         // The side he chose, remembered as the try remembers its side.
         if aim_lat.abs() > 0.1 {
@@ -326,16 +327,16 @@ pub(super) fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
     let gi = st.gi;
     let dying = st.dying;
     let routed = st.routed;
-    let in_melee = st.in_melee;
-    let committed = st.committed;
-    let join_fp = st.join_fp;
+    let in_melee = st.fight.in_melee;
+    let committed = st.fight.committed;
+    let join_fp = st.fight.join_fp;
     let desired = st.desired;
-    let best_idx = st.best_idx;
-    let scan_r = st.scan_r;
-    let my_team_bit = st.my_team_bit;
+    let best_idx = st.foe.best_idx;
+    let scan_r = st.scan.scan_r;
+    let my_team_bit = st.scan.my_team_bit;
     // The enemy he remembers, as the scan read it (`scan`).
-    let memo = st.prev_target as usize;
-    let memo_valid = st.memo_valid;
+    let memo = st.foe.prev_target as usize;
+    let memo_valid = st.foe.memo_valid;
     // Which way he is going: to that enemy, else to his regiment's fight.
     // A man walking to the fight with nobody in reach looks along the way
     // he walks (`join_goal`): straight ahead, to an enemy or to the fight.
@@ -352,7 +353,7 @@ pub(super) fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
     // the fight (`joining`) has his slot wish kept apart; the test reads
     // that, so it stays about his mark.
     let slot_dir = if orders[gi].is_none() && engaged[gi] && !routed {
-        if st.joining { st.slot_wish.normalize_or_zero() } else { desired.normalize_or_zero() }
+        if st.fight.joining { st.fight.slot_wish.normalize_or_zero() } else { desired.normalize_or_zero() }
     } else {
         Vec2::ZERO
     };
@@ -378,7 +379,7 @@ pub(super) fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
     // A joiner's comrade "in his way" stands within a ready body plus a
     // short step of room (JOIN_ROOM); for everyone else, and for his
     // sides and mark, within SEP_RADIUS.
-    let way_r = if st.joining { ready_body() + JOIN_ROOM } else { SEP_RADIUS };
+    let way_r = if st.fight.joining { ready_body() + JOIN_ROOM } else { SEP_RADIUS };
     if (i as u32).wrapping_add(tick).is_multiple_of(LOOK_TICKS) {
         let mut seen = 0u16;
         if look_lanes || watch_go || slot_on {
@@ -453,15 +454,15 @@ pub(super) fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
     let right_blocked = *s.sight & SIGHT_RIGHT != 0;
     let comrade_ahead = *s.sight & SIGHT_AHEAD != 0;
     let slot_blocked = *s.sight & SIGHT_MARK != 0;
-    st.back_blocked = *s.sight & SIGHT_BACK != 0;
-    st.memo_dir = memo_dir;
-    st.side_dir = side_dir;
-    st.watch_go = watch_go;
-    st.way_blocked = way_blocked;
-    st.left_blocked = left_blocked;
-    st.right_blocked = right_blocked;
-    st.comrade_ahead = comrade_ahead;
-    st.slot_blocked = slot_blocked;
+    st.sight.back_blocked = *s.sight & SIGHT_BACK != 0;
+    st.sight.memo_dir = memo_dir;
+    st.sight.side_dir = side_dir;
+    st.sight.watch_go = watch_go;
+    st.sight.way_blocked = way_blocked;
+    st.sight.left_blocked = left_blocked;
+    st.sight.right_blocked = right_blocked;
+    st.sight.comrade_ahead = comrade_ahead;
+    st.sight.slot_blocked = slot_blocked;
 }
 
 /// Stuck ticks before a man tries a side (half a second); how long a try
@@ -698,7 +699,7 @@ pub(super) fn openings(
 pub(super) fn try_a_side(f: &Field, s: &mut Soldier, st: &mut Step) {
     let Field { orders, engaged, anchors, home, tick, .. } = *f;
     let i = s.i;
-    let wish = st.wish;
+    let wish = st.walk.wish;
     let want = wish.length();
     let walking = orders[st.gi].is_some()
         || (anchors[st.gi] + home[i]).distance_squared(st.p) > TRY_FROM_SLOT * TRY_FROM_SLOT;
@@ -706,11 +707,11 @@ pub(super) fn try_a_side(f: &Field, s: &mut Soldier, st: &mut Step) {
         && !engaged[st.gi]
         && !st.dying
         && !st.routed
-        && !st.in_melee
-        && !st.committed
-        && st.best_idx == u32::MAX
-        && !st.memo_valid
-        && st.join_fp.is_none()
+        && !st.fight.in_melee
+        && !st.fight.committed
+        && st.foe.best_idx == u32::MAX
+        && !st.foe.memo_valid
+        && st.fight.join_fp.is_none()
         && want > 0.5;
     if !going {
         *s.stuck = 0;
@@ -734,33 +735,33 @@ pub(super) fn try_a_side(f: &Field, s: &mut Soldier, st: &mut Step) {
     // once he has made no progress for SQUEEZE_STALL ticks, whatever is
     // beside him: a man wedged in a press turns back square.
     if squeeze > 0 {
-        let free = v_along >= 0.9 * ADVANCE_PACE && !st.gap_near;
+        let free = v_along >= 0.9 * ADVANCE_PACE && !st.open.gap_near;
         let stalled = squeeze >= SQUEEZE_STALL && v_along < 0.1;
-        let through = !st.between && squeeze >= TRY_MIN && (!st.gap || free);
+        let through = !st.open.between && squeeze >= TRY_MIN && (!st.open.gap || free);
         squeeze = if through || stalled { 0 } else { (squeeze + 1).min(STUCK_SQUEEZE_TICKS) };
     }
     if squeeze > 0 {
         // His legs at their full effort along his wish: he pushes with
         // all he has, at a walk at most (`steer`).
         st.desired = wish;
-        st.fade = Vec2::ZERO;
+        st.walk.fade = Vec2::ZERO;
     } else if trying > 0 {
         trying -= 1;
         // The way ahead clear after the first TRY_MIN ticks: the step is
         // done, he walks.
-        if trying <= TRY_TICKS - TRY_MIN && st.ahead < AHEAD_MIN {
+        if trying <= TRY_TICKS - TRY_MIN && st.scan.ahead < AHEAD_MIN {
             trying = 0;
         }
         let side = if left { left_dir } else { -left_dir };
         st.desired += side * STEP_PACE;
-        st.side = side * STEP_PACE;
+        st.walk.side = side * STEP_PACE;
         mem = SIDE_MEMORY;
     } else {
         // Stuck: pressed, and not even stepping. Under half his wish
         // alone would count a lane walker at the sprint behind a slower man
         // as stuck at a jog, and he would zigzag down the lane. A crack he aims at
         // that fits only his depth presses him too.
-        let pressed = st.ahead > AHEAD_MIN || st.gap;
+        let pressed = st.scan.ahead > AHEAD_MIN || st.open.gap;
         let stuck = pressed && v_along < (0.5 * want).min(STEP_PACE);
         count = if stuck { (count + 1).min(STUCK_TICKS) } else { count.saturating_sub(1) };
         // He turns his shoulders as he reaches the crack he aims at, no
@@ -769,16 +770,16 @@ pub(super) fn try_a_side(f: &Field, s: &mut Soldier, st: &mut Step) {
         // (stuck at its top, a ring or wide aim into a standing man's
         // spring) drops it and tries a side; the ring reads again after
         // the step. Passers keep their aims: a lane queue stands still too.
-        let dead_aim = st.aim_fit != 0
+        let dead_aim = st.open.aim_fit != 0
             && orders[st.gi].is_none()
             && (anchors[st.gi] + home[i]).distance_squared(st.p) > TRY_FROM_SLOT * TRY_FROM_SLOT;
-        let start = count >= STUCK_TICKS && !st.gap_near && (st.aim_fit == 0 || dead_aim);
+        let start = count >= STUCK_TICKS && !st.open.gap_near && (st.open.aim_fit == 0 || dead_aim);
         if start {
             if dead_aim {
                 *s.aim = Vec2::NAN;
                 *s.sight &= !SIGHT_RING;
             }
-            let lean = st.push.dot(left_dir);
+            let lean = st.scan.push.dot(left_dir);
             left = if lean.abs() > LEAN_MIN {
                 lean > 0.0
             } else if mem > 0 {
@@ -790,7 +791,7 @@ pub(super) fn try_a_side(f: &Field, s: &mut Soldier, st: &mut Step) {
             count = 0;
             mem = SIDE_MEMORY;
         } else {
-            if st.gap_near {
+            if st.open.gap_near {
                 squeeze = 1;
                 count = 0;
             }
@@ -824,8 +825,8 @@ pub(super) fn hold_the_frame(f: &Field, st: &mut Step) {
     let Field { contact, form_face, orders, moving, .. } = *f;
     let gi = st.gi;
     let routed = st.routed;
-    let slot_blocked = st.slot_blocked;
-    let mut desired = if st.joining { st.slot_wish } else { st.desired };
+    let slot_blocked = st.sight.slot_blocked;
+    let mut desired = if st.fight.joining { st.fight.slot_wish } else { st.desired };
     // A regiment fighting on its contact frame never steps backward, away
     // from its fight, to dress its ranks: a man ahead of his mark (bunched up
     // behind a stopped front, or shoved forward) stays; he only steps forward
@@ -851,8 +852,8 @@ pub(super) fn hold_the_frame(f: &Field, st: &mut Step) {
     if slot_blocked {
         desired = Vec2::ZERO;
     }
-    if st.joining {
-        st.slot_wish = desired;
+    if st.fight.joining {
+        st.fight.slot_wish = desired;
     } else {
         st.desired = desired;
     }

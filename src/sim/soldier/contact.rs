@@ -157,15 +157,13 @@ pub(super) fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut
     recall_foe(f, st, i, reach.best_idx, reach.prev_target);
     ramp_stance(f, s, st, friction, fall_on, reach.best_idx);
     let mine = &widths[my_level];
-    st.brake = (mine.slow, mine.stop);
+    st.scan.brake = (mine.slow, mine.stop);
     draw_knife(f, s, st, reach.best_idx);
     contact.hand_on(st);
     crowd.hand_on(st);
     reach.hand_on(st);
-    st.impale_idx = spear.impale_idx;
-    st.at_charge_speed = spear.at_charge_speed;
-    st.scan_r = scan_r;
-    st.my_team_bit = my_team_bit;
+    st.scan.scan_r = scan_r;
+    st.scan.my_team_bit = my_team_bit;
     obstacles.hand_on(s, st, widths[pose_lv].sep);
 }
 
@@ -382,11 +380,11 @@ impl<'a> Contact<'a> {
     /// means over the overlap.
     #[inline]
     fn hand_on(&self, st: &mut Step) {
-        st.push = self.push;
-        st.corr = self.corr;
+        st.scan.push = self.push;
+        st.scan.corr = self.corr;
         if self.overlap > 0.0 {
-            st.overlap_vel = self.overlap_vel / self.overlap;
-            st.overlap_share = self.overlap_share / self.overlap;
+            st.scan.overlap_vel = self.overlap_vel / self.overlap;
+            st.scan.overlap_share = self.overlap_share / self.overlap;
         }
     }
 }
@@ -461,10 +459,10 @@ impl Crowd {
 
     #[inline]
     fn hand_on(&self, st: &mut Step) {
-        st.crowd = self.crowd;
-        st.crowd_still = self.crowd_still;
-        st.ahead = self.ahead;
-        st.press4 = self.press4;
+        st.scan.crowd = self.crowd;
+        st.scan.crowd_still = self.crowd_still;
+        st.scan.ahead = self.ahead;
+        st.scan.press4 = self.press4;
     }
 }
 
@@ -498,9 +496,9 @@ impl Reach {
 
     #[inline]
     fn hand_on(&self, st: &mut Step) {
-        st.best_idx = self.best_idx;
-        st.sticky = self.sticky;
-        st.prev_target = self.prev_target;
+        st.foe.best_idx = self.best_idx;
+        st.foe.sticky = self.sticky;
+        st.foe.prev_target = self.prev_target;
     }
 }
 
@@ -697,18 +695,18 @@ impl<'a> Obstacles<'a> {
     /// opening he found among them, and whether a body is at both sides.
     #[inline]
     fn hand_on(&self, s: &Soldier, st: &mut Step, sep0: f32) {
-        st.open_on = self.open_on;
-        st.body0 = self.body0;
-        st.sep0 = sep0;
-        st.saw = self.row_at.is_finite();
-        if self.open_on && st.saw {
+        st.open.open_on = self.open_on;
+        st.open.body0 = self.body0;
+        st.open.sep0 = sep0;
+        st.open.saw = self.row_at.is_finite();
+        if self.open_on && st.open.saw {
             let (pref, coin) = side_pref(s.i, *s.stuck);
             let (aim_lat, aim_along, fit, span) =
                 openings(&self.row, self.row_at, OPEN_SEE, self.body0, SQUEEZE_DEPTH, false, pref, coin);
-            st.near = (aim_lat, aim_along, fit);
-            st.near_span = span;
+            st.open.near = (aim_lat, aim_along, fit);
+            st.open.near_span = span;
         }
-        st.between = self.side_left && self.side_right;
+        st.open.between = self.side_left && self.side_right;
     }
 }
 
@@ -732,9 +730,9 @@ fn reads_openings(f: &Field, s: &Soldier, st: &Step) -> bool {
         && !engaged[gi]
         && !st.dying
         && !st.routed
-        && !st.in_melee
-        && !st.committed
-        && st.join_fp.is_none()
+        && !st.fight.in_melee
+        && !st.fight.committed
+        && st.fight.join_fp.is_none()
         && st.desired.length_squared() > 0.25
 }
 
@@ -766,15 +764,15 @@ fn recall_foe(f: &Field, st: &mut Step, i: usize, best_idx: u32, prev_target: u3
     // he is on his way to his place (`on_his_way`).
     let memo = prev_target as usize;
     let (memo_d2, memo_valid) = if (best_idx == u32::MAX && !st.dying && !st.routed)
-        || (st.in_melee && !st.committed)
+        || (st.fight.in_melee && !st.fight.committed)
     {
         remembered_foe(f, i, st.p, st.gi, memo)
     } else {
         (f32::MAX, false)
     };
-    st.memo_valid = memo_valid;
-    st.memo_d2 = memo_d2;
-    st.best_idx = best_idx;
+    st.foe.memo_valid = memo_valid;
+    st.foe.memo_d2 = memo_d2;
+    st.foe.best_idx = best_idx;
 }
 
 /// His stance for the next tick, a step of the ramp toward ready or back

@@ -114,7 +114,7 @@ pub(super) fn drive(f: &Field, s: &mut Soldier, st: &mut Step) {
     } else if !dying {
         let holding = orders[gi].is_none();
         let mut goal = orders[gi].unwrap_or(anchors[gi]) + home[i];
-        st.place_dist = goal.distance(p);
+        st.walk.place_dist = goal.distance(p);
         // On a route, a man whose straight way to his slot is blocked
         // follows the route instead (sim/route.rs); short of the last leg
         // he keeps his pace. He reads the route every LOOK_TICKS, when he
@@ -147,8 +147,8 @@ pub(super) fn drive(f: &Field, s: &mut Soldier, st: &mut Step) {
         let stepping = s.vel.xz().length_squared()
             > (0.5 * STEP_PACE) * (0.5 * STEP_PACE);
         let deadzone = if stepping { STEP_STOP } else { HOLD_DEADZONE };
-        st.parked = holding && dist < deadzone;
-        if !st.parked {
+        st.walk.parked = holding && dist < deadzone;
+        if !st.walk.parked {
             // Slope penalty: steep ground is slow ground. Wading the river is
             // slow too (the bridge deck is dry: full speed).
             let slope = terrain.slope_at(p.x, p.y);
@@ -185,12 +185,12 @@ pub(super) fn drive(f: &Field, s: &mut Soldier, st: &mut Step) {
     if joins_as_walker()
         && !dying
         && !routed
-        && st.committed
+        && st.fight.committed
         && *s.sight & SIGHT_FOE == 0
         && *s.swing & crate::units::SWING_STATE_MASK == crate::units::SWING_READY
     {
-        st.slot_wish = desired;
-        st.joining = true;
+        st.fight.slot_wish = desired;
+        st.fight.joining = true;
         // Arrived at the men ahead: a comrade in his way by his last look
         // and himself standing since the still men ahead stopped him
         // (`steer` sets his stood bit then), he stands with no wish until
@@ -266,7 +266,7 @@ pub(super) fn join_goal(f: &Field, s: &Soldier, st: &Step) -> (Vec2, Vec2) {
     if counts {
         return to_foe(max_close);
     }
-    if let Some(fp) = st.join_fp {
+    if let Some(fp) = st.fight.join_fp {
         let to_fp = fp - p;
         let d = to_fp.length();
         if d > 1.0 {
@@ -291,14 +291,14 @@ fn behind_the_line(face: Vec2, line: f32, p: Vec2, body: f32) -> bool {
 /// keep compressing itself.
 #[inline]
 pub(super) fn yield_to_crowd(f: &Field, st: &mut Step) {
-    let crowd = st.crowd;
-    let mut corr = st.corr;
-    let mut push = st.push;
+    let crowd = st.scan.crowd;
+    let mut corr = st.scan.corr;
+    let mut push = st.scan.push;
     let mut desired = st.desired;
     let corr_len2 = corr.length_squared();
     if corr_len2 > 1e-12 {
-        st.overlap_dir = corr / corr_len2.sqrt();
-        st.overlap_depth = corr_len2.sqrt() / CORR_GAIN;
+        st.scan.overlap_dir = corr / corr_len2.sqrt();
+        st.scan.overlap_depth = corr_len2.sqrt() / CORR_GAIN;
     }
     // Every correction is applied, the sub-centimetre ones too: a threshold
     // turns a steady lean into jumps of a centimetre.
@@ -312,12 +312,12 @@ pub(super) fn yield_to_crowd(f: &Field, st: &mut Step) {
     // Yield in dense crowds: goal drive fades out entirely so the mass can't
     // keep compressing itself; `jam` (0 = free, 1 = packed) also damps the
     // response below.
-    let (slow, stop) = st.brake;
+    let (slow, stop) = st.scan.brake;
     let jam = if still_brake() {
         // The friction contact's brake: the still men ahead of him against
         // a band half as wide, for that smaller count.
         let (slow, stop) = (0.5 * slow, 0.5 * stop);
-        ((st.crowd_still - slow) / (stop - slow)).clamp(0.0, 1.0)
+        ((st.scan.crowd_still - slow) / (stop - slow)).clamp(0.0, 1.0)
     } else {
         ((crowd - slow) / (stop - slow)).clamp(0.0, 1.0)
     };
@@ -330,13 +330,13 @@ pub(super) fn yield_to_crowd(f: &Field, st: &mut Step) {
     let pressed = jam;
     let runs_in = charge_runs_in() && f.charging[st.gi] && !f.fat_nocharge[st.gi] && !st.dying && !st.routed;
     let jam = if runs_in { 0.0 } else { jam };
-    st.wish = desired;
-    st.fade = desired * jam;
+    st.walk.wish = desired;
+    st.walk.fade = desired * jam;
     desired *= 1.0 - jam;
-    st.corr = corr;
-    st.push = push;
-    st.jam = jam;
-    st.body_jam = if runs_in { pressed } else { jam };
+    st.scan.corr = corr;
+    st.scan.push = push;
+    st.walk.jam = jam;
+    st.walk.body_jam = if runs_in { pressed } else { jam };
     st.desired = desired;
 }
 
