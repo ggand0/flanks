@@ -97,8 +97,8 @@ FAMILIES = [
 ]
 # Per kind, the families it has, and what the others fall back to.
 HAS = {
-    "knight": ["stand", "wall", "walk", "run", "stab", "swing", "stagger", "cheer"],
-    "man_at_arms": ["stand", "wall", "walk", "run", "stab", "swing", "stagger", "cheer"],
+    "knight": ["stand", "wall", "walk", "walk_level", "run", "run_level", "stab", "swing", "stagger", "cheer"],
+    "man_at_arms": ["stand", "wall", "walk", "walk_level", "run", "run_level", "stab", "swing", "stagger", "cheer"],
     "spearman": ["stand", "ready", "wall", "walk", "walk_level", "run", "run_level", "stab", "stagger", "cheer"],
     "archer": ["stand", "bowup", "walk", "run", "shot", "stab", "swing", "stagger", "cheer"],
 }
@@ -124,7 +124,6 @@ def record(speed=0.0, z=0.0, band=0.0, wall=0.0, gait=0.0, w4=0.0, psw=0.0, time
 def family_records(kind, fam):
     """The records of one family's frames, in frame order."""
     archer = kind == "archer"
-    spear = kind == "spearman"
     gait = [k / GAIT_FRAMES for k in range(GAIT_FRAMES)]
     if fam == "stand":
         return [record()]
@@ -139,10 +138,7 @@ def family_records(kind, fam):
     if fam == "walk_level":
         return [record(speed=WALK_SPEED, band=0.5, gait=g) for g in gait]
     if fam == "run":
-        # A sword kind runs at the enemy; a spearman's charge, his spear
-        # levelled, is run_level, and an archer does not charge.
-        band = 0.0 if (spear or archer) else 1.0
-        return [record(speed=RUN_SPEED, band=band, gait=g) for g in gait]
+        return [record(speed=RUN_SPEED, gait=g) for g in gait]
     if fam == "run_level":
         return [record(speed=RUN_SPEED, band=1.0, gait=g) for g in gait]
     if fam in ("stab", "swing"):
