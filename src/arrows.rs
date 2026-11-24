@@ -94,6 +94,12 @@ pub struct Arrows {
     /// the attached fly-loop sounds (audio.rs) — tracks this instead.
     pub id: Vec<u32>,
     next_id: u32,
+    /// Where and how fast it left the bow, and the ticks it has flown:
+    /// its path so far for the arrow view (`FL_ARROW_VIZ`), exact from
+    /// these three since the flight is a fixed sum of steps.
+    pub launch: Vec<Vec3>,
+    pub launch_vel: Vec<Vec3>,
+    pub age: Vec<u16>,
 }
 
 impl Arrows {
@@ -110,6 +116,9 @@ impl Arrows {
         self.team.swap_remove(i);
         self.group.swap_remove(i);
         self.id.swap_remove(i);
+        self.launch.swap_remove(i);
+        self.launch_vel.swap_remove(i);
+        self.age.swap_remove(i);
     }
 
     fn clear(&mut self) {
@@ -121,6 +130,9 @@ impl Arrows {
         self.team.clear();
         self.group.clear();
         self.id.clear();
+        self.launch.clear();
+        self.launch_vel.clear();
+        self.age.clear();
     }
 }
 
@@ -210,6 +222,7 @@ impl Plugin for ArrowsPlugin {
             .init_resource::<RegTracks>()
             .init_resource::<ArrowStats>()
             .init_resource::<StuckArrows>()
+            .init_resource::<ArrowMarks>()
             .add_systems(Startup, setup_arrow_buckets)
             .add_systems(
                 FixedUpdate,
@@ -223,7 +236,7 @@ impl Plugin for ArrowsPlugin {
                 )
                     .in_set(crate::game_state::SimSet),
             )
-            .add_systems(Update, (sync_arrow_instances, sync_stuck_instances));
+            .add_systems(Update, (sync_arrow_instances, sync_stuck_instances, draw_arrow_viz));
     }
 }
 
@@ -393,6 +406,7 @@ fn update_arrows(
     mut tracks: ResMut<RegTracks>,
     time: Res<Time>,
     mut sounds: Option<ResMut<crate::audio::SoundEvents>>,
+    mut marks: ResMut<ArrowMarks>,
     mut tick: Local<u32>,
 ) {
     let _timed = Timed(&ARROW_UPDATE_NS, std::time::Instant::now());
@@ -436,6 +450,9 @@ fn update_arrows(
             arrows.group.push(s.group);
             let id = arrows.next_id;
             arrows.id.push(id);
+            arrows.launch.push(s.pos);
+            arrows.launch_vel.push(s.vel);
+            arrows.age.push(0);
             arrows.next_id = arrows.next_id.wrapping_add(1);
         }
     }
@@ -457,6 +474,8 @@ fn update_arrows(
     }
     let mut hits: Vec<Hit> = Vec::new();
     let strike_band = crate::unit_types::tallest() + STRIKE_MARGIN;
+    let viz = arrow_viz();
+    let now = time.elapsed_secs();
     let mut i = 0;
     while i < arrows.len() {
         let prev = arrows.pos[i];
@@ -468,6 +487,7 @@ fn update_arrows(
         arrows.pos[i] = p;
         arrows.vel[i] = v;
         (arrows.yaw[i], arrows.pitch[i]) = flight_angles(v);
+        arrows.age[i] = arrows.age[i].saturating_add(1);
 
         // Over the wall's pieces the whole step is read, not its end: a
         // merlon or a rail is thinner than an arrow's step.
@@ -530,6 +550,9 @@ fn update_arrows(
                 });
                 stats.hits += 1;
                 stats.landed += 1;
+                if viz {
+                    marks.push(units.pos[u], Mark::Man, now);
+                }
                 arrows.swap_remove(i);
                 continue;
             }
@@ -553,6 +576,10 @@ fn update_arrows(
             if let Some(se) = sounds.as_deref_mut() {
                 se.push_arrow_ground(q);
             }
+            if viz {
+                let stone = terrain.fine().is_some_and(|f| f.solid(q.x, q.z));
+                marks.push(q, if stone { Mark::Stone } else { Mark::Ground }, now);
+            }
             arrows.swap_remove(i);
             continue;
         }
@@ -575,6 +602,9 @@ fn update_arrows(
             stats.landed += 1;
             if let Some(se) = sounds.as_deref_mut() {
                 se.push_arrow_ground(Vec3::new(p.x, ground, p.z));
+            }
+            if viz {
+                marks.push(Vec3::new(p.x, ground, p.z), Mark::Ground, now);
             }
             arrows.swap_remove(i);
             continue;
@@ -787,6 +817,74 @@ fn flight_hit(terrain: &crate::terrain::Terrain, a: Vec3, b: Vec3) -> Option<f32
         let q = a.lerp(b, t);
         q.y <= terrain.height_at(q.x, q.z)
     })
+}
+
+/// FL_ARROW_VIZ=1: the arrow view. Each flying arrow's path from its bow
+/// to where it is, green for a flat shot and orange for a lob (launched
+/// steeper than 30 degrees), and for four seconds a mark where each one
+/// ended: red on the wall's stone, white on the ground, yellow on a man.
+/// Drawn only; the flight is the same with it off.
+fn arrow_viz() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FL_ARROW_VIZ").is_ok_and(|v| v == "1"))
+}
+
+/// Where an arrow ended, for the arrow view.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mark {
+    Ground,
+    Stone,
+    Man,
+}
+
+/// The arrow view's marks: where each arrow ended and when (s).
+#[derive(Resource, Default)]
+struct ArrowMarks(Vec<(Vec3, Mark, f32)>);
+
+impl ArrowMarks {
+    fn push(&mut self, at: Vec3, mark: Mark, now: f32) {
+        self.0.push((at, mark, now));
+    }
+}
+
+/// How long the arrow view shows where an arrow ended (s).
+const MARK_S: f32 = 4.0;
+
+/// The arrow view (`arrow_viz`), drawn every frame.
+fn draw_arrow_viz(
+    arrows: Res<Arrows>,
+    mut marks: ResMut<ArrowMarks>,
+    time: Res<Time>,
+    fixed: Res<Time<Fixed>>,
+    mut gizmos: Gizmos,
+) {
+    if !arrow_viz() {
+        return;
+    }
+    let dt = fixed.timestep().as_secs_f32();
+    let g = missile::GRAVITY;
+    for i in 0..arrows.len() {
+        let (p0, v0, n) = (arrows.launch[i], arrows.launch_vel[i], arrows.age[i] as f32);
+        let lob = v0.y > 0.577 * v0.xz().length();
+        let color = if lob { Color::srgb(1.0, 0.55, 0.1) } else { Color::srgb(0.2, 1.0, 0.3) };
+        // The flight's own sum: after m steps of v.y -= g dt, p += v dt.
+        let at = |m: f32| p0 + v0 * (m * dt) - Vec3::Y * (g * dt * dt * m * (m + 1.0) * 0.5);
+        const K: usize = 16;
+        gizmos.linestrip((0..=K).map(|j| at(n * j as f32 / K as f32)), color);
+    }
+    let now = time.elapsed_secs();
+    marks.0.retain(|&(_, _, t)| now - t < MARK_S);
+    for &(at, mark, _) in &marks.0 {
+        let color = match mark {
+            Mark::Ground => Color::srgb(1.0, 1.0, 1.0),
+            Mark::Stone => Color::srgb(1.0, 0.1, 0.1),
+            Mark::Man => Color::srgb(1.0, 0.95, 0.1),
+        };
+        let r = 0.35;
+        gizmos.line(at - Vec3::X * r, at + Vec3::X * r, color);
+        gizmos.line(at - Vec3::Z * r, at + Vec3::Z * r, color);
+        gizmos.line(at, at + Vec3::Y * 0.8, color);
+    }
 }
 
 /// A shaft's heading and climb (radians) from its velocity.

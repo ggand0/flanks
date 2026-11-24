@@ -617,6 +617,12 @@ impl FineGround {
         self.index(x, z).map(|i| self.flags[i] & F_BLOCKED != 0)
     }
 
+    /// Whether `(x, z)` is on a piece's solid part (false off the grid).
+    #[inline]
+    pub fn solid(&self, x: f32, z: f32) -> bool {
+        self.index(x, z).is_some_and(|i| self.flags[i] & F_SOLID != 0)
+    }
+
     /// On the grid: the height the pieces add over the drawn ground at
     /// `(x, z)`, nothing off them: a floor's height on a clear cell, the
     /// top of the solid part on a solid one (`Piece::top`).
