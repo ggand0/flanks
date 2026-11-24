@@ -1,37 +1,184 @@
-"""Draw the placeholder sprite sheet of the far soldiers' cards (FL_SPRITE).
+"""Draw the sprite sheet of the far soldiers' cards (FL_SPRITE).
 
-For each soldier kind it rasterizes one level of the unit model
-(assets/units/<kind>.glb) from the front, orthographic, with the model's
-own atlas: rgb the atlas colour lit by the game's sky and sun terms
-(unit_instancing.wgsl `sky_and_sun`, the sun as main.rs `sun_rotation`),
-the team mask from the atlas alpha. Four times supersampled, then
-averaged down.
+Each kind is drawn from the level the far soldiers stand next to, posed by
+the game itself: the tool writes the instance records of every frame it
+wants, runs the game with FL_SPRITE_BAKE (src/sprite_bake.rs), which poses
+every corner of the mesh with the draw's own pose code and writes the
+placed corners back, and draws each frame from every view with the
+model's atlas.
 
-The sheet is 8 cells of CW x CH pixels in one row. Cells 0..3 are the
-kinds (knight, man-at-arms, spearman, archer): rgb colour with the team
-cloth grey, alpha the cut-out. Cells 4..7 are the same kinds' team masks
-in alpha (rgb white). The feet stand on the cell's bottom row, the figure
-centred, PX_PER_M pixels a metre.
+The card is lit in the game's shader by the same sky and sun as the mesh
+(unit_instancing.wgsl `sky_and_sun`), so the sheet holds no light: per
+texel the colour outside the team cloth, the cloth's grey, the normal in
+the soldier's own frame and the cut-out.
 
-It prints each kind's quad in model metres and its uv rect, the table
-`SPRITE_CARDS` in src/unit_glb.rs. Run from the repo root:
+Sheet (assets/units/sprites.png, sRGB RGBA8): two halves side by side.
+Left half: rgb the colour outside the cloth (atlas colour times one less
+the team mask), alpha the cut-out (the share of the texel the figure
+covers). Right half, the same texel half a sheet to the right: rgb the
+normal, n * 0.5 + 0.5 written so that the sRGB decode gives it back, alpha
+the cloth's grey (atlas grey times the team mask times the largest channel
+of the kind's cloth hue), which the shader tints by the team colour times
+that hue. Every texel outside the figure carries the nearest figure
+texel's values, so the mips have no fringe.
 
-    python3 tools/sprite_sheet.py                  # writes assets/units/sprites.png from L0
-    python3 tools/sprite_sheet.py <units dir> <out png> [level name]
+Each kind has one cell per (camera height, direction around him, frame), in
+that order. A cell shows him orthographic from that view, x along the
+camera's right and y along its up, and is just large enough for him: its
+box, in metres from his centre (half his height above his feet), goes to
+the layout with its place in the sheet. The cells are packed in shelves.
+The layout goes to assets/units/sprites.json, which the game reads
+(src/unit_glb.rs `SpriteLayout`).
 
-Needs numpy and Pillow.
+Frames: a family per thing a man can be doing (FAMILIES, the order of the
+ids the shader picks by, unit_instancing.wgsl `sprite_frame`), each a few
+frames over its phase. A family a kind does not have takes the frames of
+the one it falls back to.
+
+Run from the repo root:
+
+    python3 tools/sprite_sheet.py --game <game binary or launcher> [--work <dir>]
+
+The game is started with FL_SPRITE_BAKE=<work dir> and the variables of
+--env, and ends by itself once it has written the placed corners. With
+--bake-done the tool reads an existing <work dir>/bake_out.bin instead.
+Needs numpy, numba and Pillow.
 """
-import json, struct, sys
+import argparse
+import io
+import json
+import math
+import os
+import struct
+import subprocess
+import sys
+
+import numba
 import numpy as np
 from PIL import Image
-import io
 
 KINDS = ["knight", "man_at_arms", "spearman", "archer"]
-CW, CH = 128, 256
-PX_PER_M = 88.0
+
+# Pixels per metre of the sheet's base level, and the supersampling of
+# the drawing.
+PX_PER_M = 12.0
 SS = 4
-SUN = np.array([0.472, 0.682, 0.560])
-SUN /= np.linalg.norm(SUN)
+# Cells are a multiple of this many pixels wide and high and start on
+# such a multiple, so the first mips of a cell take nothing from its
+# neighbours.
+CELL_ALIGN = 8
+# Empty pixels kept around the figure in a cell at least.
+MARGIN = 2
+
+# Camera heights above the horizon, degrees, and directions around the man.
+ELEVATIONS = [3.0, 14.0, 30.0, 55.0]
+DIRECTIONS = 8
+
+# Ground speeds, m/s, the walk and run frames are drawn at, and the speeds
+# the shader switches at: below STAND_BELOW a man shows his standing
+# frames, from RUN_FROM his run.
+WALK_SPEED = 1.5
+RUN_SPEED = 6.0
+STAND_BELOW = 0.35
+RUN_FROM = 3.5
+
+GAIT_FRAMES = 8
+ATTACK_WINDUP = 4
+ATTACK_FOLLOW = [0.25, 0.65]
+SHOT_DRAW = [1 / 6, 1 / 2, 5 / 6]
+SHOT_RELEASE = [0.25, 0.75]
+SHOT_RELOAD = [1 / 6, 1 / 2, 5 / 6]
+STAGGER = [0.45, 0.85]
+CHEER_FRAMES = 4
+
+FAMILIES = [
+    "stand", "ready", "wall", "bowup", "walk", "walk_level", "run", "run_level",
+    "stab", "swing", "shot", "stagger", "cheer",
+]
+# Per kind, the families it has, and what the others fall back to.
+HAS = {
+    "knight": ["stand", "wall", "walk", "run", "stab", "swing", "stagger", "cheer"],
+    "man_at_arms": ["stand", "wall", "walk", "run", "stab", "swing", "stagger", "cheer"],
+    "spearman": ["stand", "ready", "wall", "walk", "walk_level", "run", "run_level", "stab", "stagger", "cheer"],
+    "archer": ["stand", "bowup", "walk", "run", "shot", "stab", "swing", "stagger", "cheer"],
+}
+FALLBACK = {
+    "ready": "stand", "wall": "stand", "bowup": "stand", "walk_level": "walk", "run_level": "run",
+    "swing": "stab", "shot": "stand", "stab": "stand",
+}
+
+TAU = 2.0 * math.pi
+# render_units.rs CELEBRATE_BASE and RANGED_BASE, FOLLOW_BASE and FOLLOW_SPAN.
+CELEBRATE_BASE = 12.0
+RANGED_BASE = 16.0
+FOLLOW_BASE = 1.4
+FOLLOW_SPAN = 0.59
+
+
+def record(speed=0.0, z=0.0, band=0.0, wall=0.0, gait=0.0, w4=0.0, psw=0.0, time=0.0):
+    """One instance record (render_units.rs InstanceData) at yaw 0 and the
+    origin, seed 0, white: pos_scale, color, anim, anim2, and its time."""
+    return [0.0, 0.0, 0.0, psw, 1.0, 1.0, 1.0, 0.0, 0.0, speed, z, 0.0, band, wall, gait, w4], time
+
+
+def family_records(kind, fam):
+    """The records of one family's frames, in frame order."""
+    archer = kind == "archer"
+    spear = kind == "spearman"
+    gait = [k / GAIT_FRAMES for k in range(GAIT_FRAMES)]
+    if fam == "stand":
+        return [record()]
+    if fam == "ready":
+        return [record(band=0.5)]
+    if fam == "wall":
+        return [record(band=0.5, wall=1.0)]
+    if fam == "bowup":
+        return [record(band=0.5, psw=1.0)]
+    if fam == "walk":
+        return [record(speed=WALK_SPEED, gait=g) for g in gait]
+    if fam == "walk_level":
+        return [record(speed=WALK_SPEED, band=0.5, gait=g) for g in gait]
+    if fam == "run":
+        # A sword kind runs at the enemy; a spearman's charge, his spear
+        # levelled, is run_level, and an archer does not charge.
+        band = 0.0 if (spear or archer) else 1.0
+        return [record(speed=RUN_SPEED, band=band, gait=g) for g in gait]
+    if fam == "run_level":
+        return [record(speed=RUN_SPEED, band=1.0, gait=g) for g in gait]
+    if fam in ("stab", "swing"):
+        digit = 0.0 if fam == "stab" else 1.0
+        psw = -1.0 if archer else 0.0
+        out = [record(band=0.5, z=digit * 2 + (k + 0.5) / ATTACK_WINDUP, psw=psw) for k in range(ATTACK_WINDUP)]
+        out += [record(band=0.5, z=digit * 2 + FOLLOW_BASE + FOLLOW_SPAN * f, psw=psw) for f in ATTACK_FOLLOW]
+        return out
+    if fam == "shot":
+        out = []
+        for clip, xs in ((0, SHOT_DRAW), (1, SHOT_RELEASE), (2, SHOT_RELOAD)):
+            out += [record(band=0.5, z=RANGED_BASE + clip * 2 + x, psw=1.0) for x in xs]
+        return out
+    if fam == "stagger":
+        return [record(w4=s) for s in STAGGER]
+    if fam == "cheer":
+        return [record(z=CELEBRATE_BASE + 0.5, time=(k / CHEER_FRAMES) * TAU / 9.0) for k in range(CHEER_FRAMES)]
+    raise ValueError(fam)
+
+
+def kind_frames(kind):
+    """The kind's frames in sheet order and per family its (first frame,
+    frame count), with the fallbacks resolved."""
+    frames = []
+    span = {}
+    for fam in FAMILIES:
+        if fam in HAS[kind]:
+            recs = family_records(kind, fam)
+            span[fam] = (len(frames), len(recs))
+            frames += recs
+    for fam in FAMILIES:
+        f = fam
+        while f not in span:
+            f = FALLBACK[f]
+        span[fam] = span[f]
+    return frames, span
 
 
 def read_glb(path):
@@ -44,21 +191,21 @@ def read_glb(path):
     return j, blob
 
 
-def accessor(j, blob, i):
-    a = j["accessors"][i]
-    bv = j["bufferViews"][a["bufferView"]]
-    comps = {"SCALAR": 1, "VEC2": 2, "VEC3": 3, "VEC4": 4}[a["type"]]
-    dt = {5126: np.float32, 5123: np.uint16, 5125: np.uint32, 5121: np.uint8}[a["componentType"]]
-    start = bv.get("byteOffset", 0) + a.get("byteOffset", 0)
-    size = np.dtype(dt).itemsize
-    stride = bv.get("byteStride", comps * size)
-    raw = np.frombuffer(blob, dtype=np.uint8, count=stride * (a["count"] - 1) + comps * size, offset=start)
-    out = np.empty((a["count"], comps), dtype=dt)
-    for k in range(a["count"]):
-        out[k] = np.frombuffer(raw[k * stride:k * stride + comps * size].tobytes(), dtype=dt)
-    if a.get("normalized") and dt != np.float32:
-        out = out.astype(np.float32) / np.iinfo(dt).max
-    return out
+def read_atlas(path):
+    """The model's atlas in linear light, rgb, its team mask, and the
+    cloth's hue: the cloth's mean colour over its mean grey, scaled so its
+    largest channel is 1, and that scale."""
+    j, blob = read_glb(path)
+    img = j["images"][0]
+    bv = j["bufferViews"][img["bufferView"]]
+    start = bv.get("byteOffset", 0)
+    a = np.asarray(Image.open(io.BytesIO(blob[start:start + bv["byteLength"]])).convert("RGBA")).astype(np.float32) / 255.0
+    rgb = srgb_to_lin(a[..., :3]).astype(np.float32)
+    m = a[..., 3]
+    cloth = (rgb * m[..., None]).reshape(-1, 3).sum(axis=0)
+    hue = cloth / cloth.mean()
+    scale = float(hue.max())
+    return rgb, m.copy(), scale, hue / scale
 
 
 def srgb_to_lin(c):
@@ -70,121 +217,273 @@ def lin_to_srgb(c):
     return np.where(c <= 0.0031308, c * 12.92, 1.055 * c ** (1 / 2.4) - 0.055)
 
 
-def render(path, level):
-    j, blob = read_glb(path)
-    node = [nd for nd in j["nodes"] if nd.get("name") == level][0]
-    img = j["images"][0]
-    bv = j["bufferViews"][img["bufferView"]]
-    atlas = np.asarray(Image.open(io.BytesIO(blob[bv.get("byteOffset", 0):bv.get("byteOffset", 0) + bv["byteLength"]])).convert("RGBA")).astype(np.float32) / 255.0
-    ah, aw = atlas.shape[:2]
-    tris = []
-    for prim in j["meshes"][node["mesh"]]["primitives"]:
-        at = prim["attributes"]
-        pos = accessor(j, blob, at["POSITION"]).astype(np.float64)
-        nrm = accessor(j, blob, at["NORMAL"]).astype(np.float64)
-        uv = accessor(j, blob, at["TEXCOORD_0"]).astype(np.float64)
-        idx = accessor(j, blob, prim["indices"]).reshape(-1).astype(np.int64)
-        tris.append((pos, nrm, uv, idx))
-    allpos = np.concatenate([t[0] for t in tris])
-    lo, hi = allpos.min(0), allpos.max(0)
-    d = PX_PER_M * SS
-    W, H = CW * SS, CH * SS
-    # Screen x = model +X (the camera stands at +Z looking at his front), y down from the cell top; the feet (model
-    # y = 0) on the bottom row, x = 0 at the middle column.
-    col = np.zeros((H, W, 3))
-    mask = np.zeros((H, W))
-    cov = np.zeros((H, W))
-    zbuf = np.full((H, W), -1e9)
-    for pos, nrm, uv, idx in tris:
-        for t in range(0, len(idx), 3):
-            ia, ib, ic = idx[t], idx[t + 1], idx[t + 2]
-            P = pos[[ia, ib, ic]]
-            sx = W / 2 + P[:, 0] * d
-            sy = H - P[:, 1] * d
-            x0, x1 = int(max(np.floor(sx.min()), 0)), int(min(np.ceil(sx.max()), W - 1))
-            y0, y1 = int(max(np.floor(sy.min()), 0)), int(min(np.ceil(sy.max()), H - 1))
-            if x1 < x0 or y1 < y0:
-                continue
-            xs, ys = np.meshgrid(np.arange(x0, x1 + 1) + 0.5, np.arange(y0, y1 + 1) + 0.5)
-            den = (sy[1] - sy[2]) * (sx[0] - sx[2]) + (sx[2] - sx[1]) * (sy[0] - sy[2])
-            if abs(den) < 1e-12:
-                continue
-            w0 = ((sy[1] - sy[2]) * (xs - sx[2]) + (sx[2] - sx[1]) * (ys - sy[2])) / den
-            w1 = ((sy[2] - sy[0]) * (xs - sx[2]) + (sx[0] - sx[2]) * (ys - sy[2])) / den
-            w2 = 1 - w0 - w1
-            inside = (w0 >= 0) & (w1 >= 0) & (w2 >= 0)
-            if not inside.any():
-                continue
-            z = w0 * P[0, 2] + w1 * P[1, 2] + w2 * P[2, 2]
-            yy, xx = ys[inside].astype(int), xs[inside].astype(int)
-            zz = z[inside]
-            closer = zz > zbuf[yy, xx]
-            if not closer.any():
-                continue
-            yy, xx, zz = yy[closer], xx[closer], zz[closer]
-            a, b, c = w0[inside][closer], w1[inside][closer], w2[inside][closer]
-            U = a * uv[ia, 0] + b * uv[ib, 0] + c * uv[ic, 0]
-            V = a * uv[ia, 1] + b * uv[ib, 1] + c * uv[ic, 1]
-            N = a[:, None] * nrm[ia] + b[:, None] * nrm[ib] + c[:, None] * nrm[ic]
-            N /= np.maximum(np.linalg.norm(N, axis=1, keepdims=True), 1e-9)
-            tx = np.clip((U % 1.0) * aw, 0, aw - 1).astype(int)
-            ty = np.clip((V % 1.0) * ah, 0, ah - 1).astype(int)
-            tex = atlas[ty, tx]
-            sky = 0.30 + 0.20 * (0.5 + 0.5 * N[:, 1])
-            sun = 0.65 * np.maximum(N @ SUN, 0.0)
-            zbuf[yy, xx] = zz
-            # Colour in linear light; the cloth (team mask) grey at its own brightness, so the shader's tint by the
-            # team colour gives the cloth its colour as the atlas tint does on a mesh.
-            lin = srgb_to_lin(tex[:, :3])
-            col[yy, xx] = lin * (sky + sun)[:, None]
-            mask[yy, xx] = tex[:, 3]
-            cov[yy, xx] = 1.0
-    # Average down, colour weighted by coverage.
+def write_bake_input(path):
+    rows = []
+    for k, kind in enumerate(KINDS):
+        frames, _ = kind_frames(kind)
+        for rec, time in frames:
+            rows.append([float(k), time, 0.0, 0.0] + rec)
+    np.asarray(rows, dtype=np.float32).tofile(path)
+
+
+def read_bake_output(path):
+    """Per kind: placed positions (frames, corners, 3), normals, the atlas
+    coordinates (corners, 2) and the part ids (corners)."""
+    b = open(path, "rb").read()
+    off = 0
+    out = []
+    for kind in KINDS:
+        corners, records = struct.unpack("<II", b[off:off + 8])
+        off += 8
+        a = np.frombuffer(b, dtype=np.float32, count=records * corners * 8, offset=off).reshape(records, corners, 2, 4)
+        off += records * corners * 32
+        frames, _ = kind_frames(kind)
+        assert records == len(frames), f"{kind}: {records} records posed, {len(frames)} asked"
+        uvbits = a[0, :, 0, 3].copy().view(np.uint32)
+        uv = np.stack([(uvbits & 0xFFFF) / 65535.0, (uvbits >> 16) / 65535.0], axis=1)
+        out.append((a[:, :, 0, :3].astype(np.float64), a[:, :, 1, :3].astype(np.float64), uv, a[0, :, 1, 3].copy()))
+    return out
+
+
+def view_basis(az, el):
+    """Toward the camera, its right and its up, in the soldier's frame
+    (his facing +Z, unit_pose.wgsl `place`)."""
+    d = np.array([math.sin(az) * math.cos(el), math.sin(el), math.cos(az) * math.cos(el)])
+    right = np.array([d[2], 0.0, -d[0]])
+    right /= np.linalg.norm(right)
+    up = np.cross(right, -d)
+    return d, right, up
+
+
+@numba.njit(cache=True)
+def raster(sx, sy, sz, nrm, uv, w, h, atlas_rgb, atlas_mask, out_rgb, out_mask, out_nrm, out_cov, zbuf):
+    """Triangles (corner triples) in pixel space onto the buffers: the
+    nearest (largest sz) wins. Colour and mask from the atlas, bilinear;
+    the normal blended from the corners as the vertex light is."""
+    ah, aw = atlas_mask.shape
+    for t in range(0, sx.shape[0], 3):
+        x0, x1, x2 = sx[t], sx[t + 1], sx[t + 2]
+        y0, y1, y2 = sy[t], sy[t + 1], sy[t + 2]
+        den = (y1 - y2) * (x0 - x2) + (x2 - x1) * (y0 - y2)
+        if abs(den) < 1e-12:
+            continue
+        lo_x = max(int(math.floor(min(x0, x1, x2))), 0)
+        hi_x = min(int(math.ceil(max(x0, x1, x2))), w - 1)
+        lo_y = max(int(math.floor(min(y0, y1, y2))), 0)
+        hi_y = min(int(math.ceil(max(y0, y1, y2))), h - 1)
+        for py in range(lo_y, hi_y + 1):
+            cy = py + 0.5
+            for px in range(lo_x, hi_x + 1):
+                cx = px + 0.5
+                a = ((y1 - y2) * (cx - x2) + (x2 - x1) * (cy - y2)) / den
+                b = ((y2 - y0) * (cx - x2) + (x0 - x2) * (cy - y2)) / den
+                c = 1.0 - a - b
+                if a < 0.0 or b < 0.0 or c < 0.0:
+                    continue
+                z = a * sz[t] + b * sz[t + 1] + c * sz[t + 2]
+                if z <= zbuf[py, px]:
+                    continue
+                zbuf[py, px] = z
+                u = a * uv[t, 0] + b * uv[t + 1, 0] + c * uv[t + 2, 0]
+                v = a * uv[t, 1] + b * uv[t + 1, 1] + c * uv[t + 2, 1]
+                fx = (u % 1.0) * aw - 0.5
+                fy = (v % 1.0) * ah - 0.5
+                ix = int(math.floor(fx))
+                iy = int(math.floor(fy))
+                tx = fx - ix
+                ty = fy - iy
+                for ch in range(4):
+                    acc = 0.0
+                    for dy in range(2):
+                        for dx in range(2):
+                            qx = min(max(ix + dx, 0), aw - 1)
+                            qy = min(max(iy + dy, 0), ah - 1)
+                            wgt = (tx if dx == 1 else 1.0 - tx) * (ty if dy == 1 else 1.0 - ty)
+                            if ch < 3:
+                                acc += wgt * atlas_rgb[qy, qx, ch]
+                            else:
+                                acc += wgt * atlas_mask[qy, qx]
+                    if ch < 3:
+                        out_rgb[py, px, ch] = acc
+                    else:
+                        out_mask[py, px] = acc
+                for ch in range(3):
+                    out_nrm[py, px, ch] = a * nrm[t, ch] + b * nrm[t + 1, ch] + c * nrm[t + 2, ch]
+                out_cov[py, px] = 1.0
+
+
+def draw_cell(pos, nrm, uv, view, atlas):
+    """One frame from one view, in a cell just large enough for it: the
+    cell's box in metres from his centre (x0, x1 along the camera's right,
+    y0, y1 along its up), and (rgb outside the cloth, cloth grey, normal,
+    cut-out) at the cell's size, linear values."""
+    az, el = view
+    d, right, up = view_basis(az, el)
+    x = pos @ right
+    y = pos @ up
+    # The box on the pixel grid, the margin around it, grown to whole
+    # multiples of CELL_ALIGN about its middle.
+    px0 = math.floor(x.min() * PX_PER_M) - MARGIN
+    px1 = math.ceil(x.max() * PX_PER_M) + MARGIN
+    py0 = math.floor(y.min() * PX_PER_M) - MARGIN
+    py1 = math.ceil(y.max() * PX_PER_M) + MARGIN
+    cw, ch = align(px1 - px0), align(py1 - py0)
+    px0 -= (cw - (px1 - px0)) // 2
+    py0 -= (ch - (py1 - py0)) // 2
+    box = (px0 / PX_PER_M, (px0 + cw) / PX_PER_M, py0 / PX_PER_M, (py0 + ch) / PX_PER_M)
+    w, h = cw * SS, ch * SS
+    k = PX_PER_M * SS
+    sx = (x - box[0]) * k
+    sy = (box[3] - y) * k
+    sz = pos @ d
+    rgb = np.zeros((h, w, 3))
+    mask = np.zeros((h, w))
+    n = np.zeros((h, w, 3))
+    cov = np.zeros((h, w))
+    zbuf = np.full((h, w), -1e9)
+    raster(sx, sy, sz, nrm, uv, w, h, atlas[0], atlas[1], rgb, mask, n, cov, zbuf)
+    grey = rgb.mean(axis=2)
+    plain = rgb * (1.0 - mask[..., None])
+    cloth = grey * mask * atlas[2]
+
     def down(a):
-        return a.reshape(CH, SS, CW, SS, *a.shape[2:]).mean(axis=(1, 3))
+        return a.reshape(ch, SS, cw, SS, *a.shape[2:]).sum(axis=(1, 3))
     c = down(cov)
-    rgb = down(col * cov[..., None]) / np.maximum(c[..., None], 1e-9)
-    m = down(mask * cov) / np.maximum(c, 1e-9)
-    return rgb, m, c, lo, hi
+    inv = 1.0 / np.maximum(c, 1e-9)
+    return box, (
+        down(plain * cov[..., None]) * inv[..., None],
+        down(cloth * cov) * inv,
+        down(n * cov[..., None]) * inv[..., None],
+        c / (SS * SS),
+    )
+
+
+def dilate(values, filled):
+    """Fill every empty pixel with the mean of its filled neighbours, ring
+    by ring outward, so the mips have no fringe."""
+    values = values.copy()
+    filled = filled.copy()
+    while not filled.all():
+        acc = np.zeros_like(values)
+        cnt = np.zeros(filled.shape)
+        for dy, dx in ((0, 1), (0, -1), (1, 0), (-1, 0), (1, 1), (1, -1), (-1, 1), (-1, -1)):
+            f = np.zeros_like(filled)
+            v = np.zeros_like(values)
+            sy0, sy1 = max(dy, 0), filled.shape[0] + min(dy, 0)
+            sx0, sx1 = max(dx, 0), filled.shape[1] + min(dx, 0)
+            f[sy0:sy1, sx0:sx1] = filled[sy0 - dy:sy1 - dy, sx0 - dx:sx1 - dx]
+            v[sy0:sy1, sx0:sx1] = values[sy0 - dy:sy1 - dy, sx0 - dx:sx1 - dx]
+            acc += v * f.reshape(f.shape + (1,) * (values.ndim - 2))
+            cnt += f
+        grow = ~filled & (cnt > 0)
+        if not grow.any():
+            break
+        values[grow] = acc[grow] / cnt[grow].reshape(-1, *([1] * (values.ndim - 2)))
+        filled |= grow
+    return values
+
+
+def align(v):
+    return int(math.ceil(v / CELL_ALIGN) * CELL_ALIGN)
 
 
 def main():
-    units = sys.argv[1] if len(sys.argv) > 1 else "assets/units"
-    out = sys.argv[2] if len(sys.argv) > 2 else "assets/units/sprites.png"
-    level = sys.argv[3] if len(sys.argv) > 3 else "L0"
-    sheet = np.zeros((CH, CW * 8, 4))
-    for k, name in enumerate(KINDS):
-        rgb, m, c, lo, hi = render(f"{units}/{name}.glb", level)
-        # The mips average rgb without weighting by alpha, so the colour runs out into the empty pixels around the
-        # figure: no dark fringe on a far card.
-        filled = c > 0.0
-        for _ in range(CW):
-            if filled.all():
-                break
-            acc = np.zeros_like(rgb)
-            n = np.zeros(c.shape)
-            for dy, dx in ((0, 1), (0, -1), (1, 0), (-1, 0)):
-                f = np.roll(filled, (dy, dx), axis=(0, 1))
-                acc += np.roll(rgb, (dy, dx), axis=(0, 1)) * f[..., None]
-                n += f
-            grow = ~filled & (n > 0)
-            rgb[grow] = acc[grow] / n[grow][:, None]
-            filled = filled | grow
-        sheet[:, k * CW:(k + 1) * CW, :3] = lin_to_srgb(rgb)
-        sheet[:, k * CW:(k + 1) * CW, 3] = c
-        sheet[:, (4 + k) * CW:(5 + k) * CW, :3] = 1.0
-        sheet[:, (4 + k) * CW:(5 + k) * CW, 3] = m * c
-        ys, xs = np.nonzero(c > 0.02)
-        # Quad in model metres (x left to right, y feet up), and the uv rect over the whole sheet, a pixel of margin.
-        px0, px1 = max(xs.min() - 1, 0), min(xs.max() + 2, CW)
-        py0, py1 = max(ys.min() - 1, 0), CH
-        qx0, qx1 = (px0 - CW / 2) / PX_PER_M, (px1 - CW / 2) / PX_PER_M
-        qy0, qy1 = (CH - py1) / PX_PER_M, (CH - py0) / PX_PER_M
-        u0, u1 = (k * CW + px0) / (8 * CW), (k * CW + px1) / (8 * CW)
-        v0, v1 = py0 / CH, py1 / CH
-        print(f"    // {name}: model {lo.round(3)} to {hi.round(3)}")
-        print(f"    [{qx0:.4f}, {qx1:.4f}, {qy0:.4f}, {qy1:.4f}, {u0:.5f}, {u1:.5f}, {v0:.5f}, {v1:.5f}],")
-    Image.fromarray((np.clip(sheet, 0, 1) * 255 + 0.5).astype(np.uint8), "RGBA").save(out)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--game", help="the game binary, or a launcher that runs it with the environment it is given")
+    ap.add_argument("--work", default="tmp/sprite-bake")
+    ap.add_argument("--units", default="assets/units")
+    ap.add_argument("--out", default="assets/units/sprites.png")
+    ap.add_argument("--bake-done", action="store_true", help="read the placed corners already in --work")
+    ap.add_argument("--env", nargs="*", default=[], help="KEY=VALUE pairs for the game")
+    args = ap.parse_args()
+    os.makedirs(args.work, exist_ok=True)
+    work = os.path.abspath(args.work)
+    if not args.bake_done:
+        if not args.game:
+            sys.exit("--game is needed to pose the frames (or --bake-done)")
+        write_bake_input(os.path.join(work, "bake_in.bin"))
+        out = os.path.join(work, "bake_out.bin")
+        if os.path.exists(out):
+            os.replace(out, out + ".old")
+        env = dict(os.environ, FL_SPRITE_BAKE=work)
+        env.pop("FL_SPRITE", None)
+        for pair in args.env:
+            key, value = pair.split("=", 1)
+            env[key] = value
+        subprocess.run([args.game], env=env, check=False)
+        if not os.path.exists(out):
+            sys.exit(f"the game wrote no {out}")
+    posed = read_bake_output(os.path.join(work, "bake_out.bin"))
+
+    views = [(TAU * d / DIRECTIONS, math.radians(e)) for e in ELEVATIONS for d in range(DIRECTIONS)]
+    kinds = []
+    cells = []
+    for k, kind in enumerate(KINDS):
+        pos, nrm, uv, part = posed[k]
+        frames, span = kind_frames(kind)
+        atlas = read_atlas(os.path.join(args.units, f"{kind}.glb"))
+        first = len(cells)
+        for view in views:
+            for f in range(len(frames)):
+                box, planes = draw_cell(pos[f], nrm[f], uv, view, atlas)
+                cells.append(dict(kind=k, box=box, planes=planes))
+        kinds.append(dict(name=kind, frames=len(frames), span=span, first=first, cloth=atlas[3]))
+        sizes = [c["planes"][3].shape for c in cells[first:]]
+        print(f"{kind}: {len(frames)} frames x {len(views)} views, cells {min(s[1] for s in sizes)}..{max(s[1] for s in sizes)} x {min(s[0] for s in sizes)}..{max(s[0] for s in sizes)} px")
+
+    # Shelves: the cells by height, tallest first, left to right in rows
+    # across a half as wide as the power of two that keeps the sheet near
+    # square.
+    total = sum(c["planes"][3].size for c in cells)
+    half_w = 1 << int(math.ceil(math.log2(math.sqrt(total / 2.0) * 1.05)))
+    order = sorted(range(len(cells)), key=lambda i: -cells[i]["planes"][3].shape[0])
+    x = y = shelf = 0
+    for i in order:
+        ch, cw = cells[i]["planes"][3].shape
+        if x + cw > half_w:
+            x, y, shelf = 0, y + shelf, 0
+        cells[i]["at"] = (x, y)
+        x += cw
+        shelf = max(shelf, ch)
+    height = align(y + shelf)
+    width = 2 * half_w
+    sheet = np.zeros((height, width, 4), dtype=np.uint8)
+    for c in cells:
+        plain, cloth, n, cov = c["planes"]
+        ch, cw = cov.shape
+        cx, cy = c["at"]
+        filled = cov > 0
+        if not filled.any():
+            filled[0, 0] = True
+        plain = dilate(plain, filled)
+        cloth = dilate(cloth, filled)
+        n = dilate(n, filled)
+        left = np.concatenate([lin_to_srgb(plain), cov[..., None]], axis=2)
+        right = np.concatenate([lin_to_srgb(np.clip(n * 0.5 + 0.5, 0, 1)), np.clip(cloth, 0, 1)[..., None]], axis=2)
+        sheet[cy:cy + ch, cx:cx + cw] = (np.clip(left, 0, 1) * 255 + 0.5).astype(np.uint8)
+        sheet[cy:cy + ch, half_w + cx:half_w + cx + cw] = (np.clip(right, 0, 1) * 255 + 0.5).astype(np.uint8)
+    layout = dict(
+        width=width, height=height, px_per_m=PX_PER_M, elevations=ELEVATIONS, directions=DIRECTIONS,
+        families=FAMILIES, speeds=dict(stand_below=STAND_BELOW, run_from=RUN_FROM, walk=WALK_SPEED, run=RUN_SPEED),
+        kinds=[],
+    )
+    for kd in kinds:
+        mine = cells[kd["first"]:kd["first"] + kd["frames"] * len(views)]
+        layout["kinds"].append(dict(
+            name=kd["name"], frames=kd["frames"],
+            families=[list(kd["span"][f]) for f in FAMILIES],
+            cloth=[round(float(v), 5) for v in kd["cloth"]],
+            # Per cell: its rect in the left half, pixels (x, y, width,
+            # height), and its box in metres (x0, x1, y0, y1).
+            cells=[[c["at"][0], c["at"][1], c["planes"][3].shape[1], c["planes"][3].shape[0]]
+                   + [round(v, 5) for v in c["box"]] for c in mine],
+        ))
+    Image.fromarray(sheet, "RGBA").save(args.out, optimize=True)
+    with open(os.path.splitext(args.out)[0] + ".json", "w") as f:
+        json.dump(layout, f, separators=(",", ":"))
+        f.write("\n")
+    raw = width * height * 4
+    print(f"sheet {width}x{height}: {raw} bytes a level, {raw * 4 // 3} with its mips; file {os.path.getsize(args.out)} bytes")
 
 
 if __name__ == "__main__":
