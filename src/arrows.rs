@@ -469,8 +469,11 @@ fn update_arrows(
         arrows.vel[i] = v;
         (arrows.yaw[i], arrows.pitch[i]) = flight_angles(v);
 
+        // Over the wall's pieces the whole step is read, not its end: a
+        // merlon or a rail is thinner than an arrow's step.
+        let wall_t = flight_hit(&terrain, prev, p);
         let ground = terrain.height_at(p.x, p.z);
-        if p.y.min(prev.y) > ground + strike_band {
+        if wall_t.is_none() && p.y.min(prev.y) > ground + strike_band {
             i += 1;
             continue;
         }
@@ -490,6 +493,10 @@ fn update_arrows(
             }
             let u = o.idx as usize;
             let t = ((o.xz() - a).dot(ab) / len2).clamp(0.0, 1.0);
+            // A man behind the stone the shaft strikes first is not hit.
+            if wall_t.is_some_and(|w| t > w) {
+                return;
+            }
             if o.xz().distance_squared(a + ab * t) > HIT_RADIUS * HIT_RADIUS {
                 return;
             }
@@ -526,6 +533,28 @@ fn update_arrows(
                 arrows.swap_remove(i);
                 continue;
             }
+        }
+
+        // Stone or ground over the wall's pieces, struck inside the step:
+        // planted where it struck.
+        if let Some(t) = wall_t {
+            let q = prev.lerp(p, t);
+            let dir = v.normalize_or_zero();
+            let yaw = dir.x.atan2(dir.z);
+            let pitch = dir.y.atan2(dir.xz().length());
+            stuck.push(InstanceData {
+                position: q - dir * 0.16,
+                w: 1.0,
+                color: [1.0, 1.0, 1.0, 0.0],
+                anim: [yaw, 0.0, 0.0, 0.0],
+                anim2: [0.0, 0.0, pitch, 0.0],
+            });
+            stats.landed += 1;
+            if let Some(se) = sounds.as_deref_mut() {
+                se.push_arrow_ground(q);
+            }
+            arrows.swap_remove(i);
+            continue;
         }
 
         // Ground: plant the shaft where it struck, angled as it flew.
@@ -738,6 +767,26 @@ fn sync_arrow_instances(
             anim2: [0.0, 0.0, arrows.pitch[i], 0.0],
         });
     }
+}
+
+/// Where in its step `a` to `b` an arrow over the wall's pieces strikes
+/// the floor or the stone under it, as the share of the step (0 to 1),
+/// None where it strikes nothing there or is not over the pieces. Read
+/// every fine cell (terrain.rs `fine`), so a merlon, a parapet or a rail
+/// in the step is met; skipped for an arrow above the tallest piece.
+fn flight_hit(terrain: &crate::terrain::Terrain, a: Vec3, b: Vec3) -> Option<f32> {
+    let f = terrain.fine()?;
+    if f.blocked(a.x, a.z).is_none() && f.blocked(b.x, b.z).is_none() {
+        return None;
+    }
+    if a.y.min(b.y) > terrain.ground_at(b.x, b.z) + crate::town_layout::TALLEST {
+        return None;
+    }
+    let n = ((b - a).xz().length() / crate::town_layout::FINE).ceil().max(1.0) as usize;
+    (1..=n).map(|k| k as f32 / n as f32).find(|&t| {
+        let q = a.lerp(b, t);
+        q.y <= terrain.height_at(q.x, q.z)
+    })
 }
 
 /// A shaft's heading and climb (radians) from its velocity.

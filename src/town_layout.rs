@@ -76,6 +76,8 @@ const RAIL: f32 = 0.5;
 /// gaps between (docs/plans/028-wall-models.md).
 const KERB: f32 = 0.5;
 const MERLON: f32 = 1.5;
+/// The highest any piece reaches over its ground (m): a drum's roof.
+pub const TALLEST: f32 = ROOF + MERLON;
 /// The house grid: columns and rows of centres on a 30 m pitch.
 const HOUSE_PITCH: f32 = 30.0;
 const HOUSE_COLS: i32 = 10;
