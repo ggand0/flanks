@@ -73,6 +73,10 @@ pub struct NavGrid {
     /// The cost tables built so far, one per regiment width (see
     /// `Costs`). Emptied whenever the grid changes.
     costs: std::sync::Mutex<Vec<std::sync::Arc<Costs>>>,
+    /// The terrain's fine ground over the wall's pieces (town_layout.rs
+    /// `FineGround`), where a man's straight line is read: he may stand
+    /// in a 2 m cell the grid calls unwalkable, beside a rail or a kerb.
+    fine: Option<std::sync::Arc<crate::town_layout::FineGround>>,
 }
 
 impl Clone for NavGrid {
@@ -91,6 +95,7 @@ impl Clone for NavGrid {
             has_water: self.has_water,
             heights: self.heights.clone(),
             costs: Default::default(),
+            fine: self.fine.clone(),
         }
     }
 }
@@ -162,6 +167,7 @@ impl NavGrid {
             has_water: false,
             heights: terrain.heights().to_vec(),
             costs: Default::default(),
+            fine: terrain.fine().cloned(),
         };
         grid.fill_cells(terrain, 0, 0, nx - 1, nz - 1);
         grid.has_water = grid.wet.iter().any(|&w| w);
@@ -226,7 +232,7 @@ impl NavGrid {
                 let i = z * self.nx + x;
                 let p = self.pos(i);
                 let inside = p.x >= lo.x && p.x <= hi.x && p.y >= lo.y && p.y <= hi.y;
-                self.walk[i] = inside && !terrain.blocked_at(p.x, p.y);
+                self.walk[i] = inside && !terrain.vertex_blocked_at(p.x, p.y);
                 let slope = terrain.slope_at(p.x, p.y);
                 let wade = terrain.wade_mult(p.x, p.y);
                 self.wet[i] = wade < 1.0;
@@ -386,7 +392,9 @@ impl NavGrid {
     /// as far as he looks (`SIGHT`). Marches along the line by the
     /// clearance: in open ground a few lookups cover the whole way, next
     /// to a wall it steps half a metre, so a look is at most about a
-    /// hundred lookups.
+    /// hundred lookups. Over the wall's pieces it reads the fine ground
+    /// and its clearance instead (town_layout.rs `FineGround::line_step`),
+    /// the ground his body stands on.
     pub fn walk_line(&self, a: Vec2, b: Vec2) -> bool {
         let d = b - a;
         let len = d.length();
@@ -399,6 +407,14 @@ impl NavGrid {
         let mut t = 0.0f32;
         loop {
             let q = a + dir * t.min(len);
+            if let Some(step) = self.fine.as_ref().and_then(|f| f.line_step(q)) {
+                let Some(step) = step else { return false };
+                if t >= len {
+                    return true;
+                }
+                t += step;
+                continue;
+            }
             let Some(i) = self.cell_at(q) else { return false };
             if !self.walk[i] {
                 return false;
@@ -982,6 +998,32 @@ fn octile(a: Vec2, b: Vec2) -> f32 {
 
 /// One-dimensional squared distance transform (Felzenszwalb and
 /// Huttenlocher): `out[q] = min_p (q - p)^2 + f[p]`.
+/// The Euclidean distance (m) from each cell of a `w` by `h` grid of
+/// `cell`-metre cells to the nearest cell that is not `open`, capped at
+/// `cap`; cells beyond the grid count as open. The transform of
+/// `clearance_window` over a whole grid of any cell size.
+pub(crate) fn clearance(open: &[bool], w: usize, h: usize, cell: f32, cap: f32) -> Vec<f32> {
+    let big = 1e12f64;
+    let mut f: Vec<f64> = open.iter().map(|&o| if o { big } else { 0.0 }).collect();
+    let n = w.max(h);
+    let (mut col, mut out, mut v, mut zz) = (vec![0.0f64; n], vec![0.0f64; n], vec![0usize; n], vec![0.0f64; n + 1]);
+    for x in 0..w {
+        for z in 0..h {
+            col[z] = f[z * w + x];
+        }
+        edt_1d(&col[..h], &mut out[..h], &mut v, &mut zz);
+        for z in 0..h {
+            f[z * w + x] = out[z];
+        }
+    }
+    for z in 0..h {
+        col[..w].copy_from_slice(&f[z * w..z * w + w]);
+        edt_1d(&col[..w], &mut out[..w], &mut v, &mut zz);
+        f[z * w..z * w + w].copy_from_slice(&out[..w]);
+    }
+    f.iter().map(|&d2| ((d2.sqrt() as f32) * cell).min(cap)).collect()
+}
+
 fn edt_1d(f: &[f64], out: &mut [f64], v: &mut [usize], z: &mut [f64]) {
     let n = f.len();
     if n == 0 {
