@@ -381,6 +381,9 @@ struct Walk {
     /// parked, he has arrived (`steer`).
     place_dist: f32,
     parked: bool,
+    /// His wish is the way round blocked ground on his regiment's route
+    /// (`follow_route`), not the straight way to his place.
+    rounding: bool,
     jam: f32,
     /// The press's hold on his body this tick (`steer`): the brake's value
     /// before a charge takes his own stopping away.
@@ -397,6 +400,7 @@ impl Walk {
         side: Vec2::ZERO,
         place_dist: f32::INFINITY,
         parked: false,
+        rounding: false,
         jam: 0.0,
         body_jam: 0.0,
         new_v: Vec2::ZERO,

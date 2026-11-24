@@ -14,7 +14,9 @@ use super::*;
 const JOIN_ROOM: f32 = 0.3;
 /// Under the friction contact the soldiers of a regiment under an Attack
 /// order do not step backward to their places (`hold_the_frame`), so a
-/// regiment that ran in behind a friend stays piled up.
+/// regiment that ran in behind a friend stays piled up. A soldier who
+/// follows the route round a wall or a block walks it whichever way it
+/// goes.
 fn pile_stays() -> bool {
     friction_contact()
 }
@@ -904,7 +906,9 @@ pub(super) fn hold_the_frame(f: &Field, st: &mut Step) {
     // Attack order that has not reached its fight yet: its soldiers who
     // ran in and piled up behind a friend stay where they are, they do not
     // walk backward to their places and open the pile again (`pile_stays`).
-    let attacking = pile_stays() && orders[gi].is_some() && !moving[gi];
+    // A man walking the route round blocked ground (`Walk::rounding`) is
+    // not going to his place: it is the way, not a step back to dress.
+    let attacking = pile_stays() && orders[gi].is_some() && !moving[gi] && !st.walk.rounding;
     if (contact[gi] || attacking) && !routed && form_face[gi] != Vec2::ZERO {
         let back = desired.dot(form_face[gi]);
         if back < 0.0 {

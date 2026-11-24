@@ -103,7 +103,9 @@ pub(super) fn drive(f: &Field, s: &mut Soldier, st: &mut Step) {
         let holding = orders[gi].is_none();
         let goal = orders[gi].unwrap_or(anchors[gi]) + home[i];
         st.walk.place_dist = goal.distance(p);
+        let place = goal;
         let (goal, through) = follow_route(f, s, st, goal);
+        st.walk.rounding = goal != place;
         let to_goal = goal - p;
         let dist = to_goal.length();
         // Hold deadzone: parked units don't jitter around their slot point
