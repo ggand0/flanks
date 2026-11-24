@@ -251,8 +251,28 @@ fn follow_route(f: &Field, s: &mut Soldier, st: &Step, goal: Vec2) -> (Vec2, boo
 /// reach and just inside it. Straight ahead and to the fight point he goes
 /// at the jog, or at the advance with a comrade ahead. "A comrade ahead" is
 /// his last look (`look_around`).
+///
+/// He goes that way only where he can walk it straight: on a map with
+/// blocked ground, a fight behind a wall, on its walk above him or across
+/// a cliff is reached by his regiment's route, so there he walks his slot
+/// wish, which follows the route (`follow_route`), instead. One straight
+/// line read on the planner's grid a call; none where no ground blocks.
 #[inline]
 pub(super) fn join_goal(f: &Field, s: &Soldier, st: &Step) -> (Vec2, Vec2) {
+    let (way, wish, toward) = join_way(f, s, st);
+    match f.paths.nav {
+        Some(nav) if toward != st.p && !nav.walk_line(st.p, toward) => {
+            (st.fight.slot_wish.normalize_or_zero(), st.fight.slot_wish)
+        }
+        _ => (way, wish),
+    }
+}
+
+/// `join_goal`'s way, wish and the point it heads for, before the test
+/// that he can walk there straight; the point is where he stands when he
+/// heads nowhere.
+#[inline]
+fn join_way(f: &Field, s: &Soldier, st: &Step) -> (Vec2, Vec2, Vec2) {
     let Field { pos_prev, engaged, hold, form_face, fight_line, .. } = *f;
     let i = s.i;
     let p = st.p;
@@ -268,12 +288,13 @@ pub(super) fn join_goal(f: &Field, s: &Soldier, st: &Step) -> (Vec2, Vec2) {
         let own = crate::units::hash01((i as u32).wrapping_mul(0x3C1B) ^ 0x51F7);
         let fight = FIGHT_SHARE * params.reach;
         let stop = fight + 0.8 * (params.reach - fight) * own;
+        let at = pos_prev[memo].xz();
         if dist <= stop || dist >= max_close {
-            return (dir, Vec2::ZERO);
+            return (dir, Vec2::ZERO, at);
         }
         let urge = ((dist - stop) / 0.8).clamp(0.0, 1.0);
         let pace = if dist > JOG_BEYOND && !ahead { COMBAT_JOG_PACE } else { ADVANCE_PACE };
-        (dir, to_enemy * (pace * urge / dist))
+        (dir, to_enemy * (pace * urge / dist), at)
     };
     let look = if engaged[gi] { seek_radius() } else { WIDE_ACQUIRE_R };
     let max_close = if hold[gi] { 2.2 } else { look + 1.0 };
@@ -284,7 +305,7 @@ pub(super) fn join_goal(f: &Field, s: &Soldier, st: &Step) -> (Vec2, Vec2) {
     let line = fight_line[gi];
     if behind_the_line(face, line, p, ready_body()) {
         let pace = if ahead { ADVANCE_PACE } else { COMBAT_JOG_PACE };
-        return (face, face * pace);
+        return (face, face * pace, p + face * (line - p.dot(face)));
     }
     if counts {
         return to_foe(max_close);
@@ -294,11 +315,11 @@ pub(super) fn join_goal(f: &Field, s: &Soldier, st: &Step) -> (Vec2, Vec2) {
         let d = to_fp.length();
         if d > 1.0 {
             let pace = if ahead { ADVANCE_PACE } else { COMBAT_JOG_PACE };
-            return (to_fp / d, to_fp * (pace / d));
+            return (to_fp / d, to_fp * (pace / d), fp);
         }
-        return (to_fp.normalize_or_zero(), Vec2::ZERO);
+        return (to_fp.normalize_or_zero(), Vec2::ZERO, fp);
     }
-    (Vec2::ZERO, Vec2::ZERO)
+    (Vec2::ZERO, Vec2::ZERO, p)
 }
 
 /// Whether a soldier at `p` stands more than `body` behind his regiment's
