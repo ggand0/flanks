@@ -132,8 +132,12 @@ pub(super) fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut
     gather_candidates(f.grid, p, i, my_team_bit, scan_r, spear.foe_cut(params), cands);
     let grid = f.grid;
     let sorted = grid.sorted();
+    let levels = Levels::new(f, i);
     for &o_rank in cands.iter() {
         let o = &sorted[o_rank as usize];
+        if levels.apart(f, o.idx) {
+            continue;
+        }
         let o_vel = grid.sorted_vel(o_rank as usize);
         let d = p - o.xz();
         let d2 = d.length_squared();
@@ -165,6 +169,37 @@ pub(super) fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut
     st.scan.scan_r = scan_r;
     st.scan.my_team_bit = my_team_bit;
     obstacles.hand_on(s, st, widths[pose_lv].sep);
+}
+
+/// Two men on different levels: on a map with cliffs (a wall's walk and
+/// the ground at its foot, a raised block), a neighbour close in plan may
+/// stand a storey above or below. Their bodies meet only where they
+/// overlap in height, so a man whose middle is more than the two half
+/// heights above or below his own is no body he touches, no man in his
+/// reach and no part of the crowd round him. Where no ground blocks there
+/// is no cliff and no such pair, and nothing is read.
+pub(super) struct Levels {
+    on: bool,
+    y: f32,
+    hh: f32,
+}
+
+impl Levels {
+    #[inline]
+    pub(super) fn new(f: &Field, i: usize) -> Self {
+        let on = f.terrain.kind.has_blocked_ground();
+        let hh = if on { crate::unit_types::half_height(f.kind[i] as usize) } else { 0.0 };
+        Levels { on, y: f.pos_prev[i].y, hh }
+    }
+
+    /// Whether man `o` stands on another level from this one.
+    #[inline(always)]
+    pub(super) fn apart(&self, f: &Field, o: u32) -> bool {
+        self.on && {
+            let o = o as usize;
+            (f.pos_prev[o].y - self.y).abs() >= self.hh + crate::unit_types::half_height(f.kind[o] as usize)
+        }
+    }
 }
 
 /// One neighbour as the scan reads him: his row in the grid and his
