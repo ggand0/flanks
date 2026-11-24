@@ -179,7 +179,7 @@ pub struct TickJob {
     pub(crate) shoot_at: Vec<Option<ShootAt>>,
     /// Per regiment: under fire this tick (some regiment's bows aim at it).
     pub(crate) targeted: Vec<bool>,
-    pub(crate) blocks: [Vec<(Vec2, f32, f32)>; 2],
+    pub(crate) blocks: [Vec<crate::arrows::LoftBlock>; 2],
     pub(crate) faces_spearwall: [bool; 2],
     // Products of the run beyond the columns, all swapped into their
     // resources when the job is taken or installed.
@@ -342,9 +342,9 @@ struct FireSolutions {
     search_blocks: Vec<Vec<u32>>,
     /// Per regiment under search: the shooters' blocks near it.
     clear_blocks: Vec<Vec<crate::formation::BlockRect>>,
-    /// Friendly formed blocks per team as discs with a clearance ceiling,
+    /// Friendly formed blocks per team with a clearance ceiling,
     /// for the loft-over-friendlies check.
-    blocks: [Vec<(Vec2, f32, f32)>; 2],
+    blocks: [Vec<crate::arrows::LoftBlock>; 2],
 }
 
 /// Fill `job` from the live world: the shared columns, the per-regiment
@@ -1739,30 +1739,27 @@ fn clear_blocks_near(
     clear_blocks
 }
 
-/// Each team's live formed regiments as discs with a clearance ceiling.
+/// Each team's live formed regiments as blocks with a clearance ceiling.
 #[inline]
-fn loft_blocks(groups: &Groups, terrain: &Terrain) -> [Vec<(Vec2, f32, f32)>; 2] {
+fn loft_blocks(groups: &Groups, terrain: &Terrain) -> [Vec<crate::arrows::LoftBlock>; 2] {
     // Friendly blocks per team for the loft-over-friendlies check: every
-    // live formed regiment as a disc with a clearance ceiling. A
-    // shooter's own regiment is in here too — that is what makes rear
-    // ranks loft over their own front rank. The ceiling is 1.3 m over the
-    // heads at the disc's centre.
+    // live formed regiment as its block (`formation::block_rect`) with a
+    // clearance ceiling. A shooter's own regiment is in here too: that is
+    // what makes rear ranks loft over their own front rank, and a line one
+    // rank deep has nothing of its own before it. The ceiling is 1.3 m
+    // over the heads at the block's centre.
     let ceiling = crate::unit_types::tallest() + 1.3;
-    let blocks: [Vec<(Vec2, f32, f32)>; 2] = [0u8, 1u8].map(|tm| {
+    [0u8, 1u8].map(|tm| {
         groups
             .list
             .iter()
             .filter(|g| g.team == tm && g.count > 0 && !g.state.is_broken())
-            .map(|g| {
-                (
-                    g.centroid,
-                    g.radius.max(3.0),
-                    terrain.height_at(g.centroid.x, g.centroid.y) + ceiling,
-                )
+            .map(|g| crate::arrows::LoftBlock {
+                rect: crate::formation::block_rect(g),
+                top: terrain.height_at(g.centroid.x, g.centroid.y) + ceiling,
             })
             .collect()
-    });
-    blocks
+    })
 }
 
 /// How far a shaft aimed at a man can come down from him: the corner of

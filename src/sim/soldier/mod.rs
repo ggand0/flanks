@@ -115,7 +115,7 @@ pub(crate) struct Field<'a> {
     /// The death column at the tick's start: another man's life, read
     /// by the archer who picks him.
     pub death_snap: &'a [u8],
-    pub blocks: &'a [Vec<(Vec2, f32, f32)>; 2],
+    pub blocks: &'a [Vec<crate::arrows::LoftBlock>; 2],
     pub faces_spearwall: [bool; 2],
     pub dt: f32,
     pub tick_seed: u32,

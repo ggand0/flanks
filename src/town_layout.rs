@@ -70,6 +70,12 @@ pub const STAIR_W: f32 = 4.0;
 /// The stair's rail: this thick, along the flight's open side and across
 /// the platform's far end.
 const RAIL: f32 = 0.5;
+/// How far the stair's rail, the walk's inner kerb and its outer parapet
+/// rise over the floor beside them (m), and the merlons' tips over the
+/// walk: one merlon 1 m wide at the middle of each 2 m wall unit, 1 m
+/// gaps between (docs/plans/028-wall-models.md).
+const KERB: f32 = 0.5;
+const MERLON: f32 = 1.5;
 /// The house grid: columns and rows of centres on a 30 m pitch.
 const HOUSE_PITCH: f32 = 30.0;
 const HOUSE_COLS: i32 = 10;
@@ -182,6 +188,23 @@ impl Piece {
     pub fn raise_clamped(&self, p: Vec2) -> f32 {
         let (lo, hi) = self.local_bounds();
         self.raise_local(self.local(p).clamp(lo, hi)).unwrap_or(0.0)
+    }
+
+    /// The top of the piece's solid part at `p` over the ground: the walk's
+    /// inner kerb and outer parapet, the merlons, the stair's rail, a
+    /// drum's or the gatehouse's roof, a house's eaves. What an arrow
+    /// meets there (arrows.rs `arc_clears`).
+    pub fn top(&self, p: Vec2) -> f32 {
+        let (lo, hi) = self.local_bounds();
+        let l = self.local(p).clamp(lo, hi);
+        match self.kind {
+            Kind::Wall | Kind::Landing if l.y > 3.0 => {
+                WALK + if l.x.abs() <= 0.5 { MERLON } else { KERB }
+            }
+            Kind::Wall | Kind::Landing => WALK + KERB,
+            Kind::Stair => WALK * (l.x / 12.0).clamp(0.0, 1.0) + KERB,
+            _ => self.raise_clamped(p),
+        }
     }
 
     /// The rise per metre of the piece's floor at `p`, as a world vector:
@@ -593,12 +616,19 @@ impl FineGround {
     }
 
     /// On the grid: the height the pieces add over the drawn ground at
-    /// `(x, z)`, nothing off them.
+    /// `(x, z)`, nothing off them: a floor's height on a clear cell, the
+    /// top of the solid part on a solid one (`Piece::top`).
     #[inline]
     pub fn raise(&self, x: f32, z: f32) -> Option<f32> {
         let i = self.index(x, z)?;
         let k = self.piece[i];
-        Some(if k == NO_PIECE { 0.0 } else { self.pieces[k as usize].raise_clamped(Vec2::new(x, z)) })
+        Some(if k == NO_PIECE {
+            0.0
+        } else if self.flags[i] & F_SOLID != 0 {
+            self.pieces[k as usize].top(Vec2::new(x, z))
+        } else {
+            self.pieces[k as usize].raise_clamped(Vec2::new(x, z))
+        })
     }
 
     /// On the grid: the rise per metre the pieces add at `(x, z)`, as a

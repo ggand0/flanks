@@ -249,91 +249,133 @@ fn setup_arrow_buckets(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>)
     ));
 }
 
+/// A friendly regiment as the loft test reads it: its block as it stands
+/// and the height an arc must clear over it, 1.3 m over the heads at its
+/// centre (sim/job.rs `loft_blocks`).
+#[derive(Clone, Copy)]
+pub struct LoftBlock {
+    pub rect: crate::formation::BlockRect,
+    pub top: f32,
+}
+
 /// Solve a launch velocity from `from` to `to` (M2TW model: the engine
 /// picks a speed in the 20..48 m/s band and an arc that fits). The flat
 /// low-root solution at full draw when the path clears every friendly
-/// block AND the terrain en route; otherwise the slowest lofted arc
-/// that reaches — a high lob just over the crowd (M2TW's
-/// loft-over-friendlies; the ~65 degree max angle emerges from the
-/// speed floor). `blocks` = friendly regiment discs as
-/// (centroid, radius, clearance top y).
-pub fn solve_launch(
-    from: Vec3,
-    to: Vec3,
-    blocks: &[(Vec2, f32, f32)],
-    terrain: &crate::terrain::Terrain,
-) -> Vec3 {
+/// block and the ground en route; otherwise the slowest lofted arc that
+/// reaches, a high lob just over the crowd (M2TW's loft-over-friendlies;
+/// the ~65 degree max angle emerges from the speed floor), when that arc
+/// clears the ground; otherwise None: no arc reaches the man without
+/// striking the ground, a wall, its parapet or its merlons first, and
+/// the archer does not loose at him. `blocks` are the shooter's side's
+/// regiments (`LoftBlock`): an arc lofts over a block whose centre it
+/// passes over too low, so a one-rank line shooting out over nothing of
+/// its own shoots flat.
+pub fn solve_launch(from: Vec3, to: Vec3, blocks: &[LoftBlock], terrain: &crate::terrain::Terrain) -> Option<Vec3> {
     let flat = to.xz() - from.xz();
     let d = flat.length().max(0.5);
     let dir = flat / d;
     let dy = to.y - from.y;
     let g = missile::GRAVITY;
+    let arc_y = |s: f32, tan: f32, vv: f32| from.y + s * tan - g * s * s * (1.0 + tan * tan) / (2.0 * vv);
 
     let mut vv = missile::SPEED_MAX * missile::SPEED_MAX;
     let disc = vv * vv - g * (g * d * d + 2.0 * dy * vv);
-    let mut tan = f32::MAX;
     let mut lofted = disc <= 0.0;
+    let mut tan = f32::MAX;
     if !lofted {
         tan = (vv - disc.sqrt()) / (g * d);
-        // Does the flat arc clear the friendlies under it? Height of the
-        // parabola at forward distance x: x*tan - g*x^2*(1+tan^2)/(2*vv).
-        for &(c, r, top) in blocks {
-            let s = (c - from.xz()).dot(dir);
-            if s < 2.0 || s > d - 2.0 {
+        // Does the flat arc clear the friendlies under it? Read where it
+        // passes the block's centre, where its heads stand and its
+        // ceiling is measured, when the line's point nearest that centre
+        // lies on the block: a line one rank deep, shot along at a slant,
+        // has its centre off to the side of the shot.
+        for b in blocks {
+            let s = (b.rect.centre - from.xz()).dot(dir);
+            if !(2.0..=d - 2.0).contains(&s) {
                 continue;
             }
-            let lat = (c - from.xz()).perp_dot(dir).abs();
-            if lat > r {
+            if b.rect.distance(from.xz() + dir * s) > 0.0 {
                 continue;
             }
-            let y = from.y + s * tan - g * s * s * (1.0 + tan * tan) / (2.0 * vv);
-            if y < top {
+            if arc_y(s, tan, vv) < b.top {
                 lofted = true;
                 break;
             }
         }
     }
-    if !lofted {
-        // Terrain line of sight: ground RISING above the shooter's feet
-        // blocks the flat shot — firing up a slope, the flat arc threads
-        // exactly where the uphill front rank's heads are (rear archers
-        // shot their own front rows), or straight into the hillside.
-        // Only raised ground counts: flat fields keep their flat
-        // volleys, downhill stays a sniping shot, and the last meters
-        // are exempt (the arrow has to come down on the target). The
-        // arc must clear a head standing on any such rise.
-        let from_ground = terrain.height_at(from.x, from.z);
-        let head = crate::unit_types::tallest() + 0.2;
-        let step = (d / 24.0).max(4.0);
-        let mut s = 2.0_f32;
-        while s < d - 4.0 {
-            let p = from.xz() + dir * s;
-            let g_s = terrain.height_at(p.x, p.y);
-            if g_s > from_ground + 0.35 {
-                let y = from.y + s * tan - g * s * s * (1.0 + tan * tan) / (2.0 * vv);
-                if y < g_s + head {
-                    lofted = true;
-                    break;
-                }
-            }
-            s += step;
-        }
+    // Ground RISING above the shooter's feet blocks the flat shot where
+    // the arc passes under a head standing on it: firing up a slope, the
+    // flat arc threads exactly where the uphill front rank's heads are
+    // (rear archers shot their own front rows), or into the hillside.
+    // Only ground a man stands on counts; flat fields keep their flat
+    // volleys and downhill stays a sniping shot.
+    let to_ground = terrain.height_at(to.x, to.z);
+    if !lofted && !arc_clears(from, dir, d, to_ground, |s| arc_y(s, tan, vv), terrain, true) {
+        lofted = true;
     }
     if lofted {
         // Slowest speed that still reaches -> the high root sits near
         // the minimum-energy 45 degrees, +15% keeps it a clean lob
         // instead of a grazing edge case.
         let vmin2 = g * (dy + (dy * dy + d * d).sqrt());
-        vv = (vmin2 * 1.15).clamp(
-            missile::SPEED_MIN * missile::SPEED_MIN,
-            missile::SPEED_MAX * missile::SPEED_MAX,
-        );
+        vv = (vmin2 * 1.15).clamp(missile::SPEED_MIN * missile::SPEED_MIN, missile::SPEED_MAX * missile::SPEED_MAX);
         let disc = vv * vv - g * (g * d * d + 2.0 * dy * vv);
         tan = (vv + disc.max(0.0).sqrt()) / (g * d);
+        if !arc_clears(from, dir, d, to_ground, |s| arc_y(s, tan, vv), terrain, false) {
+            return None;
+        }
     }
     let cos = 1.0 / (1.0 + tan * tan).sqrt();
     let speed = vv.sqrt();
-    Vec3::new(dir.x * speed * cos, speed * tan * cos, dir.y * speed * cos)
+    Some(Vec3::new(dir.x * speed * cos, speed * tan * cos, dir.y * speed * cos))
+}
+
+/// The arc `arc_y` (height at distance s along the line) from `from`
+/// along `dir` for `d` metres to a man standing on ground `to_ground`
+/// stays above the ground under it, and with `heads` above a head
+/// standing on ground that rises above the shooter's feet. Over the last
+/// `NEAR_TARGET` metres the shaft comes down on the man, so ground there
+/// no higher than his own does not count; a wall or its battlements
+/// before him do. Read every `d / 24` metres and at least every 4, and
+/// over the wall's pieces every fine cell (terrain.rs `fine`), so a
+/// parapet, a merlon or a wall's face in the way is met.
+fn arc_clears(
+    from: Vec3,
+    dir: Vec2,
+    d: f32,
+    to_ground: f32,
+    arc_y: impl Fn(f32) -> f32,
+    terrain: &crate::terrain::Terrain,
+    heads: bool,
+) -> bool {
+    /// The stretch before the man where the shaft comes down on him.
+    const NEAR_TARGET: f32 = 4.0;
+    let from_ground = terrain.height_at(from.x, from.z);
+    let head = crate::unit_types::tallest() + 0.2;
+    let coarse = (d / 24.0).max(4.0);
+    let fine = terrain.fine();
+    // Over the wall's pieces from just past his own body: the parapet or
+    // the merlon he stands behind is less than a metre before him. The
+    // vertex grid has nothing that near, and its reads start 2 m out. His
+    // own rank's heads count from 2 m.
+    let mut s = if fine.is_some() { crate::town_layout::FINE } else { 2.0 };
+    while s < d {
+        let p = from.xz() + dir * s;
+        let g_s = terrain.height_at(p.x, p.y);
+        let y = arc_y(s);
+        let near = s >= d - NEAR_TARGET;
+        if near && g_s <= to_ground + 0.35 {
+            // His own ground: the shaft lands on him there.
+        } else if y < g_s {
+            return false;
+        }
+        if !near && heads && s >= 2.0 && g_s > from_ground + 0.35 && y < g_s + head && !terrain.blocked_at(p.x, p.y) {
+            return false;
+        }
+        let on_pieces = fine.is_some_and(|f| f.blocked(p.x, p.y).is_some());
+        s += if on_pieces { crate::town_layout::FINE } else { coarse };
+    }
+    true
 }
 
 #[allow(clippy::too_many_arguments)] // bevy system params

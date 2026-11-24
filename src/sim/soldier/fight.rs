@@ -394,17 +394,15 @@ fn loose(f: &Field, s: &mut Soldier, st: &Step, out: &mut ChunkOut, shot: &crate
             + crate::arrows::AIM_HEIGHT * crate::unit_types::tallest(),
         aim.y,
     );
-    out.arrows.push(crate::arrows::ArrowSpawn {
-        pos: from,
-        vel: crate::arrows::solve_launch(
-            from,
-            to,
-            &blocks[team[i] as usize],
-            terrain,
-        ),
-        team: team[i],
-        group: group[i],
-    });
+    // No arc reaches the man without striking the ground, the wall or its
+    // battlements first: he lowers the bow and draws at another man.
+    let Some(vel) = crate::arrows::solve_launch(from, to, &blocks[team[i] as usize], terrain) else {
+        *s.quarry = u32::MAX;
+        *s.swing = crate::units::SWING_RECOVER;
+        *s.swing_t = crate::unit_types::missile::CANCEL_TICKS;
+        return;
+    };
+    out.arrows.push(crate::arrows::ArrowSpawn { pos: from, vel, team: team[i], group: group[i] });
     *s.ammo = s.ammo.saturating_sub(1);
     *s.swing = crate::units::SWING_RECOVER;
     // Reload: the M2TW volley cycle is animation-bound at
@@ -719,7 +717,7 @@ fn pick_quarry(
     };
     let keeps =
         crate::units::hash01((i as u32).wrapping_mul(0x9E37) ^ 0x1B3D) < KEEP_QUARRY_SHARE;
-    if keeps && quarry_ok(f, p, my_team, reach2, shot, blocks, *s.quarry) {
+    if keeps && quarry_ok(f, p, my_team, reach2, shot, blocks, *s.quarry) && can_hit(f, i, p, *s.quarry) {
         return Some(*s.quarry);
     }
     if !tick.wrapping_add((i as u32).wrapping_mul(7)).is_multiple_of(QUARRY_LOOK_TICKS) {
@@ -736,11 +734,27 @@ fn pick_quarry(
                 ^ (i as u32).wrapping_mul(0x7F4A_7C15).wrapping_add(k.wrapping_mul(0x2545_F491)),
         );
         let m = list[((h * list.len() as f32) as usize).min(list.len() - 1)];
-        if quarry_ok(f, p, my_team, reach2, shot, blocks, m) {
+        if quarry_ok(f, p, my_team, reach2, shot, blocks, m) && can_hit(f, i, p, m) {
             return Some(m);
         }
     }
     None
+}
+
+/// Whether archer `i` at `p` has an arc to man `m` as he stands
+/// (`arrows::solve_launch`): none for a man behind a wall, or under its
+/// battlements below him. He draws only at a man he can hit, or a slow
+/// archer in a crowd would plant his feet to draw at men he cannot reach,
+/// over and over. One launch solve a try.
+#[inline]
+fn can_hit(f: &Field, i: usize, p: Vec2, m: u32) -> bool {
+    let Field { terrain, pos_prev, kind, team, blocks, .. } = *f;
+    let m = m as usize;
+    let over = crate::unit_types::half_height(kind[i] as usize) + crate::arrows::LAUNCH_OVER_HEAD;
+    let from = Vec3::new(p.x, pos_prev[i].y + over, p.y);
+    let at = pos_prev[m].xz();
+    let to = Vec3::new(at.x, terrain.height_at(at.x, at.y) + crate::arrows::AIM_HEIGHT * crate::unit_types::tallest(), at.y);
+    crate::arrows::solve_launch(from, to, &blocks[team[i] as usize], terrain).is_some()
 }
 
 /// A waiting man's sidestep: in some one-second windows he steps toward
