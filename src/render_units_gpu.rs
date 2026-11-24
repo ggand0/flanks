@@ -1656,7 +1656,7 @@ fn pull_vertices(mesh: &Mesh) -> Option<(Vec<PullVertex>, bool)> {
 /// Render-world side of `PullMesh`: the corners in a storage buffer.
 #[derive(Component)]
 pub struct PullMeshGpu {
-    vertices: Buffer,
+    pub(crate) vertices: Buffer,
     /// The indexed form: its vertices (storage) and its group list.
     indexed: Option<(Buffer, Buffer)>,
     /// The same for the shadow casters (`PullMesh::cast`), else `indexed`.
