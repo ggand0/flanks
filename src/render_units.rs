@@ -601,8 +601,8 @@ fn setup_unit_mesh(
             // pulled draw. Its instance data stays, and stays empty.
             let last = lod == NUM_LODS - 1;
             let cast_source = model.cast_last.as_ref().filter(|_| last);
-            let fallen = model.fallen_last.as_ref().filter(|_| last);
-            let pulled = pull_mesh_for(&mesh, &bucket, &gpu, cast_source, last && model.light_last, fallen);
+            let card = model.fallen_last.as_ref().zip(model.sprite_table.as_deref()).filter(|_| last);
+            let pulled = pull_mesh_for(&mesh, &bucket, &gpu, cast_source, last && model.light_last, card);
             let mut entity = commands.spawn((
                 Mesh3d(meshes.add(mesh)),
                 InstanceMaterialData::default(),
@@ -1860,12 +1860,15 @@ impl SpecializedRenderPipeline for CustomPipeline {
             descriptor.vertex.shader_defs.push("UNIT_SPRITE".into());
             if let Some(fragment) = descriptor.fragment.as_mut() {
                 fragment.shader_defs.push("UNIT_SPRITE".into());
+                // FL_SPRITE=2 writes the samples it covers itself
+                // (unit_instancing.wgsl `SpriteFragment`).
                 if key.shape.sprite == 2 {
                     fragment.shader_defs.push("UNIT_SPRITE_A2C".into());
+                    fragment.shader_defs.push(bevy::shader::ShaderDefVal::UInt(
+                        "UNIT_SPRITE_SAMPLES".into(),
+                        descriptor.multisample.count,
+                    ));
                 }
-            }
-            if key.shape.sprite == 2 {
-                descriptor.multisample.alpha_to_coverage_enabled = true;
             }
         }
         atlas_defs(&mut descriptor, key.atlas);

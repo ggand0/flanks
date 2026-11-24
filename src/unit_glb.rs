@@ -160,6 +160,8 @@ pub struct KindMeshes {
     /// level, which the dying and the fallen at that level keep.
     pub sprite: Option<Image>,
     pub fallen_last: Option<Mesh>,
+    /// `FL_SPRITE`: the card's table of the sheet's layout (`sprite_table`).
+    pub sprite_table: Option<Vec<[f32; 4]>>,
 }
 
 impl KindMeshes {
@@ -174,6 +176,7 @@ impl KindMeshes {
             cast_last: None,
             sprite: None,
             fallen_last: None,
+            sprite_table: None,
         }
     }
 }
@@ -493,15 +496,19 @@ fn import(kind: usize, path: &Path, pulled: bool) -> Fallible<KindMeshes> {
     // FL_SPRITE: the file's last level becomes a card, and keeps only its
     // shadow casters and the dying and the fallen.
     let mut sprite = None;
+    let mut sprite_rows = None;
     let mut fallen_last = None;
     if sprite_mode() != 0 && pulled && levels[last].is_some() {
-        match sprite_sheet() {
-            Ok(image) => sprite = Some(image),
+        match sprite_table(kind, rig.bow.params[3] > 0.5).and_then(|rows| Ok((rows, sprite_sheet()?))) {
+            Ok((rows, image)) => {
+                sprite_rows = Some(rows);
+                sprite = Some(image);
+            }
             Err(e) => error!("FL_SPRITE: {e}; drawing the file's last level"),
         }
     }
     if sprite.is_some() && let Some(file) = levels[last].take() {
-        levels[last] = Some(card_level(kind, scale, half_height));
+        levels[last] = Some(card_level());
         cast_last = Some(level_mesh(&file));
         fallen_last = Some(level_mesh(&file));
         info!("{name}: the last level is a card (FL_SPRITE={})", sprite_mode());
@@ -531,13 +538,15 @@ fn import(kind: usize, path: &Path, pulled: bool) -> Fallible<KindMeshes> {
         light_last,
         cast_last,
         sprite,
+        sprite_table: sprite_rows,
         fallen_last,
     })
 }
 
-/// `FL_SPRITE`: 0 off (the default), 1 every living soldier at the last
-/// level is drawn as a card cut out by a plain discard, 2 the same cut out
-/// by alpha to coverage. GPU path only. Read once, at import. The last
+/// `FL_SPRITE`: 0 off (the default), 1 every standing soldier at the last
+/// level is drawn as a card that covers whole pixels, 2 the same card
+/// covering single samples of a pixel (unit_instancing.wgsl
+/// `SpriteFragment`). GPU path only. Read once, at import. The last
 /// level then begins `FL_SPRITE_FROM` metres from the camera, 400 by
 /// default (render_units.rs `LodConfig::sprite_from`), unless `FL_LOD_PX`
 /// is given, which sets every switch in pixels as without the card.
@@ -546,25 +555,114 @@ pub fn sprite_mode() -> u32 {
     *MODE.get_or_init(|| crate::util::env_or("FL_SPRITE", 0_u32).min(2))
 }
 
-/// Per kind, the card's quad in the model's metres (x left to right as
-/// the camera sees his front, y from the feet up) and its rect in the
-/// sprite sheet (u from, u to, v of the top, v of the feet): x0, x1, y0,
-/// y1, u0, u1, v0, v1. Printed by tools/sprite_sheet.py for the sheet it
-/// writes.
-const SPRITE_CARDS: [[f32; 8]; NUM_KINDS] = [
-    [-0.5455, 0.6818, 0.0000, 1.8182, 0.01562, 0.12109, 0.37500, 1.00000],
-    [-0.5114, 0.6364, 0.0000, 1.8182, 0.14355, 0.24219, 0.37500, 1.00000],
-    [-0.4318, 0.6250, 0.0000, 2.9091, 0.27539, 0.36621, 0.00000, 1.00000],
-    [-0.4091, 0.4091, 0.0000, 1.8182, 0.40234, 0.47266, 0.37500, 1.00000],
+/// The sprite sheet's layout (assets/units/sprites.json, written with the
+/// sheet by tools/sprite_sheet.py). Per kind one cell per (camera height,
+/// direction around the man, frame), each just large enough for him.
+#[derive(serde::Deserialize)]
+struct SpriteLayout {
+    width: u32,
+    height: u32,
+    /// Camera heights above the horizon the cells are drawn from, degrees.
+    elevations: Vec<f32>,
+    /// Directions around the man, evenly spaced from his front.
+    directions: u32,
+    /// The family names, in the order of the shader's ids
+    /// (`SPRITE_FAMILIES`).
+    families: Vec<String>,
+    speeds: SpriteSpeeds,
+    kinds: Vec<SpriteKind>,
+}
+
+#[derive(serde::Deserialize)]
+struct SpriteSpeeds {
+    /// Below this ground speed, m/s, a man shows his standing frames.
+    stand_below: f32,
+    /// From this ground speed on, his run.
+    run_from: f32,
+}
+
+#[derive(serde::Deserialize)]
+struct SpriteKind {
+    name: String,
+    /// Frames per view.
+    frames: u32,
+    /// Per family, its first frame and its frame count.
+    families: Vec<[u32; 2]>,
+    /// The team cloth's hue, the cloth's mean colour over its grey with the
+    /// largest channel 1: the shader tints the cloth's grey by the team
+    /// colour times this.
+    cloth: [f32; 3],
+    /// Per cell, in the order (camera height, direction, frame): its rect
+    /// in the sheet's left half in pixels (x, y, width, height), and what
+    /// it shows in metres from his centre, from x0 to x1 along the
+    /// camera's right and from y0 to y1 along its up.
+    cells: Vec<[f32; 8]>,
+}
+
+/// The shader's family ids (unit_instancing.wgsl `sprite_frame`).
+const SPRITE_FAMILIES: [&str; 13] = [
+    "stand", "ready", "wall", "bowup", "walk", "walk_level", "run", "run_level", "stab", "swing", "shot",
+    "stagger", "cheer",
 ];
 
-/// The sprite sheet: one row of eight cells, the four kinds' pictures (rgb
-/// colour with the team cloth grey, alpha the cut-out), then the four
-/// kinds' team masks in alpha, the mask of a picture half a sheet to its
-/// right (unit_instancing.wgsl `UNIT_SPRITE`). Read and given its mips as
-/// a model's atlas is. The sheet is a placeholder: tools/sprite_sheet.py
-/// draws it from each kind's nearest level in its rest pose, seen from
-/// the front.
+/// Rows of a kind's sprite table before its cells (`sprite_table`), an
+/// even count so each cell's two rows fill one card vertex.
+pub const SPRITE_HEAD_ROWS: usize = 12;
+
+/// `FL_SPRITE`: per kind, the rows the card's vertex shader reads the
+/// sheet's layout from (unit_instancing.wgsl `sprite_row`): 0 frames per
+/// view, directions and camera heights, 1 the camera heights in radians,
+/// 2 the speeds the family pick switches at and 1 for a bow kind, 3 the cloth's hue, 4 to 10
+/// two families a row, each its first frame and its frame count, 11
+/// unused; then two rows a cell, its rect in uv (u, v of its top left
+/// corner, its width and height) and its box in metres.
+fn sprite_table(kind: usize, bow: bool) -> Fallible<Vec<[f32; 4]>> {
+    let path = crate::util::game_root().join("assets/units/sprites.json");
+    let bytes = crate::game_files::read(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let layout: SpriteLayout =
+        serde_json::from_slice(&bytes).map_err(|e| format!("cannot parse {}: {e}", path.display()))?;
+    if layout.families.iter().map(String::as_str).ne(SPRITE_FAMILIES) {
+        return Err(format!("{} lists other families than the shader picks", path.display()));
+    }
+    if layout.elevations.is_empty() || layout.elevations.len() > 4 || layout.directions == 0 {
+        return Err(format!("{}: one to four camera heights and some directions", path.display()));
+    }
+    let k = layout
+        .kinds
+        .iter()
+        .find(|k| k.name == KIND_FILE[kind])
+        .ok_or(format!("{} has no {}", path.display(), KIND_FILE[kind]))?;
+    let views = layout.elevations.len() * layout.directions as usize;
+    if k.cells.len() != views * k.frames as usize || k.families.len() != SPRITE_FAMILIES.len() {
+        return Err(format!("{}: {} has {} cells and {} families", path.display(), k.name, k.cells.len(), k.families.len()));
+    }
+    let (w, h) = (layout.width as f32, layout.height as f32);
+    let mut elevations = [0.0; 4];
+    for (e, deg) in elevations.iter_mut().zip(&layout.elevations) {
+        *e = deg.to_radians();
+    }
+    let mut rows = vec![
+        [k.frames as f32, layout.directions as f32, layout.elevations.len() as f32, 0.0],
+        elevations,
+        [layout.speeds.stand_below, layout.speeds.run_from, if bow { 1.0 } else { 0.0 }, 0.0],
+        [k.cloth[0], k.cloth[1], k.cloth[2], 0.0],
+    ];
+    for pair in k.families.chunks(2) {
+        let second = pair.get(1).copied().unwrap_or([0, 1]);
+        rows.push([pair[0][0] as f32, pair[0][1] as f32, second[0] as f32, second[1] as f32]);
+    }
+    rows.resize(SPRITE_HEAD_ROWS, [0.0; 4]);
+    for c in &k.cells {
+        rows.push([c[0] / w, c[1] / h, c[2] / w, c[3] / h]);
+        rows.push([c[4], c[5], c[6], c[7]]);
+    }
+    Ok(rows)
+}
+
+/// The sprite sheet (tools/sprite_sheet.py): rgb the colour outside the
+/// team cloth and alpha the cut-out in its left half, and half a sheet to
+/// the right of each texel its normal in rgb and the cloth's grey in
+/// alpha. Read and given its mips as a model's atlas is.
 fn sprite_sheet() -> Fallible<Image> {
     let path = crate::util::game_root().join("assets/units/sprites.png");
     let bytes = crate::game_files::read(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
@@ -588,20 +686,19 @@ fn sprite_sheet() -> Fallible<Image> {
     Ok(image)
 }
 
-/// The card: two triangles in the plane of his facing, from `SPRITE_CARDS`
-/// scaled as the model is, feet at `-half_height`. Every corner is on the
-/// body, part 0. The vertex shader turns it to face the camera about the
-/// vertical through his position (unit_instancing.wgsl `sprite_output`).
-fn card_level(kind: usize, scale: f32, half_height: f32) -> Level {
-    let [x0, x1, y0, y1, u0, u1, v0, v1] = SPRITE_CARDS[kind];
-    let corner = |x: f32, y: f32| Vec3::new(scale * x, scale * y - half_height, 0.0);
+/// The card: a unit square, x and y from 0 to 1, which the vertex shader
+/// stretches over the cell's box and turns to face the camera about his
+/// centre (unit_instancing.wgsl `sprite_output`). Every corner is on the
+/// body, part 0.
+fn card_level() -> Level {
+    let corner = |x: f32, y: f32| Vec3::new(x, y, 0.0);
     Level {
-        pos: vec![corner(x0, y0), corner(x1, y0), corner(x1, y1), corner(x0, y1)],
+        pos: vec![corner(0.0, 0.0), corner(1.0, 0.0), corner(1.0, 1.0), corner(0.0, 1.0)],
         nrm: vec![Vec3::Z; 4],
         part: vec![0.0; 4],
-        pivot: vec![-half_height; 4],
+        pivot: vec![0.0; 4],
         col: vec![[1.0, 1.0, 1.0, 0.0]; 4],
-        tex: vec![[u0, v1], [u1, v1], [u1, v0], [u0, v0]],
+        tex: vec![[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]],
         skin: Vec::new(),
         idx: vec![0, 1, 2, 0, 2, 3],
     }

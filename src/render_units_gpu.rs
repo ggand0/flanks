@@ -1163,6 +1163,9 @@ pub struct PullMesh {
     /// dying and the fallen at this level draw with.
     card: bool,
     fallen: Option<IndexedMesh>,
+    /// `FL_SPRITE`: the card's sheet layout as vertices, uploaded after its
+    /// corners (unit_instancing.wgsl `sprite_row`).
+    table: Vec<PullVertex>,
 }
 
 /// A level drawn indexed: its vertices, and its index list repeated for
@@ -1526,14 +1529,15 @@ impl PullMesh {
     /// `mesh`. `light`: the level is the light last level (unit_glb.rs
     /// `light_last_level`), which takes its colour from the vertex colour
     /// word as that level packs it.
-    /// `fallen`: the level is the card, and this mesh is the one its dying
-    /// and fallen draw with.
+    /// `card`: the level is the card; the mesh its dying and fallen draw
+    /// with, and the rows of its sheet's layout (unit_glb.rs
+    /// `sprite_table`).
     pub fn from_mesh(
         mesh: &Mesh,
         bucket: usize,
         cast_source: Option<&Mesh>,
         light: bool,
-        fallen: Option<&Mesh>,
+        card: Option<(&Mesh, &[[f32; 4]])>,
     ) -> Option<Self> {
         use bevy::mesh::VertexAttributeValues as V;
         let (records, skinned) = pull_vertices(mesh)?;
@@ -1556,7 +1560,26 @@ impl PullMesh {
                 tri.iter_mut().for_each(|c| c.atlas_uv = point);
             }
         }
-        let card = fallen.is_some();
+        let fallen = card.map(|(m, _)| m);
+        // The table rides after the card's corners, two rows a vertex.
+        let table: Vec<PullVertex> = card.map_or(Vec::new(), |(_, rows)| {
+            rows.chunks(2)
+                .map(|r| {
+                    let second = r.get(1).copied().unwrap_or([0.0; 4]);
+                    PullVertex {
+                        position: [r[0][0], r[0][1], r[0][2]],
+                        part: r[0][3],
+                        normal: [second[0], second[1], second[2]],
+                        pivot: second[3],
+                        color: 0,
+                        atlas_uv: 0,
+                        skin: 0,
+                        weight: 0.0,
+                    }
+                })
+                .collect()
+        });
+        let card = card.is_some();
         // The card's six corners draw expanded: no group to pad, so its
         // list can end where the dying and the fallen begin.
         let indexed = if card {
@@ -1610,6 +1633,7 @@ impl PullMesh {
             light,
             card,
             fallen,
+            table,
         })
     }
 }
@@ -1697,8 +1721,8 @@ pub struct DrawShape {
     pub flat_light: bool,
     /// The light last level's colour (`PullMesh::light`).
     pub light_level: bool,
-    /// `FL_SPRITE`: 0 a mesh, 1 the card cut out by discard, 2 the card cut
-    /// out by alpha to coverage (unit_instancing.wgsl `UNIT_SPRITE`).
+    /// `FL_SPRITE`: 0 a mesh, 1 the card covering whole pixels, 2 the card
+    /// covering single samples (unit_instancing.wgsl `UNIT_SPRITE`).
     pub sprite: u8,
 }
 
@@ -1758,10 +1782,12 @@ fn extract_pull_meshes(
             Some(m) => m.vertices.iter().all(|c| c.part < 0.5),
             None => mesh.corners.iter().all(|c| c.part < 0.5),
         };
+        // A card's table follows its corners in the same buffer.
+        let corners: Vec<PullVertex> = mesh.corners.iter().chain(&mesh.table).copied().collect();
         commands.entity(e).insert(PullMeshGpu {
             vertices: render_device.create_buffer_with_data(&BufferInitDescriptor {
                 label: Some("unit pull mesh"),
-                contents: bytemuck::cast_slice(&mesh.corners),
+                contents: bytemuck::cast_slice(&corners),
                 usage: BufferUsages::STORAGE,
             }),
             indexed,
@@ -2757,9 +2783,9 @@ pub fn pull_mesh_for(
     cfg: &GpuSyncConfig,
     cast_source: Option<&Mesh>,
     light: bool,
-    fallen: Option<&Mesh>,
+    card: Option<(&Mesh, &[[f32; 4]])>,
 ) -> Option<PullMesh> {
-    cfg.enabled.then(|| PullMesh::from_mesh(mesh, bucket.0, cast_source, light, fallen)).flatten()
+    cfg.enabled.then(|| PullMesh::from_mesh(mesh, bucket.0, cast_source, light, card)).flatten()
 }
 
 #[cfg(test)]
