@@ -374,7 +374,8 @@ pub(crate) fn prepare_tick(
     let t0 = std::time::Instant::now();
     share_columns(job, units);
     let t1 = std::time::Instant::now();
-    skirmish_reactions(groups, tracks, terrain, tick);
+    let nav = routes.nav().cloned();
+    skirmish_reactions(groups, tracks, terrain, nav.as_deref(), tick);
     let t2 = std::time::Instant::now();
     open_for_passers(groups, terrain, tracks, tick);
     let t2b = std::time::Instant::now();
@@ -415,7 +416,7 @@ pub(crate) fn prepare_tick(
     job.clear_blocks = fire.clear_blocks;
     job.blocks = fire.blocks;
     let last = std::mem::take(&mut job.sidearm);
-    job.sidearm = sidearm_reasons(groups, tracks, terrain, &last, tick);
+    job.sidearm = sidearm_reasons(groups, tracks, terrain, nav.as_deref(), &last, tick);
     job.field.size_to(terrain.min(), terrain.max());
     let t5 = std::time::Instant::now();
     log_prep([t1 - t0, t2 - t1, t2b - t2, t3 - t2b, t4 - t3, t5 - t4, t5 - t0]);
@@ -542,6 +543,41 @@ fn gap_within(a: &GroupData, b: &GroupData, limit: f32) -> Option<f32> {
         return None;
     }
     Some(edge_gap(a, b))
+}
+
+/// Whether men of block `from` can walk straight to block `to`: the
+/// planner's straight line (`NavGrid::walk_line`) between the two blocks'
+/// nearest points is clear. Always where no ground blocks (no grid). A
+/// block at the foot of a wall cannot walk to one on its walk, though
+/// their edges may be a metre or two apart seen from above.
+fn walks_to(nav: Option<&crate::nav::NavGrid>, from: &GroupData, to: &GroupData) -> bool {
+    let Some(nav) = nav else { return true };
+    let (a, b) = (crate::formation::block_rect(from), crate::formation::block_rect(to));
+    let at = b.closest(a.centre);
+    nav.walk_line(a.closest(at), at)
+}
+
+/// How far the men of block `from` walk to block `to` (m), within `max`
+/// (`NavGrid::walk_gap` between points of the two blocks a cell apart),
+/// None beyond it. Where no ground blocks
+/// (no grid) the edge gap, when within `max`.
+fn walk_gap(nav: Option<&crate::nav::NavGrid>, from: &GroupData, to: &GroupData, max: f32) -> Option<f32> {
+    let Some(nav) = nav else { return Some(edge_gap(from, to)).filter(|&g| g <= max) };
+    let points = |gd: &GroupData| {
+        let r = crate::formation::block_rect(gd);
+        let (fwd, half_d) = if r.fwd == Vec2::ZERO { (Vec2::Y, r.half_w) } else { (r.fwd, r.half_d) };
+        let right = Vec2::new(fwd.y, -fwd.x);
+        let (nw, nd) = ((r.half_w / crate::terrain::CELL).ceil() as i32, (half_d / crate::terrain::CELL).ceil() as i32);
+        let mut out = Vec::with_capacity(((2 * nw + 1) * (2 * nd + 1)) as usize);
+        for a in -nw..=nw {
+            for b in -nd..=nd {
+                let (u, v) = (a as f32 / nw.max(1) as f32, b as f32 / nd.max(1) as f32);
+                out.push(r.centre + right * (u * r.half_w) + fwd * (v * half_d));
+            }
+        }
+        out
+    };
+    nav.walk_gap(&points(from), &points(to), max)
 }
 
 /// `edge_gap` between two blocks given as rectangles.
@@ -1163,6 +1199,7 @@ fn skirmish_reactions(
     groups: &mut Groups,
     tracks: &crate::arrows::RegTracks,
     terrain: &Terrain,
+    nav: Option<&crate::nav::NavGrid>,
     tick: u32,
 ) {
     let n = groups.list.len();
@@ -1200,7 +1237,7 @@ fn skirmish_reactions(
         if !tick.wrapping_add(g as u32).is_multiple_of(ARCHER_LOOK) {
             continue;
         }
-        let look = skirmish_look(groups, g, tracks, terrain, tick, able);
+        let look = skirmish_look(groups, g, tracks, terrain, nav, tick, able);
         skirmish_act(&mut groups.list[g], g, look);
     }
 }
@@ -1214,6 +1251,7 @@ fn skirmish_look(
     g: usize,
     tracks: &crate::arrows::RegTracks,
     terrain: &Terrain,
+    nav: Option<&crate::nav::NavGrid>,
     tick: u32,
     able: bool,
 ) -> SkirmishLook {
@@ -1261,12 +1299,17 @@ fn skirmish_look(
             }
             continue;
         }
-        if able && gap <= SKIRMISH_NEAR {
+        // Near by the way its men walk to the regiment (`walk_gap`): an
+        // enemy at the foot of the wall the regiment stands on is far, one
+        // a short climb below it near. Coming only as a block that can
+        // walk to it straight (`walks_to`): its straight approach is the
+        // way it comes.
+        if able && gap <= SKIRMISH_NEAR && walk_gap(nav, ed, gd, SKIRMISH_NEAR).is_some() {
             (run, why) = (true, "near");
             run_from = Some((gap, e as u32));
             continue;
         }
-        if able && approach_hits(gl, g, e, vel(e), horizon, cap) {
+        if able && approach_hits(gl, g, e, vel(e), horizon, cap) && walks_to(nav, ed, gd) {
             (run, why) = (true, "coming");
             run_from = Some((gap, e as u32));
             continue;
@@ -1745,6 +1788,7 @@ fn sidearm_reasons(
     groups: &Groups,
     tracks: &crate::arrows::RegTracks,
     terrain: &Terrain,
+    nav: Option<&crate::nav::NavGrid>,
     last: &[Sidearm],
     tick: u32,
 ) -> Vec<Sidearm> {
@@ -1778,7 +1822,10 @@ fn sidearm_reasons(
                 let Some(gap) = gap_within(gd, eg, scope) else {
                     continue;
                 };
-                if gap <= crate::sim::soldier::KNIFE_EDGE {
+                // A block he can be walked to straight (`walks_to`): an
+                // enemy at the foot of the wall he stands on cannot come
+                // at him in a bow draw.
+                if gap <= crate::sim::soldier::KNIFE_EDGE && walks_to(nav, eg, gd) {
                     arm.blocks.push(crate::formation::block_rect(eg));
                 }
                 arm.foe_in_range = arm.foe_in_range

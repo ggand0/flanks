@@ -600,6 +600,19 @@ impl BlockRect {
         dir.dot(right).abs() * self.half_w + dir.dot(self.fwd).abs() * self.half_d
     }
 
+    /// The point of the block nearest `p`: `p` itself inside.
+    pub fn closest(&self, p: Vec2) -> Vec2 {
+        let d = p - self.centre;
+        if self.fwd == Vec2::ZERO {
+            let len = d.length();
+            return if len <= self.half_w { p } else { self.centre + d * (self.half_w / len) };
+        }
+        let right = Vec2::new(self.fwd.y, -self.fwd.x);
+        let across = d.dot(right).clamp(-self.half_w, self.half_w);
+        let along = d.dot(self.fwd).clamp(-self.half_d, self.half_d);
+        self.centre + right * across + self.fwd * along
+    }
+
     /// The distance from `p` to the nearest point of the block, 0 inside.
     pub fn distance(&self, p: Vec2) -> f32 {
         let d = p - self.centre;
