@@ -60,7 +60,7 @@ pub(super) fn side_pref(i: usize, stuck: u16) -> (f32, f32) {
 /// fighting men keep their own footwork.
 #[inline]
 pub(super) fn choose_opening(f: &Field, s: &mut Soldier, st: &mut Step) {
-    let Field { orders, tick, anchors, home, .. } = *f;
+    let Field { orders, tick, anchors, home, terrain, .. } = *f;
     let i = s.i;
     let going = st.open.open_on && st.foe.best_idx == u32::MAX && !st.foe.memo_valid;
     let ring_flag = *s.sight & SIGHT_RING != 0;
@@ -124,6 +124,21 @@ pub(super) fn choose_opening(f: &Field, s: &mut Soldier, st: &mut Step) {
             }
         } else {
             *s.aim = Vec2::NAN;
+        }
+    }
+    // A way his body cannot step (into a wall, a drum or a rail, on a map
+    // with blocked ground) is no way through, however open the ground at
+    // the aim itself: he drops it and keeps his own way, else he walks at
+    // it into the stone once the men round it are gone.
+    if fit > 0 {
+        let to = wd * aim_along.max(0.0) + perp * aim_lat;
+        let r = terrain.body_radius();
+        if r > 0.0 && to.length_squared() > 1e-12 {
+            let d = to.normalize() * crate::town_layout::FINE;
+            if !terrain.body_free(p.x + d.x, p.y + d.y, r, d.x, d.y) {
+                *s.aim = Vec2::NAN;
+                fit = 0;
+            }
         }
     }
     st.open.aim_fit = fit;
