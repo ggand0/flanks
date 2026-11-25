@@ -29,6 +29,10 @@
 //!   where the blocked ground begins. The archers' skirmish is off, as a
 //!   player sets it to hold a wall: the skirmish rule measures the
 //!   enemy's distance straight through the wall.
+//! - `FL_TEST_PATH=walls_rout` with `FL_MAP=walled_town` or
+//!   `FL_MAP=wall_debug`: the archers' scene, and once the archers stand
+//!   on the walk their regiment breaks: its men flee for their map edge,
+//!   off the walk by a stair. The ten-second lines count them on the walk.
 //! - `FL_TEST_PATH=walls_assault` with `FL_MAP=walled_town` or
 //!   `FL_MAP=wall_debug`: the archers' scene with their skirmish on, as a
 //!   player has it, a regiment of 200 on the ground at the wall's inner
@@ -207,6 +211,8 @@ struct PathTest {
     then: Option<(usize, &'static str, (Vec2, Vec2))>,
     /// The assault scene's attack order, once given.
     assault_given: bool,
+    /// The rout scene's break has been made.
+    rout_given: bool,
 }
 
 /// The longest frame in the current second and since the orders.
@@ -248,8 +254,8 @@ pub fn spawn(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
     // The wall scenes run on either map with the wall.
     let wanted_map = match scene.as_str() {
         "river" => Some(crate::terrain::MapKind::River),
-        "walls" | "walls_archers" | "walls_assault" | "walls_place" | "walls_under" | "walls_cross" | "walls_long"
-        | "walls_two_long" => None,
+        "walls" | "walls_archers" | "walls_assault" | "walls_rout" | "walls_place" | "walls_under" | "walls_cross"
+        | "walls_long" | "walls_two_long" => None,
         _ => Some(crate::terrain::MapKind::Obstacles),
     };
     match wanted_map {
@@ -315,11 +321,17 @@ pub fn spawn(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
                 list[1].skirmish = false;
             }
         }
-        "walls_archers" => {
+        "walls_archers" | "walls_rout" => {
             crate::regiments::spawn_regiment(units, terrain, &mut list, 0, KIND_ARCHER, spots::PLAZA, 60, -1.0);
             crate::regiments::spawn_regiment(units, terrain, &mut list, 1, KIND_HEAVY, ARCHERS_TARGET, 300, 1.0);
             list[0].skirmish = false;
             list[1].hold = true;
+            if scene == "walls_rout" {
+                // A regiment of the archers' army far behind the town, so
+                // the archers' break does not end the battle.
+                crate::regiments::spawn_regiment(units, terrain, &mut list, 0, KIND_HEAVY, spots::BEHIND_TOWN, 40, -1.0);
+                list[2].hold = true;
+            }
         }
         "walls_assault" => {
             crate::regiments::spawn_regiment(units, terrain, &mut list, 0, KIND_ARCHER, spots::PLAZA, 60, -1.0);
@@ -389,6 +401,16 @@ fn give_orders(
         groups.list[3].order = Some(Order::Attack(2));
         info!("[path-test] tick {}: assault ordered, regiment 1 attacks regiment 0, regiment 3 regiment 2", pipeline.tick);
     }
+    // The rout scene's break, once the archers' line has its verdict.
+    if test.ordered
+        && !test.rout_given
+        && scene().as_deref() == Some("walls_rout")
+        && test.subjects.iter().any(|s| s.g == 0 && s.reported)
+    {
+        test.rout_given = true;
+        groups.list[0].state = crate::orders::RegState::Shattered;
+        info!("[path-test] tick {}: regiment 0 breaks on the walk", pipeline.tick);
+    }
     if test.ordered || pipeline.tick < ORDER_TICK || groups.list.is_empty() {
         return;
     }
@@ -441,12 +463,12 @@ fn give_orders(
                 }
             }
         }
-        "walls_archers" | "walls_assault" => {
+        "walls_archers" | "walls_assault" | "walls_rout" => {
             // 50 m: two ranks at the walk's pitch.
             let c = spots::WALK_EAST - Vec2::new(80.0, 0.0);
             crate::orders::line_order(&mut groups, &terrain, &[0], c - Vec2::new(25.0, 0.0), c + Vec2::new(25.0, 0.0));
             order(&mut groups, &mut units, &terrain, &mut test, pipeline.tick, 0, "walls-archers", None);
-            if scene == "walls_archers" {
+            if scene != "walls_assault" {
                 orders.push((1, "walls-foot", ARCHERS_TARGET.with_y(crate::town_layout::WALL_Z + 12.0)));
             }
         }
@@ -564,7 +586,7 @@ fn log_progress(
     let walls = scene.starts_with("walls");
     let walk_lane = walls.then(|| crate::town_layout::walk_lane(terrain.body_radius()));
     let ten_s = tick.is_multiple_of(300);
-    if matches!(scene.as_str(), "walls_assault" | "walls_archers") && tick.is_multiple_of(150) && groups.list.len() > 1 {
+    if matches!(scene.as_str(), "walls_assault" | "walls_archers" | "walls_rout") && tick.is_multiple_of(150) && groups.list.len() > 1 {
         log_assault(&groups, &units, secs);
     }
     // On the wall scenes the ten-second lines go on after the verdict, for
