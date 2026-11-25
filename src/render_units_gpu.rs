@@ -1768,13 +1768,11 @@ fn extract_pull_meshes(
         let sprite = if mesh.card { crate::unit_glb::sprite_mode() as u8 } else { 0 };
         let shape = DrawShape { light_level: mesh.light, sprite, ..shape_of(mesh.indexed.as_ref()) };
         let cast_shape = shape_of(mesh.cast.as_ref().or(mesh.indexed.as_ref()));
-        // The light last level's casters keep its own corner count; a
-        // card's casters draw the file's last level, with that level's.
+        // The casters draw the cast mesh with its own corners per soldier:
+        // the light last level's and a card's cast the file's last level,
+        // which has more corners than the level they stand in for.
         let per_soldier = |m: &IndexedMesh| (m.indices.len() / m.group.max(1) as usize) as u32;
-        let cast_count = match (&mesh.cast, mesh.card) {
-            (Some(cast), true) => per_soldier(cast),
-            _ => mesh.corners.len() as u32,
-        };
+        let cast_count = mesh.cast.as_ref().map_or(mesh.corners.len() as u32, per_soldier);
         let fallen = mesh.fallen.as_ref().map(upload);
         let fallen_shape = shape_of(mesh.fallen.as_ref());
         let fallen_count = mesh.fallen.as_ref().map_or(0, per_soldier);
