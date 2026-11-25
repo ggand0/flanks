@@ -246,11 +246,7 @@ impl Routes {
                 last_leg: route.k + 1 >= route.points.len(),
             });
         }
-        *nav = if views.iter().any(Option::is_some) || !requests.is_empty() {
-            self.nav.clone()
-        } else {
-            None
-        };
+        *nav = self.nav.clone();
     }
 
     /// Take the plans a tick job made and the searches it did not finish.
@@ -898,6 +894,20 @@ mod tests {
         let mut pending = routes_at(&points, 1);
         pending.per[0].state = State::Pending { serial: 1, old: None };
         assert_eq!(pending.frame_line(0, goal), None);
+    }
+
+    /// The soldiers get the grid every tick on a map that has one, with
+    /// no route and no search out: their own walk tests read it while
+    /// every regiment stands.
+    #[test]
+    fn the_job_gets_the_grid_with_no_route_and_no_request() {
+        let terrain = crate::terrain::build_terrain(crate::terrain::MapKind::WallDebug);
+        let mut routes = Routes::default();
+        routes.prepare(&terrain);
+        let (mut requests, mut views, mut nav) = (Vec::new(), Vec::new(), None);
+        routes.fill_job(&mut requests, &mut views, &mut nav, 2);
+        assert!(requests.is_empty() && views.iter().all(Option::is_none));
+        assert!(nav.is_some());
     }
 
     /// The frame moves on by its men once a fifth of the living are past
