@@ -203,13 +203,15 @@ struct Params {
     // then up and down (`fall_way`).
     bound_settled: array<vec4<f32>, 32>,
     // FL_SPRITE (render_units_gpu.rs `BuildParams::sprite`): x 1 when the
-    // last level is a card. Per kind, the dying and fallen draw at that
-    // level: corners per soldier, soldiers per instance, vertices per
-    // soldier.
+    // last level is a card, y 1 when the cards cast (FL_SPRITE_SHADOW). Per
+    // kind, the dying and fallen draw at that level: corners per soldier,
+    // soldiers per instance, vertices per soldier; and the level a card
+    // that casts is posed for.
     sprite: vec4<u32>,
     sprite_corners: vec4<u32>,
     sprite_groups: vec4<u32>,
     sprite_verts: vec4<u32>,
+    sprite_cast_lod: vec4<u32>,
 };
 
 struct DrawArgs {
@@ -899,8 +901,11 @@ fn build_soldier(i: u32) {
         sm.lod &= LOD_MASK;
     }
     let visible = in_view && occl != HIDDEN;
+    // FL_SPRITE_SHADOW: a standing soldier held at the card's level casts
+    // as well.
+    let card_casts = params.sprite.y != 0u && lod == NUM_LODS - 1u && death_t == 0.0;
     var casts = 0u;
-    if lod < params.cast_lods {
+    if lod < params.cast_lods || card_casts {
         casts = cascade_mask(position);
     }
     if !in_view && casts == 0u {
@@ -974,12 +979,20 @@ fn build_soldier(i: u32) {
     // draws at, which spares the skeleton of a near soldier drawn far.
     // FL_SPRITE: a standing soldier drawn as a card reads his record, not a
     // pose: the card needs his position, team colour and flash alone
-    // (unit_instancing.wgsl `sprite_output`). He takes no pose slot. At
-    // the last level he casts nothing (render_units_shadow.rs CAST_LODS).
-    if params.sprite.x != 0u && visible && draw_lod == NUM_LODS - 1u && death_t == 0.0 && casts == 0u {
-        queue_draw(i, kind * NUM_LODS + draw_lod, i, draw_lod, dot(d, d), occl == MARKED, false);
-        if draw_lod != lod {
-            atomicAdd(&counts[COARSER_COUNTER + kind * NUM_LODS + lod], 1u);
+    // (unit_instancing.wgsl `sprite_output`). At the last level he casts
+    // nothing (render_units_shadow.rs CAST_LODS), and takes no pose slot,
+    // unless the cards cast (FL_SPRITE_SHADOW): then his shadow is his
+    // body's, posed for the finest level a cascade casts his kind with and
+    // put on the caster lists as a near soldier's is.
+    if params.sprite.x != 0u && draw_lod == NUM_LODS - 1u && death_t == 0.0 {
+        if visible {
+            queue_draw(i, kind * NUM_LODS + draw_lod, i, draw_lod, dot(d, d), occl == MARKED, false);
+            if draw_lod != lod {
+                atomicAdd(&counts[COARSER_COUNTER + kind * NUM_LODS + lod], 1u);
+            }
+        }
+        if casts != 0u {
+            append_casters(casts, kind, list_entry(kind, i, params.sprite_cast_lod[kind]));
         }
         return;
     }

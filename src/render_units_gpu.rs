@@ -310,14 +310,17 @@ pub struct BuildParams {
     /// `SETTLED`), two entries per kind and way he fell: forward, back,
     /// right, left, then up and down.
     bound_settled: [Vec4; NUM_KINDS * 4 * 2],
-    /// `FL_SPRITE`: x 1 when the last level of any kind is a card. Then
-    /// per kind, the dying and fallen draw at that level (`PullMesh::fallen`):
-    /// the corners per soldier of its index list, the soldiers per instance
-    /// and the vertices per soldier.
+    /// `FL_SPRITE`: x 1 when the last level of any kind is a card, y 1
+    /// when the cards cast (`FL_SPRITE_SHADOW`). Then per kind, the dying
+    /// and fallen draw at that level (`PullMesh::fallen`): the corners per
+    /// soldier of its index list, the soldiers per instance and the
+    /// vertices per soldier; and the level a card that casts is posed for,
+    /// the finest any cascade casts the kind with, so his pose serves each.
     sprite: UVec4,
     sprite_corners: UVec4,
     sprite_groups: UVec4,
     sprite_verts: UVec4,
+    sprite_cast_lod: UVec4,
 }
 
 /// The pose pass uniform (`Params` in unit_pose_pass.wgsl).
@@ -2346,6 +2349,12 @@ pub(crate) fn prepare_gpu_units(
         if mesh.fallen.is_some() {
             let kind = mesh.bucket / NUM_LODS;
             params.sprite.x = 1;
+            params.sprite.y = crate::unit_glb::sprite_shadow() as u32;
+            params.sprite_cast_lod[kind] = input.shadow_levels[..(params.n_cascades as usize).min(MAX_CASCADES)]
+                .iter()
+                .map(|levels| levels[kind])
+                .min()
+                .unwrap_or(0);
             params.sprite_corners[kind] = mesh.fallen_count;
             params.sprite_groups[kind] = mesh.fallen_shape.group;
             params.sprite_verts[kind] = mesh.fallen_shape.verts;

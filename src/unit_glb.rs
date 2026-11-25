@@ -556,6 +556,17 @@ pub fn sprites() -> bool {
     *ON.get_or_init(|| crate::util::env_or("FL_SPRITE", 0_u32) != 0)
 }
 
+/// `FL_SPRITE_SHADOW=1`, with `FL_SPRITE`: a card inside the sun's shadow
+/// range casts the shadow of his body, posed and drawn into the cascades
+/// as a near soldier is (unit_build.wgsl `build_soldier`). Off by default,
+/// as the far meshes cast nothing (render_units_shadow.rs `CAST_LODS`).
+/// The shadow map ends `FL_SHADOW_DIST` metres out, 280 by default, so a
+/// card casts only when the cards begin nearer than that.
+pub fn sprite_shadow() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| sprites() && crate::util::env_or("FL_SPRITE_SHADOW", 0_u32) != 0)
+}
+
 /// The sprite sheet's layout (assets/units/sprites.json, written with the
 /// sheet by tools/sprite_sheet.py). Per kind one cell per (camera height,
 /// direction around the man, frame), each just large enough for him.
