@@ -350,8 +350,8 @@ pub fn solve_launch(from: Vec3, to: Vec3, blocks: &[LoftBlock], terrain: &crate:
 /// `NEAR_TARGET` metres the shaft comes down on the man, so ground there
 /// no higher than his own does not count; a wall or its battlements
 /// before him do. Read every `d / 24` metres and at least every 4, and
-/// over the wall's pieces every fine cell (terrain.rs `fine`), so a
-/// parapet, a merlon or a wall's face in the way is met.
+/// near a piece every fine cell (terrain.rs `fine`), so a parapet, a
+/// merlon, a wall's face or a house in the way is met.
 fn arc_clears(
     from: Vec3,
     dir: Vec2,
@@ -385,15 +385,15 @@ fn arc_clears(
         if !near && heads && s >= 2.0 && g_s > from_ground + 0.35 && y < g_s + head && !terrain.blocked_at(p.x, p.y) {
             return false;
         }
-        let on_pieces = fine.is_some_and(|f| f.blocked(p.x, p.y).is_some());
-        s += if on_pieces {
+        let by_a_piece = fine.is_some_and(|f| f.by_a_piece(p.x, p.y));
+        s += if by_a_piece {
             crate::town_layout::FINE
         } else {
-            // A stride over open ground ends where the pieces begin: a
-            // whole one could land past the parapet and the merlons on a
-            // wall's near face.
-            let to_pieces = fine.and_then(|f| f.entry(p, dir)).map_or(f32::INFINITY, |e| e + 0.5 * crate::town_layout::FINE);
-            coarse.min(to_pieces)
+            // A stride over open ground ends where a piece's block begins:
+            // a whole one could land past the parapet and the merlons on a
+            // wall's near face, or through a house.
+            let to_piece = fine.and_then(|f| f.to_piece(p, dir, coarse)).map_or(f32::INFINITY, |e| e + 0.5 * crate::town_layout::FINE);
+            coarse.min(to_piece)
         };
     }
     true
@@ -807,14 +807,17 @@ fn sync_arrow_instances(
     }
 }
 
-/// Where in its step `a` to `b` an arrow over the wall's pieces strikes
-/// the floor or the stone under it, as the share of the step (0 to 1),
-/// None where it strikes nothing there or is not over the pieces. Read
-/// every fine cell (terrain.rs `fine`), so a merlon, a parapet or a rail
-/// in the step is met; skipped for an arrow above the tallest piece.
+/// Where in its step `a` to `b` an arrow by a piece strikes the floor or
+/// the stone under it, as the share of the step (0 to 1), None where it
+/// strikes nothing there or the step passes no block a piece reaches
+/// into (town_layout.rs `FineGround::to_piece`). Read every fine cell
+/// (terrain.rs `fine`), so a merlon, a parapet or a rail in the step is
+/// met; skipped for an arrow above the tallest piece.
 fn flight_hit(terrain: &crate::terrain::Terrain, a: Vec3, b: Vec3) -> Option<f32> {
     let f = terrain.fine()?;
-    if f.blocked(a.x, a.z).is_none() && f.blocked(b.x, b.z).is_none() {
+    let (flat, len) = ((b - a).xz(), (b - a).xz().length());
+    let by_a_piece = if len > 1e-6 { f.to_piece(a.xz(), flat / len, len).is_some() } else { f.by_a_piece(a.x, a.z) };
+    if !by_a_piece {
         return None;
     }
     if a.y.min(b.y) > terrain.ground_at(b.x, b.z) + crate::town_layout::TALLEST {
@@ -941,10 +944,10 @@ mod tests {
         let floor = terrain.height_at(man.x, man.y);
         assert!((floor - terrain.ground_at(man.x, man.y) - WALK).abs() < 1e-3, "the man stands on the walk");
         let to = Vec3::new(man.x, floor + AIM_HEIGHT * crate::unit_types::tallest(), man.y);
-        // Out to the bow's flat reach at its top speed (48 m/s, 235 m):
-        // the grid begins 6 m before the merlons (the towers' bounds and
-        // 2 m), so only a stride longer than that, from about 196 m out,
-        // can jump the whole wall.
+        // Out to the bow's flat reach at its top speed (48 m/s, 235 m),
+        // where a stride over open ground is near 10 m: it ends where the
+        // first block a wall unit reaches into begins, at least 1.25 m
+        // before the unit's outer face.
         let mut out = 12.0f32;
         while out < 240.0 {
             let z = row + out;
@@ -956,6 +959,84 @@ mod tests {
                 "a straight shot from {out} m out passes the merlon"
             );
             out += 0.37;
+        }
+    }
+
+    /// A straight shot from the open ground east of the walled town at a
+    /// man standing behind a house meets the house from 20 to 200 m out,
+    /// though the stride over the open ground between the houses is
+    /// coarse; and the same shot at a man beside the house reaches him.
+    #[test]
+    fn a_shot_at_a_man_behind_a_house_meets_the_house_from_any_distance() {
+        let terrain = build_terrain(MapKind::WalledTown);
+        let houses: Vec<_> = crate::town_layout::pieces(MapKind::WalledTown)
+            .into_iter()
+            .filter(|p| matches!(p.kind, crate::town_layout::Kind::House(_)))
+            .collect();
+        // The first house of the easternmost column: nothing stands east
+        // of it.
+        let east = houses.iter().map(|p| p.pos.x).fold(f32::MIN, f32::max);
+        let house = houses.iter().find(|p| p.pos.x == east).expect("a house");
+        let (lo, hi) = house.bounds();
+        let shot = |man: Vec2, out: f32| {
+            let floor = terrain.height_at(man.x, man.y);
+            let to = Vec3::new(man.x, floor + AIM_HEIGHT * crate::unit_types::tallest(), man.y);
+            let x = man.x + out;
+            let from = Vec3::new(x, terrain.height_at(x, man.y) + 1.5, man.y);
+            let d = (to.xz() - from.xz()).length();
+            let line = |s: f32| from.y + (to.y - from.y) * s / d;
+            arc_clears(from, Vec2::NEG_X, d, floor, line, &terrain, false)
+        };
+        let (behind, beside) = (Vec2::new(lo.x - 1.0, house.pos.y), Vec2::new(lo.x - 1.0, hi.y + 2.0));
+        let mut out = 20.0f32;
+        while out <= 200.0 {
+            assert!(!shot(behind, out), "a straight shot from {out} m out passes the house at {}", house.pos);
+            assert!(shot(beside, out), "a straight shot from {out} m out misses the man beside the house at {}", house.pos);
+            out += 0.37;
+        }
+    }
+
+    /// An arrow at chest height through the gatehouse's gate block, on its
+    /// edge strips outside the bridge, strikes the block: it stands at the
+    /// walk's height with its kerb, parapet and merlons, out to the drums.
+    #[test]
+    fn an_arrow_through_the_gate_blocks_edge_strips_strikes_the_block() {
+        let terrain = build_terrain(MapKind::WallDebug);
+        for z in [WALL_Z - 4.5, WALL_Z + 4.5] {
+            let mut x = -5.75f32;
+            while x < 5.5 {
+                let at = |x: f32| Vec3::new(x, terrain.ground_at(x, z) + 1.2, z);
+                assert!(flight_hit(&terrain, at(x), at(x + 0.5)).is_some(), "an arrow from ({x}, {z}) at chest height flies through the block");
+                x += 0.5;
+            }
+        }
+    }
+
+    /// An arrow over a drum's roof just under the merlons' tips strikes a
+    /// merlon on the rim and passes a gap between two, and just over the
+    /// parapet in a gap it strikes the parapet: a tower's 24 merlons and a
+    /// gatehouse drum's 18, the first toward +x.
+    #[test]
+    fn an_arrow_over_a_drums_rim_meets_its_merlons_and_its_parapet() {
+        let terrain = build_terrain(MapKind::WallDebug);
+        let tower = Vec2::new(crate::town_layout::TOWERS_X[1], WALL_Z);
+        let gate_drum = Vec2::new(10.0, WALL_Z);
+        for (centre, r, merlons) in [(tower, 7.5f32, 24.0f32), (gate_drum, 5.5, 18.0)] {
+            let pitch = std::f32::consts::TAU / merlons;
+            // Beside the passage: the rim's quarter on either side.
+            for k in [(merlons / 4.0).floor(), (merlons * 3.0 / 4.0).floor()] {
+                for (angle, merlon) in [(k * pitch, true), ((k + 0.5) * pitch, false)] {
+                    let c = centre + Vec2::new(angle.cos(), angle.sin()) * r;
+                    let tangent = Vec2::new(-angle.sin(), angle.cos()) * 0.1;
+                    let at = |h: f32, side: f32| {
+                        let p = c + tangent * side;
+                        Vec3::new(p.x, terrain.ground_at(p.x, p.y) + h, p.y)
+                    };
+                    let step = |h: f32| flight_hit(&terrain, at(h, -1.0), at(h, 1.0)).is_some();
+                    assert_eq!(step(13.2), merlon, "an arrow 13.2 m up over the rim at {c}, the merlon's middle: {merlon}");
+                    assert!(step(12.3), "an arrow 12.3 m up over the rim at {c} passes the parapet");
+                }
+            }
         }
     }
 }

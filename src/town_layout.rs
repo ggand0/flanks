@@ -75,11 +75,39 @@ const RAIL: f32 = 0.5;
 /// How far the stair's rail, the walk's inner kerb and its outer parapet
 /// rise over the floor beside them (m), and the merlons' tips over the
 /// walk: one merlon 1 m wide at the middle of each 2 m wall unit, 1 m
-/// gaps between (docs/plans/028-wall-models.md).
+/// gaps between (docs/plans/028-wall-models.md). A drum's roof has the
+/// same parapet and merlons around its rim.
 const KERB: f32 = 0.5;
 const MERLON: f32 = 1.5;
-/// The highest any piece reaches over its ground (m): a drum's roof.
+/// Half a merlon's width along the wall and the gatehouse's bridge (m).
+const MERLON_HALF: f32 = 0.5;
+/// How deep the wall's edge strips are, the parapet with its merlons and
+/// the kerb, and a drum roof's rim (m).
+const EDGE: f32 = 1.0;
+/// Half the walk's clear width between the strips (m).
+const WALK_HALF: f32 = WALL_HALF - EDGE;
+/// The highest any piece reaches over its ground (m): the merlons on a
+/// drum's roof.
 pub const TALLEST: f32 = ROOF + MERLON;
+/// A drum tower's radius (m) and the merlons around its roof's rim.
+const TOWER_R: f32 = 8.0;
+const TOWER_MERLONS: f32 = 24.0;
+/// Half the width of a drum's passage at the walk's height, the towers'
+/// and the gatehouse drums', and of the gatehouse's bridge (m).
+const PASSAGE_HALF: f32 = 4.0;
+/// The gatehouse's drums: their centres either side of the gate (x, m),
+/// their radius (m) and the merlons around each roof's rim.
+const GATE_DRUM_X: f32 = 10.0;
+const GATE_DRUM_R: f32 = 6.0;
+const GATE_DRUM_MERLONS: f32 = 18.0;
+/// Half the gatehouse's gate block (m): it reaches 7 m either side of the
+/// gate into the drums and 5 m out from the wall's line on both sides,
+/// its edge strips past the bridge's 8 m.
+const GATE_BLOCK: Vec2 = Vec2::new(7.0, 5.0);
+/// The merlons on the gate block's outer strip (x, m).
+const GATE_MERLONS_X: [f32; 4] = [-3.0, -1.0, 1.0, 3.0];
+/// The stair's flight along its length (m), its platform after it.
+const FLIGHT: f32 = 12.0;
 /// The house grid: columns and rows of centres on a 30 m pitch.
 const HOUSE_PITCH: f32 = 30.0;
 const HOUSE_COLS: i32 = 10;
@@ -196,17 +224,36 @@ impl Piece {
 
     /// The top of the piece's solid part at `p` over the ground: the walk's
     /// inner kerb and outer parapet, the merlons, the stair's rail, a
-    /// drum's or the gatehouse's roof, a house's eaves. What an arrow
+    /// drum's roof and the parapet and merlons around its rim, the gate
+    /// block's kerb, parapet and merlons, a house's eaves. What an arrow
     /// meets there (arrows.rs `arc_clears`).
     pub fn top(&self, p: Vec2) -> f32 {
         let (lo, hi) = self.local_bounds();
         let l = self.local(p).clamp(lo, hi);
         match self.kind {
-            Kind::Wall | Kind::Landing if l.y > 3.0 => {
-                WALK + if l.x.abs() <= 0.5 { MERLON } else { KERB }
+            Kind::Wall | Kind::Landing if l.y > WALK_HALF => {
+                WALK + if l.x.abs() <= MERLON_HALF { MERLON } else { KERB }
             }
             Kind::Wall | Kind::Landing => WALK + KERB,
-            Kind::Stair => WALK * (l.x / 12.0).clamp(0.0, 1.0) + KERB,
+            Kind::Stair => WALK * (l.x / FLIGHT).clamp(0.0, 1.0) + KERB,
+            Kind::Tower if l.y.abs() > PASSAGE_HALF && l.length() <= TOWER_R => drum_top(l, TOWER_R, TOWER_MERLONS),
+            Kind::Gatehouse => {
+                let drum = |cx: f32| {
+                    let d = l - Vec2::new(cx, 0.0);
+                    (l.y.abs() > PASSAGE_HALF && d.length() <= GATE_DRUM_R).then(|| drum_top(d, GATE_DRUM_R, GATE_DRUM_MERLONS))
+                };
+                if let Some(h) = drum(-GATE_DRUM_X).or_else(|| drum(GATE_DRUM_X)) {
+                    h
+                } else if l.y > PASSAGE_HALF && l.x.abs() <= GATE_BLOCK.x {
+                    // The outer strip: the parapet and its merlons.
+                    let merlon = GATE_MERLONS_X.iter().any(|&x| (l.x - x).abs() <= MERLON_HALF);
+                    WALK + if merlon { MERLON } else { KERB }
+                } else if l.y < -PASSAGE_HALF && l.x.abs() <= GATE_BLOCK.x {
+                    WALK + KERB
+                } else {
+                    self.raise_clamped(p)
+                }
+            }
             _ => self.raise_clamped(p),
         }
     }
@@ -215,9 +262,9 @@ impl Piece {
     /// up the stair's flight, nothing on every level floor.
     pub fn rise(&self, p: Vec2) -> Vec2 {
         let l = self.local(p);
-        if self.kind == Kind::Stair && (0.0..12.0).contains(&l.x) {
+        if self.kind == Kind::Stair && (0.0..FLIGHT).contains(&l.x) {
             let (c, s) = self.rot();
-            Vec2::new(c, -s) * (WALK / 12.0)
+            Vec2::new(c, -s) * (WALK / FLIGHT)
         } else {
             Vec2::ZERO
         }
@@ -230,22 +277,25 @@ impl Piece {
             Kind::Wall | Kind::Landing => Some(WALK),
             Kind::House(_) => Some(EAVES),
             // The flight, then the platform from 12 m on.
-            Kind::Stair => Some(WALK * (l.x / 12.0).clamp(0.0, 1.0)),
+            Kind::Stair => Some(WALK * (l.x / FLIGHT).clamp(0.0, 1.0)),
             Kind::Tower => {
-                if l.y.abs() <= 4.0 + E {
+                if l.y.abs() <= PASSAGE_HALF + E {
                     Some(WALK)
-                } else if l.length() <= 8.0 + E {
+                } else if l.length() <= TOWER_R + E {
                     Some(ROOF)
                 } else {
                     None
                 }
             }
             Kind::Gatehouse => {
-                let drum = |cx: f32| (l - Vec2::new(cx, 0.0)).length() <= 6.0 + E;
-                if l.y.abs() <= 4.0 + E {
+                let drum = |cx: f32| (l - Vec2::new(cx, 0.0)).length() <= GATE_DRUM_R + E;
+                if l.y.abs() <= PASSAGE_HALF + E {
                     Some(WALK)
-                } else if drum(-10.0) || drum(10.0) {
+                } else if drum(-GATE_DRUM_X) || drum(GATE_DRUM_X) {
                     Some(ROOF)
+                } else if l.x.abs() <= GATE_BLOCK.x + E && l.y.abs() <= GATE_BLOCK.y + E {
+                    // The gate block's edge strips, at the walk's height.
+                    Some(WALK)
                 } else {
                     None
                 }
@@ -262,8 +312,8 @@ impl Piece {
         let (lo, hi) = self.local_bounds();
         let inside = l.x >= lo.x && l.x <= hi.x && l.y >= lo.y && l.y <= hi.y;
         match self.kind {
-            Kind::Wall => inside.then_some(if l.y.abs() <= 3.0 { Surface::Clear } else { Surface::Solid }),
-            Kind::Landing => inside.then_some(if l.y <= 3.0 { Surface::Clear } else { Surface::Solid }),
+            Kind::Wall => inside.then_some(if l.y.abs() <= WALK_HALF { Surface::Clear } else { Surface::Solid }),
+            Kind::Landing => inside.then_some(if l.y <= WALK_HALF { Surface::Clear } else { Surface::Solid }),
             Kind::House(_) => inside.then_some(Surface::Solid),
             Kind::Stair => {
                 // The return rail across the far end reaches a metre over
@@ -278,21 +328,21 @@ impl Piece {
                 Some(if rail { Surface::Solid } else { Surface::Clear })
             }
             Kind::Tower => {
-                if l.length() > 8.0 {
+                if l.length() > TOWER_R {
                     None
-                } else if l.y.abs() <= 4.0 {
+                } else if l.y.abs() <= PASSAGE_HALF {
                     Some(Surface::Clear)
                 } else {
                     Some(Surface::Solid)
                 }
             }
             Kind::Gatehouse => {
-                let drum = |cx: f32| (l - Vec2::new(cx, 0.0)).length() <= 6.0;
-                let strip = inside && l.y.abs() <= 4.0;
-                let block = l.x.abs() <= 5.0 && l.y.abs() <= 5.0;
+                let drum = |cx: f32| (l - Vec2::new(cx, 0.0)).length() <= GATE_DRUM_R;
+                let strip = inside && l.y.abs() <= PASSAGE_HALF;
+                let block = l.x.abs() <= GATE_BLOCK.x && l.y.abs() <= GATE_BLOCK.y;
                 if strip {
                     Some(Surface::Clear)
-                } else if drum(-10.0) || drum(10.0) || block {
+                } else if drum(-GATE_DRUM_X) || drum(GATE_DRUM_X) || block {
                     Some(Surface::Solid)
                 } else {
                     None
@@ -300,6 +350,19 @@ impl Piece {
             }
         }
     }
+}
+
+/// The top of a drum's roof at `d` from its centre, inside its radius `r`:
+/// the roof, and on the rim's outer `EDGE` the parapet with `merlons`
+/// merlons, the first toward +x, each as wide as the gap after it (the
+/// models' battlement, 24 merlons on a tower and 18 on a gatehouse drum).
+fn drum_top(d: Vec2, r: f32, merlons: f32) -> f32 {
+    if d.length() < r - EDGE {
+        return ROOF;
+    }
+    let pitch = std::f32::consts::TAU / merlons;
+    let off = (d.y.atan2(d.x) / pitch).round() * pitch - d.y.atan2(d.x);
+    ROOF + if off.abs() <= pitch * 0.25 { MERLON } else { KERB }
 }
 
 /// The wall units of one curtain: centres every 2 m from `a` to `b`.
@@ -595,10 +658,17 @@ pub struct FineGround {
     /// `CLEAR_CAP`: how far a straight line steps from it.
     clear: Vec<f32>,
     pieces: Vec<Piece>,
+    /// Per `BLOCK` of cells, row-major `bx` wide: whether a piece's bounds,
+    /// a metre and a cell more, reach into it.
+    by_piece: Vec<bool>,
+    bx: usize,
+    bz: usize,
 }
 
 /// The fine ground's clearance cap (m).
 const CLEAR_CAP: f32 = 8.0;
+/// The side of the fine ground's square blocks of cells (cells): 4 m.
+const BLOCK: usize = 16;
 
 impl FineGround {
     /// The cell holding `(x, z)`, None off the grid.
@@ -619,11 +689,70 @@ impl FineGround {
         self.index(x, z).map(|i| self.flags[i] & F_BLOCKED != 0)
     }
 
+    /// Whether `(x, z)` is in a block a piece reaches into (false off the
+    /// grid): where a reader of the pieces' heights reads every cell.
+    #[inline]
+    pub fn by_a_piece(&self, x: f32, z: f32) -> bool {
+        self.index(x, z).is_some_and(|_| {
+            let b = ((Vec2::new(x, z) - self.origin) / (FINE * BLOCK as f32)).floor();
+            self.by_piece[b.y as usize * self.bx + b.x as usize]
+        })
+    }
+
+    /// How far along `dir` (a unit vector) from `p` the line reaches the
+    /// first block a piece reaches into (`by_a_piece`), within `max` m: 0
+    /// where `p` is in one, None where the line meets none by then. A
+    /// reader that strides over open ground stops there, so no stride
+    /// steps over a piece. Walks the line block by block: one or two
+    /// blocks per 4 m of `max`.
+    pub fn to_piece(&self, p: Vec2, dir: Vec2, max: f32) -> Option<f32> {
+        let size = FINE * BLOCK as f32;
+        let mut t = if self.index(p.x, p.y).is_some() { 0.0 } else { self.entry(p, dir)? };
+        if t > max {
+            return None;
+        }
+        let g = (p + dir * t - self.origin) / size;
+        let (mut bx, mut bz) = ((g.x.floor().max(0.0) as usize).min(self.bx - 1), (g.y.floor().max(0.0) as usize).min(self.bz - 1));
+        // Per axis: the distance along the line to the block's next edge,
+        // and between edges; infinite along an axis the line keeps to.
+        let axis = |p: f32, d: f32, o: f32, b: usize| {
+            if d.abs() < 1e-9 {
+                (f32::INFINITY, f32::INFINITY)
+            } else {
+                let edge = o + (b as f32 + if d > 0.0 { 1.0 } else { 0.0 }) * size;
+                ((edge - p) / d, size / d.abs())
+            }
+        };
+        let (mut next_x, step_x) = axis(p.x, dir.x, self.origin.x, bx);
+        let (mut next_z, step_z) = axis(p.y, dir.y, self.origin.y, bz);
+        loop {
+            if self.by_piece[bz * self.bx + bx] {
+                return Some(t);
+            }
+            t = next_x.min(next_z);
+            if t > max {
+                return None;
+            }
+            // Into the neighbouring block, None past the grid's.
+            let (b, n, d, step, next) =
+                if next_x < next_z { (&mut bx, self.bx, dir.x, step_x, &mut next_x) } else { (&mut bz, self.bz, dir.y, step_z, &mut next_z) };
+            *next += step;
+            if d > 0.0 {
+                *b += 1;
+                if *b >= n {
+                    return None;
+                }
+            } else if *b == 0 {
+                return None;
+            } else {
+                *b -= 1;
+            }
+        }
+    }
+
     /// How far along `dir` (a unit vector) from `p` the grid begins: None
-    /// where `p` is on it already or the line never meets it. A reader
-    /// that strides over open ground stops there, so nothing on the
-    /// pieces' near side is stepped over.
-    pub fn entry(&self, p: Vec2, dir: Vec2) -> Option<f32> {
+    /// where `p` is on it already or the line never meets it.
+    fn entry(&self, p: Vec2, dir: Vec2) -> Option<f32> {
         let (lo, hi) = (self.origin, self.origin + Vec2::new(self.nx as f32, self.nz as f32) * FINE);
         let (mut t0, mut t1) = (0.0f32, f32::INFINITY);
         for (p, d, lo, hi) in [(p.x, dir.x, lo.x, hi.x), (p.y, dir.y, lo.y, hi.y)] {
@@ -715,7 +844,6 @@ pub fn fine_ground(
     let (nx, nz) = (((hi.x - origin.x + 2.0) / FINE).ceil() as usize, ((hi.y - origin.y + 2.0) / FINE).ceil() as usize);
     let centre = |i: usize, k: usize| origin + (Vec2::new(i as f32, k as f32) + 0.5) * FINE;
     // The pieces near each 4 m block of cells, so a cell asks a few.
-    const BLOCK: usize = 16;
     let (bx, bz) = (nx.div_ceil(BLOCK), nz.div_ceil(BLOCK));
     let mut near: Vec<Vec<u16>> = vec![Vec::new(); bx * bz];
     for (k, p) in pieces.iter().enumerate() {
@@ -798,7 +926,8 @@ pub fn fine_ground(
     }
     let open: Vec<bool> = flags.iter().map(|f| f & F_BLOCKED == 0).collect();
     let clear = crate::nav::clearance(&open, nx, nz, FINE, CLEAR_CAP);
-    FineGround { origin, nx, nz, piece, flags, clear, pieces: pieces.to_vec() }
+    let by_piece = near.iter().map(|n| !n.is_empty()).collect();
+    FineGround { origin, nx, nz, piece, flags, clear, pieces: pieces.to_vec(), by_piece, bx, bz }
 }
 
 /// A straight stretch of ground with fixed rows a unit stands in: the
