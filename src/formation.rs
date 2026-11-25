@@ -609,6 +609,12 @@ pub fn block_half_extents(gd: &GroupData, files: u32, facing: f32, lane: bool) -
     let stagger = if ranks > 1 { stagger } else { 0.0 };
     let half_w = (files - 1) as f32 * 0.5 * pitch.x + 0.5 * stagger + 1.0;
     let half_d = (ranks - 1) as f32 * 0.5 * pitch.y + 1.0;
+    turned_half_extents(half_w, half_d, facing)
+}
+
+/// Axis-aligned half extents (x, z) of a rectangle `half_w` wide along
+/// its ranks and `half_d` deep, turned to `facing`.
+pub fn turned_half_extents(half_w: f32, half_d: f32, facing: f32) -> Vec2 {
     let fwd = facing_dir(facing);
     let right = Vec2::new(fwd.y, -fwd.x);
     Vec2::new(

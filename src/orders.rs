@@ -923,13 +923,13 @@ fn lane_layout(groups: &Groups, lane: &Lane, picked: &[usize], a: Vec2, b: Vec2)
 }
 
 /// A run on the lane from `start` along `dir` behind the runs it meets
-/// (`taken`, with `backs` the centre of each one's rear rank): the rows
-/// in front of `front` are theirs, the rows behind are free. `n` men,
-/// `extra` files over the fewest the free rows allow, the ranks `pitch`
-/// deep. The run is widened until its men fit the rows its whole width
-/// leaves free; None where no row is free behind them or the run leaves
-/// the lane. Returns the files, the run and the front rank's centre
-/// across the lane.
+/// (`taken`, with `backs` the centre of each one's places nearest the
+/// lane's back edge, `lane_runs`): the rows in front of `front` are
+/// theirs, the rows behind are free. `n` men, `extra` files over the
+/// fewest the free rows allow, the ranks `pitch` deep. The run is
+/// widened until its men fit the rows its whole width leaves free; None
+/// where no row is free behind them or the run leaves the lane. Returns
+/// the files, the run and the front rank's centre across the lane.
 #[allow(clippy::too_many_arguments)]
 fn behind_run(
     lane: &Lane,
@@ -971,11 +971,13 @@ fn behind_run(
 }
 
 /// The stretches of the lane (x ranges) the team's regiments other than
-/// `skip` stand on or are going to, each with the centre of its rear
-/// rank across the lane: each one whose order's point, or its anchor
-/// without an order, is on the lane; and a regiment of the lane that was
-/// told to attack, for as long as its men are still on it (archers
-/// shooting from the wall keep their places).
+/// `skip` stand on or are going to, each with the centre of its places
+/// nearest the lane's back edge, across the lane, its block taken at its
+/// facing (a block facing out has its rear rank there, one facing along
+/// the lane its outer file on that side): each one whose order's point,
+/// or its anchor without an order, is on the lane; and a regiment of the
+/// lane that was told to attack, for as long as its men are still on it
+/// (archers shooting from the wall keep their places).
 fn lane_runs(groups: &Groups, lane: &Lane, team: u8, skip: &[usize]) -> Vec<(f32, f32, f32)> {
     let body = crate::sim::soldier::body_distance();
     groups
@@ -997,9 +999,13 @@ fn lane_runs(groups: &Groups, lane: &Lane, team: u8, skip: &[usize]) -> Vec<(f32
             let pitch = crate::formation::lane_pitch(gd.chosen_spacing(), gd.kind);
             let files = files.min(gd.count as u32);
             let shift = if (gd.count as u32) > files { crate::formation::lane_stagger(gd.chosen_spacing(), gd.kind) } else { 0.0 };
-            let half = (files - 1) as f32 * 0.5 * pitch.x + 0.5 * shift + body * 0.5;
-            let back = at.y - (gd.count as u32).div_ceil(files).saturating_sub(1) as f32 * 0.5 * pitch.y;
-            Some((at.x - half, at.x + half, back))
+            let half_w = (files - 1) as f32 * 0.5 * pitch.x + 0.5 * shift;
+            let half_d = (gd.count as u32).div_ceil(files).saturating_sub(1) as f32 * 0.5 * pitch.y;
+            // The block as its slots lay it, at its facing (formation.rs
+            // `assign_slots`), on the lane's axes.
+            let reach = crate::formation::turned_half_extents(half_w, half_d, gd.facing);
+            let half = reach.x + body * 0.5;
+            Some((at.x - half, at.x + half, at.y - reach.y))
         })
         .collect()
 }
@@ -1965,5 +1971,37 @@ mod tests {
         // Once its men have left the walk the run is free.
         groups.list[0].centroid = behind;
         assert!(lane_runs(&groups, &lane, 0, &[1]).is_empty());
+    }
+
+    /// A regiment holding on the walk turned to face along it: its run is
+    /// its two ranks' depth along the walk, its places nearest the walk's
+    /// back edge are its outer file on that side, and the next regiment
+    /// dragged from beside that run is placed clear of it.
+    #[test]
+    fn a_block_facing_along_the_walk_holds_its_depth() {
+        let lane = walk();
+        let at = Vec2::new(0.0, crate::town_layout::WALL_Z);
+        let behind = Vec2::new(0.0, crate::town_layout::WALL_Z - 50.0);
+        let mut held = archers(100, at);
+        held.files = 50;
+        held.anchor = at;
+        held.facing = crate::formation::facing_of(Vec2::X);
+        let mut groups = Groups { list: vec![held, archers(100, behind)] };
+        let gd = &groups.list[0];
+        let pitch = crate::formation::lane_pitch(gd.chosen_spacing(), gd.kind);
+        let stagger = crate::formation::lane_stagger(gd.chosen_spacing(), gd.kind);
+        let half = 0.5 * pitch.y + 0.5 * crate::sim::soldier::body_distance();
+        let back = at.y - (49.0 * 0.5 * pitch.x + 0.5 * stagger);
+        let runs = lane_runs(&groups, &lane, 0, &[1]);
+        assert_eq!(runs.len(), 1);
+        let (lo, hi, rear) = runs[0];
+        assert!((lo - (at.x - half)).abs() < 1e-4 && (hi - (at.x + half)).abs() < 1e-4, "the run ({lo}, {hi}) is the block's depth");
+        assert!((rear - back).abs() < 1e-4, "the rear {rear} is the outer file at {back}");
+        assert!(lane_order(&mut groups, &lane, 1, lo - 1.0, lo - 1.0));
+        let next = run_of(&groups.list[1]);
+        assert!(
+            next.0 >= hi + LINE_REG_GAP - 0.01 || next.1 <= lo - LINE_REG_GAP + 0.01,
+            "the run {next:?} is clear of ({lo}, {hi})"
+        );
     }
 }
