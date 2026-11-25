@@ -619,6 +619,27 @@ impl FineGround {
         self.index(x, z).map(|i| self.flags[i] & F_BLOCKED != 0)
     }
 
+    /// How far along `dir` (a unit vector) from `p` the grid begins: None
+    /// where `p` is on it already or the line never meets it. A reader
+    /// that strides over open ground stops there, so nothing on the
+    /// pieces' near side is stepped over.
+    pub fn entry(&self, p: Vec2, dir: Vec2) -> Option<f32> {
+        let (lo, hi) = (self.origin, self.origin + Vec2::new(self.nx as f32, self.nz as f32) * FINE);
+        let (mut t0, mut t1) = (0.0f32, f32::INFINITY);
+        for (p, d, lo, hi) in [(p.x, dir.x, lo.x, hi.x), (p.y, dir.y, lo.y, hi.y)] {
+            if d.abs() < 1e-9 {
+                if p < lo || p >= hi {
+                    return None;
+                }
+                continue;
+            }
+            let (a, b) = ((lo - p) / d, (hi - p) / d);
+            t0 = t0.max(a.min(b));
+            t1 = t1.min(a.max(b));
+        }
+        (t0 > 0.0 && t0 <= t1).then_some(t0)
+    }
+
     /// Whether `(x, z)` is on a piece's solid part (false off the grid).
     #[inline]
     pub fn solid(&self, x: f32, z: f32) -> bool {

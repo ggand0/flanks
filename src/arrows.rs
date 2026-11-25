@@ -386,7 +386,15 @@ fn arc_clears(
             return false;
         }
         let on_pieces = fine.is_some_and(|f| f.blocked(p.x, p.y).is_some());
-        s += if on_pieces { crate::town_layout::FINE } else { coarse };
+        s += if on_pieces {
+            crate::town_layout::FINE
+        } else {
+            // A stride over open ground ends where the pieces begin: a
+            // whole one could land past the parapet and the merlons on a
+            // wall's near face.
+            let to_pieces = fine.and_then(|f| f.entry(p, dir)).map_or(f32::INFINITY, |e| e + 0.5 * crate::town_layout::FINE);
+            coarse.min(to_pieces)
+        };
     }
     true
 }
@@ -907,4 +915,47 @@ fn sync_stuck_instances(
     stuck.dirty = false;
     data.0.clear();
     data.0.extend_from_slice(&stuck.data);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::terrain::{build_terrain, MapKind};
+    use crate::town_layout::{WALK, WALL_Z};
+
+    /// A straight shot from the slope at a man standing on the walk
+    /// behind a merlon meets the merlon, from every distance: the read
+    /// over open ground ends where the wall's pieces begin, so no stride
+    /// lands past the stone on the wall's outer face.
+    #[test]
+    fn a_shot_at_a_man_behind_a_merlon_meets_the_merlon_from_any_distance() {
+        let terrain = build_terrain(MapKind::WallDebug);
+        // The merlons' row on the outer face, and a merlon's middle on it,
+        // on the curtain east of the gatehouse (x 16 m on either side of
+        // 0), past the stair's platform and short of the tower at x 80.
+        let row = WALL_Z + 3.5;
+        let stone = |x: f32| terrain.height_at(x, row) - terrain.ground_at(x, row);
+        let x = (0..80).map(|k| 60.0 + k as f32 * 0.05).find(|&x| stone(x) > WALK + 1.4 && stone(x + 0.3) > WALK + 1.4);
+        let x = x.expect("a merlon on the outer face") + 0.15;
+        let man = Vec2::new(x, row - 1.5);
+        let floor = terrain.height_at(man.x, man.y);
+        assert!((floor - terrain.ground_at(man.x, man.y) - WALK).abs() < 1e-3, "the man stands on the walk");
+        let to = Vec3::new(man.x, floor + AIM_HEIGHT * crate::unit_types::tallest(), man.y);
+        // Out to the bow's flat reach at its top speed (48 m/s, 235 m):
+        // the grid begins 6 m before the merlons (the towers' bounds and
+        // 2 m), so only a stride longer than that, from about 196 m out,
+        // can jump the whole wall.
+        let mut out = 12.0f32;
+        while out < 240.0 {
+            let z = row + out;
+            let from = Vec3::new(x, terrain.height_at(x, z) + 1.5, z);
+            let d = (to.xz() - from.xz()).length();
+            let line = |s: f32| from.y + (to.y - from.y) * s / d;
+            assert!(
+                !arc_clears(from, Vec2::NEG_Y, d, floor, line, &terrain, false),
+                "a straight shot from {out} m out passes the merlon"
+            );
+            out += 0.37;
+        }
+    }
 }
