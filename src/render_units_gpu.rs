@@ -420,6 +420,14 @@ const PROBE_EVERY: u32 = 16;
 /// a run, both on an RTX 3090.
 const PROBE_RUNS: f32 = 3.0e6;
 
+/// `FL_SPRITE`: what drawing a hidden card costs, in the probe's vertex
+/// runs. Measured at the ground view with the cards from 200 m, where the
+/// test was off and about 163,000 hidden men drew as cards: the unit pass
+/// took 0.22 ms more than with the cards from 250 m, where the test hid
+/// them, about 1.35 ns a card, 31 runs at 44 ps. Its six corners alone
+/// would count it as 6, under the share of the pass it takes.
+const CARD_RUNS: f32 = 31.0;
+
 /// The columns a snapshot record is packed from: the live ones, or the
 /// tick job's shared copies of them.
 pub(crate) struct PackColumns<'a> {
@@ -1066,13 +1074,18 @@ fn on_counts_readback(
     counts.flips += words[84] as usize;
     counts.flip_frames += 1;
     // A frame the test ran on: the vertex runs it saved decide the next
-    // probe, at least one per vertex of each hidden soldier's level, and for
-    // each soldier `FL_LOD_HIDDEN` drew a level coarser the vertices his held
-    // level has over the one he was drawn at.
+    // probe, at least one per vertex of each hidden soldier's level (a
+    // card's measured cost, CARD_RUNS), and for each soldier `FL_LOD_HIDDEN`
+    // drew a level coarser the vertices his held level has over the one he
+    // was drawn at.
     if words[34] != 0 {
         let mut verts = [0.0f32; NUM_BUCKETS];
         for m in &meshes {
-            verts[m.bucket] = m.indexed.as_ref().map_or(m.corners.len(), |i| i.vertices.len()) as f32;
+            verts[m.bucket] = if m.card {
+                CARD_RUNS
+            } else {
+                m.indexed.as_ref().map_or(m.corners.len(), |i| i.vertices.len()) as f32
+            };
         }
         let hidden: f32 = (0..NUM_BUCKETS).map(|b| words[52 + b] as f32 * verts[b]).sum();
         let coarser: f32 = (0..NUM_BUCKETS)
