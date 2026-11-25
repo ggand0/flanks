@@ -515,17 +515,10 @@ fn share_columns(job: &mut TickJob, units: &Units) {
 /// front rank stops this share of its range short of the target's near
 /// edge (`firing_place`), then it stands and shoots. It shoots on until
 /// the gap passes the range; the band between is the hysteresis that
-/// keeps a block from marching and halting by turns.
+/// keeps a block from marching and halting by turns. The place and the
+/// range are measured with one reach (`firing_place`), so the band is
+/// this share of it against a target at any speed.
 const CLOSE_IN: f32 = 0.8;
-/// A marching archer regiment halts only where its frame stands within
-/// this share of its reach toward the target, the target's own way
-/// counted (`bow_reach_toward`). The firing place is built from the
-/// standing reach (CLOSE_IN of it), so against a standing target the
-/// place passes; against one going away the reach toward it shrinks, and
-/// a halt at the place would stand at the edge of the range, out of it a
-/// tick later, and march and halt by turns, the men re-dressing each
-/// time. Between CLOSE_IN and 1, so the halt keeps a band to the range.
-const HALT_IN: f32 = 0.9;
 /// The time an enemy block takes to reach a regiment that counts as
 /// coming for it (seconds): the skirmish trigger and, with skirmish off,
 /// the moment the men turn their bows on it.
@@ -610,9 +603,8 @@ fn bow_reach_standing(g: &GroupData, from: Vec2, t: &GroupData, terrain: &Terrai
 
 /// How far `g`'s bows reach toward `t` from `from` (metres): the
 /// standing reach plus three seconds of `t`'s speed toward `from` (the
-/// shafts land where the target will be). The range test's reach; the
-/// firing place does not follow the target's speed, or the regiment
-/// would walk back and forth with every change of it.
+/// shafts land where the target will be). The range test's reach, and
+/// the firing place's against a target going away (`firing_place`).
 fn bow_reach_toward(
     g: &GroupData,
     from: Vec2,
@@ -640,22 +632,9 @@ fn frame_in_bow_range(
     t_vel: Vec2,
     terrain: &Terrain,
 ) -> bool {
-    frame_within_reach(g, centre, t, t_vel, terrain, 1.0)
-}
-
-/// Whether `g`'s frame about `centre` is within `share` of its reach
-/// toward `t` (`frame_in_bow_range` at a share of 1).
-fn frame_within_reach(
-    g: &GroupData,
-    centre: Vec2,
-    t: &GroupData,
-    t_vel: Vec2,
-    terrain: &Terrain,
-    share: f32,
-) -> bool {
     let here = crate::formation::block_rect_at(g, centre);
     let gap = rect_gap(&here, &crate::formation::block_rect(t));
-    gap <= share * bow_reach_toward(g, centre, t, t_vel, terrain)
+    gap <= bow_reach_toward(g, centre, t, t_vel, terrain)
 }
 
 /// Where an archer regiment's attack order marches it: the frame centre
@@ -663,14 +642,23 @@ fn frame_within_reach(
 /// of its reach short of the target's near edge, kept inside the map.
 /// Every man walks to his slot about it, so no slot lies in the enemy
 /// and a column's head stops at the place like everyone else.
-fn firing_place(g: &GroupData, t: &GroupData, terrain: &Terrain) -> Vec2 {
+///
+/// The reach is the one the range test reads (`bow_reach_toward`) against
+/// a target going away, so the regiment closes in farther on it and the
+/// place stands CLOSE_IN inside the range whatever the target's speed;
+/// laid from the standing reach it stood at the range's edge against a
+/// target going away fast enough, and the regiment marched and halted by
+/// turns. Against a target that stands or comes it is the standing
+/// reach: a target coming on does not move the place back through the
+/// regiment's own men.
+fn firing_place(g: &GroupData, t: &GroupData, t_vel: Vec2, terrain: &Terrain) -> Vec2 {
     let to_t = t.centroid - g.centroid;
     let dist = to_t.length();
     if dist < 1e-3 {
         return g.centroid;
     }
     let u = to_t / dist;
-    let reach = bow_reach_standing(g, g.centroid, t, terrain);
+    let reach = bow_reach_standing(g, g.centroid, t, terrain).min(bow_reach_toward(g, g.centroid, t, t_vel, terrain));
     let short = crate::formation::block_reach_along(t, -u)
         + (CLOSE_IN * reach).max(0.0)
         + crate::formation::block_rect(g).half_d;
@@ -1508,20 +1496,18 @@ fn stand_off(groups: &mut Groups, g: usize, tracks: &crate::arrows::RegTracks, t
         return;
     }
     let t_vel = vel(target as usize);
-    let place = firing_place(gd, td, terrain);
+    let place = firing_place(gd, td, t_vel, terrain);
     let fresh = gd.standoff_target != Some(target);
     let was = gd.standoff && !fresh;
     // A fresh order shoots where it stands when it can; a standing
     // regiment stands until the frame it holds is out of range; a
     // marching one halts where its leading men arrive at the firing
-    // place, which is in range by its construction.
-    let now = if fresh {
-        in_bow_range(gd, td, t_vel, terrain)
-    } else if was {
-        frame_in_bow_range(gd, gd.anchor, td, t_vel, terrain)
-    } else {
-        head_arrived(gd, place) && frame_within_reach(gd, place, td, t_vel, terrain, HALT_IN)
-    };
+    // place, which is in range by its construction. A standing regiment
+    // whose frame is out of range while its leading men already stand at
+    // the place has no march to make: its frame steps on to the place.
+    let holds = was && frame_in_bow_range(gd, gd.anchor, td, t_vel, terrain);
+    let halts = !fresh && !holds && head_arrived(gd, place) && frame_in_bow_range(gd, place, td, t_vel, terrain);
+    let now = if fresh { in_bow_range(gd, td, t_vel, terrain) } else { holds || halts };
     let to_target = td.centroid - gd.centroid;
     if now != gd.standoff || fresh {
         let gap = edge_gap(gd, td);
@@ -1552,6 +1538,9 @@ fn stand_off(groups: &mut Groups, g: usize, tracks: &crate::arrows::RegTracks, t
         } else if gd.anchor.distance(gd.centroid) > 2.0 {
             gd.anchor = gd.centroid;
         }
+    } else if was && halts {
+        gd.anchor = place;
+        gd.reform = true;
     }
     if !now
         && (fresh || was)
@@ -2043,6 +2032,35 @@ mod tests {
 
     fn one(gd: GroupData) -> Groups {
         Groups { list: vec![gd] }
+    }
+
+    /// An archer regiment's firing place stands a fifth of the reach the
+    /// range test reads inside that range, against a target that stands
+    /// and against one going away at a walk, a run and a rout's pace: the
+    /// halt there never stands at the range's edge.
+    #[test]
+    fn the_firing_place_stands_inside_the_range_at_any_target_speed() {
+        let terrain = build_terrain(MapKind::Grassland);
+        let g = holder(Vec2::ZERO, Vec2::ZERO);
+        let mut t = GroupData::new(1, crate::unit_types::KIND_HEAVY, Vec2::new(0.0, 300.0), 200);
+        t.shape = FormShape::Rect;
+        t.files = 50;
+        t.facing = facing_of(Vec2::Y);
+        t.centroid = Vec2::new(0.0, 300.0);
+        for away in [0.0f32, 2.0, 4.0, 7.5] {
+            let t_vel = Vec2::new(0.0, away);
+            let place = firing_place(&g, &t, t_vel, &terrain);
+            let gap = rect_gap(&crate::formation::block_rect_at(&g, place), &crate::formation::block_rect(&t));
+            let reach = bow_reach_toward(&g, place, &t, t_vel, &terrain);
+            assert!(frame_in_bow_range(&g, place, &t, t_vel, &terrain), "in range at {away} m/s");
+            assert!(
+                (reach - gap - (1.0 - CLOSE_IN) * reach).abs() < 0.05 * reach,
+                "target going away at {away} m/s: gap {gap} m of a reach of {reach} m"
+            );
+        }
+        // A target coming on leaves the place where a standing one has it.
+        let still = firing_place(&g, &t, Vec2::ZERO, &terrain);
+        assert_eq!(firing_place(&g, &t, Vec2::new(0.0, -4.0), &terrain), still);
     }
 
     /// On the wall walk the block stands six ranks deep at the lane's
