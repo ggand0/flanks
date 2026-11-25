@@ -629,6 +629,7 @@ fn start_normal_battle(config: &mut BattleConfig, next: &mut NextState<GameState
     next.set(start_target());
 }
 
+#[allow(clippy::too_many_arguments)] // bevy system params
 fn menu_buttons(
     mut commands: Commands,
     query: Query<(&Interaction, &MenuButton), Changed<Interaction>>,
@@ -636,6 +637,7 @@ fn menu_buttons(
     mut config: ResMut<BattleConfig>,
     mut next: ResMut<NextState<GameState>>,
     mut exit: MessageWriter<AppExit>,
+    mut maps: MessageWriter<MapChanged>,
     mut auto: Local<bool>,
 ) {
     // Launch-time starts, looked at on the menu's first frame only: a test
@@ -651,6 +653,15 @@ fn menu_buttons(
         // FL_DEPLOY=0 it skips the picker and deployment too), for
         // measured runs of the real game with the AI on.
         if std::env::var("FL_AUTOSTART").is_ok() {
+            // FL_AUTOSTART_MAP=<name>: the map picked as the menu picks
+            // it, the terrain rebuilt from the one the game opened on, so
+            // a scripted run takes the path of a play that chose its map.
+            if let Some(map) = std::env::var("FL_AUTOSTART_MAP").ok().and_then(|n| MapKind::named(&n))
+                && config.map != map
+            {
+                config.map = map;
+                maps.write(MapChanged(map));
+            }
             start_normal_battle(&mut config, &mut next);
             return;
         }

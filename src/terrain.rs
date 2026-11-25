@@ -67,20 +67,27 @@ impl MapKind {
         if let Some(setup) = crate::battle_setup::from_env() {
             return setup.map;
         }
-        match std::env::var("FL_MAP").as_deref() {
-            Ok("big_grassland") => Self::BigGrassland,
-            Ok("hill") => Self::Hill,
-            Ok("big_hill") => Self::BigHill,
-            Ok("walled_town") => Self::WalledTown,
-            Ok("wall_debug") => Self::WallDebug,
-            Ok("line_debug") => Self::LineDebug,
-            Ok("river") => Self::River,
-            Ok("classic") => Self::Classic,
-            Ok("sandbox") => Self::Sandbox,
-            Ok("obstacles") => Self::Obstacles,
-            Ok("town") => Self::Town,
-            _ => Self::Grassland,
-        }
+        std::env::var("FL_MAP").ok().and_then(|n| Self::named(&n)).unwrap_or(Self::Grassland)
+    }
+
+    /// The map of a launch name (`FL_MAP=wall_debug`), None for an unknown
+    /// one.
+    pub fn named(name: &str) -> Option<Self> {
+        Some(match name {
+            "grassland" => Self::Grassland,
+            "big_grassland" => Self::BigGrassland,
+            "hill" => Self::Hill,
+            "big_hill" => Self::BigHill,
+            "walled_town" => Self::WalledTown,
+            "wall_debug" => Self::WallDebug,
+            "line_debug" => Self::LineDebug,
+            "river" => Self::River,
+            "classic" => Self::Classic,
+            "sandbox" => Self::Sandbox,
+            "obstacles" => Self::Obstacles,
+            "town" => Self::Town,
+            _ => return None,
+        })
     }
 
     pub fn label(self) -> &'static str {
