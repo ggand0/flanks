@@ -626,19 +626,17 @@ fn sun_shadow(shadow_position: vec3<f32>, frag_xy: vec2<f32>) -> f32 {
     return fetch_directional_shadow(0u, p, vec3<f32>(0.0), view_depth(shadow_position), frag_xy);
 }
 
-#ifdef UNIT_SPRITE
-// FL_SPRITE: a number from 0 to 1 per pixel and soldier, fixed while
-// neither moves (a PCG step over both).
+#ifdef UNIT_SPRITE_A2C
+// FL_SPRITE with MSAA: a number per pixel and soldier, fixed while neither
+// moves (a PCG step over both), that picks the samples a card covers.
 fn sprite_hash(pixel: vec2<f32>, soldier: u32) -> u32 {
     var h = (u32(pixel.x) * 1973u + u32(pixel.y) * 9277u + soldier * 26699u) | 1u;
     h = h * 747796405u + 2891336453u;
     h = ((h >> ((h >> 28u) + 4u)) ^ h) * 277803737u;
     return (h >> 22u) ^ h;
 }
-#endif
 
-#ifdef UNIT_SPRITE_A2C
-// FL_SPRITE=2: the card's colour and the samples of the pixel it covers.
+// The card's colour and the samples of the pixel it covers.
 struct SpriteFragment {
     @location(0) color: vec4<f32>,
     @builtin(sample_mask) mask: u32,
@@ -671,23 +669,29 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // at that normal, as the mesh's corners are (`sky_and_sun`), with the
     // sun's direction in his frame from the vertex stage.
     //
-    // The cut-out. Where the sheet is drawn at twice its size or larger,
-    // the figure's edge is where its alpha crosses a half. From its own
-    // size down, a texel's alpha is the share of it the figure covers, as
-    // the mips averaged it, and the card covers that share of the pixel: a
-    // pixel test against a number fixed per pixel and soldier (or, with
-    // FL_SPRITE=2, that share of the pixel's samples, picked the same
-    // way), so the men in a crowd cover the ground between them as their
-    // meshes do, and a spear thinner than a pixel covers a little of it.
-    // Between the two, a blend.
+    // The cut-out covers a pixel as a mesh does under the view's
+    // anti-aliasing.
+    //
+    // With MSAA a mesh covers the samples inside it. Where the sheet is
+    // drawn at twice its size or larger, the figure's edge is where its
+    // alpha crosses a half, over the samples on its side. From its own size
+    // down, a texel's alpha is the share of it the figure covers, as the
+    // mips averaged it, and the card covers that share of the pixel's
+    // samples, picked by a number fixed per pixel and soldier, so the men
+    // in a crowd cover the ground between them as their meshes do, and a
+    // spear thinner than a pixel covers a little of it. Between the two, a
+    // blend.
+    //
+    // Without MSAA a mesh covers a pixel when it covers the pixel's centre:
+    // the card does where the figure on the sheet's finest level covers it.
     let texel = textureSample(unit_atlas, unit_atlas_sampler, in.atlas_uv);
     let more = textureSample(unit_atlas, unit_atlas_sampler, in.atlas_uv + vec2<f32>(0.5, 0.0));
+#ifdef UNIT_SPRITE_A2C
     let texels = in.atlas_uv * vec2<f32>(textureDimensions(unit_atlas));
     let per_pixel = max(length(dpdx(texels)), length(dpdy(texels)));
     let smaller = clamp(2.0 * per_pixel - 1.0, 0.0, 1.0);
     let hash = sprite_hash(in.clip_position.xy, in.packed.y >> 16u);
     let pick = (f32(hash >> 8u) + 0.5) / 16777216.0;
-#ifdef UNIT_SPRITE_A2C
     let sharp = clamp((texel.a - 0.5) / max(fwidth(texel.a), 1e-4) + 0.5, 0.0, 1.0);
     let share = mix(sharp, texel.a, smaller);
     let samples = #{UNIT_SPRITE_SAMPLES}u;
@@ -700,7 +704,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let turn = (hash & 0xffu) % samples;
     let mask = ((run << turn) | (run >> (samples - turn))) & all;
 #else
-    if texel.a < mix(0.5, pick, smaller) {
+    if textureSampleLevel(unit_atlas, unit_atlas_sampler, in.atlas_uv, 0.0).a < 0.5 {
         discard;
     }
 #endif

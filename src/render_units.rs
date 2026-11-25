@@ -170,7 +170,7 @@ pub struct LodConfig {
     pub debug: bool,
     /// `FL_SPRITE_FROM`: with `FL_SPRITE` on and no `FL_LOD_PX`, the camera
     /// distance in metres from which a soldier draws the last level, the
-    /// card (unit_glb.rs `sprite_mode`). Default 400.
+    /// card (unit_glb.rs `sprites`). Default 400.
     ///
     /// The level pick works in pixels (a soldier's projected height against
     /// `px`), so `LodBands::new` turns these metres into the last switch's
@@ -205,7 +205,7 @@ impl Default for LodConfig {
             }
         }
         let lod_px = crate::util::perf_str("FL_LOD_PX").is_some_and(|v| v.trim() != "0");
-        let sprite_from = (crate::unit_glb::sprite_mode() != 0 && !lod_px).then(|| {
+        let sprite_from = (crate::unit_glb::sprites() && !lod_px).then(|| {
             let m = crate::util::env_or("FL_SPRITE_FROM", 400.0_f32);
             if m > 0.0 {
                 m
@@ -1856,13 +1856,13 @@ impl SpecializedRenderPipeline for CustomPipeline {
         if key.shape.light_level {
             descriptor.vertex.shader_defs.push("UNIT_LIGHT_LEVEL".into());
         }
-        if key.shape.sprite > 0 {
+        if key.shape.sprite {
             descriptor.vertex.shader_defs.push("UNIT_SPRITE".into());
             if let Some(fragment) = descriptor.fragment.as_mut() {
                 fragment.shader_defs.push("UNIT_SPRITE".into());
-                // FL_SPRITE=2 writes the samples it covers itself
+                // With MSAA the card writes the samples it covers itself
                 // (unit_instancing.wgsl `SpriteFragment`).
-                if key.shape.sprite == 2 {
+                if descriptor.multisample.count > 1 {
                     fragment.shader_defs.push("UNIT_SPRITE_A2C".into());
                     fragment.shader_defs.push(bevy::shader::ShaderDefVal::UInt(
                         "UNIT_SPRITE_SAMPLES".into(),

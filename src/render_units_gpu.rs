@@ -1721,9 +1721,9 @@ pub struct DrawShape {
     pub flat_light: bool,
     /// The light last level's colour (`PullMesh::light`).
     pub light_level: bool,
-    /// `FL_SPRITE`: 0 a mesh, 1 the card covering whole pixels, 2 the card
-    /// covering single samples (unit_instancing.wgsl `UNIT_SPRITE`).
-    pub sprite: u8,
+    /// `FL_SPRITE`: the level is the card (unit_instancing.wgsl
+    /// `UNIT_SPRITE`).
+    pub sprite: bool,
 }
 
 /// Uploads each pulled bucket's mesh once. The render entity persists,
@@ -1760,12 +1760,12 @@ fn extract_pull_meshes(
                 flat_atlas: m.flat_atlas,
                 flat_light: m.flat_light,
                 light_level: false,
-                sprite: 0,
+                sprite: false,
             })
         };
         let indexed = mesh.indexed.as_ref().map(upload);
         let cast = mesh.cast.as_ref().map(upload);
-        let sprite = if mesh.card { crate::unit_glb::sprite_mode() as u8 } else { 0 };
+        let sprite = mesh.card;
         let shape = DrawShape { light_level: mesh.light, sprite, ..shape_of(mesh.indexed.as_ref()) };
         let cast_shape = shape_of(mesh.cast.as_ref().or(mesh.indexed.as_ref()));
         // The casters draw the cast mesh with its own corners per soldier:

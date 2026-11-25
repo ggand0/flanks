@@ -498,7 +498,7 @@ fn import(kind: usize, path: &Path, pulled: bool) -> Fallible<KindMeshes> {
     let mut sprite = None;
     let mut sprite_rows = None;
     let mut fallen_last = None;
-    if sprite_mode() != 0 && pulled && levels[last].is_some() {
+    if sprites() && pulled && levels[last].is_some() {
         match sprite_table(kind, rig.bow.params[3] > 0.5).and_then(|rows| Ok((rows, sprite_sheet()?))) {
             Ok((rows, image)) => {
                 sprite_rows = Some(rows);
@@ -511,7 +511,7 @@ fn import(kind: usize, path: &Path, pulled: bool) -> Fallible<KindMeshes> {
         levels[last] = Some(card_level());
         cast_last = Some(level_mesh(&file));
         fallen_last = Some(level_mesh(&file));
-        info!("{name}: the last level is a card (FL_SPRITE={})", sprite_mode());
+        info!("{name}: the last level is a card (FL_SPRITE)");
     }
     let light_last = l3_light() && sprite.is_none() && pulled && levels[last].is_some();
     if light_last && let Some(file) = levels[last].take() {
@@ -543,16 +543,17 @@ fn import(kind: usize, path: &Path, pulled: bool) -> Fallible<KindMeshes> {
     })
 }
 
-/// `FL_SPRITE`: 0 off (the default), 1 every standing soldier at the last
-/// level is drawn as a card that covers whole pixels, 2 the same card
-/// covering single samples of a pixel (unit_instancing.wgsl
+/// `FL_SPRITE=1`: every standing soldier at the last level is drawn as a
+/// card (off by default). It covers a pixel as the meshes do under the
+/// view's anti-aliasing: with MSAA the samples its picture covers, without
+/// it the pixels whose centre it covers (unit_instancing.wgsl
 /// `SpriteFragment`). GPU path only. Read once, at import. The last
 /// level then begins `FL_SPRITE_FROM` metres from the camera, 400 by
 /// default (render_units.rs `LodConfig::sprite_from`), unless `FL_LOD_PX`
 /// is given, which sets every switch in pixels as without the card.
-pub fn sprite_mode() -> u32 {
-    static MODE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| crate::util::env_or("FL_SPRITE", 0_u32).min(2))
+pub fn sprites() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::util::env_or("FL_SPRITE", 0_u32) != 0)
 }
 
 /// The sprite sheet's layout (assets/units/sprites.json, written with the
