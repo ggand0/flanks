@@ -24,6 +24,7 @@ mod obstacle_map;
 mod orders;
 mod overlay;
 mod picker;
+mod play_log;
 mod regiments;
 mod render_units;
 mod render_units_gpu;
@@ -196,6 +197,7 @@ fn main() {
             balance::BalancePlugin,
             picker::PickerPlugin,
             frame_log::FrameLogPlugin,
+            play_log::PlayLogPlugin,
         ))
         .insert_resource(Time::<Fixed>::from_hz(30.0))
         // A frame that overruns makes the fixed clock owe catch-up sim
