@@ -517,6 +517,15 @@ fn share_columns(job: &mut TickJob, units: &Units) {
 /// the gap passes the range; the band between is the hysteresis that
 /// keeps a block from marching and halting by turns.
 const CLOSE_IN: f32 = 0.8;
+/// A marching archer regiment halts only where its frame stands within
+/// this share of its reach toward the target, the target's own way
+/// counted (`bow_reach_toward`). The firing place is built from the
+/// standing reach (CLOSE_IN of it), so against a standing target the
+/// place passes; against one going away the reach toward it shrinks, and
+/// a halt at the place would stand at the edge of the range, out of it a
+/// tick later, and march and halt by turns, the men re-dressing each
+/// time. Between CLOSE_IN and 1, so the halt keeps a band to the range.
+const HALT_IN: f32 = 0.9;
 /// The time an enemy block takes to reach a regiment that counts as
 /// coming for it (seconds): the skirmish trigger and, with skirmish off,
 /// the moment the men turn their bows on it.
@@ -631,9 +640,22 @@ fn frame_in_bow_range(
     t_vel: Vec2,
     terrain: &Terrain,
 ) -> bool {
+    frame_within_reach(g, centre, t, t_vel, terrain, 1.0)
+}
+
+/// Whether `g`'s frame about `centre` is within `share` of its reach
+/// toward `t` (`frame_in_bow_range` at a share of 1).
+fn frame_within_reach(
+    g: &GroupData,
+    centre: Vec2,
+    t: &GroupData,
+    t_vel: Vec2,
+    terrain: &Terrain,
+    share: f32,
+) -> bool {
     let here = crate::formation::block_rect_at(g, centre);
     let gap = rect_gap(&here, &crate::formation::block_rect(t));
-    gap <= bow_reach_toward(g, centre, t, t_vel, terrain)
+    gap <= share * bow_reach_toward(g, centre, t, t_vel, terrain)
 }
 
 /// Where an archer regiment's attack order marches it: the frame centre
@@ -1498,7 +1520,7 @@ fn stand_off(groups: &mut Groups, g: usize, tracks: &crate::arrows::RegTracks, t
     } else if was {
         frame_in_bow_range(gd, gd.anchor, td, t_vel, terrain)
     } else {
-        head_arrived(gd, place) && frame_in_bow_range(gd, place, td, t_vel, terrain)
+        head_arrived(gd, place) && frame_within_reach(gd, place, td, t_vel, terrain, HALT_IN)
     };
     let to_target = td.centroid - gd.centroid;
     if now != gd.standoff || fresh {
