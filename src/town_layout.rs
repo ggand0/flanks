@@ -55,6 +55,8 @@ use crate::terrain::{MapKind, CELL};
 /// The wall's centre line (z, m): its outer face at +4 looks south down
 /// the climb, the town lies north of its inner face at -4.
 pub const WALL_Z: f32 = -130.0;
+/// Half the wall's thickness (m): its faces at `WALL_Z` -4 and +4.
+pub const WALL_HALF: f32 = 4.0;
 /// The walk's height over the levelled ground (m).
 pub const WALK: f32 = 8.0;
 /// The drum roofs' height over the levelled ground (m).

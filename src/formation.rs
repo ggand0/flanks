@@ -581,14 +581,15 @@ pub fn assign_slots(units: &mut Units, g: u32, gd: &mut GroupData) -> Vec<u32> {
 /// `slot_offsets`, `blob_radius`) so a density retune can't silently
 /// diverge from the clamp footprint. The block at `files` in the spacing
 /// it closes to: a new placement is a new order, and an order closes an
-/// open regiment.
-pub fn block_half_extents(gd: &GroupData, files: u32, facing: f32) -> Vec2 {
+/// open regiment. `lane`: the placement is a lane's, at the lane's pitch
+/// and rank shift, whatever the regiment stands on now.
+pub fn block_half_extents(gd: &GroupData, files: u32, facing: f32, lane: bool) -> Vec2 {
     if gd.shape == FormShape::Blob {
         return Vec2::splat(blob_radius(gd.count));
     }
     let files = (files.max(1) as usize).min(gd.count.max(1));
     let ranks = gd.count.max(1).div_ceil(files);
-    let (pitch, stagger) = if gd.lane {
+    let (pitch, stagger) = if lane {
         (lane_pitch(gd.chosen_spacing(), gd.kind), lane_stagger(gd.chosen_spacing(), gd.kind))
     } else {
         (gd.chosen_spacing().pitch(gd.kind), 0.0)

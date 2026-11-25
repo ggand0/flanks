@@ -1017,6 +1017,11 @@ fn deploy_zone(terrain: &Terrain) -> (Vec2, Vec2) {
     let (centre, gap) = crate::regiments::army_lines(terrain.kind);
     let (mut lo, mut hi) = deploy_zone_for(terrain, gap);
     hi.y += centre;
+    // The defender of a wall deploys on it: the zone runs to the wall's
+    // outer face, so its walk is in it.
+    if terrain.kind.has_wall() {
+        hi.y = hi.y.max(crate::town_layout::WALL_Z + crate::town_layout::WALL_HALF);
+    }
     // A setup with open sides (the demo battle) deploys out to the map's
     // sides, so a line can close the corridors past its ends.
     if crate::battle_setup::from_env().is_some_and(|s| s.open_sides) {
@@ -1072,15 +1077,25 @@ fn clamp_layout_to_zone(
     nav: Option<&crate::nav::NavGrid>,
 ) {
     for p in layout {
-        let he = crate::formation::block_half_extents(&groups.list[p.g], p.files, p.facing);
-        let anchor = clamp_anchor(p.anchor, he, terrain, nav);
-        // A lane's block moved off its rows is a block on the ground.
-        p.lane &= anchor == p.anchor;
-        p.anchor = anchor;
+        let gd = &groups.list[p.g];
+        if p.lane {
+            // A lane's run is on the lane's own places already
+            // (`lane_layout`), which the route grid's coarse cells do not
+            // see: only the zone can move it, and moved it is a block on
+            // the ground.
+            let he = crate::formation::block_half_extents(gd, p.files, p.facing, true);
+            if clamp_anchor(p.anchor, he, terrain, None) == p.anchor {
+                continue;
+            }
+            p.lane = false;
+        }
+        let he = crate::formation::block_half_extents(gd, p.files, p.facing, false);
+        p.anchor = clamp_anchor(p.anchor, he, terrain, nav);
     }
 }
 
-/// Deployment drag release: place the drawn line by teleport.
+/// Deployment drag release, or a click on a lane: place the line by
+/// teleport.
 fn deploy_place_line(
     groups: &mut Groups,
     units: &mut Units,
@@ -1121,7 +1136,7 @@ fn deploy_move(
         picked.iter().map(|&g| groups.list[g].centroid).sum::<Vec2>() / picked.len() as f32;
     for &g in picked {
         let gd = &mut groups.list[g];
-        let he = crate::formation::block_half_extents(gd, gd.files, gd.facing);
+        let he = crate::formation::block_half_extents(gd, gd.files, gd.facing, false);
         gd.anchor = clamp_anchor(target + (gd.centroid - centroid), he, terrain, nav);
         gd.order = None;
         gd.auto_order = false;
@@ -1308,9 +1323,21 @@ fn click_release(
     t: f32,
 ) {
     if deploy_active {
-        // No attack targets while deploying: every click is a placement.
+        // No attack targets while deploying: every click is a placement,
+        // on a lane the lane's places from the click on, as in battle
+        // (`click_order`).
         let picked: Vec<usize> = selection.picked_controllable(groups).collect();
-        deploy_move(groups, units, terrain, routes.grid(), &picked, start);
+        if lane_at(terrain, start).is_some() {
+            let mut layout = line_layout(groups, terrain, &picked, start, start, Vec2::ZERO, false);
+            clamp_layout_to_zone(groups, &mut layout, terrain, routes.grid());
+            if layout.is_empty() {
+                info!("no room on the lane at ({:.0}, {:.0}): {} regiments placed nowhere", start.x, start.y, picked.len());
+                return;
+            }
+            deploy_place_line(groups, units, terrain, layout);
+        } else {
+            deploy_move(groups, units, terrain, routes.grid(), &picked, start);
+        }
         cues.write(crate::audio::UiCue::Deploy);
     } else if let Some(e) = enemy_regiment_at(groups, start) {
         attack_regiments(groups, selected, e);
@@ -1750,6 +1777,39 @@ mod tests {
         let places = drag_x(&groups, 3.0, true);
         assert!(places.iter().all(|p| p.2 >= 1));
         assert_tight(&places, 6.0);
+    }
+
+    /// While deploying, a 500-man regiment dragged along the walk, or
+    /// clicked onto it, stands on the walk: every man in the walk's band at
+    /// its height, six ranks deep for a short drag, fewer for a long one.
+    #[test]
+    fn a_regiment_deploys_onto_the_walk() {
+        let terrain = crate::terrain::build_terrain(crate::terrain::MapKind::WallDebug);
+        let nav = crate::nav::NavGrid::build(&terrain);
+        let z = crate::town_layout::WALL_Z;
+        let behind = Vec2::new(0.0, z - 40.0);
+        for (len, ranks) in [(0.0, 6), (30.0, 6), (150.0, 4)] {
+            let mut groups = Groups { list: vec![archers(500, behind)] };
+            let mut units = Units::default();
+            for k in 0..500 {
+                let p = behind + Vec2::new((k % 50) as f32 * 1.4 - 35.0, (k / 50) as f32 * 1.4);
+                crate::units::push_unit(&mut units, &terrain, k, 0, crate::unit_types::KIND_ARCHER, 0, p.x, p.y, behind);
+            }
+            let (a, b) = (Vec2::new(-60.0, z + 1.0), Vec2::new(-60.0 + len, z - 1.0));
+            let mut layout = line_layout(&groups, &terrain, &[0], a, b, Vec2::ZERO, false);
+            clamp_layout_to_zone(&groups, &mut layout, &terrain, nav.as_ref());
+            assert!(layout.len() == 1 && layout[0].lane, "a {len} m drag is a lane's");
+            deploy_place_line(&mut groups, &mut units, &terrain, layout);
+            let gd = &groups.list[0];
+            assert!(gd.lane);
+            assert_eq!(crate::formation::grid(gd).1, ranks, "ranks for a {len} m drag");
+            for i in 0..units.len() {
+                let p = units.pos[i];
+                assert!((p.z - z).abs() <= 3.0, "man {i} at {p} is on the walk's band");
+                let walk = crate::town_layout::WALK + terrain.ground_at(p.x, p.z);
+                assert!(p.y > walk, "man {i} at {p} stands up on the walk ({walk} m)");
+            }
+        }
     }
 
     /// Ctrl changes nothing on the wall's walk.
