@@ -103,7 +103,7 @@ pub(super) const CHARGE_SPEED_FRAC: f32 = 0.6;
 /// regiment running to the fight within 6 m.
 #[inline]
 pub(super) fn acquire(f: &Field, s: &mut Soldier, st: &mut Step) {
-    let Field { grid, press, engaged, focus, tick_seed, .. } = *f;
+    let Field { grid, press, engaged, focus, tick_seed, paths, .. } = *f;
     let i = s.i;
     let p = st.p;
     let gi = st.gi;
@@ -135,6 +135,12 @@ pub(super) fn acquire(f: &Field, s: &mut Soldier, st: &mut Step) {
     {
         let look = if engaged[gi] { seek_radius() } else { WIDE_ACQUIRE_R };
         let mut far_d2 = look * look;
+        // He goes for an enemy he can walk to straight: on a map with
+        // blocked ground not one behind a wall, on its walk above him or
+        // at its foot below, nor one across a cliff. Where nothing blocks
+        // the ground there is no grid and every enemy is one he can walk
+        // to.
+        let goes_to = |o: &crate::spatial::SortedUnit| paths.nav.is_none_or(|nav| nav.walk_line(p, o.xz()));
         if let Some(t) = focus[gi] {
             // His regiment fights one ordered target (sim/job.rs `focus`):
             // he looks for its men anywhere in his sight, and for any
@@ -154,7 +160,7 @@ pub(super) fn acquire(f: &Field, s: &mut Soldier, st: &mut Step) {
                         || (d2 < threat2
                             && closing > 0.0
                             && closing * closing > GOING_SPEED * GOING_SPEED * d2);
-                    if counts && d2 < far_d2 {
+                    if counts && d2 < far_d2 && goes_to(o) {
                         far_d2 = d2;
                         *s.target = o.idx;
                     }
@@ -166,7 +172,7 @@ pub(super) fn acquire(f: &Field, s: &mut Soldier, st: &mut Step) {
                     && (o.meta & crate::spatial::META_DYING) == 0;
                 if enemy {
                     let d2 = (p - o.xz()).length_squared();
-                    if d2 < far_d2 {
+                    if d2 < far_d2 && goes_to(o) {
                         far_d2 = d2;
                         *s.target = o.idx;
                     }
