@@ -587,7 +587,7 @@ fn log_progress(
     let walk_lane = walls.then(|| crate::town_layout::walk_lane(terrain.body_radius()));
     let ten_s = tick.is_multiple_of(300);
     if matches!(scene.as_str(), "walls_assault" | "walls_archers" | "walls_rout") && tick.is_multiple_of(150) && groups.list.len() > 1 {
-        log_assault(&groups, &units, secs);
+        log_assault(&groups, &units, &terrain, secs);
     }
     // On the wall scenes the ten-second lines go on after the verdict, for
     // the latest subject of each regiment only (the walls scene orders its
@@ -876,7 +876,7 @@ struct Tally {
 /// The assault scene's five-second lines (the module docs): one per enemy
 /// regiment of the scene (the path test's far holder, the last regiment,
 /// left out), then the archers'.
-fn log_assault(groups: &Groups, units: &Units, secs: f32) {
+fn log_assault(groups: &Groups, units: &Units, terrain: &Terrain, secs: f32) {
     let face = crate::town_layout::WALL_Z + 4.0;
     let n = groups.list.len().saturating_sub(1);
     for g in (0..n).filter(|&g| groups.list[g].team == 1) {
@@ -918,7 +918,7 @@ fn log_assault(groups: &Groups, units: &Units, secs: f32) {
     let (mut on_walk, mut knives) = (0usize, 0usize);
     for i in (0..units.len()).filter(|&i| units.death_t[i] == 0 && units.group[i] == 0) {
         let p = Vec2::new(units.pos[i].x, units.pos[i].z);
-        on_walk += usize::from((p.y - crate::town_layout::WALL_Z).abs() <= 3.0 && units.pos[i].y > 7.0);
+        on_walk += usize::from((p.y - crate::town_layout::WALL_Z).abs() <= 3.0 && units.pos[i].y > terrain.ground_at(p.x, p.y) + crate::town_layout::WALK - 0.5);
         knives += usize::from(units.sight[i] & crate::sim::soldier::SIGHT_KNIFE != 0);
     }
     info!(
