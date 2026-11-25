@@ -882,12 +882,16 @@ fn lane_layout(groups: &Groups, lane: &Lane, picked: &[usize], a: Vec2, b: Vec2)
         let pitch = crate::formation::lane_pitch(gd.chosen_spacing(), gd.kind);
         let stagger = crate::formation::lane_stagger(gd.chosen_spacing(), gd.kind);
         let share = len * gd.count as f32 / total as f32;
-        // The ranks the lane holds; the hundredth of a millimetre keeps a
-        // depth that fills the lane exactly from rounding a rank away.
         let n = gd.count as u32;
         // The ranks the lane holds in front of `front` (a man's centre),
-        // to its back edge; the hundredth of a millimetre keeps a depth
-        // that fills the lane exactly from rounding a rank away.
+        // to its back edge. The margins, a tenth of a millimetre and a
+        // ten-thousandth of a rank, keep a rank whose centre falls on the
+        // back edge from being rounded away: at FL_BODY=1.4 the walk gives
+        // a man's centre 4.6 m, which a shieldwall's five ranks 1.15 m
+        // apart fill exactly, and a shieldwall behind one four ranks deep
+        // has its front rank on the back edge. At the default body every
+        // spacing's depth is a hundredth of a rank or more from a whole
+        // number of ranks, and the margins change nothing.
         let rows = |front: f32| {
             if front < lane.across.0 - 1e-4 { 0 } else { ((front - lane.across.0) / pitch.y + 1e-4).floor() as u32 + 1 }
         };
@@ -923,9 +927,9 @@ fn lane_layout(groups: &Groups, lane: &Lane, picked: &[usize], a: Vec2, b: Vec2)
 /// in front of `front` are theirs, the rows behind are free. `n` men,
 /// `extra` files over the fewest the free rows allow, the ranks `pitch`
 /// deep. The run is widened until its men fit the rows its whole width
-/// leaves free, a few times at most; None where no row is free behind
-/// them or the run leaves the lane. Returns the files, the run and the
-/// front rank's centre across the lane.
+/// leaves free; None where no row is free behind them or the run leaves
+/// the lane. Returns the files, the run and the front rank's centre
+/// across the lane.
 #[allow(clippy::too_many_arguments)]
 fn behind_run(
     lane: &Lane,
@@ -939,8 +943,10 @@ fn behind_run(
     rows: &dyn Fn(f32) -> u32,
     width: &dyn Fn(u32) -> f32,
 ) -> Option<(u32, (f32, f32), f32)> {
+    // Each pass that does not return takes more files than the last, and
+    // never more than `n`, which the rows always hold: the loop ends.
     let mut files = 1;
-    for _ in 0..6 {
+    loop {
         let w = width(files);
         let run = if dir > 0.0 { (start, start + w) } else { (start - w, start) };
         if run.0 < lane.along.0 - 0.01 || run.1 > lane.along.1 + 0.01 {
@@ -962,7 +968,6 @@ fn behind_run(
         }
         files = need;
     }
-    None
 }
 
 /// The stretches of the lane (x ranges) the team's regiments other than
