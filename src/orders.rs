@@ -878,12 +878,16 @@ fn lane_layout(groups: &Groups, lane: &Lane, picked: &[usize], a: Vec2, b: Vec2)
     for (g, _) in segs {
         let gd = &groups.list[g];
         let pitch = crate::formation::lane_pitch(gd.chosen_spacing(), gd.kind);
+        let stagger = crate::formation::lane_stagger(gd.chosen_spacing(), gd.kind);
         let share = len * gd.count as f32 / total as f32;
-        let ranks_max = (((lane.across.1 - lane.across.0) / pitch.y).floor() as u32 + 1).max(1);
+        // The ranks the lane holds; the hundredth of a millimetre keeps a
+        // depth that fills the lane exactly from rounding a rank away.
+        let ranks_max = (((lane.across.1 - lane.across.0) / pitch.y + 1e-4).floor() as u32 + 1).max(1);
         let least = (gd.count as u32).div_ceil(ranks_max).clamp(1, gd.count as u32);
         let drawn = ((share / pitch.x).floor() as u32).clamp(least, gd.count as u32);
         let placed = [drawn, least].into_iter().find_map(|files| {
-            let width = (files - 1) as f32 * pitch.x + body;
+            let shift = if (gd.count as u32) > files { stagger } else { 0.0 };
+            let width = (files - 1) as f32 * pitch.x + shift + body;
             free_run(lane, &taken, cursor, dir, width).map(|run| (files, run))
         });
         let Some((files, run)) = placed else { continue };
@@ -920,7 +924,9 @@ fn lane_runs(groups: &Groups, lane: &Lane, team: u8, skip: &[usize]) -> Vec<(f32
             }
             let files = if gd.files == 0 { crate::formation::default_files(gd.count) } else { gd.files };
             let pitch = crate::formation::lane_pitch(gd.chosen_spacing(), gd.kind);
-            let half = (files.min(gd.count as u32) - 1) as f32 * 0.5 * pitch.x + body * 0.5;
+            let files = files.min(gd.count as u32);
+            let shift = if (gd.count as u32) > files { crate::formation::lane_stagger(gd.chosen_spacing(), gd.kind) } else { 0.0 };
+            let half = (files - 1) as f32 * 0.5 * pitch.x + 0.5 * shift + body * 0.5;
             Some((at.x - half, at.x + half))
         })
         .collect()
@@ -1370,15 +1376,18 @@ fn draw_order_preview(
         let gd = &groups.list[p.g];
         let fwd = facing_dir(p.facing);
         let right = Vec2::new(fwd.y, -fwd.x);
-        let pitch = if p.lane {
-            crate::formation::lane_pitch(gd.chosen_spacing(), gd.kind)
+        let (pitch, stagger) = if p.lane {
+            (
+                crate::formation::lane_pitch(gd.chosen_spacing(), gd.kind),
+                crate::formation::lane_stagger(gd.chosen_spacing(), gd.kind),
+            )
         } else {
-            gd.chosen_spacing().pitch(gd.kind)
+            (gd.chosen_spacing().pitch(gd.kind), 0.0)
         };
         let world = |off: Vec2| p.anchor + right * off.x + fwd * off.y;
 
         if total <= PREVIEW_CIRCLE_CAP {
-            for off in slot_offsets(gd.count, p.files as usize, pitch) {
+            for off in slot_offsets(gd.count, p.files as usize, pitch, stagger) {
                 gizmos.circle(
                     Isometry3d::new(
                         lift(world(off), 0.25),
@@ -1558,11 +1567,12 @@ mod tests {
         placed
     }
 
-    /// A regiment's run on the lane: its outer centres less and plus half
-    /// a body.
+    /// A regiment's run on the lane: its outer centres, the ranks' shift
+    /// included, less and plus half a body.
     fn run_of(gd: &GroupData) -> (f32, f32) {
         let Some(Order::Move(at)) = gd.order else { panic!("no order") };
-        let half = (gd.files - 1) as f32 * 0.5 * crate::formation::pitch_of(gd).x + 0.5 * crate::sim::soldier::body_distance();
+        let shift = if gd.count > gd.files as usize { crate::formation::stagger_of(gd) } else { 0.0 };
+        let half = (gd.files - 1) as f32 * 0.5 * crate::formation::pitch_of(gd).x + 0.5 * shift + 0.5 * crate::sim::soldier::body_distance();
         (at.x - half, at.x + half)
     }
 
@@ -1607,8 +1617,8 @@ mod tests {
         for g in 0..2 {
             let gd = &groups.list[g];
             assert!(gd.lane, "regiment {g} is a lane's");
-            // Five ranks of a hundred at the lane's pitch.
-            assert_eq!((gd.files, crate::formation::grid(gd).1), (100, 5));
+            // Six ranks of 84 at the lane's pitch.
+            assert_eq!((gd.files, crate::formation::grid(gd).1), (84, 6));
         }
         assert!(!lane_order(&mut groups, &lane, 2, 0.0, 8.0));
         let third = &groups.list[2];
@@ -1628,10 +1638,10 @@ mod tests {
         let mut groups = Groups { list: (0..2).map(|_| archers(200, behind)).collect() };
         // The first takes all but 60 m at the west end, in one rank or two.
         assert!(lane_order(&mut groups, &lane, 0, lane.along.0 + 60.0, lane.along.1));
-        // The second is dragged 100 m into the 57 m left: 40 files by 5.
+        // The second is dragged 100 m into the 57 m left: 34 files by 6.
         assert!(lane_order(&mut groups, &lane, 1, lane.along.0, lane.along.0 + 100.0));
         let gd = &groups.list[1];
-        assert_eq!(gd.files, 40);
+        assert_eq!(gd.files, 34);
         let (a, b) = (run_of(&groups.list[0]), run_of(gd));
         assert!(b.0 >= lane.along.0 - 0.01 && b.1 + LINE_REG_GAP <= a.0 + 0.01, "the runs {b:?} and {a:?}");
     }

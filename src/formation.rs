@@ -163,15 +163,36 @@ impl FormSpacing {
 }
 
 /// The slot pitch of a regiment on a lane (the wall's walk). In normal
-/// order it is the rest distance of two men at ease (sim/soldier/body.rs
-/// `sep_ease`), the closest two standing men keep without pushing each
-/// other, so the walk holds a rank more than at the field's pitch; the
-/// other spacings keep their own.
+/// order its files are the rest distance of two men at ease
+/// (sim/soldier/body.rs `sep_ease`) apart, the closest two standing men
+/// keep without pushing each other, and every other rank stands shifted
+/// half a file (`lane_stagger`), so a man stands between the two men
+/// ahead of him and the ranks come closer: the depth at which those two
+/// are at the rest distance from him too. The 6 m walk holds six ranks
+/// where it held five straight behind each other; the other spacings
+/// keep their own pitch, unshifted.
 pub fn lane_pitch(spacing: FormSpacing, kind: u8) -> Vec2 {
     match spacing {
-        FormSpacing::Normal => Vec2::splat(crate::sim::soldier::sep_ease()),
+        FormSpacing::Normal => {
+            let sep = crate::sim::soldier::sep_ease();
+            Vec2::new(sep, (sep * sep - 0.25 * sep * sep).sqrt())
+        }
         _ => spacing.pitch(kind),
     }
+}
+
+/// How far every other rank of a lane's block stands shifted along the
+/// rank (`lane_pitch`): half a file in normal order, none in the others.
+pub fn lane_stagger(spacing: FormSpacing, kind: u8) -> f32 {
+    match spacing {
+        FormSpacing::Normal => 0.5 * lane_pitch(spacing, kind).x,
+        _ => 0.0,
+    }
+}
+
+/// A regiment's rank shift as it stands (`lane_stagger`): none off a lane.
+pub fn stagger_of(gd: &GroupData) -> f32 {
+    if gd.lane { lane_stagger(gd.spacing, gd.kind) } else { 0.0 }
 }
 
 /// A regiment's slot pitch as it stands: its spacing's, or the lane's
@@ -411,20 +432,31 @@ pub fn facing_of(dir: Vec2) -> f32 {
 
 /// Row-major LOCAL slot offsets (x = lateral, y = forward) for `n` units
 /// in `files` columns: front rank first, left to right, partial last rank
-/// centered, block centered on the origin. The one grid used by slot
-/// assignment AND the drag-order placement preview — what you see is
-/// where they stand.
-pub fn slot_offsets(n: usize, files: usize, pitch: Vec2) -> Vec<Vec2> {
+/// centered, block centered on the origin. With a `stagger` (a lane's,
+/// `lane_stagger`) every other rank stands that far to the right of the
+/// one ahead, the block still centred, and a partial last rank keeps to
+/// its rank's files, as near the middle as they go: centred freely, it
+/// could stand a man straight behind another at the ranks' close depth.
+/// The one grid used by slot assignment AND the drag-order placement
+/// preview — what you see is where they stand.
+pub fn slot_offsets(n: usize, files: usize, pitch: Vec2, stagger: f32) -> Vec<Vec2> {
     let files = files.clamp(1, n.max(1));
     let ranks = n.div_ceil(files);
     let half_depth = (ranks - 1) as f32 / 2.0;
+    let stagger = if ranks > 1 { stagger } else { 0.0 };
+    let full = (files - 1) as f32 / 2.0;
     let mut out = Vec::with_capacity(n);
     for r in 0..ranks {
         let in_row = files.min(n - r * files);
-        let half_w = (in_row - 1) as f32 / 2.0;
         let fwd = (half_depth - r as f32) * pitch.y;
+        let (first, shift) = if stagger > 0.0 {
+            let shift = if r % 2 == 1 { 0.5 * stagger } else { -0.5 * stagger };
+            (((files - in_row) / 2) as f32 - full, shift)
+        } else {
+            (-((in_row - 1) as f32 / 2.0), 0.0)
+        };
         for c in 0..in_row {
-            out.push(Vec2::new((c as f32 - half_w) * pitch.x, fwd));
+            out.push(Vec2::new((first + c as f32) * pitch.x + shift, fwd));
         }
     }
     out
@@ -525,7 +557,7 @@ pub fn assign_slots(units: &mut Units, g: u32, gd: &mut GroupData) -> Vec<u32> {
         FormShape::Rect => {
             let files = (gd.files.max(1) as usize).min(n);
             let pitch = pitch_of(gd);
-            let slots = slot_offsets(n, files, pitch);
+            let slots = slot_offsets(n, files, pitch, stagger_of(gd));
             // Front-to-back, then left-to-right within each rank: the
             // greedy crossing-minimizer, matching the slots' row-major
             // order.
@@ -556,8 +588,13 @@ pub fn block_half_extents(gd: &GroupData, files: u32, facing: f32) -> Vec2 {
     }
     let files = (files.max(1) as usize).min(gd.count.max(1));
     let ranks = gd.count.max(1).div_ceil(files);
-    let pitch = if gd.lane { lane_pitch(gd.chosen_spacing(), gd.kind) } else { gd.chosen_spacing().pitch(gd.kind) };
-    let half_w = (files - 1) as f32 * 0.5 * pitch.x + 1.0;
+    let (pitch, stagger) = if gd.lane {
+        (lane_pitch(gd.chosen_spacing(), gd.kind), lane_stagger(gd.chosen_spacing(), gd.kind))
+    } else {
+        (gd.chosen_spacing().pitch(gd.kind), 0.0)
+    };
+    let stagger = if ranks > 1 { stagger } else { 0.0 };
+    let half_w = (files - 1) as f32 * 0.5 * pitch.x + 0.5 * stagger + 1.0;
     let half_d = (ranks - 1) as f32 * 0.5 * pitch.y + 1.0;
     let fwd = facing_dir(facing);
     let right = Vec2::new(fwd.y, -fwd.x);
@@ -642,13 +679,21 @@ pub fn block_rect_at(gd: &GroupData, centre: Vec2) -> BlockRect {
         let r = if gd.radius > 0.0 { gd.radius } else { blob_radius(gd.count) };
         return BlockRect { centre, fwd: Vec2::ZERO, half_w: r, half_d: r };
     }
-    let (files, _, pitch) = grid(gd);
     BlockRect {
         centre,
         fwd: facing_dir(gd.facing),
-        half_w: (files - 1) as f32 * 0.5 * pitch.x + 1.0,
+        half_w: half_width(gd) + 1.0,
         half_d: front_offset(gd) + 1.0,
     }
+}
+
+/// Half the width of a Rect block's places as it stands, outer centre to
+/// outer centre: its files, and a lane block's rank shift
+/// (`lane_stagger`) when it has more than one rank.
+fn half_width(gd: &GroupData) -> f32 {
+    let (files, ranks, pitch) = grid(gd);
+    let stagger = if ranks > 1 { stagger_of(gd) } else { 0.0 };
+    (files - 1) as f32 * 0.5 * pitch.x + 0.5 * stagger
 }
 
 /// A radius about the centroid that holds the whole of `block_rect`
@@ -659,8 +704,7 @@ pub fn block_bound(gd: &GroupData) -> f32 {
     if gd.shape == FormShape::Blob || gd.files == 0 {
         return if gd.radius > 0.0 { gd.radius } else { blob_radius(gd.count) };
     }
-    let (files, _, pitch) = grid(gd);
-    let half_w = (files - 1) as f32 * 0.5 * pitch.x + 1.0;
+    let half_w = half_width(gd) + 1.0;
     let half_d = front_offset(gd) + 1.0;
     (half_w * half_w + half_d * half_d).sqrt()
 }
@@ -1160,8 +1204,9 @@ mod tests {
     }
 
     /// On the wall's walk a regiment in normal order stands at the rest
-    /// distance of men at ease, five ranks on the walk; ordered off the
-    /// walk it is back at its field pitch.
+    /// distance of men at ease, every other rank shifted half a file, six
+    /// ranks on the walk; ordered off the walk it is back at its field
+    /// pitch.
     #[test]
     fn a_regiment_stands_tighter_on_a_lane_and_only_there() {
         let lane = crate::town_layout::walk_lane(0.6);
@@ -1171,9 +1216,13 @@ mod tests {
         assert!(stands_on_lane(&gd, &lane));
         gd.lane = true;
         let tight = crate::sim::soldier::sep_ease();
-        assert_eq!(pitch_of(&gd), Vec2::splat(tight));
-        assert_eq!(grid(&gd).2, Vec2::splat(tight));
-        assert!(((lane.across.1 - lane.across.0) / tight).floor() as u32 + 1 == 5, "ranks the walk holds");
+        let pitch = pitch_of(&gd);
+        assert_eq!(pitch.x, tight);
+        assert_eq!(grid(&gd).2, pitch);
+        assert_eq!(stagger_of(&gd), 0.5 * tight);
+        // A man and either of the two men ahead of him: the rest distance.
+        assert!((Vec2::new(0.5 * tight, pitch.y).length() - tight).abs() < 1e-5);
+        assert!(((lane.across.1 - lane.across.0) / pitch.y + 1e-4).floor() as u32 + 1 == 6, "ranks the walk holds");
         // Holding there, and told to shoot from there with its men on it.
         gd.order = None;
         gd.anchor = on_walk;
@@ -1190,6 +1239,29 @@ mod tests {
         gd.lane = true;
         gd.spacing = FormSpacing::Wall;
         assert_eq!(pitch_of(&gd), FormSpacing::Wall.pitch(gd.kind));
+        assert_eq!(stagger_of(&gd), 0.0);
+    }
+
+    /// The lane's grid with its rank shift: every pair of places at least
+    /// the rest distance apart, the partial last rank too, and the block
+    /// centred.
+    #[test]
+    fn the_shifted_ranks_keep_every_man_at_the_rest_distance() {
+        let pitch = lane_pitch(FormSpacing::Normal, crate::unit_types::KIND_ARCHER);
+        let stagger = lane_stagger(FormSpacing::Normal, crate::unit_types::KIND_ARCHER);
+        for (n, files) in [(500, 84), (60, 10), (61, 10), (67, 10), (7, 4), (5, 5)] {
+            let slots = slot_offsets(n, files, pitch, stagger);
+            assert_eq!(slots.len(), n);
+            for (i, a) in slots.iter().enumerate() {
+                for b in &slots[i + 1..] {
+                    assert!(a.distance(*b) >= pitch.x - 1e-4, "{n} in {files} files: {a} and {b}");
+                }
+            }
+            let (lo, hi) = slots.iter().fold((f32::MAX, f32::MIN), |(lo, hi), s| (lo.min(s.x), hi.max(s.x)));
+            if n >= 2 * files {
+                assert!((lo + hi).abs() < 1e-4, "{n} in {files} files centred: {lo} to {hi}");
+            }
+        }
     }
 
     /// A block that opens 3.9 m behind and nothing ahead moves its anchor

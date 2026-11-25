@@ -2023,7 +2023,7 @@ mod tests {
         Groups { list: vec![gd] }
     }
 
-    /// On the wall walk the block stands five ranks deep at the lane's
+    /// On the wall walk the block stands six ranks deep at the lane's
     /// pitch, its front face on the parapet and its rear face at the
     /// kerb: no layout that grows the block fits, wherever its men are.
     #[test]
