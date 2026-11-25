@@ -174,10 +174,14 @@ pub(super) fn drive(f: &Field, s: &mut Soldier, st: &mut Step) {
     }
 }
 
+/// How far ahead a fleeing man looks for blocked ground on his straight
+/// way to his edge (m): where it is not clear, he takes the way on foot.
+const FLEE_LOOK: f32 = 12.0;
+
 /// A broken man's flight (`drive`): his wish toward his own map edge.
 #[inline]
 fn flee(f: &Field, i: usize, p: Vec2) -> Vec2 {
-    let Field { terrain, speed, team, .. } = *f;
+    let Field { terrain, speed, team, paths, .. } = *f;
     // Broken: flee toward the own map edge with a per-unit lateral
     // scatter — slightly SLOWER than formed pursuers (0.9x): fleeing at
     // exactly max speed made pursuit a zero-kill treadmill (gap frozen
@@ -185,7 +189,18 @@ fn flee(f: &Field, i: usize, p: Vec2) -> Vec2 {
     let flee_z: f32 = if team[i] == 0 { -1.0 } else { 1.0 };
     let lat = (crate::units::hash01((i as u32).wrapping_mul(17) + 3) - 0.5)
         * 0.7;
-    let dir = Vec2::new(lat, flee_z).normalize_or_zero();
+    let mut dir = Vec2::new(lat, flee_z).normalize_or_zero();
+    // Where his straight way runs into a wall, a kerb or a cliff (on the
+    // wall's walk it runs over the inner edge), he flees the way a man
+    // walks to his edge instead: along the walk, down a stair, round the
+    // wall (nav.rs `flee_way`). A straight way pressed him against the
+    // stone, and a man with little scatter never slid off it.
+    if let Some(nav) = paths.nav
+        && !nav.walk_line(p, p + dir * FLEE_LOOK)
+        && let Some(way) = nav.flee_way(team[i], p)
+    {
+        dir = way;
+    }
     let slope = terrain.slope_at(p.x, p.y);
     dir
         * speed[i]

@@ -77,6 +77,10 @@ pub struct NavGrid {
     /// `FineGround`), where a man's straight line is read: he may stand
     /// in a 2 m cell the grid calls unwalkable, beside a rail or a kerb.
     fine: Option<std::sync::Arc<crate::town_layout::FineGround>>,
+    /// Each army's walk to its own map edge (`flee_fields`): per cell,
+    /// metres on foot to the edge it flees to, team 0's (-z) first;
+    /// infinite where no walk reaches it.
+    flee: [Vec<f32>; 2],
 }
 
 impl Clone for NavGrid {
@@ -96,6 +100,7 @@ impl Clone for NavGrid {
             heights: self.heights.clone(),
             costs: Default::default(),
             fine: self.fine.clone(),
+            flee: self.flee.clone(),
         }
     }
 }
@@ -168,11 +173,13 @@ impl NavGrid {
             heights: terrain.heights().to_vec(),
             costs: Default::default(),
             fine: terrain.fine().cloned(),
+            flee: [Vec::new(), Vec::new()],
         };
         grid.fill_cells(terrain, 0, 0, nx - 1, nz - 1);
         grid.has_water = grid.wet.iter().any(|&w| w);
         grid.clearance_window(0, 0, nx - 1, nz - 1, 0, 0, nx - 1, nz - 1);
         grid.label_regions();
+        grid.flee = grid.flee_fields();
         Some(grid)
     }
 
@@ -219,8 +226,72 @@ impl NavGrid {
         let (wx1, wz1) = ((ox1 + r).min(self.nx - 1), (oz1 + r).min(self.nz - 1));
         self.clearance_window(wx0, wz0, wx1, wz1, ox0, oz0, ox1, oz1);
         self.label_regions();
+        self.flee = self.flee_fields();
         self.costs.lock().unwrap().clear();
         true
+    }
+
+    /// Each army's walk to its own map edge: for every cell the metres on
+    /// foot, over the planner's moves (`neighbours`: its stairs, round its
+    /// walls), to the edge the army flees to (team 0 toward -z, team 1
+    /// toward +z, as `flee` in sim/soldier/motion.rs): its seeds are each
+    /// column's first walkable cell counted from that edge (the outer
+    /// rows are a margin no man walks). One search over the grid per
+    /// army.
+    fn flee_fields(&self) -> [Vec<f32>; 2] {
+        let field = |rows: Vec<usize>| {
+            let mut d = vec![f32::INFINITY; self.walk.len()];
+            let mut heap = BinaryHeap::new();
+            for x in 0..self.nx {
+                if let Some(i) = rows.iter().map(|&z| z * self.nx + x).find(|&i| self.walk[i]) {
+                    d[i] = 0.0;
+                    heap.push(Node { f: 0.0, i: i as u32 });
+                }
+            }
+            let mut nb = [(0u32, 0.0f32, 0u8); 8];
+            while let Some(Node { f, i }) = heap.pop() {
+                let i = i as usize;
+                if f > d[i] {
+                    continue;
+                }
+                let k = self.neighbours(i, &mut nb);
+                for &(j, step, _) in &nb[..k] {
+                    let nd = f + step;
+                    if nd < d[j as usize] {
+                        d[j as usize] = nd;
+                        heap.push(Node { f: nd, i: j });
+                    }
+                }
+            }
+            d
+        };
+        [field((0..self.nz).collect()), field((0..self.nz).rev().collect())]
+    }
+
+    /// The way a man of `team` at `p` flees on foot to his army's map
+    /// edge (`flee_fields`): toward the neighbouring cell nearest the
+    /// edge, from his own cell or, where he stands in a cell the grid
+    /// calls unwalkable (beside a kerb or a rail), the nearest walkable
+    /// one within 3 m. A unit vector; None where no walk reaches the edge.
+    pub fn flee_way(&self, team: u8, p: Vec2) -> Option<Vec2> {
+        let d = &self.flee[(team as usize).min(1)];
+        let i = match self.cell_at(p) {
+            Some(i) if self.walk[i] => i,
+            _ => self.nearest_walkable(p, 3.0)?,
+        };
+        if !d[i].is_finite() {
+            return None;
+        }
+        let mut nb = [(0u32, 0.0f32, 0u8); 8];
+        let k = self.neighbours(i, &mut nb);
+        let best = nb[..k].iter().map(|n| n.0 as usize).filter(|&j| d[j] < d[i]).min_by(|&a, &b| d[a].total_cmp(&d[b]));
+        let to = match best {
+            Some(j) => self.pos(j),
+            // At the edge itself: on toward it.
+            None => self.pos(i),
+        };
+        let v = to - p;
+        (v.length_squared() > 1e-6).then(|| v.normalize())
     }
 
     /// Walkable, cost and water for the cells in `[x0, x1] x [z0, z1]`.
@@ -1316,6 +1387,31 @@ mod tests {
                     assert!(x.abs() > TOWERS_X[3], "{kind:?}: the route crosses the wall line at x {x}");
                 }
             }
+        }
+    }
+
+    /// A man fleeing from the wall's walk, of either army, reaches his
+    /// own map edge on foot, every step on walkable ground: along the
+    /// walk, down a stair, round the wall.
+    #[test]
+    fn a_man_fleeing_from_the_walk_reaches_his_edge_on_foot() {
+        let terrain = crate::terrain::build_terrain(MapKind::WallDebug);
+        let g = NavGrid::build(&terrain).expect("a wall map has a grid");
+        let (lo, hi) = (terrain.min(), terrain.max());
+        for (team, edge) in [(0u8, lo.y), (1u8, hi.y)] {
+            let mut p = Vec2::new(-20.0, crate::town_layout::WALL_Z);
+            let mut reached = false;
+            for _ in 0..4000 {
+                let Some(way) = g.flee_way(team, p) else { panic!("team {team}: no way at {p}") };
+                p += way * 0.5;
+                let i = g.cell_at(p).expect("on the field");
+                assert!(g.walk[i] || g.nearest_walkable(p, 3.0).is_some(), "team {team}: off the ground at {p}");
+                if (p.y - edge).abs() < 6.0 {
+                    reached = true;
+                    break;
+                }
+            }
+            assert!(reached, "team {team} reached {p}, not its edge at z {edge}");
         }
     }
 
