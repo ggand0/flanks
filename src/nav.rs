@@ -268,13 +268,35 @@ impl NavGrid {
         [field((0..self.nz).collect()), field((0..self.nz).rev().collect())]
     }
 
-    /// The way a man of `team` at `p` flees on foot to his army's map
-    /// edge (`flee_fields`): toward the neighbouring cell nearest the
-    /// edge, from his own cell or, where he stands in a cell the grid
-    /// calls unwalkable (beside a kerb or a rail), the nearest walkable
-    /// one within 3 m. A unit vector; None where no walk reaches the edge.
-    pub fn flee_way(&self, team: u8, p: Vec2) -> Option<Vec2> {
+    /// The way a man of `team` at `p` runs to reach his army's map edge on
+    /// foot (`flee_fields`): straight down the slope of his walking
+    /// distance to the edge, read at his own spot from the four cells
+    /// round him. On open ground that is straight at the edge; by a wall
+    /// it bends along the wall toward its stair or its end. Where one of
+    /// those four cells is no ground to walk on, he heads for the cell
+    /// nearest the edge on foot among his own and the eight round it, from
+    /// the nearest walkable cell within 3 m where he stands in a cell the
+    /// grid calls unwalkable (beside a kerb or a rail). A unit vector;
+    /// None where no walk reaches the edge.
+    pub fn flee_dir(&self, team: u8, p: Vec2) -> Option<Vec2> {
         let d = &self.flee[(team as usize).min(1)];
+        let g = (p - self.origin) / CELL;
+        let (x0, z0) = (g.x.floor(), g.y.floor());
+        if x0 >= 0.0 && z0 >= 0.0 && x0 + 1.0 < self.nx as f32 && z0 + 1.0 < self.nz as f32 {
+            let (tx, tz) = (g.x - x0, g.y - z0);
+            let i = z0 as usize * self.nx + x0 as usize;
+            let (a, b, c, e) = (d[i], d[i + 1], d[i + self.nx], d[i + self.nx + 1]);
+            if a.is_finite() && b.is_finite() && c.is_finite() && e.is_finite() {
+                // The distance between the four centres, bilinear: its
+                // slope at p, per cell, along x and along z.
+                let gx = (1.0 - tz) * (b - a) + tz * (e - c);
+                let gz = (1.0 - tx) * (c - a) + tx * (e - b);
+                let v = -Vec2::new(gx, gz);
+                if v.length_squared() > 1e-6 {
+                    return Some(v.normalize());
+                }
+            }
+        }
         let i = match self.cell_at(p) {
             Some(i) if self.walk[i] => i,
             _ => self.nearest_walkable(p, 3.0)?,
@@ -1402,7 +1424,7 @@ mod tests {
             let mut p = Vec2::new(-20.0, crate::town_layout::WALL_Z);
             let mut reached = false;
             for _ in 0..4000 {
-                let Some(way) = g.flee_way(team, p) else { panic!("team {team}: no way at {p}") };
+                let Some(way) = g.flee_dir(team, p) else { panic!("team {team}: no way at {p}") };
                 p += way * 0.5;
                 let i = g.cell_at(p).expect("on the field");
                 assert!(g.walk[i] || g.nearest_walkable(p, 3.0).is_some(), "team {team}: off the ground at {p}");
@@ -1412,6 +1434,21 @@ mod tests {
                 }
             }
             assert!(reached, "team {team} reached {p}, not its edge at z {edge}");
+        }
+    }
+
+    /// On open ground with nothing between a man and his edge, he flees
+    /// straight at it, wherever he stands between the cell centres.
+    #[test]
+    fn a_man_fleeing_over_open_ground_runs_straight_at_his_edge() {
+        let terrain = crate::terrain::build_terrain(MapKind::WallDebug);
+        let g = NavGrid::build(&terrain).expect("a wall map has a grid");
+        for (team, p, want) in [
+            (0u8, crate::town_layout::spots::BEHIND_TOWN + Vec2::new(0.7, -0.3), Vec2::new(0.0, -1.0)),
+            (1u8, Vec2::new(0.7, 0.3), Vec2::new(0.0, 1.0)),
+        ] {
+            let way = g.flee_dir(team, p).expect("open ground has a way");
+            assert!((way - want).length() < 1e-3, "team {team} at {p}: {way}, not {want}");
         }
     }
 
