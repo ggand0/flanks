@@ -578,8 +578,9 @@ struct SpriteLayout {
 struct SpriteSpeeds {
     /// Below this ground speed, m/s, a man shows his standing frames.
     stand_below: f32,
-    /// From this ground speed on, his run.
-    run_from: f32,
+    /// The ground speeds, m/s, at which the slow walk switches to the
+    /// walk, the walk to the jog and the jog to the run.
+    switch: [f32; 3],
 }
 
 #[derive(serde::Deserialize)]
@@ -601,22 +602,24 @@ struct SpriteKind {
 }
 
 /// The shader's family ids (unit_instancing.wgsl `sprite_frame`).
-const SPRITE_FAMILIES: [&str; 13] = [
-    "stand", "ready", "wall", "bowup", "walk", "walk_level", "run", "run_level", "stab", "swing", "shot",
-    "stagger", "cheer",
+const SPRITE_FAMILIES: [&str; 23] = [
+    "stand", "ready", "wall", "bowup", "stand_knife", "slow", "slow_level", "slow_knife", "walk", "walk_level",
+    "walk_knife", "jog", "jog_level", "jog_knife", "run", "run_level", "run_knife", "stab", "swing", "shot",
+    "stagger", "cheer", "charge",
 ];
 
 /// Rows of a kind's sprite table before its cells (`sprite_table`), an
 /// even count so each cell's two rows fill one card vertex.
-pub const SPRITE_HEAD_ROWS: usize = 12;
+pub const SPRITE_HEAD_ROWS: usize = 18;
 
 /// `FL_SPRITE`: per kind, the rows the card's vertex shader reads the
 /// sheet's layout from (unit_instancing.wgsl `sprite_row`): 0 frames per
 /// view, directions and camera heights, 1 the camera heights in radians,
-/// 2 the speeds the family pick switches at and 1 for a bow kind, 3 the cloth's hue, 4 to 10
-/// two families a row, each its first frame and its frame count, 11
-/// unused; then two rows a cell, its rect in uv (u, v of its top left
-/// corner, its width and height) and its box in metres.
+/// 2 the speed below which he stands and 1 for a bow kind, 3 the cloth's
+/// hue, 4 the speeds the gaits switch at, 5 to 16 two families a row, each
+/// its first frame and its frame count, 17 unused; then two rows a cell,
+/// its rect in uv (u, v of its top left corner, its width and height) and
+/// its box in metres.
 fn sprite_table(kind: usize, bow: bool) -> Fallible<Vec<[f32; 4]>> {
     let path = crate::util::game_root().join("assets/units/sprites.json");
     let bytes = crate::game_files::read(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
@@ -645,8 +648,9 @@ fn sprite_table(kind: usize, bow: bool) -> Fallible<Vec<[f32; 4]>> {
     let mut rows = vec![
         [k.frames as f32, layout.directions as f32, layout.elevations.len() as f32, 0.0],
         elevations,
-        [layout.speeds.stand_below, layout.speeds.run_from, if bow { 1.0 } else { 0.0 }, 0.0],
+        [layout.speeds.stand_below, if bow { 1.0 } else { 0.0 }, 0.0, 0.0],
         [k.cloth[0], k.cloth[1], k.cloth[2], 0.0],
+        [layout.speeds.switch[0], layout.speeds.switch[1], layout.speeds.switch[2], 0.0],
     ];
     for pair in k.families.chunks(2) {
         let second = pair.get(1).copied().unwrap_or([0, 1]);

@@ -74,13 +74,19 @@ MARGIN = 2
 ELEVATIONS = [3.0, 14.0, 30.0, 55.0]
 DIRECTIONS = 8
 
-# Ground speeds, m/s, the walk and run frames are drawn at, and the speeds
-# the shader switches at: below STAND_BELOW a man shows his standing
-# frames, from RUN_FROM his run.
-WALK_SPEED = 1.5
-RUN_SPEED = 6.0
+# Ground speeds, m/s, the gaits are drawn at, and the speeds the shader
+# switches at. The pose sizes a man's gait to his speed (unit_pose.wgsl
+# `gait_at`): up to about 1.5 m/s his stride grows, and from there to about
+# 4 m/s his feet leave the ground for longer, from a walk into a run; above
+# that it stays the same. So four gaits: a slow walk, the walk, a jog and
+# the run, each switched to halfway between its neighbours in that change
+# (the stride at a 0.86 m leg for the slow walk and the walk, the share of
+# the run for the jog and the run). Below STAND_BELOW a man shows his
+# standing frames.
+GAITS = ["slow", "walk", "jog", "run"]
+GAIT_SPEEDS = [0.8, 1.5, 2.6, 6.0]
+GAIT_SWITCH = [1.1, 2.2, 3.3]
 STAND_BELOW = 0.35
-RUN_FROM = 3.5
 
 GAIT_FRAMES = 8
 ATTACK_WINDUP = 4
@@ -90,22 +96,33 @@ SHOT_RELEASE = [0.25, 0.75]
 SHOT_RELOAD = [1 / 6, 1 / 2, 5 / 6]
 STAGGER = [0.45, 0.85]
 CHEER_FRAMES = 4
+# A charging blow lands at a run: its wind-up and follow-through frames,
+# each with the legs at these places in the gait's cycle.
+CHARGE_GAIT = [0.0, 0.5]
 
-FAMILIES = [
-    "stand", "ready", "wall", "bowup", "walk", "walk_level", "run", "run_level",
-    "stab", "swing", "shot", "stagger", "cheer",
-]
+# The families, in the order of the shader's ids (unit_instancing.wgsl
+# `sprite_frame`). Each gait has three: plain, with the spear or blade
+# levelled, and an archer's with his knife out and his bow put away.
+FAMILIES = ["stand", "ready", "wall", "bowup", "stand_knife"]
+for _g in GAITS:
+    FAMILIES += [_g, _g + "_level", _g + "_knife"]
+FAMILIES += ["stab", "swing", "shot", "stagger", "cheer", "charge"]
 # Per kind, the families it has, and what the others fall back to.
+_LEVELLED = [g for gait in GAITS for g in (gait, gait + "_level")]
 HAS = {
-    "knight": ["stand", "wall", "walk", "walk_level", "run", "run_level", "stab", "swing", "stagger", "cheer"],
-    "man_at_arms": ["stand", "wall", "walk", "walk_level", "run", "run_level", "stab", "swing", "stagger", "cheer"],
-    "spearman": ["stand", "ready", "wall", "walk", "walk_level", "run", "run_level", "stab", "stagger", "cheer"],
-    "archer": ["stand", "bowup", "walk", "run", "shot", "stab", "swing", "stagger", "cheer"],
+    "knight": ["stand", "wall"] + _LEVELLED + ["stab", "swing", "stagger", "cheer", "charge"],
+    "man_at_arms": ["stand", "wall"] + _LEVELLED + ["stab", "swing", "stagger", "cheer", "charge"],
+    "spearman": ["stand", "ready", "wall"] + _LEVELLED + ["stab", "stagger", "cheer", "charge"],
+    "archer": ["stand", "bowup", "stand_knife"] + [g for gait in GAITS for g in (gait, gait + "_knife")]
+    + ["shot", "stab", "swing", "stagger", "cheer", "charge"],
 }
 FALLBACK = {
-    "ready": "stand", "wall": "stand", "bowup": "stand", "walk_level": "walk", "run_level": "run",
+    "ready": "stand", "wall": "stand", "bowup": "stand", "stand_knife": "stand",
     "swing": "stab", "shot": "stand", "stab": "stand",
 }
+for _g in GAITS:
+    FALLBACK[_g + "_level"] = _g
+    FALLBACK[_g + "_knife"] = _g
 
 TAU = 2.0 * math.pi
 # render_units.rs CELEBRATE_BASE and RANGED_BASE, FOLLOW_BASE and FOLLOW_SPAN.
@@ -133,14 +150,26 @@ def family_records(kind, fam):
         return [record(band=0.5, wall=1.0)]
     if fam == "bowup":
         return [record(band=0.5, psw=1.0)]
-    if fam == "walk":
-        return [record(speed=WALK_SPEED, gait=g) for g in gait]
-    if fam == "walk_level":
-        return [record(speed=WALK_SPEED, band=0.5, gait=g) for g in gait]
-    if fam == "run":
-        return [record(speed=RUN_SPEED, gait=g) for g in gait]
-    if fam == "run_level":
-        return [record(speed=RUN_SPEED, band=1.0, gait=g) for g in gait]
+    for g, speed in zip(GAITS, GAIT_SPEEDS):
+        if fam == g:
+            return [record(speed=speed, gait=x) for x in gait]
+        if fam == g + "_level":
+            return [record(speed=speed, band=0.5 if g != "run" else 1.0, gait=x) for x in gait]
+        if fam == g + "_knife":
+            return [record(speed=speed, psw=-1.0, gait=x) for x in gait]
+    if fam == "stand_knife":
+        return [record(psw=-1.0)]
+    if fam == "charge":
+        # The charging blow: the swing digit plus 3 (render_units.rs), a
+        # stab at his parts' levels, at a run with the spear levelled.
+        psw = -1.0 if archer else 0.0
+        out = []
+        for g in CHARGE_GAIT:
+            out += [record(speed=GAIT_SPEEDS[-1], band=1.0, gait=g, z=6.0 + (k + 0.5) / ATTACK_WINDUP, psw=psw)
+                    for k in range(ATTACK_WINDUP)]
+            out += [record(speed=GAIT_SPEEDS[-1], band=1.0, gait=g, z=6.0 + FOLLOW_BASE + FOLLOW_SPAN * f, psw=psw)
+                    for f in ATTACK_FOLLOW]
+        return out
     if fam in ("stab", "swing"):
         digit = 0.0 if fam == "stab" else 1.0
         psw = -1.0 if archer else 0.0
@@ -460,7 +489,7 @@ def main():
         sheet[cy:cy + ch, half_w + cx:half_w + cx + cw] = (np.clip(right, 0, 1) * 255 + 0.5).astype(np.uint8)
     layout = dict(
         width=width, height=height, px_per_m=PX_PER_M, elevations=ELEVATIONS, directions=DIRECTIONS,
-        families=FAMILIES, speeds=dict(stand_below=STAND_BELOW, run_from=RUN_FROM, walk=WALK_SPEED, run=RUN_SPEED),
+        families=FAMILIES, speeds=dict(stand_below=STAND_BELOW, gaits=GAIT_SPEEDS, switch=GAIT_SWITCH),
         kinds=[],
     )
     for kd in kinds:

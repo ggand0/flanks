@@ -197,28 +197,29 @@ fn sprite_row(r: u32) -> vec4<f32> {
 }
 
 // Rows of the table before its cells, two a cell after them.
-const SPRITE_HEAD: u32 = 12u;
+const SPRITE_HEAD: u32 = 18u;
 const TAU_SPRITE: f32 = 6.2831853;
 
-// The families, in the order of unit_glb.rs `SPRITE_FAMILIES`.
+// The families, in the order of unit_glb.rs `SPRITE_FAMILIES`. Each gait
+// has three, plain, levelled and with an archer's knife out, from
+// SPRITE_SLOW on: the slow walk, the walk, the jog and the run.
 const SPRITE_STAND: u32 = 0u;
 const SPRITE_READY: u32 = 1u;
 const SPRITE_WALL: u32 = 2u;
 const SPRITE_BOWUP: u32 = 3u;
-const SPRITE_WALK: u32 = 4u;
-const SPRITE_WALK_LEVEL: u32 = 5u;
-const SPRITE_RUN: u32 = 6u;
-const SPRITE_RUN_LEVEL: u32 = 7u;
-const SPRITE_STAB: u32 = 8u;
-const SPRITE_SWING: u32 = 9u;
-const SPRITE_SHOT: u32 = 10u;
-const SPRITE_STAGGER: u32 = 11u;
-const SPRITE_CHEER: u32 = 12u;
+const SPRITE_STAND_KNIFE: u32 = 4u;
+const SPRITE_SLOW: u32 = 5u;
+const SPRITE_STAB: u32 = 17u;
+const SPRITE_SWING: u32 = 18u;
+const SPRITE_SHOT: u32 = 19u;
+const SPRITE_STAGGER: u32 = 20u;
+const SPRITE_CHEER: u32 = 21u;
+const SPRITE_CHARGE: u32 = 22u;
 
 // A family's first frame and frame count. A family the kind does not have
 // holds the frames of the one it stands in for.
 fn sprite_family(f: u32) -> vec2<u32> {
-    let row = sprite_row(4u + f / 2u);
+    let row = sprite_row(5u + f / 2u);
     let pair = select(row.zw, row.xy, f % 2u == 0u);
     return vec2<u32>(pair + 0.5);
 }
@@ -227,12 +228,15 @@ fn sprite_family(f: u32) -> vec2<u32> {
 // (unit_pose.wgsl `pose_begin`); the sheet draws each frame at the middle
 // of the stretch of his phase it stands for. A bow shot by its table and
 // its progress; the cheer by the bounce's phase; a blow by its wind-up or
-// its follow-through, a stab apart from the other blows; a stagger by how
-// much is left of it; on the move his walk or his run, the spear levelled
-// or not, at the gait's phase; standing, in a wall, with his bow up, with
-// his spear levelled, or at rest.
+// its follow-through, a stab apart from the other blows, and a charging
+// blow at a run by its progress and which foot leads; a stagger by how
+// much is left of it; on the move the gait his speed falls in, the spear
+// levelled, the knife out or neither, at the gait's phase; standing, in a
+// wall, with his bow up, with his knife out, with his spear levelled, or
+// at rest.
 fn sprite_frame(inst: PullInstance) -> u32 {
     let speeds = sprite_row(2u);
+    let switches = sprite_row(4u);
     let zraw = max(inst.anim.z, 0.0);
     let seed = inst.color.a;
     let band = max(inst.anim2.x, 0.0);
@@ -241,6 +245,10 @@ fn sprite_frame(inst: PullInstance) -> u32 {
         max(smoothstep(0.25, 0.5, band), smoothstep(0.05, 0.25, band) * 0.75),
         max(smoothstep(0.7, 1.0, band), wall),
     );
+    // A bow kind's knife out and his bow put away: his fourth position
+    // float below zero (unit_pose.wgsl `pose_begin`).
+    let knife = speeds.y > 0.5 && inst.pos_scale.w < -0.5;
+    let gait_phase = fract(inst.anim2.z + seed);
     let w4 = max(inst.anim2.w, 0.0);
     var fam = SPRITE_STAND;
     var k = 0u;
@@ -262,8 +270,10 @@ fn sprite_frame(inst: PullInstance) -> u32 {
         fam = SPRITE_CHEER;
         phase = fract(globals.time * 9.0 / TAU_SPRITE + seed);
     } else if zraw > 0.0 {
+        // The 2s digit is the swing style, plus 3 on a charging blow.
         let digit = floor(zraw * 0.5 + 0.001);
-        let style = digit - select(0.0, 3.0, digit > 2.5);
+        let charge = digit > 2.5;
+        let style = digit - select(0.0, 3.0, charge);
         fam = select(SPRITE_SWING, SPRITE_STAB, style < 0.5);
         let within = zraw - digit * 2.0;
         if within > 1.395 {
@@ -272,18 +282,29 @@ fn sprite_frame(inst: PullInstance) -> u32 {
         } else {
             k = min(u32(within * 4.0), 3u);
         }
+        if charge {
+            // Six frames of the blow at each of two places in the gait's
+            // cycle (tools/sprite_sheet.py CHARGE_GAIT, 0 and a half): the
+            // nearer one.
+            fam = SPRITE_CHARGE;
+            k += 6u * (u32(floor(gait_phase * 2.0 + 0.5)) % 2u);
+        }
     } else if w4 > 0.25 && w4 <= 1.0 {
         fam = SPRITE_STAGGER;
         k = select(0u, 1u, w4 >= 0.65);
     } else if inst.anim.y >= speeds.x {
-        let levelled = level > 0.5;
-        fam = select(select(SPRITE_WALK, SPRITE_WALK_LEVEL, levelled), select(SPRITE_RUN, SPRITE_RUN_LEVEL, levelled), inst.anim.y >= speeds.y);
-        phase = fract(inst.anim2.z + seed);
+        let speed = inst.anim.y;
+        let gait = select(0u, 1u, speed >= switches.x) + select(0u, 1u, speed >= switches.y)
+            + select(0u, 1u, speed >= switches.z);
+        let variant = select(select(0u, 1u, level > 0.5), 2u, knife);
+        fam = SPRITE_SLOW + 3u * gait + variant;
+        phase = gait_phase;
     } else if wall > 0.5 {
         fam = SPRITE_WALL;
-    } else if speeds.z > 0.5 && inst.pos_scale.w > 0.5 {
-        // A bow kind's bow up: his fourth position float (unit_pose.wgsl
-        // `pose_begin`).
+    } else if knife {
+        fam = SPRITE_STAND_KNIFE;
+    } else if speeds.y > 0.5 && inst.pos_scale.w > 0.5 {
+        // A bow kind's bow up: his fourth position float.
         fam = SPRITE_BOWUP;
     } else if level > 0.5 {
         fam = SPRITE_READY;
