@@ -1360,34 +1360,15 @@ mod tests {
     }
 
     /// The tick's order is settled for every pair of systems that touch
-    /// the same data, except the pairs listed here. Each listed pair runs
-    /// in an order the scheduler picks; it is listed so that no new pair
-    /// joins them unseen, and comes off the list once it is ordered.
+    /// the same data: none is left for the scheduler to pick, so the tick
+    /// runs in one order whatever else the app holds.
     #[test]
-    fn the_sim_tick_has_no_new_unordered_pairs() {
-        // Two groups, both older than the battle clock. Before the
-        // install: the archers' ammo tally, the reforms, the lane fill and
-        // the regiment sums all write the regiments, and the reforms and
-        // the lane fill move men the density field reads. After it: the
-        // arrows and the death sweep against fatigue and morale, which all
-        // write the regiments.
-        const KNOWN: &[&str] = &[
-            "ammo_tally (in set SimSet) / apply_reforms (in set SimSet) on Groups, Units",
-            "ammo_tally (in set SimSet) / fill_lane_slots (in set SimSet) on Groups, Units",
-            "ammo_tally (in set SimSet) / update_groups (in set SimSet) on Groups",
-            "apply_reforms (in set SimSet) / update_field (in set SimSet) on Units",
-            "apply_reforms (in set SimSet) / update_groups (in set SimSet) on Groups, Units",
-            "fill_lane_slots (in set SimSet) / update_field (in set SimSet) on Units",
-            "fill_lane_slots (in set SimSet) / update_groups (in set SimSet) on Groups, Units",
-            "process_deaths (in set SimSet) / update_fatigue (in set SimSet) on Groups",
-            "process_deaths (in set SimSet) / update_morale (in set SimSet) on Groups",
-            "update_arrows (in set SimSet) / update_fatigue (in set SimSet) on Groups",
-            "update_arrows (in set SimSet) / update_morale (in set SimSet) on Groups",
-        ];
+    fn the_sim_tick_has_no_unordered_pairs() {
         let pairs = unordered_tick_pairs();
         assert!(
-            pairs.iter().map(String::as_str).eq(KNOWN.iter().copied()),
-            "the unordered pairs on the sim tick changed; now {} pairs:\n{}",
+            pairs.is_empty(),
+            "{} pairs of sim tick systems touch the same data with no order between them \
+             (rerun with `cargo test --profile opt-dev --features bevy/debug` to see their names):\n{}",
             pairs.len(),
             pairs.join("\n")
         );

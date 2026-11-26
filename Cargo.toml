@@ -36,12 +36,6 @@ winit = { version = "0.30", default-features = false }
 # mingw, native or cross.
 embed-resource = "3"
 
-[dev-dependencies]
-# The tests name systems: the sim tick's order test (game_state.rs) lists
-# the unordered pairs by name, which bevy keeps only with `debug`. Only
-# the test build carries the names; the game's build is unchanged.
-bevy = { version = "0.19", features = ["debug"] }
-
 [features]
 # Profiling: `cargo run --profile opt-dev --features tracy`, then attach
 # the Tracy UI. Enables bevy's per-system spans + our manual sim spans.

@@ -640,7 +640,7 @@ fn log_tally(tick: u32, stats: &ArrowStats, in_flight: usize) {
 /// Archer regiment upkeep, before the tick: the regiment ammo pools for
 /// the HUD, summed over the archer regiments' own men. The skirmish run
 /// is a reaction of the tick's prep (sim/job.rs `skirmish_reactions`).
-fn ammo_tally(
+pub(crate) fn ammo_tally(
     mut groups: ResMut<crate::orders::Groups>,
     units: Res<crate::units::Units>,
     runs: Res<crate::sim::RegimentRuns>,

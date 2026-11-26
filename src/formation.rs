@@ -738,7 +738,19 @@ impl Plugin for FormationPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(
             FixedUpdate,
-            (apply_reforms, fill_lane_slots)
+            (
+                // The reforms deal the men's places (`home`) and the lane
+                // fill swaps them; the regiment sums read those places, so
+                // both go before the sums. The ammo tally and the density
+                // field read no places and sit between the two.
+                apply_reforms
+                    .before(crate::arrows::ammo_tally)
+                    .before(crate::frontline::update_field),
+                fill_lane_slots
+                    .after(crate::arrows::ammo_tally)
+                    .after(crate::frontline::update_field)
+                    .before(crate::frontline::update_groups),
+            )
                 .chain()
                 .after(crate::sim::take_tick)
                 .before(crate::sim::step_sim)
