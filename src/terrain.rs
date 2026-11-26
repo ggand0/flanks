@@ -583,6 +583,9 @@ struct TerrainChunks {
     band_material: Option<Handle<StandardMaterial>>,
     /// Every map's textures, held so a map switch finds them loaded.
     warm: Vec<Handle<Image>>,
+    /// The map the chunks show; the chunks are rebuilt when the terrain
+    /// becomes another.
+    built_for: Option<MapKind>,
 }
 
 const GROUND_TEXTURES: [&str; 9] = [
@@ -638,20 +641,25 @@ pub struct TerrainPlugin;
 impl Plugin for TerrainPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<TerrainChunks>()
-            .add_message::<MapChanged>()
             .add_plugins(MaterialPlugin::<GroundMaterial>::default())
-            .add_systems(PreStartup, generate_terrain)
             .add_systems(Startup, spawn_chunks)
             .add_systems(
                 Update,
-                (
-                    rebuild_map.in_set(MapRebuild),
-                    crater_tool,
-                    remesh_dirty,
-                    decide_terrain_casting,
-                )
-                    .chain(),
+                (rebuild_chunks.after(MapRebuild), crater_tool, remesh_dirty, decide_terrain_casting).chain(),
             );
+    }
+}
+
+/// The terrain the sim walks on: built at launch from the chosen map and
+/// built again when the map changes (`MapRebuild`). The ground's meshes
+/// are `TerrainPlugin`'s.
+pub struct TerrainDataPlugin;
+
+impl Plugin for TerrainDataPlugin {
+    fn build(&self, app: &mut App) {
+        app.add_message::<MapChanged>()
+            .add_systems(PreStartup, generate_terrain)
+            .add_systems(Update, rebuild_terrain.in_set(MapRebuild));
     }
 }
 
@@ -1128,20 +1136,10 @@ fn ground_layers(assets: &AssetServer, images: &mut Assets<Image>, terrain: &Ter
     }
 }
 
-/// Replace the field and its chunk entities together so switching map sizes
-/// leaves neither missing ground nor chunks from the previous field.
-#[allow(clippy::too_many_arguments)]
-fn rebuild_map(
-    mut changes: MessageReader<MapChanged>,
-    mut terrain: ResMut<Terrain>,
-    mut chunks: ResMut<TerrainChunks>,
-    mut materials: ResMut<Assets<GroundMaterial>>,
-    assets: Res<AssetServer>,
-    mut images: ResMut<Assets<Image>>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut commands: Commands,
-    chunk_entities: Query<Entity, With<GroundChunk>>,
-) {
+/// A map change builds the new map's field. The ground's chunks follow it
+/// (`rebuild_chunks`), so switching map sizes leaves neither missing
+/// ground nor chunks from the previous field.
+fn rebuild_terrain(mut changes: MessageReader<MapChanged>, mut terrain: ResMut<Terrain>) {
     let Some(MapChanged(kind)) = changes.read().last().copied() else {
         return;
     };
@@ -1150,6 +1148,27 @@ fn rebuild_map(
     }
     let t0 = Instant::now();
     *terrain = build_terrain(kind);
+    debug!("terrain rebuilt as {} in {:.2} ms", kind.label(), t0.elapsed().as_secs_f32() * 1000.0);
+}
+
+/// The ground's chunks for a terrain that became another map.
+#[allow(clippy::too_many_arguments)]
+fn rebuild_chunks(
+    terrain: Res<Terrain>,
+    mut chunks: ResMut<TerrainChunks>,
+    mut materials: ResMut<Assets<GroundMaterial>>,
+    assets: Res<AssetServer>,
+    mut images: ResMut<Assets<Image>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut commands: Commands,
+    chunk_entities: Query<Entity, With<GroundChunk>>,
+) {
+    if chunks.built_for == Some(terrain.kind) {
+        return;
+    }
+    let kind = terrain.kind;
+    let t0 = Instant::now();
+    chunks.built_for = Some(kind);
     chunks.original_heights = terrain.ground_heights().to_vec();
     let material = materials.add(GroundMaterial {
         base: ground_base(),
@@ -1162,7 +1181,7 @@ fn rebuild_map(
     chunks.material = Some(material);
     spawn_chunk_meshes(&mut commands, &terrain, &mut meshes, &mut chunks);
     debug!(
-        "map rebuilt as {} in {:.2} ms",
+        "ground rebuilt as {} in {:.2} ms",
         kind.label(),
         t0.elapsed().as_secs_f32() * 1000.0
     );
@@ -1199,6 +1218,7 @@ fn spawn_chunks(
         .map(|path| ground_texture(&assets, path))
         .collect();
     chunks.original_heights = terrain.ground_heights().to_vec();
+    chunks.built_for = Some(terrain.kind);
     spawn_chunk_meshes(&mut commands, &terrain, &mut meshes, &mut chunks);
 }
 
@@ -2018,7 +2038,7 @@ mod tests {
             .insert_resource(build_terrain(MapKind::Grassland))
             .add_message::<MapChanged>()
             .add_systems(Startup, spawn_chunks)
-            .add_systems(Update, (rebuild_map, remesh_dirty).chain());
+            .add_systems(Update, (rebuild_terrain, rebuild_chunks, remesh_dirty).chain());
         app.update();
         for kind in [
             MapKind::BigGrassland,

@@ -240,8 +240,8 @@ impl BattleClock {
     }
 }
 
-/// The sim's tick rate in hertz (main.rs sets the fixed clock to this
-/// rate) and its fixed timestep in seconds.
+/// The sim's tick rate in hertz (shells.rs `fixed_time` sets the fixed
+/// clock to this rate) and its fixed timestep in seconds.
 pub const SIM_HZ: f64 = 30.0;
 pub const SIM_DT: f64 = 1.0 / SIM_HZ;
 
@@ -369,10 +369,35 @@ enum ResultsButton {
     MainMenu,
 }
 
-pub struct GameShellPlugin;
+/// How a launch starts its battle, set by the shell: whether the first
+/// battle starts without a key press, and whether a normal battle opens
+/// in deployment.
+#[derive(Resource, Clone, Copy, Debug)]
+pub struct LaunchPlan {
+    pub autostart: bool,
+    pub deployment: bool,
+}
 
-impl Plugin for GameShellPlugin {
+impl LaunchPlan {
+    /// The windowed game's: FL_AUTOSTART starts the battle, FL_DEPLOY=0
+    /// skips the deployment.
+    pub fn from_env() -> Self {
+        Self {
+            autostart: std::env::var("FL_AUTOSTART").is_ok(),
+            deployment: crate::util::env_or("FL_DEPLOY", 1_u32) != 0,
+        }
+    }
+}
+
+/// The game's states, the battle's lifecycle and the sim tick's sets: what
+/// the sim needs of the shell, with no window.
+pub struct GameSimPlugin;
+
+impl Plugin for GameSimPlugin {
     fn build(&self, app: &mut App) {
+        if !app.world().contains_resource::<LaunchPlan>() {
+            app.insert_resource(LaunchPlan::from_env());
+        }
         app.init_resource::<BattleConfig>()
             .init_resource::<Deployment>()
             .init_resource::<BattleClock>()
@@ -397,7 +422,22 @@ impl Plugin for GameShellPlugin {
                 FixedUpdate,
                 advance_battle_clock.after(crate::sim::kick_tick).in_set(SimSet),
             )
-            .configure_sets(
+            .add_systems(OnEnter(GameState::Battle), setup_battle)
+            // The launch's own start, before a map change it asks for is
+            // built (`MapRebuild`), so the battle spawns on the new map.
+            .add_systems(
+                Update,
+                launch_start.before(crate::terrain::MapRebuild).run_if(in_state(GameState::Menu)),
+            );
+    }
+}
+
+/// The menus, the pause, the deployment and the results screens.
+pub struct GameShellPlugin;
+
+impl Plugin for GameShellPlugin {
+    fn build(&self, app: &mut App) {
+        app.configure_sets(
                 Update,
                 BattleInputSet.run_if(
                     in_state(GameState::Battle).and_then(not(time_paused)),
@@ -408,7 +448,7 @@ impl Plugin for GameShellPlugin {
                 (MapInputSet, HudInputSet).chain().in_set(BattleInputSet),
             )
             .add_systems(OnEnter(GameState::Menu), spawn_menu)
-            .add_systems(OnEnter(GameState::Battle), setup_battle)
+            .add_systems(OnEnter(GameState::Battle), spawn_deploy_ui.after(setup_battle))
             .add_systems(OnEnter(GameState::Results), spawn_results)
             .add_systems(
                 Update,
@@ -689,9 +729,9 @@ fn spawn_option_text(button: &mut ChildSpawnerCommands, value: &str) {
 /// Units screen; scripted scenarios and FL_DEPLOY=0 skip deployment and
 /// the picker both and drop straight into the fight. An `FL_SETUP` file
 /// brings its own armies, so it skips the picker and keeps deployment.
-fn start_target() -> GameState {
+fn start_target(plan: &LaunchPlan) -> GameState {
     if scripts_active()
-        || crate::util::env_or("FL_DEPLOY", 1_u32) == 0
+        || !plan.deployment
         || crate::battle_setup::for_battle(Scenario::Normal).is_some()
     {
         GameState::Battle
@@ -706,10 +746,32 @@ fn start_target() -> GameState {
 /// scenario, not the stale one. Launch-only battery envs
 /// (FL_TEST_FRONT and kin) are not scenario envs and still skip the
 /// picker on purpose.
-fn start_normal_battle(config: &mut BattleConfig, next: &mut NextState<GameState>) {
+fn start_normal_battle(config: &mut BattleConfig, plan: &LaunchPlan, next: &mut NextState<GameState>) {
     config.scenario = Scenario::Normal;
     sync_scenario_env(Scenario::Normal);
-    next.set(start_target());
+    next.set(start_target(plan));
+}
+
+/// The launch's own start, looked at on the menu's first frame only: a
+/// scripted scenario or the Demo starts at once, and with
+/// `LaunchPlan::autostart` a normal battle starts without a key press. A
+/// test battle from the menu leaves its scenario's env var set, and a
+/// later visit to the menu must not start it again.
+fn launch_start(
+    mut config: ResMut<BattleConfig>,
+    plan: Res<LaunchPlan>,
+    mut next: ResMut<NextState<GameState>>,
+    mut done: Local<bool>,
+) {
+    if *done {
+        return;
+    }
+    *done = true;
+    if scripts_active() || Scenario::from_env() == Scenario::Demo {
+        next.set(GameState::Battle);
+    } else if plan.autostart {
+        start_normal_battle(&mut config, &plan, &mut next);
+    }
 }
 
 fn menu_buttons(
@@ -719,34 +781,17 @@ fn menu_buttons(
     mut config: ResMut<BattleConfig>,
     mut next: ResMut<NextState<GameState>>,
     mut exit: MessageWriter<AppExit>,
-    mut auto: Local<bool>,
+    plan: Res<LaunchPlan>,
 ) {
-    // Launch-time starts, looked at on the menu's first frame only: a test
-    // battle from the menu leaves its scenario's env var set, and a later
-    // visit to the menu must not start it again.
-    if !*auto {
-        *auto = true;
-        if scripts_active() || Scenario::from_env() == Scenario::Demo {
-            next.set(GameState::Battle);
-            return;
-        }
-        // FL_AUTOSTART=1: start a normal battle without a key press (with
-        // FL_DEPLOY=0 it skips the picker and deployment too), for
-        // measured runs of the real game with the AI on.
-        if std::env::var("FL_AUTOSTART").is_ok() {
-            start_normal_battle(&mut config, &mut next);
-            return;
-        }
-    }
     if keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::Space) {
-        start_normal_battle(&mut config, &mut next);
+        start_normal_battle(&mut config, &plan, &mut next);
         return;
     }
     for (interaction, btn) in &query {
         if *interaction == Interaction::Pressed {
             match btn {
                 MenuButton::StartBattle => {
-                    start_normal_battle(&mut config, &mut next);
+                    start_normal_battle(&mut config, &plan, &mut next);
                 }
                 MenuButton::TestBattles => spawn_test_battles(&mut commands),
                 MenuButton::Quit => {
@@ -951,14 +996,14 @@ fn sync_scenario_env(scenario: Scenario) {
 
 #[allow(clippy::too_many_arguments)]
 pub fn setup_battle(
-    mut commands: Commands,
+    plan: Res<LaunchPlan>,
     mut units: ResMut<Units>,
     terrain: Res<Terrain>,
     mut groups: ResMut<Groups>,
     mut stats: ResMut<CombatStats>,
     mut selection: ResMut<Selection>,
     mut outcome: ResMut<BattleOutcome>,
-    mut corpses: ResMut<Corpses>,
+    mut corpses: Option<ResMut<Corpses>>,
     mut dir_stats: ResMut<DirTestStats>,
     mut virt_time: ResMut<Time<Virtual>>,
     mut deploy: ResMut<Deployment>,
@@ -983,7 +1028,9 @@ pub fn setup_battle(
     *dir_stats = DirTestStats::default();
     *selection = Selection::default();
     outcome.0 = None;
-    corpses.clear();
+    if let Some(corpses) = corpses.as_mut() {
+        corpses.clear();
+    }
     crate::arrows::reset(&mut arrows, &mut arrow_spawns, &mut stuck);
     virt_time.unpause();
     sync_scenario_env(config.scenario);
@@ -1001,12 +1048,12 @@ pub fn setup_battle(
         }
     }
     // Scripted scenarios and test batteries start fighting immediately;
-    // a normal battle and the Demo open in deployment. FL_DEPLOY=0 skips it.
+    // a normal battle and the Demo open in deployment unless the launch
+    // skips it (FL_DEPLOY=0, the headless shell).
     deploy.active = matches!(config.scenario, Scenario::Normal | Scenario::Demo)
         && !scripts_active()
-        && crate::util::env_or("FL_DEPLOY", 1_u32) != 0;
+        && plan.deployment;
     if deploy.active {
-        spawn_deploy_ui(&mut commands);
         info!("deployment phase: place your regiments, then begin the battle");
     }
     info!(
@@ -1018,7 +1065,12 @@ pub fn setup_battle(
     );
 }
 
-fn spawn_deploy_ui(commands: &mut Commands) {
+/// The deployment's banner and Begin Battle button, when the battle opens
+/// in deployment.
+fn spawn_deploy_ui(mut commands: Commands, deploy: Res<Deployment>) {
+    if !deploy.active {
+        return;
+    }
     // One transparent full-screen column: banner pinned up top, Begin
     // Battle pinned above the card bar. Plain nodes carry no
     // Interaction, so map picking under it is untouched.
@@ -1305,24 +1357,10 @@ mod tests {
         use bevy::ecs::schedule::{LogLevel, ScheduleBuildSettings};
         let mut app = App::new();
         app.add_plugins((MinimalPlugins, bevy::state::app::StatesPlugin));
-        // Every plugin that puts systems on the sim tick and needs no GPU.
-        // overlay.rs `count_sim_tick` is left out (its plugin brings the
-        // render diagnostics); it writes only its own frame counter.
-        app.add_plugins((
-            GameShellPlugin,
-            crate::battle_setup::BattleSetupPlugin,
-            crate::scenes::ScenesPlugin,
-            crate::morale::MoralePlugin,
-            crate::fatigue::FatiguePlugin,
-            crate::ai::AiPlugin,
-            crate::sim::SimPlugin,
-            crate::arrows::ArrowsPlugin,
-            crate::orders::OrdersPlugin,
-            crate::formation::FormationPlugin,
-            crate::frontline::FrontlinePlugin,
-            crate::combat::CombatPlugin,
-            crate::cli::CliPlugin,
-        ));
+        // The sim group, exactly as the headless run loads it. The view's
+        // only tick system, overlay.rs `count_sim_tick`, writes its own
+        // frame counter and nothing else.
+        app.add_plugins(crate::shells::SimPlugins);
         let world = app.world_mut();
         world.resource_scope(|world, mut schedules: Mut<Schedules>| {
             let schedule = schedules.get_mut(FixedUpdate).expect("the tick has systems");

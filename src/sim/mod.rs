@@ -98,7 +98,6 @@ impl Plugin for SimPlugin {
             .init_resource::<CombatScale>()
             .init_resource::<DamageBuffers>()
             .init_resource::<DirTestStats>()
-            .insert_resource(DebugViz(true))
             .init_resource::<SpatialGrid>()
             .init_resource::<TickPipeline>()
             .init_resource::<SharedTerrain>()
@@ -112,7 +111,17 @@ impl Plugin for SimPlugin {
                     kick_tick.after(route::update_routes),
                 )
                     .in_set(crate::game_state::SimSet),
-            )
+            );
+    }
+}
+
+/// The sim's debug drawing: the debug gizmos' toggle, the routes and the
+/// contact view.
+pub struct SimViewPlugin;
+
+impl Plugin for SimViewPlugin {
+    fn build(&self, app: &mut App) {
+        app.insert_resource(DebugViz(true))
             .init_resource::<contact_viz::ContactViz>()
             .add_systems(
                 Update,
@@ -731,7 +740,7 @@ pub fn step_sim(
     mut dir_stats: ResMut<DirTestStats>,
     mut sounds: Option<ResMut<crate::audio::SoundEvents>>,
     mut routes: ResMut<route::Routes>,
-    clock: Res<crate::game_state::BattleClock>,
+    (clock, outcome): (Res<crate::game_state::BattleClock>, Res<crate::ai::BattleOutcome>),
 ) {
     let _frame_log = crate::frame_log::time_step();
     let _tick_log = crate::frame_log::tick::time(crate::frame_log::tick::Part::Step);
@@ -815,7 +824,7 @@ pub fn step_sim(
     let tick = pipeline.tick;
     let audit = job.audit.take();
     // A `--ticks` run's last tick prints its hash whether FL_HASH is set or not.
-    audit_and_log(audit, tick, crate::cli::last_tick(&clock), &units, &grid, &mut stats);
+    audit_and_log(audit, tick, crate::cli::last_tick(&clock, &outcome), &units, &grid, &mut stats);
 
     pipeline.scratch = Some(job);
 }
@@ -892,7 +901,7 @@ pub fn kick_tick(
     mut pipeline: ResMut<TickPipeline>,
     (handoff, settings): (
         Option<ResMut<crate::render_units_gpu::SnapshotHandoff>>,
-        Res<crate::settings::Settings>,
+        Option<Res<crate::settings::Settings>>,
     ),
     mut routes: ResMut<route::Routes>,
 ) {
@@ -928,7 +937,7 @@ pub fn kick_tick(
     // the same columns after Update (render_units_gpu.rs).
     if let Some(mut handoff) = handoff.filter(|_| crate::render_units_gpu::job_packs_snapshot()) {
         job.pack = Some(handoff.expect((units.generation, pipeline.tick), units.last_changed()));
-        job.hit_flash = settings.interface.hit_flash;
+        job.hit_flash = settings.is_some_and(|s| s.interface.hit_flash);
     }
     let worker = pipeline.worker.get_or_insert_with(TickWorker::default);
     worker.to_worker.lock().unwrap().send(job).expect("sim tick worker alive");

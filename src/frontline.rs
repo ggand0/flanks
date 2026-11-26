@@ -279,8 +279,16 @@ impl Plugin for FrontlinePlugin {
                     .after(crate::sim::take_tick)
                     .before(crate::sim::step_sim)
                     .in_set(crate::game_state::SimSet),
-            )
-            .add_systems(Update, (draw_front_gizmos, draw_fight_points, draw_attack_front));
+            );
+    }
+}
+
+/// The front's debug drawing.
+pub struct FrontlineViewPlugin;
+
+impl Plugin for FrontlineViewPlugin {
+    fn build(&self, app: &mut App) {
+        app.add_systems(Update, (draw_front_gizmos, draw_fight_points, draw_attack_front));
     }
 }
 

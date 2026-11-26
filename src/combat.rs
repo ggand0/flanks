@@ -53,7 +53,7 @@ pub fn process_deaths(
     mut terrain: ResMut<Terrain>,
     mut stats: ResMut<CombatStats>,
     groups: Res<crate::orders::Groups>,
-    mut corpses: ResMut<crate::render_units::Corpses>,
+    mut corpses: Option<ResMut<crate::render_units::Corpses>>,
     (pipeline, runs): (Res<crate::sim::TickPipeline>, Res<crate::sim::RegimentRuns>),
 ) {
     let _span = info_span!("process_deaths").entered();
@@ -108,8 +108,10 @@ pub fn process_deaths(
                 }
                 // Leave the body where it fell, frozen in its final topple
                 // pose (fx = 2.0 is the shader's fully-dead state). Escaped
-                // units leave nothing.
-                corpses.push(
+                // units leave nothing. The bodies are the view's; a run
+                // with no view keeps none.
+                if let Some(corpses) = corpses.as_mut() {
+                    corpses.push(
                     units.kind[i] as usize,
                     crate::render_units::InstanceData {
                         position: units.pos[i],
@@ -118,7 +120,8 @@ pub fn process_deaths(
                         anim: [units.yaw[i], 0.0, 0.0, 2.0],
                         anim2: [0.0; 4],
                     },
-                );
+                    );
+                }
             }
             let seed = stats.kills[team] as u32 ^ ((team as u32) << 30);
             if dead && craters.len() < CRATERS_PER_TICK && hash01(seed) < CRATER_CHANCE {

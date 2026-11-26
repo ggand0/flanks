@@ -35,6 +35,7 @@ mod scenes;
 mod selection;
 mod selection_rings;
 mod settings;
+mod shells;
 mod sim;
 mod spatial;
 mod sprite_bake;
@@ -127,11 +128,22 @@ fn window_position() -> bevy::window::WindowPosition {
 
 fn main() {
     cli::init();
+    let mut app = App::new();
+    if cli::args().headless {
+        shells::headless(&mut app, task_pool_options());
+        app.add_systems(Startup, log_task_pools);
+    } else {
+        windowed(&mut app);
+    }
+    app.run();
+}
+
+/// The windowed game: the sim and the view on bevy's default plugins.
+fn windowed(app: &mut App) {
     // Load before the App so the window opens with the saved video
     // settings instead of switching modes one frame in.
     let user_settings = settings::Settings::load();
-    App::new()
-        .add_plugins(game_files::GameFilesPlugin)
+    app.add_plugins(game_files::GameFilesPlugin)
         .add_plugins(
             DefaultPlugins
                 .set(TaskPoolPlugin {
@@ -166,43 +178,9 @@ fn main() {
                 }),
         )
         .insert_resource(user_settings)
-        .add_plugins(game_state::GameShellPlugin)
-        .add_plugins(settings::SettingsPlugin)
-        .add_plugins(battle_setup::BattleSetupPlugin)
-        .add_plugins(window_icon::WindowIconPlugin)
-        .add_plugins(town::TownPlugin)
-        .add_plugins((
-            terrain::TerrainPlugin,
-            water::WaterPlugin,
-            vegetation::VegetationPlugin,
-            units::UnitsPlugin,
-            scenes::ScenesPlugin,
-            morale::MoralePlugin,
-            fatigue::FatiguePlugin,
-            ai::AiPlugin,
-            banners::BannersPlugin,
-            audio::BattleAudioPlugin,
-            sim::SimPlugin,
-            arrows::ArrowsPlugin,
-        ))
-        .add_plugins((
-            orders::OrdersPlugin,
-            selection::SelectionPlugin,
-            formation::FormationPlugin,
-            frontline::FrontlinePlugin,
-            combat::CombatPlugin,
-            render_units::UnitRenderPlugin,
-            selection_rings::SelectionRingsPlugin,
-            camera::RtsCameraPlugin,
-            overlay::OverlayPlugin,
-            unit_cards::UnitCardsPlugin,
-            balance::BalancePlugin,
-            picker::PickerPlugin,
-            frame_log::FrameLogPlugin,
-            sprite_bake::SpriteBakePlugin,
-            cli::CliPlugin,
-        ))
-        .insert_resource(Time::<Fixed>::from_hz(game_state::SIM_HZ))
+        .add_plugins(shells::SimPlugins)
+        .add_plugins(shells::ViewPlugins)
+        .insert_resource(shells::fixed_time())
         // A frame that overruns makes the fixed clock owe catch-up sim
         // ticks, which Bevy runs back to back the next frame (default
         // max_delta 250 ms = up to 7 ticks at 30 Hz). Every tick after
@@ -226,8 +204,7 @@ fn main() {
             focused_mode: bevy::winit::UpdateMode::Continuous,
             unfocused_mode: bevy::winit::UpdateMode::Continuous,
         })
-        .add_systems(Startup, (setup_world, log_task_pools))
-        .run();
+        .add_systems(Startup, (setup_world, log_task_pools, cli::apply_speed));
 }
 
 fn log_task_pools() {

@@ -755,8 +755,17 @@ impl Plugin for FormationPlugin {
                 .after(crate::sim::take_tick)
                 .before(crate::sim::step_sim)
                 .in_set(crate::game_state::SimSet),
-        )
-        .add_systems(
+        );
+    }
+}
+
+/// The player's formation commands: the hotkeys, and the deployment's
+/// instant re-dress.
+pub struct FormationViewPlugin;
+
+impl Plugin for FormationViewPlugin {
+    fn build(&self, app: &mut App) {
+        app.add_systems(
             Update,
             (
                 formation_keys.in_set(crate::game_state::BattleInputSet),

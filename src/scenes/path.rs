@@ -216,8 +216,17 @@ impl Plugin for PathTestPlugin {
                     .chain()
                     .run_if(on)
                     .in_set(crate::game_state::ScriptSet::Path),
-            )
-            .add_systems(Update, watch_frames.run_if(on));
+            );
+    }
+}
+
+/// The path scenes' frame watch: the longest frames, which the scene's log
+/// prints. A run with no frames prints zeros.
+pub struct PathFramesPlugin;
+
+impl Plugin for PathFramesPlugin {
+    fn build(&self, app: &mut App) {
+        app.add_systems(Update, watch_frames.run_if(|| scene().is_some()));
     }
 }
 

@@ -210,7 +210,6 @@ impl Plugin for ArrowsPlugin {
             .init_resource::<RegTracks>()
             .init_resource::<ArrowStats>()
             .init_resource::<StuckArrows>()
-            .add_systems(Startup, setup_arrow_buckets)
             .add_systems(
                 FixedUpdate,
                 (
@@ -222,7 +221,16 @@ impl Plugin for ArrowsPlugin {
                         .before(crate::combat::process_deaths),
                 )
                     .in_set(crate::game_state::SimSet),
-            )
+            );
+    }
+}
+
+/// The arrows on screen: the flying shafts and the ground litter.
+pub struct ArrowsViewPlugin;
+
+impl Plugin for ArrowsViewPlugin {
+    fn build(&self, app: &mut App) {
+        app.add_systems(Startup, setup_arrow_buckets)
             .add_systems(Update, (sync_arrow_instances, sync_stuck_instances));
     }
 }

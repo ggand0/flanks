@@ -1,9 +1,13 @@
 //! The command line, read once at the top of `main`.
 //!
 //!   --ticks N   run the battle for N sim ticks, print the state's hash at
-//!               tick N and the run's speed, then quit with success
+//!               tick N and the run's speed, then quit with success; a
+//!               battle decided sooner ends the run one tick after
 //!   --seed N    fix every launch-time random choice: the spawn offsets
 //!               (what FL_SEED=N does) and the enemy army's roll
+//!   --headless  run the sim with no window, as fast as it goes (needs
+//!               --ticks); without --seed it takes the seed from FL_SEED
+//!   --speed X   the windowed game's time runs X times as fast
 //!
 //! Every FL_ switch keeps working beside these. An unknown flag prints the
 //! usage and quits with exit code 2.
@@ -12,17 +16,24 @@ use bevy::prelude::*;
 
 use crate::game_state::{BattleClock, SimSet};
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct Args {
     /// Quit once the battle clock reaches this many ticks.
     pub ticks: Option<u32>,
     /// The launch seed; without it the launch-time choices read the clock.
     pub seed: Option<u32>,
+    /// The sim with no window (shells.rs `headless`).
+    pub headless: bool,
+    /// The windowed game's time speed.
+    pub speed: Option<f64>,
 }
 
-const USAGE: &str = "usage: flanks [--ticks N] [--seed N]
+const USAGE: &str = "usage: flanks [--ticks N] [--seed N] [--headless | --speed X]
   --ticks N   run N sim ticks of the battle, print its hash at tick N, then quit
-  --seed N    fix the spawn offsets (as FL_SEED=N) and the enemy army's roll";
+  --seed N    fix the spawn offsets (as FL_SEED=N) and the enemy army's roll
+  --headless  run the sim with no window as fast as it goes; needs --ticks,
+              and without --seed takes its seed from FL_SEED (default 0)
+  --speed X   run the windowed game's time X times as fast (X > 0)";
 
 static ARGS: std::sync::OnceLock<Args> = std::sync::OnceLock::new();
 
@@ -30,7 +41,12 @@ static ARGS: std::sync::OnceLock<Args> = std::sync::OnceLock::new();
 /// line prints the usage to stderr and exits with code 2.
 pub fn init() {
     match parse(std::env::args().skip(1)) {
-        Ok(args) => {
+        Ok(mut args) => {
+            // A headless run always repeats: its seed is FL_SEED's when no
+            // --seed is given, the army rolls included.
+            if args.headless && args.seed.is_none() {
+                args.seed = Some(crate::util::env_or("FL_SEED", 0u32));
+            }
             ARGS.set(args).expect("the command line is read once");
         }
         Err(e) => {
@@ -55,6 +71,14 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
         match flag.as_str() {
             "--ticks" => args.ticks = Some(number("--ticks")?.max(1)),
             "--seed" => args.seed = Some(number("--seed")?),
+            "--headless" => args.headless = true,
+            "--speed" => {
+                let v = it.next().ok_or("--speed needs a number")?;
+                match v.parse::<f64>() {
+                    Ok(x) if x > 0.0 && x.is_finite() => args.speed = Some(x),
+                    _ => return Err(format!("--speed needs a number above 0, got {v:?}")),
+                }
+            }
             "-h" | "--help" => {
                 println!("{USAGE}");
                 std::process::exit(0);
@@ -62,36 +86,50 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
             _ => return Err(format!("unknown argument {flag:?}")),
         }
     }
+    if args.headless && args.ticks.is_none() {
+        return Err("--headless needs --ticks".into());
+    }
+    if args.headless && args.speed.is_some() {
+        return Err("--speed is for the windowed game; --headless runs as fast as it goes".into());
+    }
     Ok(args)
 }
 
-/// The run condition of `SimSet`: false once a `--ticks` run has run its
-/// ticks, so a frame that owes more ticks runs none past the limit.
-pub fn under_tick_limit(clock: Res<BattleClock>) -> bool {
-    args().ticks.is_none_or(|n| clock.tick < n)
+/// The run condition of `SimSet`: false once a `--ticks` run has ended, so
+/// a frame that owes more ticks runs none past its end.
+pub fn under_tick_limit(clock: Res<BattleClock>, run: Res<RunState>) -> bool {
+    !run.ended && args().ticks.is_none_or(|n| clock.tick < n)
 }
 
 /// True on the tick that ends a `--ticks` run: the tick whose install
-/// brings the clock to the limit.
-pub fn last_tick(clock: &BattleClock) -> bool {
-    args().ticks == Some(clock.tick + 1)
+/// brings the clock to the limit, or the tick after the battle was
+/// decided.
+pub fn last_tick(clock: &BattleClock, outcome: &crate::ai::BattleOutcome) -> bool {
+    match args().ticks {
+        Some(n) => clock.tick + 1 == n || outcome.0.is_some(),
+        None => false,
+    }
 }
 
-/// The wall clock of a `--ticks` run, from the end of its first tick.
+/// A `--ticks` run's wall clock, from the end of its first tick, and
+/// whether it has ended.
 #[derive(Resource, Default)]
-struct RunTimer(Option<std::time::Instant>);
+pub struct RunState {
+    started: Option<std::time::Instant>,
+    ended: bool,
+}
 
-/// Logs the launch's seeds and quits the app at the tick limit with the
-/// run's numbers.
+/// Logs the launch's seeds and ends a `--ticks` run with the run's
+/// numbers.
 pub struct CliPlugin;
 
 impl Plugin for CliPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, log_seed);
+        app.init_resource::<RunState>().add_systems(Startup, log_seed);
         if args().ticks.is_none() {
             return;
         }
-        app.init_resource::<RunTimer>().add_systems(
+        app.add_systems(
             FixedUpdate,
             end_at_tick_limit
                 .after(crate::game_state::advance_battle_clock)
@@ -104,7 +142,7 @@ impl Plugin for CliPlugin {
 /// enemy army's rolls are logged where they are drawn (regiments.rs).
 fn log_seed() {
     match args().seed {
-        Some(seed) => info!("[seed] spawn seed {seed} from --seed"),
+        Some(seed) => info!("[seed] spawn seed {seed}, enemy army rolls from it (--seed, or FL_SEED headless)"),
         None => info!(
             "[seed] spawn seed {} from FL_SEED, enemy army rolls from the clock",
             crate::util::env_or("FL_SEED", 0u32)
@@ -112,22 +150,50 @@ fn log_seed() {
     }
 }
 
-fn end_at_tick_limit(clock: Res<BattleClock>, mut timer: ResMut<RunTimer>, mut exit: MessageWriter<AppExit>) {
+/// Ends a `--ticks` run at its limit, or on the tick after the battle was
+/// decided (the victory check runs after the install, so the decided
+/// state's hash is the next tick's), with the run's numbers.
+fn end_at_tick_limit(
+    clock: Res<BattleClock>,
+    outcome_now: Res<crate::ai::BattleOutcome>,
+    mut run: ResMut<RunState>,
+    mut decided: Local<crate::game_state::PerBattle<bool>>,
+    mut exit: MessageWriter<AppExit>,
+) {
     let Some(limit) = args().ticks else { return };
-    let started = *timer.0.get_or_insert_with(std::time::Instant::now);
-    if clock.tick < limit {
+    let started = *run.started.get_or_insert_with(std::time::Instant::now);
+    let decided = decided.of(&clock);
+    let over = clock.tick >= limit || *decided;
+    *decided = outcome_now.0.is_some();
+    if !over {
         return;
     }
+    run.ended = true;
     let wall = started.elapsed().as_secs_f64();
     // Timed from the end of the first tick, so over the ticks after it.
     let timed = clock.tick.saturating_sub(1);
+    let result = match outcome_now.0 {
+        None => "undecided",
+        Some(0) => "victory",
+        Some(1) => "defeat",
+        Some(_) => "mutual destruction",
+    };
     info!(
-        "[run] ticks {} wall {wall:.2} s ({} ticks timed) {:.1} ticks/s",
+        "[run] ticks {} wall {wall:.2} s ({} ticks timed) {:.1} ticks/s result {result}",
         clock.tick,
         timed,
         if wall > 0.0 { timed as f64 / wall } else { 0.0 },
     );
     exit.write(AppExit::Success);
+}
+
+/// The windowed game's time speed from `--speed`. The fixed tick keeps its
+/// length; more of them run per second of the wall clock.
+pub fn apply_speed(mut time: ResMut<Time<Virtual>>) {
+    if let Some(speed) = args().speed {
+        time.set_relative_speed_f64(speed);
+        info!("time runs {speed}x (--speed)");
+    }
 }
 
 #[cfg(test)]
@@ -141,9 +207,15 @@ mod tests {
     #[test]
     fn flags_parse_and_unknown_ones_fail() {
         assert_eq!(parsed(""), Ok(Args::default()));
-        assert_eq!(parsed("--ticks 900 --seed 1"), Ok(Args { ticks: Some(900), seed: Some(1) }));
+        assert_eq!(parsed("--ticks 900 --seed 1"), Ok(Args { ticks: Some(900), seed: Some(1), ..default() }));
+        assert_eq!(parsed("--headless --ticks 9"), Ok(Args { ticks: Some(9), headless: true, ..default() }));
+        assert_eq!(parsed("--speed 4"), Ok(Args { speed: Some(4.0), ..default() }));
         assert!(parsed("--ticks").is_err());
         assert!(parsed("--ticks x").is_err());
-        assert!(parsed("--headless").is_err());
+        assert!(parsed("--headless").is_err(), "headless needs --ticks");
+        assert!(parsed("--headless --ticks 9 --speed 2").is_err(), "speed is windowed only");
+        assert!(parsed("--speed 0").is_err());
+        assert!(parsed("--speed -1").is_err());
+        assert!(parsed("--bogus").is_err());
     }
 }

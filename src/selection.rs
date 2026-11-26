@@ -78,8 +78,7 @@ pub struct SelectionPlugin;
 
 impl Plugin for SelectionPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<Selection>()
-            .init_resource::<DragLine>()
+        app.init_resource::<DragLine>()
             .init_resource::<Hover>()
             .init_resource::<ControlGroups>()
             .add_systems(
