@@ -19,10 +19,16 @@ use crate::units::hash01;
 
 /// Env master override (FL_VOLUME, linear). Multiplies the settings
 /// volumes so scripted test runs stay muted regardless of the saved
-/// settings file.
+/// settings file. A headless run is silent at any FL_VOLUME: it carries
+/// the sound only because its pictures need the game's view.
 pub fn env_master() -> f32 {
     static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-    *V.get_or_init(|| crate::util::env_or("FL_VOLUME", 1.0))
+    *V.get_or_init(|| {
+        if crate::cli::args().headless {
+            return 0.0;
+        }
+        crate::util::env_or("FL_VOLUME", 1.0)
+    })
 }
 
 /// Effective battle-sound volume (beds, combat, vox, horns, stings).
