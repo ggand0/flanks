@@ -374,7 +374,6 @@ pub(crate) fn prepare_tick(
     let t0 = std::time::Instant::now();
     share_columns(job, units);
     let t1 = std::time::Instant::now();
-    let nav = routes.nav().cloned();
     let on_wall = wall_archers(groups, terrain);
     skirmish_reactions(groups, tracks, terrain, &on_wall, tick);
     let t2 = std::time::Instant::now();
@@ -417,7 +416,7 @@ pub(crate) fn prepare_tick(
     job.clear_blocks = fire.clear_blocks;
     job.blocks = fire.blocks;
     let last = std::mem::take(&mut job.sidearm);
-    job.sidearm = sidearm_reasons(groups, tracks, terrain, nav.as_deref(), &last, tick);
+    job.sidearm = sidearm_reasons(groups, tracks, terrain, &last, tick);
     job.field.size_to(terrain.min(), terrain.max());
     let t5 = std::time::Instant::now();
     log_prep([t1 - t0, t2 - t1, t2b - t2, t3 - t2b, t4 - t3, t5 - t4, t5 - t0]);
@@ -546,18 +545,6 @@ fn gap_within(a: &GroupData, b: &GroupData, limit: f32) -> Option<f32> {
         return None;
     }
     Some(edge_gap(a, b))
-}
-
-/// Whether men of block `from` can walk straight to block `to`: the
-/// planner's straight line (`NavGrid::walk_line`) between the two blocks'
-/// nearest points is clear. Always where no ground blocks (no grid). A
-/// block at the foot of a wall cannot walk to one on its walk, though
-/// their edges may be a metre or two apart seen from above.
-fn walks_to(nav: Option<&crate::nav::NavGrid>, from: &GroupData, to: &GroupData) -> bool {
-    let Some(nav) = nav else { return true };
-    let (a, b) = (crate::formation::block_rect(from), crate::formation::block_rect(to));
-    let at = b.closest(a.centre);
-    nav.walk_line(a.closest(at), at)
 }
 
 /// `edge_gap` between two blocks given as rectangles.
@@ -1783,10 +1770,37 @@ pub(crate) fn clear_reach() -> f32 {
         + crate::arrows::STRIKE_MARGIN
 }
 
+/// Whether enemy block `e` stands on the level of archer block `a` where
+/// it comes nearest them: the ground at `e`'s point nearest `a` within a
+/// standing man's height of the ground under `a`'s men (`levels_apart`).
+/// `a`'s level is the ground under its men's centroid, since a block on
+/// the walk is drawn deeper than the walk's 6 m and its edge lies over the
+/// parapet or the air past the wall's face. `e`'s point is read where it
+/// is a floor a man stands on, else (a wall's face, a drum, a parapet,
+/// which a block pressed against the wall reaches into) the ground under
+/// `e`'s centroid answers. On a map with no blocked ground there is one
+/// level, and nothing is read. Up to three height reads per pair within
+/// the knife distance.
+fn on_level_of(terrain: &Terrain, a: &GroupData, e: &GroupData) -> bool {
+    if !terrain.kind.has_blocked_ground() {
+        return true;
+    }
+    let (ra, re) = (crate::formation::block_rect(a), crate::formation::block_rect(e));
+    let q = re.closest(ra.closest(re.centre));
+    let floor_e = if terrain.blocked_at(q.x, q.y) {
+        terrain.height_at(e.centroid.x, e.centroid.y)
+    } else {
+        terrain.height_at(q.x, q.y)
+    };
+    let floor_a = terrain.height_at(a.centroid.x, a.centroid.y);
+    let half = |gd: &GroupData| crate::unit_types::half_height(gd.kind as usize);
+    !crate::sim::soldier::levels_apart(floor_e - floor_a, half(a), half(e))
+}
+
 /// Why each archer regiment's men take their knives out this tick
 /// (`Sidearm`): its swords-out order, an enemy block in bow range for the
 /// men with empty quivers, and the unbroken enemy blocks within the knife
-/// distance of its own block. The gap between two blocks along the line
+/// distance of its own block on its level (`on_level_of`). The gap between two blocks along the line
 /// between their centres is never more than the distance between any man
 /// of one and any point of the other, so no block left out is within the
 /// knife distance of a man inside his block. A man outside it is
@@ -1795,7 +1809,6 @@ fn sidearm_reasons(
     groups: &Groups,
     tracks: &crate::arrows::RegTracks,
     terrain: &Terrain,
-    nav: Option<&crate::nav::NavGrid>,
     last: &[Sidearm],
     tick: u32,
 ) -> Vec<Sidearm> {
@@ -1829,10 +1842,10 @@ fn sidearm_reasons(
                 let Some(gap) = gap_within(gd, eg, scope) else {
                     continue;
                 };
-                // A block he can be walked to straight (`walks_to`): an
-                // enemy at the foot of the wall he stands on cannot come
-                // at him in a bow draw.
-                if gap <= crate::sim::soldier::KNIFE_EDGE && walks_to(nav, eg, gd) {
+                // A block on his level (`on_level_of`): an enemy at the
+                // foot of the wall he stands on cannot come at him in a bow
+                // draw, one that has climbed onto the walk can.
+                if gap <= crate::sim::soldier::KNIFE_EDGE && on_level_of(terrain, gd, eg) {
                     arm.blocks.push(crate::formation::block_rect(eg));
                 }
                 arm.foe_in_range = arm.foe_in_range
@@ -2060,6 +2073,30 @@ mod tests {
         // A target coming on leaves the place where a standing one has it.
         let still = firing_place(&g, &t, Vec2::ZERO, &terrain);
         assert_eq!(firing_place(&g, &t, Vec2::new(0.0, -4.0), &terrain), still);
+    }
+
+    /// An enemy block at the foot of the wall below archers on its walk
+    /// is not on their level, pressed against the face or not; one that
+    /// has climbed onto the walk is.
+    #[test]
+    fn the_knife_counts_an_enemy_on_the_walk_not_one_at_its_foot() {
+        let terrain = build_terrain(MapKind::WallDebug);
+        let z = crate::town_layout::WALL_Z;
+        let archers = holder(Vec2::new(120.0, z), Vec2::new(120.0, z));
+        let enemy = |at: Vec2, men: usize, files: u32| {
+            let mut e = GroupData::new(1, crate::unit_types::KIND_HEAVY, at, men);
+            e.shape = FormShape::Rect;
+            e.files = files;
+            e.facing = facing_of(-Vec2::Y);
+            e.centroid = at;
+            e
+        };
+        for foot in [z + 18.0, z + 13.0, z + 11.0] {
+            let e = enemy(Vec2::new(120.0, foot), 300, 26);
+            assert!(!on_level_of(&terrain, &archers, &e), "an enemy about z = {foot} at the foot counts");
+        }
+        let e = enemy(Vec2::new(100.0, z), 20, 10);
+        assert!(on_level_of(&terrain, &archers, &e), "an enemy on the walk does not count");
     }
 
     /// On the wall walk the block stands six ranks deep at the lane's
