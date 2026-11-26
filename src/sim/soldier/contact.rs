@@ -24,9 +24,12 @@ const CUT_MARGIN: f32 = 0.01;
 /// The enemy he remembers (`target` at the tick's start) as one still to
 /// go for: a living index of the other team within his sight plus a
 /// metre, and with his regiment focused on one target, a man of it or
-/// one within his threat distance. Returns the squared distance to him
-/// (f32::MAX for an index out of range or of his own team) and whether he
-/// counts. The scan's `memo_valid` and the join in `drive` both read it.
+/// one within his threat distance, and on his own level as the scan reads
+/// levels (`Levels`): an enemy who climbed onto the wall above him, or one
+/// at its foot below a man on its walk, is out of his reach, and he lets
+/// him go. Returns the squared distance to him (f32::MAX for an index out
+/// of range or of his own team) and whether he counts. The scan's
+/// `memo_valid` and the join in `drive` both read it.
 #[inline]
 pub(super) fn remembered_foe(f: &Field, i: usize, p: Vec2, gi: usize, memo: usize) -> (f32, bool) {
     let Field { pos_prev, team, group, focus, .. } = *f;
@@ -35,7 +38,8 @@ pub(super) fn remembered_foe(f: &Field, i: usize, p: Vec2, gi: usize, memo: usiz
     }
     let d2 = pos_prev[memo].xz().distance_squared(p);
     let ok = d2 < (seek_radius() + 1.0) * (seek_radius() + 1.0)
-        && focus[gi].is_none_or(|t| group[memo] == t || d2 < threat_radius() * threat_radius());
+        && focus[gi].is_none_or(|t| group[memo] == t || d2 < threat_radius() * threat_radius())
+        && !Levels::new(f, i).apart(f, memo as u32);
     (d2, ok)
 }
 /// How deep another body is in his own, from the touch (the pair's body
