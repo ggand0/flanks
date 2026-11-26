@@ -166,6 +166,8 @@ pub struct ArrowStats {
     /// Since the start, for the archery tally: arrows loosed, and by the
     /// victim's team and kind the men struck, wounded and killed.
     pub loosed_total: u64,
+    /// Arrows loosed since the start, by the shooters' team.
+    pub loosed_team: [u64; 2],
     pub struck: [[u32; crate::unit_types::NUM_KINDS]; 2],
     pub wounded: [[u32; crate::unit_types::NUM_KINDS]; 2],
     pub killed: [[u32; crate::unit_types::NUM_KINDS]; 2],
@@ -480,6 +482,7 @@ fn update_arrows(
             }
             stats.loosed += 1;
             stats.loosed_total += 1;
+            stats.loosed_team[(s.team as usize).min(1)] += 1;
             if let Some(se) = sounds.as_deref_mut() {
                 se.push_loose(s.group, s.pos);
             }
