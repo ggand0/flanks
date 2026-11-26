@@ -3,6 +3,7 @@
 
 use bevy::prelude::*;
 
+use crate::game_state::{BattleClock, PerBattle};
 use crate::units::{Units, hash01, push_unit, spawn_seed};
 
 /// FL_TEST_SURROUND: two equal blue detachments of light infantry, one
@@ -86,11 +87,12 @@ pub fn spawn_surround_test(
 /// FL_TEST_SURROUND bookkeeping: per-capita survival of the encircled
 /// pocket (x < 0) vs the line fight (x > 0). Swing combat's acceptance
 /// criterion is the pocket dying clearly faster.
-pub(super) fn surround_test_log(units: Res<Units>, time: Res<Time>, mut next: Local<f32>) {
+pub(super) fn surround_test_log(units: Res<Units>, clock: Res<BattleClock>, mut next: Local<PerBattle<f32>>) {
     if std::env::var("FL_TEST_SURROUND").is_err() {
         return;
     }
-    let t = time.elapsed_secs();
+    let next = next.of(&clock);
+    let t = clock.secs();
     if t < *next {
         return;
     }

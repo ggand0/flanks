@@ -3,6 +3,7 @@
 
 use bevy::prelude::*;
 
+use crate::game_state::{BattleClock, PerBattle};
 use crate::orders::{Groups, Order, PLAYER_TEAM};
 use crate::regiments::spawn_regiment;
 use crate::regiments::{EDGE_MARGIN, SIDE_MARGIN};
@@ -79,21 +80,22 @@ type RetargetTest = Option<(u32, Vec<(usize, usize, usize)>)>;
 /// enemy regiment, as a player retargeting mid-fight would. Every 5 s
 /// after, each one's men are counted: striking a man of the old target,
 /// of the new one, and still within 2.5 m of an old-target man, with the
-/// regiment's distance to both. It fires on the sim tick, so two runs of
-/// one binary retarget on the same tick.
+/// regiment's distance to both. It runs on the sim tick and times itself
+/// by the battle clock, so two runs of one binary retarget on the same tick.
 pub(super) fn test_retarget_script(
     units: Res<Units>,
-    pipeline: Res<crate::sim::TickPipeline>,
+    clock: Res<BattleClock>,
     mut groups: ResMut<Groups>,
-    mut state: Local<RetargetTest>,
+    mut state: Local<PerBattle<RetargetTest>>,
 ) {
     let scenario = std::env::var("FL_TEST_RETARGET").is_ok();
     let at_s = std::env::var("FL_RETARGET_AT").ok().and_then(|v| v.parse::<f32>().ok());
     let Some(at) = at_s.or(scenario.then_some(20.0)) else {
         return;
     };
-    let tick = pipeline.tick;
-    let secs = tick as f32 / 30.0;
+    let state = state.of(&clock);
+    let tick = clock.tick;
+    let secs = clock.secs();
     if state.is_none() {
         if secs < at {
             return;

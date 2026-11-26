@@ -2,6 +2,7 @@
 
 use bevy::prelude::*;
 
+use crate::game_state::{BattleClock, PerBattle};
 use crate::orders::Groups;
 use crate::regiments::spawn_regiment;
 use crate::terrain::Terrain;
@@ -54,13 +55,14 @@ pub(crate) fn spawn_dir_test(units: &mut Units, terrain: &Terrain, groups: &mut 
 pub(super) fn dir_test_log(
     dir_stats: Res<crate::sim::damage::DirTestStats>,
     units: Res<Units>,
-    time: Res<Time>,
-    mut next: Local<f32>,
+    clock: Res<BattleClock>,
+    mut next: Local<PerBattle<f32>>,
 ) {
     if !dir_stats.enabled || units.len() == 0 {
         return;
     }
-    let t = time.elapsed_secs();
+    let next = next.of(&clock);
+    let t = clock.secs();
     if t < *next {
         return;
     }

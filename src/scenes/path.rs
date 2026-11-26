@@ -203,23 +203,21 @@ pub struct PathTestPlugin;
 
 impl Plugin for PathTestPlugin {
     fn build(&self, app: &mut App) {
-        if scene().is_none() {
-            return;
-        }
+        // Registered in every launch, so the tick's order is one schedule
+        // whatever the scene, and run only in a path scene. The orders go
+        // out between the install and the next job, where the pipelined
+        // tick's kick and the inline tick's next prep both read them.
+        let on = || scene().is_some();
         app.init_resource::<PathTest>()
             .init_resource::<FrameWatch>()
-            // The orders go out between the install and the next job,
-            // where the pipelined tick's kick and the inline tick's next
-            // prep both read them.
             .add_systems(
                 FixedUpdate,
                 (give_orders, log_progress)
                     .chain()
-                    .after(crate::orders::clear_arrived_orders)
-                    .before(crate::sim::route::update_routes)
-                    .in_set(crate::game_state::SimSet),
+                    .run_if(on)
+                    .in_set(crate::game_state::ScriptSet::Path),
             )
-            .add_systems(Update, watch_frames);
+            .add_systems(Update, watch_frames.run_if(on));
     }
 }
 

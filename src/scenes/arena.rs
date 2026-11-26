@@ -3,6 +3,7 @@
 
 use bevy::prelude::*;
 
+use crate::game_state::{BattleClock, PerBattle};
 use crate::orders::Groups;
 use crate::regiments::spawn_regiment;
 use crate::terrain::Terrain;
@@ -62,13 +63,14 @@ pub(super) fn arena_log(
     dir_stats: Res<crate::sim::damage::DirTestStats>,
     units: Res<Units>,
     groups: Res<Groups>,
-    time: Res<Time>,
-    mut next: Local<f32>,
+    clock: Res<BattleClock>,
+    mut next: Local<PerBattle<f32>>,
 ) {
     if std::env::var("FL_ARENA").is_err() || units.len() == 0 || groups.list.len() < 4 {
         return;
     }
-    let t = time.elapsed_secs();
+    let next = next.of(&clock);
+    let t = clock.secs();
     if t < *next {
         return;
     }

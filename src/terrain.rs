@@ -647,7 +647,6 @@ impl Plugin for TerrainPlugin {
                 (
                     rebuild_map.in_set(MapRebuild),
                     crater_tool,
-                    auto_test_craters,
                     remesh_dirty,
                     decide_terrain_casting,
                 )
@@ -1627,21 +1626,25 @@ fn crater_tool(
     }
 }
 
-/// FL_TEST_CRATERS=1: carve a crater near the field center every 2 s
-/// (screenshot/perf verification without input injection).
-fn auto_test_craters(
+/// FL_TEST_CRATERS=1: carve a crater near the field center every 2 s of
+/// the battle (screenshot/perf verification without input injection). It
+/// runs on the sim tick (scenes/mod.rs registers it), so the next tick's
+/// terrain snapshot carries the crater.
+pub(crate) fn auto_test_craters(
     mut terrain: ResMut<Terrain>,
-    time: Res<Time>,
-    mut next: Local<f32>,
-    mut n: Local<u32>,
+    clock: Res<crate::game_state::BattleClock>,
+    mut state: Local<crate::game_state::PerBattle<(f32, u32)>>,
 ) {
     if std::env::var("FL_TEST_CRATERS").is_err() {
         return;
     }
-    if time.elapsed_secs() < *next {
+    // The next crater's time and the craters carved this battle.
+    let (next, n) = state.of(&clock);
+    let t = clock.secs();
+    if t < *next {
         return;
     }
-    *next = time.elapsed_secs() + 2.0;
+    *next = t + 2.0;
     *n += 1;
     let a = hash01(*n * 7 + 1) * std::f32::consts::TAU;
     let r = hash01(*n * 7 + 2).sqrt() * 140.0;

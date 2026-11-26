@@ -17,7 +17,7 @@ use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::formation::{FormShape, FormSpacing};
-use crate::game_state::{BattleConfig, Deployment, EnemyComp, GameState, Scenario};
+use crate::game_state::{BattleClock, BattleConfig, EnemyComp, Scenario, ScriptSet};
 use crate::orders::{Groups, PLAYER_TEAM};
 use crate::terrain::{MapKind, Terrain};
 use crate::unit_types::NUM_KINDS;
@@ -425,13 +425,12 @@ fn demo_setup() -> BattleSetup {
 }
 
 /// The scripted orders of the battle's setup still to give, by regiment
-/// index, the regiment each saved unit went to (for an attack's target),
-/// and the time the battle began on the game clock.
+/// index, and the regiment each saved unit went to (for an attack's
+/// target).
 #[derive(Resource, Default)]
 pub struct SetupScript {
     pending: Vec<(usize, Scripted)>,
     placed: Vec<usize>,
-    begun: Option<f32>,
 }
 
 impl SetupScript {
@@ -445,24 +444,18 @@ impl SetupScript {
             let g = *placed.get(o.unit)?;
             Some((g, Scripted { when: When::After(o.after), then: o.then }))
         }));
-        Self { pending, placed: placed.to_vec(), begun: None }
+        Self { pending, placed: placed.to_vec() }
     }
 }
 
-/// Give each scripted order once its cue comes. The clock starts when the
-/// deployment ends and stops while the game is paused. A unit that has
-/// died or broken drops its order.
-fn run_setup_script(
-    time: Res<Time>,
-    deploy: Res<Deployment>,
-    mut script: ResMut<SetupScript>,
-    mut groups: ResMut<Groups>,
-) {
-    if deploy.active || script.pending.is_empty() {
+/// Give each scripted order once its cue comes, on the battle clock: it
+/// starts when the deployment ends and stops while the game is paused. A
+/// unit that has died or broken drops its order.
+fn run_setup_script(clock: Res<BattleClock>, mut script: ResMut<SetupScript>, mut groups: ResMut<Groups>) {
+    if script.pending.is_empty() {
         return;
     }
-    let now = time.elapsed_secs();
-    let since = now - *script.begun.get_or_insert(now);
+    let now = clock.secs();
     let mut due = Vec::new();
     {
         let groups = &*groups;
@@ -472,7 +465,7 @@ fn run_setup_script(
                 return false;
             }
             let ready = match order.when {
-                When::After(t) => since >= t,
+                When::After(t) => now >= t,
                 When::EnemyWithin(r) => {
                     nearest_enemy(groups, gd.team, front_of(gd)).is_some_and(|(_, d2)| d2 <= r * r)
                 }
@@ -549,7 +542,7 @@ pub struct BattleSetupPlugin;
 impl Plugin for BattleSetupPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<SetupScript>()
-            .add_systems(Update, run_setup_script.run_if(in_state(GameState::Battle)));
+            .add_systems(FixedUpdate, run_setup_script.in_set(ScriptSet::Setup));
     }
 }
 
@@ -758,14 +751,14 @@ mod tests {
             groups.list.push(unit(1, e));
         }
         world.insert_resource(groups);
-        world.insert_resource(Deployment { active: false });
         let placed = (0..=enemies.len()).collect();
-        world.insert_resource(SetupScript { pending: vec![(0, order)], placed, begun: None });
-        world.insert_resource(Time::<()>::default());
+        world.insert_resource(SetupScript { pending: vec![(0, order)], placed });
+        world.insert_resource(BattleClock::default());
         let mut system = IntoSystem::into_system(run_setup_script);
         system.initialize(&mut world);
+        // The battle clock moves on by `secs` of ticks, then the script runs.
         let run = move |world: &mut World, secs: f32| {
-            world.resource_mut::<Time>().advance_by(std::time::Duration::from_secs_f32(secs));
+            world.resource_mut::<BattleClock>().tick += (secs as f64 * crate::game_state::SIM_HZ).round() as u32;
             system.run((), world).unwrap();
         };
         (world, run)
@@ -775,18 +768,15 @@ mod tests {
         world.resource::<Groups>().list[0].order
     }
 
-    /// A timed charge waits out the deployment and its time on the game
-    /// clock, then attacks the nearest steady enemy unit.
+    /// A timed charge waits out its time on the battle clock, then attacks
+    /// the nearest steady enemy unit.
     #[test]
     fn a_timed_charge_attacks_the_nearest_enemy_on_time() {
         use crate::orders::Order;
         let charge = Scripted { when: When::After(20.0), then: Then::Charge };
         let (mut world, mut run) = scripted_world(&[Vec2::new(300.0, 50.0), Vec2::new(20.0, 40.0)], charge);
-        world.resource_mut::<Deployment>().active = true;
-        run(&mut world, 30.0);
-        assert!(order_of(&world).is_none(), "no order while deploying");
-        world.resource_mut::<Deployment>().active = false;
-        run(&mut world, 1.0);
+        run(&mut world, 0.0);
+        assert!(order_of(&world).is_none(), "the battle's first tick");
         run(&mut world, 19.0);
         assert!(order_of(&world).is_none(), "19 s into the battle");
         run(&mut world, 1.5);

@@ -3,6 +3,7 @@
 
 use bevy::prelude::*;
 
+use crate::game_state::{BattleClock, PerBattle};
 use crate::orders::{Groups, Order, PLAYER_TEAM, Selection, order_regiments, select_along_line};
 use crate::units::Units;
 
@@ -28,24 +29,27 @@ fn regiment_spread(units: &Units, g: u32) -> f32 {
     (sum / c as f32).sqrt()
 }
 
+/// The orders test's stage, the long-marched regiment with its spread at
+/// departure, and the group move's arrangement.
+type OrdersTest = (u32, Option<(u32, f32)>, Vec<(usize, Vec2)>);
+
 /// FL_TEST_ORDERS=1: regiment cohesion + arrangement-preserving group
 /// moves. Stage 0: enclosure-select regiments (exercises the promote
 /// path), long-march ONE regiment 350 m and compare its RMS spread on
 /// arrival (acceptance: < 1.5x). Stage 1: group-move several regiments
 /// and log how well their relative arrangement survived.
 pub(super) fn test_orders_script(
-    time: Res<Time>,
+    clock: Res<BattleClock>,
     units: Res<Units>,
     mut groups: ResMut<Groups>,
     mut selection: ResMut<Selection>,
-    mut stage: Local<u32>,
-    mut watch: Local<Option<(u32, f32)>>,
-    mut arrangement: Local<Vec<(usize, Vec2)>>,
+    mut state: Local<PerBattle<OrdersTest>>,
 ) {
     if std::env::var("FL_TEST_ORDERS").is_err() {
         return;
     }
-    let t = time.elapsed_secs();
+    let (stage, watch, arrangement) = state.of(&clock);
+    let t = clock.secs();
     match *stage {
         0 if t > 5.0 => {
             // Enclosure stroke around a spot inside the blue army: must

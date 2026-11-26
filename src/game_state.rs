@@ -221,6 +221,74 @@ pub fn scripts_active() -> bool {
 #[derive(SystemSet, Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct SimSet;
 
+/// The battle's own clock: the sim ticks run since this battle began
+/// (0 during its first tick) and which battle of the launch it is. It
+/// stands still while deploying and while paused, because the tick does
+/// not run then. Scripts, the AI and the scene logs time themselves by
+/// it, so two runs of one battle give their orders on the same ticks.
+#[derive(Resource, Default, Clone, Copy, Debug)]
+pub struct BattleClock {
+    pub tick: u32,
+    /// Goes up by one each time a battle is set up.
+    pub battle: u32,
+}
+
+impl BattleClock {
+    /// The battle's time in seconds: its ticks times the fixed timestep.
+    pub fn secs(&self) -> f32 {
+        (self.tick as f64 * SIM_DT) as f32
+    }
+}
+
+/// The sim's tick rate in hertz (main.rs sets the fixed clock to this
+/// rate) and its fixed timestep in seconds.
+pub const SIM_HZ: f64 = 30.0;
+pub const SIM_DT: f64 = 1.0 / SIM_HZ;
+
+/// The last system of the tick: the tick that just ran is counted.
+pub fn advance_battle_clock(mut clock: ResMut<BattleClock>) {
+    clock.tick += 1;
+}
+
+/// A system's own state for one battle: it goes back to `T::default()`
+/// when a new battle is set up, because the battle clock starts again at
+/// zero then.
+#[derive(Default)]
+pub struct PerBattle<T> {
+    battle: Option<u32>,
+    value: T,
+}
+
+impl<T: Default> PerBattle<T> {
+    /// This battle's state, fresh on the first call of a new battle.
+    pub fn of(&mut self, clock: &BattleClock) -> &mut T {
+        if self.battle != Some(clock.battle) {
+            self.battle = Some(clock.battle);
+            self.value = T::default();
+        }
+        &mut self.value
+    }
+}
+
+/// The slot on the sim tick for the orders nobody types and for the scene
+/// logs: after the arrived orders are cleared and before the routes are
+/// planned, where the pipelined tick's kick and the inline tick's next
+/// prep both read the orders. The parts run in this order.
+#[derive(SystemSet, Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum ScriptSet {
+    /// The battle setup's scripted orders and the test craters.
+    Setup,
+    /// The test scenes' scripts.
+    Scenes,
+    /// The path scenes' orders and watch (scenes/path.rs).
+    Path,
+    /// The victory check, the enemy AI and the at-ease engagement.
+    Ai,
+    /// The logs, which only read: they see the tick's state with its
+    /// orders given.
+    Logs,
+}
+
 #[derive(SystemSet, Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct BattleInputSet;
 
@@ -307,12 +375,25 @@ impl Plugin for GameShellPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<BattleConfig>()
             .init_resource::<Deployment>()
+            .init_resource::<BattleClock>()
             .init_state::<GameState>()
             .configure_sets(
                 FixedUpdate,
                 SimSet.run_if(
                     in_state(GameState::Battle).and_then(not(deploying)),
                 ),
+            )
+            .configure_sets(
+                FixedUpdate,
+                (ScriptSet::Setup, ScriptSet::Scenes, ScriptSet::Path, ScriptSet::Ai, ScriptSet::Logs)
+                    .chain()
+                    .in_set(SimSet)
+                    .after(crate::orders::clear_arrived_orders)
+                    .before(crate::sim::route::update_routes),
+            )
+            .add_systems(
+                FixedUpdate,
+                advance_battle_clock.after(crate::sim::kick_tick).in_set(SimSet),
             )
             .configure_sets(
                 Update,
@@ -887,7 +968,10 @@ pub fn setup_battle(
         ResMut<crate::arrows::ArrowSpawns>,
         ResMut<crate::arrows::StuckArrows>,
     ),
+    mut clock: ResMut<BattleClock>,
 ) {
+    clock.tick = 0;
+    clock.battle = clock.battle.wrapping_add(1);
     // A new world: any sim tick job still computing on the old one is
     // recognized as stale by the generation and dropped.
     let generation = units.generation.wrapping_add(1);

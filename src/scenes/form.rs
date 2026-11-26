@@ -2,6 +2,7 @@
 
 use bevy::prelude::*;
 
+use crate::game_state::{BattleClock, PerBattle};
 use crate::formation::FormSpacing;
 use crate::orders::Groups;
 use crate::units::Units;
@@ -52,18 +53,18 @@ fn regiment_nn(units: &Units, g: usize) -> f32 {
 /// loose. Stage 2 (+8 s): within-regiment nearest-neighbor spacing must
 /// order wall < normal < loose.
 pub(super) fn test_form_script(
-    time: Res<Time>,
+    clock: Res<BattleClock>,
     units: Res<Units>,
     terrain: Res<crate::terrain::Terrain>,
     mut groups: ResMut<Groups>,
-    mut stage: Local<u32>,
-    mut watch: Local<Vec<usize>>,
-    mut settle_at: Local<f32>,
+    mut state: Local<PerBattle<(u32, Vec<usize>, f32)>>,
 ) {
     if std::env::var("FL_TEST_FORM").is_err() {
         return;
     }
-    let t = time.elapsed_secs();
+    // The stage, the watched regiments and when they count as settled.
+    let (stage, watch, settle_at) = state.of(&clock);
+    let t = clock.secs();
     match *stage {
         0 if t > 3.0 => {
             let picked: Vec<usize> = groups
