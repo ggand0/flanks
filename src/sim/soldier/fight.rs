@@ -708,7 +708,8 @@ fn quarry_ok(
 /// men who keep theirs and the man still serves; else a new pick from
 /// his regiment's blocks (sim/job.rs `shoot_at`, `search_blocks`): a
 /// random living member, or in a search a random clear member, the
-/// nearest block first, a few tries a look and a look every few ticks.
+/// nearest block with such men first, a few tries a look and a look every
+/// few ticks.
 /// None: he waits with the bow down.
 #[inline]
 fn pick_quarry(
@@ -738,12 +739,20 @@ fn pick_quarry(
     if !tick.wrapping_add((i as u32).wrapping_mul(7)).is_multiple_of(QUARRY_LOOK_TICKS) {
         return None;
     }
+    // His tries go round the blocks with men to try, nearest first: a
+    // block with no man left to shoot gives its tries to the next.
+    let list_of = |b: u32| -> &[u32] {
+        let b = b as usize;
+        if shot.search { &clear_members[b] } else { &target_members[b] }
+    };
+    let n_open = blocks.iter().filter(|&&b| !list_of(b).is_empty()).count();
+    if n_open == 0 {
+        return None;
+    }
     for k in 0..QUARRY_TRIES {
-        let b = blocks[k as usize % blocks.len()] as usize;
-        let list: &[u32] = if shot.search { &clear_members[b] } else { &target_members[b] };
-        if list.is_empty() {
+        let Some(list) = blocks.iter().map(|&b| list_of(b)).filter(|l| !l.is_empty()).nth(k as usize % n_open) else {
             continue;
-        }
+        };
         let h = crate::units::hash01(
             tick_seed
                 ^ (i as u32).wrapping_mul(0x7F4A_7C15).wrapping_add(k.wrapping_mul(0x2545_F491)),

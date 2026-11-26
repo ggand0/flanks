@@ -428,8 +428,9 @@ fn rebuild_beside_products(job: &mut TickJob) -> Instant {
             // And of every regiment under search, its clear men: no enemy in
             // his reach (soldier/mod.rs SIGHT_FOE, as of the last tick) and farther
             // than a shaft's reach from every block of the shooters' side that
-            // stands near his (job.rs `clear_blocks`). Ascending, so a kept pick
-            // is found by a binary search (soldier/fight.rs `quarry_ok`).
+            // stands near his on his level (job.rs `clear_blocks`, `ClearBlock`).
+            // Ascending, so a kept pick is found by a binary search
+            // (soldier/fight.rs `quarry_ok`).
             let clear_r = job::clear_reach();
             clear_members.resize_with(n_groups, Vec::new);
             for (g, members) in clear_members.iter_mut().enumerate() {
@@ -443,7 +444,8 @@ fn rebuild_beside_products(job: &mut TickJob) -> Instant {
                                 return false;
                             }
                             let p = Vec2::new(pos_prev[i].x, pos_prev[i].z);
-                            near.iter().all(|b| b.distance(p) > clear_r)
+                            let half = crate::unit_types::half_height(kind[i] as usize);
+                            near.iter().all(|b| b.clears(p, pos_prev[i].y - half, half, clear_r))
                         }));
                     }
                 }

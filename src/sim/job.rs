@@ -53,11 +53,38 @@ pub(crate) struct ArcherScan {
     pub(crate) danger: Option<(f32, usize)>,
     pub(crate) best_free: Option<(f32, usize)>,
     pub(crate) busy: Vec<(f32, usize)>,
+    /// The search among the blocks in melee: how many of the nearest it
+    /// passes over, and the blocks it searched last (`bows_target`).
+    pub(crate) skip: usize,
+    pub(crate) window: Vec<u32>,
 }
 
 impl Default for ArcherScan {
     fn default() -> Self {
-        Self { tick: u32::MAX, danger: None, best_free: None, busy: Vec::new() }
+        Self { tick: u32::MAX, danger: None, best_free: None, busy: Vec::new(), skip: 0, window: Vec::new() }
+    }
+}
+
+/// A block of the shooters' side near a block under search
+/// (`clear_blocks_near`): its rectangle, and on a map with blocked ground
+/// its level, the ground under its men's centroid and its kind's half
+/// height. A man of the searched block is clear of it when he stands
+/// farther than a shaft's reach from the rectangle, or on another level
+/// (`soldier::levels_apart`): a shaft that comes down on a man at the
+/// foot of the wall comes down there, not on the walk above him.
+#[derive(Clone, Copy)]
+pub(crate) struct ClearBlock {
+    pub(crate) rect: crate::formation::BlockRect,
+    pub(crate) level: Option<(f32, f32)>,
+}
+
+impl ClearBlock {
+    /// A man standing at `p` on ground `ground`, `half` his half height,
+    /// is clear of this block.
+    #[inline]
+    pub(crate) fn clears(&self, p: Vec2, ground: f32, half: f32, reach: f32) -> bool {
+        self.rect.distance(p) > reach
+            || self.level.is_some_and(|(g, h)| crate::sim::soldier::levels_apart(ground - g, half, h))
     }
 }
 
@@ -196,9 +223,10 @@ pub struct TickJob {
     /// (`ShootAt::search`), so the job lists its clear men.
     pub(crate) searched: Vec<bool>,
     /// Per regiment under search: the blocks of the shooters' side
-    /// within a shaft's reach of it (`clear_reach`), as rectangles; the
-    /// clear men stand farther than that from every one of them.
-    pub(crate) clear_blocks: Vec<Vec<crate::formation::BlockRect>>,
+    /// within a shaft's reach of it (`clear_reach`), as rectangles with
+    /// their level; the clear men stand farther than that from every one
+    /// of them on their own level.
+    pub(crate) clear_blocks: Vec<Vec<ClearBlock>>,
     /// Per archer regiment: the enemy blocks its men search in, nearest
     /// first; empty when its bows have a plain target or none.
     pub(crate) search_blocks: Vec<Vec<u32>>,
@@ -344,7 +372,7 @@ struct FireSolutions {
     /// Per archer regiment: the blocks its men search in.
     search_blocks: Vec<Vec<u32>>,
     /// Per regiment under search: the shooters' blocks near it.
-    clear_blocks: Vec<Vec<crate::formation::BlockRect>>,
+    clear_blocks: Vec<Vec<ClearBlock>>,
     /// Friendly formed blocks per team with a clearance ceiling,
     /// for the loft-over-friendlies check.
     blocks: [Vec<crate::arrows::LoftBlock>; 2],
@@ -388,6 +416,7 @@ pub(crate) fn prepare_tick(
         tracks,
         terrain,
         &on_wall,
+        &job.searched,
         &job.clear_members,
         &mut job.archer_scans,
         kept_clear_blocks,
@@ -1418,9 +1447,10 @@ fn archer_fire_solutions(
     tracks: &crate::arrows::RegTracks,
     terrain: &Terrain,
     on_wall: &[bool],
+    last_searched: &[bool],
     clear_members: &[Vec<u32>],
     scans: &mut Vec<ArcherScan>,
-    kept_clear_blocks: Vec<Vec<crate::formation::BlockRect>>,
+    kept_clear_blocks: Vec<Vec<ClearBlock>>,
     tick: u32,
 ) -> FireSolutions {
     let n_groups = groups.list.len();
@@ -1438,8 +1468,13 @@ fn archer_fire_solutions(
     // on the move).
     let gl: &Groups = &*groups;
     let mut search_blocks: Vec<Vec<u32>> = vec![Vec::new(); n_groups];
+    // A block whose clear men the last run listed, and found none.
+    let dry = |b: u32| {
+        let b = b as usize;
+        last_searched.get(b).copied().unwrap_or(false) && clear_members.get(b).is_none_or(|m| m.is_empty())
+    };
     let shoot_at: Vec<Option<ShootAt>> = (0..n_groups)
-        .map(|g| bows_target(gl, g, tracks, terrain, on_wall[g], &mut scans[g], &mut search_blocks[g], tick))
+        .map(|g| bows_target(gl, g, tracks, terrain, on_wall[g], &dry, &mut scans[g], &mut search_blocks[g], tick))
         .collect();
     // The card's firing mark: a fire solution, arrows to spend on it and,
     // in a search, clear men to shoot (the lists of the last tick run).
@@ -1453,7 +1488,7 @@ fn archer_fire_solutions(
         groups.list[g].firing = has_men && groups.list[g].ammo_left > 0;
     }
     let (targeted, searched) = under_fire(&shoot_at, &search_blocks, n_groups);
-    let clear_blocks = clear_blocks_near(groups, &searched, kept_clear_blocks, tick);
+    let clear_blocks = clear_blocks_near(groups, terrain, &searched, kept_clear_blocks, tick);
     let blocks = loft_blocks(groups, terrain);
 
     FireSolutions {
@@ -1574,7 +1609,8 @@ fn stand_off(groups: &mut Groups, g: usize, tracks: &crate::arrows::RegTracks, t
 
 /// What one archer regiment's bows shoot at this tick, and the blocks
 /// its men search in (`search_in`). `on_wall`: the regiment stands on the
-/// wall (`wall_archers`).
+/// wall (`wall_archers`). `dry`: a block the last run searched and found
+/// no clear man in.
 #[inline]
 #[allow(clippy::too_many_arguments)]
 fn bows_target(
@@ -1583,6 +1619,7 @@ fn bows_target(
     tracks: &crate::arrows::RegTracks,
     terrain: &Terrain,
     on_wall: bool,
+    dry: &impl Fn(u32) -> bool,
     scan: &mut ArcherScan,
     search_in: &mut Vec<u32>,
     tick: u32,
@@ -1612,6 +1649,11 @@ fn bows_target(
         *scan = ArcherScan::default();
     } else if scan.tick == u32::MAX || tick.wrapping_add(g as u32).is_multiple_of(ARCHER_LOOK)
     {
+        // A search whose blocks all had no clear man passes on to the
+        // next blocks in melee, farther out, at this look; one that found
+        // men keeps its blocks.
+        let window = std::mem::take(&mut scan.window);
+        let skip = if !window.is_empty() && window.iter().all(|&b| dry(b)) { scan.skip + window.len() } else { scan.skip };
         let mut danger: Option<(f32, usize)> = None;
         let mut best_free: Option<(f32, usize)> = None;
         let mut busy: Vec<(f32, usize)> = Vec::new();
@@ -1637,7 +1679,7 @@ fn bows_target(
                 best_free = Some((gap, e));
             }
         }
-        *scan = ArcherScan { tick, danger, best_free, busy };
+        *scan = ArcherScan { tick, danger, best_free, busy, skip, window };
     }
     let danger = scan.danger.filter(|&(_, e)| live(e));
     let best_free = scan.best_free.filter(|&(_, e)| live(e));
@@ -1650,8 +1692,12 @@ fn bows_target(
     // Fire at will: the block coming for the regiment, every man on it
     // (with skirmish on, the run takes the regiment away before this);
     // else the nearest block in range that is not in melee; else the men
-    // search the blocks in melee, nearest first. Fire at will off (the
-    // scan is empty): nothing.
+    // search the blocks in melee, nearest first, past those a search found
+    // no clear man in (`ArcherScan::skip`), from the nearest again once
+    // it has passed them all. Fire at will off (the scan is empty):
+    // nothing.
+    let mut skip = scan.skip;
+    let mut from_busy = false;
     let mut at_will = |search_in: &mut Vec<u32>| -> Option<(usize, bool)> {
         if let Some((_, e)) = danger {
             Some((e, true))
@@ -1659,8 +1705,12 @@ fn bows_target(
             Some((e, false))
         } else {
             busy.sort_by(|a, b| a.0.total_cmp(&b.0));
-            let (_, e) = *busy.first()?;
-            *search_in = busy.iter().take(SEARCH_BLOCKS).map(|&(_, e)| e as u32).collect();
+            if skip >= busy.len() {
+                skip = 0;
+            }
+            let (_, e) = *busy.get(skip)?;
+            *search_in = busy.iter().skip(skip).take(SEARCH_BLOCKS).map(|&(_, e)| e as u32).collect();
+            from_busy = true;
             Some((e, true))
         }
     };
@@ -1696,6 +1746,9 @@ fn bows_target(
     if search && search_in.is_empty() {
         search_in.push(t as u32);
     }
+    // The blocks in melee it searches now, for its next look.
+    scan.skip = if from_busy { skip } else { 0 };
+    scan.window = if from_busy { search_in.clone() } else { Vec::new() };
     let tg = &gl.list[t];
     Some(ShootAt {
         c: tg.centroid,
@@ -1733,10 +1786,11 @@ fn under_fire(shoot_at: &[Option<ShootAt>], search_blocks: &[Vec<u32>], n_groups
 #[inline]
 fn clear_blocks_near(
     groups: &Groups,
+    terrain: &Terrain,
     searched: &[bool],
-    kept_clear_blocks: Vec<Vec<crate::formation::BlockRect>>,
+    kept_clear_blocks: Vec<Vec<ClearBlock>>,
     tick: u32,
-) -> Vec<Vec<crate::formation::BlockRect>> {
+) -> Vec<Vec<ClearBlock>> {
     let n_groups = groups.list.len();
     // The blocks of the shooters' side within a shaft's reach of each
     // searched block, by the gap between the edges, as rectangles: a man
@@ -1747,11 +1801,14 @@ fn clear_blocks_near(
     // Broken blocks count too: the rectangle sits on the men's centroid.
     // Listed every ARCHER_LOOK ticks per searched block, staggered, and
     // kept between (the last tick's list, or none for a block newly
-    // under search).
+    // under search). On a map with blocked ground each with its level: a
+    // block on the wall above a man at its foot is not near him. One
+    // height read per block listed.
     let clear_r = clear_reach();
+    let levels = terrain.kind.has_blocked_ground();
     let mut kept = kept_clear_blocks;
     kept.resize_with(n_groups, Vec::new);
-    let clear_blocks: Vec<Vec<crate::formation::BlockRect>> = kept
+    let clear_blocks: Vec<Vec<ClearBlock>> = kept
         .into_iter()
         .enumerate()
         .map(|(e, old)| {
@@ -1770,7 +1827,15 @@ fn clear_blocks_near(
                         && fg.count > 0
                         && gap_within(fg, eg, clear_r).is_some_and(|gap| gap <= clear_r)
                 })
-                .map(crate::formation::block_rect)
+                .map(|fg| ClearBlock {
+                    rect: crate::formation::block_rect(fg),
+                    level: levels.then(|| {
+                        (
+                            terrain.height_at(fg.centroid.x, fg.centroid.y),
+                            crate::unit_types::half_height(fg.kind as usize),
+                        )
+                    }),
+                })
                 .collect()
         })
         .collect();
@@ -2138,6 +2203,36 @@ mod tests {
         }
         let e = enemy(Vec2::new(100.0, z), 20, 10);
         assert!(on_level_of(&terrain, &archers, &e), "an enemy on the walk does not count");
+    }
+
+    /// A man at the foot of the wall below archers on its walk is clear of
+    /// their block, however near it on the map; a man on the walk beside
+    /// them is not, nor is one near a friendly block on the ground.
+    #[test]
+    fn a_block_on_the_wall_is_not_near_a_man_at_its_foot() {
+        let terrain = build_terrain(MapKind::WallDebug);
+        let z = crate::town_layout::WALL_Z;
+        let archers = holder(Vec2::new(120.0, z), Vec2::new(120.0, z));
+        let mut e = GroupData::new(1, crate::unit_types::KIND_HEAVY, Vec2::new(120.0, z + 15.0), 300);
+        e.shape = FormShape::Rect;
+        e.files = 26;
+        e.facing = facing_of(-Vec2::Y);
+        e.centroid = Vec2::new(120.0, z + 15.0);
+        let mut friend = GroupData::new(0, crate::unit_types::KIND_HEAVY, Vec2::new(120.0, z + 32.0), 200);
+        friend.shape = FormShape::Rect;
+        friend.files = 20;
+        friend.facing = facing_of(-Vec2::Y);
+        friend.centroid = Vec2::new(120.0, z + 32.0);
+        let groups = Groups { list: vec![archers, e, friend] };
+        let near = clear_blocks_near(&groups, &terrain, &[false, true, false], Vec::new(), 0);
+        assert_eq!(near[1].len(), 2, "both blocks of the shooters' side are within reach on the map");
+        let (r, half) = (clear_reach(), crate::unit_types::half_height(crate::unit_types::KIND_HEAVY as usize));
+        let at_foot = Vec2::new(120.0, z + 6.0);
+        let ground = terrain.height_at(at_foot.x, at_foot.y);
+        assert!(near[1][0].clears(at_foot, ground, half, r), "the archers' block on the walk is near a man at its foot");
+        assert!(!near[1][0].clears(at_foot, ground + crate::town_layout::WALK, half, r), "a man on the walk's level is clear");
+        let by_friend = Vec2::new(120.0, z + 22.0);
+        assert!(!near[1][1].clears(by_friend, terrain.height_at(by_friend.x, by_friend.y), half, r));
     }
 
     /// On the wall walk the block stands six ranks deep at the lane's
