@@ -431,7 +431,7 @@ def main():
         if os.path.exists(out):
             os.replace(out, out + ".old")
         env = dict(os.environ, FL_SPRITE_BAKE=work)
-        env.pop("FL_SPRITE", None)
+        env["FL_SPRITE"] = "0"
         for pair in args.env:
             key, value = pair.split("=", 1)
             env[key] = value

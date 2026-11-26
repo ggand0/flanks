@@ -543,17 +543,18 @@ fn import(kind: usize, path: &Path, pulled: bool) -> Fallible<KindMeshes> {
     })
 }
 
-/// `FL_SPRITE=1`: every standing soldier at the last level is drawn as a
-/// card (off by default). It covers a pixel as the meshes do under the
-/// view's anti-aliasing: with MSAA the samples its picture covers, without
-/// it the pixels whose centre it covers (unit_instancing.wgsl
+/// `FL_SPRITE`: every standing soldier at the last level is drawn as a
+/// card, on by default; `FL_SPRITE=0` draws the last level as its mesh.
+/// The card covers a pixel as the meshes do under the view's
+/// anti-aliasing: with MSAA the samples its picture covers, without it
+/// the pixels whose centre it covers (unit_instancing.wgsl
 /// `SpriteFragment`). GPU path only. Read once, at import. The last
 /// level then begins `FL_SPRITE_FROM` metres from the camera, 400 by
 /// default (render_units.rs `LodConfig::sprite_from`), unless `FL_LOD_PX`
 /// is given, which sets every switch in pixels as without the card.
 pub fn sprites() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| crate::util::env_or("FL_SPRITE", 0_u32) != 0)
+    *ON.get_or_init(|| crate::util::env_or("FL_SPRITE", 1_u32) != 0)
 }
 
 /// `FL_SPRITE_SHADOW=1`, with `FL_SPRITE`: a card inside the sun's shadow
