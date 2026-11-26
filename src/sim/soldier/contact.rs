@@ -673,6 +673,7 @@ struct Obstacles<'a> {
     body0: f32,
     widths: &'a [Width; WIDTH_LEVELS],
     orders: &'a [Option<Vec2>],
+    terrain: &'a crate::terrain::Terrain,
     row: Row,
     row_at: f32,
     side_left: bool,
@@ -702,6 +703,7 @@ impl<'a> Obstacles<'a> {
             body0,
             widths,
             orders: f.orders,
+            terrain: f.terrain,
             row: Row::default(),
             row_at: f32::INFINITY,
             side_left: false,
@@ -740,7 +742,8 @@ impl<'a> Obstacles<'a> {
     }
 
     /// His normal body and spring, whether he saw an obstacle and the
-    /// opening he found among them, and whether a body is at both sides.
+    /// opening he found among them (one his body can walk straight to,
+    /// `way_free`), and whether a body is at both sides.
     #[inline]
     fn hand_on(&self, s: &Soldier, st: &mut Step, sep0: f32) {
         st.open.open_on = self.open_on;
@@ -749,8 +752,11 @@ impl<'a> Obstacles<'a> {
         st.open.saw = self.row_at.is_finite();
         if self.open_on && st.open.saw {
             let (pref, coin) = side_pref(s.i, *s.stuck);
+            let (p, wd) = (st.p, self.wish_dir);
+            let perp = Vec2::new(-wd.y, wd.x);
+            let free = |lat: f32, along: f32| way_free(self.terrain, p, wd * along + perp * lat);
             let (aim_lat, aim_along, fit, span) =
-                openings(&self.row, self.row_at, OPEN_SEE, self.body0, SQUEEZE_DEPTH, false, pref, coin);
+                openings(&self.row, self.row_at, OPEN_SEE, self.body0, SQUEEZE_DEPTH, false, pref, coin, free);
             st.open.near = (aim_lat, aim_along, fit);
             st.open.near_span = span;
         }

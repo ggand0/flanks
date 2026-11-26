@@ -60,7 +60,7 @@ pub(super) fn side_pref(i: usize, stuck: u16) -> (f32, f32) {
 /// fighting men keep their own footwork.
 #[inline]
 pub(super) fn choose_opening(f: &Field, s: &mut Soldier, st: &mut Step) {
-    let Field { orders, tick, anchors, home, terrain, .. } = *f;
+    let Field { orders, tick, anchors, home, .. } = *f;
     let i = s.i;
     let going = st.open.open_on && st.foe.best_idx == u32::MAX && !st.foe.memo_valid;
     let ring_flag = *s.sight & SIGHT_RING != 0;
@@ -126,21 +126,6 @@ pub(super) fn choose_opening(f: &Field, s: &mut Soldier, st: &mut Step) {
             *s.aim = Vec2::NAN;
         }
     }
-    // A way his body cannot step (into a wall, a drum or a rail, on a map
-    // with blocked ground) is no way through, however open the ground at
-    // the aim itself: he drops it and keeps his own way, else he walks at
-    // it into the stone once the men round it are gone.
-    if fit > 0 {
-        let to = wd * aim_along.max(0.0) + perp * aim_lat;
-        let r = terrain.body_radius();
-        if r > 0.0 && to.length_squared() > 1e-12 {
-            let d = to.normalize() * crate::town_layout::FINE;
-            if !terrain.body_free(p.x + d.x, p.y + d.y, r, d.x, d.y) {
-                *s.aim = Vec2::NAN;
-                fit = 0;
-            }
-        }
-    }
     st.open.aim_fit = fit;
     st.open.gap = fit == 1 && !taken;
     st.open.gap_near = st.open.gap && aim_along < st.open.sep0;
@@ -190,10 +175,11 @@ fn crack_taken(f: &Field, i: usize, st: &Step, p: Vec2, wd: Vec2) -> bool {
 }
 
 /// The ring read (`choose_opening`): the crack round a hemmed man nearest
-/// his way that fits him, as his aim. Returns whether he aims at one.
+/// his way that fits him and that his body can walk straight to
+/// (`way_free`), as his aim. Returns whether he aims at one.
 #[inline]
 fn read_the_ring(f: &Field, s: &mut Soldier, st: &Step, p: Vec2, wd: Vec2, perp: Vec2, v: &mut u16) -> bool {
-    let Field { grid, orders, .. } = *f;
+    let Field { grid, orders, terrain, .. } = *f;
     let i = s.i;
     let mut ring_aim = false;
     let my_team_bit = st.scan.my_team_bit;
@@ -267,7 +253,7 @@ fn read_the_ring(f: &Field, s: &mut Soldier, st: &Step, p: Vec2, wd: Vec2, perp:
             };
             let off = (wd.x * point.y - wd.y * point.x).atan2(point.dot(wd)).abs();
             let cost = off + if wf == 1 { SQUEEZE_DETOUR } else { 0.0 };
-            if cost < best {
+            if cost < best && way_free(terrain, p, point) {
                 best = cost;
                 best_point = point;
                 best_fit = wf;
@@ -284,10 +270,11 @@ fn read_the_ring(f: &Field, s: &mut Soldier, st: &Step, p: Vec2, wd: Vec2, perp:
 }
 
 /// The wide look (`choose_opening`): out to OPEN_FAR, the opening in the
-/// row nearest him that fits him, as his aim.
+/// row nearest him that fits him and that his body can walk straight to
+/// (`way_free`), as his aim.
 #[inline]
 fn wide_look(f: &Field, s: &mut Soldier, st: &Step, p: Vec2, wd: Vec2, perp: Vec2, v: &mut u16) {
-    let Field { grid, orders, .. } = *f;
+    let Field { grid, orders, terrain, .. } = *f;
     let i = s.i;
     let (pref, coin) = side_pref(i, *v);
     let my_team_bit = st.scan.my_team_bit;
@@ -346,8 +333,9 @@ fn wide_look(f: &Field, s: &mut Soldier, st: &Step, p: Vec2, wd: Vec2, perp: Vec
             }
         }
     }
+    let free = |lat: f32, along: f32| way_free(terrain, p, wd * along + perp * lat);
     let (w_lat, w_along, w_fit, _) =
-        openings(&wide, wide_at, OPEN_FAR, st.open.body0, SQUEEZE_DEPTH, true, pref, coin);
+        openings(&wide, wide_at, OPEN_FAR, st.open.body0, SQUEEZE_DEPTH, true, pref, coin, free);
     *s.aim = if w_fit > 0 { p + wd * w_along + perp * w_lat } else { Vec2::NAN };
     *v = (*v & !STUCK_WIDE_DEPTH) | ((w_fit == 1) as u16 * STUCK_WIDE_DEPTH);
 }
@@ -689,10 +677,13 @@ impl Row {
 /// `see`: ahead between the nearest man on each side, left between the
 /// two nearest on his left, right between the two on his right, and, when
 /// `beyond` (the wide look), the open ground past the last man seen on a
-/// side up to the edge of his sight at that distance. Returns the aim
-/// across and along his way, its fit (0 none, 1 his depth, 2 his width),
-/// and the picked opening's air across his way with the far side of its
-/// passage along it (the farther of its two men's far sides).
+/// side up to the edge of his sight at that distance. An opening counts
+/// only where `free(across, along)` says his body can walk the straight
+/// way to its aim (`way_free`): men standing beside a tower leave cracks
+/// that lead into its stone. Returns the aim across and along his way,
+/// its fit (0 none, 1 his depth, 2 his width), and the picked opening's
+/// air across his way with the far side of its passage along it (the
+/// farther of its two men's far sides).
 #[inline]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn openings(
@@ -704,6 +695,7 @@ pub(super) fn openings(
     beyond: bool,
     pref: f32,
     coin: f32,
+    free: impl Fn(f32, f32) -> bool,
 ) -> (f32, f32, u8, (f32, f32, f32)) {
     let none = (f32::NAN, f32::NAN, f32::NAN);
     if row.n_left == 0 && row.n_right == 0 {
@@ -744,7 +736,7 @@ pub(super) fn openings(
         let cost = aim.abs() + if fd { SQUEEZE_DETOUR } else { 0.0 }
             - if pref != 0.0 && sign(aim) == pref { OPEN_SIDE_KEEP } else { 0.0 }
             - if sign(aim) == coin { 0.01 } else { 0.0 };
-        if cost < best {
+        if cost < best && free(aim, row_at.min(see)) {
             best = cost;
             aim_lat = aim;
             fit = if fw { 2 } else { 1 };
@@ -752,6 +744,37 @@ pub(super) fn openings(
         }
     }
     (aim_lat, if fit > 0 { row_at.min(see) } else { 0.0 }, fit, span)
+}
+
+/// Whether a body of his radius can walk the straight way from `p` to
+/// `p + to` without meeting blocked ground: `Terrain::body_free` at every
+/// fine cell along it (every half metre where `p` is off the wall's fine
+/// ground, whose blocked cells are 2 m wide), toward its end. Where the
+/// fine ground says nothing blocked is nearer `p` than the way and his
+/// radius, one read answers. On a map with no blocked ground every way is free and
+/// nothing is read. The choice of opening asks it of the opening it would
+/// take (`openings`, the ring read): up to 16 reads of a body's few cells
+/// for a crack 4 m off beside stone.
+#[inline]
+pub(super) fn way_free(terrain: &crate::terrain::Terrain, p: Vec2, to: Vec2) -> bool {
+    let r = terrain.body_radius();
+    let len = to.length();
+    if r == 0.0 || len < 1e-6 {
+        return true;
+    }
+    let on_fine = terrain.fine().and_then(|f| f.line_step(p));
+    if let Some(Some(step)) = on_fine
+        && step >= len + r
+    {
+        return true;
+    }
+    let dir = to / len;
+    let stride = if on_fine.is_some() { crate::town_layout::FINE } else { 0.5 };
+    let n = (len / stride).ceil().max(1.0) as usize;
+    (1..=n).all(|k| {
+        let q = p + to * (k as f32 / n as f32);
+        terrain.body_free(q.x, q.y, r, dir.x, dir.y)
+    })
 }
 
 /// A man going somewhere who finds himself stuck tries a side. Stuck is
@@ -941,5 +964,28 @@ pub(super) fn hold_the_frame(f: &Field, st: &mut Step) {
         st.fight.slot_wish = desired;
     } else {
         st.desired = desired;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::terrain::{build_terrain, MapKind};
+    use crate::town_layout::{TOWERS_X, WALL_Z};
+
+    /// A man standing a metre off the east end tower's drum on the outer
+    /// side cannot walk the straight way to an aim 3 m on, into the drum;
+    /// the way along the drum's side, and the way back out, are open.
+    #[test]
+    fn a_way_into_a_tower_is_not_free() {
+        let terrain = build_terrain(MapKind::WallDebug);
+        let centre = Vec2::new(TOWERS_X[3], WALL_Z);
+        let out = Vec2::new(0.6, 0.8);
+        let p = centre + out * 9.3;
+        assert!(terrain.body_free(p.x, p.y, terrain.body_radius(), 0.0, 0.0), "he stands on open ground");
+        assert!(!way_free(&terrain, p, -out * 3.0), "the way into the drum is free");
+        let along = Vec2::new(-out.y, out.x);
+        assert!(way_free(&terrain, p + out * 0.5, along * 2.0), "the way along the drum is blocked");
+        assert!(way_free(&terrain, p, out * 3.0), "the way out is blocked");
     }
 }
