@@ -171,13 +171,22 @@ pub(super) fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut
     obstacles.hand_on(s, st, widths[pose_lv].sep);
 }
 
+/// Whether two things whose ground heights differ by `dy` stand on
+/// different levels: the difference is a standing soldier's height or
+/// more, the half heights `half_a` and `half_b` of the two men standing
+/// there added. Two men on different levels do not overlap in height.
+#[inline(always)]
+pub(crate) fn levels_apart(dy: f32, half_a: f32, half_b: f32) -> bool {
+    dy.abs() >= half_a + half_b
+}
+
 /// Two men on different levels: on a map with cliffs (a wall's walk and
 /// the ground at its foot, a raised block), a neighbour close in plan may
 /// stand a storey above or below. Their bodies meet only where they
 /// overlap in height, so a man whose middle is more than the two half
-/// heights above or below his own is no body he touches, no man in his
-/// reach and no part of the crowd round him. Where no ground blocks there
-/// is no cliff and no such pair, and nothing is read.
+/// heights above or below his own (`levels_apart`) is no body he touches,
+/// no man in his reach and no part of the crowd round him. Where no
+/// ground blocks there is no cliff and no such pair, and nothing is read.
 pub(super) struct Levels {
     on: bool,
     y: f32,
@@ -197,7 +206,7 @@ impl Levels {
     pub(super) fn apart(&self, f: &Field, o: u32) -> bool {
         self.on && {
             let o = o as usize;
-            (f.pos_prev[o].y - self.y).abs() >= self.hh + crate::unit_types::half_height(f.kind[o] as usize)
+            levels_apart(f.pos_prev[o].y - self.y, self.hh, crate::unit_types::half_height(f.kind[o] as usize))
         }
     }
 }

@@ -27,7 +27,7 @@ pub(crate) use body::{
     body_distance, crowd_brake, friction_contact, pose_level, ready_body, sep_ease, turn_level, width_level, widths,
     POSE_READY, SEP_RADIUS, STANCE_EASE, STANCE_FIGHT, STANCE_READY,
 };
-pub(crate) use contact::KNIFE_EDGE;
+pub(crate) use contact::{levels_apart, KNIFE_EDGE};
 pub(crate) use fight::{GOING_SPEED, STEP_BACK_TICKS};
 pub(crate) use motion::{ADVANCE_PACE, HOLD_DEADZONE, STEP_PACE, STEP_STOP};
 pub(crate) use passing::{squeezing, stuck_count, stuck_trying, RING_AIMS, STUCK_LEFT};

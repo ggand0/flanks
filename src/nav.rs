@@ -519,46 +519,6 @@ impl NavGrid {
         }
     }
 
-    /// How far a man walks from the nearest of the points `from` to the
-    /// nearest of the points `to` (m), on the grid's walkable cells by its
-    /// eight steps, None beyond `max` or with no way. A Dijkstra search
-    /// from `from`'s cells that stops at the first of `to`'s it closes or
-    /// at `max`: about (max / CELL)^2 cells at most. Points on unwalkable
-    /// cells are left out.
-    pub fn walk_gap(&self, from: &[Vec2], to: &[Vec2], max: f32) -> Option<f32> {
-        let goal: std::collections::HashSet<usize> =
-            to.iter().filter_map(|&p| self.cell_at(p)).filter(|&i| self.walk[i]).collect();
-        if goal.is_empty() {
-            return None;
-        }
-        let mut best: std::collections::HashMap<usize, f32> = std::collections::HashMap::new();
-        let mut heap = BinaryHeap::new();
-        for i in from.iter().filter_map(|&p| self.cell_at(p)).filter(|&i| self.walk[i]) {
-            if best.insert(i, 0.0).is_none() {
-                heap.push(Node { f: 0.0, i: i as u32 });
-            }
-        }
-        let mut nb = [(0u32, 0.0f32, 0u8); 8];
-        while let Some(Node { f: d, i }) = heap.pop() {
-            let i = i as usize;
-            if best.get(&i).is_some_and(|&b| d > b) {
-                continue;
-            }
-            if goal.contains(&i) {
-                return Some(d);
-            }
-            let k = self.neighbours(i, &mut nb);
-            for &(j, step, _) in &nb[..k] {
-                let nd = d + step;
-                if nd <= max && best.get(&(j as usize)).is_none_or(|&b| nd < b) {
-                    best.insert(j as usize, nd);
-                    heap.push(Node { f: nd, i: j });
-                }
-            }
-        }
-        None
-    }
-
     /// Every point of the line from `a` to `b` stands at least `w` from
     /// unwalkable ground: a block of that half width walks it straight.
     pub fn band_clear(&self, a: Vec2, b: Vec2, w: f32) -> bool {

@@ -375,7 +375,8 @@ pub(crate) fn prepare_tick(
     share_columns(job, units);
     let t1 = std::time::Instant::now();
     let nav = routes.nav().cloned();
-    skirmish_reactions(groups, tracks, terrain, nav.as_deref(), tick);
+    let on_wall = wall_archers(groups, terrain);
+    skirmish_reactions(groups, tracks, terrain, &on_wall, tick);
     let t2 = std::time::Instant::now();
     open_for_passers(groups, terrain, tracks, tick);
     let t2b = std::time::Instant::now();
@@ -557,29 +558,6 @@ fn walks_to(nav: Option<&crate::nav::NavGrid>, from: &GroupData, to: &GroupData)
     let (a, b) = (crate::formation::block_rect(from), crate::formation::block_rect(to));
     let at = b.closest(a.centre);
     nav.walk_line(a.closest(at), at)
-}
-
-/// How far the men of block `from` walk to block `to` (m), within `max`
-/// (`NavGrid::walk_gap` between points of the two blocks a cell apart),
-/// None beyond it. Where no ground blocks
-/// (no grid) the edge gap, when within `max`.
-fn walk_gap(nav: Option<&crate::nav::NavGrid>, from: &GroupData, to: &GroupData, max: f32) -> Option<f32> {
-    let Some(nav) = nav else { return Some(edge_gap(from, to)).filter(|&g| g <= max) };
-    let points = |gd: &GroupData| {
-        let r = crate::formation::block_rect(gd);
-        let (fwd, half_d) = if r.fwd == Vec2::ZERO { (Vec2::Y, r.half_w) } else { (r.fwd, r.half_d) };
-        let right = Vec2::new(fwd.y, -fwd.x);
-        let (nw, nd) = ((r.half_w / crate::terrain::CELL).ceil() as i32, (half_d / crate::terrain::CELL).ceil() as i32);
-        let mut out = Vec::with_capacity(((2 * nw + 1) * (2 * nd + 1)) as usize);
-        for a in -nw..=nw {
-            for b in -nd..=nd {
-                let (u, v) = (a as f32 / nw.max(1) as f32, b as f32 / nd.max(1) as f32);
-                out.push(r.centre + right * (u * r.half_w) + fwd * (v * half_d));
-            }
-        }
-        out
-    };
-    nav.walk_gap(&points(from), &points(to), max)
 }
 
 /// `edge_gap` between two blocks given as rectangles.
@@ -1190,6 +1168,32 @@ pub(crate) fn end_skirmish(gd: &mut GroupData) {
     }
 }
 
+/// Per regiment: an archer regiment standing on the wall, on a map with
+/// the wall (`MapKind::has_wall`); false for every other. On the wall is
+/// on the walk's level: the ground under the centroid of its men stands
+/// over the drawn ground within a standing man's height of the walk's
+/// height (`levels_apart`), so the walk, a tower's passage, the
+/// gatehouse's top and the last metres of a stair count, and the ground,
+/// a house or a drum's roof do not. The centroid stands for the men: the
+/// walk is a strip 6 m wide, so the middle of a regiment standing on it
+/// is on it, and a regiment strung out up a stair counts once its middle
+/// is up. Two height reads per archer regiment per tick.
+fn wall_archers(groups: &Groups, terrain: &Terrain) -> Vec<bool> {
+    let walled = terrain.kind.has_wall();
+    groups
+        .list
+        .iter()
+        .map(|gd| {
+            walled && gd.kind == crate::unit_types::KIND_ARCHER && gd.count > 0 && {
+                let c = gd.centroid;
+                let over = terrain.height_at(c.x, c.y) - terrain.ground_at(c.x, c.y);
+                let half = crate::unit_types::half_height(gd.kind as usize);
+                !crate::sim::soldier::levels_apart(over - crate::town_layout::WALK, half, half)
+            }
+        })
+        .collect()
+}
+
 /// The skirmish reaction: an archer regiment in skirmish mode runs from
 /// an enemy block whose edge is on it (SKIRMISH_NEAR) or that is coming
 /// for it (`approach_hits` within the approach horizon, longer while it
@@ -1202,17 +1206,16 @@ pub(crate) fn end_skirmish(gd: &mut GroupData) {
 /// with skirmish off too, since that march is the game's own, not a
 /// point the player chose. Enemy men already in reach of the regiment's
 /// own men, with no real melee begun (the melee clock), are the block's
-/// leading men on it: a run. Hold position, skirmish off and a regiment
-/// in a real melee: no run.
+/// leading men on it: a run. Hold position, skirmish off, a regiment in a
+/// real melee and a regiment on the wall (`on_wall`): no run.
 fn skirmish_reactions(
     groups: &mut Groups,
     tracks: &crate::arrows::RegTracks,
     terrain: &Terrain,
-    nav: Option<&crate::nav::NavGrid>,
+    on_wall: &[bool],
     tick: u32,
 ) {
-    let n = groups.list.len();
-    for g in 0..n {
+    for (g, &up) in on_wall.iter().enumerate() {
         let gd = &groups.list[g];
         let bows = gd.kind == crate::unit_types::KIND_ARCHER
             && !gd.melee
@@ -1220,7 +1223,10 @@ fn skirmish_reactions(
             && !gd.state.is_broken()
             && !gd.hold
             && gd.melee_ticks == 0;
-        let able = bows && gd.skirmish;
+        // Archers on the wall (`wall_archers`) hold it: no run, whatever
+        // the skirmish switch says. The switch stays as the player set it,
+        // so the run comes back once the regiment is off the wall.
+        let able = bows && gd.skirmish && !up;
         let closing = bows
             && !gd.skirmishing
             && !gd.standoff
@@ -1246,7 +1252,7 @@ fn skirmish_reactions(
         if !tick.wrapping_add(g as u32).is_multiple_of(ARCHER_LOOK) {
             continue;
         }
-        let look = skirmish_look(groups, g, tracks, terrain, nav, tick, able);
+        let look = skirmish_look(groups, g, tracks, terrain, tick, able);
         skirmish_act(&mut groups.list[g], g, look);
     }
 }
@@ -1260,7 +1266,6 @@ fn skirmish_look(
     g: usize,
     tracks: &crate::arrows::RegTracks,
     terrain: &Terrain,
-    nav: Option<&crate::nav::NavGrid>,
     tick: u32,
     able: bool,
 ) -> SkirmishLook {
@@ -1308,17 +1313,12 @@ fn skirmish_look(
             }
             continue;
         }
-        // Near by the way its men walk to the regiment (`walk_gap`): an
-        // enemy at the foot of the wall the regiment stands on is far, one
-        // a short climb below it near. Coming only as a block that can
-        // walk to it straight (`walks_to`): its straight approach is the
-        // way it comes.
-        if able && gap <= SKIRMISH_NEAR && walk_gap(nav, ed, gd, SKIRMISH_NEAR).is_some() {
+        if able && gap <= SKIRMISH_NEAR {
             (run, why) = (true, "near");
             run_from = Some((gap, e as u32));
             continue;
         }
-        if able && approach_hits(gl, g, e, vel(e), horizon, cap) && walks_to(nav, ed, gd) {
+        if able && approach_hits(gl, g, e, vel(e), horizon, cap) {
             (run, why) = (true, "coming");
             run_from = Some((gap, e as u32));
             continue;
