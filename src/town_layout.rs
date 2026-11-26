@@ -832,16 +832,23 @@ pub fn fine_ground(
     ground: impl Fn(Vec2) -> f32,
     natural_blocked: impl Fn(Vec2) -> bool,
 ) -> FineGround {
-    // The pieces' bounds and 2 m more on every side: the stair's return
-    // rail reaches a metre past its own.
+    // The pieces' bounds and two vertex cells more on every side. The
+    // vertex grid's piece rules (`sim_ground`) block a vertex up to a cell
+    // past a piece's bounds, and a point reads its nearest vertex, so off
+    // this grid such a vertex's square would block ground up to a cell
+    // and a half out: past an end tower's tip, the grass beside its
+    // passage's cliff. On the grid a cell is decided by its own rules. The
+    // stair's return rail, a metre past the stair's bounds, is on it too.
     let (mut lo, mut hi) = (Vec2::splat(f32::INFINITY), Vec2::splat(f32::NEG_INFINITY));
     for p in pieces {
         let (a, b) = p.bounds();
         lo = lo.min(a);
         hi = hi.max(b);
     }
-    let origin = lo - Vec2::splat(2.0);
-    let (nx, nz) = (((hi.x - origin.x + 2.0) / FINE).ceil() as usize, ((hi.y - origin.y + 2.0) / FINE).ceil() as usize);
+    let margin = 2.0 * CELL;
+    let origin = lo - Vec2::splat(margin);
+    let (nx, nz) =
+        (((hi.x - origin.x + margin) / FINE).ceil() as usize, ((hi.y - origin.y + margin) / FINE).ceil() as usize);
     let centre = |i: usize, k: usize| origin + (Vec2::new(i as f32, k as f32) + 0.5) * FINE;
     // The pieces near each 4 m block of cells, so a cell asks a few.
     let (bx, bz) = (nx.div_ceil(BLOCK), nz.div_ceil(BLOCK));
@@ -1104,6 +1111,82 @@ mod tests {
             assert_eq!(town.height_at(p.x, p.y), debug.height_at(p.x, p.y), "the sim's height at {p}");
             assert_eq!(town.ground_at(p.x, p.y), debug.ground_at(p.x, p.y), "the drawn ground at {p}");
             assert_eq!(town.blocked_at(p.x, p.y), debug.blocked_at(p.x, p.y), "blocked at {p}");
+        }
+    }
+
+    /// Past an end tower's tip, where its passage ends in air 8 m up, the
+    /// grass is open: on both maps a man stands and walks every way at
+    /// every point from 2 to 3 m past the tower, across the passage's
+    /// width and more.
+    #[test]
+    fn a_man_walks_on_the_grass_past_an_end_towers_tip() {
+        for map in [MapKind::WallDebug, MapKind::WalledTown] {
+            let t = build_terrain(map);
+            let r = t.body_radius();
+            let towers: Vec<_> = pieces(map).into_iter().filter(|p| p.kind == Kind::Tower).map(|p| p.bounds()).collect();
+            let west = towers.iter().map(|b| b.0.x).fold(f32::INFINITY, f32::min);
+            let east = towers.iter().map(|b| b.1.x).fold(f32::NEG_INFINITY, f32::max);
+            for (tip, out) in [(west, -1.0f32), (east, 1.0)] {
+                let mut d = 2.0f32;
+                while d <= 3.0 {
+                    let x = tip + out * d;
+                    let mut z = WALL_Z - 5.0;
+                    while z <= WALL_Z + 5.0 {
+                        let walks = [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)].iter().all(|&(dx, dz)| t.body_free(x, z, r, dx, dz));
+                        assert!(walks && t.body_overlap(x, z, r) == Vec2::ZERO, "{map:?}: a man cannot stand and walk at ({x}, {z}), {d} m past the tower");
+                        z += 0.05;
+                    }
+                    d += 0.05;
+                }
+            }
+        }
+    }
+
+    /// Within two vertex cells of any piece's bounds every point is on the
+    /// fine ground, and it is blocked exactly where the fine ground's own
+    /// rules block it: on a solid part, at a cliff of a `STEP` or more to
+    /// a 4-neighbour that is not solid, or off the pieces by the drawn
+    /// ground's step rule. The vertex grid never answers there.
+    #[test]
+    fn near_the_pieces_the_fine_grounds_own_rules_block() {
+        for map in [MapKind::WallDebug, MapKind::WalledTown] {
+            let t = build_terrain(map);
+            let f = t.fine().expect("the fine ground");
+            let dims = t.grid_verts();
+            let natural = |c: Vec2| {
+                let g = ((c - t.min()) / CELL).round();
+                let (x, z) = ((g.x.max(0.0) as usize).min(dims.0 - 1), (g.y.max(0.0) as usize).min(dims.1 - 1));
+                crate::terrain::vertex_blocked(t.ground_heights(), dims, x, z)
+            };
+            let mut seen = vec![false; f.nx * f.nz];
+            for p in pieces(map) {
+                let (a, b) = p.bounds();
+                let (a, b) = (a - Vec2::splat(2.0 * CELL), b + Vec2::splat(2.0 * CELL));
+                let (i0, k0) = (((a.x - f.origin.x) / FINE).floor() as i64, ((a.y - f.origin.y) / FINE).floor() as i64);
+                let (i1, k1) = (((b.x - f.origin.x) / FINE).ceil() as i64, ((b.y - f.origin.y) / FINE).ceil() as i64);
+                for k in k0..k1 {
+                    for i in i0..i1 {
+                        let c = f.origin + (Vec2::new(i as f32, k as f32) + 0.5) * FINE;
+                        if c.x < a.x || c.x > b.x || c.y < a.y || c.y > b.y {
+                            continue;
+                        }
+                        let at = f.index(c.x, c.y).unwrap_or_else(|| panic!("{map:?}: ({c}) is off the fine ground"));
+                        if std::mem::replace(&mut seen[at], true) {
+                            continue;
+                        }
+                        let solid = f.solid(c.x, c.y);
+                        let h = t.height_at(c.x, c.y);
+                        let cliff = !solid
+                            && [(FINE, 0.0), (-FINE, 0.0), (0.0, FINE), (0.0, -FINE)].iter().any(|&(dx, dz)| {
+                                let n = c + Vec2::new(dx, dz);
+                                f.index(n.x, n.y).is_some() && !f.solid(n.x, n.y) && (t.height_at(n.x, n.y) - h).abs() >= STEP
+                            });
+                        let off = f.piece[at] == NO_PIECE && natural(c);
+                        assert_eq!(t.blocked_at(c.x, c.y), solid || cliff || off,
+                            "{map:?}: ({c}) solid {solid}, cliff {cliff}, natural {off}");
+                    }
+                }
+            }
         }
     }
 }

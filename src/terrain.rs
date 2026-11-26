@@ -632,7 +632,7 @@ fn blocked_vertex(
 /// The step rule per vertex: a face steeper than SLOPE_BLOCK against any
 /// 4-neighbor (terrace risers, gorge walls, crater lips). The river
 /// itself is wadeable and never blocks.
-fn vertex_blocked(heights: &[f32], (verts_x, verts_z): (usize, usize), x: usize, z: usize) -> bool {
+pub(crate) fn vertex_blocked(heights: &[f32], (verts_x, verts_z): (usize, usize), x: usize, z: usize) -> bool {
     let h = heights[z * verts_x + x];
     let mut max_d = 0.0f32;
     if x > 0 {
