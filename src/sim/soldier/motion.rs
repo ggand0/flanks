@@ -82,7 +82,7 @@ const ROUT_FLEE_FRAC: f32 = 0.9;
 /// contact's brake a man out of formation with nobody in his reach walks
 /// to the fight instead (`joins_as_walker`, `join_goal`).
 #[inline]
-pub(super) fn drive(f: &Field, s: &mut Soldier, st: &mut Step) {
+pub(super) fn drive(f: &Field, s: &mut Soldier, st: &mut Step, asks: &mut Vec<crate::sim::route::WayAsk>) {
     let Field { terrain, speed, home, orders, anchors, .. } = *f;
     let i = s.i;
     let p = st.p;
@@ -104,7 +104,7 @@ pub(super) fn drive(f: &Field, s: &mut Soldier, st: &mut Step) {
         let goal = orders[gi].unwrap_or(anchors[gi]) + home[i];
         st.walk.place_dist = goal.distance(p);
         let place = goal;
-        let (goal, through) = follow_route(f, s, st, goal);
+        let (goal, through) = follow_route(f, s, st, goal, asks);
         st.walk.rounding = goal != place;
         let to_goal = goal - p;
         let dist = to_goal.length();
@@ -202,10 +202,12 @@ fn flee(f: &Field, i: usize, p: Vec2) -> Vec2 {
 }
 
 /// The goal of his walk to his place (`drive`), the route's point when
-/// his regiment has a route, and whether he walks through it.
+/// his regiment has a route, and whether he walks through it. Cut off
+/// from the route with no way of his own in sight, he asks for one
+/// (`asks`, sim/route.rs `WayAsk`).
 #[inline]
-fn follow_route(f: &Field, s: &mut Soldier, st: &Step, goal: Vec2) -> (Vec2, bool) {
-    let Field { terrain, orders, anchors, paths, .. } = *f;
+fn follow_route(f: &Field, s: &mut Soldier, st: &Step, goal: Vec2, asks: &mut Vec<crate::sim::route::WayAsk>) -> (Vec2, bool) {
+    let Field { orders, anchors, paths, .. } = *f;
     let i = s.i;
     let p = st.p;
     let gi = st.gi;
@@ -223,7 +225,11 @@ fn follow_route(f: &Field, s: &mut Soldier, st: &Step, goal: Vec2) -> (Vec2, boo
             let kept = !way.x.is_nan();
             let at_way = kept && way.x.is_finite() && p.distance_squared(way) < 4.0;
             if !kept || at_way || (i as u32).wrapping_add(f.tick).is_multiple_of(LOOK_TICKS) {
-                let (t, th) = crate::sim::route::man_target(nav, terrain, route, frame, p, goal, i);
+                let aim = crate::sim::route::man_target(nav, route, frame, p, goal, way.is_finite().then_some(way), i);
+                if aim.ask {
+                    asks.push(crate::sim::route::WayAsk { g: gi as u32, p, goal: frame });
+                }
+                let (t, th) = (aim.at, aim.through);
                 *s.way = if t == goal && !th { Vec2::INFINITY } else if t == goal { Vec2::NEG_INFINITY } else { t };
                 (goal, through) = (t, th);
             } else if way.x.is_infinite() {

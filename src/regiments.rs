@@ -505,7 +505,7 @@ fn prepare_route_costs(nav: &crate::nav::NavGrid, list: &[GroupData]) {
             crate::sim::route::half_width(gd, Vec2::X),
             crate::sim::route::half_width_max(gd),
         ] {
-            widths.push(crate::nav::PlanRequest { g: 0, serial: 0, start: Vec2::ZERO, goal: Vec2::ZERO, half_w });
+            widths.push(crate::nav::PlanRequest { g: 0, serial: 0, start: Vec2::ZERO, goal: Vec2::ZERO, half_w, man: false });
         }
     }
     nav.prepare_costs(&widths);

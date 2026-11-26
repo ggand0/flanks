@@ -490,7 +490,7 @@ fn integrate_chunks(job: &mut TickJob, terrain: &Terrain) {
         reg_broken, press, moving, passing, stance, focus, engaged, contact, fight_point, fight_line,
         melee_ticks, hold, wall_archers, threat, form_face, wall, charging, fat_speed, fat_nocharge, shoot_at, blocks,
         target_members, search_blocks, sidearm, clear_members, dead, at_edge, grid, events, arrow_spawns,
-        routes, nav, ..
+        way_asks, routes, nav, ..
     } = job;
     let team = &team[..];
     let death_t_in = &death_t_in[..];
@@ -578,7 +578,7 @@ fn integrate_chunks(job: &mut TickJob, terrain: &Terrain) {
             .zip(death_t.chunks_mut(CHUNK))
             .zip(events.iter_mut())
             .zip(ammo.chunks_mut(CHUNK))
-            .zip(arrow_spawns.iter_mut())
+            .zip(arrow_spawns.iter_mut().zip(way_asks.iter_mut()))
             .zip(out_form.chunks_mut(CHUNK))
             .zip(sight.chunks_mut(CHUNK))
             .zip(way.chunks_mut(CHUNK))
@@ -592,7 +592,7 @@ fn integrate_chunks(job: &mut TickJob, terrain: &Terrain) {
             .enumerate()
         {
             let (((((((((((((((((((((pos, vel), yaw), yaw_prev), target), swing), swing_t), flash),
-                death_t), events), ammo), arrows), out_form), sight), way), chain), pose), quarry), stuck), aim),
+                death_t), events), ammo), (arrows, asks)), out_form), sight), way), chain), pose), quarry), stuck), aim),
                 imposed), stood) = chunk;
             let start = ci * CHUNK;
             scope.spawn(async move {
@@ -621,7 +621,8 @@ fn integrate_chunks(job: &mut TickJob, terrain: &Terrain) {
                 };
                 ins.copy_into(&mut rows);
                 events.clear();
-                let mut out = soldier::ChunkOut { events, arrows };
+                asks.clear();
+                let mut out = soldier::ChunkOut { events, arrows, asks };
                 soldier::tick_chunk(f, rows, &mut out);
                 sweep_candidates(start, pos, death_t, team, edge_lo, edge_hi)
             });
@@ -785,7 +786,7 @@ pub fn step_sim(
     pipeline.sweep_candidates.sort_unstable();
     pipeline.sweep_candidates.dedup();
     std::mem::swap(&mut *grid, &mut job.grid);
-    routes.hand_back(&mut job.plans, &mut job.plan_requests);
+    routes.hand_back(&mut job.plans, &mut job.plan_requests, &mut job.way_asks);
     std::mem::swap(&mut damage.0, &mut job.events);
     std::mem::swap(&mut arrow_spawns.0, &mut job.arrow_spawns);
     stats.grid_ms = job.grid_ms;

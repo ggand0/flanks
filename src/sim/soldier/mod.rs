@@ -181,10 +181,13 @@ pub(crate) struct Rows<'a> {
     pub stood: &'a mut [bool],
 }
 
-/// What a chunk emits beside its rows: landed swings and loosed arrows.
+/// What a chunk emits beside its rows: landed swings, loosed arrows, and
+/// the asks of men cut off from their regiment's route for a way back
+/// (sim/route.rs `WayAsk`).
 pub(crate) struct ChunkOut<'a> {
     pub events: &'a mut Vec<DamageEvent>,
     pub arrows: &'a mut Vec<crate::arrows::ArrowSpawn>,
+    pub asks: &'a mut Vec<crate::sim::route::WayAsk>,
 }
 
 /// What one stage of a soldier's tick hands the next: who he is and his
@@ -440,7 +443,7 @@ pub(crate) fn tick_chunk(f: &Field, rows: Rows, out: &mut ChunkOut) {
             stood: &mut rows.stood[j],
         };
         let mut st = begin(f, &mut s);
-        drive(f, &mut s, &mut st);
+        drive(f, &mut s, &mut st, out.asks);
         scan(f, &mut s, &mut st, out, &mut cands);
         look_around(f, &mut s, &mut st);
         choose_opening(f, &mut s, &mut st);

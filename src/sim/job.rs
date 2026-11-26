@@ -261,6 +261,9 @@ pub struct TickJob {
     pub(crate) grid: SpatialGrid,
     pub(crate) events: Vec<Vec<DamageEvent>>,
     pub(crate) arrow_spawns: Vec<Vec<crate::arrows::ArrowSpawn>>,
+    /// Per chunk, its cut-off men's asks for a way (sim/route.rs `WayAsk`),
+    /// handed to the routes at the install.
+    pub(crate) way_asks: Vec<Vec<crate::sim::route::WayAsk>>,
     pub(crate) terrain: Option<std::sync::Arc<Terrain>>,
     pub(crate) dt: f32,
     pub(crate) combat_scale: f32,
@@ -435,6 +438,9 @@ pub(crate) fn prepare_tick(
     }
     if job.arrow_spawns.len() < n_chunks {
         job.arrow_spawns.resize_with(n_chunks, Vec::new);
+    }
+    if job.way_asks.len() < n_chunks {
+        job.way_asks.resize_with(n_chunks, Vec::new);
     }
     // Spawn buffers come back drained from arrows.rs. A job dropped as
     // stale never got that far.

@@ -48,6 +48,14 @@ pub const SIGHT: f32 = 48.0;
 /// How far round an unreachable goal the planner looks for reachable
 /// ground to end the route at (m).
 const NEAR_GOAL: f32 = 400.0;
+/// How far round the goal of one man's way (a point of his regiment's
+/// route, which may lie in stone beside a rail) the planner looks for
+/// ground he can stand on and walk to the goal from straight, to end the
+/// way at (m).
+const MAN_GOAL_NEAR: f32 = 6.0;
+/// Cells one man's way may close before the search gives up: ten ticks
+/// of `PLAN_BUDGET` (sim/route.rs), a way round about a 600 m wall.
+pub const MAN_CELLS: u32 = 40_000;
 
 /// The grid. See the module docs.
 pub struct NavGrid {
@@ -124,6 +132,12 @@ pub struct PlanRequest {
     pub goal: Vec2,
     /// Half the regiment's width across its way (m).
     pub half_w: f32,
+    /// A way for one man of the regiment (sim/route.rs `man_target`), not
+    /// a route for its block: it costs only the ground, has no width, keeps
+    /// every leg one he can walk straight (`walk_line`), ends where he can
+    /// walk straight to the goal or nowhere, and gives up after `MAN_CELLS`
+    /// cells.
+    pub man: bool,
 }
 
 /// The planner's answer.
@@ -735,7 +749,7 @@ impl NavGrid {
     /// yet, on the pool. Returns whether any had to be built.
     pub fn prepare_costs(&self, requests: &[PlanRequest]) -> bool {
         let mut spans: Vec<Span> = Vec::new();
-        for r in requests {
+        for r in requests.iter().filter(|r| !r.man) {
             let span = Span::of(r.half_w.clamp(CELL, CLEAR_CAP - CELL));
             if !spans.iter().any(|s| s.k_axis == span.k_axis) && self.cached_costs(span).is_none() {
                 spans.push(span);
@@ -885,8 +899,8 @@ impl NavGrid {
     /// spreads over ticks and no tick waits for it.
     pub fn begin(&self, req: &PlanRequest) -> Search {
         let t0 = Instant::now();
-        let need = req.half_w.clamp(CELL, CLEAR_CAP - CELL);
-        let costs = self.costs(Span::of(need));
+        let need = if req.man { CELL } else { req.half_w.clamp(CELL, CLEAR_CAP - CELL) };
+        let costs = (!req.man).then(|| self.costs(Span::of(need)));
         let mut search = Search {
             req: *req,
             need,
@@ -897,6 +911,8 @@ impl NavGrid {
             heap: BinaryHeap::new(),
             seen: std::collections::HashMap::new(),
             cells: 0,
+            limit: if req.man { MAN_CELLS } else { u32::MAX },
+            gave_up: false,
             ticks: 0,
             ms: 0.0,
             done: false,
@@ -907,9 +923,19 @@ impl NavGrid {
             return search;
         };
         let region = self.region[start];
-        let goal_cell = self.cell_at(req.goal).filter(|&i| self.region[i] == region);
+        let goal_cell = if req.man {
+            self.nearest_where(req.goal, MAN_GOAL_NEAR, |i| self.region[i] == region && self.walk_line(self.pos(i), req.goal))
+        } else {
+            self.cell_at(req.goal).filter(|&i| self.region[i] == region)
+        };
         let (target, reached) = match goal_cell {
             Some(i) => (i, true),
+            None if req.man => {
+                // No ground he can reach by the goal: no way.
+                search.done = true;
+                search.ms = t0.elapsed().as_secs_f32() * 1000.0;
+                return search;
+            }
             None => {
                 // The nearest reachable ground where the block fits, else
                 // the nearest reachable ground at all, within `NEAR_GOAL`
@@ -951,6 +977,10 @@ impl NavGrid {
                     search.ms += t0.elapsed().as_secs_f32() * 1000.0;
                     return None;
                 }
+                if search.cells >= search.limit {
+                    search.gave_up = true;
+                    break;
+                }
                 let Some(Node { i, .. }) = search.heap.pop() else { break };
                 let seen = search.seen.get_mut(&i).expect("a heap entry was seen");
                 if seen.closed {
@@ -966,7 +996,11 @@ impl NavGrid {
                 let k = self.neighbours(i as usize, &mut nb);
                 for &(j, len, class) in &nb[..k] {
                     let class = class as usize;
-                    let gj = gi + len * 0.5 * (search.costs.w[i as usize][class] + search.costs.w[j as usize][class]);
+                    let gj = gi
+                        + len
+                            * 0.5
+                            * (self.step_cost(search.costs.as_deref(), i as usize, class)
+                                + self.step_cost(search.costs.as_deref(), j as usize, class));
                     match search.seen.get_mut(&j) {
                         Some(sj) if sj.closed => continue,
                         Some(sj) if gj >= sj.g => continue,
@@ -992,8 +1026,10 @@ impl NavGrid {
             ticks: search.ticks,
             ms: search.ms,
         };
-        if search.seen.is_empty() {
-            // No walkable ground near the start.
+        if search.seen.is_empty() || search.gave_up {
+            // No walkable ground near the start, or one man's way that ran
+            // past its cells.
+            out.reached = false;
             out.ms += t0.elapsed().as_secs_f32() * 1000.0;
             return Some(out);
         }
@@ -1010,23 +1046,43 @@ impl NavGrid {
         }
         path.reverse();
         let g_of = |i: usize| search.seen.get(&(i as u32)).map_or(0.0, |sn| sn.g);
-        let kept = self.pull_straight(&path, &g_of, search.need, &search.costs);
-        out.points.push(req.start);
+        let kept = self.pull_straight(&path, &g_of, search.need, search.costs.as_deref(), req.man);
+        // A man's way runs from cell to cell, on ground he stands on at
+        // both ends; a regiment's route from its centre to its goal.
+        out.points.push(if req.man { self.pos(search.start) } else { req.start });
         if kept.len() > 2 {
             for &k in &kept[1..kept.len() - 1] {
                 out.points.push(self.pos(path[k]));
             }
         }
-        out.points.push(if search.reached { req.goal } else { self.pos(search.target) });
+        out.points.push(if search.reached && !req.man { req.goal } else { self.pos(search.target) });
         out.ms += t0.elapsed().as_secs_f32() * 1000.0;
         Some(out)
+    }
+
+    /// The cost per metre of cell `i` in step class `class`: the regiment's
+    /// table, or for one man (no table) the ground's own cost.
+    #[inline]
+    fn step_cost(&self, costs: Option<&Costs>, i: usize, class: usize) -> f32 {
+        match costs {
+            Some(c) => c.w[i][class],
+            None => self.cost[i],
+        }
     }
 
     /// The indices of `path` kept as waypoints: from each kept cell, the
     /// farthest later cell reachable by a straight segment that is
     /// walkable, keeps the clearance the grid path had between them (up to
-    /// the regiment's half width) and costs no more than that stretch.
-    fn pull_straight(&self, path: &[usize], g_of: &dyn Fn(usize) -> f32, need: f32, costs: &Costs) -> Vec<usize> {
+    /// the regiment's half width) and costs no more than that stretch; for
+    /// one man (`man`), also a segment he walks straight (`walk_line`).
+    fn pull_straight(
+        &self,
+        path: &[usize],
+        g_of: &dyn Fn(usize) -> f32,
+        need: f32,
+        costs: Option<&Costs>,
+        man: bool,
+    ) -> Vec<usize> {
         let last = path.len() - 1;
         let mut kept = vec![0];
         let mut i = 0;
@@ -1037,7 +1093,8 @@ impl NavGrid {
                 min_clear = min_clear.min(self.clear[path[j]]);
                 let want = min_clear.min(need);
                 let budget = (g_of(path[j]) - g_of(path[i])) * SMOOTH_SLACK + 0.1;
-                if self.segment_fits(self.pos(path[i]), self.pos(path[j]), want, costs, budget) {
+                let (a, b) = (self.pos(path[i]), self.pos(path[j]));
+                if self.segment_fits(a, b, want, costs, budget) && (!man || self.walk_line(a, b)) {
                     best = j;
                 } else if j > best + 12 {
                     break;
@@ -1051,7 +1108,7 @@ impl NavGrid {
 
     /// The straight segment from `a` to `b` is walkable, keeps clearance
     /// `want` everywhere, and costs at most `budget` by `costs`.
-    fn segment_fits(&self, a: Vec2, b: Vec2, want: f32, costs: &Costs, budget: f32) -> bool {
+    fn segment_fits(&self, a: Vec2, b: Vec2, want: f32, costs: Option<&Costs>, budget: f32) -> bool {
         let len = a.distance(b);
         let d = (b - a).abs();
         let class: usize = if d.x > 2.414 * d.y {
@@ -1073,7 +1130,7 @@ impl NavGrid {
                 return false;
             }
             let wgt = if k == 0 || k == steps { 0.5 } else { 1.0 };
-            cost += costs.w[i][class] * step * wgt;
+            cost += self.step_cost(costs, i, class) * step * wgt;
             if cost > budget {
                 return false;
             }
@@ -1224,13 +1281,17 @@ impl Ord for Node {
 pub struct Search {
     pub req: PlanRequest,
     need: f32,
-    costs: std::sync::Arc<Costs>,
+    /// The regiment's cost table; None for one man's way.
+    costs: Option<std::sync::Arc<Costs>>,
     start: usize,
     target: usize,
     reached: bool,
     heap: BinaryHeap<Node>,
     seen: std::collections::HashMap<u32, Seen>,
     cells: u32,
+    /// Cells it may close before it gives up (`MAN_CELLS` for one man).
+    limit: u32,
+    gave_up: bool,
     ticks: u32,
     ms: f32,
     done: bool,
@@ -1254,7 +1315,7 @@ mod tests {
     }
 
     fn req(start: Vec2, goal: Vec2) -> PlanRequest {
-        PlanRequest { g: 0, serial: 0, start, goal, half_w: 14.3 }
+        PlanRequest { g: 0, serial: 0, start, goal, half_w: 14.3, man: false }
     }
 
     /// Every segment of a route is walkable for a man.
