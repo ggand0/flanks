@@ -168,6 +168,9 @@ pub struct TickJob {
     pub(crate) fight_line: Vec<f32>,
     pub(crate) melee_ticks: Vec<u32>,
     pub(crate) hold: Vec<bool>,
+    /// Per regiment: an archer regiment standing on the wall
+    /// (`wall_archers`): its men with their bows keep their places.
+    pub(crate) wall_archers: Vec<bool>,
     pub(crate) threat: Vec<Vec2>,
     pub(crate) form_face: Vec<Vec2>,
     pub(crate) wall: Vec<u8>,
@@ -384,6 +387,7 @@ pub(crate) fn prepare_tick(
         groups,
         tracks,
         terrain,
+        &on_wall,
         &job.clear_members,
         &mut job.archer_scans,
         kept_clear_blocks,
@@ -417,6 +421,7 @@ pub(crate) fn prepare_tick(
     job.blocks = fire.blocks;
     let last = std::mem::take(&mut job.sidearm);
     job.sidearm = sidearm_reasons(groups, tracks, terrain, &last, tick);
+    job.wall_archers = on_wall;
     job.field.size_to(terrain.min(), terrain.max());
     let t5 = std::time::Instant::now();
     log_prep([t1 - t0, t2 - t1, t2b - t2, t3 - t2b, t4 - t3, t5 - t4, t5 - t0]);
@@ -1397,17 +1402,22 @@ fn skirmish_act(gd: &mut GroupData, g: usize, look: SkirmishLook) {
 /// goes, to the firing place (`firing_place`, the march's goal through
 /// `Groups::goal`), stands when its leading men arrive there
 /// (`head_arrived`) and shoots; it marches again only when the frame it
-/// holds is out of range. Fire at will takes the nearest enemy block in range that is
+/// holds is out of range. A regiment on the wall (`on_wall`) makes no
+/// march: it keeps its places on the walk, shoots its target while that
+/// is in range, and shoots at will (when its fire at will is on) while it
+/// is not. Fire at will takes the nearest enemy block in range that is
 /// not in melee; when every block in range is in melee, or one is
 /// coming for the regiment, its men shoot the clear men of those blocks
 /// (`ShootAt::search`; the job lists them from `clear_blocks`, sim/mod.rs
 /// `clear_members`). Makes the regiment writes prep
 /// makes: the stand-off state with its anchor and march facing, the
 /// firing place, and the `firing` flag.
+#[allow(clippy::too_many_arguments)]
 fn archer_fire_solutions(
     groups: &mut Groups,
     tracks: &crate::arrows::RegTracks,
     terrain: &Terrain,
+    on_wall: &[bool],
     clear_members: &[Vec<u32>],
     scans: &mut Vec<ArcherScan>,
     kept_clear_blocks: Vec<Vec<crate::formation::BlockRect>>,
@@ -1417,8 +1427,8 @@ fn archer_fire_solutions(
     scans.resize_with(n_groups, Default::default);
 
     // The stand-off of every archer regiment under an attack order.
-    for g in 0..n_groups {
-        stand_off(groups, g, tracks, terrain);
+    for (g, &up) in on_wall.iter().enumerate() {
+        stand_off(groups, g, tracks, terrain, up);
     }
 
     // What each archer regiment's bows shoot at this tick, and the blocks
@@ -1429,7 +1439,7 @@ fn archer_fire_solutions(
     let gl: &Groups = &*groups;
     let mut search_blocks: Vec<Vec<u32>> = vec![Vec::new(); n_groups];
     let shoot_at: Vec<Option<ShootAt>> = (0..n_groups)
-        .map(|g| bows_target(gl, g, tracks, terrain, &mut scans[g], &mut search_blocks[g], tick))
+        .map(|g| bows_target(gl, g, tracks, terrain, on_wall[g], &mut scans[g], &mut search_blocks[g], tick))
         .collect();
     // The card's firing mark: a fire solution, arrows to spend on it and,
     // in a search, clear men to shoot (the lists of the last tick run).
@@ -1457,9 +1467,11 @@ fn archer_fire_solutions(
 }
 
 /// One regiment's stand-off: in range of its attack target it stands
-/// and shoots, out of range it marches to the firing place.
+/// and shoots, out of range it marches to the firing place. A regiment on
+/// the wall (`on_wall`) stands whatever the range: archers holding a wall
+/// keep their places on it.
 #[inline]
-fn stand_off(groups: &mut Groups, g: usize, tracks: &crate::arrows::RegTracks, terrain: &Terrain) {
+fn stand_off(groups: &mut Groups, g: usize, tracks: &crate::arrows::RegTracks, terrain: &Terrain, on_wall: bool) {
     let vel = |t: usize| tracks.vel.get(t).copied().unwrap_or(Vec2::ZERO);
     let gd = &groups.list[g];
     // With swords out the order is a charge like any infantry's.
@@ -1482,8 +1494,28 @@ fn stand_off(groups: &mut Groups, g: usize, tracks: &crate::arrows::RegTracks, t
         return;
     }
     let t_vel = vel(target as usize);
-    let place = firing_place(gd, td, t_vel, terrain);
     let fresh = gd.standoff_target != Some(target);
+    if on_wall {
+        // It stands where it is, as a fresh order in range does: the
+        // frame freezes where the men stand, and nothing turns. Out of
+        // range its men shoot at will (`bows_target`).
+        if fresh || !gd.standoff {
+            info!(
+                "regiment {g} stands on the wall for its target {target} (gap {:.1} m, in range {})",
+                edge_gap(gd, td),
+                in_bow_range(gd, td, t_vel, terrain)
+            );
+        }
+        let gd = &mut groups.list[g];
+        if (fresh || !gd.standoff) && gd.anchor.distance(gd.centroid) > 2.0 {
+            gd.anchor = gd.centroid;
+        }
+        gd.standoff_target = Some(target);
+        gd.standoff = true;
+        gd.fire_place = None;
+        return;
+    }
+    let place = firing_place(gd, td, t_vel, terrain);
     let was = gd.standoff && !fresh;
     // A fresh order shoots where it stands when it can; a standing
     // regiment stands until the frame it holds is out of range; a
@@ -1541,13 +1573,16 @@ fn stand_off(groups: &mut Groups, g: usize, tracks: &crate::arrows::RegTracks, t
 }
 
 /// What one archer regiment's bows shoot at this tick, and the blocks
-/// its men search in (`search_in`).
+/// its men search in (`search_in`). `on_wall`: the regiment stands on the
+/// wall (`wall_archers`).
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn bows_target(
     gl: &Groups,
     g: usize,
     tracks: &crate::arrows::RegTracks,
     terrain: &Terrain,
+    on_wall: bool,
     scan: &mut ArcherScan,
     search_in: &mut Vec<u32>,
     tick: u32,
@@ -1612,6 +1647,23 @@ fn bows_target(
     // shoots that block, whatever its order and fire at will say,
     // unless a block is coming for it.
     let held = gd.skirmish_hold.map(|h| h as usize).filter(|&h| live(h));
+    // Fire at will: the block coming for the regiment, every man on it
+    // (with skirmish on, the run takes the regiment away before this);
+    // else the nearest block in range that is not in melee; else the men
+    // search the blocks in melee, nearest first. Fire at will off (the
+    // scan is empty): nothing.
+    let mut at_will = |search_in: &mut Vec<u32>| -> Option<(usize, bool)> {
+        if let Some((_, e)) = danger {
+            Some((e, true))
+        } else if let Some((_, e)) = best_free {
+            Some((e, false))
+        } else {
+            busy.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let (_, e) = *busy.first()?;
+            *search_in = busy.iter().take(SEARCH_BLOCKS).map(|&(_, e)| e as u32).collect();
+            Some((e, true))
+        }
+    };
     let (t, search) = match gd.order {
         _ if danger.is_none() && held.is_some() => {
             let h = held.unwrap_or_default();
@@ -1623,7 +1675,9 @@ fn bows_target(
         // The ordered target, once standing off, unless a block is
         // coming for the regiment: the men turn their bows on that
         // one first, whatever the order. At a block in melee the
-        // men shoot its clear members only.
+        // men shoot its clear members only. A regiment on the wall
+        // stands with its target out of range: its men shoot at will
+        // meanwhile.
         Some(crate::orders::Order::Attack(t))
             if gd.skirmish_hold.is_none() && danger.is_none() =>
         {
@@ -1631,26 +1685,13 @@ fn bows_target(
             if !gd.standoff || !live(t) {
                 return None;
             }
-            (t, gl.list[t].engaged)
-        }
-        // Fire at will: the block coming for the regiment, every
-        // man on it (with skirmish on, the run takes the regiment
-        // away before this); else the nearest block in range that
-        // is not in melee; else the men search the blocks in
-        // melee, nearest first. Fire at will off: nothing.
-        _ => {
-            if let Some((_, e)) = danger {
-                (e, true)
-            } else if let Some((_, e)) = best_free {
-                (e, false)
+            if on_wall && !in_bow_range(gd, &gl.list[t], vel(t), terrain) {
+                at_will(search_in)?
             } else {
-                busy.sort_by(|a, b| a.0.total_cmp(&b.0));
-                let (_, e) = *busy.first()?;
-                *search_in =
-                    busy.iter().take(SEARCH_BLOCKS).map(|&(_, e)| e as u32).collect();
-                (e, true)
+                (t, gl.list[t].engaged)
             }
         }
+        _ => at_will(search_in)?,
     };
     if search && search_in.is_empty() {
         search_in.push(t as u32);

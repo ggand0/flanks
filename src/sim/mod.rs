@@ -486,7 +486,7 @@ fn integrate_chunks(job: &mut TickJob, terrain: &Terrain) {
         imposed_in, stood_in, quarry_in, pos_out, vel, yaw, yaw_prev, target, swing, swing_t, flash, death_t,
         ammo, out_form, sight, chain, way, pose, stuck, aim, imposed, stood, quarry, orders, anchors,
         reg_broken, press, moving, passing, stance, focus, engaged, contact, fight_point, fight_line,
-        melee_ticks, hold, threat, form_face, wall, charging, fat_speed, fat_nocharge, shoot_at, blocks,
+        melee_ticks, hold, wall_archers, threat, form_face, wall, charging, fat_speed, fat_nocharge, shoot_at, blocks,
         target_members, search_blocks, sidearm, clear_members, dead, at_edge, grid, events, arrow_spawns,
         routes, nav, ..
     } = job;
@@ -516,6 +516,7 @@ fn integrate_chunks(job: &mut TickJob, terrain: &Terrain) {
         fight_line: &fight_line[..],
         melee_ticks: &melee_ticks[..],
         hold: &hold[..],
+        wall_archers: &wall_archers[..],
         threat: &threat[..],
         form_face: &form_face[..],
         wall: &wall[..],

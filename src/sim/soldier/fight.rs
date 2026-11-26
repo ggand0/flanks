@@ -100,10 +100,11 @@ pub(super) const CHARGE_SPEED_FRAC: f32 = 0.6;
 /// (15 m for a fighting regiment, 4 m on the approach; with his regiment
 /// focused on one target, its men, and any man within his threat distance
 /// coming at him), and a man still in formation notices a comrade of his
-/// regiment running to the fight within 6 m.
+/// regiment running to the fight within 6 m. An archer of a regiment on
+/// the wall with his bow in hand does neither.
 #[inline]
 pub(super) fn acquire(f: &Field, s: &mut Soldier, st: &mut Step) {
-    let Field { grid, press, engaged, focus, tick_seed, paths, .. } = *f;
+    let Field { grid, press, engaged, focus, tick_seed, paths, wall_archers, .. } = *f;
     let i = s.i;
     let p = st.p;
     let gi = st.gi;
@@ -126,9 +127,17 @@ pub(super) fn acquire(f: &Field, s: &mut Soldier, st: &mut Step) {
     if far_look {
         *s.sight &= !SIGHT_GO_FAR;
     }
+    // An archer of a regiment on the wall, his bow in hand, keeps his
+    // place and shoots from it: he goes for no enemy he sees off the end
+    // of the walk or below it, nor after a comrade running. With his
+    // knife out he fights like any man.
+    let keeps_place = wall_archers[gi]
+        && st.my_kind == crate::unit_types::KIND_ARCHER as usize
+        && *s.sight & SIGHT_KNIFE == 0;
     if best_idx == u32::MAX
         && !dying
         && !routed
+        && !keeps_place
         && press[gi]
         && crowd < acquire_crowd_lim
         && far_look

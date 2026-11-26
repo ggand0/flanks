@@ -97,6 +97,9 @@ pub(crate) struct Field<'a> {
     pub fight_line: &'a [f32],
     pub melee_ticks: &'a [u32],
     pub hold: &'a [bool],
+    /// Per regiment: an archer regiment standing on the wall (sim/job.rs
+    /// `wall_archers`): its men with their bows take no far target.
+    pub wall_archers: &'a [bool],
     pub threat: &'a [Vec2],
     pub form_face: &'a [Vec2],
     pub wall: &'a [u8],
