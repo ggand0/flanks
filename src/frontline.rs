@@ -361,8 +361,9 @@ pub(crate) struct RegimentSums {
     target_fight_n: u32,
     target_line_sum: f32,
     target_line_n: u32,
-    /// With a route frame waiting at a waypoint: the living men beyond
-    /// the line through it across the next leg, and the living men
+    /// With a route frame waiting at a waypoint: the living men past it
+    /// (beyond the line through it across the next leg, with the waypoint
+    /// in a straight walk of them), and the living men
     /// (`GroupData::frame_past`).
     past: u32,
     living: u32,
@@ -406,7 +407,8 @@ impl<'a> SumColumns<'a> {
 /// the blocks of the open friends within its reach, and the line its
 /// waiting route frame is passed at (sim/route.rs `frame_line`: the
 /// waypoint's index, the waypoint and the leg's direction after it), if
-/// it has one. Built the same way at the kick, for the job, and in
+/// it has one, and the grid the men's walk to that waypoint is read on.
+/// Built the same way at the kick, for the job, and in
 /// `update_groups`: a regiment whose inputs are the same bits in both
 /// takes the job's sums.
 #[derive(Default)]
@@ -419,6 +421,7 @@ pub(crate) struct SumInputs {
     slots: Vec<u32>,
     open: Vec<Vec<(u32, BlockRect)>>,
     lines: Vec<Option<(u32, Vec2, Vec2)>>,
+    nav: Option<std::sync::Arc<crate::nav::NavGrid>>,
 }
 
 impl SumInputs {
@@ -445,7 +448,16 @@ impl SumInputs {
             && self.open[g].iter().zip(&other.open[g]).all(|((h, a), (k, b))| h == k && r(a, b))
             && match (self.lines[g], other.lines[g]) {
                 (None, None) => true,
-                (Some((k, here, dir)), Some((j, there, way))) => k == j && v(here, there) && v(dir, way),
+                (Some((k, here, dir)), Some((j, there, way))) => {
+                    k == j
+                        && v(here, there)
+                        && v(dir, way)
+                        && match (&self.nav, &other.nav) {
+                            (None, None) => true,
+                            (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
+                            _ => false,
+                        }
+                }
                 _ => false,
             }
     }
@@ -454,7 +466,7 @@ impl SumInputs {
     pub(crate) fn sums(&self, cols: &SumColumns, runs: &[(u32, u32)], g: usize) -> RegimentSums {
         let regiment = (self.cents[g], self.bias[g], self.fwd[g], self.target[g], self.bows[g]);
         let line = self.lines[g].map(|(_, here, dir)| (here, dir));
-        regiment_sums(cols, runs, regiment, &self.open[g], line)
+        regiment_sums(cols, runs, regiment, &self.open[g], line, self.nav.as_deref())
     }
 }
 
@@ -523,7 +535,8 @@ pub(crate) fn sum_inputs(groups: &Groups, routes: Option<&crate::sim::route::Rou
     let lines: Vec<Option<(u32, Vec2, Vec2)>> = (0..groups.list.len())
         .map(|g| routes?.frame_line(g, groups.goal(g)?))
         .collect();
-    SumInputs { cents, bias, fwd, target, bows, slots, open, lines }
+    let nav = routes.and_then(|r| r.nav().cloned());
+    SumInputs { cents, bias, fwd, target, bows, slots, open, lines, nav }
 }
 
 /// One regiment's sums over its men, walking its runs in index order. `pc`
@@ -531,14 +544,17 @@ pub(crate) fn sum_inputs(groups: &Groups, routes: Option<&crate::sim::route::Rou
 /// forward vector, `tg` its attack target, `bows` whether it is an archer
 /// regiment, the only kind whose lead and velocity anything reads,
 /// `open` the blocks of the open friends within its reach, empty when
-/// there is none, and `line` the waypoint its route frame waits at with
-/// the unit direction of the leg after it, if it has one.
+/// there is none, `line` the waypoint its route frame waits at with
+/// the unit direction of the leg after it, if it has one, and `nav` the
+/// grid a man's straight walk to that waypoint is read on, if the map has
+/// one.
 fn regiment_sums(
     units: &SumColumns,
     runs: &[(u32, u32)],
     (pc, pb, f, tg, bows): (Vec2, Vec2, Vec2, Option<u32>, bool),
     open: &[(u32, BlockRect)],
     line: Option<(Vec2, Vec2)>,
+    nav: Option<&crate::nav::NavGrid>,
 ) -> RegimentSums {
     let mut a = RegimentSums {
         pos: Vec2::ZERO,
@@ -584,7 +600,12 @@ fn regiment_sums(
                 && units.death_t[i] == 0
             {
                 a.living += 1;
-                a.past += u32::from((p - here).dot(dir) > 0.0);
+                // A man has come past the waypoint when he stands beyond
+                // its line and can walk straight back to it: a man beyond
+                // the line on the other side of a wall from it has not.
+                // The walk is read only for the men beyond the line.
+                let beyond = (p - here).dot(dir) > 0.0;
+                a.past += u32::from(beyond && nav.is_none_or(|nav| nav.walk_line(p, here)));
             }
             let d2 = (p - pc).length_squared();
             a.r2 += d2;
@@ -1293,11 +1314,40 @@ mod tests {
         let runs = [(0u32, places.len() as u32)];
         let regiment = (Vec2::ZERO, Vec2::ZERO, Vec2::Y, None, false);
         let cols = SumColumns::of(&units);
-        let with = regiment_sums(&cols, &runs, regiment, &[], Some((here, dir)));
+        let with = regiment_sums(&cols, &runs, regiment, &[], Some((here, dir)), None);
         assert_eq!((with.past, with.living), (3, 6));
-        let without = regiment_sums(&cols, &runs, regiment, &[], None);
+        let without = regiment_sums(&cols, &runs, regiment, &[], None, None);
         assert_eq!((without.past, without.living), (0, 0));
         // The other sums do not depend on the line.
         assert_eq!((with.count, with.pos), (without.count, without.pos));
+    }
+
+    /// A man beyond a waypoint's line with the wall between him and the
+    /// waypoint has not come past it; a man beyond it on its own side of
+    /// the wall has.
+    #[test]
+    fn a_man_beyond_the_line_across_the_wall_is_not_past_the_waypoint() {
+        use crate::town_layout::{WALL_HALF, WALL_Z};
+        let terrain = crate::terrain::build_terrain(crate::terrain::MapKind::WallDebug);
+        let nav = crate::nav::NavGrid::build(&terrain).expect("a wall map has a grid");
+        // The waypoint in the town, the next leg toward the wall: a man is
+        // beyond its line when he stands nearer the plain than it.
+        let (here, dir) = (Vec2::new(20.0, WALL_Z - WALL_HALF - 16.0), Vec2::Y);
+        let inside = Vec2::new(20.0, WALL_Z - WALL_HALF - 6.0);
+        let outside = Vec2::new(20.0, WALL_Z + WALL_HALF + 1.5);
+        assert!(nav.walk_line(inside, here), "the town man walks straight to the waypoint");
+        assert!(!nav.walk_line(outside, here), "the wall stands between the outside man and the waypoint");
+        let mut units = Units::default();
+        for (k, p) in [inside, outside].into_iter().enumerate() {
+            crate::units::push_unit(&mut units, &terrain, k as u32, 0, 0, 0, p.x, p.y, Vec2::ZERO);
+        }
+        let runs = [(0u32, 2u32)];
+        let regiment = (Vec2::ZERO, Vec2::ZERO, Vec2::Y, None, false);
+        let cols = SumColumns::of(&units);
+        let on_grid = regiment_sums(&cols, &runs, regiment, &[], Some((here, dir)), Some(&nav));
+        assert_eq!((on_grid.past, on_grid.living), (1, 2));
+        // Without a grid both are past by their side of the line.
+        let no_grid = regiment_sums(&cols, &runs, regiment, &[], Some((here, dir)), None);
+        assert_eq!((no_grid.past, no_grid.living), (2, 2));
     }
 }
