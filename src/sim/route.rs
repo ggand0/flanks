@@ -235,6 +235,15 @@ fn share_passed(past: Option<(u32, u32, u32)>, k: usize, share: f32) -> bool {
     matches!(past, Some((at, n, of)) if share > 0.0 && at as usize == k && of > 0 && n as f32 >= share * of as f32)
 }
 
+/// Whether a block of half width `w` has the room to stand at waypoint
+/// `here`: the open ground round it reaches at least that far, with the
+/// width capped as `NavGrid::band_clear` caps it. A frame waits for its
+/// unit to gather only at a waypoint with that room; at one without it, a
+/// stair, a landing or the wall walk, it passes on to the next point.
+fn room_to_gather(nav: &NavGrid, here: Vec2, w: f32) -> bool {
+    nav.clearance_at(here) >= w.min(crate::nav::CLEAR_CAP - crate::terrain::CELL)
+}
+
 impl Routes {
     /// The grid, for the job and the debug view.
     pub fn nav(&self) -> Option<&Arc<NavGrid>> {
@@ -703,6 +712,11 @@ fn advance_frame(routes: &mut Routes, groups: &Groups, nav: &crate::nav::NavGrid
         if near || nav.straight_ok(gd.centroid, next, w) {
             passed = if near { "near" } else { "clear" };
             k += 1;
+        } else if !room_to_gather(nav, here, w) {
+            // The block cannot stand at the waypoint: the frame does not
+            // wait there for the men to gather, it moves on.
+            passed = "narrow";
+            k += 1;
         } else if share_passed(gd.frame_past, k, frame_share()) {
             // The regiment's centre is short of the waypoint and the
             // way on is too narrow for its block, but enough of its
@@ -756,7 +770,8 @@ pub(crate) struct FrameTest {
 
 /// The advance loop's two tests on the centre for the log, mirrored: the
 /// same `here`, `next` and half width, and the straight check from the
-/// centre. The third, the share of men past the waypoint, is not in it.
+/// centre. The share of men past the waypoint and the room at it are not
+/// in it.
 /// None once the frame is at the route's last waypoint.
 pub(crate) fn frame_test(nav: &NavGrid, gd: &GroupData, points: &[Vec2], k: usize, goal: Vec2) -> Option<FrameTest> {
     if k + 1 >= points.len() {
@@ -1138,6 +1153,19 @@ mod tests {
         assert!(!share_passed(None, 4, FRAME_SHARE));
         // Switched off, no count moves it.
         assert!(!share_passed(Some((4, 200, 200)), 4, 0.0));
+    }
+
+    /// A 200-man block has no room to stand at the top of a stair on Wall
+    /// Debug, and has it on the open ground inside the town.
+    #[test]
+    fn a_block_has_room_to_gather_on_open_ground_and_none_atop_a_stair() {
+        let terrain = crate::terrain::build_terrain(crate::terrain::MapKind::WallDebug);
+        let nav = NavGrid::build(&terrain).expect("Wall Debug has a grid");
+        let gd = GroupData::new(0, crate::unit_types::KIND_HEAVY, Vec2::new(164.0, -162.0), 200);
+        let w = half_width(&gd, Vec2::Y);
+        let (top, open) = (Vec2::new(48.0, -136.0), Vec2::new(164.0, -162.0));
+        assert!(!room_to_gather(&nav, top, w), "room at the stair's top {top}: clearance {} for half width {w}", nav.clearance_at(top));
+        assert!(room_to_gather(&nav, open, w), "no room at {open}: clearance {} for half width {w}", nav.clearance_at(open));
     }
 
     /// The route a regiment inside Wall Debug's town planned from its
