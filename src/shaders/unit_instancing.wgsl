@@ -179,6 +179,206 @@ fn measure_reach(placed: vec3<f32>) {
 }
 #endif
 
+#ifdef UNIT_SPRITE
+// FL_SPRITE: the card of a standing soldier drawn far off (unit_glb.rs
+// `card_level`). The sprite sheet (tools/sprite_sheet.py) holds each kind
+// seen from a few camera heights and directions around him, in a few frames
+// of each thing he can be doing; the card shows the cell of the view and
+// frame that match him, lit here as the mesh is lit.
+//
+// The sheet's layout rides after the card's corners in `pull_vertices`,
+// two rows of four floats a vertex (unit_glb.rs `sprite_table`).
+fn sprite_row(r: u32) -> vec4<f32> {
+    let v = pull_vertices[#{PULL_VERTS}u + r / 2u];
+    if r % 2u == 0u {
+        return vec4<f32>(v.position, v.part);
+    }
+    return vec4<f32>(v.normal, v.pivot);
+}
+
+// Rows of the table before its cells, two a cell after them.
+const SPRITE_HEAD: u32 = 18u;
+const TAU_SPRITE: f32 = 6.2831853;
+
+// The families, in the order of unit_glb.rs `SPRITE_FAMILIES`. Each gait
+// has three, plain, levelled and with an archer's knife out, from
+// SPRITE_SLOW on: the slow walk, the walk, the jog and the run.
+const SPRITE_STAND: u32 = 0u;
+const SPRITE_READY: u32 = 1u;
+const SPRITE_WALL: u32 = 2u;
+const SPRITE_BOWUP: u32 = 3u;
+const SPRITE_STAND_KNIFE: u32 = 4u;
+const SPRITE_SLOW: u32 = 5u;
+const SPRITE_STAB: u32 = 17u;
+const SPRITE_SWING: u32 = 18u;
+const SPRITE_SHOT: u32 = 19u;
+const SPRITE_STAGGER: u32 = 20u;
+const SPRITE_CHEER: u32 = 21u;
+const SPRITE_CHARGE: u32 = 22u;
+
+// A family's first frame and frame count. A family the kind does not have
+// holds the frames of the one it stands in for.
+fn sprite_family(f: u32) -> vec2<u32> {
+    let row = sprite_row(5u + f / 2u);
+    let pair = select(row.zw, row.xy, f % 2u == 0u);
+    return vec2<u32>(pair + 0.5);
+}
+
+// The frame of what he is doing, from his record as the pose decodes it
+// (unit_pose.wgsl `pose_begin`); the sheet draws each frame at the middle
+// of the stretch of his phase it stands for. A bow shot by its table and
+// its progress; the cheer by the bounce's phase; a blow by its wind-up or
+// its follow-through, a stab apart from the other blows, and a charging
+// blow at a run by its progress and which foot leads; a stagger by how
+// much is left of it; on the move the gait his speed falls in, the spear
+// levelled, the knife out or neither, at the gait's phase; standing, in a
+// wall, with his bow up, with his knife out, with his spear levelled, or
+// at rest.
+fn sprite_frame(inst: PullInstance) -> u32 {
+    let speeds = sprite_row(2u);
+    let switches = sprite_row(4u);
+    let zraw = max(inst.anim.z, 0.0);
+    let seed = inst.color.a;
+    let band = max(inst.anim2.x, 0.0);
+    let wall = inst.anim2.y;
+    let level = max(
+        max(smoothstep(0.25, 0.5, band), smoothstep(0.05, 0.25, band) * 0.75),
+        max(smoothstep(0.7, 1.0, band), wall),
+    );
+    // A bow kind's knife out and his bow put away: his fourth position
+    // float below zero (unit_pose.wgsl `pose_begin`).
+    let knife = speeds.y > 0.5 && inst.pos_scale.w < -0.5;
+    let gait_phase = fract(inst.anim2.z + seed);
+    let w4 = max(inst.anim2.w, 0.0);
+    var fam = SPRITE_STAND;
+    var k = 0u;
+    // A looping family's phase, 0 to 1; negative for the others.
+    var phase = -1.0;
+    if zraw > 15.5 {
+        fam = SPRITE_SHOT;
+        let clip = floor((zraw - 16.0) * 0.5 + 0.001);
+        let x = clamp(zraw - 16.0 - clip * 2.0, 0.0, 0.999);
+        let table = u32(clamp(clip, 0.0, 5.0)) % 3u;
+        if table == 0u {
+            k = u32(x * 3.0);
+        } else if table == 1u {
+            k = 3u + u32(x * 2.0);
+        } else {
+            k = 5u + u32(x * 3.0);
+        }
+    } else if zraw > 11.5 {
+        fam = SPRITE_CHEER;
+        phase = fract(globals.time * 9.0 / TAU_SPRITE + seed);
+    } else if zraw > 0.0 {
+        // The 2s digit is the swing style, plus 3 on a charging blow.
+        let digit = floor(zraw * 0.5 + 0.001);
+        let charge = digit > 2.5;
+        let style = digit - select(0.0, 3.0, charge);
+        fam = select(SPRITE_SWING, SPRITE_STAB, style < 0.5);
+        let within = zraw - digit * 2.0;
+        if within > 1.395 {
+            let follow = clamp((within - 1.4) / 0.59, 0.0, 1.0);
+            k = 4u + select(0u, 1u, follow >= 0.45);
+        } else {
+            k = min(u32(within * 4.0), 3u);
+        }
+        if charge {
+            // Six frames of the blow at each of two places in the gait's
+            // cycle (tools/sprite_sheet.py CHARGE_GAIT, 0 and a half): the
+            // nearer one.
+            fam = SPRITE_CHARGE;
+            k += 6u * (u32(floor(gait_phase * 2.0 + 0.5)) % 2u);
+        }
+    } else if w4 > 0.25 && w4 <= 1.0 {
+        fam = SPRITE_STAGGER;
+        k = select(0u, 1u, w4 >= 0.65);
+    } else if inst.anim.y >= speeds.x {
+        let speed = inst.anim.y;
+        let gait = select(0u, 1u, speed >= switches.x) + select(0u, 1u, speed >= switches.y)
+            + select(0u, 1u, speed >= switches.z);
+        let variant = select(select(0u, 1u, level > 0.5), 2u, knife);
+        fam = SPRITE_SLOW + 3u * gait + variant;
+        phase = gait_phase;
+    } else if wall > 0.5 {
+        fam = SPRITE_WALL;
+    } else if knife {
+        fam = SPRITE_STAND_KNIFE;
+    } else if speeds.y > 0.5 && inst.pos_scale.w > 0.5 {
+        // A bow kind's bow up: his fourth position float.
+        fam = SPRITE_BOWUP;
+    } else if level > 0.5 {
+        fam = SPRITE_READY;
+    }
+    let span = sprite_family(fam);
+    if phase >= 0.0 {
+        k = u32(floor(phase * f32(span.y) + 0.5)) % span.y;
+    }
+    return span.x + min(k, span.y - 1u);
+}
+
+// One corner of the card. The list entry is his record (unit_build.wgsl
+// `build_soldier`). The view's cell is the nearest of the sheet's camera
+// heights and directions around him to the camera as he sees it, and the
+// card stands at his centre square to the camera, spanning the cell's box
+// along the camera's right and up, as the cell was drawn. The fragment
+// lights it from the sheet's normals, which are in his own frame: the
+// corner carries the direction toward the sun turned into that frame (the
+// fragment stage cannot read the sun's uniform), and no sun share.
+fn sprite_output(entry: u32, v: PullVertex) -> VertexOutput {
+    let inst = pull_records[entry & 0x1fffffffu];
+    let p = inst.pos_scale.xyz;
+    let to_cam = normalize(view.world_position - p);
+    let c = cos(inst.anim.x);
+    let s = sin(inst.anim.x);
+    // The camera in his own frame (unit_pose.wgsl `rot_y` undone).
+    let lx = to_cam.x * c - to_cam.z * s;
+    let lz = to_cam.x * s + to_cam.z * c;
+    let head = sprite_row(0u);
+    let frames = u32(head.x + 0.5);
+    let dirs = u32(head.y + 0.5);
+    let n_elev = u32(head.z + 0.5);
+    let turns = i32(round(atan2(lx, lz) / TAU_SPRITE * f32(dirs)));
+    let d = u32((turns % i32(dirs) + i32(dirs)) % i32(dirs));
+    let el = asin(clamp(to_cam.y, -1.0, 1.0));
+    let heights = sprite_row(1u);
+    var e = 0u;
+    for (var i = 1u; i < n_elev; i++) {
+        if abs(el - heights[i]) < abs(el - heights[e]) {
+            e = i;
+        }
+    }
+    let cell = (e * dirs + d) * frames + sprite_frame(inst);
+    let rect = sprite_row(SPRITE_HEAD + 2u * cell);
+    let bounds = sprite_row(SPRITE_HEAD + 2u * cell + 1u);
+    let side = vec3<f32>(to_cam.z, 0.0, -to_cam.x);
+    let right = side / max(length(side), 1e-4);
+    let up = cross(right, -to_cam);
+    let x = mix(bounds.x, bounds.y, v.position.x);
+    let y = mix(bounds.z, bounds.w, v.position.y);
+    let world = p + right * x + up * y;
+    var out: VertexOutput;
+    out.clip_position = position_world_to_clip(world);
+    let l = sun.direction_to_light.xyz;
+    out.color = vec4<f32>(l.x * c - l.z * s, l.y, l.x * s + l.z * c, 0.0);
+    // anim.w: the hit flash in [0, 1]; a standing soldier has no death.
+    // The cloth takes the team colour times the kind's cloth hue.
+    // The top half of the second word is his record's index, which the
+    // fragment's cut-out picks by.
+    let flash = clamp(inst.anim.w, 0.0, 1.0);
+    out.packed = vec2<u32>(
+        pack4x8unorm(vec4<f32>(inst.color.rgb * sprite_row(3u).xyz, 0.0)),
+        pack4x8unorm(vec4<f32>(flash, 0.0, 0.0, 0.0)) | (entry << 16u),
+    );
+#ifdef UNIT_SHADOW_RECEIVE
+    out.shadow_position = world + sun.direction_to_light.xyz * shadow_normal_bias(world);
+#endif
+#ifdef UNIT_ATLAS
+    out.atlas_uv = rect.xy + vec2<f32>(v.position.x, 1.0 - v.position.y) * rect.zw;
+#endif
+    return out;
+}
+#endif
+
 @vertex
 fn vertex_pull(@builtin(vertex_index) index: u32, @builtin(instance_index) instance: u32) -> VertexOutput {
 #ifdef PULL_INDEXED
@@ -205,6 +405,9 @@ fn vertex_pull(@builtin(vertex_index) index: u32, @builtin(instance_index) insta
     }
 #endif
     let v = pull_vertices[corner];
+#ifdef UNIT_SPRITE
+    return sprite_output(entry, v);
+#else
 #ifdef UNIT_POSE_READ
     // The level rides the top two bits and the occlusion check's mark the
     // bit below (unit_build.wgsl `queue_draw`).
@@ -287,6 +490,7 @@ fn vertex_pull(@builtin(vertex_index) index: u32, @builtin(instance_index) insta
     out.packed.y |= ((entry >> 29u) & 1u) << 8u;
 #endif
     return out;
+#endif
 }
 #else
 @vertex
@@ -443,16 +647,98 @@ fn sun_shadow(shadow_position: vec3<f32>, frag_xy: vec2<f32>) -> f32 {
     return fetch_directional_shadow(0u, p, vec3<f32>(0.0), view_depth(shadow_position), frag_xy);
 }
 
+#ifdef UNIT_SPRITE_A2C
+// FL_SPRITE with MSAA: a number per pixel and soldier, fixed while neither
+// moves (a PCG step over both), that picks the samples a card covers.
+fn sprite_hash(pixel: vec2<f32>, soldier: u32) -> u32 {
+    var h = (u32(pixel.x) * 1973u + u32(pixel.y) * 9277u + soldier * 26699u) | 1u;
+    h = h * 747796405u + 2891336453u;
+    h = ((h >> ((h >> 28u) + 4u)) ^ h) * 277803737u;
+    return (h >> 22u) ^ h;
+}
+
+// The card's colour and the samples of the pixel it covers.
+struct SpriteFragment {
+    @location(0) color: vec4<f32>,
+    @builtin(sample_mask) mask: u32,
+};
+#endif
+
 @fragment
+#ifdef UNIT_SPRITE_A2C
+fn fragment(in: VertexOutput) -> SpriteFragment {
+#else
 fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
+#endif
 #ifdef UNIT_BOUND_CHECK
     if (in.packed.y & 256u) != 0u {
+#ifdef UNIT_SPRITE_A2C
+        return SpriteFragment(vec4<f32>(1.0, 0.0, 1.0, 1.0), 0xffffffffu);
+#else
         return vec4<f32>(1.0, 0.0, 1.0, 1.0);
+#endif
     }
 #endif
     // rgb = team colour, a = death darkening.
     let team = unpack4x8unorm(in.packed.x);
     let flash = unpack4x8unorm(in.packed.y).x;
+#ifdef UNIT_SPRITE
+    // FL_SPRITE: the card's cell (tools/sprite_sheet.py): rgb the colour
+    // outside the team cloth and alpha the cut-out, and half a sheet to its
+    // right the normal in his own frame and the cloth's grey, which takes
+    // the team colour as the atlas mask does. Lit by the sky and the sun
+    // at that normal, as the mesh's corners are (`sky_and_sun`), with the
+    // sun's direction in his frame from the vertex stage.
+    //
+    // The cut-out covers a pixel as a mesh does under the view's
+    // anti-aliasing.
+    //
+    // With MSAA a mesh covers the samples inside it. Where the sheet is
+    // drawn at twice its size or larger, the figure's edge is where its
+    // alpha crosses a half, over the samples on its side. From its own size
+    // down, a texel's alpha is the share of it the figure covers, as the
+    // mips averaged it, and the card covers that share of the pixel's
+    // samples, picked by a number fixed per pixel and soldier, so the men
+    // in a crowd cover the ground between them as their meshes do, and a
+    // spear thinner than a pixel covers a little of it. Between the two, a
+    // blend.
+    //
+    // Without MSAA a mesh covers a pixel when it covers the pixel's centre:
+    // the card does where the figure on the sheet's finest level covers it.
+    let texel = textureSample(unit_atlas, unit_atlas_sampler, in.atlas_uv);
+    let more = textureSample(unit_atlas, unit_atlas_sampler, in.atlas_uv + vec2<f32>(0.5, 0.0));
+#ifdef UNIT_SPRITE_A2C
+    let texels = in.atlas_uv * vec2<f32>(textureDimensions(unit_atlas));
+    let per_pixel = max(length(dpdx(texels)), length(dpdy(texels)));
+    let smaller = clamp(2.0 * per_pixel - 1.0, 0.0, 1.0);
+    let hash = sprite_hash(in.clip_position.xy, in.packed.y >> 16u);
+    let pick = (f32(hash >> 8u) + 0.5) / 16777216.0;
+    let sharp = clamp((texel.a - 0.5) / max(fwidth(texel.a), 1e-4) + 0.5, 0.0, 1.0);
+    let share = mix(sharp, texel.a, smaller);
+    let samples = #{UNIT_SPRITE_SAMPLES}u;
+    let covered = min(u32(share * f32(samples) + pick), samples);
+    if covered == 0u {
+        discard;
+    }
+    let all = (1u << samples) - 1u;
+    let run = (1u << covered) - 1u;
+    let turn = (hash & 0xffu) % samples;
+    let mask = ((run << turn) | (run >> (samples - turn))) & all;
+#else
+    if textureSampleLevel(unit_atlas, unit_atlas_sampler, in.atlas_uv, 0.0).a < 0.5 {
+        discard;
+    }
+#endif
+    let n = more.rgb * 2.0 - 1.0;
+    let sky = 0.30 + 0.20 * (0.5 + 0.5 * n.y);
+    var direct = 0.65 * max(dot(n, in.color.xyz), 0.0);
+#ifdef UNIT_SHADOW_RECEIVE
+    if direct > 0.0 {
+        direct *= sun_shadow(in.shadow_position, in.clip_position.xy);
+    }
+#endif
+    var rgb = (texel.rgb + more.a * team.rgb) * (sky + direct);
+#else
 #ifdef UNIT_ATLAS
     // The atlas mask tints rather than replaces, so cloth keeps its weave
     // under the team colour.
@@ -461,6 +747,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     var rgb = in.color.rgb * texel.rgb * tint;
 #else
     var rgb = in.color.rgb;
+#endif
 #endif
 #ifdef UNIT_SHADOW_RECEIVE
     // The sun's share of the light, less what its shadow takes. A face
@@ -471,5 +758,9 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
 #endif
     rgb = mix(rgb, vec3<f32>(1.0, 1.0, 1.0), flash * 0.8);
     rgb = rgb * (1.0 - 0.45 * team.a);
+#ifdef UNIT_SPRITE_A2C
+    return SpriteFragment(vec4<f32>(rgb, 1.0), mask);
+#else
     return vec4<f32>(rgb, 1.0);
+#endif
 }

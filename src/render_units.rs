@@ -168,6 +168,22 @@ pub struct LodConfig {
     pub px: [[f32; NUM_LODS - 1]; crate::unit_types::NUM_KINDS],
     /// FL_LOD_DEBUG=1: tint soldiers by level.
     pub debug: bool,
+    /// `FL_SPRITE_FROM`: with `FL_SPRITE` on and no `FL_LOD_PX`, the camera
+    /// distance in metres from which a soldier draws the last level, the
+    /// card (unit_glb.rs `sprites`). Default 400.
+    ///
+    /// The level pick works in pixels (a soldier's projected height against
+    /// `px`), so `LodBands::new` turns these metres into the last switch's
+    /// pixel height every frame from the camera's own projection: the height
+    /// of a soldier of the kind at this distance in the current window (rows
+    /// over twice the tangent of half the vertical field of view). The card
+    /// so begins at the same metres at any window size or field of view; at
+    /// 1360 rows and the 45 degree view, 400 m is a 1.7 m man about 7.0 px
+    /// tall, at 2160 rows about 11.1 px. The nearer switches keep their pixel
+    /// heights, so they move with the window as they do without it. The
+    /// shadow casters' level per cascade (`shadow_level`) keeps the plain
+    /// thresholds.
+    pub sprite_from: Option<f32>,
 }
 
 impl Default for LodConfig {
@@ -188,10 +204,23 @@ impl Default for LodConfig {
                 Err(_) => warn!("FL_LOD_PX wants {} comma-separated numbers", NUM_LODS - 1),
             }
         }
+        let lod_px = crate::util::perf_str("FL_LOD_PX").is_some_and(|v| v.trim() != "0");
+        let sprite_from = (crate::unit_glb::sprites() && !lod_px).then(|| {
+            let m = crate::util::env_or("FL_SPRITE_FROM", 400.0_f32);
+            if m > 0.0 {
+                m
+            } else {
+                warn!("FL_SPRITE_FROM wants a distance in metres above 0, not {m}; the card begins at 400 m");
+                400.0
+            }
+        });
+        if let Some(m) = sprite_from {
+            info!("FL_SPRITE: the card begins {m} m from the camera (FL_SPRITE_FROM)");
+        }
         if std::env::var("FL_LOD").is_ok_and(|v| v == "0") {
             px = [[0.0; NUM_LODS - 1]; crate::unit_types::NUM_KINDS];
         }
-        Self { px, debug: std::env::var("FL_LOD_DEBUG").is_ok() }
+        Self { px, debug: std::env::var("FL_LOD_DEBUG").is_ok(), sprite_from }
     }
 }
 
@@ -233,7 +262,11 @@ impl LodBands {
         for (kind, px) in cfg.px.iter().enumerate() {
             let height = 2.0 * crate::unit_types::half_height(kind);
             for (j, px) in px.iter().enumerate() {
-                if px_per_unit > 0.0 && *px > 0.0 {
+                // FL_SPRITE_FROM: the last switch's pixel height is that of
+                // this kind at the card's distance in this projection.
+                let from = cfg.sprite_from.filter(|_| j == NUM_LODS - 2 && *px > 0.0);
+                let px = from.map_or(*px, |m| height * px_per_unit / m);
+                if px_per_unit > 0.0 && px > 0.0 {
                     // A soldier is `px` tall at this distance.
                     let d = height * px_per_unit / px;
                     bands.plain[kind][j] = d * d;
@@ -429,13 +462,14 @@ fn extract_instance_data(
             Option<&UnitAtlas>,
             Option<&UnitRig>,
             Option<&InstanceBucket>,
+            Option<&FallenAtlas>,
         )>,
     >,
     mut extracted: Query<&mut ExtractedInstances>,
     mut commands: Commands,
 ) {
     let t0 = std::time::Instant::now();
-    for (render_entity, data, atlas, rig, bucket) in &main_entities {
+    for (render_entity, data, atlas, rig, bucket, fallen_atlas) in &main_entities {
         let e = render_entity.id();
         if let Ok(mut ex) = extracted.get_mut(e) {
             ex.0.clear();
@@ -445,6 +479,9 @@ fn extract_instance_data(
             entity.insert(ExtractedInstances(data.0.clone()));
             if let Some(atlas) = atlas {
                 entity.insert(ExtractedAtlas(atlas.0.id()));
+            }
+            if let Some(atlas) = fallen_atlas {
+                entity.insert(ExtractedFallenAtlas(atlas.0.id()));
             }
             if let Some(rig) = rig {
                 entity.insert(rig.clone());
@@ -500,6 +537,7 @@ impl Plugin for UnitRenderPlugin {
             .add_render_command::<Units3d, DrawCustom>()
             .init_resource::<SpecializedMeshPipelines<CustomPipeline>>()
             .init_resource::<SpecializedRenderPipelines<CustomPipeline>>()
+            .init_resource::<SpriteFallenPipelines>()
             .add_systems(
                 RenderStartup,
                 init_custom_pipeline.after(MeshPipelineSystems),
@@ -552,6 +590,7 @@ fn setup_unit_mesh(
         }
         let rig = UnitRig { rig, clips: std::sync::Arc::new(model.clips) };
         let atlas = model.atlas.map(|image| images.add(image));
+        let sprite = model.sprite.map(|image| images.add(image));
         let tris: Vec<usize> =
             lods.iter().map(|m| m.indices().map_or(0, |i| i.len() / 3)).collect();
         info!("unit meshes: kind {kind} tris per level {tris:?}, leg {:.2} m", rig.rig.leg);
@@ -562,7 +601,8 @@ fn setup_unit_mesh(
             // pulled draw. Its instance data stays, and stays empty.
             let last = lod == NUM_LODS - 1;
             let cast_source = model.cast_last.as_ref().filter(|_| last);
-            let pulled = pull_mesh_for(&mesh, &bucket, &gpu, cast_source, last && model.light_last);
+            let card = model.fallen_last.as_ref().zip(model.sprite_table.as_deref()).filter(|_| last);
+            let pulled = pull_mesh_for(&mesh, &bucket, &gpu, cast_source, last && model.light_last, card);
             let mut entity = commands.spawn((
                 Mesh3d(meshes.add(mesh)),
                 InstanceMaterialData::default(),
@@ -575,8 +615,20 @@ fn setup_unit_mesh(
             if let Some(pulled) = pulled {
                 entity.insert(pulled);
             }
-            if let Some(atlas) = atlas.as_ref().filter(|_| model.textured[lod]) {
-                entity.insert(UnitAtlas(atlas.clone()));
+            // FL_SPRITE: the card samples the sprite sheet, and the dying
+            // and the fallen at its level the kind's atlas.
+            match sprite.as_ref().filter(|_| last) {
+                Some(sheet) => {
+                    entity.insert(UnitAtlas(sheet.clone()));
+                    if let Some(atlas) = atlas.as_ref().filter(|_| model.textured[lod]) {
+                        entity.insert(FallenAtlas(atlas.clone()));
+                    }
+                }
+                None => {
+                    if let Some(atlas) = atlas.as_ref().filter(|_| model.textured[lod]) {
+                        entity.insert(UnitAtlas(atlas.clone()));
+                    }
+                }
             }
         }
     }
@@ -590,6 +642,15 @@ pub(crate) struct UnitAtlas(pub Handle<Image>);
 /// Render world: the atlas of a bucket.
 #[derive(Component, Clone, Copy)]
 pub(crate) struct ExtractedAtlas(pub AssetId<Image>);
+
+/// `FL_SPRITE`: the kind's atlas, which the dying and the fallen at a card
+/// bucket's level sample (unit_glb.rs `KindMeshes::fallen_last`).
+#[derive(Component, Clone)]
+pub(crate) struct FallenAtlas(pub Handle<Image>);
+
+/// Render world: a card bucket's `FallenAtlas`.
+#[derive(Component, Clone, Copy)]
+pub(crate) struct ExtractedFallenAtlas(pub AssetId<Image>);
 
 /// The rig of a bucket's kind (unit_meshes.rs `Rig`) and an archer's
 /// shot tables (`unit_glb.rs` `Shots`), shared by the kind's buckets. The
@@ -1209,10 +1270,11 @@ fn queue_custom(
             Option<&PullMeshGpu>,
             Has<ExtractedAtlas>,
             Option<&ExtractedBucket>,
+            Has<ExtractedFallenAtlas>,
         ),
         With<ExtractedInstances>,
     >,
-    gpu_input: Option<Res<GpuUnitInput>>,
+    (gpu_input, mut fallen_pipelines): (Option<Res<GpuUnitInput>>, ResMut<SpriteFallenPipelines>),
     receive_levels: Res<crate::render_units_shadow::ShadowReceiveLevels>,
     mut transparent_render_phases: ResMut<ViewSortedRenderPhases<Transparent3d>>,
     mut unit_phases: ResMut<ViewSortedRenderPhases<Units3d>>,
@@ -1237,7 +1299,7 @@ fn queue_custom(
             continue;
         };
 
-        for (entity, main_entity, pull_mesh, atlas, bucket) in &material_meshes {
+        for (entity, main_entity, pull_mesh, atlas, bucket, fallen_atlas) in &material_meshes {
             let Some(mesh_instance) = render_mesh_instances.render_mesh_queue_data(*main_entity)
             else {
                 continue;
@@ -1252,6 +1314,26 @@ fn queue_custom(
                     mesh.primitive_topology(),
                     mesh.index_format(),
                 );
+            // FL_SPRITE: a card bucket's dying and fallen draw with the
+            // file's last level, through the pipeline that level had.
+            if let Some(pull_mesh) = pull_mesh.filter(|m| m.fallen.is_some()) {
+                fallen_pipelines.0[pull_mesh.bucket] = Some(pull_pipelines.specialize(
+                    &pipeline_cache,
+                    &custom_pipeline,
+                    PullPipelineKey {
+                        mesh: key,
+                        layout: mesh.layout.clone(),
+                        verts: pull_mesh.fallen_count,
+                        bucket: pull_mesh.bucket as u32,
+                        lod_debug,
+                        atlas: fallen_atlas,
+                        receive,
+                        pose_pass,
+                        skinned: false,
+                        shape: pull_mesh.fallen_shape,
+                    },
+                ));
+            }
             let pipeline = match pull_mesh {
                 // GPU mode: the pulled variant, no vertex buffers.
                 Some(pull_mesh) => pull_pipelines.specialize(
@@ -1374,6 +1456,11 @@ pub(crate) fn prepare_instance_buffers(
         std::sync::atomic::Ordering::Relaxed,
     );
 }
+
+/// `FL_SPRITE`: per bucket, the pipeline of a card bucket's dying and
+/// fallen draw (`DrawMeshInstanced`).
+#[derive(Resource, Default)]
+pub(crate) struct SpriteFallenPipelines(pub [Option<CachedRenderPipelineId>; NUM_BUCKETS]);
 
 #[derive(Resource, Clone)]
 pub(crate) struct CustomPipeline {
@@ -1769,6 +1856,21 @@ impl SpecializedRenderPipeline for CustomPipeline {
         if key.shape.light_level {
             descriptor.vertex.shader_defs.push("UNIT_LIGHT_LEVEL".into());
         }
+        if key.shape.sprite {
+            descriptor.vertex.shader_defs.push("UNIT_SPRITE".into());
+            if let Some(fragment) = descriptor.fragment.as_mut() {
+                fragment.shader_defs.push("UNIT_SPRITE".into());
+                // With MSAA the card writes the samples it covers itself
+                // (unit_instancing.wgsl `SpriteFragment`).
+                if descriptor.multisample.count > 1 {
+                    fragment.shader_defs.push("UNIT_SPRITE_A2C".into());
+                    fragment.shader_defs.push(bevy::shader::ShaderDefVal::UInt(
+                        "UNIT_SPRITE_SAMPLES".into(),
+                        descriptor.multisample.count,
+                    ));
+                }
+            }
+        }
         atlas_defs(&mut descriptor, key.atlas);
         receive_defs(&mut descriptor, key.receive);
         centroid_defs(&mut descriptor);
@@ -1841,6 +1943,8 @@ impl<P: PhaseItem> RenderCommand<P> for DrawMeshInstanced {
         SRes<RenderMeshInstances>,
         SRes<MeshAllocator>,
         SRes<GpuUnitBuffers>,
+        SRes<SpriteFallenPipelines>,
+        SRes<PipelineCache>,
     );
     type ViewQuery = ();
     type ItemQuery = (
@@ -1858,7 +1962,11 @@ impl<P: PhaseItem> RenderCommand<P> for DrawMeshInstanced {
             Option<&'w PulledBucketGpu>,
             Option<&'w BucketBindGroup>,
         )>,
-        (meshes, render_mesh_instances, mesh_allocator, gpu): SystemParamItem<'w, '_, Self::Param>,
+        (meshes, render_mesh_instances, mesh_allocator, gpu, fallen_pipelines, pipeline_cache): SystemParamItem<
+            'w,
+            '_,
+            Self::Param,
+        >,
         pass: &mut TrackedRenderPass<'w>,
     ) -> RenderCommandResult {
         // A borrow check workaround.
@@ -1882,6 +1990,22 @@ impl<P: PhaseItem> RenderCommand<P> for DrawMeshInstanced {
                     pass.draw_indexed_indirect(&alloc.indexed_args, pulled.bucket as u64 * 20);
                 }
                 None => pass.draw_indirect(&alloc.args, pulled.bucket as u64 * 16),
+            }
+            // FL_SPRITE: after a card bucket's cards, its dying and fallen
+            // with the file's last level, from where the cards end on the
+            // bucket's list (unit_build.wgsl `finish_sprite`).
+            if let Some((group, index)) = &pulled.fallen
+                && let Some(id) = fallen_pipelines.into_inner().0[pulled.bucket as usize]
+                && let Some(pipeline) = pipeline_cache.into_inner().get_render_pipeline(id)
+            {
+                let kind = pulled.bucket as usize / NUM_LODS;
+                pass.set_render_pipeline(pipeline);
+                pass.set_bind_group(3, group, &[]);
+                pass.set_index_buffer(index.slice(..), IndexFormat::Uint32);
+                pass.draw_indexed_indirect(
+                    &alloc.indexed_args,
+                    ((crate::render_units_gpu::SPRITE_FALLEN_ARGS + kind) * 20) as u64,
+                );
             }
             return RenderCommandResult::Success;
         }

@@ -98,6 +98,11 @@ const POSE_ARG: usize = DRAW_ARGS;
 /// Indexed draw arguments: the camera's buckets, then the caster lists.
 const INDEXED_ARGS: usize = NUM_BUCKETS + CASTER_LISTS;
 
+/// `FL_SPRITE`: per kind, the indexed draw of the dying and the fallen at
+/// a card bucket's level, after the caster lists' (unit_build.wgsl
+/// `finish_sprite`).
+pub(crate) const SPRITE_FALLEN_ARGS: usize = INDEXED_ARGS;
+
 /// Depth bins of each camera bucket's list (unit_build.wgsl `queue_draw`).
 const DEPTH_BINS: usize = 128;
 
@@ -305,6 +310,17 @@ pub struct BuildParams {
     /// `SETTLED`), two entries per kind and way he fell: forward, back,
     /// right, left, then up and down.
     bound_settled: [Vec4; NUM_KINDS * 4 * 2],
+    /// `FL_SPRITE`: x 1 when the last level of any kind is a card, y 1
+    /// when the cards cast (`FL_SPRITE_SHADOW`). Then per kind, the dying
+    /// and fallen draw at that level (`PullMesh::fallen`): the corners per
+    /// soldier of its index list, the soldiers per instance and the
+    /// vertices per soldier; and the level a card that casts is posed for,
+    /// the finest any cascade casts the kind with, so his pose serves each.
+    sprite: UVec4,
+    sprite_corners: UVec4,
+    sprite_groups: UVec4,
+    sprite_verts: UVec4,
+    sprite_cast_lod: UVec4,
 }
 
 /// The pose pass uniform (`Params` in unit_pose_pass.wgsl).
@@ -403,6 +419,14 @@ const PROBE_EVERY: u32 = 16;
 /// pyramid pass costs 0.12 to 0.14 ms at 2560x1360 and the unit draw 44 ps
 /// a run, both on an RTX 3090.
 const PROBE_RUNS: f32 = 3.0e6;
+
+/// `FL_SPRITE`: what drawing a hidden card costs, in the probe's vertex
+/// runs. Measured at the ground view with the cards from 200 m, where the
+/// test was off and about 163,000 hidden men drew as cards: the unit pass
+/// took 0.22 ms more than with the cards from 250 m, where the test hid
+/// them, about 1.35 ns a card, 31 runs at 44 ps. Its six corners alone
+/// would count it as 6, under the share of the pass it takes.
+const CARD_RUNS: f32 = 31.0;
 
 /// The columns a snapshot record is packed from: the live ones, or the
 /// tick job's shared copies of them.
@@ -1050,13 +1074,18 @@ fn on_counts_readback(
     counts.flips += words[84] as usize;
     counts.flip_frames += 1;
     // A frame the test ran on: the vertex runs it saved decide the next
-    // probe, at least one per vertex of each hidden soldier's level, and for
-    // each soldier `FL_LOD_HIDDEN` drew a level coarser the vertices his held
-    // level has over the one he was drawn at.
+    // probe, at least one per vertex of each hidden soldier's level (a
+    // card's measured cost, CARD_RUNS), and for each soldier `FL_LOD_HIDDEN`
+    // drew a level coarser the vertices his held level has over the one he
+    // was drawn at.
     if words[34] != 0 {
         let mut verts = [0.0f32; NUM_BUCKETS];
         for m in &meshes {
-            verts[m.bucket] = m.indexed.as_ref().map_or(m.corners.len(), |i| i.vertices.len()) as f32;
+            verts[m.bucket] = if m.card {
+                CARD_RUNS
+            } else {
+                m.indexed.as_ref().map_or(m.corners.len(), |i| i.vertices.len()) as f32
+            };
         }
         let hidden: f32 = (0..NUM_BUCKETS).map(|b| words[52 + b] as f32 * verts[b]).sum();
         let coarser: f32 = (0..NUM_BUCKETS)
@@ -1145,6 +1174,14 @@ pub struct PullMesh {
     skinned: bool,
     /// The light last level (`from_mesh`).
     light: bool,
+    /// `FL_SPRITE`: the level is the card (unit_glb.rs `card_level`), drawn
+    /// expanded, and `fallen` is the file's last level welded, which the
+    /// dying and the fallen at this level draw with.
+    card: bool,
+    fallen: Option<IndexedMesh>,
+    /// `FL_SPRITE`: the card's sheet layout as vertices, uploaded after its
+    /// corners (unit_instancing.wgsl `sprite_row`).
+    table: Vec<PullVertex>,
 }
 
 /// A level drawn indexed: its vertices, and its index list repeated for
@@ -1508,7 +1545,16 @@ impl PullMesh {
     /// `mesh`. `light`: the level is the light last level (unit_glb.rs
     /// `light_last_level`), which takes its colour from the vertex colour
     /// word as that level packs it.
-    pub fn from_mesh(mesh: &Mesh, bucket: usize, cast_source: Option<&Mesh>, light: bool) -> Option<Self> {
+    /// `card`: the level is the card; the mesh its dying and fallen draw
+    /// with, and the rows of its sheet's layout (unit_glb.rs
+    /// `sprite_table`).
+    pub fn from_mesh(
+        mesh: &Mesh,
+        bucket: usize,
+        cast_source: Option<&Mesh>,
+        light: bool,
+        card: Option<(&Mesh, &[[f32; 4]])>,
+    ) -> Option<Self> {
         use bevy::mesh::VertexAttributeValues as V;
         let (records, skinned) = pull_vertices(mesh)?;
         let Some(V::Float32x2(atlas_uv)) = mesh.attribute(Mesh::ATTRIBUTE_UV_1) else {
@@ -1530,7 +1576,31 @@ impl PullMesh {
                 tri.iter_mut().for_each(|c| c.atlas_uv = point);
             }
         }
-        let indexed = if welded_levels() {
+        let fallen = card.map(|(m, _)| m);
+        // The table rides after the card's corners, two rows a vertex.
+        let table: Vec<PullVertex> = card.map_or(Vec::new(), |(_, rows)| {
+            rows.chunks(2)
+                .map(|r| {
+                    let second = r.get(1).copied().unwrap_or([0.0; 4]);
+                    PullVertex {
+                        position: [r[0][0], r[0][1], r[0][2]],
+                        part: r[0][3],
+                        normal: [second[0], second[1], second[2]],
+                        pivot: second[3],
+                        color: 0,
+                        atlas_uv: 0,
+                        skin: 0,
+                        weight: 0.0,
+                    }
+                })
+                .collect()
+        });
+        let card = card.is_some();
+        // The card's six corners draw expanded: no group to pad, so its
+        // list can end where the dying and the fallen begin.
+        let indexed = if card {
+            None
+        } else if welded_levels() {
             let m = weld(&corners, flat_light_levels()[bucket % NUM_LODS]);
             info!(
                 "unit bucket {bucket}: {} triangles on {} welded vertices, {} soldiers per instance{}{}{}",
@@ -1562,6 +1632,14 @@ impl PullMesh {
             );
             m
         });
+        let fallen = fallen.and_then(|m| {
+            let level = Self::from_mesh(m, bucket, None, false, None)?;
+            let flat_light = flat_light_levels()[bucket % NUM_LODS];
+            Some(level.indexed.unwrap_or_else(|| weld(&level.corners, flat_light)))
+        });
+        if card {
+            info!("unit bucket {bucket}: a card of {} corners, drawn expanded", corners.len());
+        }
         Some(Self {
             corners,
             indexed,
@@ -1569,6 +1647,9 @@ impl PullMesh {
             bucket,
             skinned,
             light,
+            card,
+            fallen,
+            table,
         })
     }
 }
@@ -1615,7 +1696,7 @@ fn pull_vertices(mesh: &Mesh) -> Option<(Vec<PullVertex>, bool)> {
 /// Render-world side of `PullMesh`: the corners in a storage buffer.
 #[derive(Component)]
 pub struct PullMeshGpu {
-    vertices: Buffer,
+    pub(crate) vertices: Buffer,
     /// The indexed form: its vertices (storage) and its group list.
     indexed: Option<(Buffer, Buffer)>,
     /// The same for the shadow casters (`PullMesh::cast`), else `indexed`.
@@ -1630,7 +1711,17 @@ pub struct PullMeshGpu {
     pub skinned: bool,
     /// Every corner is on the body, part 0: the vertex shader reads only
     /// the pose slots `pose_begin` writes (unit_pose.wgsl `pose_write`).
+    /// On a card bucket, of the mesh its dying and fallen draw with, the
+    /// only ones of the bucket that take a pose slot.
     pub body_only: bool,
+    /// Corners per soldier of the shadow casters' mesh.
+    pub cast_count: u32,
+    /// `FL_SPRITE`: the dying and fallen draw of a card bucket
+    /// (`PullMesh::fallen`): its vertices and group list, its shape and its
+    /// corners per soldier.
+    pub fallen: Option<(Buffer, Buffer)>,
+    pub fallen_shape: DrawShape,
+    pub fallen_count: u32,
 }
 
 /// How a bucket's level draws. `group` 0: expanded corners, one plain draw
@@ -1646,6 +1737,9 @@ pub struct DrawShape {
     pub flat_light: bool,
     /// The light last level's colour (`PullMesh::light`).
     pub light_level: bool,
+    /// `FL_SPRITE`: the level is the card (unit_instancing.wgsl
+    /// `UNIT_SPRITE`).
+    pub sprite: bool,
 }
 
 /// Uploads each pulled bucket's mesh once. The render entity persists,
@@ -1682,16 +1776,32 @@ fn extract_pull_meshes(
                 flat_atlas: m.flat_atlas,
                 flat_light: m.flat_light,
                 light_level: false,
+                sprite: false,
             })
         };
         let indexed = mesh.indexed.as_ref().map(upload);
         let cast = mesh.cast.as_ref().map(upload);
-        let shape = DrawShape { light_level: mesh.light, ..shape_of(mesh.indexed.as_ref()) };
+        let sprite = mesh.card;
+        let shape = DrawShape { light_level: mesh.light, sprite, ..shape_of(mesh.indexed.as_ref()) };
         let cast_shape = shape_of(mesh.cast.as_ref().or(mesh.indexed.as_ref()));
+        // The casters draw the cast mesh with its own corners per soldier:
+        // the light last level's and a card's cast the file's last level,
+        // which has more corners than the level they stand in for.
+        let per_soldier = |m: &IndexedMesh| (m.indices.len() / m.group.max(1) as usize) as u32;
+        let cast_count = mesh.cast.as_ref().map_or(mesh.corners.len() as u32, per_soldier);
+        let fallen = mesh.fallen.as_ref().map(upload);
+        let fallen_shape = shape_of(mesh.fallen.as_ref());
+        let fallen_count = mesh.fallen.as_ref().map_or(0, per_soldier);
+        let body_only = match &mesh.fallen {
+            Some(m) => m.vertices.iter().all(|c| c.part < 0.5),
+            None => mesh.corners.iter().all(|c| c.part < 0.5),
+        };
+        // A card's table follows its corners in the same buffer.
+        let corners: Vec<PullVertex> = mesh.corners.iter().chain(&mesh.table).copied().collect();
         commands.entity(e).insert(PullMeshGpu {
             vertices: render_device.create_buffer_with_data(&BufferInitDescriptor {
                 label: Some("unit pull mesh"),
-                contents: bytemuck::cast_slice(&mesh.corners),
+                contents: bytemuck::cast_slice(&corners),
                 usage: BufferUsages::STORAGE,
             }),
             indexed,
@@ -1701,7 +1811,11 @@ fn extract_pull_meshes(
             shape,
             cast_shape,
             skinned: mesh.skinned,
-            body_only: mesh.corners.iter().all(|c| c.part < 0.5),
+            body_only,
+            cast_count,
+            fallen,
+            fallen_shape,
+            fallen_count,
         });
     }
 }
@@ -1719,6 +1833,9 @@ pub struct PulledBucketGpu {
     /// that cascade's set of the bucket table, so the bucket's draw reads
     /// the cascade's caster list for its kind.
     pub shadow: Vec<BindGroup>,
+    /// `FL_SPRITE`: the group and index list of a card bucket's dying and
+    /// fallen draw (`PullMeshGpu::fallen`).
+    pub fallen: Option<(BindGroup, Buffer)>,
     generation: u32,
     /// Bound to its own atlas, or has none. Otherwise it waits on the upload.
     atlas_settled: bool,
@@ -2045,7 +2162,7 @@ impl UnitAlloc {
             indexed_args: storage_buffer(
                 device,
                 "unit indexed draw args",
-                INDEXED_ARGS * 20,
+                (INDEXED_ARGS + NUM_KINDS) * 20,
                 BufferUsages::INDIRECT,
             ),
             regiments: storage_buffer(
@@ -2218,7 +2335,7 @@ pub(crate) fn prepare_gpu_units(
         info[0][b] = [alloc.bases[b], mesh.count, stride, mesh.shape.group];
         for c in 0..MAX_CASCADES {
             let base = alloc.shadow_bases[c][b / NUM_LODS];
-            info[1 + c][b] = [base, mesh.count, stride, mesh.cast_shape.group];
+            info[1 + c][b] = [base, mesh.cast_count, stride, mesh.cast_shape.group];
         }
     }
     queue.write_buffer(&alloc.bucket_info, 0, bytemuck::cast_slice(&info));
@@ -2241,6 +2358,21 @@ pub(crate) fn prepare_gpu_units(
     params.pose_src_base = UVec4::from_array(alloc.pose_src_base);
     params.pose_cap = UVec4::from_array(alloc.pose_cap);
     params.pose_pass = input.pose_pass as u32;
+    for mesh in &meshes {
+        if mesh.fallen.is_some() {
+            let kind = mesh.bucket / NUM_LODS;
+            params.sprite.x = 1;
+            params.sprite.y = crate::unit_glb::sprite_shadow() as u32;
+            params.sprite_cast_lod[kind] = input.shadow_levels[..(params.n_cascades as usize).min(MAX_CASCADES)]
+                .iter()
+                .map(|levels| levels[kind])
+                .min()
+                .unwrap_or(0);
+            params.sprite_corners[kind] = mesh.fallen_count;
+            params.sprite_groups[kind] = mesh.fallen_shape.group;
+            params.sprite_verts[kind] = mesh.fallen_shape.verts;
+        }
+    }
     // The test reads last frame's pyramid with the camera it was drawn
     // with, when there is one and the camera did not cut since.
     params.occlude.y = 0;
@@ -2421,6 +2553,7 @@ fn prepare_pull_bind_groups(
         Option<&ExtractedAtlas>,
         &RigBuffer,
         Option<&PulledBucketGpu>,
+        Option<&crate::render_units::ExtractedFallenAtlas>,
     )>,
 ) {
     let (Some(alloc), Some(sun)) = (&buffers.alloc, sun.binding()) else {
@@ -2432,24 +2565,34 @@ fn prepare_pull_bind_groups(
     if crate::render_units_occlusion::bound_check() && reach.is_none() {
         return;
     }
-    for (entity, mesh, atlas, rig, existing) in &meshes {
+    for (entity, mesh, atlas, rig, existing, fallen_atlas) in &meshes {
         if existing.is_some_and(|b| b.generation == buffers.generation && b.atlas_settled) {
             continue;
         }
-        let (view, sampler, atlas_settled) = custom_pipeline.atlas_for(atlas, &images);
+        let (view, sampler, own_settled) = custom_pipeline.atlas_for(atlas, &images);
+        let fallen_atlas = fallen_atlas.map(|a| crate::render_units::ExtractedAtlas(a.0));
+        let (fallen_view, fallen_sampler, fallen_settled) =
+            custom_pipeline.atlas_for(fallen_atlas.as_ref(), &images);
+        let atlas_settled = own_settled && fallen_settled;
         let layout = pipeline_cache.get_bind_group_layout(&custom_pipeline.pull_layout);
         // Set 0 of the bucket table is the camera's, set 1 + c cascade c's.
         // An indexed level draws indexed into every one of them, the
         // cascades from the casters' own mesh where it has one.
+        // Set 0 again for the dying and fallen of a card bucket (`set` past
+        // the cascades), with their own mesh and the kind's atlas.
+        let fallen_set = MAX_CASCADES as u64 + 1;
         let group = |set: u64| {
             let indexed = match set {
                 0 => mesh.indexed.as_ref(),
+                s if s == fallen_set => mesh.fallen.as_ref(),
                 _ => mesh.cast.as_ref().or(mesh.indexed.as_ref()),
             };
             let corners = match indexed {
                 Some((vertices, _)) => vertices,
                 None => &mesh.vertices,
             };
+            let (view, sampler) = if set == fallen_set { (fallen_view, fallen_sampler) } else { (view, sampler) };
+            let set = if set == fallen_set { 0 } else { set };
             let entries = BindGroupEntries::with_indices((
                     (0, alloc.records.as_entire_binding()),
                     (1, alloc.index_list.as_entire_binding()),
@@ -2480,6 +2623,7 @@ fn prepare_pull_bind_groups(
             index: mesh.indexed.as_ref().map(|(_, indices)| indices.clone()),
             shadow_index: mesh.cast.as_ref().or(mesh.indexed.as_ref()).map(|(_, indices)| indices.clone()),
             shadow: (1..=MAX_CASCADES as u64).map(group).collect(),
+            fallen: mesh.fallen.as_ref().map(|(_, indices)| (group(fallen_set), indices.clone())),
             generation: buffers.generation,
             atlas_settled,
             bucket: mesh.bucket as u32,
@@ -2659,8 +2803,9 @@ pub fn pull_mesh_for(
     cfg: &GpuSyncConfig,
     cast_source: Option<&Mesh>,
     light: bool,
+    card: Option<(&Mesh, &[[f32; 4]])>,
 ) -> Option<PullMesh> {
-    cfg.enabled.then(|| PullMesh::from_mesh(mesh, bucket.0, cast_source, light)).flatten()
+    cfg.enabled.then(|| PullMesh::from_mesh(mesh, bucket.0, cast_source, light, card)).flatten()
 }
 
 #[cfg(test)]

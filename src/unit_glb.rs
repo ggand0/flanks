@@ -155,6 +155,13 @@ pub struct KindMeshes {
     /// keep.
     pub light_last: bool,
     pub cast_last: Option<Mesh>,
+    /// `FL_SPRITE`: the last level is a card (`card_level`) that shows the
+    /// kind's picture in `sprite`, and `fallen_last` is the file's own last
+    /// level, which the dying and the fallen at that level keep.
+    pub sprite: Option<Image>,
+    pub fallen_last: Option<Mesh>,
+    /// `FL_SPRITE`: the card's table of the sheet's layout (`sprite_table`).
+    pub sprite_table: Option<Vec<[f32; 4]>>,
 }
 
 impl KindMeshes {
@@ -167,6 +174,9 @@ impl KindMeshes {
             clips: Vec::new(),
             light_last: false,
             cast_last: None,
+            sprite: None,
+            fallen_last: None,
+            sprite_table: None,
         }
     }
 }
@@ -483,7 +493,27 @@ fn import(kind: usize, path: &Path, pulled: bool) -> Fallible<KindMeshes> {
     if l3_light() && !pulled && kind == 0 {
         warn!("FL_L3_LIGHT: the light last level draws only on the GPU path; drawing the file's last level");
     }
-    let light_last = l3_light() && pulled && levels[last].is_some();
+    // FL_SPRITE: the file's last level becomes a card, and keeps only its
+    // shadow casters and the dying and the fallen.
+    let mut sprite = None;
+    let mut sprite_rows = None;
+    let mut fallen_last = None;
+    if sprites() && pulled && levels[last].is_some() {
+        match sprite_table(kind, rig.bow.params[3] > 0.5).and_then(|rows| Ok((rows, sprite_sheet()?))) {
+            Ok((rows, image)) => {
+                sprite_rows = Some(rows);
+                sprite = Some(image);
+            }
+            Err(e) => error!("FL_SPRITE: {e}; drawing the file's last level"),
+        }
+    }
+    if sprite.is_some() && let Some(file) = levels[last].take() {
+        levels[last] = Some(card_level());
+        cast_last = Some(level_mesh(&file));
+        fallen_last = Some(level_mesh(&file));
+        info!("{name}: the last level is a card (FL_SPRITE)");
+    }
+    let light_last = l3_light() && sprite.is_none() && pulled && levels[last].is_some();
     if light_last && let Some(file) = levels[last].take() {
         levels[last] = Some(light_last_level(&file, atlas.as_ref(), kind, half_height, name));
         cast_last = Some(level_mesh(&file));
@@ -507,7 +537,188 @@ fn import(kind: usize, path: &Path, pulled: bool) -> Fallible<KindMeshes> {
         clips,
         light_last,
         cast_last,
+        sprite,
+        sprite_table: sprite_rows,
+        fallen_last,
     })
+}
+
+/// `FL_SPRITE`: every standing soldier at the last level is drawn as a
+/// card, on by default; `FL_SPRITE=0` draws the last level as its mesh.
+/// The card covers a pixel as the meshes do under the view's
+/// anti-aliasing: with MSAA the samples its picture covers, without it
+/// the pixels whose centre it covers (unit_instancing.wgsl
+/// `SpriteFragment`). GPU path only. Read once, at import. The last
+/// level then begins `FL_SPRITE_FROM` metres from the camera, 400 by
+/// default (render_units.rs `LodConfig::sprite_from`), unless `FL_LOD_PX`
+/// is given, which sets every switch in pixels as without the card.
+pub fn sprites() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::util::env_or("FL_SPRITE", 1_u32) != 0)
+}
+
+/// `FL_SPRITE_SHADOW=1`, with `FL_SPRITE`: a card inside the sun's shadow
+/// range casts the shadow of his body, posed and drawn into the cascades
+/// as a near soldier is (unit_build.wgsl `build_soldier`). Off by default,
+/// as the far meshes cast nothing (render_units_shadow.rs `CAST_LODS`).
+/// The shadow map ends `FL_SHADOW_DIST` metres out, 280 by default, so a
+/// card casts only when the cards begin nearer than that.
+pub fn sprite_shadow() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| sprites() && crate::util::env_or("FL_SPRITE_SHADOW", 0_u32) != 0)
+}
+
+/// The sprite sheet's layout (assets/units/sprites.json, written with the
+/// sheet by tools/sprite_sheet.py). Per kind one cell per (camera height,
+/// direction around the man, frame), each just large enough for him.
+#[derive(serde::Deserialize)]
+struct SpriteLayout {
+    width: u32,
+    height: u32,
+    /// Camera heights above the horizon the cells are drawn from, degrees.
+    elevations: Vec<f32>,
+    /// Directions around the man, evenly spaced from his front.
+    directions: u32,
+    /// The family names, in the order of the shader's ids
+    /// (`SPRITE_FAMILIES`).
+    families: Vec<String>,
+    speeds: SpriteSpeeds,
+    kinds: Vec<SpriteKind>,
+}
+
+#[derive(serde::Deserialize)]
+struct SpriteSpeeds {
+    /// Below this ground speed, m/s, a man shows his standing frames.
+    stand_below: f32,
+    /// The ground speeds, m/s, at which the slow walk switches to the
+    /// walk, the walk to the jog and the jog to the run.
+    switch: [f32; 3],
+}
+
+#[derive(serde::Deserialize)]
+struct SpriteKind {
+    name: String,
+    /// Frames per view.
+    frames: u32,
+    /// Per family, its first frame and its frame count.
+    families: Vec<[u32; 2]>,
+    /// The team cloth's hue, the cloth's mean colour over its grey with the
+    /// largest channel 1: the shader tints the cloth's grey by the team
+    /// colour times this.
+    cloth: [f32; 3],
+    /// Per cell, in the order (camera height, direction, frame): its rect
+    /// in the sheet's left half in pixels (x, y, width, height), and what
+    /// it shows in metres from his centre, from x0 to x1 along the
+    /// camera's right and from y0 to y1 along its up.
+    cells: Vec<[f32; 8]>,
+}
+
+/// The shader's family ids (unit_instancing.wgsl `sprite_frame`).
+const SPRITE_FAMILIES: [&str; 23] = [
+    "stand", "ready", "wall", "bowup", "stand_knife", "slow", "slow_level", "slow_knife", "walk", "walk_level",
+    "walk_knife", "jog", "jog_level", "jog_knife", "run", "run_level", "run_knife", "stab", "swing", "shot",
+    "stagger", "cheer", "charge",
+];
+
+/// Rows of a kind's sprite table before its cells (`sprite_table`), an
+/// even count so each cell's two rows fill one card vertex.
+pub const SPRITE_HEAD_ROWS: usize = 18;
+
+/// `FL_SPRITE`: per kind, the rows the card's vertex shader reads the
+/// sheet's layout from (unit_instancing.wgsl `sprite_row`): 0 frames per
+/// view, directions and camera heights, 1 the camera heights in radians,
+/// 2 the speed below which he stands and 1 for a bow kind, 3 the cloth's
+/// hue, 4 the speeds the gaits switch at, 5 to 16 two families a row, each
+/// its first frame and its frame count, 17 unused; then two rows a cell,
+/// its rect in uv (u, v of its top left corner, its width and height) and
+/// its box in metres.
+fn sprite_table(kind: usize, bow: bool) -> Fallible<Vec<[f32; 4]>> {
+    let path = crate::util::game_root().join("assets/units/sprites.json");
+    let bytes = crate::game_files::read(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let layout: SpriteLayout =
+        serde_json::from_slice(&bytes).map_err(|e| format!("cannot parse {}: {e}", path.display()))?;
+    if layout.families.iter().map(String::as_str).ne(SPRITE_FAMILIES) {
+        return Err(format!("{} lists other families than the shader picks", path.display()));
+    }
+    if layout.elevations.is_empty() || layout.elevations.len() > 4 || layout.directions == 0 {
+        return Err(format!("{}: one to four camera heights and some directions", path.display()));
+    }
+    let k = layout
+        .kinds
+        .iter()
+        .find(|k| k.name == KIND_FILE[kind])
+        .ok_or(format!("{} has no {}", path.display(), KIND_FILE[kind]))?;
+    let views = layout.elevations.len() * layout.directions as usize;
+    if k.cells.len() != views * k.frames as usize || k.families.len() != SPRITE_FAMILIES.len() {
+        return Err(format!("{}: {} has {} cells and {} families", path.display(), k.name, k.cells.len(), k.families.len()));
+    }
+    let (w, h) = (layout.width as f32, layout.height as f32);
+    let mut elevations = [0.0; 4];
+    for (e, deg) in elevations.iter_mut().zip(&layout.elevations) {
+        *e = deg.to_radians();
+    }
+    let mut rows = vec![
+        [k.frames as f32, layout.directions as f32, layout.elevations.len() as f32, 0.0],
+        elevations,
+        [layout.speeds.stand_below, if bow { 1.0 } else { 0.0 }, 0.0, 0.0],
+        [k.cloth[0], k.cloth[1], k.cloth[2], 0.0],
+        [layout.speeds.switch[0], layout.speeds.switch[1], layout.speeds.switch[2], 0.0],
+    ];
+    for pair in k.families.chunks(2) {
+        let second = pair.get(1).copied().unwrap_or([0, 1]);
+        rows.push([pair[0][0] as f32, pair[0][1] as f32, second[0] as f32, second[1] as f32]);
+    }
+    rows.resize(SPRITE_HEAD_ROWS, [0.0; 4]);
+    for c in &k.cells {
+        rows.push([c[0] / w, c[1] / h, c[2] / w, c[3] / h]);
+        rows.push([c[4], c[5], c[6], c[7]]);
+    }
+    Ok(rows)
+}
+
+/// The sprite sheet (tools/sprite_sheet.py): rgb the colour outside the
+/// team cloth and alpha the cut-out in its left half, and half a sheet to
+/// the right of each texel its normal in rgb and the cloth's grey in
+/// alpha. Read and given its mips as a model's atlas is.
+fn sprite_sheet() -> Fallible<Image> {
+    let path = crate::util::game_root().join("assets/units/sprites.png");
+    let bytes = crate::game_files::read(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+        mipmap_filter: ImageFilterMode::Linear,
+        ..ImageSamplerDescriptor::linear()
+    });
+    let mut image = Image::from_buffer(
+        &bytes,
+        ImageType::MimeType("image/png"),
+        CompressedImageFormats::NONE,
+        true,
+        sampler,
+        RenderAssetUsages::RENDER_WORLD,
+    )
+    .map_err(|e| format!("cannot decode {}: {e}", path.display()))?;
+    if image.texture_descriptor.format != TextureFormat::Rgba8UnormSrgb {
+        return Err(format!("{} decodes to {:?}, it must be 8-bit RGBA", path.display(), image.texture_descriptor.format));
+    }
+    add_mips(&mut image)?;
+    Ok(image)
+}
+
+/// The card: a unit square, x and y from 0 to 1, which the vertex shader
+/// stretches over the cell's box and turns to face the camera about his
+/// centre (unit_instancing.wgsl `sprite_output`). Every corner is on the
+/// body, part 0.
+fn card_level() -> Level {
+    let corner = |x: f32, y: f32| Vec3::new(x, y, 0.0);
+    Level {
+        pos: vec![corner(0.0, 0.0), corner(1.0, 0.0), corner(1.0, 1.0), corner(0.0, 1.0)],
+        nrm: vec![Vec3::Z; 4],
+        part: vec![0.0; 4],
+        pivot: vec![0.0; 4],
+        col: vec![[1.0, 1.0, 1.0, 0.0]; 4],
+        tex: vec![[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]],
+        skin: Vec::new(),
+        idx: vec![0, 1, 2, 0, 2, 3],
+    }
 }
 
 /// `FL_L3_LIGHT=1`: every imported kind draws its last level from three
