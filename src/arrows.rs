@@ -47,7 +47,14 @@ const LITTER_CAP_DEFAULT: usize = 50_000;
 /// Body-hit lateral radius (m): the shaft passes within this of a
 /// soldier's axis to strike him. A man is about 0.5 m across the torso
 /// and 0.8 m with his arms.
-const HIT_RADIUS: f32 = 0.35;
+pub(crate) const HIT_RADIUS: f32 = 0.35;
+/// How far over a man's head a shaft still strikes him (m): the top of
+/// his hit band, below the launch height (LAUNCH_OVER_HEAD) or shooters
+/// hit themselves.
+pub(crate) const HIT_OVER_HEAD: f32 = 0.05;
+/// The last metres before the man aimed at, where the flat shot comes
+/// down on him: a friendly block there is not read by the loft test.
+const LOFT_NEAR_TARGET: f32 = 2.0;
 /// FL_WOUND=<share> overrides `missile::WOUND_SHARE` for calibration.
 fn wound_share() -> f32 {
     static W: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
@@ -262,13 +269,17 @@ fn setup_arrow_buckets(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>)
     ));
 }
 
-/// A friendly regiment as the loft test reads it: its block as it stands
-/// and the height an arc must clear over it, 1.3 m over the heads at its
-/// centre (sim/job.rs `loft_blocks`).
+/// A friendly regiment as the loft test reads it (sim/job.rs
+/// `loft_blocks`): its block as its men's bodies take it up (`rect`: its
+/// outer places and a body's hit radius past them), the ground under its
+/// men's centroid (`floor`), its men's height (`head`) and its rank pitch
+/// (`rank`).
 #[derive(Clone, Copy)]
 pub struct LoftBlock {
     pub rect: crate::formation::BlockRect,
-    pub top: f32,
+    pub floor: f32,
+    pub head: f32,
+    pub rank: f32,
 }
 
 /// Solve a launch velocity from `from` to `to`: a speed in the 20..48 m/s
@@ -280,9 +291,9 @@ pub struct LoftBlock {
 /// clears the ground; otherwise None: no arc reaches the man without
 /// striking the ground, a wall, its parapet or its merlons first, and
 /// the archer does not loose at him. `blocks` are the shooter's side's
-/// regiments (`LoftBlock`): an arc lofts over a block whose centre it
-/// passes over too low, so a one-rank line shooting out over nothing of
-/// its own shoots flat.
+/// regiments (`LoftBlock`): the flat arc lofts over a block it passes over
+/// low enough to strike a man of it (`flat_clears`), so a one-rank line
+/// shooting out over nothing of its own shoots flat.
 pub fn solve_launch(from: Vec3, to: Vec3, blocks: &[LoftBlock], terrain: &crate::terrain::Terrain) -> Option<Vec3> {
     let flat = to.xz() - from.xz();
     let d = flat.length().max(0.5);
@@ -297,24 +308,7 @@ pub fn solve_launch(from: Vec3, to: Vec3, blocks: &[LoftBlock], terrain: &crate:
     let mut tan = f32::MAX;
     if !lofted {
         tan = (vv - disc.sqrt()) / (g * d);
-        // Does the flat arc clear the friendlies under it? Read where it
-        // passes the block's centre, where its heads stand and its
-        // ceiling is measured, when the line's point nearest that centre
-        // lies on the block: a line one rank deep, shot along at a slant,
-        // has its centre off to the side of the shot.
-        for b in blocks {
-            let s = (b.rect.centre - from.xz()).dot(dir);
-            if !(2.0..=d - 2.0).contains(&s) {
-                continue;
-            }
-            if b.rect.distance(from.xz() + dir * s) > 0.0 {
-                continue;
-            }
-            if arc_y(s, tan, vv) < b.top {
-                lofted = true;
-                break;
-            }
-        }
+        lofted = !flat_clears(from, dir, d, blocks, |s| arc_y(s, tan, vv), terrain);
     }
     // Ground RISING above the shooter's feet blocks the flat shot where
     // the arc passes under a head standing on it: firing up a slope, the
@@ -341,6 +335,47 @@ pub fn solve_launch(from: Vec3, to: Vec3, blocks: &[LoftBlock], terrain: &crate:
     let cos = 1.0 / (1.0 + tan * tan).sqrt();
     let speed = vv.sqrt();
     Some(Vec3::new(dir.x * speed * cos, speed * tan * cos, dir.y * speed * cos))
+}
+
+/// The flat arc `arc_y` (height at distance s along the line) from `from`
+/// along `dir` for `d` metres passes over every friendly block in `blocks`
+/// too high to strike a man of it. An arc is a curve with its top between
+/// its ends, so over the stretch of the line inside a block it is lowest
+/// at the stretch's ends: there it must be over the heads of the men
+/// standing on the ground below by more than a shaft's hit band
+/// (`HIT_OVER_HEAD`, the test `update_arrows` strikes a man by). In a block
+/// the shooter stands in, his own, the stretch begins at the near edge of
+/// the body of the man a rank ahead of him; it ends LOFT_NEAR_TARGET short
+/// of the man aimed at, where the shaft comes down on him. On a map with
+/// blocked ground an end over ground on another level than the block's
+/// own (past the wall's face, over its parapet) reads the block's ground,
+/// where its men stand. Per block a slab test, and for a block the line
+/// crosses two heights read.
+fn flat_clears(
+    from: Vec3,
+    dir: Vec2,
+    d: f32,
+    blocks: &[LoftBlock],
+    arc_y: impl Fn(f32) -> f32,
+    terrain: &crate::terrain::Terrain,
+) -> bool {
+    let levels = terrain.kind.has_blocked_ground();
+    let end = d - LOFT_NEAR_TARGET;
+    blocks.iter().all(|b| {
+        let Some((s0, s1)) = b.rect.line_span(from.xz(), dir) else { return true };
+        let s0 = if s0 <= 0.0 { b.rank - HIT_RADIUS } else { s0 };
+        let s1 = s1.min(end);
+        if s0 > s1 {
+            return true;
+        }
+        [s0, s1].into_iter().all(|s| {
+            let q = from.xz() + dir * s;
+            let ground = terrain.height_at(q.x, q.y);
+            let half = 0.5 * b.head;
+            let floor = if levels && crate::sim::soldier::levels_apart(ground - b.floor, half, half) { b.floor } else { ground };
+            arc_y(s) > floor + b.head + HIT_OVER_HEAD
+        })
+    })
 }
 
 /// The arc `arc_y` (height at distance s along the line) from `from`
@@ -531,9 +566,9 @@ fn update_arrows(
             let arrow_y = prev.y + (p.y - prev.y) * t;
             let hh = crate::unit_types::half_height(units.kind[u] as usize);
             let uy = units.pos[u].y;
-            // The top margin stays below the launch height
+            // The top margin (HIT_OVER_HEAD) stays below the launch height
             // (LAUNCH_OVER_HEAD) or shooters hit themselves.
-            if arrow_y < uy - hh || arrow_y > uy + hh + 0.05 {
+            if arrow_y < uy - hh || arrow_y > uy + hh + HIT_OVER_HEAD {
                 return;
             }
             if best.is_none_or(|(bt, _)| t < bt) {
@@ -925,6 +960,65 @@ mod tests {
     use super::*;
     use crate::terrain::{build_terrain, MapKind};
     use crate::town_layout::{WALK, WALL_Z};
+
+    /// The pitch of a launch above the flat: rise over run.
+    fn climb(v: Vec3) -> f32 {
+        v.y / v.xz().length()
+    }
+
+    /// A flat shot over a friendly block that stands up to the man aimed
+    /// at clears the block's middle, where its arc is highest, with room
+    /// to spare, and comes down into the heads of its far ranks: it is
+    /// lofted. With nothing in the way the same shot is flat.
+    #[test]
+    fn a_flat_arc_over_a_block_is_read_where_it_leaves_the_block() {
+        let terrain = build_terrain(MapKind::Grassland);
+        let h = |p: Vec2| terrain.height_at(p.x, p.y);
+        let tallest = crate::unit_types::tallest();
+        let (a, b) = (Vec2::ZERO, Vec2::new(0.0, 100.0));
+        let from = Vec3::new(a.x, h(a) + tallest + LAUNCH_OVER_HEAD, a.y);
+        let to = Vec3::new(b.x, h(b) + AIM_HEIGHT * tallest, b.y);
+        let flat = solve_launch(from, to, &[], &terrain).expect("a shot");
+        assert!(climb(flat) < 0.4, "the open shot is flat: {}", climb(flat));
+        let centre = Vec2::new(0.0, 50.0);
+        let block = LoftBlock {
+            rect: crate::formation::BlockRect { centre, fwd: Vec2::Y, half_w: 5.0, half_d: 48.0 },
+            floor: h(centre),
+            head: tallest,
+            rank: 1.5,
+        };
+        // The flat arc at the block's middle, 1.3 m over its heads and more.
+        let (vh, tan) = (flat.xz().length(), climb(flat));
+        let arc = |s: f32| from.y + s * tan - missile::GRAVITY * s * s / (2.0 * vh * vh);
+        assert!(arc(50.0) > block.floor + tallest + 1.3);
+        let shot = solve_launch(from, to, &[block], &terrain).expect("a shot");
+        assert!(climb(shot) > 0.7, "the shot over the block is lofted: {}", climb(shot));
+    }
+
+    /// Archers four ranks deep on the walk shooting down at a man 30 m out
+    /// at the wall's foot: the flat shot of a man of the rear rank comes
+    /// down through the heads of the ranks before him, so he lofts; a man
+    /// of the front rank has nobody of his before him and shoots flat.
+    #[test]
+    fn a_rear_rank_on_the_walk_lofts_over_its_front_ranks() {
+        let terrain = build_terrain(MapKind::WallDebug);
+        let tallest = crate::unit_types::tallest();
+        let rank = 1.1;
+        let centre = Vec2::new(120.0, WALL_Z);
+        let block = LoftBlock {
+            rect: crate::formation::BlockRect { centre, fwd: Vec2::Y, half_w: 10.0, half_d: 1.5 * rank + HIT_RADIUS },
+            floor: terrain.height_at(centre.x, centre.y),
+            head: tallest,
+            rank,
+        };
+        let man = Vec2::new(120.0, WALL_Z + 30.0);
+        let to = Vec3::new(man.x, terrain.height_at(man.x, man.y) + AIM_HEIGHT * tallest, man.y);
+        let launch = |z: f32| Vec3::new(centre.x, block.floor + tallest + LAUNCH_OVER_HEAD, z);
+        let rear = solve_launch(launch(WALL_Z - 1.5 * rank), to, &[block], &terrain).expect("a shot");
+        assert!(climb(rear) > 0.7, "the rear rank's shot is lofted: {}", climb(rear));
+        let front = solve_launch(launch(WALL_Z + 1.5 * rank), to, &[block], &terrain).expect("a shot");
+        assert!(climb(front) < 0.4, "the front rank's shot is flat: {}", climb(front));
+    }
 
     /// A straight shot from the slope at a man standing on the walk
     /// behind a merlon meets the merlon, from every distance: the read

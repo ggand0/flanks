@@ -669,6 +669,33 @@ impl BlockRect {
         self.centre + right * across + self.fwd * along
     }
 
+    /// The stretch of the line `from + dir * s` (`dir` a unit vector)
+    /// inside the block: the distances along it where it enters and where
+    /// it leaves, either below zero behind `from`; None where it misses.
+    pub fn line_span(&self, from: Vec2, dir: Vec2) -> Option<(f32, f32)> {
+        let d = from - self.centre;
+        if self.fwd == Vec2::ZERO {
+            let b = d.dot(dir);
+            let disc = b * b - (d.length_squared() - self.half_w * self.half_w);
+            return (disc >= 0.0).then(|| (-b - disc.sqrt(), -b + disc.sqrt()));
+        }
+        let right = Vec2::new(self.fwd.y, -self.fwd.x);
+        let (mut lo, mut hi) = (f32::NEG_INFINITY, f32::INFINITY);
+        for (axis, half) in [(right, self.half_w), (self.fwd, self.half_d)] {
+            let (at, along) = (d.dot(axis), dir.dot(axis));
+            if along.abs() < 1e-9 {
+                if at.abs() > half {
+                    return None;
+                }
+                continue;
+            }
+            let (a, b) = ((-half - at) / along, (half - at) / along);
+            lo = lo.max(a.min(b));
+            hi = hi.min(a.max(b));
+        }
+        (lo <= hi).then_some((lo, hi))
+    }
+
     /// The distance from `p` to the nearest point of the block, 0 inside.
     pub fn distance(&self, p: Vec2) -> f32 {
         let d = p - self.centre;
@@ -694,6 +721,12 @@ pub fn block_rect(gd: &GroupData) -> BlockRect {
 /// `centre` is its anchor, the dressed formation rather than the men's
 /// average, which stragglers drag off it.
 pub fn block_rect_at(gd: &GroupData, centre: Vec2) -> BlockRect {
+    block_rect_with(gd, centre, 1.0)
+}
+
+/// The block of a regiment as it stands about `centre`, `margin` metres
+/// past its outer places on every side (a blob's disc as it is).
+pub fn block_rect_with(gd: &GroupData, centre: Vec2, margin: f32) -> BlockRect {
     if gd.shape == FormShape::Blob || gd.files == 0 {
         let r = if gd.radius > 0.0 { gd.radius } else { blob_radius(gd.count) };
         return BlockRect { centre, fwd: Vec2::ZERO, half_w: r, half_d: r };
@@ -701,8 +734,8 @@ pub fn block_rect_at(gd: &GroupData, centre: Vec2) -> BlockRect {
     BlockRect {
         centre,
         fwd: facing_dir(gd.facing),
-        half_w: half_width(gd) + 1.0,
-        half_d: front_offset(gd) + 1.0,
+        half_w: half_width(gd) + margin,
+        half_d: front_offset(gd) + margin,
     }
 }
 

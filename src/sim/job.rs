@@ -1842,24 +1842,26 @@ fn clear_blocks_near(
     clear_blocks
 }
 
-/// Each team's live formed regiments as blocks with a clearance ceiling.
+/// Each team's live formed regiments as the loft test reads them.
 #[inline]
 fn loft_blocks(groups: &Groups, terrain: &Terrain) -> [Vec<crate::arrows::LoftBlock>; 2] {
-    // Friendly blocks per team for the loft-over-friendlies check: every
-    // live formed regiment as its block (`formation::block_rect`) with a
-    // clearance ceiling. A shooter's own regiment is in here too: that is
-    // what makes rear ranks loft over their own front rank, and a line one
-    // rank deep has nothing of its own before it. The ceiling is 1.3 m
-    // over the heads at the block's centre.
-    let ceiling = crate::unit_types::tallest() + 1.3;
+    // Friendly blocks per team for the loft-over-friendlies check
+    // (arrows.rs `flat_clears`): every live formed regiment as the ground
+    // its men's bodies take up (its outer places and a body's hit radius
+    // past them), the ground under its centroid, its men's height and its
+    // rank pitch. A shooter's own regiment is in here too: that is what
+    // makes rear ranks loft over their own front rank, and a line one
+    // rank deep has nothing of its own before it.
     [0u8, 1u8].map(|tm| {
         groups
             .list
             .iter()
             .filter(|g| g.team == tm && g.count > 0 && !g.state.is_broken())
             .map(|g| crate::arrows::LoftBlock {
-                rect: crate::formation::block_rect(g),
-                top: terrain.height_at(g.centroid.x, g.centroid.y) + ceiling,
+                rect: crate::formation::block_rect_with(g, g.centroid, crate::arrows::HIT_RADIUS),
+                floor: terrain.height_at(g.centroid.x, g.centroid.y),
+                head: 2.0 * crate::unit_types::half_height(g.kind as usize),
+                rank: crate::formation::grid(g).2.y,
             })
             .collect()
     })
