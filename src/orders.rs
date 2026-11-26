@@ -851,18 +851,22 @@ pub fn log_order(t: f32, g: usize, gd: &GroupData, what: &str) {
 
 /// Lay `picked` regiments along a lane from `a` toward `b` (a click is
 /// `a == b`): each block faces out, its places are the lane's pitch apart
-/// (`formation::lane_pitch`), its ranks are as many as the lane holds at
-/// that pitch, its files run along the lane as far as its share of the
-/// drag or as far as its men need in those ranks, whichever is more, and
-/// its run slides along the lane past the runs the team's other
-/// regiments hold (`free_run`). The regiments keep their order along the
-/// drag, each run after the one before it.
+/// with every other rank shifted half a file (`formation::lane_pitch`,
+/// `lane_stagger`), its ranks are as many as the lane holds at that
+/// pitch, its files are the fewest its men need in those ranks and one
+/// more for each file's pitch of its share of the drag, and its run
+/// slides along the lane past the runs the team's other regiments hold
+/// (`free_run`). A run that starts on another regiment's run is laid
+/// behind it instead, in the rows that run leaves free (`behind_run`).
+/// The regiments keep their order along the drag, each run after the one
+/// before it.
 ///
 /// A regiment gets a placement only where its whole run is on the lane
-/// and clear of every other run: where the drawn width has no such
-/// stretch it takes the least width its ranks allow, and where that has
-/// none either it gets no placement and keeps the order it had. Places
-/// are never laid past the lane's ends or over another regiment's.
+/// and clear of every other run, or behind them: where the drawn width
+/// has no such stretch beside the runs it takes the least width its ranks
+/// allow, and where that has none either it gets no placement and keeps
+/// the order it had. Places are never laid past the lane's ends or over
+/// another regiment's.
 fn lane_layout(groups: &Groups, lane: &Lane, picked: &[usize], a: Vec2, b: Vec2) -> Vec<LinePlacement> {
     let dir = if b.x >= a.x { 1.0 } else { -1.0 };
     let facing = lane.facing();

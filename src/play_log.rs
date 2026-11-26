@@ -179,8 +179,8 @@ fn snapshot(
     let t = time.elapsed_secs();
     if let Some(cam) = camera.iter().next() {
         let (p, f) = (cam.translation(), cam.forward());
-        // Where the camera's middle meets the ground's plane at its own
-        // height less the ground's: the spot it looks at, near enough.
+        // Where the camera's middle line meets the plane y = 0: the spot
+        // it looks at, near enough.
         let ahead = if f.y < -1e-3 { p + *f * (p.y / -f.y) } else { p };
         let _ = writeln!(
             file,

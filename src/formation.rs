@@ -90,9 +90,9 @@ const FILE_ORDER_PERIOD: u32 = 8;
 /// is settling into it, and may trade it with a neighbour also settling
 /// (`keep_places_in_order`); a man farther along is still on his way.
 const SETTLE_NEAR: f32 = 2.5;
-/// How much nearer (m², the two men's squared distances to their places
-/// summed) a trade has to bring two settling men before they make it: men
-/// jostled a little off their places keep them.
+/// How much nearer (square metres, the two men's squared distances to
+/// their places summed) a trade has to bring two settling men before they
+/// make it: men jostled a little off their places keep them.
 const SETTLE_GAIN: f32 = 0.5;
 
 /// A regiment coming onto a lane (town_layout.rs `Lane`) fills its run
@@ -180,9 +180,9 @@ impl FormSpacing {
 /// keep without pushing each other, and every other rank stands shifted
 /// half a file (`lane_stagger`), so a man stands between the two men
 /// ahead of him and the ranks come closer: the depth at which those two
-/// are at the rest distance from him too. The 6 m walk holds six ranks
-/// where it held five straight behind each other; the other spacings
-/// keep their own pitch, unshifted.
+/// are at the rest distance from him too. The 6 m walk holds six such
+/// ranks, against five standing straight behind each other; the other
+/// spacings keep their own pitch, unshifted.
 pub fn lane_pitch(spacing: FormSpacing, kind: u8) -> Vec2 {
     match spacing {
         FormSpacing::Normal => {
@@ -450,7 +450,7 @@ pub fn facing_of(dir: Vec2) -> f32 {
 /// its rank's files, as near the middle as they go: centred freely, it
 /// could stand a man straight behind another at the ranks' close depth.
 /// The one grid used by slot assignment AND the drag-order placement
-/// preview — what you see is where they stand.
+/// preview: what you see is where they stand.
 pub fn slot_offsets(n: usize, files: usize, pitch: Vec2, stagger: f32) -> Vec<Vec2> {
     let files = files.clamp(1, n.max(1));
     let ranks = n.div_ceil(files);
@@ -1089,7 +1089,10 @@ pub(crate) fn stands_on_lane(gd: &GroupData, lane: &crate::town_layout::Lane) ->
 /// places, so nobody has to pass anybody along a walk too narrow to
 /// pass on. The men on the lane also keep their order along it. One test
 /// per man still on his way and one pass over the men there per tick,
-/// nothing once they are all there; a new order or a fight ends it.
+/// until they are all there; a new order or a fight ends it. Every
+/// `FILE_ORDER_PERIOD` ticks the men of a regiment standing on the lane
+/// who are settling into their places trade crossed ones
+/// (`keep_places_in_order`).
 fn fill_lane_slots(
     mut units: ResMut<Units>,
     mut groups: ResMut<Groups>,

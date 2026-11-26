@@ -516,8 +516,8 @@ fn share_columns(job: &mut TickJob, units: &Units) {
 /// edge (`firing_place`), then it stands and shoots. It shoots on until
 /// the gap passes the range; the band between is the hysteresis that
 /// keeps a block from marching and halting by turns. The place and the
-/// range are measured with one reach (`firing_place`), so the band is
-/// this share of it against a target at any speed.
+/// range are measured with one reach (`firing_place`), so the band is at
+/// least the rest of it, a fifth, against a target at any speed.
 const CLOSE_IN: f32 = 0.8;
 /// The time an enemy block takes to reach a regiment that counts as
 /// coming for it (seconds): the skirmish trigger and, with skirmish off,
@@ -645,10 +645,9 @@ fn frame_in_bow_range(
 ///
 /// The reach is the one the range test reads (`bow_reach_toward`) against
 /// a target going away, so the regiment closes in farther on it and the
-/// place stands CLOSE_IN inside the range whatever the target's speed;
-/// laid from the standing reach it stood at the range's edge against a
-/// target going away fast enough, and the regiment marched and halted by
-/// turns. Against a target that stands or comes it is the standing
+/// place stands the rest of that reach past CLOSE_IN, a fifth, inside the
+/// range whatever the target's speed. Against a target that stands or
+/// comes it is the standing
 /// reach: a target coming on does not move the place back through the
 /// regiment's own men.
 fn firing_place(g: &GroupData, t: &GroupData, t_vel: Vec2, terrain: &Terrain) -> Vec2 {

@@ -271,11 +271,11 @@ pub struct LoftBlock {
     pub top: f32,
 }
 
-/// Solve a launch velocity from `from` to `to` (M2TW model: the engine
-/// picks a speed in the 20..48 m/s band and an arc that fits). The flat
+/// Solve a launch velocity from `from` to `to`: a speed in the 20..48 m/s
+/// band and an arc that fits. The flat
 /// low-root solution at full draw when the path clears every friendly
 /// block and the ground en route; otherwise the slowest lofted arc that
-/// reaches, a high lob just over the crowd (M2TW's loft-over-friendlies;
+/// reaches, a high lob just over the crowd (the loft over friendlies;
 /// the ~65 degree max angle emerges from the speed floor), when that arc
 /// clears the ground; otherwise None: no arc reaches the man without
 /// striking the ground, a wall, its parapet or its merlons first, and
@@ -349,7 +349,7 @@ pub fn solve_launch(from: Vec3, to: Vec3, blocks: &[LoftBlock], terrain: &crate:
 /// standing on ground that rises above the shooter's feet. Over the last
 /// `NEAR_TARGET` metres the shaft comes down on the man, so ground there
 /// no higher than his own does not count; a wall or its battlements
-/// before him do. Read every `d / 24` metres and at least every 4, and
+/// before him do. Read every `d / 24` metres, never closer than 4, and
 /// near a piece every fine cell (terrain.rs `fine`), so a parapet, a
 /// merlon, a wall's face or a house in the way is met.
 fn arc_clears(
@@ -367,10 +367,10 @@ fn arc_clears(
     let head = crate::unit_types::tallest() + 0.2;
     let coarse = (d / 24.0).max(4.0);
     let fine = terrain.fine();
-    // Over the wall's pieces from just past his own body: the parapet or
-    // the merlon he stands behind is less than a metre before him. The
-    // vertex grid has nothing that near, and its reads start 2 m out. His
-    // own rank's heads count from 2 m.
+    // On a map with the wall's pieces, from just past his own body: the
+    // parapet or the merlon he stands behind is less than a metre before
+    // him. The vertex grid has nothing that near, and its reads start 2 m
+    // out. His own rank's heads count from 2 m.
     let mut s = if fine.is_some() { crate::town_layout::FINE } else { 2.0 };
     while s < d {
         let p = from.xz() + dir * s;
@@ -497,8 +497,8 @@ fn update_arrows(
         (arrows.yaw[i], arrows.pitch[i]) = flight_angles(v);
         arrows.age[i] = arrows.age[i].saturating_add(1);
 
-        // Over the wall's pieces the whole step is read, not its end: a
-        // merlon or a rail is thinner than an arrow's step.
+        // Near a piece the whole step is read, not its end: a merlon or a
+        // rail is thinner than an arrow's step.
         let wall_t = flight_hit(&terrain, prev, p);
         let ground = terrain.height_at(p.x, p.z);
         if wall_t.is_none() && p.y.min(prev.y) > ground + strike_band {
@@ -566,7 +566,7 @@ fn update_arrows(
             }
         }
 
-        // Stone or ground over the wall's pieces, struck inside the step:
+        // Stone or ground near a piece, struck inside the step:
         // planted where it struck.
         if let Some(t) = wall_t {
             let q = prev.lerp(p, t);

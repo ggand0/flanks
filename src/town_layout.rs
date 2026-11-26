@@ -75,7 +75,7 @@ const RAIL: f32 = 0.5;
 /// How far the stair's rail, the walk's inner kerb and its outer parapet
 /// rise over the floor beside them (m), and the merlons' tips over the
 /// walk: one merlon 1 m wide at the middle of each 2 m wall unit, 1 m
-/// gaps between (docs/plans/028-wall-models.md). A drum's roof has the
+/// gaps between, as in the wall's models. A drum's roof has the
 /// same parapet and merlons around its rim.
 const KERB: f32 = 0.5;
 const MERLON: f32 = 1.5;
@@ -633,20 +633,20 @@ const F_SOLID: u8 = 2;
 
 /// The ground over the pieces as the sim reads it, on a `FINE` grid: per
 /// cell, whether a man may stand there and which piece's surface it is.
-/// The 2 m vertex grid can open only whole 2 m squares, so a stair whose
-/// clear tread is 3.5 m wide opened one row of vertices and a man's
-/// centre 0.8 m of it; and a point beside a face blended the two levels
-/// across the cell. Read here, a man stands where the model's floor is,
-/// at the floor's own height.
+/// The 2 m vertex grid can open only whole 2 m squares, so on a stair
+/// whose clear tread is 3.5 m wide it opens one row of vertices and gives
+/// a man's centre 0.75 m of it, and a point beside a face blends the two
+/// levels across the cell. Read here, a man stands where the model's
+/// floor is, at the floor's own height.
 ///
 /// A cell is solid where its centre is on a piece's solid part, clear
 /// where it is on a piece's clear surface and on no solid part, and
 /// otherwise off the pieces, where the drawn ground's own step rule
 /// (`natural_blocked`) decides. A clear or natural cell is also blocked
 /// where it lies a `STEP` or more above or below a 4-neighbour that is
-/// not solid: an end tower's passage onto air. Its height is the drawn ground plus the
-/// piece's (`Piece::raise`), exact at any point, so the stair is one
-/// slope from its foot to its platform.
+/// not solid: an end tower's passage onto air. Its height is the drawn
+/// ground plus the piece's (`Piece::raise`), exact at any point, so the
+/// stair is one slope from its foot to its platform.
 #[derive(Clone)]
 pub struct FineGround {
     origin: Vec2,
@@ -832,8 +832,8 @@ pub fn fine_ground(
     ground: impl Fn(Vec2) -> f32,
     natural_blocked: impl Fn(Vec2) -> bool,
 ) -> FineGround {
-    // The pieces' bounds and a metre more: the stair's return rail
-    // reaches a metre past its own.
+    // The pieces' bounds and 2 m more on every side: the stair's return
+    // rail reaches a metre past its own.
     let (mut lo, mut hi) = (Vec2::splat(f32::INFINITY), Vec2::splat(f32::NEG_INFINITY));
     for p in pieces {
         let (a, b) = p.bounds();

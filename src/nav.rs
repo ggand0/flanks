@@ -1129,8 +1129,6 @@ fn octile(a: Vec2, b: Vec2) -> f32 {
     hi + (std::f32::consts::SQRT_2 - 1.0) * lo
 }
 
-/// One-dimensional squared distance transform (Felzenszwalb and
-/// Huttenlocher): `out[q] = min_p (q - p)^2 + f[p]`.
 /// The Euclidean distance (m) from each cell of a `w` by `h` grid of
 /// `cell`-metre cells to the nearest cell that is not `open`, capped at
 /// `cap`; cells beyond the grid count as open. The transform of
@@ -1157,6 +1155,8 @@ pub(crate) fn clearance(open: &[bool], w: usize, h: usize, cell: f32, cap: f32) 
     f.iter().map(|&d2| ((d2.sqrt() as f32) * cell).min(cap)).collect()
 }
 
+/// One-dimensional squared distance transform (Felzenszwalb and
+/// Huttenlocher): `out[q] = min_p (q - p)^2 + f[p]`.
 fn edt_1d(f: &[f64], out: &mut [f64], v: &mut [usize], z: &mut [f64]) {
     let n = f.len();
     if n == 0 {
