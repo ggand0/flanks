@@ -139,8 +139,9 @@ pub(super) fn audit_stats(stats: &mut SimStats, sums: &NeighbourSums, pos: &[Vec
 /// cadence (every 150 ticks, or every FL_HASH=n ticks), the bit-identity
 /// gate for refactors and optimisations. Log samplers ride wall time, so
 /// the same binary logs different casualty digits run to run and log
-/// diffs prove nothing; equal hashes at equal ticks do.
-pub(super) fn fingerprint(tick: u32, units: &Units) {
+/// diffs prove nothing; equal hashes at equal ticks do. `now` prints it
+/// on this tick whether FL_HASH is set or not.
+pub(super) fn fingerprint(tick: u32, now: bool, units: &Units) {
     let Units {
         pos,
         yaw,
@@ -156,9 +157,7 @@ let hash_every = *HASH_EVERY.get_or_init(|| {
     let n: u32 = std::env::var("FL_HASH").ok()?.parse().unwrap_or(0);
     Some(if n > 1 { n } else { 150 })
 });
-if let Some(every) = hash_every
-    && tick.is_multiple_of(every)
-{
+if now || hash_every.is_some_and(|every| tick.is_multiple_of(every)) {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for i in 0..pos.len() {
         for v in [

@@ -9,6 +9,7 @@ mod balance;
 mod banners;
 mod battle_setup;
 mod camera;
+mod cli;
 mod combat;
 mod fatigue;
 mod formation;
@@ -125,6 +126,7 @@ fn window_position() -> bevy::window::WindowPosition {
 }
 
 fn main() {
+    cli::init();
     // Load before the App so the window opens with the saved video
     // settings instead of switching modes one frame in.
     let user_settings = settings::Settings::load();
@@ -198,8 +200,9 @@ fn main() {
             picker::PickerPlugin,
             frame_log::FrameLogPlugin,
             sprite_bake::SpriteBakePlugin,
+            cli::CliPlugin,
         ))
-        .insert_resource(Time::<Fixed>::from_hz(30.0))
+        .insert_resource(Time::<Fixed>::from_hz(game_state::SIM_HZ))
         // A frame that overruns makes the fixed clock owe catch-up sim
         // ticks, which Bevy runs back to back the next frame (default
         // max_delta 250 ms = up to 7 ticks at 30 Hz). Every tick after

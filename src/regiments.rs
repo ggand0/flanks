@@ -164,11 +164,32 @@ fn archetype_jittered(idx: usize, n_regs: usize, seed: u32) -> [usize; NUM_KINDS
     )
 }
 
-fn time_seed() -> u32 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(7)
+/// The roll behind a battle's enemy army. With `--seed` it comes from the
+/// seed and the count of rolls before it, so a launch rolls the same
+/// armies in the same order; without, from the clock. Each roll is logged.
+fn army_roll() -> u32 {
+    static ROLLS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let k = ROLLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let roll = match crate::cli::args().seed {
+        Some(seed) => {
+            let mut x = seed.wrapping_mul(0x85EB_CA77) ^ k.wrapping_mul(0x9E37_79B1) ^ 0x5bd1_e995;
+            x ^= x >> 15;
+            x = x.wrapping_mul(0x2c1b_3c6d);
+            x ^ (x >> 12)
+        }
+        None => std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(7),
+    };
+    info!(
+        "[seed] enemy army roll {roll} (roll {k}, {})",
+        match crate::cli::args().seed {
+            Some(seed) => format!("from --seed {seed}"),
+            None => "from the clock".to_string(),
+        }
+    );
+    roll
 }
 
 /// Spawn one regiment block (units + GroupData). `dir` faces the enemy
@@ -452,10 +473,10 @@ fn army_comp(team: u8, config: &crate::game_state::BattleConfig, n_regs: usize, 
                 EnemyComp::Style(idx) => {
                     let idx = idx.min(ARCHETYPES.len() - 1);
                     info!("enemy army style: {}", archetype_name(idx));
-                    archetype_jittered(idx, n_regs, time_seed())
+                    archetype_jittered(idx, n_regs, army_roll())
                 }
                 EnemyComp::Random => {
-                    let seed = time_seed();
+                    let seed = army_roll();
                     let idx =
                         (hash01(seed) * ARCHETYPES.len() as f32) as usize % ARCHETYPES.len();
                     info!("enemy army style: {}", archetype_name(idx));

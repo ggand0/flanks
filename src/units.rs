@@ -217,9 +217,10 @@ pub fn hash01(mut x: u32) -> f32 {
     (x >> 8) as f32 / 16_777_216.0
 }
 
-/// FL_SEED: offsets every per-unit spawn hash — perturbation runs for
-/// battle-outcome sensitivity sweeps (the sim itself is deterministic,
-/// so run-to-run variance must be injected at spawn). Apply it where a
+/// FL_SEED (or `--seed`, which takes its place): offsets every per-unit
+/// spawn hash, for perturbation runs in battle-outcome sensitivity sweeps
+/// (the sim itself is deterministic, so run-to-run variance must be
+/// injected at spawn). Apply it where a
 /// seed is BUILT, not inside `push_unit`: the positional jitter is
 /// computed at the call sites, and a seed offset applied further down
 /// would leave every run with identical formation geometry.
@@ -229,7 +230,10 @@ pub fn spawn_seed(raw: u32) -> u32 {
 
 fn spawn_seed_offset() -> u32 {
     static S: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *S.get_or_init(|| crate::util::env_or("FL_SEED", 0u32).wrapping_mul(0x9E37_79B1))
+    *S.get_or_init(|| {
+        let seed = crate::cli::args().seed.unwrap_or_else(|| crate::util::env_or("FL_SEED", 0u32));
+        seed.wrapping_mul(0x9E37_79B1)
+    })
 }
 
 /// Append one fully-initialized unit to every SoA column. `anchor` is the

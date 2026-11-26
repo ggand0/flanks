@@ -380,7 +380,9 @@ impl Plugin for GameShellPlugin {
             .configure_sets(
                 FixedUpdate,
                 SimSet.run_if(
-                    in_state(GameState::Battle).and_then(not(deploying)),
+                    in_state(GameState::Battle)
+                        .and_then(not(deploying))
+                        .and_then(crate::cli::under_tick_limit),
                 ),
             )
             .configure_sets(

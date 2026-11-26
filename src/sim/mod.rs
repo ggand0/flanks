@@ -731,6 +731,7 @@ pub fn step_sim(
     mut dir_stats: ResMut<DirTestStats>,
     mut sounds: Option<ResMut<crate::audio::SoundEvents>>,
     mut routes: ResMut<route::Routes>,
+    clock: Res<crate::game_state::BattleClock>,
 ) {
     let _frame_log = crate::frame_log::time_step();
     let _tick_log = crate::frame_log::tick::time(crate::frame_log::tick::Part::Step);
@@ -813,7 +814,8 @@ pub fn step_sim(
     pipeline.tick = pipeline.tick.wrapping_add(1);
     let tick = pipeline.tick;
     let audit = job.audit.take();
-    audit_and_log(audit, tick, &units, &grid, &mut stats);
+    // A `--ticks` run's last tick prints its hash whether FL_HASH is set or not.
+    audit_and_log(audit, tick, crate::cli::last_tick(&clock), &units, &grid, &mut stats);
 
     pipeline.scratch = Some(job);
 }
@@ -844,11 +846,12 @@ fn install_job(job: &mut TickJob, u: &mut Units) {
 }
 
 /// The installed tick's numbers: the neighbour audit on its ticks, the
-/// FL_HASH fingerprint and the spike line.
+/// FL_HASH fingerprint (on its cadence, or `hash_now`) and the spike line.
 #[inline]
 fn audit_and_log(
     audit: Option<diag::NeighbourSums>,
     tick: u32,
+    hash_now: bool,
     units: &Units,
     grid: &SpatialGrid,
     stats: &mut SimStats,
@@ -865,7 +868,7 @@ fn audit_and_log(
             .unwrap_or_else(|| diag::neighbour_sums(grid, &units.pos_prev[..]));
         diag::audit_stats(stats, &sums, &units.pos[..], &units.pos_prev[..]);
     }
-    diag::fingerprint(tick, units);
+    diag::fingerprint(tick, hash_now, units);
     diag::spike_line(stats, tick, units.pos.len());
 }
 
