@@ -274,7 +274,7 @@ pub fn take_tick(
 
 /// FL_PIPELINE=0 computes every tick inline inside FixedUpdate, exactly
 /// as the sim ran before the tick left the frame path: the fallback and
-/// the A/B knob, bit-identical by FL_HASH.
+/// the A/B switch.
 fn pipeline_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| !std::env::var("FL_PIPELINE").is_ok_and(|v| v == "0"))
