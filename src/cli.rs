@@ -8,6 +8,10 @@
 //!   --headless  run the sim with no window, as fast as it goes (needs
 //!               --ticks); without --seed it takes the seed from FL_SEED
 //!   --speed X   the windowed game's time runs X times as fast
+//!   --shots N   save a picture every N sim ticks and at the run's last
+//!               tick (shots.rs); with --headless the run carries the
+//!               renderer, with no window
+//!   --shots-dir DIR  the pictures' folder
 //!
 //! Every FL_ switch keeps working beside these. An unknown flag prints the
 //! usage and quits with exit code 2.
@@ -26,14 +30,21 @@ pub struct Args {
     pub headless: bool,
     /// The windowed game's time speed.
     pub speed: Option<f64>,
+    /// A picture every this many sim ticks.
+    pub shots: Option<u32>,
+    /// The pictures' folder.
+    pub shots_dir: Option<std::path::PathBuf>,
 }
 
-const USAGE: &str = "usage: flanks [--ticks N] [--seed N] [--headless | --speed X]
+const USAGE: &str = "usage: flanks [--ticks N] [--seed N] [--headless | --speed X] [--shots N [--shots-dir DIR]]
   --ticks N   run N sim ticks of the battle, print its hash at tick N, then quit
   --seed N    fix the spawn offsets (as FL_SEED=N) and the enemy army's roll
   --headless  run the sim with no window as fast as it goes; needs --ticks,
               and without --seed takes its seed from FL_SEED (default 0)
-  --speed X   run the windowed game's time X times as fast (X > 0)";
+  --speed X   run the windowed game's time X times as fast (X > 0)
+  --shots N   save a picture every N sim ticks and at the run's last tick, as
+              tick-000150.png and so on; --headless then carries the renderer
+  --shots-dir DIR  the pictures' folder (default tmp/runs/shots/<start time>/)";
 
 static ARGS: std::sync::OnceLock<Args> = std::sync::OnceLock::new();
 
@@ -72,6 +83,8 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
             "--ticks" => args.ticks = Some(number("--ticks")?.max(1)),
             "--seed" => args.seed = Some(number("--seed")?),
             "--headless" => args.headless = true,
+            "--shots" => args.shots = Some(number("--shots")?.max(1)),
+            "--shots-dir" => args.shots_dir = Some(it.next().ok_or("--shots-dir needs a folder")?.into()),
             "--speed" => {
                 let v = it.next().ok_or("--speed needs a number")?;
                 match v.parse::<f64>() {
@@ -88,6 +101,9 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
     }
     if args.headless && args.ticks.is_none() {
         return Err("--headless needs --ticks".into());
+    }
+    if args.shots_dir.is_some() && args.shots.is_none() {
+        return Err("--shots-dir needs --shots".into());
     }
     if args.headless && args.speed.is_some() {
         return Err("--speed is for the windowed game; --headless runs as fast as it goes".into());
@@ -111,12 +127,21 @@ pub fn last_tick(clock: &BattleClock, outcome: &crate::ai::BattleOutcome) -> boo
     }
 }
 
-/// A `--ticks` run's wall clock, from the end of its first tick, and
-/// whether it has ended.
+/// A `--ticks` run's wall clock, from the end of its first tick, whether
+/// it has ended, and the work it waits for before the app quits (a
+/// picture still being written).
 #[derive(Resource, Default)]
 pub struct RunState {
     started: Option<std::time::Instant>,
     ended: bool,
+    pub holds: u32,
+}
+
+impl RunState {
+    /// The run's last tick has run.
+    pub fn ended(&self) -> bool {
+        self.ended
+    }
 }
 
 /// Logs the launch's seeds and ends a `--ticks` run with the run's
@@ -134,7 +159,8 @@ impl Plugin for CliPlugin {
             end_at_tick_limit
                 .after(crate::game_state::advance_battle_clock)
                 .in_set(SimSet),
-        );
+        )
+        .add_systems(Last, quit_when_done);
     }
 }
 
@@ -153,12 +179,11 @@ fn log_seed() {
 /// Ends a `--ticks` run at its limit, or on the tick after the battle was
 /// decided (the victory check runs after the install, so the decided
 /// state's hash is the next tick's), with the run's numbers.
-fn end_at_tick_limit(
+pub fn end_at_tick_limit(
     clock: Res<BattleClock>,
     outcome_now: Res<crate::ai::BattleOutcome>,
     mut run: ResMut<RunState>,
     mut decided: Local<crate::game_state::PerBattle<bool>>,
-    mut exit: MessageWriter<AppExit>,
 ) {
     let Some(limit) = args().ticks else { return };
     let started = *run.started.get_or_insert_with(std::time::Instant::now);
@@ -184,7 +209,13 @@ fn end_at_tick_limit(
         timed,
         if wall > 0.0 { timed as f64 / wall } else { 0.0 },
     );
-    exit.write(AppExit::Success);
+}
+
+/// Quits once the run has ended and nothing it waits for is pending.
+fn quit_when_done(run: Res<RunState>, mut exit: MessageWriter<AppExit>) {
+    if run.ended && run.holds == 0 {
+        exit.write(AppExit::Success);
+    }
 }
 
 /// The windowed game's time speed from `--speed`. The fixed tick keeps its
@@ -217,5 +248,12 @@ mod tests {
         assert!(parsed("--speed 0").is_err());
         assert!(parsed("--speed -1").is_err());
         assert!(parsed("--bogus").is_err());
+        assert_eq!(
+            parsed("--headless --ticks 9 --shots 3 --shots-dir x"),
+            Ok(Args { ticks: Some(9), headless: true, shots: Some(3), shots_dir: Some("x".into()), ..default() })
+        );
+        assert!(parsed("--shots").is_err());
+        assert!(parsed("--shots x").is_err());
+        assert!(parsed("--shots-dir x").is_err(), "a folder needs --shots");
     }
 }

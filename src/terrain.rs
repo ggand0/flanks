@@ -576,7 +576,7 @@ fn vertex_blocked(heights: &[f32], (verts_x, verts_z): (usize, usize), x: usize,
 
 /// Original heights identify exposed crater soil without changing the sim surface.
 #[derive(Resource, Default)]
-struct TerrainChunks {
+pub(crate) struct TerrainChunks {
     meshes: Vec<Handle<Mesh>>,
     original_heights: Vec<f32>,
     material: Option<Handle<GroundMaterial>>,
@@ -649,6 +649,32 @@ impl Plugin for TerrainPlugin {
             );
     }
 }
+
+/// The headless renderer's start: the launch's start waits
+/// (`StartHold`) until every ground texture is loaded, then a few frames
+/// more for the pipelines that draw them.
+pub(crate) fn release_start_when_ground_loaded(
+    mut commands: Commands,
+    chunks: Res<TerrainChunks>,
+    assets: Res<AssetServer>,
+    mut frames_since: Local<u32>,
+) {
+    let loaded = chunks.warm.iter().all(|h| assets.is_loaded_with_dependencies(h.id()))
+        && chunks.material.is_some();
+    if !loaded {
+        *frames_since = 0;
+        return;
+    }
+    *frames_since += 1;
+    if *frames_since == WARM_FRAMES {
+        commands.remove_resource::<crate::game_state::StartHold>();
+        info!("ground loaded: the battle starts");
+    }
+}
+
+/// Frames drawn after the ground is loaded before the headless renderer's
+/// battle starts.
+const WARM_FRAMES: u32 = 30;
 
 /// The terrain the sim walks on: built at launch from the chosen map and
 /// built again when the map changes (`MapRebuild`). The ground's meshes

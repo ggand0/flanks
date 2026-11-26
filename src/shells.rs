@@ -3,7 +3,8 @@
 //! window's side: the drawing, the sound, the camera, the menus and the
 //! player's input. The windowed game runs both on bevy's default plugins;
 //! the headless run (`--headless`) runs the sim group alone on bevy's
-//! minimal plugins, one sim tick per app update. The shells differ only
+//! minimal plugins, one sim tick per app update, and with `--shots` runs
+//! both groups with no window (`headless_render`). The shells differ only
 //! in the groups they load, in how time advances and in how the battle
 //! starts: headless opens no menu and no deployment.
 
@@ -65,6 +66,7 @@ impl PluginGroup for ViewPlugins {
             .add(crate::picker::PickerPlugin)
             .add(crate::frame_log::FrameLogPlugin)
             .add(crate::sprite_bake::SpriteBakePlugin)
+            .add(crate::shots::ShotsPlugin)
     }
 }
 
@@ -93,6 +95,25 @@ pub fn headless(app: &mut App, task_pools: bevy::app::TaskPoolOptions) {
     .add_systems(Last, one_tick_per_update);
 }
 
+/// The headless renderer (`--headless --shots N`): the windowed game's
+/// sim and view groups on bevy's default plugins with no window and no
+/// window event loop, the camera drawing into an image. Time moves as in
+/// `headless`, one tick per update, and the battle starts once the
+/// ground is loaded, with no deployment.
+pub fn headless_render(app: &mut App) {
+    let tick = fixed_time().timestep();
+    app.insert_resource(crate::game_state::LaunchPlan { autostart: true, deployment: false })
+        .insert_resource(crate::game_state::StartHold)
+        .add_plugins(bevy::app::ScheduleRunnerPlugin::run_loop(std::time::Duration::ZERO))
+        .insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(tick))
+        .add_systems(
+            Update,
+            crate::terrain::release_start_when_ground_loaded
+                .run_if(resource_exists::<crate::game_state::StartHold>),
+        )
+        .add_systems(Last, one_tick_per_update);
+}
+
 /// The headless loop's promise: once a battle runs, each app update adds
 /// exactly one to its clock. A run that breaks it stops with the ticks it
 /// saw, since its hashes would no longer stand for the same ticks as the
@@ -100,8 +121,13 @@ pub fn headless(app: &mut App, task_pools: bevy::app::TaskPoolOptions) {
 fn one_tick_per_update(
     clock: Res<crate::game_state::BattleClock>,
     state: Res<State<crate::game_state::GameState>>,
+    run: Res<crate::cli::RunState>,
     mut last: Local<Option<(u32, u32)>>,
 ) {
+    // After the last tick the app only waits for its pictures.
+    if run.ended() {
+        return;
+    }
     if *state.get() != crate::game_state::GameState::Battle {
         *last = None;
         return;

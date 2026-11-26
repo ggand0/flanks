@@ -646,7 +646,7 @@ fn build_frame_params(
     ),
     groups: Res<crate::orders::Groups>,
     time: Res<Time>,
-    fixed_time: Res<Time<Fixed>>,
+    (fixed_time, shots): (Res<Time<Fixed>>, Option<Res<crate::shots::Shots>>),
     lod_cfg: Res<LodConfig>,
     camera: Query<(Entity, &Camera, &Projection, &Transform), With<Camera3d>>,
     lights: Query<(
@@ -721,7 +721,7 @@ fn build_frame_params(
         *plane = half_space.normal_d();
     }
     p.cam_pos = cam_tf.translation;
-    p.alpha = fixed_time.overstep_fraction();
+    p.alpha = crate::shots::Shots::render_alpha(shots.as_deref(), &fixed_time);
     p.k_walk = (dt / 0.25).min(1.0);
     p.k_band = (dt / 0.35).min(1.0);
     p.k_wall = (dt / 0.5).min(1.0);

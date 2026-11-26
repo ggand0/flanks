@@ -683,13 +683,14 @@ pub fn reset(arrows: &mut Arrows, spawns: &mut ArrowSpawns, stuck: &mut StuckArr
 fn sync_arrow_instances(
     arrows: Res<Arrows>,
     fixed: Res<Time<Fixed>>,
+    shots: Option<Res<crate::shots::Shots>>,
     mut query: Query<&mut InstanceMaterialData, With<ArrowBucket>>,
 ) {
     let _timed = Timed(&ARROW_PACK_NS, std::time::Instant::now());
     let Ok(mut data) = query.single_mut() else {
         return;
     };
-    let alpha = fixed.overstep_fraction();
+    let alpha = crate::shots::Shots::render_alpha(shots.as_deref(), &fixed);
     data.0.clear();
     data.0.reserve(arrows.len());
     for i in 0..arrows.len() {

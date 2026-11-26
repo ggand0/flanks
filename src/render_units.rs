@@ -919,7 +919,7 @@ fn sync_instance_data(
     hover: Res<crate::orders::Hover>,
     groups: Res<crate::orders::Groups>,
     time: Res<Time>,
-    fixed_time: Res<Time<Fixed>>,
+    (fixed_time, shots): (Res<Time<Fixed>>, Option<Res<crate::shots::Shots>>),
     lod_cfg: Res<LodConfig>,
     corpses: Res<Corpses>,
     camera: Query<(&Camera, &Projection, &Transform), With<Camera3d>>,
@@ -958,7 +958,7 @@ fn sync_instance_data(
     let clip_from_world = projection.get_clip_from_view() * cam_tf.to_matrix().inverse();
     let frustum = Frustum(ViewFrustum::from_clip_from_world(&clip_from_world));
     let cull = !*no_cull.get_or_insert_with(|| std::env::var("FL_NO_CULL").is_ok());
-    let alpha = fixed_time.overstep_fraction();
+    let alpha = crate::shots::Shots::render_alpha(shots.as_deref(), &fixed_time);
     // Detail levels: a soldier of height H at distance d covers
     // H * px_per_unit / d pixels, from the live field of view and
     // viewport height. Euclidean distance to the camera, not view depth:

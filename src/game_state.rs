@@ -389,6 +389,13 @@ impl LaunchPlan {
     }
 }
 
+/// While this resource exists the launch's own start waits: the headless
+/// renderer holds it until the ground's textures are loaded, so its first
+/// pictures are complete. The battle clock counts from the start, so the
+/// wait moves no tick.
+#[derive(Resource)]
+pub struct StartHold;
+
 /// The game's states, the battle's lifecycle and the sim tick's sets: what
 /// the sim needs of the shell, with no window.
 pub struct GameSimPlugin;
@@ -427,7 +434,9 @@ impl Plugin for GameSimPlugin {
             // built (`MapRebuild`), so the battle spawns on the new map.
             .add_systems(
                 Update,
-                launch_start.before(crate::terrain::MapRebuild).run_if(in_state(GameState::Menu)),
+                launch_start
+                    .before(crate::terrain::MapRebuild)
+                    .run_if(in_state(GameState::Menu).and_then(not(resource_exists::<StartHold>))),
             );
     }
 }
@@ -1358,8 +1367,8 @@ mod tests {
         let mut app = App::new();
         app.add_plugins((MinimalPlugins, bevy::state::app::StatesPlugin));
         // The sim group, exactly as the headless run loads it. The view's
-        // only tick system, overlay.rs `count_sim_tick`, writes its own
-        // frame counter and nothing else.
+        // tick systems, overlay.rs `count_sim_tick` and shots.rs
+        // `mark_due`, write only their own frame counter and picture tick.
         app.add_plugins(crate::shells::SimPlugins);
         let world = app.world_mut();
         world.resource_scope(|world, mut schedules: Mut<Schedules>| {
