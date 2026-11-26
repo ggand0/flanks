@@ -405,8 +405,9 @@ pub(crate) fn prepare_tick(
     let t0 = std::time::Instant::now();
     share_columns(job, units);
     let t1 = std::time::Instant::now();
+    let nav = routes.nav().cloned();
     let on_wall = wall_archers(groups, terrain);
-    skirmish_reactions(groups, tracks, terrain, &on_wall, tick);
+    skirmish_reactions(groups, tracks, terrain, nav.as_deref(), &on_wall, tick);
     let t2 = std::time::Instant::now();
     open_for_passers(groups, terrain, tracks, tick);
     let t2b = std::time::Instant::now();
@@ -579,6 +580,41 @@ fn gap_within(a: &GroupData, b: &GroupData, limit: f32) -> Option<f32> {
         return None;
     }
     Some(edge_gap(a, b))
+}
+
+/// Whether men of block `from` can walk straight to block `to`: the
+/// planner's straight line (`NavGrid::walk_line`) between the two blocks'
+/// nearest points is clear. Always where no ground blocks (no grid). A
+/// block at the foot of a wall cannot walk to one on its walk, though
+/// their edges may be a metre or two apart seen from above.
+fn walks_to(nav: Option<&crate::nav::NavGrid>, from: &GroupData, to: &GroupData) -> bool {
+    let Some(nav) = nav else { return true };
+    let (a, b) = (crate::formation::block_rect(from), crate::formation::block_rect(to));
+    let at = b.closest(a.centre);
+    nav.walk_line(a.closest(at), at)
+}
+
+/// How far the men of block `from` walk to block `to` (m), within `max`
+/// (`NavGrid::walk_gap` between points of the two blocks a cell apart),
+/// None beyond it. Where no ground blocks
+/// (no grid) the edge gap, when within `max`.
+fn walk_gap(nav: Option<&crate::nav::NavGrid>, from: &GroupData, to: &GroupData, max: f32) -> Option<f32> {
+    let Some(nav) = nav else { return Some(edge_gap(from, to)).filter(|&g| g <= max) };
+    let points = |gd: &GroupData| {
+        let r = crate::formation::block_rect(gd);
+        let (fwd, half_d) = if r.fwd == Vec2::ZERO { (Vec2::Y, r.half_w) } else { (r.fwd, r.half_d) };
+        let right = Vec2::new(fwd.y, -fwd.x);
+        let (nw, nd) = ((r.half_w / crate::terrain::CELL).ceil() as i32, (half_d / crate::terrain::CELL).ceil() as i32);
+        let mut out = Vec::with_capacity(((2 * nw + 1) * (2 * nd + 1)) as usize);
+        for a in -nw..=nw {
+            for b in -nd..=nd {
+                let (u, v) = (a as f32 / nw.max(1) as f32, b as f32 / nd.max(1) as f32);
+                out.push(r.centre + right * (u * r.half_w) + fwd * (v * half_d));
+            }
+        }
+        out
+    };
+    nav.walk_gap(&points(from), &points(to), max)
 }
 
 /// `edge_gap` between two blocks given as rectangles.
@@ -1233,6 +1269,7 @@ fn skirmish_reactions(
     groups: &mut Groups,
     tracks: &crate::arrows::RegTracks,
     terrain: &Terrain,
+    nav: Option<&crate::nav::NavGrid>,
     on_wall: &[bool],
     tick: u32,
 ) {
@@ -1273,7 +1310,7 @@ fn skirmish_reactions(
         if !tick.wrapping_add(g as u32).is_multiple_of(ARCHER_LOOK) {
             continue;
         }
-        let look = skirmish_look(groups, g, tracks, terrain, tick, able);
+        let look = skirmish_look(groups, g, tracks, terrain, nav, tick, able);
         skirmish_act(&mut groups.list[g], g, look);
     }
 }
@@ -1287,6 +1324,7 @@ fn skirmish_look(
     g: usize,
     tracks: &crate::arrows::RegTracks,
     terrain: &Terrain,
+    nav: Option<&crate::nav::NavGrid>,
     tick: u32,
     able: bool,
 ) -> SkirmishLook {
@@ -1334,12 +1372,17 @@ fn skirmish_look(
             }
             continue;
         }
-        if able && gap <= SKIRMISH_NEAR {
+        // Units on the wall do not run at all (`able`). For a unit on
+        // the ground an enemy counts as near by the way its men walk to
+        // the unit (`walk_gap`) and as coming only when it can walk to
+        // the unit straight (`walks_to`), so an enemy on the other side
+        // of a wall does not start a run.
+        if able && gap <= SKIRMISH_NEAR && walk_gap(nav, ed, gd, SKIRMISH_NEAR).is_some() {
             (run, why) = (true, "near");
             run_from = Some((gap, e as u32));
             continue;
         }
-        if able && approach_hits(gl, g, e, vel(e), horizon, cap) {
+        if able && approach_hits(gl, g, e, vel(e), horizon, cap) && walks_to(nav, ed, gd) {
             (run, why) = (true, "coming");
             run_from = Some((gap, e as u32));
             continue;
