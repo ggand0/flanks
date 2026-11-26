@@ -79,22 +79,6 @@ pub enum FormShape {
     Blob,
 }
 
-/// Two men on a lane whose places cross by more than this (m) along it
-/// trade places (`fill_lane_slots`).
-const LANE_CROSS: f32 = 2.0;
-
-/// Ticks between the checks of a lane regiment's places
-/// (`keep_places_in_order`), staggered by regiment.
-const FILE_ORDER_PERIOD: u32 = 8;
-/// A man on a lane this near his place along it (m), anywhere across it,
-/// is settling into it, and may trade it with a neighbour also settling
-/// (`keep_places_in_order`); a man farther along is still on his way.
-const SETTLE_NEAR: f32 = 2.5;
-/// How much nearer (square metres, the two men's squared distances to
-/// their places summed) a trade has to bring two settling men before they
-/// make it: men jostled a little off their places keep them.
-const SETTLE_GAIN: f32 = 0.5;
-
 /// A regiment coming onto a lane (town_layout.rs `Lane`) fills its run
 /// from the far end as its men arrive: `fill_lane_slots`.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -1120,22 +1104,15 @@ pub(crate) fn stands_on_lane(gd: &GroupData, lane: &crate::town_layout::Lane) ->
 /// farthest place still held by a man behind him, and that man takes the
 /// place he had. The men already standing then always hold the far
 /// places, so nobody has to pass anybody along a walk too narrow to
-/// pass on. The men on the lane also keep their order along it. One test
-/// per man still on his way and one pass over the men there per tick,
-/// until they are all there; a new order or a fight ends it. Every
-/// `FILE_ORDER_PERIOD` ticks the men of a regiment standing on the lane
-/// who are settling into their places trade crossed ones
-/// (`keep_places_in_order`).
-fn fill_lane_slots(
-    mut units: ResMut<Units>,
-    mut groups: ResMut<Groups>,
-    terrain: Res<crate::terrain::Terrain>,
-    mut tick: Local<u32>,
-) {
+/// pass on. Every tick the men of a regiment whose block is the lane's
+/// who stand on the lane then share out the places they hold by the
+/// order they stand in (`deal_lane_places`). One test per man still on
+/// his way, one pass over the men and one sort of each regiment's men on
+/// the lane per tick; a new order or a fight ends the arrivals.
+fn fill_lane_slots(mut units: ResMut<Units>, mut groups: ResMut<Groups>, terrain: Res<crate::terrain::Terrain>) {
     if !terrain.kind.has_wall() {
         return;
     }
-    *tick = tick.wrapping_add(1);
     let lane = crate::town_layout::walk_lane(terrain.body_radius());
     for g in 0..groups.list.len() {
         let gd = &mut groups.list[g];
@@ -1145,22 +1122,6 @@ fn fill_lane_slots(
         if on != gd.lane {
             gd.lane = on;
             gd.reform = true;
-        }
-        if gd.lane
-            && !gd.reform
-            && !gd.engaged
-            && gd.count > 0
-            && !gd.state.is_broken()
-            && gd.shape == FormShape::Rect
-            && tick.wrapping_add(g as u32).is_multiple_of(FILE_ORDER_PERIOD)
-        {
-            let at = match gd.order {
-                Some(crate::orders::Order::Move(p)) => p,
-                _ => gd.anchor,
-            };
-            if keep_places_in_order(&mut units, g as u32, at) {
-                gd.slots_dealt = gd.slots_dealt.wrapping_add(1);
-            }
         }
         if gd.lane_fill.is_none() {
             continue;
@@ -1217,28 +1178,6 @@ fn fill_lane_slots(
             }
             pending.swap_remove(k);
         }
-        // The men on the lane keep their order along it: the crowd at a
-        // stair's head shoves a man past the head, and the place he took
-        // on the far side would have him pass every man standing between.
-        // Two neighbours in that order whose places cross by more than
-        // `LANE_CROSS` swap them, one pass a tick, so the order settles
-        // without two men side by side trading places every tick.
-        pending.sort_unstable();
-        let mut on: Vec<(f32, usize)> = (0..units.len())
-            .filter(|&i| units.group[i] == g as u32 && units.death_t[i] == 0)
-            .filter(|&i| pending.binary_search(&(i as u32)).is_err())
-            .map(|i| (units.pos[i].x, i))
-            .collect();
-        on.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
-        for w in on.windows(2) {
-            let (a, b) = (w[0].1, w[1].1);
-            if units.home[a].x > units.home[b].x + LANE_CROSS {
-                let (ha, hb) = (units.home[a], units.home[b]);
-                units.home[a] = hb;
-                units.home[b] = ha;
-                dealt = true;
-            }
-        }
         if dealt {
             gd.slots_dealt = gd.slots_dealt.wrapping_add(1);
         }
@@ -1247,41 +1186,81 @@ fn fill_lane_slots(
             gd.lane_fill = None;
         }
     }
+    // The living men on the lane of each regiment whose block is the
+    // lane's, in one pass over the men.
+    let dealing: Vec<bool> = groups
+        .list
+        .iter()
+        .map(|gd| {
+            gd.lane
+                && !gd.reform
+                && !gd.engaged
+                && gd.count > 0
+                && !gd.state.is_broken()
+                && gd.shape == FormShape::Rect
+                && gd.spacing != FormSpacing::Open
+        })
+        .collect();
+    if !dealing.contains(&true) {
+        return;
+    }
+    let mut on_lane: Vec<Vec<usize>> = vec![Vec::new(); groups.list.len()];
+    for i in 0..units.len() {
+        let g = units.group[i] as usize;
+        if g < dealing.len()
+            && dealing[g]
+            && units.death_t[i] == 0
+            && lane.contains(Vec2::new(units.pos[i].x, units.pos[i].z))
+        {
+            on_lane[g].push(i);
+        }
+    }
+    for (g, men) in on_lane.iter_mut().enumerate() {
+        if men.len() < 2 {
+            continue;
+        }
+        let gd = &mut groups.list[g];
+        let files = (gd.files.max(1) as usize).min(gd.count.max(1));
+        if deal_lane_places(&mut units, men, pitch_of(gd).x, files) {
+            gd.slots_dealt = gd.slots_dealt.wrapping_add(1);
+        }
+    }
 }
 
-/// Keeps the men of regiment `g` settling into its lane block in the
-/// order of their places. Places are handed out as men come onto the lane
-/// (`fill_lane_slots`), before anyone knows where across the column on
-/// the walk he will reach his place, and a full lane leaves two men no gap
-/// to pass each other: two settling men (each within SETTLE_NEAR of his
-/// place along the lane, the lane's whole depth across it) who stand each
-/// nearer the other's place, by SETTLE_GAIN at
-/// least, trade them. Men still on their way along the lane keep theirs,
-/// so a man walking past others is never turned about. `at` is where the
-/// block's places are laid from. One sort of the regiment's settling men
-/// and a look at the neighbours within SETTLE_NEAR along the lane of each;
-/// whether any place changed hands.
-fn keep_places_in_order(units: &mut Units, g: u32, at: Vec2) -> bool {
-    let mut men: Vec<(Vec2, usize)> = (0..units.len())
-        .filter(|&i| units.group[i] == g && units.death_t[i] == 0)
-        .map(|i| (Vec2::new(units.pos[i].x, units.pos[i].z), i))
-        .filter(|&(p, i)| (p.x - (at.x + units.home[i].x)).abs() <= SETTLE_NEAR)
-        .collect();
-    men.sort_unstable_by(|a, b| a.0.x.total_cmp(&b.0.x));
+/// Shares out the places the men `men` of one regiment on a lane hold
+/// among them by the order they stand in. The places go file by file
+/// along the lane (x), a file being the places of one column of the
+/// block's grid (`slot_offsets`, `files` files `pitch_x` apart; every
+/// other rank's shift is a quarter of a file either way, so it keeps to
+/// its file), and the men go by how far along the lane they stand: the
+/// first file's k places go to the k men farthest back, and so on, and
+/// in each file the men take its places in the order they stand across
+/// the lane. So the man farthest along holds the farthest place, men side
+/// by side hold places side by side, a man who lags takes a nearer place
+/// than the men ahead of him, and a man beside an empty place farther on
+/// takes it. The files hold fixed numbers of places, so the same men
+/// fall into each file whichever end the count starts from. Whether any
+/// place changed hands.
+fn deal_lane_places(units: &mut Units, men: &mut [usize], pitch_x: f32, files: usize) -> bool {
+    let full = (files.max(1) - 1) as f32 * 0.5;
+    let file_of = |h: Vec2| (h.x / pitch_x + full).round() as i32;
+    let mut places: Vec<Vec2> = men.iter().map(|&i| units.home[i]).collect();
+    places.sort_unstable_by(|a, b| file_of(*a).cmp(&file_of(*b)).then(a.y.total_cmp(&b.y)));
+    men.sort_unstable_by(|&a, &b| units.pos[a].x.total_cmp(&units.pos[b].x));
     let mut dealt = false;
-    for k in 0..men.len() {
-        let (pa, a) = men[k];
-        for &(pb, b) in men[k + 1..].iter().take_while(|o| o.0.x - pa.x < SETTLE_NEAR) {
-            let (ha, hb) = (at + units.home[a], at + units.home[b]);
-            let kept = pa.distance_squared(ha) + pb.distance_squared(hb);
-            let traded = pa.distance_squared(hb) + pb.distance_squared(ha);
-            if traded + SETTLE_GAIN < kept {
-                let (oa, ob) = (units.home[a], units.home[b]);
-                units.home[a] = ob;
-                units.home[b] = oa;
+    let mut k = 0;
+    while k < places.len() {
+        let f = file_of(places[k]);
+        let end = k + places[k..].iter().take_while(|h| file_of(**h) == f).count();
+        let file_men = &mut men[k..end];
+        file_men.sort_unstable_by(|&a, &b| units.pos[a].z.total_cmp(&units.pos[b].z));
+        for (&i, &h) in file_men.iter().zip(&places[k..end]) {
+            if units.home[i] != h {
+                units.home[i] = h;
                 dealt = true;
             }
         }
+        k = end;
     }
     dealt
 }
@@ -1290,48 +1269,86 @@ fn keep_places_in_order(units: &mut Units, g: u32, at: Vec2) -> bool {
 mod tests {
     use super::*;
 
-    /// Two settling men on the walk who stand each nearer the other's
-    /// place trade them, in one file or across two; two side by side, or
-    /// one of them still on his way, keep theirs.
-    #[test]
-    fn settling_men_on_a_lane_keep_their_order() {
+    /// A regiment of archers on the walk at `at`, man k holding `homes[k]`
+    /// and standing at `stands[k]` (offsets from `at`).
+    fn on_walk(at: Vec2, homes: &[Vec2], stands: &[Vec2]) -> Units {
         let terrain = crate::terrain::build_terrain(crate::terrain::MapKind::WallDebug);
-        let at = Vec2::new(80.0, crate::town_layout::WALL_Z);
         let mut units = Units::default();
-        // (where he stands, his place's offset from `at`)
-        let men = [
-            // One file at x 80: the man behind holds the front place.
-            (Vec2::new(80.1, -130.9), Vec2::new(0.0, 0.5)),
-            (Vec2::new(79.9, -130.0), Vec2::new(0.0, -1.4)),
-            // Two files at x 85 and 86, crossed on the diagonal.
-            (Vec2::new(86.0, -131.4), Vec2::new(5.0, 0.5)),
-            (Vec2::new(85.0, -129.9), Vec2::new(6.0, -0.95)),
-            // Side by side at x 95, each as near the one place as the other.
-            (Vec2::new(94.5, -130.45), Vec2::new(14.5, 0.5)),
-            (Vec2::new(95.5, -130.45), Vec2::new(15.5, -1.4)),
-            // At x 100, crossed, one of them still on his way.
-            (Vec2::new(104.0, -130.9), Vec2::new(20.0, 0.5)),
-            (Vec2::new(100.0, -130.0), Vec2::new(20.0, -1.4)),
-            // At x 110, crossed by the walk's whole depth.
-            (Vec2::new(110.0, -128.5), Vec2::new(30.0, -2.36)),
-            (Vec2::new(110.5, -131.9), Vec2::new(30.5, 2.4)),
-        ];
-        for (k, &(p, _)) in men.iter().enumerate() {
+        for (k, p) in stands.iter().enumerate() {
+            let p = at + *p;
             crate::units::push_unit(&mut units, &terrain, k as u32, 0, crate::unit_types::KIND_ARCHER, 0, p.x, p.y, at);
         }
-        for (k, &(_, h)) in men.iter().enumerate() {
-            units.home[k] = h;
+        for (k, h) in homes.iter().enumerate() {
+            units.home[k] = *h;
         }
-        assert!(keep_places_in_order(&mut units, 0, at));
-        let homes: Vec<Vec2> = (0..men.len()).map(|k| units.home[k]).collect();
-        for (a, b) in [(0, 1), (2, 3), (8, 9)] {
-            assert_eq!((homes[a], homes[b]), (men[b].1, men[a].1), "men {a} and {b} trade");
+        units
+    }
+
+    /// The places the men on the walk hold, dealt by the order they stand
+    /// in: men on their places keep them, with the rank shift or without
+    /// it and with a short last rank, and two men of one file two ranks
+    /// apart who stand at each other's places each take the one he stands
+    /// at.
+    #[test]
+    fn men_on_a_lane_take_the_places_in_the_order_they_stand() {
+        let at = Vec2::new(80.0, crate::town_layout::WALL_Z);
+        let pitch = lane_pitch(FormSpacing::Normal, crate::unit_types::KIND_ARCHER);
+        let stagger = lane_stagger(FormSpacing::Normal, crate::unit_types::KIND_ARCHER);
+        for (n, files, stagger) in [(24, 4, stagger), (22, 4, stagger), (22, 4, 0.0), (21, 6, 0.0)] {
+            let slots = slot_offsets(n, files, pitch, stagger);
+            let mut units = on_walk(at, &slots, &slots);
+            let mut men: Vec<usize> = (0..n).collect();
+            assert!(!deal_lane_places(&mut units, &mut men, pitch.x, files), "{n} in {files} files on their places");
+            assert!((0..n).all(|k| units.home[k] == slots[k]));
         }
-        for k in 4..8 {
-            assert_eq!(homes[k], men[k].1, "man {k} keeps his place");
-        }
-        // Once in order, nothing changes hands.
-        assert!(!keep_places_in_order(&mut units, 0, at));
+        // Files run along the ranks: in 4 files, man 1 stands in the front
+        // rank and man 9 two ranks behind him in the same file.
+        let slots = slot_offsets(24, 4, pitch, stagger);
+        let mut homes = slots.clone();
+        homes.swap(1, 9);
+        let mut units = on_walk(at, &homes, &slots);
+        let mut men: Vec<usize> = (0..24).collect();
+        assert!(deal_lane_places(&mut units, &mut men, pitch.x, 4));
+        assert!((0..24).all(|k| units.home[k] == slots[k]), "each takes the place he stands at");
+    }
+
+    /// One rank on the walk: the man holding the farthest place lags
+    /// behind the others, so they take the farther places, each one on,
+    /// and he the nearest.
+    #[test]
+    fn a_man_who_lags_takes_a_nearer_place() {
+        let at = Vec2::new(80.0, crate::town_layout::WALL_Z);
+        let pitch = lane_pitch(FormSpacing::Normal, crate::unit_types::KIND_ARCHER);
+        let slots = slot_offsets(4, 4, pitch, 0.0);
+        // Man 0 holds the farthest place and stands a file behind the
+        // nearest; men 1 to 3 stand at the three nearer places they hold.
+        let homes = [slots[3], slots[0], slots[1], slots[2]];
+        let stands = [slots[0] - Vec2::new(pitch.x, 0.0), slots[0], slots[1], slots[2]];
+        let mut units = on_walk(at, &homes, &stands);
+        let mut men: Vec<usize> = (0..4).collect();
+        assert!(deal_lane_places(&mut units, &mut men, pitch.x, 4));
+        assert_eq!([units.home[0], units.home[1], units.home[2], units.home[3]], [slots[0], slots[1], slots[2], slots[3]]);
+    }
+
+    /// Three files by two ranks with the rank shift: the man holding the
+    /// far file's rear place stands behind the block, so the man beside
+    /// that empty place, at the middle file's rear, takes it, the man at
+    /// the near file's rear takes his, and the man behind the block the
+    /// near file's rear; the front rank keeps its places.
+    #[test]
+    fn a_man_beside_an_empty_place_farther_on_takes_it() {
+        let at = Vec2::new(80.0, crate::town_layout::WALL_Z);
+        let pitch = lane_pitch(FormSpacing::Normal, crate::unit_types::KIND_ARCHER);
+        let stagger = lane_stagger(FormSpacing::Normal, crate::unit_types::KIND_ARCHER);
+        // Front rank 0, 1, 2; rear rank 3, 4, 5, from the near end.
+        let slots = slot_offsets(6, 3, pitch, stagger);
+        let mut stands = slots.clone();
+        stands[5] = slots[3] - Vec2::new(pitch.x, 0.0);
+        let mut units = on_walk(at, &slots, &stands);
+        let mut men: Vec<usize> = (0..6).collect();
+        assert!(deal_lane_places(&mut units, &mut men, pitch.x, 3));
+        let homes: Vec<Vec2> = (0..6).map(|k| units.home[k]).collect();
+        assert_eq!(homes, vec![slots[0], slots[1], slots[2], slots[4], slots[5], slots[3]]);
     }
 
     /// 200 archers in 50 files by 4 ranks, closed, facing +z.

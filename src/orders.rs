@@ -234,7 +234,7 @@ pub struct GroupData {
     pub recent_kills: u32,
     /// How many times this regiment's slots have been dealt, by
     /// `formation::assign_slots` or by `formation::fill_lane_slots` when
-    /// men on a lane trade places, which is every write of its men's
+    /// places on a lane change hands, which is every write of its men's
     /// `home` after the kick: the tick job's regiment sums (frontline.rs)
     /// hold only while it is the count they were taken with.
     pub slots_dealt: u32,
