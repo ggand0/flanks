@@ -1298,6 +1298,101 @@ fn button_hover_style(
 mod tests {
     use super::*;
 
+    /// The pairs of sim tick systems that touch the same data with no
+    /// order between them, as "a / b" with the names sorted. Each is a
+    /// place where the tick's result could depend on which runs first.
+    fn unordered_tick_pairs() -> Vec<String> {
+        use bevy::ecs::schedule::{LogLevel, ScheduleBuildSettings};
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, bevy::state::app::StatesPlugin));
+        // Every plugin that puts systems on the sim tick and needs no GPU.
+        // overlay.rs `count_sim_tick` is left out (its plugin brings the
+        // render diagnostics); it writes only its own frame counter.
+        app.add_plugins((
+            GameShellPlugin,
+            crate::battle_setup::BattleSetupPlugin,
+            crate::scenes::ScenesPlugin,
+            crate::morale::MoralePlugin,
+            crate::fatigue::FatiguePlugin,
+            crate::ai::AiPlugin,
+            crate::sim::SimPlugin,
+            crate::arrows::ArrowsPlugin,
+            crate::orders::OrdersPlugin,
+            crate::formation::FormationPlugin,
+            crate::frontline::FrontlinePlugin,
+            crate::combat::CombatPlugin,
+            crate::cli::CliPlugin,
+        ));
+        let world = app.world_mut();
+        world.resource_scope(|world, mut schedules: Mut<Schedules>| {
+            let schedule = schedules.get_mut(FixedUpdate).expect("the tick has systems");
+            schedule.set_build_settings(ScheduleBuildSettings {
+                ambiguity_detection: LogLevel::Error,
+                ..default()
+            });
+            // An unordered pair fails the build; the error names them, one
+            // " -- a and b" line each, then the data they share.
+            let Err(e) = schedule.initialize(world) else { return Vec::new() };
+            let text = e.to_string(schedule.graph(), world);
+            assert!(text.contains("pairs of systems"), "the tick's schedule does not build: {text}");
+            let short = |name: &str| name.rsplit("::").next().unwrap_or(name).trim_end_matches('`').to_string();
+            let mut pairs = Vec::new();
+            let mut lines = text.lines().peekable();
+            while let Some(line) = lines.next() {
+                let Some(pair) = line.trim().strip_prefix("-- ") else { continue };
+                let Some((a, b)) = pair.split_once(" and ") else { continue };
+                let (a, b) = (short(a), short(b));
+                let (a, b) = if a <= b { (a, b) } else { (b, a) };
+                let on = lines.next_if(|l| l.trim().starts_with("conflict on:")).unwrap_or_default();
+                let on: Vec<String> = on
+                    .trim()
+                    .trim_start_matches("conflict on:")
+                    .trim()
+                    .trim_matches(['[', ']'])
+                    .split(", ")
+                    .map(|c| short(c.trim_matches('"')))
+                    .collect();
+                pairs.push(format!("{a} / {b} on {}", on.join(", ")));
+            }
+            pairs.sort();
+            pairs
+        })
+    }
+
+    /// The tick's order is settled for every pair of systems that touch
+    /// the same data, except the pairs listed here. Each listed pair runs
+    /// in an order the scheduler picks; it is listed so that no new pair
+    /// joins them unseen, and comes off the list once it is ordered.
+    #[test]
+    fn the_sim_tick_has_no_new_unordered_pairs() {
+        // Two groups, both older than the battle clock. Before the
+        // install: the archers' ammo tally, the reforms, the lane fill and
+        // the regiment sums all write the regiments, and the reforms and
+        // the lane fill move men the density field reads. After it: the
+        // arrows and the death sweep against fatigue and morale, which all
+        // write the regiments.
+        const KNOWN: &[&str] = &[
+            "ammo_tally (in set SimSet) / apply_reforms (in set SimSet) on Groups, Units",
+            "ammo_tally (in set SimSet) / fill_lane_slots (in set SimSet) on Groups, Units",
+            "ammo_tally (in set SimSet) / update_groups (in set SimSet) on Groups",
+            "apply_reforms (in set SimSet) / update_field (in set SimSet) on Units",
+            "apply_reforms (in set SimSet) / update_groups (in set SimSet) on Groups, Units",
+            "fill_lane_slots (in set SimSet) / update_field (in set SimSet) on Units",
+            "fill_lane_slots (in set SimSet) / update_groups (in set SimSet) on Groups, Units",
+            "process_deaths (in set SimSet) / update_fatigue (in set SimSet) on Groups",
+            "process_deaths (in set SimSet) / update_morale (in set SimSet) on Groups",
+            "update_arrows (in set SimSet) / update_fatigue (in set SimSet) on Groups",
+            "update_arrows (in set SimSet) / update_morale (in set SimSet) on Groups",
+        ];
+        let pairs = unordered_tick_pairs();
+        assert!(
+            pairs.iter().map(String::as_str).eq(KNOWN.iter().copied()),
+            "the unordered pairs on the sim tick changed; now {} pairs:\n{}",
+            pairs.len(),
+            pairs.join("\n")
+        );
+    }
+
     /// Every menu size splits into whole units, 10 to 100 a side, and the
     /// player's starting composition fills exactly those slots.
     #[test]
