@@ -1462,7 +1462,9 @@ fn click_release(
 /// Placement preview while a formation drag is in flight: the drawn line
 /// plus a soft green marker per soldier slot (block outlines above the
 /// gizmo budget), so the player can tune width and facing before letting
-/// go. Player-facing UI — not gated by the debug-viz toggle.
+/// go. Player-facing UI — not gated by the debug-viz toggle. On a lane
+/// (`lane_layout`) the drawn line is left out: the runs are laid in the
+/// lane's rows, not along the drag, and only the places show.
 fn draw_order_preview(
     drag: Res<OrderDrag>,
     groups: Res<Groups>,
@@ -1478,7 +1480,9 @@ fn draw_order_preview(
     let line_col = Color::srgba(0.75, 0.95, 0.6, 0.9);
     let slot_col = Color::srgba(0.55, 0.92, 0.62, 0.75);
 
-    gizmos.line(lift(start, 0.4), lift(drag.cur, 0.4), line_col);
+    if !drag.layout.iter().any(|p| p.lane) {
+        gizmos.line(lift(start, 0.4), lift(drag.cur, 0.4), line_col);
+    }
 
     let total: usize = drag.layout.iter().map(|p| groups.list[p.g].count).sum();
     for p in &drag.layout {
