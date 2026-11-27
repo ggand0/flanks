@@ -538,9 +538,6 @@ fn begin(f: &Field, s: &mut Soldier) -> Step {
     {
         *s.out_form = true;
     }
-    if !in_melee {
-        *s.sight &= !(SIGHT_GO | SIGHT_GO_FAR);
-    }
     let committed = *s.out_form;
     let join_fp = if in_melee { fight_point[gi] } else { None };
     Step {

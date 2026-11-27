@@ -117,8 +117,8 @@ pub(super) const CHARGE_SPEED_FRAC: f32 = 0.6;
 /// rank and a man standing at his place, 4 m for a man walking or running
 /// to his place; with his regiment focused on one target, its men, and any
 /// man within his threat distance coming at him), and a man still in
-/// formation notices a comrade of his regiment running to the fight
-/// within 6 m. An archer of a regiment on
+/// formation, in his regiment's melee or standing at his place, notices a
+/// comrade of his regiment going to the fight within 6 m. An archer of a regiment on
 /// the wall with his bow in hand does neither.
 #[inline]
 pub(super) fn acquire(f: &Field, s: &mut Soldier, st: &mut Step) {
@@ -208,13 +208,19 @@ pub(super) fn acquire(f: &Field, s: &mut Soldier, st: &mut Step) {
             });
         }
         // Further than the neighbor scan, within JOIN_SEE_R: a comrade of his
-        // own regiment running to the fight.
+        // own regiment running to the fight, toward it in the melee; with no
+        // melee, out of his rank and moving faster than GOING_SPEED.
+        let in_melee = st.fight.in_melee;
         if watch_go
             && grid.any_candidate_vel(p, look.min(JOIN_SEE_R), |o, ov| {
                 o.idx as usize != i
                     && crate::spatial::meta_group(o.meta) == gi
                     && (p - o.xz()).length_squared() < JOIN_SEE_R * JOIN_SEE_R
-                    && ov.dot(memo_dir) > GOING_SPEED
+                    && if in_melee {
+                        ov.dot(memo_dir) > GOING_SPEED
+                    } else {
+                        f.out_form[o.idx as usize] && ov.length_squared() > GOING_SPEED * GOING_SPEED
+                    }
             })
         {
             *s.sight |= SIGHT_GO_FAR;
@@ -228,7 +234,8 @@ pub(super) fn acquire(f: &Field, s: &mut Soldier, st: &mut Step) {
 /// without it, an enemy within the short look (WIDE_ACQUIRE_R), a comrade
 /// out of his rank who stopped him, or, standing at his place, an enemy
 /// he remembers with no comrade ahead of him on the way to him at his
-/// last look. Once out he never dresses on his slot while he sees an
+/// last look, or a comrade of his regiment who has left his rank and is
+/// going. Once out he never dresses on his slot while he sees an
 /// enemy within his look (`look_radius`) or his regiment's melee runs. A
 /// man walking to the fight keeps the wish `drive` gave him until an
 /// enemy is in his reach.
@@ -254,8 +261,10 @@ pub(super) fn decide_to_join(f: &Field, s: &mut Soldier, st: &mut Step) {
         let sees = best_idx != u32::MAX
             || (memo_valid && memo_d2 < (look + 1.0) * (look + 1.0));
         // While a comrade stands in his way or ahead of him he stays out
-        // (`join_touch`).
-        let held = join_touch() && *s.sight & (SIGHT_WAY | SIGHT_AHEAD) != 0;
+        // (`join_touch`), and so he does while he sees a comrade of his
+        // regiment going (`look_around`).
+        let held = (join_touch() && *s.sight & (SIGHT_WAY | SIGHT_AHEAD) != 0)
+            || *s.sight & (SIGHT_GO | SIGHT_GO_FAR) != 0;
         if !sees && !held {
             committed = false;
             *s.out_form = false;
@@ -270,7 +279,8 @@ pub(super) fn decide_to_join(f: &Field, s: &mut Soldier, st: &mut Step) {
     // for an enemy he remembers when his look, which comes every LOOK_TICKS
     // in his own rhythm, finds no comrade ahead of him on the way to that
     // enemy: the front of a standing regiment goes for an enemy it sees,
-    // the men behind them stay in formation.
+    // and a man standing at his place who sees a comrade of his regiment
+    // out of his rank and going follows him.
     if may_leave && !committed {
         let patience = (JOIN_PATIENCE_MIN
             + (join_patience_max() - JOIN_PATIENCE_MIN)
@@ -288,6 +298,7 @@ pub(super) fn decide_to_join(f: &Field, s: &mut Soldier, st: &mut Step) {
                     && memo_valid
                     && (i as u32).wrapping_add(tick).is_multiple_of(LOOK_TICKS)
                     && *s.sight & SIGHT_AHEAD == 0)
+                || (stands_at_place(st) && saw_comrade_go)
         };
         let react = sees && {
             let window = (tick.wrapping_add((i as u32).wrapping_mul(11)) / JOIN_WINDOW)

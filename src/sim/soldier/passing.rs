@@ -598,9 +598,12 @@ pub(super) fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
     // fight, or back to his mark), in his own rhythm: a separate pass over
     // the neighbors of the separation scan, run only by men who are going
     // somewhere. He looks for a lane only while he has no enemy in reach, and
-    // watches his comrades go only while he sees no enemy of his own.
+    // watches his comrades go while he sees no enemy of his own: in his
+    // regiment's melee while he is in his rank; with no melee while he
+    // stands at his place (`stands_at_place`) or has left his rank, so a
+    // man who followed a comrade going stays out while he sees him go.
     let look_lanes = memo_dir != Vec2::ZERO && best_idx == u32::MAX && !dying && !routed;
-    let watch_go = in_melee && !committed && !memo_valid;
+    let watch_go = !memo_valid && if in_melee { !committed } else { committed || stands_at_place(st) };
     let slot_on = slot_dir != Vec2::ZERO;
     // A joiner's comrade "in his way" stands within a ready body plus a
     // short step of room (JOIN_ROOM), or within SEP_RADIUS when he keeps
@@ -718,11 +721,14 @@ struct OnHisWay {
 
 /// His look at the comrades around him on his way (`look_around`): the
 /// sight bits of a comrade in his way, to his left or right, ahead,
-/// between him and his mark, and running to the fight.
+/// between him and his mark, and of a comrade of his regiment going to
+/// the fight (toward it in the melee; out of his rank and moving with no
+/// melee).
 #[inline]
 fn look_on_his_way(f: &Field, i: usize, st: &Step, ways: &OnHisWay) -> u16 {
     let Field { grid, .. } = *f;
     let OnHisWay { memo_dir, side_dir, slot_dir, look_lanes, watch_go, slot_on, way_r } = *ways;
+    let in_melee = st.fight.in_melee;
     let p = st.p;
     let gi = st.gi;
     let scan_r = st.scan.scan_r;
@@ -748,11 +754,18 @@ fn look_on_his_way(f: &Field, i: usize, st: &Step, ways: &OnHisWay) -> u16 {
         ahead_any |= ahead;
         way |= ahead & (d2 < way_r * way_r);
         // A comrade of his own regiment close by, running to the
-        // fight: the sight that makes him follow.
+        // fight: the sight that makes him follow. In the melee he runs
+        // toward the fight faster than GOING_SPEED; with no melee there is
+        // no fight point to run toward, and a comrade out of his rank
+        // moving faster than GOING_SPEED is going.
         go |= comrade
             & watch_go
             & (crate::spatial::meta_group(o.meta) == gi)
-            & (going > GOING_SPEED);
+            & if in_melee {
+                going > GOING_SPEED
+            } else {
+                f.out_form[o.idx as usize] & (ov.length_squared() > GOING_SPEED * GOING_SPEED)
+            };
         let lateral = (-d).dot(side_dir);
         let beside = comrade & look_lanes & near;
         left |= beside & (lateral > reach);
