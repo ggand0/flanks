@@ -459,6 +459,7 @@ pub(crate) fn tick_chunk(f: &Field, rows: Rows, out: &mut ChunkOut) {
         step_into_opening(&mut st);
         try_a_side(f, &mut s, &mut st);
         close_in(f, &mut s, &mut st);
+        take_room(&s, &mut st);
         steer(f, &mut s, &mut st);
         slide(f, s.i, &mut st);
         face(f, &mut s, &mut st);

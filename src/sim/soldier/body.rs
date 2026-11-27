@@ -398,6 +398,7 @@ pub(super) fn still_brake() -> bool {
 /// (SEP_RADIUS) behind a comrade in his way, not a body and a short step
 /// behind him: he stands once his look sees that comrade, whether or not
 /// the bodies have stopped him yet, so he never walks into the back ahead.
+/// Standing there he takes his elbow room with his own legs (`take_room`).
 /// FL_ROOM=0 turns it off; only with the still brake.
 #[inline]
 pub(super) fn elbow_room() -> bool {
