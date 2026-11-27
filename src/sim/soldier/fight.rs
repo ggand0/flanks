@@ -235,7 +235,9 @@ pub(super) fn acquire(f: &Field, s: &mut Soldier, st: &mut Step) {
 /// out of his rank who stopped him, or, standing at his place, an enemy
 /// he remembers with no comrade ahead of him on the way to him at his
 /// last look, or a comrade of his regiment who has left his rank and is
-/// going. Once out he never dresses on his slot while he sees an
+/// going. He leaves only once he is stopped (his own speed under a
+/// step's pace) or an enemy is in his reach: a soldier running in his
+/// rank keeps his rank. Once out he never dresses on his slot while he sees an
 /// enemy within his look (`look_radius`) or his regiment's melee runs. A
 /// man walking to the fight keeps the wish `drive` gave him until an
 /// enemy is in his reach.
@@ -306,7 +308,13 @@ pub(super) fn decide_to_join(f: &Field, s: &mut Soldier, st: &mut Step) {
             crate::units::hash01(window ^ (i as u32).wrapping_mul(0x6A09))
                 < join_react_chance()
         };
-        if react || (in_melee && melee_ticks[gi] as f32 > patience) {
+        // A soldier still running does not leave his rank: he leaves it
+        // once the bodies have stopped him (his own speed under a step's
+        // pace, STEP_PACE) or an enemy is in his reach. One who left it at a
+        // run stood with no wish among the running bodies of his own
+        // regiment, and they threw him out of the back of its mass.
+        let stopped = best_idx != u32::MAX || s.vel.xz().length_squared() < STEP_PACE * STEP_PACE;
+        if stopped && (react || (in_melee && melee_ticks[gi] as f32 > patience)) {
             committed = true;
             *s.out_form = true;
             st.fight.set_off = true;
