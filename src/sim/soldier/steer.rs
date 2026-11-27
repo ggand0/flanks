@@ -438,7 +438,8 @@ pub(super) fn face(f: &Field, s: &mut Soldier, st: &mut Step) {
         // formed man's rule below and stood facing the line's front with the
         // fight beside him.
         None if !face_keep() && !routed && committed && memo_dir != Vec2::ZERO => memo_dir,
-        // Under the facing rule (`face_keep`), the three arms below.
+        // Under the facing rule (`face_keep`), the four arms below and the
+        // walking arm at the end.
         // Standing or stepping, he turns to the enemy he remembers once
         // that enemy is within his threat distance, in his rank or out.
         None if face_keep()
@@ -459,6 +460,16 @@ pub(super) fn face(f: &Field, s: &mut Soldier, st: &mut Step) {
             && wish2 < STEP_FACE_SPEED * STEP_FACE_SPEED
             && form_face[gi] != Vec2::ZERO
             && (st.walk.parked || st.walk.place_dist <= STEP_STOP) =>
+        {
+            form_face[gi]
+        }
+        // Standing still with his back to the way his regiment faces, in
+        // his rank or out of it, he turns round to it.
+        None if face_keep()
+            && !routed
+            && wish2 < 0.2 * 0.2
+            && form_face[gi] != Vec2::ZERO
+            && Vec2::new(s.yaw.sin(), s.yaw.cos()).dot(form_face[gi]) < 0.0 =>
         {
             form_face[gi]
         }
