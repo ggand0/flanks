@@ -1475,7 +1475,7 @@ fn click_release(
 /// Placement preview while a formation drag is in flight: the drawn line
 /// plus a soft green marker per soldier slot (block outlines above the
 /// gizmo budget), so the player can tune width and facing before letting
-/// go. Player-facing UI — not gated by the debug-viz toggle. On a lane
+/// go. Player-facing UI, drawn with the debug-viz toggle on or off. On a lane
 /// (`lane_layout`) the drawn line is left out: the runs are laid in the
 /// lane's rows, not along the drag, and only the places show.
 fn draw_order_preview(

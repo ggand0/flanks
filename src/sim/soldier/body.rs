@@ -486,7 +486,7 @@ pub(super) fn open_roomy() -> bool {
 }
 /// A held regiment's soldiers leave their ranks for its fight too and walk
 /// straight up to its fighting line (`begin`, `look_around`); they close
-/// on an enemy only within 2.2 m, as before (`join_way`). FL_HOLD_JOIN=0
+/// on an enemy only within 2.2 m (`join_way`). FL_HOLD_JOIN=0
 /// turns it off.
 #[inline]
 pub(super) fn hold_join() -> bool {
