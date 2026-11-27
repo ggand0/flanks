@@ -437,13 +437,17 @@ fn join_way(f: &Field, s: &Soldier, st: &Step) -> (Vec2, Vec2, Vec2) {
         }
         return (to_fp.normalize_or_zero(), Vec2::ZERO, fp);
     }
-    // With no melee on his regiment's clock he walks toward the fight
-    // (`join_touch`): the way his regiment faces, and the way his slot wish
-    // points only for a regiment with no facing. His place can lie behind
-    // him (he ran past it in the charge), so his slot wish is not the way
-    // to the fight.
+    // With no melee on his regiment's clock a soldier walking to the fight
+    // walks toward it (`join_touch`): the way his regiment faces, and the
+    // way his slot wish points only for a regiment with no facing. His
+    // place can lie behind him (he ran past it in the charge), so his slot
+    // wish is not the way to the fight. Only a soldier walking to the
+    // fight this tick has this way: one out of his rank for a blow or its
+    // recovery, as every soldier is on the battle's first ticks, has none,
+    // sees no comrade ahead on it and is back in his rank at once
+    // (`decide_to_join`).
     let toward = if face != Vec2::ZERO { face } else { st.fight.slot_wish.normalize_or_zero() };
-    if join_touch() && !st.fight.in_melee && toward != Vec2::ZERO {
+    if join_touch() && !st.fight.in_melee && st.fight.joining && toward != Vec2::ZERO {
         let pace = if ahead { ADVANCE_PACE } else { COMBAT_JOG_PACE };
         return (toward, toward * pace, p + toward * 2.0);
     }
