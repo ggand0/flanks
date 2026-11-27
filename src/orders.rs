@@ -79,8 +79,9 @@ pub struct GroupData {
     pub kind: u8,
     /// Current order; None = hold at anchor.
     pub order: Option<Order>,
-    /// Set when the current order was issued by at-ease auto-engagement
-    /// or a script, not the player: UI click feedback stays silent.
+    /// Set when the current order was issued by the automatic attack
+    /// (ai.rs `auto_engage`) or a script, not the player: UI click
+    /// feedback stays silent.
     pub auto_order: bool,
     /// Regiment reference point: units hold at `anchor + home`. Updated to
     /// the order target on arrival.
@@ -113,8 +114,9 @@ pub struct GroupData {
     pub facing: f32,
     /// Grid width in files (soldiers per rank). 0 = auto on first reform.
     pub files: u32,
-    /// Hold position (defend mode): never auto-engage, never chase — at
-    /// ease (false, default) idle regiments engage enemies that come near.
+    /// Hold position (defend mode): never auto-engage, never chase. Out
+    /// of it (false, default), an idle regiment attacks an enemy that comes
+    /// near when the battle's automatic attack is on (ai.rs `auto_engage`).
     pub hold: bool,
     /// A scripted regiment that never breaks, whatever its morale: the
     /// line a test scene presses against.

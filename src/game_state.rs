@@ -146,6 +146,10 @@ pub struct BattleConfig {
     pub units_per_team: usize,
     pub reg_size: usize,
     pub ai_enabled: bool,
+    /// An idle regiment of either side attacks a near enemy on its own
+    /// (ai.rs `auto_engage`). Off unless the menu or `FL_AT_EASE=1`
+    /// turns it on.
+    pub at_ease_attack: bool,
     pub map: MapKind,
     pub scenario: Scenario,
     /// Player composition from the Select Units screen: regiments per
@@ -172,6 +176,7 @@ impl Default for BattleConfig {
             units_per_team,
             reg_size,
             ai_enabled: !std::env::var("FL_AI").is_ok_and(|v| v == "0"),
+            at_ease_attack: at_ease_env(),
             map: MapKind::from_env(),
             scenario: Scenario::from_env(),
         };
@@ -180,6 +185,12 @@ impl Default for BattleConfig {
         }
         config
     }
+}
+
+/// `FL_AT_EASE=1`: the automatic attack is on for this launch, whatever
+/// a saved set-up says.
+pub fn at_ease_env() -> bool {
+    std::env::var("FL_AT_EASE").is_ok_and(|v| v == "1")
 }
 
 #[derive(States, Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
@@ -282,7 +293,7 @@ pub enum ScriptSet {
     Scenes,
     /// The path scenes' orders and watch (scenes/path.rs).
     Path,
-    /// The victory check, the enemy AI and the at-ease engagement.
+    /// The victory check, the enemy AI and the automatic attack.
     Ai,
     /// The logs, which only read: they see the tick's state with its
     /// orders given.
@@ -331,16 +342,19 @@ fn test_battles_closed(open: Query<(), With<TestBattlesRoot>>) -> bool {
 }
 
 /// One button of a segmented menu row, with its index into that row's
-/// values (`ARMY_SIZES`, `MapKind::ALL`, `AI_VALUES`).
+/// values (`ARMY_SIZES`, `MapKind::ALL`, `AI_VALUES`, `AT_EASE_VALUES`).
 #[derive(Component, Clone, Copy)]
 enum Segment {
     Army(usize),
     Map(usize),
     Ai(usize),
+    AtEase(usize),
 }
 
 /// The AI row: index 0 turns the enemy AI on.
 const AI_VALUES: [&str; 2] = ["On", "Off"];
+/// The row of the units' own attack: index 1 turns it on.
+const AT_EASE_VALUES: [&str; 2] = ["Off", "On"];
 
 #[derive(Component)]
 struct DebugButton(Scenario);
@@ -620,6 +634,12 @@ fn spawn_menu(mut commands: Commands) {
                 );
                 spawn_segment_row(opts, "Map", MapKind::ALL.iter().map(|m| m.label()), Segment::Map);
                 spawn_segment_row(opts, "AI", AI_VALUES.into_iter(), Segment::Ai);
+                spawn_segment_row(
+                    opts,
+                    "Units attack on their own",
+                    AT_EASE_VALUES.into_iter(),
+                    Segment::AtEase,
+                );
             });
 
             spawn_text_button(p, "Start Battle", MenuButton::StartBattle);
@@ -716,8 +736,9 @@ fn spawn_option_label(row: &mut ChildSpawnerCommands, label: &str) {
             ..default()
         },
         TextColor(DIM_TEXT_COLOR),
+        // Wide enough for the longest label on one line.
         Node {
-            width: Val::Px(80.0),
+            width: Val::Px(200.0),
             ..default()
         },
     ));
@@ -844,6 +865,7 @@ fn menu_segments(
                 }
             }
             Segment::Ai(i) => config.ai_enabled = i == 0,
+            Segment::AtEase(i) => config.at_ease_attack = i == 1,
         }
     }
 }
@@ -859,6 +881,7 @@ fn segment_style(
             Segment::Army(i) => ARMY_SIZES[i].0 == config.units_per_team,
             Segment::Map(i) => MapKind::ALL[i] == config.map,
             Segment::Ai(i) => (i == 0) == config.ai_enabled,
+            Segment::AtEase(i) => (i == 1) == config.at_ease_attack,
         };
         bg.0 = match interaction {
             _ if current => BTN_ACTIVE,
@@ -1078,11 +1101,12 @@ pub fn setup_battle(
         info!("deployment phase: place your regiments, then begin the battle");
     }
     info!(
-        "battle started: {} per team, map {}, scenario {}, AI {}",
+        "battle started: {} per team, map {}, scenario {}, AI {}, units attack on their own {}",
         config.units_per_team,
         config.map.label(),
         config.scenario.label(),
         if config.ai_enabled { "on" } else { "off" },
+        if config.at_ease_attack { "on" } else { "off" },
     );
 }
 
