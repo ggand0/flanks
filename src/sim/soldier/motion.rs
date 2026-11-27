@@ -168,8 +168,9 @@ pub(super) fn drive(f: &Field, s: &mut Soldier, st: &mut Step, asks: &mut Vec<cr
         // ranks behind a front would shake. A joiner who kept his wish
         // while the soldiers ahead hold him would never brace, and any
         // creep ahead would let the rear walk into the backs ahead and
-        // drift back.
-        let arrived = *s.sight & SIGHT_WAY != 0 && *s.stood;
+        // drift back. Keeping his elbow room (`elbow_room`), he stops on
+        // his look alone, an arm's length behind that comrade.
+        let arrived = *s.sight & SIGHT_WAY != 0 && (*s.stood || elbow_room());
         st.desired = if arrived { Vec2::ZERO } else { join_goal(f, s, st).1 };
     }
 }

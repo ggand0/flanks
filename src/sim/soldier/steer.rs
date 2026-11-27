@@ -368,8 +368,9 @@ fn keep_stood(s: &mut Soldier, st: &Step, desired: Vec2) {
         // men ahead have stopped him behind a comrade in his way: the
         // brake has taken his wish under the speed of a step. From
         // then he stands, and `drive` gives him no wish while that
-        // comrade is in his way.
-        under || (st.sight.way_blocked && stands(true, Vec2::ZERO, desired - side))
+        // comrade is in his way. Keeping his elbow room (`elbow_room`) he
+        // stands only once `drive` has stopped him by sight.
+        under || (!elbow_room() && st.sight.way_blocked && stands(true, Vec2::ZERO, desired - side))
     } else {
         under
     };

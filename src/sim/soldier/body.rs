@@ -394,6 +394,16 @@ pub(super) fn still_brake() -> bool {
     static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *S.get_or_init(|| friction_contact() && !std::env::var("FL_BRAKE").is_ok_and(|v| v == "density"))
 }
+/// A soldier walking to the fight stops by sight an arm's length
+/// (SEP_RADIUS) behind a comrade in his way, not a body and a short step
+/// behind him: he stands once his look sees that comrade, whether or not
+/// the bodies have stopped him yet, so he never walks into the back ahead.
+/// FL_ROOM=0 turns it off; only with the still brake.
+#[inline]
+pub(super) fn elbow_room() -> bool {
+    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *S.get_or_init(|| still_brake() && crate::util::env_or("FL_ROOM", 1u32) != 0)
+}
 
 #[cfg(test)]
 mod tests {

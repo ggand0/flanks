@@ -403,9 +403,10 @@ pub(super) fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
     let watch_go = in_melee && !committed && !memo_valid;
     let slot_on = slot_dir != Vec2::ZERO;
     // A joiner's comrade "in his way" stands within a ready body plus a
-    // short step of room (JOIN_ROOM); for everyone else, and for his
-    // sides and mark, within SEP_RADIUS.
-    let way_r = if st.fight.joining { ready_body() + JOIN_ROOM } else { SEP_RADIUS };
+    // short step of room (JOIN_ROOM), or within SEP_RADIUS when he keeps
+    // his elbow room (`elbow_room`); for everyone else, and for his sides
+    // and mark, within SEP_RADIUS.
+    let way_r = if st.fight.joining && !elbow_room() { ready_body() + JOIN_ROOM } else { SEP_RADIUS };
     if (i as u32).wrapping_add(tick).is_multiple_of(LOOK_TICKS) {
         let mut seen = 0u16;
         if look_lanes || watch_go || slot_on {
