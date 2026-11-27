@@ -434,7 +434,41 @@ pub(super) fn face(f: &Field, s: &mut Soldier, st: &mut Step) {
         // or walking. Without this a blocked joiner fell through to the
         // formed man's rule below and stood facing the line's front with the
         // fight beside him.
-        None if !routed && committed && memo_dir != Vec2::ZERO => memo_dir,
+        None if !face_keep() && !routed && committed && memo_dir != Vec2::ZERO => memo_dir,
+        // Under the facing rule (`face_keep`), the three arms below.
+        // Standing or stepping, he turns to the enemy he remembers once
+        // that enemy is within his threat distance, in his rank or out.
+        None if face_keep()
+            && !routed
+            && new_v.length_squared() < STEP_FACE_SPEED * STEP_FACE_SPEED
+            && (*s.target as usize) < pos_prev.len()
+            && team[*s.target as usize] != team[i]
+            && f.death_snap[*s.target as usize] == 0
+            && pos_prev[*s.target as usize].xz().distance_squared(p) < threat_radius() * threat_radius() =>
+        {
+            pos_prev[*s.target as usize].xz() - p
+        }
+        // In his rank, standing at his place, he dresses to the formation's
+        // facing.
+        None if face_keep()
+            && !routed
+            && !committed
+            && new_v.length_squared() < STEP_FACE_SPEED * STEP_FACE_SPEED
+            && form_face[gi] != Vec2::ZERO
+            && (st.walk.parked || st.walk.place_dist <= STEP_STOP) =>
+        {
+            form_face[gi]
+        }
+        // Else, standing or stepping, he keeps the facing he has: a formed
+        // soldier short of his place, and a soldier out of his rank who has
+        // stopped. (An unformed regiment's standing watch is further down.)
+        None if face_keep()
+            && !routed
+            && new_v.length_squared() < STEP_FACE_SPEED * STEP_FACE_SPEED
+            && (form_face[gi] != Vec2::ZERO || committed) =>
+        {
+            Vec2::ZERO
+        }
         // Blooded and the enemy still close: a man who has traded blows keeps
         // facing the fight while his last foe (combat memo, validated by team
         // and distance like the closing drive) stands within KEEP_FACING_R —

@@ -422,6 +422,16 @@ pub(super) fn back_room() -> bool {
     static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *S.get_or_init(|| still_brake() && crate::util::env_or("FL_BACK_ROOM", 1u32) != 0)
 }
+/// The facing rule. A soldier with no enemy in reach faces the way he
+/// walks; standing or stepping he keeps the facing he has; he turns to an
+/// enemy he remembers only within his threat distance; in his rank he turns
+/// to the formation's facing only at his place (`face`). FL_FACE_KEEP=0
+/// gives the rules before.
+#[inline]
+pub(super) fn face_keep() -> bool {
+    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *S.get_or_init(|| crate::util::env_or("FL_FACE_KEEP", 1u32) != 0)
+}
 /// A soldier in his rank walking to his place who is stopped behind a
 /// comrade that has left his rank and stands there leaves his rank too and
 /// walks on to the fight (`look_around`, `decide_to_join`, `join_way`).
