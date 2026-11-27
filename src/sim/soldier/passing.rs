@@ -460,7 +460,7 @@ fn too_near(f: &Field, i: usize, st: &Step, wd: Vec2) -> Option<Vec2> {
             from = to;
         }
     });
-    if near >= ARM_NEAR || near < 1e-3 {
+    if !(1e-3..ARM_NEAR).contains(&near) {
         return None;
     }
     let away = -from / near;
