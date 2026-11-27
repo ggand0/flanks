@@ -77,6 +77,19 @@ fn still_weight(o_vel: Vec2, wish_dir: Vec2) -> f32 {
 /// him past the middle of them and he comes back on the next tick, every
 /// tick. 90% of an overlap is gone in 7 ticks.
 pub(super) const CORR_GAIN: f32 = 0.15;
+/// How far one tick sets him back out of a body that overlaps his by
+/// `over`, under the friction contact. A brace holds a lean, not a body
+/// that arrives at a run: the first STANCE of the overlap the two share by
+/// their braced weights (`brace`, from `brace_pairs`), so a braced soldier
+/// holds his ground against a soldier who walks into him; what is deeper
+/// they share by their masses alone (`plain`, from `mass_pairs`), so a
+/// soldier who runs into a braced back shoves it and is not thrown back
+/// off it as off a wall. Two soldiers braced alike have one weight for
+/// both parts.
+#[inline]
+fn braced_set(over: f32, brace: f32, plain: f32) -> f32 {
+    (over.min(STANCE) * brace + (over - STANCE).max(0.0) * plain) * CORR_GAIN
+}
 pub(super) const CORR_MAX: f32 = 0.1;
 /// The count an enemy close to him sets: 31 steps of four ticks, about
 /// 4 s at 30 ticks a second, before he puts the knife away.
@@ -417,7 +430,7 @@ impl<'a> Contact<'a> {
                         || self.moving[crate::spatial::meta_group(o.meta)],
                     );
                     let my_brace = if cross { self.my_brace_cross } else { self.my_brace_same };
-                    (hard - len) * CORR_GAIN * braces[crate::spatial::meta_kind(o.meta)][my_brace][o_brace]
+                    braced_set(hard - len, braces[crate::spatial::meta_kind(o.meta)][my_brace][o_brace], mw)
                 }
                 None => back,
             };
@@ -958,6 +971,19 @@ fn draw_knife(f: &Field, s: &mut Soldier, st: &Step, best_idx: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A brace holds the first STANCE of an overlap by the braced weight
+    /// and what is deeper goes by mass; alike braced, both parts have one
+    /// weight.
+    #[test]
+    fn braced_set_holds_a_lean_and_shares_a_deep_overlap_by_mass() {
+        let near = |a: f32, b: f32| (a - b).abs() < 1e-6;
+        assert!(near(braced_set(0.05, 0.4, 1.0), 0.05 * 0.4 * CORR_GAIN));
+        assert!(near(braced_set(STANCE, 0.4, 1.0), STANCE * 0.4 * CORR_GAIN));
+        assert!(near(braced_set(0.40, 0.4, 1.0), (STANCE * 0.4 + 0.30 * 1.0) * CORR_GAIN));
+        assert!(near(braced_set(0.40, 1.6, 1.0), (STANCE * 1.6 + 0.30 * 1.0) * CORR_GAIN));
+        assert!(near(braced_set(0.40, 1.0, 1.0), 0.40 * CORR_GAIN));
+    }
 
     /// A body straight ahead, behind, left and right lies on its own side
     /// in full; one between two sides lies on both in part and on the far

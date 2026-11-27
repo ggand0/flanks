@@ -199,8 +199,10 @@ pub(crate) const STEP_FACE_SPEED: f32 = 1.05;
 /// still corrected.
 pub(crate) const STAND_GRIP: f32 = 6.0;
 /// A standing man's stance (his lean, arms and shield) takes the first
-/// STANCE metres of a net squeeze before he gives ground to it.
-const STANCE: f32 = 0.10;
+/// STANCE metres of a net squeeze before he gives ground to it. Under the
+/// friction contact it is how deep a pair's overlap his brace holds
+/// (`braced_set`, contact.rs).
+pub(super) const STANCE: f32 = 0.10;
 /// His own 0.7 to 1.3 of a man-to-man quantity (his grip).
 #[inline]
 fn own_spread(i: usize) -> f32 {

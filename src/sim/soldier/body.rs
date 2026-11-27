@@ -259,7 +259,9 @@ pub(crate) fn mass_pairs() -> &'static [[(f32, f32); crate::unit_types::NUM_KIND
 /// his feet take back at FEET (`steer`, `integrate`).
 /// The one thing that stands in for a stance is the bracing: in the
 /// setting apart a man braced against a push (`brace_pairs`) holds his
-/// ground, and the man who walks into him takes most of it.
+/// ground, and the man who walks into him takes most of it, for the first
+/// STANCE of their overlap; what is deeper, the overlap of a body that
+/// arrived at a run, the two share by their masses (`braced_set`).
 #[inline]
 pub(crate) fn friction_contact() -> bool {
     static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
