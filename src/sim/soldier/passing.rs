@@ -473,6 +473,13 @@ pub(super) fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
     } else {
         Vec2::ZERO
     };
+    // A held regiment's soldier in his rank with its melee on looks
+    // straight ahead (`hold_join`).
+    let memo_dir = if hold_join() && memo_dir == Vec2::ZERO && in_melee && !committed {
+        f.form_face[gi]
+    } else {
+        memo_dir
+    };
     // The blocking test toward a holding man's own mark. A man walking to
     // the fight (`joining`) has his slot wish kept apart; the test reads
     // that, so it stays about his mark.

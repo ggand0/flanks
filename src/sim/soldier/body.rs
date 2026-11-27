@@ -439,6 +439,15 @@ pub(super) fn open_roomy() -> bool {
     static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *S.get_or_init(|| crate::util::env_or("FL_OPEN_ROOMY", 1u32) != 0)
 }
+/// A held regiment's soldiers leave their ranks for its fight too and walk
+/// straight up to its fighting line (`begin`, `look_around`); they close
+/// on an enemy only within 2.2 m, as before (`join_way`). FL_HOLD_JOIN=0
+/// turns it off.
+#[inline]
+pub(super) fn hold_join() -> bool {
+    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *S.get_or_init(|| crate::util::env_or("FL_HOLD_JOIN", 1u32) != 0)
+}
 
 #[cfg(test)]
 mod tests {

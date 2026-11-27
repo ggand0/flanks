@@ -475,7 +475,7 @@ pub(crate) fn tick_chunk(f: &Field, rows: Rows, out: &mut ChunkOut) {
 /// in his regiment's melee.
 #[inline]
 fn begin(f: &Field, s: &mut Soldier) -> Step {
-    let Field { pos_prev, kind, group, broken, fight_point, hold, moving, .. } = *f;
+    let Field { pos_prev, kind, group, broken, fight_point, hold, moving, melee_ticks, .. } = *f;
     let i = s.i;
     let p = pos_prev[i].xz();
     let my_kind = kind[i] as usize;
@@ -502,9 +502,11 @@ fn begin(f: &Field, s: &mut Soldier) -> Step {
     // rout and death bring him back. Fighting takes him out of formation.
     // Keyed on the regiment's melee instead, a man whose regiment had no
     // fight on its clock, with an enemy standing off his flank, went to
-    // him and was pulled back to his slot, over and over.
-    let in_melee = fight_point[gi].is_some() && !routed && !dying;
-    let may_leave = !routed && !dying && !hold[gi] && !moving[gi];
+    // him and was pulled back to his slot, over and over. A held regiment
+    // with a melee on its clock has its fight too, and its soldiers may
+    // leave their ranks for it (`hold_join`).
+    let in_melee = (fight_point[gi].is_some() || (hold_join() && hold[gi] && melee_ticks[gi] > 0)) && !routed && !dying;
+    let may_leave = !routed && !dying && !moving[gi] && (!hold[gi] || hold_join());
     if !may_leave {
         *s.out_form = false;
     } else if *s.swing & crate::units::SWING_STATE_MASK
