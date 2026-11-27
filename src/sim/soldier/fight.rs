@@ -933,8 +933,12 @@ fn close_on(f: &Field, s: &mut Soldier, st: &Step, close_to: u32, memo_close: bo
     {
         let to_enemy = pos_prev[close_to as usize].xz() - p;
         let dist = to_enemy.length();
-        // Held regiments fight at arm's length only.
-        let look = look_radius(engaged[gi], st);
+        // Held regiments fight at arm's length only. A man of a fighting
+        // regiment or out of his rank closes from as far as he sees
+        // (`seek_radius`); a man standing in his rank closes only on an
+        // enemy within the short look (WIDE_ACQUIRE_R), so a swing target
+        // never pulls him out of his place from afar.
+        let look = if engaged[gi] || committed { seek_radius() } else { WIDE_ACQUIRE_R };
         let max_close = if hold[gi] { 2.2 } else { look + 1.0 };
         // He closes on an enemy in reach to his weapon's length. Going to
         // a seen enemy, each man stops at his own distance, between that
