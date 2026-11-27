@@ -57,6 +57,25 @@ fn feet_take(imposed: Vec2, dt: f32) -> Vec2 {
     let il = imposed.length();
     if il > 1e-12 { imposed * (il.min(FEET * dt) / il) } else { Vec2::ZERO }
 }
+/// A soldier thrown clear of the bodies catches his footing: with no body
+/// overlapping his, the speed he has no wish for (all of it when he wishes
+/// to go nowhere, the part against his wish when he does) his feet keep
+/// taking while it is over a step's pace (STEP_PACE), within what is left
+/// of the feet's take of one tick (FEET x dt less `taken`). Among bodies
+/// nothing changes: there the total his feet take back from the contacts
+/// stays a step's pace (`held_total`), and only his flight over open
+/// ground is cut short.
+#[inline]
+fn catch_footing(v: Vec2, wish: Vec2, taken: f32, dt: f32) -> Vec2 {
+    let wl = wish.length();
+    let unwished = if wl < 1e-3 { v } else { wish * (v.dot(wish).min(0.0) / (wl * wl)) };
+    let ul = unwished.length();
+    if ul > STEP_PACE {
+        unwished * ((ul - STEP_PACE).min((FEET * dt - taken).max(0.0)) / ul)
+    } else {
+        Vec2::ZERO
+    }
+}
 /// Whether a man of a regiment standing ready stands, below the speed of
 /// his steps. Under the friction contact it is where he is trying to go,
 /// so a push he gets does not take him out of the ready stance and only
@@ -239,6 +258,11 @@ pub(super) fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
         let cut = feet_take(*s.imposed, dt);
         v -= cut;
         *s.imposed -= cut;
+        // Thrown clear of the bodies he catches his footing
+        // (`catch_footing`). A staggered soldier reels and does not.
+        if st.scan.corr.length_squared() < 1e-12 && *s.swing & crate::units::SWING_STAGGERED == 0 {
+            v -= catch_footing(v, desired, cut.length(), dt);
+        }
     }
     // Jammed units stop shoving entirely: at full jam the crowd is
     // quasi-static and overlap resolution is purely positional — force-based
@@ -783,6 +807,28 @@ mod tests {
         let t = held_total(Vec2::new(0.7, 0.0), Vec2::new(0.0, 0.0), Vec2::new(-1.0, 0.0));
         assert!((t.length() - STEP_PACE).abs() < 1e-6);
         assert!(t.x > 0.0 && t.y == 0.0);
+    }
+
+    /// Thrown clear, his feet take the speed he has no wish for while it
+    /// is over a step's pace: all of it with no wish, the part against his
+    /// wish with one, and nothing of a speed along his wish or under a
+    /// step's pace; never more than the feet's take of one tick.
+    #[test]
+    fn catch_footing_takes_the_unwished_speed_over_a_step() {
+        let dt = 1.0 / 30.0;
+        let near = |a: Vec2, b: Vec2| (a - b).length() < 1e-6;
+        let t = catch_footing(Vec2::new(-5.0, 0.0), Vec2::ZERO, 0.0, dt);
+        assert!(near(t, Vec2::new(-FEET * dt, 0.0)));
+        let t = catch_footing(Vec2::new(-5.0, 0.0), Vec2::ZERO, FEET * dt, dt);
+        assert!(near(t, Vec2::ZERO));
+        let t = catch_footing(Vec2::new(-(STEP_PACE + 0.1), 0.0), Vec2::ZERO, 0.0, dt);
+        assert!(near(t, Vec2::new(-0.1, 0.0)));
+        let t = catch_footing(Vec2::new(-0.5, 0.0), Vec2::ZERO, 0.0, dt);
+        assert!(near(t, Vec2::ZERO));
+        let t = catch_footing(Vec2::new(-5.0, 2.0), Vec2::new(3.0, 0.0), 0.0, dt);
+        assert!(near(t, Vec2::new(-FEET * dt, 0.0)));
+        let t = catch_footing(Vec2::new(5.0, 2.0), Vec2::new(3.0, 0.0), 0.0, dt);
+        assert!(near(t, Vec2::ZERO));
     }
 
     /// A man pushed at a rail on z while he climbs along x: the rail
