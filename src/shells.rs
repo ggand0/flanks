@@ -92,7 +92,28 @@ pub fn headless(app: &mut App, task_pools: bevy::app::TaskPoolOptions) {
     .add_plugins(SimPlugins)
     .insert_resource(fixed_time())
     .insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(tick))
-    .add_systems(Last, one_tick_per_update);
+    .add_systems(Last, one_tick_per_update)
+    .add_systems(
+        OnEnter(crate::game_state::GameState::Battle),
+        refuse_over_max_men.after(crate::game_state::setup_battle),
+    );
+}
+
+/// `--max-men N`: a battle of more soldiers than N ends the run before its
+/// first tick with exit code 75 (EX_TEMPFAIL in sysexits.h), so a script
+/// that starts runs beside a game can tell a refused run from a failed one.
+fn refuse_over_max_men(
+    units: Res<crate::units::Units>,
+    mut run: ResMut<crate::cli::RunState>,
+    mut exit: MessageWriter<AppExit>,
+) {
+    let Some(limit) = crate::cli::args().max_men else { return };
+    let men = units.len();
+    if men > limit {
+        info!("[run] refused: {men} men, over the limit of {limit} beside a running game");
+        run.end();
+        exit.write(AppExit::from_code(75));
+    }
 }
 
 /// The headless renderer (`--headless --shots N`): the windowed game's

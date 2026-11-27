@@ -94,3 +94,16 @@ fn the_command_line_ends_the_run_as_told() {
     assert_eq!(flanks(&[], &["--bogus"]).code, Some(2), "an unknown flag");
     assert_eq!(flanks(&[], &["--headless", "--ticks", "9", "--speed", "2"]).code, Some(2), "--speed with --headless");
 }
+
+#[test]
+fn a_battle_over_the_men_limit_is_refused() {
+    let args = ["--headless", "--ticks", "100", "--seed", "1", "--max-men"];
+    let refused = flanks(PATH, &[&args[..], &["10"]].concat());
+    assert_eq!(refused.code, Some(75), "{}", refused.out);
+    assert!(refused.hashes().is_empty(), "a refused run ran ticks:\n{}", refused.out);
+    assert!(refused.out.contains("[run] refused: 260 men, over the limit of 10"), "{}", refused.out);
+    let under = flanks(PATH, &[&args[..], &["100000"]].concat());
+    let plain = flanks(PATH, &args[..5]);
+    assert_eq!(under.code, Some(0), "{}", under.out);
+    assert_eq!(under.hashes(), plain.hashes(), "the limit changes the run");
+}

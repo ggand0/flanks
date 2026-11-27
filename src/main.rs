@@ -127,7 +127,7 @@ fn window_position() -> bevy::window::WindowPosition {
     }
 }
 
-fn main() {
+fn main() -> AppExit {
     cli::init();
     let mut app = App::new();
     let args = cli::args();
@@ -142,7 +142,7 @@ fn main() {
             shells::headless_render(&mut app);
         }
     }
-    app.run();
+    app.run()
 }
 
 /// The sim and the view on bevy's default plugins: the windowed game, or

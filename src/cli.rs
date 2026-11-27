@@ -12,6 +12,8 @@
 //!               tick (shots.rs); with --headless the run carries the
 //!               renderer, with no window
 //!   --shots-dir DIR  the pictures' folder
+//!   --max-men N a headless run refuses a battle of more than N soldiers
+//!               (exit 75), for runs beside a running game
 //!
 //! Every FL_ switch keeps working beside these. An unknown flag prints the
 //! usage and quits with exit code 2.
@@ -34,9 +36,11 @@ pub struct Args {
     pub shots: Option<u32>,
     /// The pictures' folder.
     pub shots_dir: Option<std::path::PathBuf>,
+    /// The most soldiers a headless run takes on.
+    pub max_men: Option<usize>,
 }
 
-const USAGE: &str = "usage: flanks [--ticks N] [--seed N] [--headless | --speed X] [--shots N [--shots-dir DIR]]
+const USAGE: &str = "usage: flanks [--ticks N] [--seed N] [--headless [--max-men N] | --speed X] [--shots N [--shots-dir DIR]]
   --ticks N   run N sim ticks of the battle, print its hash at tick N, then quit
   --seed N    fix the spawn offsets (as FL_SEED=N) and the enemy army's roll
   --headless  run the sim with no window as fast as it goes; needs --ticks,
@@ -44,7 +48,9 @@ const USAGE: &str = "usage: flanks [--ticks N] [--seed N] [--headless | --speed 
   --speed X   run the windowed game's time X times as fast (X > 0)
   --shots N   save a picture every N sim ticks and at the run's last tick, as
               tick-000150.png and so on; --headless then carries the renderer
-  --shots-dir DIR  the pictures' folder (default tmp/runs/shots/<start time>/)";
+  --shots-dir DIR  the pictures' folder (default tmp/runs/shots/<start time>/)
+  --max-men N with --headless and no --shots: quit with exit code 75 before the
+              first tick when the battle holds more than N soldiers";
 
 static ARGS: std::sync::OnceLock<Args> = std::sync::OnceLock::new();
 
@@ -84,6 +90,7 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
             "--seed" => args.seed = Some(number("--seed")?),
             "--headless" => args.headless = true,
             "--shots" => args.shots = Some(number("--shots")?.max(1)),
+            "--max-men" => args.max_men = Some(number("--max-men")? as usize),
             "--shots-dir" => args.shots_dir = Some(it.next().ok_or("--shots-dir needs a folder")?.into()),
             "--speed" => {
                 let v = it.next().ok_or("--speed needs a number")?;
@@ -101,6 +108,9 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
     }
     if args.headless && args.ticks.is_none() {
         return Err("--headless needs --ticks".into());
+    }
+    if args.max_men.is_some() && (!args.headless || args.shots.is_some()) {
+        return Err("--max-men is for a headless run without --shots".into());
     }
     if args.shots_dir.is_some() && args.shots.is_none() {
         return Err("--shots-dir needs --shots".into());
@@ -141,6 +151,11 @@ impl RunState {
     /// The run's last tick has run.
     pub fn ended(&self) -> bool {
         self.ended
+    }
+
+    /// The run ends now: no tick runs after this.
+    pub fn end(&mut self) {
+        self.ended = true;
     }
 }
 
@@ -255,5 +270,12 @@ mod tests {
         assert!(parsed("--shots").is_err());
         assert!(parsed("--shots x").is_err());
         assert!(parsed("--shots-dir x").is_err(), "a folder needs --shots");
+        assert_eq!(
+            parsed("--headless --ticks 9 --max-men 500"),
+            Ok(Args { ticks: Some(9), headless: true, max_men: Some(500), ..default() })
+        );
+        assert!(parsed("--max-men 500").is_err(), "the limit is for headless runs");
+        assert!(parsed("--headless --ticks 9 --shots 3 --max-men 500").is_err(), "not with the renderer");
+        assert!(parsed("--headless --ticks 9 --max-men x").is_err());
     }
 }
