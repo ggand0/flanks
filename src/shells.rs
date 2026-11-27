@@ -70,6 +70,42 @@ impl PluginGroup for ViewPlugins {
     }
 }
 
+/// Every shell's status file: `${XDG_RUNTIME_DIR:-/tmp}/flanks/<pid>`
+/// holds the battle's soldier count, written when a battle is set up and
+/// removed when the app quits (main.rs, `remove_status`). A script that
+/// starts runs beside this process can size them by it.
+pub struct StatusFilePlugin;
+
+impl Plugin for StatusFilePlugin {
+    fn build(&self, app: &mut App) {
+        app.add_systems(
+            OnEnter(crate::game_state::GameState::Battle),
+            write_status.after(crate::game_state::setup_battle),
+        );
+    }
+}
+
+fn status_path() -> std::path::PathBuf {
+    let dir = std::env::var_os("XDG_RUNTIME_DIR").map_or_else(|| "/tmp".into(), std::path::PathBuf::from);
+    dir.join("flanks").join(std::process::id().to_string())
+}
+
+fn write_status(units: Res<crate::units::Units>) {
+    let path = status_path();
+    let written = path
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| std::fs::write(&path, format!("{}\n", units.len())));
+    if let Err(e) = written {
+        warn!("cannot write the status file {}: {e}", path.display());
+    }
+}
+
+/// The status file goes once the app has quit; there may be none.
+pub fn remove_status() {
+    let _ = std::fs::remove_file(status_path());
+}
+
 /// The sim tick's length: the fixed clock runs at `SIM_HZ`.
 pub fn fixed_time() -> Time<Fixed> {
     Time::<Fixed>::from_hz(crate::game_state::SIM_HZ)
@@ -89,7 +125,7 @@ pub fn headless(app: &mut App, task_pools: bevy::app::TaskPoolOptions) {
     )
     .add_plugins((bevy::log::LogPlugin::default(), bevy::state::app::StatesPlugin))
     .insert_resource(crate::game_state::LaunchPlan { autostart: true, deployment: false })
-    .add_plugins(SimPlugins)
+    .add_plugins((SimPlugins, StatusFilePlugin))
     .insert_resource(fixed_time())
     .insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(tick))
     .add_systems(Last, one_tick_per_update)

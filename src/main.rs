@@ -142,7 +142,9 @@ fn main() -> AppExit {
             shells::headless_render(&mut app);
         }
     }
-    app.run()
+    let exit = app.run();
+    shells::remove_status();
+    exit
 }
 
 /// The sim and the view on bevy's default plugins: the windowed game, or
@@ -197,6 +199,7 @@ fn with_view(app: &mut App, window: bool) {
         .insert_resource(user_settings)
         .add_plugins(shells::SimPlugins)
         .add_plugins(shells::ViewPlugins)
+        .add_plugins(shells::StatusFilePlugin)
         .insert_resource(shells::fixed_time())
         // A frame that overruns makes the fixed clock owe catch-up sim
         // ticks, which Bevy runs back to back the next frame (default
