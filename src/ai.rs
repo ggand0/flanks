@@ -22,7 +22,8 @@ const SPREAD_PENALTY: f32 = 40.0;
 const AI_TEAM: u8 = 1;
 /// The automatic attack's reach (`auto_engage`): when the battle set-up
 /// turns it on, an idle regiment of either team, not in hold mode,
-/// attacks an unbroken enemy regiment whose centre comes this close.
+/// attacks an unbroken enemy regiment whose centre comes this close and
+/// with no friendly regiment between them.
 const AT_EASE_R: f32 = 40.0;
 
 /// Set once when one side has no fighting regiments left.
@@ -154,9 +155,11 @@ fn ai_think(
 /// (`BattleConfig::at_ease_attack`, the menu's "Units attack on their
 /// own", `FL_AT_EASE=1`): once a second, an idle regiment of either team
 /// (no order, not engaged, not in hold mode) attacks the nearest unbroken
-/// enemy regiment whose centre is within AT_EASE_R of its own, and stands
-/// down when a target it took this way breaks or dies instead of pursuing
-/// it across the map. It runs with the enemy AI on or off. Its orders are
+/// enemy regiment it has a clear way to (no living friendly regiment's
+/// centre between them, `Groups::front_on_outline`), if that one's centre
+/// is within AT_EASE_R of its own, and stands down when a target it took
+/// this way breaks or dies instead of pursuing it across the map. It runs
+/// with the enemy AI on or off. Its orders are
 /// flagged so the order click and horn stay silent. When the option is
 /// off it gives no order and stands nobody down: an order it gave earlier
 /// stays until the player changes it or its target dies.
@@ -212,10 +215,13 @@ fn auto_engage(
         }
         let team = gd.team;
         let from = gd.centroid;
+        // Only an enemy it has a clear way to: no living friendly
+        // regiment's centre in the corridor between them.
         let Some((tg, d2)) = snapshot
             .iter()
             .enumerate()
             .filter(|(_, (tt, count, _, broken))| *tt != team && *count > 0 && !broken)
+            .filter(|(tg, _)| groups.front_on_outline(g, *tg).is_none())
             .map(|(tg, (_, _, c, _))| (tg, c.distance_squared(from)))
             .min_by(|a, b| a.1.total_cmp(&b.1))
         else {
