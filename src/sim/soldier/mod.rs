@@ -123,6 +123,13 @@ pub(crate) struct Field<'a> {
     pub out_form: &'a [bool],
     pub blocks: &'a [Vec<crate::arrows::LoftBlock>; 2],
     pub faces_spearwall: [bool; 2],
+    /// The battle's set-up turns on "Auto-engage nearby units"
+    /// (`BattleConfig::engage_near`): a soldier standing at his place goes
+    /// for an enemy he sees (`look_radius`, `decide_to_join`), a man out
+    /// of his rank closes from as far as he sees (`close_on`), and a man
+    /// who sees a comrade of his regiment leave his rank for a fight
+    /// follows him (`look_around`).
+    pub engage_near: bool,
     pub dt: f32,
     pub tick_seed: u32,
     pub tick: u32,
@@ -537,6 +544,11 @@ fn begin(f: &Field, s: &mut Soldier) -> Step {
         && *s.swing & crate::units::SWING_RANGED == 0
     {
         *s.out_form = true;
+    }
+    // With no melee on his regiment's clock he watches no comrade go, unless
+    // the battle's set-up turns on "Auto-engage nearby units" (`look_around`).
+    if !f.engage_near && !in_melee {
+        *s.sight &= !(SIGHT_GO | SIGHT_GO_FAR);
     }
     let committed = *s.out_form;
     let join_fp = if in_melee { fight_point[gi] } else { None };

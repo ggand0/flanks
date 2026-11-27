@@ -599,11 +599,13 @@ pub(super) fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
     // the neighbors of the separation scan, run only by men who are going
     // somewhere. He looks for a lane only while he has no enemy in reach, and
     // watches his comrades go while he sees no enemy of his own: in his
-    // regiment's melee while he is in his rank; with no melee while he
-    // stands at his place (`stands_at_place`) or has left his rank, so a
-    // man who followed a comrade going stays out while he sees him go.
+    // regiment's melee while he is in his rank; with no melee, when the
+    // battle's set-up turns on "Auto-engage nearby units", while he stands
+    // at his place (`stands_at_place`) or has left his rank, so a man who
+    // followed a comrade going stays out while he sees him go.
     let look_lanes = memo_dir != Vec2::ZERO && best_idx == u32::MAX && !dying && !routed;
-    let watch_go = !memo_valid && if in_melee { !committed } else { committed || stands_at_place(st) };
+    let watch_go = !memo_valid
+        && if in_melee { !committed } else { f.engage_near && (committed || stands_at_place(st)) };
     let slot_on = slot_dir != Vec2::ZERO;
     // A joiner's comrade "in his way" stands within a ready body plus a
     // short step of room (JOIN_ROOM), or within SEP_RADIUS when he keeps
@@ -723,7 +725,8 @@ struct OnHisWay {
 /// sight bits of a comrade in his way, to his left or right, ahead,
 /// between him and his mark, and of a comrade of his regiment going to
 /// the fight (toward it in the melee; out of his rank and moving with no
-/// melee).
+/// melee, which he watches only when the battle's set-up turns on
+/// "Auto-engage nearby units").
 #[inline]
 fn look_on_his_way(f: &Field, i: usize, st: &Step, ways: &OnHisWay) -> u16 {
     let Field { grid, .. } = *f;

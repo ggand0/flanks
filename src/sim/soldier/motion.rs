@@ -356,7 +356,8 @@ fn follow_route(f: &Field, s: &mut Soldier, st: &Step, goal: Vec2, asks: &mut Ve
 ///   regiment's rear walks up as a block and not as a clump about one
 ///   point;
 /// - the enemy he remembers within his closing range (his look,
-///   `look_radius`, plus a metre; a man out of his rank looks as far as
+///   `look_radius`, plus a metre; when the battle's set-up turns on
+///   "Auto-engage nearby units", a man out of his rank looks as far as
 ///   he sees, `seek_radius`): toward him;
 /// - his regiment's fight point while more than a metre off;
 /// - with no melee on his regiment's clock (he left his rank on touch,
@@ -416,7 +417,7 @@ fn join_way(f: &Field, s: &Soldier, st: &Step) -> (Vec2, Vec2, Vec2) {
         let pace = if dist > JOG_BEYOND && !ahead { COMBAT_JOG_PACE } else { ADVANCE_PACE };
         (dir, to_enemy * (pace * urge / dist), at)
     };
-    let look = look_radius(engaged[gi], st);
+    let look = look_radius(f.engage_near, engaged[gi], st);
     let max_close = if hold[gi] { 2.2 } else { look + 1.0 };
     if counts && dist < WIDE_ACQUIRE_R {
         return to_foe(max_close);

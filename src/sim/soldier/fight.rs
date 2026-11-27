@@ -66,8 +66,9 @@ fn join_patience_max() -> f32 {
 }
 
 /// How far a soldier sees an enemy to go to (FL_SEEK_R, meters): the
-/// look of a man of a fighting regiment, of a man out of his rank and of
-/// a man standing at his place (`look_radius`). A play-testing knob.
+/// look of a man of a fighting regiment, and, when the battle's set-up
+/// turns on "Auto-engage nearby units", of a man out of his rank and of a
+/// man standing at his place (`look_radius`).
 #[inline]
 pub(super) fn seek_radius() -> f32 {
     static R: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
@@ -85,10 +86,11 @@ pub(super) fn threat_radius() -> f32 {
     static R: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
     *R.get_or_init(|| crate::util::env_or("FL_THREAT_R", 4.0))
 }
-/// The short look (meters): how far a soldier in his rank looks for an
-/// enemy while he walks or runs to his place in a regiment that is not
-/// fighting, so a regiment on the march or in its charge keeps its ranks
-/// until the enemy is close (`look_radius`).
+/// The short look (meters): how far a soldier of a regiment that is not
+/// fighting looks for an enemy, so a regiment on the march, in its charge
+/// or standing keeps its ranks until the enemy is close (`look_radius`).
+/// When the battle's set-up turns on "Auto-engage nearby units", only a
+/// man in his rank who walks or runs to his place has this look.
 pub(super) const WIDE_ACQUIRE_R: f32 = 4.0;
 
 /// He stands at his place: parked in the hold deadzone, or within a
@@ -99,12 +101,14 @@ pub(super) fn stands_at_place(st: &Step) -> bool {
 }
 
 /// How far a soldier looks for an enemy to go to: as far as he sees
-/// (`seek_radius`) when his regiment fights (`engaged`), when he is out
-/// of his rank, or when he stands at his place; the short look
-/// (WIDE_ACQUIRE_R) while he walks or runs to his place in his rank.
+/// (`seek_radius`) when his regiment fights (`engaged`), and, when the
+/// battle's set-up turns on "Auto-engage nearby units" (`engage_near`),
+/// when he is out of his rank or stands at his place; else the short look
+/// (WIDE_ACQUIRE_R), as while he walks or runs to his place in his rank.
 #[inline]
-pub(super) fn look_radius(engaged: bool, st: &Step) -> f32 {
-    if engaged || st.fight.committed || stands_at_place(st) { seek_radius() } else { WIDE_ACQUIRE_R }
+pub(super) fn look_radius(engage_near: bool, engaged: bool, st: &Step) -> f32 {
+    let far = engaged || (engage_near && (st.fight.committed || stands_at_place(st)));
+    if far { seek_radius() } else { WIDE_ACQUIRE_R }
 }
 /// Speed fraction above which a newly started swing counts as a charge.
 /// The momentum bonus (attacker's charge_bonus attack points) resolves in
@@ -113,13 +117,14 @@ pub(super) const CHARGE_SPEED_FRAC: f32 = 0.6;
 
 /// The far look, every eighth tick: a pressing man with nobody in reach
 /// and no bodies pressed against his remembers the nearest enemy within his sight
-/// (`look_radius`: 15 m for a man of a fighting regiment, a man out of his
-/// rank and a man standing at his place, 4 m for a man walking or running
-/// to his place; with his regiment focused on one target, its men, and any
-/// man within his threat distance coming at him), and a man still in
-/// formation, in his regiment's melee or standing at his place, notices a
-/// comrade of his regiment going to the fight within 6 m. An archer of a regiment on
-/// the wall with his bow in hand does neither.
+/// (`look_radius`: 15 m for a man of a fighting regiment, 4 m for the
+/// others; when the battle's set-up turns on "Auto-engage nearby units",
+/// 15 m also for a man out of his rank and a man standing at his place;
+/// with his regiment focused on one target, its men, and any man within
+/// his threat distance coming at him), and a man still in formation in
+/// his regiment's melee, or, with that option on, standing at his place,
+/// notices a comrade of his regiment going to the fight within 6 m. An
+/// archer of a regiment on the wall with his bow in hand does neither.
 #[inline]
 pub(super) fn acquire(f: &Field, s: &mut Soldier, st: &mut Step) {
     let Field { grid, press, engaged, focus, tick_seed, paths, wall_archers, .. } = *f;
@@ -161,7 +166,7 @@ pub(super) fn acquire(f: &Field, s: &mut Soldier, st: &mut Step) {
         && crowd < acquire_crowd_lim
         && far_look
     {
-        let look = look_radius(engaged[gi], st);
+        let look = look_radius(f.engage_near, engaged[gi], st);
         let mut far_d2 = look * look;
         // He goes for an enemy he can walk to straight: on a map with
         // blocked ground not one behind a wall, on its walk above him or
@@ -232,9 +237,10 @@ pub(super) fn acquire(f: &Field, s: &mut Soldier, st: &mut Step) {
 /// window while he sees an enemy or a comrade going, and patience as the
 /// backstop. "Sees": in his regiment's melee, any enemy he remembers;
 /// without it, an enemy within the short look (WIDE_ACQUIRE_R), a comrade
-/// out of his rank who stopped him, or, standing at his place, an enemy
-/// he remembers with no comrade ahead of him on the way to him at his
-/// last look, or a comrade of his regiment who has left his rank and is
+/// out of his rank who stopped him, and, when the battle's set-up turns on
+/// "Auto-engage nearby units", standing at his place, an enemy he
+/// remembers with no comrade ahead of him on the way to him at his last
+/// look, or a comrade of his regiment who has left his rank and is
 /// going. He leaves only once he is stopped (his own speed under a
 /// step's pace) or an enemy is in his reach: a soldier running in his
 /// rank keeps his rank. Once out he never dresses on his slot while he sees an
@@ -259,14 +265,15 @@ pub(super) fn decide_to_join(f: &Field, s: &mut Soldier, st: &mut Step) {
     // regiment's melee runs he stays out until it ends, heading for the
     // fight when he sees nobody.
     if committed && !in_melee {
-        let look = look_radius(engaged[gi], st);
+        let look = look_radius(f.engage_near, engaged[gi], st);
         let sees = best_idx != u32::MAX
             || (memo_valid && memo_d2 < (look + 1.0) * (look + 1.0));
         // While a comrade stands in his way or ahead of him he stays out
-        // (`join_touch`), and so he does while he sees a comrade of his
+        // (`join_touch`), and so he does, when the battle's set-up turns on
+        // "Auto-engage nearby units", while he sees a comrade of his
         // regiment going (`look_around`).
         let held = (join_touch() && *s.sight & (SIGHT_WAY | SIGHT_AHEAD) != 0)
-            || *s.sight & (SIGHT_GO | SIGHT_GO_FAR) != 0;
+            || (f.engage_near && *s.sight & (SIGHT_GO | SIGHT_GO_FAR) != 0);
         if !sees && !held {
             committed = false;
             *s.out_form = false;
@@ -277,7 +284,8 @@ pub(super) fn decide_to_join(f: &Field, s: &mut Soldier, st: &mut Step) {
     // window), or his patience with the fight's noise runs out. Near men go
     // first and the line rolls up outward. With no melee on his regiment's
     // clock (a lone enemy at the flank, a thin contact) he goes for an enemy
-    // within the short look (WIDE_ACQUIRE_R), and, standing at his place,
+    // within the short look (WIDE_ACQUIRE_R). When the battle's set-up turns
+    // on "Auto-engage nearby units" he also goes, standing at his place,
     // for an enemy he remembers when his look, which comes every LOOK_TICKS
     // in his own rhythm, finds no comrade ahead of him on the way to that
     // enemy: the front of a standing regiment goes for an enemy it sees,
@@ -296,11 +304,12 @@ pub(super) fn decide_to_join(f: &Field, s: &mut Soldier, st: &mut Step) {
             // seen going (`join_touch`).
             (memo_valid && memo_d2 < WIDE_ACQUIRE_R * WIDE_ACQUIRE_R)
                 || (join_touch() && *s.sight & SIGHT_GO != 0)
-                || (stands_at_place(st)
+                || (f.engage_near
+                    && stands_at_place(st)
                     && memo_valid
                     && (i as u32).wrapping_add(tick).is_multiple_of(LOOK_TICKS)
                     && *s.sight & SIGHT_AHEAD == 0)
-                || (stands_at_place(st) && saw_comrade_go)
+                || (f.engage_near && stands_at_place(st) && saw_comrade_go)
         };
         let react = sees && {
             let window = (tick.wrapping_add((i as u32).wrapping_mul(11)) / JOIN_WINDOW)
@@ -953,11 +962,12 @@ fn close_on(f: &Field, s: &mut Soldier, st: &Step, close_to: u32, memo_close: bo
         let to_enemy = pos_prev[close_to as usize].xz() - p;
         let dist = to_enemy.length();
         // Held regiments fight at arm's length only. A man of a fighting
-        // regiment or out of his rank closes from as far as he sees
-        // (`seek_radius`); a man standing in his rank closes only on an
-        // enemy within the short look (WIDE_ACQUIRE_R), so a swing target
-        // never pulls him out of his place from afar.
-        let look = if engaged[gi] || committed { seek_radius() } else { WIDE_ACQUIRE_R };
+        // regiment, and, when the battle's set-up turns on "Auto-engage
+        // nearby units", a man out of his rank, closes from as far as he
+        // sees (`seek_radius`); any other man closes only on an enemy
+        // within the short look (WIDE_ACQUIRE_R), so a swing target never
+        // pulls a man standing in his rank out of his place from afar.
+        let look = if engaged[gi] || (f.engage_near && committed) { seek_radius() } else { WIDE_ACQUIRE_R };
         let max_close = if hold[gi] { 2.2 } else { look + 1.0 };
         // He closes on an enemy in reach to his weapon's length. Going to
         // a seen enemy, each man stops at his own distance, between that
