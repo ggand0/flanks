@@ -425,7 +425,7 @@ fn demo_setup() -> BattleSetup {
         units_per_team: 100 * DEMO_UNIT,
         reg_size: DEMO_UNIT,
         ai_enabled: true,
-        at_ease_attack: false,
+        at_ease_attack: true,
         open_sides: true,
         units,
         orders: Vec::new(),
