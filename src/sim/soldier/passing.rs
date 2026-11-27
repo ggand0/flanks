@@ -346,11 +346,18 @@ fn wide_look(f: &Field, s: &mut Soldier, st: &Step, p: Vec2, wd: Vec2, perp: Vec
 /// The depth bodies already give in a press (contact.rs CROWD_DEPTH): an
 /// opening this much narrower than his body still fits him.
 const JOIN_OPEN_GIVE: f32 = 0.1;
+/// His elbow room (`open_roomy`): an opening fits him only this much wider
+/// than his body.
+const JOIN_OPEN_ELBOW: f32 = 0.3;
 
 /// The opening among the bodies just ahead of him along `wd` (both teams,
 /// within OPEN_SEE, on his level; a comrade walking away along his way is
 /// none) that fits his width less JOIN_OPEN_GIVE (`join_open`): the point
-/// he aims at in the world, None when nothing fits.
+/// he aims at in the world, None when nothing fits. With `open_side` he
+/// reads the bodies out to QUERY_RADIUS, takes the nearest rank of them as
+/// the row and counts the open ground beside it too, and an aim another
+/// body stands on is none; with `open_roomy` the opening must fit his width
+/// and JOIN_OPEN_ELBOW.
 #[inline]
 pub(super) fn opening_ahead(f: &Field, i: usize, st: &Step, wd: Vec2, body: f32) -> Option<Vec2> {
     if wd == Vec2::ZERO {
@@ -362,12 +369,16 @@ pub(super) fn opening_ahead(f: &Field, i: usize, st: &Step, wd: Vec2, body: f32)
     let levels = Levels::new(f, i);
     let mut row = Row::default();
     let mut row_at = f32::INFINITY;
+    let side = open_side();
+    let see = if side { QUERY_RADIUS } else { OPEN_SEE };
+    let mut kept = [(0.0f32, 0.0f32, 0.0f32); 24];
+    let mut n_kept = 0usize;
     f.grid.for_each_candidate_vel(p, QUERY_RADIUS, |o, ov| {
         if o.idx as usize == i || (o.meta & crate::spatial::META_DYING) != 0 || levels.apart(f, o.idx) {
             return;
         }
         let to = o.xz() - p;
-        if to.length_squared() >= OPEN_SEE * OPEN_SEE {
+        if to.length_squared() >= see * see {
             return;
         }
         let along = to.dot(wd);
@@ -378,22 +389,40 @@ pub(super) fn opening_ahead(f: &Field, i: usize, st: &Step, wd: Vec2, body: f32)
             return;
         }
         let lat = wd.x * to.y - wd.y * to.x;
-        row.add(lat, 0.5 * widths[crate::spatial::meta_pose(o.meta)].body, along);
+        let half = 0.5 * widths[crate::spatial::meta_pose(o.meta)].body;
+        if side {
+            if n_kept < kept.len() {
+                kept[n_kept] = (lat, half, along);
+                n_kept += 1;
+            }
+        } else {
+            row.add(lat, half, along);
+        }
         row_at = row_at.min(along);
     });
+    // The nearest rank: the bodies within 0.6 m along of the nearest one.
+    if side {
+        for &(lat, half, along) in &kept[..n_kept] {
+            if along - row_at <= 0.6 {
+                row.add(lat, half, along);
+            }
+        }
+    }
     if row.n_left == 0 && row.n_right == 0 {
         return None;
     }
     let perp = Vec2::new(-wd.y, wd.x);
     let coin = side_pref(i, 0).1;
     let free = |lat: f32, along: f32| way_free(f.terrain, p, wd * along + perp * lat);
-    let (aim_lat, aim_along, fit, _) =
-        openings(&row, row_at, OPEN_SEE, body - JOIN_OPEN_GIVE, f32::INFINITY, false, 0.0, coin, free);
-    (fit == 2).then(|| p + wd * aim_along.max(OPEN_MIN_AHEAD) + perp * aim_lat)
+    let fit_w = if open_roomy() { body + JOIN_OPEN_ELBOW } else { body - JOIN_OPEN_GIVE };
+    let (aim_lat, aim_along, fit, _) = openings(&row, row_at, see, fit_w, f32::INFINITY, side, 0.0, coin, free);
+    let aim = p + wd * aim_along.max(OPEN_MIN_AHEAD) + perp * aim_lat;
+    (fit == 2 && !(side && aim_taken(f, i, aim, body))).then_some(aim)
 }
 
 /// Whether another living body on his level stands on `aim`, within his
-/// and its half bodies less JOIN_OPEN_GIVE.
+/// and its half bodies less JOIN_OPEN_GIVE, or with `open_roomy` within
+/// them and half his elbow room.
 fn aim_taken(f: &Field, i: usize, aim: Vec2, body: f32) -> bool {
     let widths = widths();
     let levels = Levels::new(f, i);
@@ -402,7 +431,8 @@ fn aim_taken(f: &Field, i: usize, aim: Vec2, body: f32) -> bool {
         if taken || o.idx as usize == i || (o.meta & crate::spatial::META_DYING) != 0 || levels.apart(f, o.idx) {
             return;
         }
-        let r = 0.5 * (body + widths[crate::spatial::meta_pose(o.meta)].body) - JOIN_OPEN_GIVE;
+        let o_body = widths[crate::spatial::meta_pose(o.meta)].body;
+        let r = if open_roomy() { 0.5 * (body + o_body) + 0.5 * JOIN_OPEN_ELBOW } else { 0.5 * (body + o_body) - JOIN_OPEN_GIVE };
         taken = o.xz().distance_squared(aim) < r * r;
     });
     taken

@@ -423,6 +423,22 @@ pub(super) fn join_touch() -> bool {
     static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *S.get_or_init(|| still_brake() && crate::util::env_or("FL_JOIN_TOUCH", 1u32) != 0)
 }
+/// The opening read counts open ground beside the nearest rank of bodies
+/// ahead as room too, not only the air between two of them
+/// (`opening_ahead`). FL_OPEN_SIDE=0 turns it off.
+#[inline]
+pub(super) fn open_side() -> bool {
+    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *S.get_or_init(|| crate::util::env_or("FL_OPEN_SIDE", 1u32) != 0)
+}
+/// An opening fits him only with his elbow room beside his body, and a
+/// body nearer than that to his aim has taken it (`opening_ahead`,
+/// `aim_taken`). FL_OPEN_ROOMY=0 turns it off.
+#[inline]
+pub(super) fn open_roomy() -> bool {
+    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *S.get_or_init(|| crate::util::env_or("FL_OPEN_ROOMY", 1u32) != 0)
+}
 
 #[cfg(test)]
 mod tests {
