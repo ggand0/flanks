@@ -420,6 +420,66 @@ pub(super) fn opening_ahead(f: &Field, i: usize, st: &Step, wd: Vec2, body: f32)
     (fit == 2 && !(side && aim_taken(f, i, aim, body))).then_some(aim)
 }
 
+/// The arm's length a stopped soldier keeps from his comrades. With a
+/// comrade nearer than ARM_NEAR he steps straight away from the nearest
+/// one, out to ARM_REST from him, when the ground on that far side is
+/// free: no body within BACK_FREE of him there. He never steps forward
+/// along his way for it (closing up is his walk's business). BACK_FREE is
+/// a body and a little: the soldier on the far side may stand an arm's
+/// length off and he still steps, and that soldier, now crowded himself
+/// and with free ground behind, steps in his turn, so a pile opens from
+/// its free edges inward. ARM_NEAR and ARM_REST lie inside the band his
+/// stop by sight leaves him in (1.12 to 1.40 m), so he does not walk up
+/// again after the step.
+const ARM_NEAR: f32 = 1.05;
+const ARM_REST: f32 = 1.2;
+const BACK_FREE: f32 = 0.95;
+
+/// The step for his arm's length (`back_room`): the vector from where he
+/// stands to where he should stand, None when nobody crowds him, the far
+/// side is not free or the ground there is blocked.
+#[inline]
+fn too_near(f: &Field, i: usize, st: &Step, wd: Vec2) -> Option<Vec2> {
+    let p = st.p;
+    let my_team_bit = st.scan.my_team_bit;
+    let levels = Levels::new(f, i);
+    // The nearest comrade, then whether the far side is free.
+    let (mut near, mut from) = (f32::INFINITY, Vec2::ZERO);
+    f.grid.for_each_candidate(p, QUERY_RADIUS, |o| {
+        if o.idx as usize == i
+            || (o.meta & crate::spatial::META_TEAM) != my_team_bit
+            || (o.meta & crate::spatial::META_DYING) != 0
+            || levels.apart(f, o.idx)
+        {
+            return;
+        }
+        let to = o.xz() - p;
+        let d = to.length();
+        if d < near {
+            near = d;
+            from = to;
+        }
+    });
+    if near >= ARM_NEAR || near < 1e-3 {
+        return None;
+    }
+    let away = -from / near;
+    if away.dot(wd) > 0.3 {
+        return None;
+    }
+    let mut blocked = false;
+    f.grid.for_each_candidate(p, QUERY_RADIUS, |o| {
+        if blocked || o.idx as usize == i || (o.meta & crate::spatial::META_DYING) != 0 || levels.apart(f, o.idx) {
+            return;
+        }
+        let to = o.xz() - p;
+        let d = to.length();
+        blocked = d < BACK_FREE && to.dot(away) > 0.5 * d;
+    });
+    let step = away * (ARM_REST - near);
+    (!blocked && way_free(f.terrain, p, step)).then_some(step)
+}
+
 /// Whether another living body on his level stands on `aim`, within his
 /// and its half bodies less JOIN_OPEN_GIVE, or with `open_roomy` within
 /// them and half his elbow room.
@@ -524,13 +584,17 @@ pub(super) fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
         // A joiner stopped behind comrades reads the row of bodies just
         // ahead of him and aims at an opening that fits him (`join_open`,
         // `drive`). An aim still ahead of him that nobody has taken is
-        // kept.
+        // kept. With a comrade inside his arm's length he aims first at
+        // the step away from him (`back_room`).
         if join_open() && st.fight.joining && !dying && !routed && best_idx == u32::MAX {
             let blocked = seen & SIGHT_WAY != 0;
             if blocked && *s.stood && memo_dir != Vec2::ZERO {
                 let body = st.open.body0;
                 let keep = s.aim.x.is_finite() && s.aim.distance_squared(p) > 0.15 * 0.15 && !aim_taken(f, i, *s.aim, body);
-                if !keep {
+                let back = if !keep && back_room() { too_near(f, i, st, memo_dir) } else { None };
+                if let Some(step) = back {
+                    *s.aim = p + step;
+                } else if !keep {
                     *s.aim = opening_ahead(f, i, st, memo_dir, body).unwrap_or(Vec2::NAN);
                 }
             } else {

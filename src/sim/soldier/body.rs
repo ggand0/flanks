@@ -398,7 +398,6 @@ pub(super) fn still_brake() -> bool {
 /// (SEP_RADIUS) behind a comrade in his way, not a body and a short step
 /// behind him: he stands once his look sees that comrade, whether or not
 /// the bodies have stopped him yet, so he never walks into the back ahead.
-/// Standing there he takes his elbow room with his own legs (`take_room`).
 /// FL_ROOM=0 turns it off; only with the still brake.
 #[inline]
 pub(super) fn elbow_room() -> bool {
@@ -413,6 +412,15 @@ pub(super) fn elbow_room() -> bool {
 pub(super) fn join_open() -> bool {
     static J: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *J.get_or_init(|| still_brake() && crate::util::env_or("FL_JOIN_OPEN", 1u32) != 0)
+}
+/// A soldier stopped behind the comrade in his way with a comrade nearer
+/// than his arm's length steps away from him, to free ground on the far
+/// side (`look_around`, `too_near`). FL_BACK_ROOM=0 turns it off; only
+/// with the still brake.
+#[inline]
+pub(super) fn back_room() -> bool {
+    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *S.get_or_init(|| still_brake() && crate::util::env_or("FL_BACK_ROOM", 1u32) != 0)
 }
 /// A soldier in his rank walking to his place who is stopped behind a
 /// comrade that has left his rank and stands there leaves his rank too and

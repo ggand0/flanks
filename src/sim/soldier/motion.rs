@@ -204,47 +204,6 @@ pub(super) fn step_into_opening(st: &mut Step) {
     }
 }
 
-/// The push of the bodies within his arm's length (`st.scan.push`, one
-/// neighbour a tenth inside the pair's rest) at which a standing soldier
-/// steps for room, and the push under which a soldier already stepping
-/// stands again, so he neither creeps nor flips at one line.
-const ROOM_GO: f32 = 0.25;
-const ROOM_STOP: f32 = 0.12;
-/// FL_ROOM_GO and FL_ROOM_STOP set the two (a play-testing dial).
-fn room_band() -> (f32, f32) {
-    static B: std::sync::OnceLock<(f32, f32)> = std::sync::OnceLock::new();
-    *B.get_or_init(|| (crate::util::env_or("FL_ROOM_GO", ROOM_GO), crate::util::env_or("FL_ROOM_STOP", ROOM_STOP)))
-}
-
-/// His elbow room (`elbow_room`). A living soldier walking to the fight
-/// (`joining`) with no enemy in his reach and no wish of his own after
-/// every stage (he stands behind a comrade in his way) steps at STEP_PACE
-/// away from the bodies inside his arm's length, toward the room beside or
-/// behind him, once they push over ROOM_GO, and keeps stepping until they
-/// push under ROOM_STOP. The step is under the speed of a walk, so he still
-/// stands (`steer`).
-#[inline]
-pub(super) fn take_room(s: &Soldier, st: &mut Step) {
-    if !elbow_room()
-        || !st.fight.joining
-        || st.dying
-        || st.routed
-        || *s.swing & crate::units::SWING_STAGGERED != 0
-        || st.foe.best_idx != u32::MAX
-        || (st.desired + st.walk.fade).length_squared() > 0.0
-    {
-        return;
-    }
-    let push = st.scan.push;
-    let len = push.length();
-    let stepping = s.vel.xz().length_squared() > (0.5 * STEP_PACE) * (0.5 * STEP_PACE);
-    let (room_go, room_stop) = room_band();
-    let go = if stepping { room_stop } else { room_go };
-    if len > go {
-        st.desired = push * (STEP_PACE / len);
-    }
-}
-
 /// A broken man's flight (`drive`): his wish toward his own map edge.
 #[inline]
 fn flee(f: &Field, i: usize, p: Vec2) -> Vec2 {
