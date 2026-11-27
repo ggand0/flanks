@@ -434,7 +434,8 @@ pub(super) fn face_keep() -> bool {
 }
 /// A soldier in his rank walking to his place who is stopped behind a
 /// comrade that has left his rank and stands there leaves his rank too and
-/// walks on to the fight (`look_around`, `decide_to_join`, `join_way`).
+/// walks on to the fight, the way his regiment faces (`look_around`,
+/// `decide_to_join`, `join_way`).
 /// FL_JOIN_TOUCH=0 turns it off; only with the still brake.
 #[inline]
 pub(super) fn join_touch() -> bool {

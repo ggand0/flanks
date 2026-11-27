@@ -286,13 +286,17 @@ fn follow_route(f: &Field, s: &mut Soldier, st: &Step, goal: Vec2, asks: &mut Ve
 ///   point;
 /// - the enemy he remembers within his closing range: toward him;
 /// - his regiment's fight point while more than a metre off;
+/// - with no melee on his regiment's clock (he left his rank on touch,
+///   `join_touch`): the way his regiment faces, or for a regiment with no
+///   facing the way his slot wish points;
 /// - else nowhere.
 ///
 /// Toward an enemy he goes at the jog over open ground more than
 /// JOG_BEYOND from him, else at the advance, slowing over his last 0.8 m
 /// and standing at his own stopping distance, between nine tenths of his
-/// reach and just inside it. Straight ahead and to the fight point he goes
-/// at the jog, or at the advance with a comrade ahead. "A comrade ahead" is
+/// reach and just inside it. Straight ahead, to the fight point and on the
+/// touch joiner's way he goes at the jog, or at the advance with a comrade
+/// ahead. "A comrade ahead" is
 /// his last look (`look_around`).
 ///
 /// He goes that way only where he can walk it straight: on a map with
@@ -362,12 +366,15 @@ fn join_way(f: &Field, s: &Soldier, st: &Step) -> (Vec2, Vec2, Vec2) {
         }
         return (to_fp.normalize_or_zero(), Vec2::ZERO, fp);
     }
-    // With no melee on his regiment's clock he walks on the way his slot
-    // wish points, toward the fight (`join_touch`).
-    if join_touch() && !st.fight.in_melee && st.fight.slot_wish != Vec2::ZERO {
-        let dir = st.fight.slot_wish.normalize_or_zero();
+    // With no melee on his regiment's clock he walks toward the fight
+    // (`join_touch`): the way his regiment faces, and the way his slot wish
+    // points only for a regiment with no facing. His place can lie behind
+    // him (he ran past it in the charge), so his slot wish is not the way
+    // to the fight.
+    let toward = if face != Vec2::ZERO { face } else { st.fight.slot_wish.normalize_or_zero() };
+    if join_touch() && !st.fight.in_melee && toward != Vec2::ZERO {
         let pace = if ahead { ADVANCE_PACE } else { COMBAT_JOG_PACE };
-        return (dir, dir * pace, p + dir * 2.0);
+        return (toward, toward * pace, p + toward * 2.0);
     }
     (Vec2::ZERO, Vec2::ZERO, p)
 }
