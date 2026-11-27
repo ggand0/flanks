@@ -404,6 +404,15 @@ pub(super) fn elbow_room() -> bool {
     static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *S.get_or_init(|| still_brake() && crate::util::env_or("FL_ROOM", 1u32) != 0)
 }
+/// A soldier walking to the fight who stands behind comrades steps into
+/// an opening among the bodies just ahead of him that fits him
+/// (`look_around`, `opening_ahead`, `step_into_opening`). FL_JOIN_OPEN=0
+/// turns it off; only with the still brake.
+#[inline]
+pub(super) fn join_open() -> bool {
+    static J: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *J.get_or_init(|| still_brake() && crate::util::env_or("FL_JOIN_OPEN", 1u32) != 0)
+}
 
 #[cfg(test)]
 mod tests {

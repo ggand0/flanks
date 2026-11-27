@@ -66,7 +66,10 @@ pub(super) fn choose_opening(f: &Field, s: &mut Soldier, st: &mut Step) {
     let ring_flag = *s.sight & SIGHT_RING != 0;
     *s.sight &= !SIGHT_RING;
     if !going {
-        *s.aim = Vec2::NAN;
+        // A joiner keeps the aim of his opening ahead (`look_around`).
+        if !(join_open() && st.fight.joining) {
+            *s.aim = Vec2::NAN;
+        }
         return;
     }
     let p = st.p;
@@ -340,6 +343,71 @@ fn wide_look(f: &Field, s: &mut Soldier, st: &Step, p: Vec2, wd: Vec2, perp: Vec
     *v = (*v & !STUCK_WIDE_DEPTH) | ((w_fit == 1) as u16 * STUCK_WIDE_DEPTH);
 }
 
+/// The depth bodies already give in a press (contact.rs CROWD_DEPTH): an
+/// opening this much narrower than his body still fits him.
+const JOIN_OPEN_GIVE: f32 = 0.1;
+
+/// The opening among the bodies just ahead of him along `wd` (both teams,
+/// within OPEN_SEE, on his level; a comrade walking away along his way is
+/// none) that fits his width less JOIN_OPEN_GIVE (`join_open`): the point
+/// he aims at in the world, None when nothing fits.
+#[inline]
+pub(super) fn opening_ahead(f: &Field, i: usize, st: &Step, wd: Vec2, body: f32) -> Option<Vec2> {
+    if wd == Vec2::ZERO {
+        return None;
+    }
+    let p = st.p;
+    let my_team_bit = st.scan.my_team_bit;
+    let widths = widths();
+    let levels = Levels::new(f, i);
+    let mut row = Row::default();
+    let mut row_at = f32::INFINITY;
+    f.grid.for_each_candidate_vel(p, QUERY_RADIUS, |o, ov| {
+        if o.idx as usize == i || (o.meta & crate::spatial::META_DYING) != 0 || levels.apart(f, o.idx) {
+            return;
+        }
+        let to = o.xz() - p;
+        if to.length_squared() >= OPEN_SEE * OPEN_SEE {
+            return;
+        }
+        let along = to.dot(wd);
+        if along <= OPEN_AHEAD {
+            return;
+        }
+        if (o.meta & crate::spatial::META_TEAM) == my_team_bit && ov.dot(wd) > 0.5 {
+            return;
+        }
+        let lat = wd.x * to.y - wd.y * to.x;
+        row.add(lat, 0.5 * widths[crate::spatial::meta_pose(o.meta)].body, along);
+        row_at = row_at.min(along);
+    });
+    if row.n_left == 0 && row.n_right == 0 {
+        return None;
+    }
+    let perp = Vec2::new(-wd.y, wd.x);
+    let coin = side_pref(i, 0).1;
+    let free = |lat: f32, along: f32| way_free(f.terrain, p, wd * along + perp * lat);
+    let (aim_lat, aim_along, fit, _) =
+        openings(&row, row_at, OPEN_SEE, body - JOIN_OPEN_GIVE, f32::INFINITY, false, 0.0, coin, free);
+    (fit == 2).then(|| p + wd * aim_along.max(OPEN_MIN_AHEAD) + perp * aim_lat)
+}
+
+/// Whether another living body on his level stands on `aim`, within his
+/// and its half bodies less JOIN_OPEN_GIVE.
+fn aim_taken(f: &Field, i: usize, aim: Vec2, body: f32) -> bool {
+    let widths = widths();
+    let levels = Levels::new(f, i);
+    let mut taken = false;
+    f.grid.for_each_candidate(aim, QUERY_RADIUS, |o| {
+        if taken || o.idx as usize == i || (o.meta & crate::spatial::META_DYING) != 0 || levels.apart(f, o.idx) {
+            return;
+        }
+        let r = 0.5 * (body + widths[crate::spatial::meta_pose(o.meta)].body) - JOIN_OPEN_GIVE;
+        taken = o.xz().distance_squared(aim) < r * r;
+    });
+    taken
+}
+
 /// What he remembers and what he sees of his comrades: the enemy he
 /// remembers if still in sight, the way he is going, and every eighth tick
 /// a look at the men around him (a comrade in his way, to his left or
@@ -415,6 +483,22 @@ pub(super) fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
         }
         if fighter {
             seen |= look_at_the_room(f, i, st, fight_dir, side_dir);
+        }
+        // A joiner stopped behind comrades reads the row of bodies just
+        // ahead of him and aims at an opening that fits him (`join_open`,
+        // `drive`). An aim still ahead of him that nobody has taken is
+        // kept.
+        if join_open() && st.fight.joining && !dying && !routed && best_idx == u32::MAX {
+            let blocked = seen & SIGHT_WAY != 0;
+            if blocked && *s.stood && memo_dir != Vec2::ZERO {
+                let body = st.open.body0;
+                let keep = s.aim.x.is_finite() && s.aim.distance_squared(p) > 0.15 * 0.15 && !aim_taken(f, i, *s.aim, body);
+                if !keep {
+                    *s.aim = opening_ahead(f, i, st, memo_dir, body).unwrap_or(Vec2::NAN);
+                }
+            } else {
+                *s.aim = Vec2::NAN;
+            }
         }
         *s.sight = (*s.sight
             & (SIGHT_GO_FAR | SIGHT_FOE | SIGHT_KNIFE_COUNT | SIGHT_KNIFE))

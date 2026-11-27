@@ -397,6 +397,9 @@ struct Walk {
     new_v: Vec2,
     /// Where his step ends on the ground plane (`slide`).
     next: Vec2,
+    /// He steps into an opening that fits him this tick (`drive`,
+    /// `step_into_opening`).
+    open_step: bool,
 }
 impl Walk {
     /// No wish and no step yet, and no place.
@@ -411,6 +414,7 @@ impl Walk {
         body_jam: 0.0,
         new_v: Vec2::ZERO,
         next: Vec2::ZERO,
+        open_step: false,
     };
 }
 
@@ -452,6 +456,7 @@ pub(crate) fn tick_chunk(f: &Field, rows: Rows, out: &mut ChunkOut) {
         decide_to_join(f, &mut s, &mut st);
         swing(f, &mut s, &mut st, out);
         yield_to_crowd(f, &mut st);
+        step_into_opening(&mut st);
         try_a_side(f, &mut s, &mut st);
         close_in(f, &mut s, &mut st);
         steer(f, &mut s, &mut st);

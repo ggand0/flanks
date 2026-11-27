@@ -171,7 +171,36 @@ pub(super) fn drive(f: &Field, s: &mut Soldier, st: &mut Step, asks: &mut Vec<cr
         // drift back. Keeping his elbow room (`elbow_room`), he stops on
         // his look alone, an arm's length behind that comrade.
         let arrived = *s.sight & SIGHT_WAY != 0 && (*s.stood || elbow_room());
-        st.desired = if arrived { Vec2::ZERO } else { join_goal(f, s, st).1 };
+        // An opening ahead that fits him (`look_around`): he steps into it
+        // at the step pace, and once there he stands.
+        if join_open() && s.aim.x.is_finite() {
+            let to = *s.aim - p;
+            let d = to.length();
+            if d > 0.15 {
+                st.desired = to * (STEP_PACE / d);
+                st.walk.open_step = true;
+            } else {
+                *s.aim = Vec2::NAN;
+                st.desired = Vec2::ZERO;
+            }
+        } else {
+            st.desired = if arrived { Vec2::ZERO } else { join_goal(f, s, st).1 };
+        }
+    }
+}
+
+/// A step into an opening that fits him (`drive`) is not taken by the
+/// crowd's brake or the press's hold; bodies still stop him through the
+/// setting apart.
+#[inline]
+pub(super) fn step_into_opening(st: &mut Step) {
+    if st.walk.open_step && st.fight.joining {
+        st.desired = st.walk.wish;
+        st.walk.fade = Vec2::ZERO;
+        st.walk.jam = 0.0;
+        st.walk.body_jam = 0.0;
+    } else {
+        st.walk.open_step = false;
     }
 }
 
