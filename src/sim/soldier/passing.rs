@@ -604,6 +604,8 @@ pub(super) fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
         // A soldier in his rank walking to his place, stopped behind a
         // comrade who has left his rank and stands, leaves his rank too
         // (`join_touch`): he sees that comrade go and has him in his way.
+        // Stopped means his own speed is under a step's pace (STEP_PACE):
+        // a soldier still running does not leave his rank.
         if join_touch()
             && st.fight.may_leave
             && !committed
@@ -613,6 +615,7 @@ pub(super) fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
             && !routed
             && desired.length_squared() > 0.25
             && st.scan.crowd_still > 0.0
+            && s.vel.xz().length_squared() < STEP_PACE * STEP_PACE
             && touched(f, i, st, desired.normalize_or_zero())
         {
             seen |= SIGHT_GO | SIGHT_WAY | SIGHT_AHEAD;
@@ -639,7 +642,8 @@ pub(super) fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
 
 /// Whether a living comrade out of his rank and standing is within
 /// SEP_RADIUS of him, within 45 degrees of his wish `wish_dir`
-/// (`join_touch`).
+/// (`join_touch`). `look_around` asks it only of a soldier the bodies have
+/// stopped: his own speed under a step's pace.
 fn touched(f: &Field, i: usize, st: &Step, wish_dir: Vec2) -> bool {
     let p = st.p;
     let my_team_bit = st.scan.my_team_bit;

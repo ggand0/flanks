@@ -432,10 +432,10 @@ pub(super) fn face_keep() -> bool {
     static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *S.get_or_init(|| crate::util::env_or("FL_FACE_KEEP", 1u32) != 0)
 }
-/// A soldier in his rank walking to his place who is stopped behind a
-/// comrade that has left his rank and stands there leaves his rank too and
-/// walks on to the fight, the way his regiment faces (`look_around`,
-/// `decide_to_join`, `join_way`).
+/// A soldier in his rank walking to his place who is stopped (his own speed
+/// under a step's pace, STEP_PACE) behind a comrade that has left his rank
+/// and stands there leaves his rank too and walks on to the fight, the way
+/// his regiment faces (`look_around`, `decide_to_join`, `join_way`).
 /// FL_JOIN_TOUCH=0 turns it off; only with the still brake.
 #[inline]
 pub(super) fn join_touch() -> bool {
