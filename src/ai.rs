@@ -152,8 +152,8 @@ fn ai_think(
 }
 
 /// The automatic attack, when the battle set-up turns it on
-/// (`BattleConfig::at_ease_attack`, the menu's "Units attack on their
-/// own", `FL_AT_EASE=1`): once a second, an idle regiment of either team
+/// (`BattleConfig::at_ease_attack`, the menu's "Auto attack",
+/// `FL_AT_EASE=1`): once a second, an idle regiment of either team
 /// (no order, not engaged, not in hold mode) attacks the nearest unbroken
 /// enemy regiment it has a clear way to (no living friendly regiment's
 /// centre between them, `Groups::front_on_outline`), if that one's centre

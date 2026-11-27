@@ -634,12 +634,7 @@ fn spawn_menu(mut commands: Commands) {
                 );
                 spawn_segment_row(opts, "Map", MapKind::ALL.iter().map(|m| m.label()), Segment::Map);
                 spawn_segment_row(opts, "AI", AI_VALUES.into_iter(), Segment::Ai);
-                spawn_segment_row(
-                    opts,
-                    "Units attack on their own",
-                    AT_EASE_VALUES.into_iter(),
-                    Segment::AtEase,
-                );
+                spawn_segment_row(opts, "Auto attack", AT_EASE_VALUES.into_iter(), Segment::AtEase);
             });
 
             spawn_text_button(p, "Start Battle", MenuButton::StartBattle);
@@ -736,9 +731,8 @@ fn spawn_option_label(row: &mut ChildSpawnerCommands, label: &str) {
             ..default()
         },
         TextColor(DIM_TEXT_COLOR),
-        // Wide enough for the longest label on one line.
         Node {
-            width: Val::Px(200.0),
+            width: Val::Px(80.0),
             ..default()
         },
     ));
@@ -1101,7 +1095,7 @@ pub fn setup_battle(
         info!("deployment phase: place your regiments, then begin the battle");
     }
     info!(
-        "battle started: {} per team, map {}, scenario {}, AI {}, units attack on their own {}",
+        "battle started: {} per team, map {}, scenario {}, AI {}, auto attack {}",
         config.units_per_team,
         config.map.label(),
         config.scenario.label(),
