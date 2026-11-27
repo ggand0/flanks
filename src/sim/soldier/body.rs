@@ -475,7 +475,9 @@ pub(super) fn open_side() -> bool {
 }
 /// An opening fits him only with his elbow room beside his body, and a
 /// body nearer than that to his aim has taken it (`opening_ahead`,
-/// `aim_taken`). FL_OPEN_ROOMY=0 turns it off.
+/// `aim_taken`). Under the arm's length rule an opening fits a walker to
+/// the fight by the room he has now instead (`room_fit`). FL_OPEN_ROOMY=0
+/// turns it off.
 #[inline]
 pub(super) fn open_roomy() -> bool {
     static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

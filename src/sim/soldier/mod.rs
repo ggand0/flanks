@@ -261,6 +261,10 @@ struct Scanned {
     /// by how far inside his arm's length it stands (1 at his own place, 0
     /// at arm's length).
     crowding: Vec2,
+    /// The room a walker to the fight under the arm's length rule has now:
+    /// the distance to his nearest living body of either team, his arm's
+    /// length at most.
+    room: f32,
     scan_r: f32,
     my_team_bit: u32,
 }
@@ -280,6 +284,7 @@ impl Scanned {
         brake: (0.0, 0.0),
         way_gap: f32::INFINITY,
         crowding: Vec2::ZERO,
+        room: 0.0,
         scan_r: 0.0,
         my_team_bit: 0,
     };

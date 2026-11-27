@@ -525,13 +525,15 @@ impl Crowd {
 /// the comrade in his way stands (`Scanned::way_gap`): the nearest living
 /// comrade within SEP_RADIUS and 45 degrees of his way who is not walking
 /// away along it, as his look reads a comrade ahead (`look_on_his_way`).
-/// With no way it only sums the crowding.
+/// With no way it only sums the crowding. It also keeps how near his
+/// nearest living body of either team stands (`Scanned::room`).
 struct Arm {
     on: bool,
     way: Vec2,
     arm: f32,
     way_gap: f32,
     crowding: Vec2,
+    near2: f32,
 }
 
 impl Arm {
@@ -543,6 +545,7 @@ impl Arm {
             arm: arm_length(),
             way_gap: f32::INFINITY,
             crowding: Vec2::ZERO,
+            near2: f32::INFINITY,
         }
     }
 
@@ -552,6 +555,7 @@ impl Arm {
         if !self.on || n.o_dying || n.d2 <= 1e-8 {
             return;
         }
+        self.near2 = self.near2.min(n.d2);
         let arm = self.arm;
         let inside = n.d2 < arm * arm;
         let ahead = n.same && self.way != Vec2::ZERO && n.d2 < SEP_RADIUS * SEP_RADIUS;
@@ -571,6 +575,7 @@ impl Arm {
     fn hand_on(&self, st: &mut Step) {
         st.scan.way_gap = self.way_gap;
         st.scan.crowding = self.crowding;
+        st.scan.room = self.near2.sqrt().min(self.arm);
     }
 }
 

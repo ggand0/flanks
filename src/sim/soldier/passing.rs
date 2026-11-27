@@ -350,6 +350,21 @@ const JOIN_OPEN_GIVE: f32 = 0.1;
 /// than his body.
 pub(super) const JOIN_OPEN_ELBOW: f32 = 0.3;
 
+/// Under the arm's length rule a place fits a soldier when the bodies
+/// about it would stand no nearer to him than his nearest body stands now
+/// (`Scanned::room`), less half of this (m): a crowd rests a few
+/// centimetres inside the arm's length, and a fit as tight as the arm's
+/// length itself would leave a fallen comrade's place empty.
+const ROOM_GIVE: f32 = 0.1;
+
+/// The nearest a body may stand to a place that fits a walker to the fight
+/// under the arm's length rule (`keep_arm`): the room he has now less half
+/// ROOM_GIVE. None without the rule or for any other soldier.
+#[inline]
+fn room_fit(st: &Step) -> Option<f32> {
+    (keep_arm() && st.fight.joining).then_some(st.scan.room - 0.5 * ROOM_GIVE)
+}
+
 /// The opening among the bodies just ahead of him along `wd` (both teams,
 /// within OPEN_SEE, on his level; a comrade walking away along his way is
 /// none) that fits his width less JOIN_OPEN_GIVE (`join_open`): the point
@@ -357,7 +372,10 @@ pub(super) const JOIN_OPEN_ELBOW: f32 = 0.3;
 /// reads the bodies out to QUERY_RADIUS, takes the nearest rank of them as
 /// the row and counts the open ground beside it too, and an aim another
 /// body stands on is none; with `open_roomy` the opening must fit his width
-/// and JOIN_OPEN_ELBOW.
+/// and JOIN_OPEN_ELBOW. Under the arm's length rule (`room_fit`) the
+/// opening fits a walker to the fight when the bodies beside his aim would
+/// stand no nearer to him than the room he has now less half ROOM_GIVE,
+/// and a body that near to his aim has taken it.
 #[inline]
 pub(super) fn opening_ahead(f: &Field, i: usize, st: &Step, wd: Vec2, body: f32) -> Option<Vec2> {
     if wd == Vec2::ZERO {
@@ -414,10 +432,16 @@ pub(super) fn opening_ahead(f: &Field, i: usize, st: &Step, wd: Vec2, body: f32)
     let perp = Vec2::new(-wd.y, wd.x);
     let coin = side_pref(i, 0).1;
     let free = |lat: f32, along: f32| way_free(f.terrain, p, wd * along + perp * lat);
-    let fit_w = if open_roomy() { body + JOIN_OPEN_ELBOW } else { body - JOIN_OPEN_GIVE };
+    let fit_w = if let Some(r) = room_fit(st) {
+        2.0 * r - body
+    } else if open_roomy() {
+        body + JOIN_OPEN_ELBOW
+    } else {
+        body - JOIN_OPEN_GIVE
+    };
     let (aim_lat, aim_along, fit, _) = openings(&row, row_at, see, fit_w, f32::INFINITY, side, 0.0, coin, free);
     let aim = p + wd * aim_along.max(OPEN_MIN_AHEAD) + perp * aim_lat;
-    (fit == 2 && !(side && aim_taken(f, i, aim, body))).then_some(aim)
+    (fit == 2 && !(side && aim_taken(f, i, aim, body, room_fit(st)))).then_some(aim)
 }
 
 /// The arm's length a stopped soldier keeps from his comrades under
@@ -483,8 +507,9 @@ fn too_near(f: &Field, i: usize, st: &Step, wd: Vec2) -> Option<Vec2> {
 
 /// Whether another living body on his level stands on `aim`, within his
 /// and its half bodies less JOIN_OPEN_GIVE, or with `open_roomy` within
-/// them and half his elbow room.
-fn aim_taken(f: &Field, i: usize, aim: Vec2, body: f32) -> bool {
+/// them and half his elbow room. Under the arm's length rule `room` is
+/// `room_fit` and a body nearer than that to the aim has taken it.
+fn aim_taken(f: &Field, i: usize, aim: Vec2, body: f32, room: Option<f32>) -> bool {
     let widths = widths();
     let levels = Levels::new(f, i);
     let mut taken = false;
@@ -493,7 +518,13 @@ fn aim_taken(f: &Field, i: usize, aim: Vec2, body: f32) -> bool {
             return;
         }
         let o_body = widths[crate::spatial::meta_pose(o.meta)].body;
-        let r = if open_roomy() { 0.5 * (body + o_body) + 0.5 * JOIN_OPEN_ELBOW } else { 0.5 * (body + o_body) - JOIN_OPEN_GIVE };
+        let r = if let Some(r) = room {
+            r
+        } else if open_roomy() {
+            0.5 * (body + o_body) + 0.5 * JOIN_OPEN_ELBOW
+        } else {
+            0.5 * (body + o_body) - JOIN_OPEN_GIVE
+        };
         taken = o.xz().distance_squared(aim) < r * r;
     });
     taken
@@ -595,7 +626,7 @@ pub(super) fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
             let blocked = seen & SIGHT_WAY != 0;
             if blocked && *s.stood && memo_dir != Vec2::ZERO {
                 let body = st.open.body0;
-                let keep = s.aim.x.is_finite() && s.aim.distance_squared(p) > 0.15 * 0.15 && !aim_taken(f, i, *s.aim, body);
+                let keep = s.aim.x.is_finite() && s.aim.distance_squared(p) > 0.15 * 0.15 && !aim_taken(f, i, *s.aim, body, room_fit(st));
                 let back = if !keep && back_room() { too_near(f, i, st, memo_dir) } else { None };
                 if let Some(step) = back {
                     *s.aim = p + step;
