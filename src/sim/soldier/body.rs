@@ -414,6 +414,15 @@ pub(super) fn join_open() -> bool {
     static J: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *J.get_or_init(|| still_brake() && crate::util::env_or("FL_JOIN_OPEN", 1u32) != 0)
 }
+/// A soldier in his rank walking to his place who is stopped behind a
+/// comrade that has left his rank and stands there leaves his rank too and
+/// walks on to the fight (`look_around`, `decide_to_join`, `join_way`).
+/// FL_JOIN_TOUCH=0 turns it off; only with the still brake.
+#[inline]
+pub(super) fn join_touch() -> bool {
+    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *S.get_or_init(|| still_brake() && crate::util::env_or("FL_JOIN_TOUCH", 1u32) != 0)
+}
 
 #[cfg(test)]
 mod tests {

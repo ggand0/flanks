@@ -903,16 +903,6 @@ fn engagement(g: usize, group: &mut crate::orders::GroupData, tk: &GroupsTick) -
     Engagement { engaged, lock_threshold, fight_n, line_sum, line_n, moving }
 }
 
-/// Under the friction contact a regiment's melee clock starts with its
-/// first soldiers who strike, not at the count gate (ENGAGE_LOCK_FRAC), so
-/// the soldiers of a regiment that reached the enemy with a handful walk to
-/// the fight like any regiment's. The contact frame keeps the count gate.
-/// FL_MELEE_FIRST=0 turns it off.
-fn melee_first() -> bool {
-    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *S.get_or_init(|| crate::sim::soldier::friction_contact() && crate::util::env_or("FL_MELEE_FIRST", 1u32) != 0)
-}
-
 /// The melee clock and the fight point.
 #[inline]
 fn melee_clock(g: usize, group: &mut crate::orders::GroupData, tk: &GroupsTick, e: &Engagement, nearest_formed: Option<Vec2>) {
@@ -945,7 +935,7 @@ fn melee_clock(g: usize, group: &mut crate::orders::GroupData, tk: &GroupsTick, 
         && !group.state.is_broken()
         && !group.crashing
         && !moving
-        && (group.melee_ticks > 0 || fight_n >= if melee_first() { 1 } else { lock_threshold })
+        && (group.melee_ticks > 0 || fight_n >= lock_threshold)
     {
         if group.retarget && group.melee_ticks == 0 {
             info!("regiment {g} fights its new target");

@@ -540,6 +540,7 @@ fn integrate_chunks(job: &mut TickJob, terrain: &Terrain) {
         search_blocks: &search_blocks[..],
         sidearm: &sidearm[..],
         death_snap: death_t_in,
+        out_form: &out_form_in[..],
         blocks: &*blocks,
         faces_spearwall, dt, tick_seed, tick, bounds_min, bounds_max,
         paths: route::KernelRoutes { routes: &routes[..], nav: nav.as_deref() },

@@ -229,7 +229,10 @@ pub(super) fn decide_to_join(f: &Field, s: &mut Soldier, st: &mut Step) {
         let look = if engaged[gi] { seek_radius() } else { WIDE_ACQUIRE_R };
         let sees = best_idx != u32::MAX
             || (memo_valid && memo_d2 < (look + 1.0) * (look + 1.0));
-        if !sees {
+        // While a comrade stands in his way or ahead of him he stays out
+        // (`join_touch`).
+        let held = join_touch() && *s.sight & (SIGHT_WAY | SIGHT_AHEAD) != 0;
+        if !sees && !held {
             committed = false;
             *s.out_form = false;
         }
@@ -250,7 +253,10 @@ pub(super) fn decide_to_join(f: &Field, s: &mut Soldier, st: &mut Step) {
         let sees = if in_melee {
             memo_valid || saw_comrade_go
         } else {
-            memo_valid && memo_d2 < WIDE_ACQUIRE_R * WIDE_ACQUIRE_R
+            // A comrade out of his rank who stopped him counts as a comrade
+            // seen going (`join_touch`).
+            (memo_valid && memo_d2 < WIDE_ACQUIRE_R * WIDE_ACQUIRE_R)
+                || (join_touch() && *s.sight & SIGHT_GO != 0)
         };
         let react = sees && {
             let window = (tick.wrapping_add((i as u32).wrapping_mul(11)) / JOIN_WINDOW)

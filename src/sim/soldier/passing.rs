@@ -500,6 +500,22 @@ pub(super) fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
                 *s.aim = Vec2::NAN;
             }
         }
+        // A soldier in his rank walking to his place, stopped behind a
+        // comrade who has left his rank and stands, leaves his rank too
+        // (`join_touch`): he sees that comrade go and has him in his way.
+        if join_touch()
+            && st.fight.may_leave
+            && !committed
+            && !in_melee
+            && best_idx == u32::MAX
+            && !dying
+            && !routed
+            && desired.length_squared() > 0.25
+            && st.scan.crowd_still > 0.0
+            && touched(f, i, st, desired.normalize_or_zero())
+        {
+            seen |= SIGHT_GO | SIGHT_WAY | SIGHT_AHEAD;
+        }
         *s.sight = (*s.sight
             & (SIGHT_GO_FAR | SIGHT_FOE | SIGHT_KNIFE_COUNT | SIGHT_KNIFE))
             | seen;
@@ -518,6 +534,30 @@ pub(super) fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
     st.sight.right_blocked = right_blocked;
     st.sight.comrade_ahead = comrade_ahead;
     st.sight.slot_blocked = slot_blocked;
+}
+
+/// Whether a living comrade out of his rank and standing is within
+/// SEP_RADIUS of him, within 45 degrees of his wish `wish_dir`
+/// (`join_touch`).
+fn touched(f: &Field, i: usize, st: &Step, wish_dir: Vec2) -> bool {
+    let p = st.p;
+    let my_team_bit = st.scan.my_team_bit;
+    let mut found = false;
+    f.grid.for_each_candidate(p, st.scan.scan_r, |o| {
+        if found
+            || o.idx as usize == i
+            || (o.meta & crate::spatial::META_TEAM) != my_team_bit
+            || (o.meta & crate::spatial::META_DYING) != 0
+            || (o.meta & crate::spatial::META_STOOD) == 0
+            || !f.out_form[o.idx as usize]
+        {
+            return;
+        }
+        let to = o.xz() - p;
+        let d2 = to.length_squared();
+        found = d2 < SEP_RADIUS * SEP_RADIUS && to.dot(wish_dir) > 0.707 * d2.sqrt();
+    });
+    found
 }
 
 /// What his look on his way looks for (`look_around`): the way he is

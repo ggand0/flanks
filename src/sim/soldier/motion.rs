@@ -403,6 +403,13 @@ fn join_way(f: &Field, s: &Soldier, st: &Step) -> (Vec2, Vec2, Vec2) {
         }
         return (to_fp.normalize_or_zero(), Vec2::ZERO, fp);
     }
+    // With no melee on his regiment's clock he walks on the way his slot
+    // wish points, toward the fight (`join_touch`).
+    if join_touch() && !st.fight.in_melee && st.fight.slot_wish != Vec2::ZERO {
+        let dir = st.fight.slot_wish.normalize_or_zero();
+        let pace = if ahead { ADVANCE_PACE } else { COMBAT_JOG_PACE };
+        return (dir, dir * pace, p + dir * 2.0);
+    }
     (Vec2::ZERO, Vec2::ZERO, p)
 }
 
