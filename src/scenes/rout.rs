@@ -3,6 +3,7 @@
 
 use bevy::prelude::*;
 
+use crate::game_state::{BattleClock, PerBattle};
 use crate::orders::{Groups, RegState};
 use crate::regiments::spawn_regiment;
 use crate::terrain::Terrain;
@@ -32,8 +33,8 @@ pub fn rout_test_log(
     groups: Res<Groups>,
     stats: Res<crate::combat::CombatStats>,
     readout: Res<crate::morale::MoraleReadout>,
-    time: Res<Time>,
-    mut next: Local<f32>,
+    clock: Res<BattleClock>,
+    mut next: Local<PerBattle<f32>>,
 ) {
     // Regiment-0 morale/fatigue timeline: the rout acceptance AND a
     // line-fight probe for the front battle (flank ring must read ~0 in
@@ -43,7 +44,8 @@ pub fn rout_test_log(
     {
         return;
     }
-    let t = time.elapsed_secs();
+    let next = next.of(&clock);
+    let t = clock.secs();
     if t < *next {
         return;
     }

@@ -221,6 +221,74 @@ pub fn scripts_active() -> bool {
 #[derive(SystemSet, Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct SimSet;
 
+/// The battle's own clock: the sim ticks run since this battle began
+/// (0 during its first tick) and which battle of the launch it is. It
+/// stands still while deploying and while paused, because the tick does
+/// not run then. Scripts, the AI and the scene logs time themselves by
+/// it, so two runs of one battle give their orders on the same ticks.
+#[derive(Resource, Default, Clone, Copy, Debug)]
+pub struct BattleClock {
+    pub tick: u32,
+    /// Goes up by one each time a battle is set up.
+    pub battle: u32,
+}
+
+impl BattleClock {
+    /// The battle's time in seconds: its ticks times the fixed timestep.
+    pub fn secs(&self) -> f32 {
+        (self.tick as f64 * SIM_DT) as f32
+    }
+}
+
+/// The sim's tick rate in hertz (shells.rs `fixed_time` sets the fixed
+/// clock to this rate) and its fixed timestep in seconds.
+pub const SIM_HZ: f64 = 30.0;
+pub const SIM_DT: f64 = 1.0 / SIM_HZ;
+
+/// The last system of the tick: the tick that just ran is counted.
+pub fn advance_battle_clock(mut clock: ResMut<BattleClock>) {
+    clock.tick += 1;
+}
+
+/// A system's own state for one battle: it goes back to `T::default()`
+/// when a new battle is set up, because the battle clock starts again at
+/// zero then.
+#[derive(Default)]
+pub struct PerBattle<T> {
+    battle: Option<u32>,
+    value: T,
+}
+
+impl<T: Default> PerBattle<T> {
+    /// This battle's state, fresh on the first call of a new battle.
+    pub fn of(&mut self, clock: &BattleClock) -> &mut T {
+        if self.battle != Some(clock.battle) {
+            self.battle = Some(clock.battle);
+            self.value = T::default();
+        }
+        &mut self.value
+    }
+}
+
+/// The slot on the sim tick for the orders nobody types and for the scene
+/// logs: after the arrived orders are cleared and before the routes are
+/// planned, where the pipelined tick's kick and the inline tick's next
+/// prep both read the orders. The parts run in this order.
+#[derive(SystemSet, Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum ScriptSet {
+    /// The battle setup's scripted orders and the test craters.
+    Setup,
+    /// The test scenes' scripts.
+    Scenes,
+    /// The path scenes' orders and watch (scenes/path.rs).
+    Path,
+    /// The victory check, the enemy AI and the at-ease engagement.
+    Ai,
+    /// The logs, which only read: they see the tick's state with its
+    /// orders given.
+    Logs,
+}
+
 #[derive(SystemSet, Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct BattleInputSet;
 
@@ -301,20 +369,84 @@ enum ResultsButton {
     MainMenu,
 }
 
-pub struct GameShellPlugin;
+/// How a launch starts its battle, set by the shell: whether the first
+/// battle starts without a key press, and whether a normal battle opens
+/// in deployment.
+#[derive(Resource, Clone, Copy, Debug)]
+pub struct LaunchPlan {
+    pub autostart: bool,
+    pub deployment: bool,
+}
 
-impl Plugin for GameShellPlugin {
+impl LaunchPlan {
+    /// The windowed game's: FL_AUTOSTART starts the battle, FL_DEPLOY=0
+    /// skips the deployment.
+    pub fn from_env() -> Self {
+        Self {
+            autostart: std::env::var("FL_AUTOSTART").is_ok(),
+            deployment: crate::util::env_or("FL_DEPLOY", 1_u32) != 0,
+        }
+    }
+}
+
+/// While this resource exists the launch's own start waits: the headless
+/// renderer holds it until the ground's textures are loaded, so its first
+/// pictures are complete. The battle clock counts from the start, so the
+/// wait moves no tick.
+#[derive(Resource)]
+pub struct StartHold;
+
+/// The game's states, the battle's lifecycle and the sim tick's sets: what
+/// the sim needs of the shell, with no window.
+pub struct GameSimPlugin;
+
+impl Plugin for GameSimPlugin {
     fn build(&self, app: &mut App) {
+        if !app.world().contains_resource::<LaunchPlan>() {
+            app.insert_resource(LaunchPlan::from_env());
+        }
         app.init_resource::<BattleConfig>()
             .init_resource::<Deployment>()
+            .init_resource::<BattleClock>()
             .init_state::<GameState>()
             .configure_sets(
                 FixedUpdate,
                 SimSet.run_if(
-                    in_state(GameState::Battle).and_then(not(deploying)),
+                    in_state(GameState::Battle)
+                        .and_then(not(deploying))
+                        .and_then(crate::cli::under_tick_limit),
                 ),
             )
             .configure_sets(
+                FixedUpdate,
+                (ScriptSet::Setup, ScriptSet::Scenes, ScriptSet::Path, ScriptSet::Ai, ScriptSet::Logs)
+                    .chain()
+                    .in_set(SimSet)
+                    .after(crate::orders::clear_arrived_orders)
+                    .before(crate::sim::route::update_routes),
+            )
+            .add_systems(
+                FixedUpdate,
+                advance_battle_clock.after(crate::sim::kick_tick).in_set(SimSet),
+            )
+            .add_systems(OnEnter(GameState::Battle), setup_battle)
+            // The launch's own start, before a map change it asks for is
+            // built (`MapRebuild`), so the battle spawns on the new map.
+            .add_systems(
+                Update,
+                launch_start
+                    .before(crate::terrain::MapRebuild)
+                    .run_if(in_state(GameState::Menu).and_then(not(resource_exists::<StartHold>))),
+            );
+    }
+}
+
+/// The menus, the pause, the deployment and the results screens.
+pub struct GameShellPlugin;
+
+impl Plugin for GameShellPlugin {
+    fn build(&self, app: &mut App) {
+        app.configure_sets(
                 Update,
                 BattleInputSet.run_if(
                     in_state(GameState::Battle).and_then(not(time_paused)),
@@ -325,7 +457,7 @@ impl Plugin for GameShellPlugin {
                 (MapInputSet, HudInputSet).chain().in_set(BattleInputSet),
             )
             .add_systems(OnEnter(GameState::Menu), spawn_menu)
-            .add_systems(OnEnter(GameState::Battle), setup_battle)
+            .add_systems(OnEnter(GameState::Battle), spawn_deploy_ui.after(setup_battle))
             .add_systems(OnEnter(GameState::Results), spawn_results)
             .add_systems(
                 Update,
@@ -606,9 +738,9 @@ fn spawn_option_text(button: &mut ChildSpawnerCommands, value: &str) {
 /// Units screen; scripted scenarios and FL_DEPLOY=0 skip deployment and
 /// the picker both and drop straight into the fight. An `FL_SETUP` file
 /// brings its own armies, so it skips the picker and keeps deployment.
-fn start_target() -> GameState {
+fn start_target(plan: &LaunchPlan) -> GameState {
     if scripts_active()
-        || crate::util::env_or("FL_DEPLOY", 1_u32) == 0
+        || !plan.deployment
         || crate::battle_setup::for_battle(Scenario::Normal).is_some()
     {
         GameState::Battle
@@ -623,10 +755,32 @@ fn start_target() -> GameState {
 /// scenario, not the stale one. Launch-only battery envs
 /// (FL_TEST_FRONT and kin) are not scenario envs and still skip the
 /// picker on purpose.
-fn start_normal_battle(config: &mut BattleConfig, next: &mut NextState<GameState>) {
+fn start_normal_battle(config: &mut BattleConfig, plan: &LaunchPlan, next: &mut NextState<GameState>) {
     config.scenario = Scenario::Normal;
     sync_scenario_env(Scenario::Normal);
-    next.set(start_target());
+    next.set(start_target(plan));
+}
+
+/// The launch's own start, looked at on the menu's first frame only: a
+/// scripted scenario or the Demo starts at once, and with
+/// `LaunchPlan::autostart` a normal battle starts without a key press. A
+/// test battle from the menu leaves its scenario's env var set, and a
+/// later visit to the menu must not start it again.
+fn launch_start(
+    mut config: ResMut<BattleConfig>,
+    plan: Res<LaunchPlan>,
+    mut next: ResMut<NextState<GameState>>,
+    mut done: Local<bool>,
+) {
+    if *done {
+        return;
+    }
+    *done = true;
+    if scripts_active() || Scenario::from_env() == Scenario::Demo {
+        next.set(GameState::Battle);
+    } else if plan.autostart {
+        start_normal_battle(&mut config, &plan, &mut next);
+    }
 }
 
 fn menu_buttons(
@@ -636,34 +790,17 @@ fn menu_buttons(
     mut config: ResMut<BattleConfig>,
     mut next: ResMut<NextState<GameState>>,
     mut exit: MessageWriter<AppExit>,
-    mut auto: Local<bool>,
+    plan: Res<LaunchPlan>,
 ) {
-    // Launch-time starts, looked at on the menu's first frame only: a test
-    // battle from the menu leaves its scenario's env var set, and a later
-    // visit to the menu must not start it again.
-    if !*auto {
-        *auto = true;
-        if scripts_active() || Scenario::from_env() == Scenario::Demo {
-            next.set(GameState::Battle);
-            return;
-        }
-        // FL_AUTOSTART=1: start a normal battle without a key press (with
-        // FL_DEPLOY=0 it skips the picker and deployment too), for
-        // measured runs of the real game with the AI on.
-        if std::env::var("FL_AUTOSTART").is_ok() {
-            start_normal_battle(&mut config, &mut next);
-            return;
-        }
-    }
     if keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::Space) {
-        start_normal_battle(&mut config, &mut next);
+        start_normal_battle(&mut config, &plan, &mut next);
         return;
     }
     for (interaction, btn) in &query {
         if *interaction == Interaction::Pressed {
             match btn {
                 MenuButton::StartBattle => {
-                    start_normal_battle(&mut config, &mut next);
+                    start_normal_battle(&mut config, &plan, &mut next);
                 }
                 MenuButton::TestBattles => spawn_test_battles(&mut commands),
                 MenuButton::Quit => {
@@ -868,14 +1005,14 @@ fn sync_scenario_env(scenario: Scenario) {
 
 #[allow(clippy::too_many_arguments)]
 pub fn setup_battle(
-    mut commands: Commands,
+    plan: Res<LaunchPlan>,
     mut units: ResMut<Units>,
     terrain: Res<Terrain>,
     mut groups: ResMut<Groups>,
     mut stats: ResMut<CombatStats>,
     mut selection: ResMut<Selection>,
     mut outcome: ResMut<BattleOutcome>,
-    mut corpses: ResMut<Corpses>,
+    mut corpses: Option<ResMut<Corpses>>,
     mut dir_stats: ResMut<DirTestStats>,
     mut virt_time: ResMut<Time<Virtual>>,
     mut deploy: ResMut<Deployment>,
@@ -887,7 +1024,10 @@ pub fn setup_battle(
         ResMut<crate::arrows::ArrowSpawns>,
         ResMut<crate::arrows::StuckArrows>,
     ),
+    mut clock: ResMut<BattleClock>,
 ) {
+    clock.tick = 0;
+    clock.battle = clock.battle.wrapping_add(1);
     // A new world: any sim tick job still computing on the old one is
     // recognized as stale by the generation and dropped.
     let generation = units.generation.wrapping_add(1);
@@ -897,7 +1037,9 @@ pub fn setup_battle(
     *dir_stats = DirTestStats::default();
     *selection = Selection::default();
     outcome.0 = None;
-    corpses.clear();
+    if let Some(corpses) = corpses.as_mut() {
+        corpses.clear();
+    }
     crate::arrows::reset(&mut arrows, &mut arrow_spawns, &mut stuck);
     virt_time.unpause();
     sync_scenario_env(config.scenario);
@@ -915,12 +1057,12 @@ pub fn setup_battle(
         }
     }
     // Scripted scenarios and test batteries start fighting immediately;
-    // a normal battle and the Demo open in deployment. FL_DEPLOY=0 skips it.
+    // a normal battle and the Demo open in deployment unless the launch
+    // skips it (FL_DEPLOY=0, the headless shell).
     deploy.active = matches!(config.scenario, Scenario::Normal | Scenario::Demo)
         && !scripts_active()
-        && crate::util::env_or("FL_DEPLOY", 1_u32) != 0;
+        && plan.deployment;
     if deploy.active {
-        spawn_deploy_ui(&mut commands);
         info!("deployment phase: place your regiments, then begin the battle");
     }
     info!(
@@ -932,7 +1074,12 @@ pub fn setup_battle(
     );
 }
 
-fn spawn_deploy_ui(commands: &mut Commands) {
+/// The deployment's banner and Begin Battle button, when the battle opens
+/// in deployment.
+fn spawn_deploy_ui(mut commands: Commands, deploy: Res<Deployment>) {
+    if !deploy.active {
+        return;
+    }
     // One transparent full-screen column: banner pinned up top, Begin
     // Battle pinned above the card bar. Plain nodes carry no
     // Interaction, so map picking under it is untouched.
@@ -1211,6 +1358,68 @@ fn button_hover_style(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pairs of sim tick systems that touch the same data with no
+    /// order between them, as "a / b" with the names sorted. Each is a
+    /// place where the tick's result could depend on which runs first.
+    fn unordered_tick_pairs() -> Vec<String> {
+        use bevy::ecs::schedule::{LogLevel, ScheduleBuildSettings};
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, bevy::state::app::StatesPlugin));
+        // The sim group, exactly as the headless run loads it. The view's
+        // tick systems, overlay.rs `count_sim_tick` and shots.rs
+        // `mark_due`, write only their own frame counter and picture tick.
+        app.add_plugins(crate::shells::SimPlugins);
+        let world = app.world_mut();
+        world.resource_scope(|world, mut schedules: Mut<Schedules>| {
+            let schedule = schedules.get_mut(FixedUpdate).expect("the tick has systems");
+            schedule.set_build_settings(ScheduleBuildSettings {
+                ambiguity_detection: LogLevel::Error,
+                ..default()
+            });
+            // An unordered pair fails the build; the error names them, one
+            // " -- a and b" line each, then the data they share.
+            let Err(e) = schedule.initialize(world) else { return Vec::new() };
+            let text = e.to_string(schedule.graph(), world);
+            assert!(text.contains("pairs of systems"), "the tick's schedule does not build: {text}");
+            let short = |name: &str| name.rsplit("::").next().unwrap_or(name).trim_end_matches('`').to_string();
+            let mut pairs = Vec::new();
+            let mut lines = text.lines().peekable();
+            while let Some(line) = lines.next() {
+                let Some(pair) = line.trim().strip_prefix("-- ") else { continue };
+                let Some((a, b)) = pair.split_once(" and ") else { continue };
+                let (a, b) = (short(a), short(b));
+                let (a, b) = if a <= b { (a, b) } else { (b, a) };
+                let on = lines.next_if(|l| l.trim().starts_with("conflict on:")).unwrap_or_default();
+                let on: Vec<String> = on
+                    .trim()
+                    .trim_start_matches("conflict on:")
+                    .trim()
+                    .trim_matches(['[', ']'])
+                    .split(", ")
+                    .map(|c| short(c.trim_matches('"')))
+                    .collect();
+                pairs.push(format!("{a} / {b} on {}", on.join(", ")));
+            }
+            pairs.sort();
+            pairs
+        })
+    }
+
+    /// The tick's order is settled for every pair of systems that touch
+    /// the same data: none is left for the scheduler to pick, so the tick
+    /// runs in one order whatever else the app holds.
+    #[test]
+    fn the_sim_tick_has_no_unordered_pairs() {
+        let pairs = unordered_tick_pairs();
+        assert!(
+            pairs.is_empty(),
+            "{} pairs of sim tick systems touch the same data with no order between them \
+             (rerun with `cargo test --profile opt-dev --features bevy/debug` to see their names):\n{}",
+            pairs.len(),
+            pairs.join("\n")
+        );
+    }
 
     /// Every menu size splits into whole units, 10 to 100 a side, and the
     /// player's starting composition fills exactly those slots.

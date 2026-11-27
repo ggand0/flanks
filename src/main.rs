@@ -9,6 +9,7 @@ mod balance;
 mod banners;
 mod battle_setup;
 mod camera;
+mod cli;
 mod combat;
 mod fatigue;
 mod formation;
@@ -34,6 +35,8 @@ mod scenes;
 mod selection;
 mod selection_rings;
 mod settings;
+mod shells;
+mod shots;
 mod sim;
 mod spatial;
 mod sprite_bake;
@@ -124,82 +127,80 @@ fn window_position() -> bevy::window::WindowPosition {
     }
 }
 
-fn main() {
+fn main() -> AppExit {
+    cli::init();
+    let mut app = App::new();
+    let args = cli::args();
+    if args.headless && args.shots.is_none() {
+        shells::headless(&mut app, task_pool_options());
+        app.add_systems(Startup, log_task_pools);
+    } else {
+        // The windowed game, or with --headless --shots the same game
+        // drawing into an image with no window.
+        with_view(&mut app, !args.headless);
+        if args.headless {
+            shells::headless_render(&mut app);
+        }
+    }
+    let exit = app.run();
+    shells::remove_status();
+    exit
+}
+
+/// The sim and the view on bevy's default plugins: the windowed game, or
+/// with `window` false the same plugins with no window and no window
+/// event loop (the headless renderer, shells.rs `headless_render`).
+fn with_view(app: &mut App, window: bool) {
     // Load before the App so the window opens with the saved video
     // settings instead of switching modes one frame in.
     let user_settings = settings::Settings::load();
-    App::new()
-        .add_plugins(game_files::GameFilesPlugin)
-        .add_plugins(
-            DefaultPlugins
-                .set(TaskPoolPlugin {
-                    task_pool_options: task_pool_options(),
-                })
-                .set(WindowPlugin {
-                    primary_window: Some(Window {
-                        title: "flanks".into(),
-                        // The app name (X11 WM_CLASS, Wayland app id) a
-                        // desktop entry matches with StartupWMClass.
-                        name: Some("flanks".into()),
-                        // Default vsync off: the FPS overlay should
-                        // show real headroom.
-                        present_mode: settings::present_mode(&user_settings),
-                        mode: settings::window_mode(&user_settings),
-                        resolution: window_resolution(),
-                        position: window_position(),
-                        ..default()
-                    }),
-                    ..default()
-                })
-                // Resolve assets/ regardless of how the binary is launched
-                // (packaged, cargo run or ./target/...). An embed_assets
-                // build serves them from memory instead (GameFilesPlugin).
-                .set(AssetPlugin {
-                    file_path: util::game_root().join("assets").to_string_lossy().into_owned(),
-                    ..default()
-                })
-                .set(RenderPlugin {
-                    render_creation: wgpu_settings().into(),
-                    ..default()
-                }),
-        )
+    let mut defaults = DefaultPlugins
+        .set(TaskPoolPlugin {
+            task_pool_options: task_pool_options(),
+        })
+        .set(WindowPlugin {
+            primary_window: window.then(|| Window {
+                title: "flanks".into(),
+                // The app name (X11 WM_CLASS, Wayland app id) a
+                // desktop entry matches with StartupWMClass.
+                name: Some("flanks".into()),
+                // Default vsync off: the FPS overlay should
+                // show real headroom.
+                present_mode: settings::present_mode(&user_settings),
+                mode: settings::window_mode(&user_settings),
+                resolution: window_resolution(),
+                position: window_position(),
+                ..default()
+            }),
+            // With no window the run ends by AppExit alone.
+            exit_condition: if window {
+                bevy::window::ExitCondition::OnPrimaryClosed
+            } else {
+                bevy::window::ExitCondition::DontExit
+            },
+            ..default()
+        })
+        // Resolve assets/ regardless of how the binary is launched
+        // (packaged, cargo run or ./target/...). An embed_assets
+        // build serves them from memory instead (GameFilesPlugin).
+        .set(AssetPlugin {
+            file_path: util::game_root().join("assets").to_string_lossy().into_owned(),
+            ..default()
+        })
+        .set(RenderPlugin {
+            render_creation: wgpu_settings().into(),
+            ..default()
+        });
+    if !window {
+        defaults = defaults.disable::<bevy::winit::WinitPlugin>();
+    }
+    app.add_plugins(game_files::GameFilesPlugin)
+        .add_plugins(defaults)
         .insert_resource(user_settings)
-        .add_plugins(game_state::GameShellPlugin)
-        .add_plugins(settings::SettingsPlugin)
-        .add_plugins(battle_setup::BattleSetupPlugin)
-        .add_plugins(window_icon::WindowIconPlugin)
-        .add_plugins(town::TownPlugin)
-        .add_plugins((
-            terrain::TerrainPlugin,
-            water::WaterPlugin,
-            vegetation::VegetationPlugin,
-            units::UnitsPlugin,
-            scenes::ScenesPlugin,
-            morale::MoralePlugin,
-            fatigue::FatiguePlugin,
-            ai::AiPlugin,
-            banners::BannersPlugin,
-            audio::BattleAudioPlugin,
-            sim::SimPlugin,
-            arrows::ArrowsPlugin,
-        ))
-        .add_plugins((
-            orders::OrdersPlugin,
-            selection::SelectionPlugin,
-            formation::FormationPlugin,
-            frontline::FrontlinePlugin,
-            combat::CombatPlugin,
-            render_units::UnitRenderPlugin,
-            selection_rings::SelectionRingsPlugin,
-            camera::RtsCameraPlugin,
-            overlay::OverlayPlugin,
-            unit_cards::UnitCardsPlugin,
-            balance::BalancePlugin,
-            picker::PickerPlugin,
-            frame_log::FrameLogPlugin,
-            sprite_bake::SpriteBakePlugin,
-        ))
-        .insert_resource(Time::<Fixed>::from_hz(30.0))
+        .add_plugins(shells::SimPlugins)
+        .add_plugins(shells::ViewPlugins)
+        .add_plugins(shells::StatusFilePlugin)
+        .insert_resource(shells::fixed_time())
         // A frame that overruns makes the fixed clock owe catch-up sim
         // ticks, which Bevy runs back to back the next frame (default
         // max_delta 250 ms = up to 7 ticks at 30 Hz). Every tick after
@@ -223,8 +224,7 @@ fn main() {
             focused_mode: bevy::winit::UpdateMode::Continuous,
             unfocused_mode: bevy::winit::UpdateMode::Continuous,
         })
-        .add_systems(Startup, (setup_world, log_task_pools))
-        .run();
+        .add_systems(Startup, (setup_world, log_task_pools, cli::apply_speed));
 }
 
 fn log_task_pools() {

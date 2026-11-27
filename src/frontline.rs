@@ -279,8 +279,16 @@ impl Plugin for FrontlinePlugin {
                     .after(crate::sim::take_tick)
                     .before(crate::sim::step_sim)
                     .in_set(crate::game_state::SimSet),
-            )
-            .add_systems(Update, (draw_front_gizmos, draw_fight_points, draw_attack_front));
+            );
+    }
+}
+
+/// The front's debug drawing.
+pub struct FrontlineViewPlugin;
+
+impl Plugin for FrontlineViewPlugin {
+    fn build(&self, app: &mut App) {
+        app.add_systems(Update, (draw_front_gizmos, draw_fight_points, draw_attack_front));
     }
 }
 
@@ -291,7 +299,7 @@ fn init_field(mut commands: Commands, terrain: Res<Terrain>) {
 /// The density field of this tick's start positions. The taken job
 /// built it on the worker and `take_tick` swapped it in; with no job
 /// taken it is rebuilt here, inline, from the same positions.
-fn update_field(
+pub(crate) fn update_field(
     field: Option<ResMut<InfluenceField>>,
     units: Res<Units>,
     pipeline: Res<crate::sim::TickPipeline>,
@@ -627,7 +635,7 @@ fn regiment_sums(
     a
 }
 
-fn update_groups(
+pub(crate) fn update_groups(
     units: Res<Units>,
     runs: Res<crate::sim::RegimentRuns>,
     mut groups: ResMut<Groups>,

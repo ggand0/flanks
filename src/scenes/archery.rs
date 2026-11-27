@@ -3,6 +3,7 @@
 
 use bevy::prelude::*;
 
+use crate::game_state::{BattleClock, PerBattle};
 use crate::orders::{GroupData, Groups};
 use crate::regiments::spawn_regiment;
 use crate::terrain::Terrain;
@@ -240,13 +241,14 @@ pub(super) fn archery_log(
     units: Res<Units>,
     arrows: Res<crate::arrows::Arrows>,
     astats: Res<crate::arrows::ArrowStats>,
-    time: Res<Time>,
-    mut next: Local<f32>,
+    clock: Res<BattleClock>,
+    mut next: Local<PerBattle<f32>>,
 ) {
     if std::env::var("FL_TEST_ARCHERY").is_err() || groups.list.len() < 6 {
         return;
     }
-    let t = time.elapsed_secs();
+    let next = next.of(&clock);
+    let t = clock.secs();
     if t < *next {
         return;
     }

@@ -50,14 +50,43 @@ pub struct ScenesPlugin;
 
 impl Plugin for ScenesPlugin {
     fn build(&self, app: &mut App) {
+        use crate::game_state::ScriptSet;
+        // On the sim tick. The scripts give orders, so they run one after
+        // another; the logs only read and run after them.
         app.add_plugins(path::PathTestPlugin)
-            .add_systems(Update, surround_test_log)
+            .add_systems(FixedUpdate, crate::terrain::auto_test_craters.in_set(ScriptSet::Setup))
             .add_systems(
-                Update,
-                (rout_test_log, dir_test_log, arena_log, charge_test_log, pile_test_log, melee_diag_log, join_test_log, routpass_test_log, pass_line_script, push_test_log, archery_log, room_log, shake_log, straggler_log),
+                FixedUpdate,
+                (
+                    test_front_script,
+                    test_form_script,
+                    test_orders_script,
+                    test_retarget_script,
+                    pass_line_script,
+                    routpass_test_log,
+                )
+                    .chain()
+                    .in_set(ScriptSet::Scenes),
             )
-            .add_systems(Update, (test_orders_script, test_retarget_script))
-            .add_systems(Update, (test_form_script, disorder_log))
-            .add_systems(Update, test_front_script);
+            .add_systems(
+                FixedUpdate,
+                (
+                    surround_test_log,
+                    rout_test_log,
+                    dir_test_log,
+                    arena_log,
+                    charge_test_log,
+                    pile_test_log,
+                    melee_diag_log,
+                    join_test_log,
+                    push_test_log,
+                    archery_log,
+                    room_log,
+                    shake_log,
+                    straggler_log,
+                    disorder_log,
+                )
+                    .in_set(ScriptSet::Logs),
+            );
     }
 }

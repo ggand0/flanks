@@ -210,7 +210,6 @@ impl Plugin for ArrowsPlugin {
             .init_resource::<RegTracks>()
             .init_resource::<ArrowStats>()
             .init_resource::<StuckArrows>()
-            .add_systems(Startup, setup_arrow_buckets)
             .add_systems(
                 FixedUpdate,
                 (
@@ -222,7 +221,16 @@ impl Plugin for ArrowsPlugin {
                         .before(crate::combat::process_deaths),
                 )
                     .in_set(crate::game_state::SimSet),
-            )
+            );
+    }
+}
+
+/// The arrows on screen: the flying shafts and the ground litter.
+pub struct ArrowsViewPlugin;
+
+impl Plugin for ArrowsViewPlugin {
+    fn build(&self, app: &mut App) {
+        app.add_systems(Startup, setup_arrow_buckets)
             .add_systems(Update, (sync_arrow_instances, sync_stuck_instances));
     }
 }
@@ -640,7 +648,7 @@ fn log_tally(tick: u32, stats: &ArrowStats, in_flight: usize) {
 /// Archer regiment upkeep, before the tick: the regiment ammo pools for
 /// the HUD, summed over the archer regiments' own men. The skirmish run
 /// is a reaction of the tick's prep (sim/job.rs `skirmish_reactions`).
-fn ammo_tally(
+pub(crate) fn ammo_tally(
     mut groups: ResMut<crate::orders::Groups>,
     units: Res<crate::units::Units>,
     runs: Res<crate::sim::RegimentRuns>,
@@ -675,13 +683,14 @@ pub fn reset(arrows: &mut Arrows, spawns: &mut ArrowSpawns, stuck: &mut StuckArr
 fn sync_arrow_instances(
     arrows: Res<Arrows>,
     fixed: Res<Time<Fixed>>,
+    shots: Option<Res<crate::shots::Shots>>,
     mut query: Query<&mut InstanceMaterialData, With<ArrowBucket>>,
 ) {
     let _timed = Timed(&ARROW_PACK_NS, std::time::Instant::now());
     let Ok(mut data) = query.single_mut() else {
         return;
     };
-    let alpha = fixed.overstep_fraction();
+    let alpha = crate::shots::Shots::render_alpha(shots.as_deref(), &fixed);
     data.0.clear();
     data.0.reserve(arrows.len());
     for i in 0..arrows.len() {

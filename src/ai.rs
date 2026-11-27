@@ -11,6 +11,7 @@
 
 use bevy::prelude::*;
 
+use crate::game_state::{BattleClock, PerBattle};
 use crate::orders::Groups;
 
 /// AI decision cadence.
@@ -31,18 +32,16 @@ pub struct AiPlugin;
 
 impl Plugin for AiPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<BattleOutcome>()
-            .add_systems(
-                Update,
-                (
-                    // Stand down while the player deploys: no enemy
-                    // pre-orders, no auto-engagement across the line.
-                    (ai_think, auto_engage)
-                        .in_set(crate::game_state::BattleInputSet)
-                        .run_if(not(crate::game_state::deploying)),
-                    check_victory,
-                ),
-            );
+        // On the sim tick, which does not run while the player deploys
+        // (no enemy pre-orders, no auto-engagement across the line) or
+        // while the game is paused. The victory check goes first: the AI
+        // stands down on the tick the battle is decided.
+        app.init_resource::<BattleOutcome>().add_systems(
+            FixedUpdate,
+            (check_victory, ai_think, auto_engage)
+                .chain()
+                .in_set(crate::game_state::ScriptSet::Ai),
+        );
     }
 }
 
@@ -71,17 +70,17 @@ fn ai_enabled() -> bool {
 }
 
 fn ai_think(
-    time: Res<Time>,
+    clock: Res<BattleClock>,
     mut groups: ResMut<Groups>,
     outcome: Res<BattleOutcome>,
     config: Res<crate::game_state::BattleConfig>,
-    mut next: Local<f32>,
-    mut targets: Local<Vec<Option<usize>>>,
+    mut state: Local<PerBattle<(f32, Vec<Option<usize>>)>>,
 ) {
     if !config.ai_enabled || !ai_enabled() || outcome.0.is_some() {
         return;
     }
-    let t = time.elapsed_secs();
+    let (next, targets) = state.of(&clock);
+    let t = clock.secs();
     // Stagger the first advance a little so the player gets oriented.
     if t < *next || t < 5.0 {
         return;
@@ -95,11 +94,11 @@ fn ai_think(
         let gr = &groups.list[g];
         gr.team != AI_TEAM && gr.count > 0 && !gr.state.is_broken()
     };
-    for g in 0..groups.list.len() {
-        if let Some(tg) = targets[g]
+    for target in targets.iter_mut() {
+        if let Some(tg) = *target
             && !alive_player(&groups, tg)
         {
-            targets[g] = None;
+            *target = None;
         }
     }
     // Commitment load per player regiment (for the spread penalty).
@@ -112,7 +111,7 @@ fn ai_think(
         }
     }
 
-    for g in 0..groups.list.len() {
+    for (g, target) in targets.iter_mut().enumerate() {
         let gr = &groups.list[g];
         if gr.team != AI_TEAM
             || gr.count == 0
@@ -144,7 +143,7 @@ fn ai_think(
         else {
             continue;
         };
-        targets[g] = Some(best);
+        *target = Some(best);
         load[best] += 1;
         groups.list[g].order = Some(crate::orders::Order::Attack(best as u32));
     }
@@ -158,11 +157,12 @@ fn ai_think(
 /// this is regiment self-preservation, not army strategy — it is also what
 /// makes rallied enemies in the AI-less sandbox fight back instead of
 /// staring. Auto orders are flagged so the UI click/horn stays silent.
-fn auto_engage(time: Res<Time>, mut groups: ResMut<Groups>, mut next: Local<f32>) {
+fn auto_engage(clock: Res<BattleClock>, mut groups: ResMut<Groups>, mut next: Local<PerBattle<f32>>) {
     if scripts_active() {
         return;
     }
-    let t = time.elapsed_secs();
+    let next = next.of(&clock);
+    let t = clock.secs();
     if t < *next || t < 5.0 {
         return;
     }
@@ -231,13 +231,14 @@ fn auto_engage(time: Res<Time>, mut groups: ResMut<Groups>, mut next: Local<f32>
 fn check_victory(
     groups: Res<Groups>,
     mut outcome: ResMut<BattleOutcome>,
-    time: Res<Time>,
-    mut next: Local<f32>,
+    clock: Res<BattleClock>,
+    mut next: Local<PerBattle<f32>>,
 ) {
     if outcome.0.is_some() || groups.list.is_empty() {
         return;
     }
-    let t = time.elapsed_secs();
+    let next = next.of(&clock);
+    let t = clock.secs();
     if t < *next || t < 10.0 {
         return;
     }
