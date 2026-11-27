@@ -96,7 +96,7 @@ pub(super) const WIDE_ACQUIRE_R: f32 = 4.0;
 pub(super) const CHARGE_SPEED_FRAC: f32 = 0.6;
 
 /// The far look, every eighth tick: a pressing man with nobody in reach
-/// and open ground around him remembers the nearest enemy within his sight
+/// and no bodies pressed against his remembers the nearest enemy within his sight
 /// (15 m for a fighting regiment, 4 m on the approach; with his regiment
 /// focused on one target, its men, and any man within his threat distance
 /// coming at him), and a man still in formation notices a comrade of his
@@ -116,11 +116,13 @@ pub(super) fn acquire(f: &Field, s: &mut Soldier, st: &mut Step) {
     let memo_dir = st.sight.memo_dir;
     let my_team_bit = st.scan.my_team_bit;
     // Sparse-fight acquisition (see WIDE_ACQUIRE_R): a pressing unit with an
-    // empty scan and open space around it memoizes a farther enemy in
-    // `target` so the closing drive below can restore contact. Gated hard
-    // (press + no near enemy + low crowd + 1/8 cadence) to stay off the 200k
-    // hot path.
-    let acquire_crowd_lim = CROWD_SLOW;
+    // empty scan memoizes a farther enemy in `target` so the closing drive
+    // below can restore contact. Limited (press + no near enemy + not packed
+    // + 1/8 cadence) to stay off the 200k hot path. Packed is the crowd at
+    // which his drive is gone, six bodies pressed against his (`Width`): a
+    // soldier standing an arm's length from his comrades still looks, and
+    // turns to an enemy who comes near (`face`).
+    let acquire_crowd_lim = st.scan.brake.1;
     // A man of a fighting regiment looks as far as he can see (seek_radius)
     // on his far look; on the approach the old short scan stands.
     let far_look = (i as u32).wrapping_add(tick_seed).is_multiple_of(8);

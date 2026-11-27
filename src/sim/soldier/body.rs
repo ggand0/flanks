@@ -42,10 +42,9 @@ fn ready_body_of(friction: bool, ease: f32, body: f32) -> f32 {
 /// between the two values of `crowd_brake`. Scalar density can't cancel
 /// out the way opposing push vectors do, so this is what stops a
 /// goal-seeking crowd from compressing itself into overlap: packed
-/// interior units genuinely stop shoving. CROWD_SLOW, six neighbours at
-/// 1.12 m, is the crowd above which a pressing man with nobody in reach
-/// stops looking for a far enemy (`acquire`).
-pub(super) const CROWD_SLOW: f32 = 1.2;
+/// interior units genuinely stop shoving. At the crowd where his drive is
+/// gone a pressing man with nobody in reach also stops looking for a far
+/// enemy (`acquire`).
 /// The fade is set by the men's real size, not by the body distance: in
 /// his ready stance a man's drive eases from six neighbours at arm's length, BRAKE_FAR of
 /// the 1.70 m man, to nothing when six are pressed against him at
