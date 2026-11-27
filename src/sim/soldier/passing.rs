@@ -348,7 +348,7 @@ fn wide_look(f: &Field, s: &mut Soldier, st: &Step, p: Vec2, wd: Vec2, perp: Vec
 const JOIN_OPEN_GIVE: f32 = 0.1;
 /// His elbow room (`open_roomy`): an opening fits him only this much wider
 /// than his body.
-const JOIN_OPEN_ELBOW: f32 = 0.3;
+pub(super) const JOIN_OPEN_ELBOW: f32 = 0.3;
 
 /// The opening among the bodies just ahead of him along `wd` (both teams,
 /// within OPEN_SEE, on his level; a comrade walking away along his way is
@@ -420,9 +420,10 @@ pub(super) fn opening_ahead(f: &Field, i: usize, st: &Step, wd: Vec2, body: f32)
     (fit == 2 && !(side && aim_taken(f, i, aim, body))).then_some(aim)
 }
 
-/// The arm's length a stopped soldier keeps from his comrades. With a
-/// comrade nearer than ARM_NEAR he steps straight away from the nearest
-/// one, out to ARM_REST from him, when the ground on that far side is
+/// The arm's length a stopped soldier keeps from his comrades under
+/// `back_room`, which is off under the arm's length rule (`keep_arm`).
+/// With a comrade nearer than ARM_NEAR he steps straight away from the
+/// nearest one, out to ARM_REST from him, when the ground on that far side is
 /// free: no body within BACK_FREE of him there. He never steps forward
 /// along his way for it (closing up is his walk's business). BACK_FREE is
 /// a body and a little: the soldier on the far side may stand an arm's
@@ -524,7 +525,10 @@ pub(super) fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
     // Which way he is going: to that enemy, else to his regiment's fight.
     // A man walking to the fight with nobody in reach looks along the way
     // he walks (`join_goal`): straight ahead, to an enemy or to the fight.
-    let memo_dir = if joins_as_walker() && committed && best_idx == u32::MAX && !dying && !routed {
+    // Under the arm's length rule `drive` has read that way already.
+    let memo_dir = if keep_arm() && st.fight.joining && best_idx == u32::MAX && !dying && !routed {
+        st.fight.join_dir
+    } else if joins_as_walker() && committed && best_idx == u32::MAX && !dying && !routed {
         join_goal(f, s, st).0
     } else if memo_valid {
         (pos_prev[memo].xz() - p).normalize_or_zero()
@@ -585,7 +589,8 @@ pub(super) fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
         // ahead of him and aims at an opening that fits him (`join_open`,
         // `drive`). An aim still ahead of him that nobody has taken is
         // kept. With a comrade inside his arm's length he aims first at
-        // the step away from him (`back_room`).
+        // the step away from him (`back_room`, off under the arm's length
+        // rule, which moves him off that comrade every tick).
         if join_open() && st.fight.joining && !dying && !routed && best_idx == u32::MAX {
             let blocked = seen & SIGHT_WAY != 0;
             if blocked && *s.stood && memo_dir != Vec2::ZERO {

@@ -251,6 +251,16 @@ struct Scanned {
     /// The crowd at which his drive starts to fade and is gone, for his
     /// width (`Width`).
     brake: (f32, f32),
+    /// How far off the comrade in his way stands, a walker to the fight
+    /// under the arm's length rule (`keep_arm`): the nearest living comrade
+    /// within SEP_RADIUS and 45 degrees of his way who is not walking away
+    /// along it; f32::INFINITY for nobody.
+    way_gap: f32,
+    /// The bodies inside his arm's length, a walker to the fight under the
+    /// arm's length rule: the sum of the unit vectors from each to him, each
+    /// by how far inside his arm's length it stands (1 at his own place, 0
+    /// at arm's length).
+    crowding: Vec2,
     scan_r: f32,
     my_team_bit: u32,
 }
@@ -268,6 +278,8 @@ impl Scanned {
         ahead: 0.0,
         press4: [0.0; 4],
         brake: (0.0, 0.0),
+        way_gap: f32::INFINITY,
+        crowding: Vec2::ZERO,
         scan_r: 0.0,
         my_team_bit: 0,
     };
@@ -370,6 +382,10 @@ struct Fight {
     /// His wish to his slot from `drive`, kept when the join replaced it,
     /// for the tick he comes back into formation (`decide_to_join`).
     slot_wish: Vec2,
+    /// The way he walks to the fight (`join_goal`, a unit vector, zero for
+    /// none), set by `drive` under the arm's length rule (`keep_arm`) for
+    /// the scan and his look.
+    join_dir: Vec2,
     /// Where the swing turns him (`swing`, `face`).
     face_target: Option<Vec2>,
 }
@@ -459,6 +475,7 @@ pub(crate) fn tick_chunk(f: &Field, rows: Rows, out: &mut ChunkOut) {
         decide_to_join(f, &mut s, &mut st);
         swing(f, &mut s, &mut st, out);
         yield_to_crowd(f, &mut st);
+        keep_arm_length(&mut st);
         step_into_opening(&mut st);
         try_a_side(f, &mut s, &mut st);
         close_in(f, &mut s, &mut st);
@@ -540,6 +557,7 @@ fn begin(f: &Field, s: &mut Soldier) -> Step {
             joining: false,
             set_off: false,
             slot_wish: Vec2::ZERO,
+            join_dir: Vec2::ZERO,
             face_target: None,
         },
         walk: Walk::NONE,

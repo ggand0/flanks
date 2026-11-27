@@ -107,8 +107,10 @@ pub(crate) const SPEAR_LINE_HALF_W: f32 = 0.35;
 /// body runs onto, which is a damage event from the spearman. One loop over
 /// his neighbours does every job: the contact between bodies (`Contact`),
 /// the crowd around him (`Crowd`), the enemy in his reach (`Reach`), the
-/// spear points (`Spear`) and the obstacles for the choice of opening
-/// (`Obstacles`).
+/// spear points (`Spear`), the obstacles for the choice of opening
+/// (`Obstacles`) and, for a walker to the fight under the arm's length
+/// rule, the bodies inside his arm's length and the comrade in his way
+/// (`Arm`).
 #[inline]
 pub(super) fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut, cands: &mut Vec<u32>) {
     let i = s.i;
@@ -132,6 +134,7 @@ pub(super) fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut
     let mut reach = Reach::new(params, *s.target);
     let mut spear = Spear::new(f, s, dying);
     let mut obstacles = Obstacles::new(f, s, st, wish_dir, widths[pose_lv].body, widths);
+    let mut arm = Arm::new(st);
     let scan_r = spear.scan_radius(params);
     gather_candidates(f.grid, p, i, my_team_bit, scan_r, spear.foe_cut(params), cands);
     let grid = f.grid;
@@ -151,6 +154,7 @@ pub(super) fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut
         reach.see(&n);
         spear.see(&n, f.yaw_snap);
         obstacles.see(&n);
+        arm.see(&n);
         let (sep_r, inv_sep, hard) = contact.rest(&n);
         if d2 < sep_r * sep_r && d2 > 1e-8 {
             let len = d2.sqrt();
@@ -170,6 +174,7 @@ pub(super) fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut
     contact.hand_on(st);
     crowd.hand_on(st);
     reach.hand_on(st);
+    arm.hand_on(st);
     st.scan.scan_r = scan_r;
     st.scan.my_team_bit = my_team_bit;
     obstacles.hand_on(s, st, widths[pose_lv].sep);
@@ -511,6 +516,61 @@ impl Crowd {
         st.scan.crowd_still = self.crowd_still;
         st.scan.ahead = self.ahead;
         st.scan.press4 = self.press4;
+    }
+}
+
+/// The arm's length rule's read (`scan`, `keep_arm_length`), only for a
+/// living walker to the fight under `keep_arm`: the bodies of either team
+/// inside his arm's length, summed as `Scanned::crowding`, and how far off
+/// the comrade in his way stands (`Scanned::way_gap`): the nearest living
+/// comrade within SEP_RADIUS and 45 degrees of his way who is not walking
+/// away along it, as his look reads a comrade ahead (`look_on_his_way`).
+/// With no way it only sums the crowding.
+struct Arm {
+    on: bool,
+    way: Vec2,
+    arm: f32,
+    way_gap: f32,
+    crowding: Vec2,
+}
+
+impl Arm {
+    #[inline]
+    fn new(st: &Step) -> Self {
+        Arm {
+            on: keep_arm() && st.fight.joining && !st.dying,
+            way: st.fight.join_dir,
+            arm: arm_length(),
+            way_gap: f32::INFINITY,
+            crowding: Vec2::ZERO,
+        }
+    }
+
+    /// A neighbour on his level (`d` points from the neighbour to him).
+    #[inline(always)]
+    fn see(&mut self, n: &Near) {
+        if !self.on || n.o_dying || n.d2 <= 1e-8 {
+            return;
+        }
+        let arm = self.arm;
+        let inside = n.d2 < arm * arm;
+        let ahead = n.same && self.way != Vec2::ZERO && n.d2 < SEP_RADIUS * SEP_RADIUS;
+        if !(inside || ahead) {
+            return;
+        }
+        let len = n.d2.sqrt();
+        if inside {
+            self.crowding += n.d / len * ((arm - len) / arm);
+        }
+        if ahead && (-n.d).dot(self.way) > 0.707 * len && n.o_vel.dot(self.way) <= 0.5 {
+            self.way_gap = self.way_gap.min(len);
+        }
+    }
+
+    #[inline]
+    fn hand_on(&self, st: &mut Step) {
+        st.scan.way_gap = self.way_gap;
+        st.scan.crowding = self.crowding;
     }
 }
 
