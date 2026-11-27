@@ -390,7 +390,9 @@ fn keep_stood(s: &mut Soldier, st: &Step, desired: Vec2) {
 /// Which way he looks: the man he swings at, the enemy in reach when he
 /// is fighting or just struck, where he is going when out of formation,
 /// the foe he remembers close by, else the line's facing, at the human
-/// turn rate.
+/// turn rate. Under the facing rule (`face_keep`) whether he stands or
+/// walks is read from his wish, not his speed, and walking he faces his
+/// wish.
 #[inline]
 pub(super) fn face(f: &Field, s: &mut Soldier, st: &mut Step) {
     let Field { pos_prev, team, threat, form_face, dt, .. } = *f;
@@ -411,6 +413,7 @@ pub(super) fn face(f: &Field, s: &mut Soldier, st: &mut Step) {
     // (yaw stepped once per tick otherwise — visible facing snaps at high
     // fps).
     *s.yaw_prev = *s.yaw;
+    let wish2 = st.desired.length_squared();
     let face_dir = match face_target {
         Some(t) => t - p,
         // A man IN his swing cycle faces the fight (a formed one too — he is
@@ -440,7 +443,7 @@ pub(super) fn face(f: &Field, s: &mut Soldier, st: &mut Step) {
         // that enemy is within his threat distance, in his rank or out.
         None if face_keep()
             && !routed
-            && new_v.length_squared() < STEP_FACE_SPEED * STEP_FACE_SPEED
+            && wish2 < STEP_FACE_SPEED * STEP_FACE_SPEED
             && (*s.target as usize) < pos_prev.len()
             && team[*s.target as usize] != team[i]
             && f.death_snap[*s.target as usize] == 0
@@ -453,7 +456,7 @@ pub(super) fn face(f: &Field, s: &mut Soldier, st: &mut Step) {
         None if face_keep()
             && !routed
             && !committed
-            && new_v.length_squared() < STEP_FACE_SPEED * STEP_FACE_SPEED
+            && wish2 < STEP_FACE_SPEED * STEP_FACE_SPEED
             && form_face[gi] != Vec2::ZERO
             && (st.walk.parked || st.walk.place_dist <= STEP_STOP) =>
         {
@@ -464,7 +467,7 @@ pub(super) fn face(f: &Field, s: &mut Soldier, st: &mut Step) {
         // stopped. (An unformed regiment's standing watch is further down.)
         None if face_keep()
             && !routed
-            && new_v.length_squared() < STEP_FACE_SPEED * STEP_FACE_SPEED
+            && wish2 < STEP_FACE_SPEED * STEP_FACE_SPEED
             && (form_face[gi] != Vec2::ZERO || committed) =>
         {
             Vec2::ZERO
@@ -506,6 +509,9 @@ pub(super) fn face(f: &Field, s: &mut Soldier, st: &mut Step) {
         {
             threat[gi]
         }
+        // Walking, he faces the way he means to walk: a speed the bodies
+        // round him put into him does not turn him.
+        None if face_keep() && !routed => st.desired,
         None => new_v,
     };
     let min_len2 = if face_target.is_some() || best_idx != u32::MAX {
