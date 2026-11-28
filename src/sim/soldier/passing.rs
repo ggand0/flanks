@@ -6,11 +6,9 @@ use bevy::prelude::*;
 
 use super::*;
 
-/// The room (m) a standing joiner wants behind the man ahead before he
-/// steps up: his look calls a comrade "in his way" only within a ready
-/// body plus this (`look_around`), so he steps up once a short step of
-/// room has opened, and from formation spacing every rank first closes up
-/// to the bodies ahead.
+/// The room (m) beyond a ready body within which a joiner's look calls a
+/// comrade "in his way" when he does not keep his elbow room
+/// (`elbow_room`, `look_around`).
 const JOIN_ROOM: f32 = 0.3;
 /// Under the friction contact the soldiers of a regiment under an Attack
 /// order do not step backward to their places (`hold_the_frame`), so a
@@ -66,7 +64,10 @@ pub(super) fn choose_opening(f: &Field, s: &mut Soldier, st: &mut Step) {
     let ring_flag = *s.sight & SIGHT_RING != 0;
     *s.sight &= !SIGHT_RING;
     if !going {
-        *s.aim = Vec2::NAN;
+        // A joiner keeps the aim of his opening ahead (`look_around`).
+        if !(join_open() && st.fight.joining) {
+            *s.aim = Vec2::NAN;
+        }
         return;
     }
     let p = st.p;
@@ -340,6 +341,132 @@ fn wide_look(f: &Field, s: &mut Soldier, st: &Step, p: Vec2, wd: Vec2, perp: Vec
     *v = (*v & !STUCK_WIDE_DEPTH) | ((w_fit == 1) as u16 * STUCK_WIDE_DEPTH);
 }
 
+/// The depth bodies already give in a press (contact.rs CROWD_DEPTH): an
+/// opening this much narrower than his body still fits him.
+const JOIN_OPEN_GIVE: f32 = 0.1;
+/// His elbow room (`open_roomy`): an opening fits him only this much wider
+/// than his body.
+pub(super) const JOIN_OPEN_ELBOW: f32 = 0.3;
+
+/// Under the arm's length rule a place fits a soldier when the bodies
+/// about it would stand no nearer to him than his nearest body stands now
+/// (`Scanned::room`), less half of this (m): a crowd rests a few
+/// centimetres inside the arm's length, and a fit as tight as the arm's
+/// length itself would leave a fallen comrade's place empty.
+const ROOM_GIVE: f32 = 0.1;
+
+/// The nearest a body may stand to a place that fits a walker to the fight
+/// under the arm's length rule (`keep_arm_length`): the room he has now
+/// less half ROOM_GIVE. None for any other soldier.
+#[inline]
+fn room_fit(st: &Step) -> Option<f32> {
+    st.fight.joining.then_some(st.scan.room - 0.5 * ROOM_GIVE)
+}
+
+/// The opening among the bodies just ahead of him along `wd` (both teams,
+/// within OPEN_SEE, on his level; a comrade walking away along his way is
+/// none) that fits his width less JOIN_OPEN_GIVE (`join_open`): the point
+/// he aims at in the world, None when nothing fits. With `open_side` he
+/// reads the bodies out to QUERY_RADIUS, takes the nearest rank of them as
+/// the row and counts the open ground beside it too, and an aim another
+/// body stands on is none; with `open_roomy` the opening must fit his width
+/// and JOIN_OPEN_ELBOW. Under the arm's length rule (`room_fit`) the
+/// opening fits a walker to the fight when the bodies beside his aim would
+/// stand no nearer to him than the room he has now less half ROOM_GIVE,
+/// and a body that near to his aim has taken it.
+#[inline]
+pub(super) fn opening_ahead(f: &Field, i: usize, st: &Step, wd: Vec2, body: f32) -> Option<Vec2> {
+    if wd == Vec2::ZERO {
+        return None;
+    }
+    let p = st.p;
+    let my_team_bit = st.scan.my_team_bit;
+    let widths = widths();
+    let levels = Levels::new(f, i);
+    let mut row = Row::default();
+    let mut row_at = f32::INFINITY;
+    let side = open_side();
+    let see = if side { QUERY_RADIUS } else { OPEN_SEE };
+    let mut kept = [(0.0f32, 0.0f32, 0.0f32); 24];
+    let mut n_kept = 0usize;
+    f.grid.for_each_candidate_vel(p, QUERY_RADIUS, |o, ov| {
+        if o.idx as usize == i || (o.meta & crate::spatial::META_DYING) != 0 || levels.apart(f, o.idx) {
+            return;
+        }
+        let to = o.xz() - p;
+        if to.length_squared() >= see * see {
+            return;
+        }
+        let along = to.dot(wd);
+        if along <= OPEN_AHEAD {
+            return;
+        }
+        if (o.meta & crate::spatial::META_TEAM) == my_team_bit && ov.dot(wd) > 0.5 {
+            return;
+        }
+        let lat = wd.x * to.y - wd.y * to.x;
+        let half = 0.5 * widths[crate::spatial::meta_pose(o.meta)].body;
+        if side {
+            if n_kept < kept.len() {
+                kept[n_kept] = (lat, half, along);
+                n_kept += 1;
+            }
+        } else {
+            row.add(lat, half, along);
+        }
+        row_at = row_at.min(along);
+    });
+    // The nearest rank: the bodies within 0.6 m along of the nearest one.
+    if side {
+        for &(lat, half, along) in &kept[..n_kept] {
+            if along - row_at <= 0.6 {
+                row.add(lat, half, along);
+            }
+        }
+    }
+    if row.n_left == 0 && row.n_right == 0 {
+        return None;
+    }
+    let perp = Vec2::new(-wd.y, wd.x);
+    let coin = side_pref(i, 0).1;
+    let free = |lat: f32, along: f32| way_free(f.terrain, p, wd * along + perp * lat);
+    let fit_w = if let Some(r) = room_fit(st) {
+        2.0 * r - body
+    } else if open_roomy() {
+        body + JOIN_OPEN_ELBOW
+    } else {
+        body - JOIN_OPEN_GIVE
+    };
+    let (aim_lat, aim_along, fit, _) = openings(&row, row_at, see, fit_w, f32::INFINITY, side, 0.0, coin, free);
+    let aim = p + wd * aim_along.max(OPEN_MIN_AHEAD) + perp * aim_lat;
+    (fit == 2 && !(side && aim_taken(f, i, aim, body, room_fit(st)))).then_some(aim)
+}
+
+/// Whether another living body on his level stands on `aim`, within his
+/// and its half bodies less JOIN_OPEN_GIVE, or with `open_roomy` within
+/// them and half his elbow room. Under the arm's length rule `room` is
+/// `room_fit` and a body nearer than that to the aim has taken it.
+fn aim_taken(f: &Field, i: usize, aim: Vec2, body: f32, room: Option<f32>) -> bool {
+    let widths = widths();
+    let levels = Levels::new(f, i);
+    let mut taken = false;
+    f.grid.for_each_candidate(aim, QUERY_RADIUS, |o| {
+        if taken || o.idx as usize == i || (o.meta & crate::spatial::META_DYING) != 0 || levels.apart(f, o.idx) {
+            return;
+        }
+        let o_body = widths[crate::spatial::meta_pose(o.meta)].body;
+        let r = if let Some(r) = room {
+            r
+        } else if open_roomy() {
+            0.5 * (body + o_body) + 0.5 * JOIN_OPEN_ELBOW
+        } else {
+            0.5 * (body + o_body) - JOIN_OPEN_GIVE
+        };
+        taken = o.xz().distance_squared(aim) < r * r;
+    });
+    taken
+}
+
 /// What he remembers and what he sees of his comrades: the enemy he
 /// remembers if still in sight, the way he is going, and every eighth tick
 /// a look at the men around him (a comrade in his way, to his left or
@@ -366,7 +493,10 @@ pub(super) fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
     // Which way he is going: to that enemy, else to his regiment's fight.
     // A man walking to the fight with nobody in reach looks along the way
     // he walks (`join_goal`): straight ahead, to an enemy or to the fight.
-    let memo_dir = if joins_as_walker() && committed && best_idx == u32::MAX && !dying && !routed {
+    // For a walker to the fight `drive` has read that way already.
+    let memo_dir = if st.fight.joining && best_idx == u32::MAX && !dying && !routed {
+        st.fight.join_dir
+    } else if joins_as_walker() && committed && best_idx == u32::MAX && !dying && !routed {
         join_goal(f, s, st).0
     } else if memo_valid {
         (pos_prev[memo].xz() - p).normalize_or_zero()
@@ -374,6 +504,13 @@ pub(super) fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
         (fp - p).normalize_or_zero()
     } else {
         Vec2::ZERO
+    };
+    // A held regiment's soldier in his rank with its melee on looks
+    // straight ahead (`hold_join`).
+    let memo_dir = if hold_join() && memo_dir == Vec2::ZERO && in_melee && !committed {
+        f.form_face[gi]
+    } else {
+        memo_dir
     };
     // The blocking test toward a holding man's own mark. A man walking to
     // the fight (`joining`) has his slot wish kept apart; the test reads
@@ -398,14 +535,20 @@ pub(super) fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
     // fight, or back to his mark), in his own rhythm: a separate pass over
     // the neighbors of the separation scan, run only by men who are going
     // somewhere. He looks for a lane only while he has no enemy in reach, and
-    // watches his comrades go only while he sees no enemy of his own.
+    // watches his comrades go while he sees no enemy of his own: in his
+    // regiment's melee while he is in his rank; with no melee, when the
+    // battle's set-up turns on "Auto-engage nearby units", while he stands
+    // at his place (`stands_at_place`) or has left his rank, so a man who
+    // followed a comrade going stays out while he sees him go.
     let look_lanes = memo_dir != Vec2::ZERO && best_idx == u32::MAX && !dying && !routed;
-    let watch_go = in_melee && !committed && !memo_valid;
+    let watch_go = !memo_valid
+        && if in_melee { !committed } else { f.engage_near && (committed || stands_at_place(st)) };
     let slot_on = slot_dir != Vec2::ZERO;
     // A joiner's comrade "in his way" stands within a ready body plus a
-    // short step of room (JOIN_ROOM); for everyone else, and for his
-    // sides and mark, within SEP_RADIUS.
-    let way_r = if st.fight.joining { ready_body() + JOIN_ROOM } else { SEP_RADIUS };
+    // short step of room (JOIN_ROOM), or within SEP_RADIUS when he keeps
+    // his elbow room (`elbow_room`); for everyone else, and for his sides
+    // and mark, within SEP_RADIUS.
+    let way_r = if st.fight.joining && !elbow_room() { ready_body() + JOIN_ROOM } else { SEP_RADIUS };
     if (i as u32).wrapping_add(tick).is_multiple_of(LOOK_TICKS) {
         let mut seen = 0u16;
         if look_lanes || watch_go || slot_on {
@@ -414,6 +557,41 @@ pub(super) fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
         }
         if fighter {
             seen |= look_at_the_room(f, i, st, fight_dir, side_dir);
+        }
+        // A joiner stopped behind comrades reads the row of bodies just
+        // ahead of him and aims at an opening that fits him (`join_open`,
+        // `drive`). An aim still ahead of him that nobody has taken is
+        // kept.
+        if join_open() && st.fight.joining && !dying && !routed && best_idx == u32::MAX {
+            let blocked = seen & SIGHT_WAY != 0;
+            if blocked && *s.stood && memo_dir != Vec2::ZERO {
+                let body = st.open.body0;
+                let keep = s.aim.x.is_finite() && s.aim.distance_squared(p) > 0.15 * 0.15 && !aim_taken(f, i, *s.aim, body, room_fit(st));
+                if !keep {
+                    *s.aim = opening_ahead(f, i, st, memo_dir, body).unwrap_or(Vec2::NAN);
+                }
+            } else {
+                *s.aim = Vec2::NAN;
+            }
+        }
+        // A soldier in his rank walking to his place, stopped behind a
+        // comrade who has left his rank and stands, leaves his rank too
+        // (`join_touch`): he sees that comrade go and has him in his way.
+        // Stopped means his own speed is under a step's pace (STEP_PACE):
+        // a soldier still running does not leave his rank.
+        if join_touch()
+            && st.fight.may_leave
+            && !committed
+            && !in_melee
+            && best_idx == u32::MAX
+            && !dying
+            && !routed
+            && desired.length_squared() > 0.25
+            && st.scan.crowd_still > 0.0
+            && s.vel.xz().length_squared() < STEP_PACE * STEP_PACE
+            && touched(f, i, st, desired.normalize_or_zero())
+        {
+            seen |= SIGHT_GO | SIGHT_WAY | SIGHT_AHEAD;
         }
         *s.sight = (*s.sight
             & (SIGHT_GO_FAR | SIGHT_FOE | SIGHT_KNIFE_COUNT | SIGHT_KNIFE))
@@ -435,6 +613,31 @@ pub(super) fn look_around(f: &Field, s: &mut Soldier, st: &mut Step) {
     st.sight.slot_blocked = slot_blocked;
 }
 
+/// Whether a living comrade out of his rank and standing is within
+/// SEP_RADIUS of him, within 45 degrees of his wish `wish_dir`
+/// (`join_touch`). `look_around` asks it only of a soldier the bodies have
+/// stopped: his own speed under a step's pace.
+fn touched(f: &Field, i: usize, st: &Step, wish_dir: Vec2) -> bool {
+    let p = st.p;
+    let my_team_bit = st.scan.my_team_bit;
+    let mut found = false;
+    f.grid.for_each_candidate(p, st.scan.scan_r, |o| {
+        if found
+            || o.idx as usize == i
+            || (o.meta & crate::spatial::META_TEAM) != my_team_bit
+            || (o.meta & crate::spatial::META_DYING) != 0
+            || (o.meta & crate::spatial::META_STOOD) == 0
+            || !f.out_form[o.idx as usize]
+        {
+            return;
+        }
+        let to = o.xz() - p;
+        let d2 = to.length_squared();
+        found = d2 < SEP_RADIUS * SEP_RADIUS && to.dot(wish_dir) > 0.707 * d2.sqrt();
+    });
+    found
+}
+
 /// What his look on his way looks for (`look_around`): the way he is
 /// going, his sides and the way to his mark, whether he looks for a lane,
 /// watches his comrades go or tests his mark, and how near a comrade in
@@ -452,11 +655,15 @@ struct OnHisWay {
 
 /// His look at the comrades around him on his way (`look_around`): the
 /// sight bits of a comrade in his way, to his left or right, ahead,
-/// between him and his mark, and running to the fight.
+/// between him and his mark, and of a comrade of his regiment going to
+/// the fight (toward it in the melee; out of his rank and moving with no
+/// melee, which he watches only when the battle's set-up turns on
+/// "Auto-engage nearby units").
 #[inline]
 fn look_on_his_way(f: &Field, i: usize, st: &Step, ways: &OnHisWay) -> u16 {
     let Field { grid, .. } = *f;
     let OnHisWay { memo_dir, side_dir, slot_dir, look_lanes, watch_go, slot_on, way_r } = *ways;
+    let in_melee = st.fight.in_melee;
     let p = st.p;
     let gi = st.gi;
     let scan_r = st.scan.scan_r;
@@ -482,11 +689,18 @@ fn look_on_his_way(f: &Field, i: usize, st: &Step, ways: &OnHisWay) -> u16 {
         ahead_any |= ahead;
         way |= ahead & (d2 < way_r * way_r);
         // A comrade of his own regiment close by, running to the
-        // fight: the sight that makes him follow.
+        // fight: the sight that makes him follow. In the melee he runs
+        // toward the fight faster than GOING_SPEED; with no melee there is
+        // no fight point to run toward, and a comrade out of his rank
+        // moving faster than GOING_SPEED is going.
         go |= comrade
             & watch_go
             & (crate::spatial::meta_group(o.meta) == gi)
-            & (going > GOING_SPEED);
+            & if in_melee {
+                going > GOING_SPEED
+            } else {
+                f.out_form[o.idx as usize] & (ov.length_squared() > GOING_SPEED * GOING_SPEED)
+            };
         let lateral = (-d).dot(side_dir);
         let beside = comrade & look_lanes & near;
         left |= beside & (lateral > reach);

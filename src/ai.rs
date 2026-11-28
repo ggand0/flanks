@@ -20,8 +20,10 @@ const THINK_PERIOD: f32 = 2.0;
 /// regiment (meters-equivalent).
 const SPREAD_PENALTY: f32 = 40.0;
 const AI_TEAM: u8 = 1;
-/// At-ease engagement range: an idle regiment (either team, not in HOLD)
-/// attacks an unbroken enemy regiment that closes to this distance.
+/// The automatic attack's reach (`auto_engage`): when the battle set-up
+/// turns it on, an idle regiment of either team, not in hold mode,
+/// attacks an unbroken enemy regiment whose centre comes this close and
+/// with no friendly regiment between them.
 const AT_EASE_R: f32 = 40.0;
 
 /// Set once when one side has no fighting regiments left.
@@ -33,7 +35,7 @@ pub struct AiPlugin;
 impl Plugin for AiPlugin {
     fn build(&self, app: &mut App) {
         // On the sim tick, which does not run while the player deploys
-        // (no enemy pre-orders, no auto-engagement across the line) or
+        // (no enemy pre-orders, no automatic attack across the line) or
         // while the game is paused. The victory check goes first: the AI
         // stands down on the tick the battle is decided.
         app.init_resource::<BattleOutcome>().add_systems(
@@ -149,16 +151,25 @@ fn ai_think(
     }
 }
 
-/// At ease (M2TW): an idle Steady regiment of EITHER team — no order, not
-/// engaged, not in hold-position mode — attacks an unbroken enemy regiment
-/// that comes within AT_EASE_R on its own initiative, and stands down when
-/// an auto-engaged target breaks or dies instead of pursuing it across the
-/// map (pursuit is for deliberate player orders). Runs even with FL_AI=0:
-/// this is regiment self-preservation, not army strategy — it is also what
-/// makes rallied enemies in the AI-less sandbox fight back instead of
-/// staring. Auto orders are flagged so the UI click/horn stays silent.
-fn auto_engage(clock: Res<BattleClock>, mut groups: ResMut<Groups>, mut next: Local<PerBattle<f32>>) {
-    if scripts_active() {
+/// The automatic attack, when the battle set-up turns it on
+/// (`BattleConfig::at_ease_attack`, the menu's "Auto attack",
+/// `FL_AT_EASE=1`): once a second, an idle regiment of either team
+/// (no order, not engaged, not in hold mode) attacks the nearest unbroken
+/// enemy regiment it has a clear way to (no living friendly regiment's
+/// centre between them, `Groups::front_on_outline`), if that one's centre
+/// is within AT_EASE_R of its own, and stands down when a target it took
+/// this way breaks or dies instead of pursuing it across the map. It runs
+/// with the enemy AI on or off. Its orders are
+/// flagged so the order click and horn stay silent. When the option is
+/// off it gives no order and stands nobody down: an order it gave earlier
+/// stays until the player changes it or its target dies.
+fn auto_engage(
+    clock: Res<BattleClock>,
+    config: Res<crate::game_state::BattleConfig>,
+    mut groups: ResMut<Groups>,
+    mut next: Local<PerBattle<f32>>,
+) {
+    if scripts_active() || !config.at_ease_attack {
         return;
     }
     let next = next.of(&clock);
@@ -204,10 +215,13 @@ fn auto_engage(clock: Res<BattleClock>, mut groups: ResMut<Groups>, mut next: Lo
         }
         let team = gd.team;
         let from = gd.centroid;
+        // Only an enemy it has a clear way to: no living friendly
+        // regiment's centre in the corridor between them.
         let Some((tg, d2)) = snapshot
             .iter()
             .enumerate()
             .filter(|(_, (tt, count, _, broken))| *tt != team && *count > 0 && !broken)
+            .filter(|(tg, _)| groups.front_on_outline(g, *tg).is_none())
             .map(|(tg, (_, _, c, _))| (tg, c.distance_squared(from)))
             .min_by(|a, b| a.1.total_cmp(&b.1))
         else {

@@ -42,10 +42,9 @@ fn ready_body_of(friction: bool, ease: f32, body: f32) -> f32 {
 /// between the two values of `crowd_brake`. Scalar density can't cancel
 /// out the way opposing push vectors do, so this is what stops a
 /// goal-seeking crowd from compressing itself into overlap: packed
-/// interior units genuinely stop shoving. CROWD_SLOW, six neighbours at
-/// 1.12 m, is the crowd above which a pressing man with nobody in reach
-/// stops looking for a far enemy (`acquire`).
-pub(super) const CROWD_SLOW: f32 = 1.2;
+/// interior units genuinely stop shoving. At the crowd where his drive is
+/// gone a pressing man with nobody in reach also stops looking for a far
+/// enemy (`acquire`).
 /// The fade is set by the men's real size, not by the body distance: in
 /// his ready stance a man's drive eases from six neighbours at arm's length, BRAKE_FAR of
 /// the 1.70 m man, to nothing when six are pressed against him at
@@ -260,7 +259,9 @@ pub(crate) fn mass_pairs() -> &'static [[(f32, f32); crate::unit_types::NUM_KIND
 /// his feet take back at FEET (`steer`, `integrate`).
 /// The one thing that stands in for a stance is the bracing: in the
 /// setting apart a man braced against a push (`brace_pairs`) holds his
-/// ground, and the man who walks into him takes most of it.
+/// ground, and the man who walks into him takes most of it, for the first
+/// STANCE of their overlap; what is deeper, the overlap of a body that
+/// arrived at a run, the two share by their masses (`braced_set`).
 #[inline]
 pub(crate) fn friction_contact() -> bool {
     static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -393,6 +394,79 @@ pub(super) fn brace_level(
 pub(super) fn still_brake() -> bool {
     static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *S.get_or_init(|| friction_contact() && !std::env::var("FL_BRAKE").is_ok_and(|v| v == "density"))
+}
+/// A soldier walking to the fight counts a comrade as in his way for his
+/// look within an arm's length (SEP_RADIUS), not a body and a short step
+/// ahead of him (`look_around`). His stop is the arm's length rule's
+/// (`keep_arm_length`). FL_ROOM=0 turns it off; only with the still brake.
+#[inline]
+pub(super) fn elbow_room() -> bool {
+    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *S.get_or_init(|| still_brake() && crate::util::env_or("FL_ROOM", 1u32) != 0)
+}
+/// A soldier walking to the fight who stands behind comrades steps into
+/// an opening among the bodies just ahead of him that fits him
+/// (`look_around`, `opening_ahead`, `step_into_opening`). FL_JOIN_OPEN=0
+/// turns it off; only with the still brake.
+#[inline]
+pub(super) fn join_open() -> bool {
+    static J: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *J.get_or_init(|| still_brake() && crate::util::env_or("FL_JOIN_OPEN", 1u32) != 0)
+}
+/// A soldier's arm's length (m): his body in the ready stance and half his
+/// elbow room, 1.05 m with the defaults, the same room an opening that fits
+/// him leaves him at each side (`opening_ahead`, `aim_taken`).
+#[inline]
+pub(super) fn arm_length() -> f32 {
+    ready_body() + 0.5 * super::passing::JOIN_OPEN_ELBOW
+}
+/// The facing rule. A soldier with no enemy in reach faces the way he means
+/// to walk (his wish), not the way the bodies round him move him; with no
+/// wish past a step's he keeps the facing he has; he turns to an enemy he
+/// remembers only within his threat distance; in his rank he turns to the
+/// formation's facing only at his place (`face`). FL_FACE_KEEP=0 turns
+/// it off.
+#[inline]
+pub(super) fn face_keep() -> bool {
+    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *S.get_or_init(|| crate::util::env_or("FL_FACE_KEEP", 1u32) != 0)
+}
+/// A soldier in his rank walking to his place who is stopped (his own speed
+/// under a step's pace, STEP_PACE) behind a comrade that has left his rank
+/// and stands there leaves his rank too and walks on to the fight, the way
+/// his regiment faces (`look_around`, `decide_to_join`, `join_way`).
+/// FL_JOIN_TOUCH=0 turns it off; only with the still brake.
+#[inline]
+pub(super) fn join_touch() -> bool {
+    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *S.get_or_init(|| still_brake() && crate::util::env_or("FL_JOIN_TOUCH", 1u32) != 0)
+}
+/// The opening read counts open ground beside the nearest rank of bodies
+/// ahead as room too, not only the air between two of them
+/// (`opening_ahead`). FL_OPEN_SIDE=0 turns it off.
+#[inline]
+pub(super) fn open_side() -> bool {
+    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *S.get_or_init(|| crate::util::env_or("FL_OPEN_SIDE", 1u32) != 0)
+}
+/// An opening fits him only with his elbow room beside his body, and a
+/// body nearer than that to his aim has taken it (`opening_ahead`,
+/// `aim_taken`). Under the arm's length rule an opening fits a walker to
+/// the fight by the room he has now instead (`room_fit`). FL_OPEN_ROOMY=0
+/// turns it off.
+#[inline]
+pub(super) fn open_roomy() -> bool {
+    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *S.get_or_init(|| crate::util::env_or("FL_OPEN_ROOMY", 1u32) != 0)
+}
+/// A held regiment's soldiers leave their ranks for its fight too and walk
+/// straight up to its fighting line (`begin`, `look_around`); they close
+/// on an enemy only within 2.2 m (`join_way`). FL_HOLD_JOIN=0
+/// turns it off.
+#[inline]
+pub(super) fn hold_join() -> bool {
+    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *S.get_or_init(|| crate::util::env_or("FL_HOLD_JOIN", 1u32) != 0)
 }
 
 #[cfg(test)]

@@ -491,6 +491,7 @@ fn integrate_chunks(job: &mut TickJob, terrain: &Terrain) {
     let bounds_min = job.bounds_min;
     let bounds_max = job.bounds_max;
     let faces_spearwall = job.faces_spearwall;
+    let engage_near = job.engage_near;
     let TickJob {
         pos_in, speed, team, kind, group, home, vel_in, yaw_in, yaw_prev_in, target_in, swing_in, swing_t_in,
         flash_in, death_t_in, ammo_in, out_form_in, sight_in, chain_in, way_in, pose_in, stuck_in, aim_in,
@@ -540,8 +541,9 @@ fn integrate_chunks(job: &mut TickJob, terrain: &Terrain) {
         search_blocks: &search_blocks[..],
         sidearm: &sidearm[..],
         death_snap: death_t_in,
+        out_form: &out_form_in[..],
         blocks: &*blocks,
-        faces_spearwall, dt, tick_seed, tick, bounds_min, bounds_max,
+        faces_spearwall, engage_near, dt, tick_seed, tick, bounds_min, bounds_max,
         paths: route::KernelRoutes { routes: &routes[..], nav: nav.as_deref() },
     };
     let f = &field;
@@ -737,7 +739,7 @@ pub fn step_sim(
     mut cstats: ResMut<crate::combat::CombatStats>,
     mut groups: ResMut<Groups>,
     (terrain, shared_terrain): (Res<Terrain>, Res<SharedTerrain>),
-    scale: Res<CombatScale>,
+    (scale, config): (Res<CombatScale>, Option<Res<crate::game_state::BattleConfig>>),
     time: Res<Time>,
     mut stats: ResMut<SimStats>,
     mut pipeline: ResMut<TickPipeline>,
@@ -771,6 +773,7 @@ pub fn step_sim(
                 terrain_arc,
                 time.delta_secs(),
                 scale.0,
+                config.is_some_and(|c| c.engage_near),
                 pipeline.tick,
             );
             // update_field rebuilt the resource inline this tick.
@@ -900,7 +903,7 @@ pub fn kick_tick(
     mut groups: ResMut<Groups>,
     tracks: Res<crate::arrows::RegTracks>,
     shared_terrain: Res<SharedTerrain>,
-    scale: Res<CombatScale>,
+    (scale, config): (Res<CombatScale>, Option<Res<crate::game_state::BattleConfig>>),
     time: Res<Time>,
     mut pipeline: ResMut<TickPipeline>,
     (handoff, settings): (
@@ -928,6 +931,7 @@ pub fn kick_tick(
         terrain_arc,
         time.delta_secs(),
         scale.0,
+        config.is_some_and(|c| c.engage_near),
         pipeline.tick,
     );
     job.field_wanted = true;
@@ -978,7 +982,7 @@ mod tests {
         tick: u32,
     ) {
         let tracks = crate::arrows::RegTracks::default();
-        prepare_tick(job, units, groups, &tracks, routes, terrain, 1.0 / 30.0, 1.0, tick);
+        prepare_tick(job, units, groups, &tracks, routes, terrain, 1.0 / 30.0, 1.0, false, tick);
         job.field_wanted = false;
         job.sums_wanted = false;
         run_tick_job(job);

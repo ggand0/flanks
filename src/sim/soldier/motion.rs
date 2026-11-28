@@ -16,10 +16,10 @@ const SEP_PUSH_MAX: f32 = 2.5;
 /// place of the walk to his slot, so the scan reads the men ahead of him
 /// on that way, and the still men ahead stop him there (`yield_to_crowd`)
 /// as they stop every walker. He does not wait at arm's length behind a
-/// comrade and move up in hops. Once the men ahead have stopped him behind
-/// a comrade in his way he stands, braced, with no wish, until a short
-/// step of room opens ahead (`drive`, `steer`). Without that brake he
-/// joins through `close_in`.
+/// comrade and move up in hops. His walk shrinks to nothing as he comes to
+/// an arm's length from the comrade in his way, and he moves off any body
+/// nearer than that (`keep_arm_length`). Without that brake he joins
+/// through `close_in`.
 #[inline]
 pub(super) fn joins_as_walker() -> bool {
     still_brake()
@@ -158,19 +158,96 @@ pub(super) fn drive(f: &Field, s: &mut Soldier, st: &mut Step, asks: &mut Vec<cr
     {
         st.fight.slot_wish = desired;
         st.fight.joining = true;
-        // Arrived at the men ahead: a comrade in his way by his last look
-        // and himself standing since the still men ahead stopped him
-        // (`steer` sets his stood bit then), he stands with no wish until
-        // a step of room opens ahead (JOIN_ROOM). His own standing is
-        // read, never his speed: in a packed regiment the bodies around
-        // him move him more than a centimetre a tick, and read from his
-        // speed that push would make him a walker again, unbraced, and the
-        // ranks behind a front would shake. A joiner who kept his wish
-        // while the soldiers ahead hold him would never brace, and any
-        // creep ahead would let the rear walk into the backs ahead and
-        // drift back.
-        let arrived = *s.sight & SIGHT_WAY != 0 && *s.stood;
-        st.desired = if arrived { Vec2::ZERO } else { join_goal(f, s, st).1 };
+        // An opening ahead that fits him (`look_around`): he steps into it
+        // at the step pace, and once there he stands.
+        if join_open() && s.aim.x.is_finite() {
+            st.fight.join_dir = join_goal(f, s, st).0;
+            let to = *s.aim - p;
+            let d = to.length();
+            if d > 0.15 {
+                st.desired = to * (STEP_PACE / d);
+                st.walk.open_step = true;
+            } else {
+                *s.aim = Vec2::NAN;
+                st.desired = Vec2::ZERO;
+            }
+        } else {
+            // His walk to the fight. How near the comrade in his way stands
+            // shrinks it after the scan (`keep_arm_length`).
+            let (way, wish) = join_goal(f, s, st);
+            st.fight.join_dir = way;
+            st.desired = wish;
+        }
+    }
+}
+
+/// A step into an opening that fits him (`drive`) is not taken by the
+/// crowd's brake or the press's hold; bodies still stop him through the
+/// setting apart.
+#[inline]
+pub(super) fn step_into_opening(st: &mut Step) {
+    if st.walk.open_step && st.fight.joining {
+        st.desired = st.walk.wish;
+        st.walk.fade = Vec2::ZERO;
+        st.walk.jam = 0.0;
+        st.walk.body_jam = 0.0;
+    } else {
+        st.walk.open_step = false;
+    }
+}
+
+/// The pace at which a crowded soldier moves off the bodies inside his
+/// arm's length, per unit of crowding (m/s): one comrade at the touch of
+/// bodies moves him at 0.2 m/s. His legs follow a wish with a lag of a
+/// third of a second (steer.rs STEER_GAIN), and a faster pace would carry
+/// him past the place where the crowding ends.
+const EASE_PACE: f32 = 1.5;
+
+/// The share of his walk to the fight a soldier keeps with the comrade in
+/// his way `gap` metres off: none at his arm's length `arm` or nearer, all
+/// of it at SEP_RADIUS or beyond, and in between the square of the share
+/// of that stretch he still has, so he slows the more the nearer he comes.
+#[inline]
+fn way_share(gap: f32, arm: f32) -> f32 {
+    let u = ((gap - arm) / (SEP_RADIUS - arm)).clamp(0.0, 1.0);
+    u * u
+}
+
+/// His move off the bodies inside his arm's length: along their sum
+/// (`Scanned::crowding`), EASE_PACE for each unit of it, a step's pace at
+/// most.
+#[inline]
+fn ease_off(crowding: Vec2) -> Vec2 {
+    (crowding * EASE_PACE).clamp_length_max(STEP_PACE)
+}
+
+/// The arm's length rule: a soldier walking to the fight keeps
+/// an arm's length (`arm_length`) from the bodies round him, read every
+/// tick. Farther than an arm's length from the comrade in his way he walks
+/// up, and his pace shrinks to nothing as he comes to arm's length. Nearer
+/// than an arm's length to any body he moves away from it, the nearer the
+/// faster, at a step's pace at most. He takes no step of a set length, and
+/// he stands when nobody crowds him and the comrade in his way is at arm's
+/// length. A step into an opening that fits him is left as it is.
+#[inline]
+pub(super) fn keep_arm_length(st: &mut Step) {
+    if !st.fight.joining || st.walk.open_step {
+        return;
+    }
+    // His walk to the fight, as the crowd's brake left it, by how far the
+    // comrade in his way stands beyond his arm's length.
+    let share = way_share(st.scan.way_gap, arm_length());
+    st.desired *= share;
+    st.walk.fade *= share;
+    st.walk.wish *= share;
+    // His move off the bodies inside his arm's length, which the brake does
+    // not take: it leads away from them. The press's hold on his body is
+    // for his walk into the men ahead, so a crowded soldier's is none.
+    let ease = ease_off(st.scan.crowding);
+    if ease != Vec2::ZERO {
+        st.desired += ease;
+        st.walk.wish += ease;
+        st.walk.body_jam = 0.0;
     }
 }
 
@@ -254,15 +331,22 @@ fn follow_route(f: &Field, s: &mut Soldier, st: &Step, goal: Vec2, asks: &mut Ve
 ///   (`behind_the_line`): straight ahead along the facing, so a fighting
 ///   regiment's rear walks up as a block and not as a clump about one
 ///   point;
-/// - the enemy he remembers within his closing range: toward him;
+/// - the enemy he remembers within his closing range (his look,
+///   `look_radius`, plus a metre; when the battle's set-up turns on
+///   "Auto-engage nearby units", a man out of his rank looks as far as
+///   he sees, `seek_radius`): toward him;
 /// - his regiment's fight point while more than a metre off;
+/// - with no melee on his regiment's clock (he left his rank on touch,
+///   `join_touch`): the way his regiment faces, or for a regiment with no
+///   facing the way his slot wish points;
 /// - else nowhere.
 ///
 /// Toward an enemy he goes at the jog over open ground more than
 /// JOG_BEYOND from him, else at the advance, slowing over his last 0.8 m
 /// and standing at his own stopping distance, between nine tenths of his
-/// reach and just inside it. Straight ahead and to the fight point he goes
-/// at the jog, or at the advance with a comrade ahead. "A comrade ahead" is
+/// reach and just inside it. Straight ahead, to the fight point and on the
+/// touch joiner's way he goes at the jog, or at the advance with a comrade
+/// ahead. "A comrade ahead" is
 /// his last look (`look_around`).
 ///
 /// He goes that way only where he can walk it straight: on a map with
@@ -309,7 +393,7 @@ fn join_way(f: &Field, s: &Soldier, st: &Step) -> (Vec2, Vec2, Vec2) {
         let pace = if dist > JOG_BEYOND && !ahead { COMBAT_JOG_PACE } else { ADVANCE_PACE };
         (dir, to_enemy * (pace * urge / dist), at)
     };
-    let look = if engaged[gi] { seek_radius() } else { WIDE_ACQUIRE_R };
+    let look = look_radius(f.engage_near, engaged[gi], st);
     let max_close = if hold[gi] { 2.2 } else { look + 1.0 };
     if counts && dist < WIDE_ACQUIRE_R {
         return to_foe(max_close);
@@ -331,6 +415,20 @@ fn join_way(f: &Field, s: &Soldier, st: &Step) -> (Vec2, Vec2, Vec2) {
             return (to_fp / d, to_fp * (pace / d), fp);
         }
         return (to_fp.normalize_or_zero(), Vec2::ZERO, fp);
+    }
+    // With no melee on his regiment's clock a soldier walking to the fight
+    // walks toward it (`join_touch`): the way his regiment faces, and the
+    // way his slot wish points only for a regiment with no facing. His
+    // place can lie behind him (he ran past it in the charge), so his slot
+    // wish is not the way to the fight. Only a soldier walking to the
+    // fight this tick has this way: one out of his rank for a blow or its
+    // recovery, as every soldier is on the battle's first ticks, has none,
+    // sees no comrade ahead on it and is back in his rank at once
+    // (`decide_to_join`).
+    let toward = if face != Vec2::ZERO { face } else { st.fight.slot_wish.normalize_or_zero() };
+    if join_touch() && !st.fight.in_melee && st.fight.joining && toward != Vec2::ZERO {
+        let pace = if ahead { ADVANCE_PACE } else { COMBAT_JOG_PACE };
+        return (toward, toward * pace, p + toward * 2.0);
     }
     (Vec2::ZERO, Vec2::ZERO, p)
 }
@@ -428,5 +526,44 @@ mod tests {
         let east = Vec2::new(1.0, 0.0);
         assert!(behind_the_line(east, -20.0, Vec2::new(-25.0, 100.0), body));
         assert!(!behind_the_line(east, -20.0, Vec2::new(-20.5, 100.0), body));
+    }
+
+    /// A joiner keeps none of his walk with the comrade in his way at his
+    /// arm's length or nearer, all of it at SEP_RADIUS and beyond or with
+    /// nobody in his way, a quarter half way, and never less as the gap grows.
+    #[test]
+    fn way_share_shrinks_the_walk_to_nothing_at_arms_length() {
+        let arm = 1.05;
+        assert_eq!(way_share(arm, arm), 0.0);
+        assert_eq!(way_share(0.5, arm), 0.0);
+        assert_eq!(way_share(0.0, arm), 0.0);
+        assert_eq!(way_share(SEP_RADIUS, arm), 1.0);
+        assert_eq!(way_share(3.0, arm), 1.0);
+        assert_eq!(way_share(f32::INFINITY, arm), 1.0);
+        assert!((way_share(0.5 * (arm + SEP_RADIUS), arm) - 0.25).abs() < 1e-5);
+        let mut last = 0.0;
+        for k in 0..=200 {
+            let share = way_share(k as f32 * 0.01, arm);
+            assert!(share >= last, "{k}");
+            last = share;
+        }
+    }
+
+    /// A soldier with no crowding does not move off; with crowding he moves
+    /// along it, the faster the more of it, never past STEP_PACE.
+    #[test]
+    fn ease_off_leads_away_from_the_crowding_at_a_step_at_most() {
+        assert_eq!(ease_off(Vec2::ZERO), Vec2::ZERO);
+        let dir = Vec2::new(0.6, -0.8);
+        let mut last = 0.0;
+        for k in 1..=100 {
+            let ease = ease_off(dir * (k as f32 * 0.05));
+            assert!(ease.normalize().dot(dir) > 0.9999, "{k}");
+            assert!(ease.length() >= last - 1e-6, "{k}");
+            assert!(ease.length() <= STEP_PACE + 1e-6, "{k}");
+            last = ease.length();
+        }
+        assert!(ease_off(dir * 0.1).length() < ease_off(dir * 0.2).length());
+        assert!((ease_off(dir * 100.0).length() - STEP_PACE).abs() < 1e-5);
     }
 }

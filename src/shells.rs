@@ -31,6 +31,7 @@ impl PluginGroup for SimPlugins {
             .add(crate::formation::FormationPlugin)
             .add(crate::frontline::FrontlinePlugin)
             .add(crate::combat::CombatPlugin)
+            .add(crate::play_log::PlayLogPlugin)
             .add(crate::cli::CliPlugin)
     }
 }
@@ -65,7 +66,7 @@ impl PluginGroup for ViewPlugins {
             .add(crate::balance::BalancePlugin)
             .add(crate::picker::PickerPlugin)
             .add(crate::frame_log::FrameLogPlugin)
-            .add(crate::play_log::PlayLogPlugin)
+            .add(crate::play_log::PlayLogViewPlugin)
             .add(crate::sprite_bake::SpriteBakePlugin)
             .add(crate::shots::ShotsPlugin)
     }

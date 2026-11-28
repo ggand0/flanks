@@ -118,8 +118,18 @@ pub(crate) struct Field<'a> {
     /// The death column at the tick's start: another man's life, read
     /// by the archer who picks him.
     pub death_snap: &'a [u8],
+    /// The out-of-rank column at the tick's start: which comrades have left
+    /// their rank (`join_touch`).
+    pub out_form: &'a [bool],
     pub blocks: &'a [Vec<crate::arrows::LoftBlock>; 2],
     pub faces_spearwall: [bool; 2],
+    /// The battle's set-up turns on "Auto-engage nearby units"
+    /// (`BattleConfig::engage_near`): a soldier standing at his place goes
+    /// for an enemy he sees (`look_radius`, `decide_to_join`), a man out
+    /// of his rank closes from as far as he sees (`close_on`), and a man
+    /// who sees a comrade of his regiment leave his rank for a fight
+    /// follows him (`look_around`).
+    pub engage_near: bool,
     pub dt: f32,
     pub tick_seed: u32,
     pub tick: u32,
@@ -248,6 +258,20 @@ struct Scanned {
     /// The crowd at which his drive starts to fade and is gone, for his
     /// width (`Width`).
     brake: (f32, f32),
+    /// How far off the comrade in his way stands, a walker to the fight
+    /// under the arm's length rule (`keep_arm_length`): the nearest living
+    /// comrade within SEP_RADIUS and 45 degrees of his way who is not
+    /// walking away along it; f32::INFINITY for nobody.
+    way_gap: f32,
+    /// The bodies inside his arm's length, a walker to the fight under the
+    /// arm's length rule: the sum of the unit vectors from each to him, each
+    /// by how far inside his arm's length it stands (1 at his own place, 0
+    /// at arm's length).
+    crowding: Vec2,
+    /// The room a walker to the fight under the arm's length rule has now:
+    /// the distance to his nearest living body of either team, his arm's
+    /// length at most.
+    room: f32,
     scan_r: f32,
     my_team_bit: u32,
 }
@@ -265,6 +289,9 @@ impl Scanned {
         ahead: 0.0,
         press4: [0.0; 4],
         brake: (0.0, 0.0),
+        way_gap: f32::INFINITY,
+        crowding: Vec2::ZERO,
+        room: 0.0,
         scan_r: 0.0,
         my_team_bit: 0,
     };
@@ -367,6 +394,10 @@ struct Fight {
     /// His wish to his slot from `drive`, kept when the join replaced it,
     /// for the tick he comes back into formation (`decide_to_join`).
     slot_wish: Vec2,
+    /// The way he walks to the fight (`join_goal`, a unit vector, zero for
+    /// none), set by `drive` for a walker to the fight, for the scan and
+    /// his look.
+    join_dir: Vec2,
     /// Where the swing turns him (`swing`, `face`).
     face_target: Option<Vec2>,
 }
@@ -397,6 +428,9 @@ struct Walk {
     new_v: Vec2,
     /// Where his step ends on the ground plane (`slide`).
     next: Vec2,
+    /// He steps into an opening that fits him this tick (`drive`,
+    /// `step_into_opening`).
+    open_step: bool,
 }
 impl Walk {
     /// No wish and no step yet, and no place.
@@ -411,6 +445,7 @@ impl Walk {
         body_jam: 0.0,
         new_v: Vec2::ZERO,
         next: Vec2::ZERO,
+        open_step: false,
     };
 }
 
@@ -452,6 +487,8 @@ pub(crate) fn tick_chunk(f: &Field, rows: Rows, out: &mut ChunkOut) {
         decide_to_join(f, &mut s, &mut st);
         swing(f, &mut s, &mut st, out);
         yield_to_crowd(f, &mut st);
+        keep_arm_length(&mut st);
+        step_into_opening(&mut st);
         try_a_side(f, &mut s, &mut st);
         close_in(f, &mut s, &mut st);
         steer(f, &mut s, &mut st);
@@ -466,7 +503,7 @@ pub(crate) fn tick_chunk(f: &Field, rows: Rows, out: &mut ChunkOut) {
 /// in his regiment's melee.
 #[inline]
 fn begin(f: &Field, s: &mut Soldier) -> Step {
-    let Field { pos_prev, kind, group, broken, fight_point, hold, moving, .. } = *f;
+    let Field { pos_prev, kind, group, broken, fight_point, hold, moving, melee_ticks, .. } = *f;
     let i = s.i;
     let p = pos_prev[i].xz();
     let my_kind = kind[i] as usize;
@@ -493,9 +530,11 @@ fn begin(f: &Field, s: &mut Soldier) -> Step {
     // rout and death bring him back. Fighting takes him out of formation.
     // Keyed on the regiment's melee instead, a man whose regiment had no
     // fight on its clock, with an enemy standing off his flank, went to
-    // him and was pulled back to his slot, over and over.
-    let in_melee = fight_point[gi].is_some() && !routed && !dying;
-    let may_leave = !routed && !dying && !hold[gi] && !moving[gi];
+    // him and was pulled back to his slot, over and over. A held regiment
+    // with a melee on its clock has its fight too, and its soldiers may
+    // leave their ranks for it (`hold_join`).
+    let in_melee = (fight_point[gi].is_some() || (hold_join() && hold[gi] && melee_ticks[gi] > 0)) && !routed && !dying;
+    let may_leave = !routed && !dying && !moving[gi] && (!hold[gi] || hold_join());
     if !may_leave {
         *s.out_form = false;
     } else if *s.swing & crate::units::SWING_STATE_MASK
@@ -506,7 +545,9 @@ fn begin(f: &Field, s: &mut Soldier) -> Step {
     {
         *s.out_form = true;
     }
-    if !in_melee {
+    // With no melee on his regiment's clock he watches no comrade go, unless
+    // the battle's set-up turns on "Auto-engage nearby units" (`look_around`).
+    if !f.engage_near && !in_melee {
         *s.sight &= !(SIGHT_GO | SIGHT_GO_FAR);
     }
     let committed = *s.out_form;
@@ -530,6 +571,7 @@ fn begin(f: &Field, s: &mut Soldier) -> Step {
             joining: false,
             set_off: false,
             slot_wish: Vec2::ZERO,
+            join_dir: Vec2::ZERO,
             face_target: None,
         },
         walk: Walk::NONE,

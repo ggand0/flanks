@@ -2,12 +2,13 @@
 //! play, so one play is enough. Files go to `tmp/runs/play-logs/<start
 //! time>/`:
 //!
-//! - `regs.log`: every five seconds of battle, one line per regiment: its
-//!   team, kind, men, state, where its men are and where it is sent (its
-//!   centroid, anchor, order and the goal its men's places are laid
-//!   about), its fight (engaged, contact frame, melee clock, charge),
-//!   archers' stand-off and skirmish, its spacing and files, how far its
-//!   men spread, and how many stand off their places and how far.
+//! - `regs.log`: every five seconds of battle (on the sim tick, by the
+//!   battle clock), one line per regiment: its team, kind, men, state,
+//!   where its men are and where it is sent (its centroid, anchor, order
+//!   and the goal its men's places are laid about), its fight (engaged,
+//!   contact frame, melee clock, charge), archers' stand-off and
+//!   skirmish, its spacing and files, how far its men spread, and how
+//!   many stand off their places and how far.
 //! - `snap-<n>.txt`, written when the player presses F9: every living
 //!   soldier at that moment (regiment, position and height, his place,
 //!   his velocity, his target, out of formation or not), every regiment's
@@ -24,14 +25,26 @@ use std::io::Write;
 use crate::orders::{Groups, Order};
 use crate::units::Units;
 
+/// `regs.log`, written on the sim tick. Registered in every launch, so
+/// the tick's order is one schedule whatever the switches, and run only
+/// with `FL_PLAY_LOG` on.
 pub struct PlayLogPlugin;
 
 impl Plugin for PlayLogPlugin {
     fn build(&self, app: &mut App) {
-        if !on() {
-            return;
-        }
-        app.init_resource::<PlayLog>().add_systems(Update, (log_regiments, snapshot));
+        app.init_resource::<PlayLog>().add_systems(
+            FixedUpdate,
+            log_regiments.run_if(on).in_set(crate::game_state::ScriptSet::Logs),
+        );
+    }
+}
+
+/// The F9 snapshot, taken from the window.
+pub struct PlayLogViewPlugin;
+
+impl Plugin for PlayLogViewPlugin {
+    fn build(&self, app: &mut App) {
+        app.add_systems(Update, snapshot.run_if(on));
     }
 }
 
@@ -39,15 +52,13 @@ fn on() -> bool {
     std::env::var("FL_PLAY_LOG").is_ok_and(|v| v != "0")
 }
 
-/// How often `regs.log` gets its lines (seconds of battle).
-const EVERY_S: f32 = 5.0;
+/// How often `regs.log` gets its lines (ticks of battle: five seconds).
+const EVERY_TICKS: u32 = 150;
 
 #[derive(Resource, Default)]
 struct PlayLog {
     dir: Option<std::path::PathBuf>,
     regs: Option<std::fs::File>,
-    /// Battle time of the last `regs.log` lines (s).
-    last: f32,
     snaps: u32,
 }
 
@@ -138,16 +149,17 @@ fn regiment_line(groups: &Groups, units: &Units, g: usize, t: f32) -> String {
     )
 }
 
-/// `regs.log`, every EVERY_S seconds of battle.
-fn log_regiments(mut log: ResMut<PlayLog>, groups: Res<Groups>, units: Res<Units>, time: Res<Time<Virtual>>) {
-    if groups.list.is_empty() || units.len() == 0 {
+/// `regs.log`, every `EVERY_TICKS` ticks of battle from its first tick.
+fn log_regiments(
+    mut log: ResMut<PlayLog>,
+    groups: Res<Groups>,
+    units: Res<Units>,
+    clock: Res<crate::game_state::BattleClock>,
+) {
+    if groups.list.is_empty() || units.len() == 0 || !clock.tick.is_multiple_of(EVERY_TICKS) {
         return;
     }
-    let t = time.elapsed_secs();
-    if t < log.last + EVERY_S && log.regs.is_some() {
-        return;
-    }
-    log.last = t;
+    let t = clock.secs();
     if log.regs.is_none() {
         let path = log.dir().join("regs.log");
         log.regs = std::fs::File::create(&path).map_err(|e| warn!("[play-log] {}: {e}", path.display())).ok();
@@ -164,7 +176,7 @@ fn snapshot(
     mut log: ResMut<PlayLog>,
     groups: Res<Groups>,
     units: Res<Units>,
-    time: Res<Time<Virtual>>,
+    clock: Res<crate::game_state::BattleClock>,
     camera: Query<&GlobalTransform, With<Camera3d>>,
 ) {
     if !keys.just_pressed(KeyCode::F9) || groups.list.is_empty() {
@@ -176,7 +188,7 @@ fn snapshot(
         warn!("[play-log] cannot write {}", path.display());
         return;
     };
-    let t = time.elapsed_secs();
+    let t = clock.secs();
     if let Some(cam) = camera.iter().next() {
         let (p, f) = (cam.translation(), cam.forward());
         // Where the camera's middle line meets the plane y = 0: the spot

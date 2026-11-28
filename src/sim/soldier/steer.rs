@@ -57,6 +57,25 @@ fn feet_take(imposed: Vec2, dt: f32) -> Vec2 {
     let il = imposed.length();
     if il > 1e-12 { imposed * (il.min(FEET * dt) / il) } else { Vec2::ZERO }
 }
+/// A soldier thrown clear of the bodies catches his footing: with no body
+/// overlapping his, the speed he has no wish for (all of it when he wishes
+/// to go nowhere, the part against his wish when he does) his feet keep
+/// taking while it is over a step's pace (STEP_PACE), within what is left
+/// of the feet's take of one tick (FEET x dt less `taken`). Among bodies
+/// nothing changes: there the total his feet take back from the contacts
+/// stays a step's pace (`held_total`), and only his flight over open
+/// ground is cut short.
+#[inline]
+fn catch_footing(v: Vec2, wish: Vec2, taken: f32, dt: f32) -> Vec2 {
+    let wl = wish.length();
+    let unwished = if wl < 1e-3 { v } else { wish * (v.dot(wish).min(0.0) / (wl * wl)) };
+    let ul = unwished.length();
+    if ul > STEP_PACE {
+        unwished * ((ul - STEP_PACE).min((FEET * dt - taken).max(0.0)) / ul)
+    } else {
+        Vec2::ZERO
+    }
+}
 /// Whether a man of a regiment standing ready stands, below the speed of
 /// his steps. Under the friction contact it is where he is trying to go,
 /// so a push he gets does not take him out of the ready stance and only
@@ -180,8 +199,10 @@ pub(crate) const STEP_FACE_SPEED: f32 = 1.05;
 /// still corrected.
 pub(crate) const STAND_GRIP: f32 = 6.0;
 /// A standing man's stance (his lean, arms and shield) takes the first
-/// STANCE metres of a net squeeze before he gives ground to it.
-const STANCE: f32 = 0.10;
+/// STANCE metres of a net squeeze before he gives ground to it. Under the
+/// friction contact it is how deep a pair's overlap his brace holds
+/// (`braced_set`, contact.rs).
+pub(super) const STANCE: f32 = 0.10;
 /// His own 0.7 to 1.3 of a man-to-man quantity (his grip).
 #[inline]
 fn own_spread(i: usize) -> f32 {
@@ -239,6 +260,11 @@ pub(super) fn steer(f: &Field, s: &mut Soldier, st: &mut Step) {
         let cut = feet_take(*s.imposed, dt);
         v -= cut;
         *s.imposed -= cut;
+        // Thrown clear of the bodies he catches his footing
+        // (`catch_footing`). A staggered soldier reels and does not.
+        if st.scan.corr.length_squared() < 1e-12 && *s.swing & crate::units::SWING_STAGGERED == 0 {
+            v -= catch_footing(v, desired, cut.length(), dt);
+        }
     }
     // Jammed units stop shoving entirely: at full jam the crowd is
     // quasi-static and overlap resolution is purely positional — force-based
@@ -364,12 +390,12 @@ fn keep_stood(s: &mut Soldier, st: &Step, desired: Vec2) {
         let arrived = has_arrived(st.walk.place_dist, st.walk.parked, st.sight.slot_blocked);
         still_stands(*s.stood, under, arrived)
     } else if st.fight.joining {
-        // A soldier walking to the fight is a walker until the still
-        // men ahead have stopped him behind a comrade in his way: the
-        // brake has taken his wish under the speed of a step. From
-        // then he stands, and `drive` gives him no wish while that
-        // comrade is in his way.
-        under || (st.sight.way_blocked && stands(true, Vec2::ZERO, desired - side))
+        // A soldier walking to the fight is a walker until his wish is
+        // under the speed of a step: the brake or his arm's length
+        // (`keep_arm_length`) has taken it. Not keeping his elbow room
+        // (`elbow_room`), he stands too once the still men ahead have
+        // stopped him behind a comrade in his way.
+        under || (!elbow_room() && st.sight.way_blocked && stands(true, Vec2::ZERO, desired - side))
     } else {
         under
     };
@@ -389,7 +415,9 @@ fn keep_stood(s: &mut Soldier, st: &Step, desired: Vec2) {
 /// Which way he looks: the man he swings at, the enemy in reach when he
 /// is fighting or just struck, where he is going when out of formation,
 /// the foe he remembers close by, else the line's facing, at the human
-/// turn rate.
+/// turn rate. Under the facing rule (`face_keep`) whether he stands or
+/// walks is read from his wish, not his speed, and walking he faces his
+/// wish.
 #[inline]
 pub(super) fn face(f: &Field, s: &mut Soldier, st: &mut Step) {
     let Field { pos_prev, team, threat, form_face, dt, .. } = *f;
@@ -410,6 +438,7 @@ pub(super) fn face(f: &Field, s: &mut Soldier, st: &mut Step) {
     // (yaw stepped once per tick otherwise — visible facing snaps at high
     // fps).
     *s.yaw_prev = *s.yaw;
+    let wish2 = st.desired.length_squared();
     let face_dir = match face_target {
         Some(t) => t - p,
         // A man IN his swing cycle faces the fight (a formed one too — he is
@@ -433,7 +462,52 @@ pub(super) fn face(f: &Field, s: &mut Soldier, st: &mut Step) {
         // or walking. Without this a blocked joiner fell through to the
         // formed man's rule below and stood facing the line's front with the
         // fight beside him.
-        None if !routed && committed && memo_dir != Vec2::ZERO => memo_dir,
+        None if !face_keep() && !routed && committed && memo_dir != Vec2::ZERO => memo_dir,
+        // Under the facing rule (`face_keep`), the four arms below and the
+        // walking arm at the end.
+        // Standing or stepping, he turns to the enemy he remembers once
+        // that enemy is within his threat distance, in his rank or out.
+        None if face_keep()
+            && !routed
+            && wish2 < STEP_FACE_SPEED * STEP_FACE_SPEED
+            && (*s.target as usize) < pos_prev.len()
+            && team[*s.target as usize] != team[i]
+            && f.death_snap[*s.target as usize] == 0
+            && pos_prev[*s.target as usize].xz().distance_squared(p) < threat_radius() * threat_radius() =>
+        {
+            pos_prev[*s.target as usize].xz() - p
+        }
+        // In his rank, standing at his place, he dresses to the formation's
+        // facing.
+        None if face_keep()
+            && !routed
+            && !committed
+            && wish2 < STEP_FACE_SPEED * STEP_FACE_SPEED
+            && form_face[gi] != Vec2::ZERO
+            && (st.walk.parked || st.walk.place_dist <= STEP_STOP) =>
+        {
+            form_face[gi]
+        }
+        // Standing still with his back to the way his regiment faces, in
+        // his rank or out of it, he turns round to it.
+        None if face_keep()
+            && !routed
+            && wish2 < 0.2 * 0.2
+            && form_face[gi] != Vec2::ZERO
+            && Vec2::new(s.yaw.sin(), s.yaw.cos()).dot(form_face[gi]) < 0.0 =>
+        {
+            form_face[gi]
+        }
+        // Else, standing or stepping, he keeps the facing he has: a formed
+        // soldier short of his place, and a soldier out of his rank who has
+        // stopped. (An unformed regiment's standing watch is further down.)
+        None if face_keep()
+            && !routed
+            && wish2 < STEP_FACE_SPEED * STEP_FACE_SPEED
+            && (form_face[gi] != Vec2::ZERO || committed) =>
+        {
+            Vec2::ZERO
+        }
         // Blooded and the enemy still close: a man who has traded blows keeps
         // facing the fight while his last foe (combat memo, validated by team
         // and distance like the closing drive) stands within KEEP_FACING_R —
@@ -471,6 +545,9 @@ pub(super) fn face(f: &Field, s: &mut Soldier, st: &mut Step) {
         {
             threat[gi]
         }
+        // Walking, he faces the way he means to walk: a speed the bodies
+        // round him put into him does not turn him.
+        None if face_keep() && !routed => st.desired,
         None => new_v,
     };
     let min_len2 = if face_target.is_some() || best_idx != u32::MAX {
@@ -731,6 +808,28 @@ mod tests {
         let t = held_total(Vec2::new(0.7, 0.0), Vec2::new(0.0, 0.0), Vec2::new(-1.0, 0.0));
         assert!((t.length() - STEP_PACE).abs() < 1e-6);
         assert!(t.x > 0.0 && t.y == 0.0);
+    }
+
+    /// Thrown clear, his feet take the speed he has no wish for while it
+    /// is over a step's pace: all of it with no wish, the part against his
+    /// wish with one, and nothing of a speed along his wish or under a
+    /// step's pace; never more than the feet's take of one tick.
+    #[test]
+    fn catch_footing_takes_the_unwished_speed_over_a_step() {
+        let dt = 1.0 / 30.0;
+        let near = |a: Vec2, b: Vec2| (a - b).length() < 1e-6;
+        let t = catch_footing(Vec2::new(-5.0, 0.0), Vec2::ZERO, 0.0, dt);
+        assert!(near(t, Vec2::new(-FEET * dt, 0.0)));
+        let t = catch_footing(Vec2::new(-5.0, 0.0), Vec2::ZERO, FEET * dt, dt);
+        assert!(near(t, Vec2::ZERO));
+        let t = catch_footing(Vec2::new(-(STEP_PACE + 0.1), 0.0), Vec2::ZERO, 0.0, dt);
+        assert!(near(t, Vec2::new(-0.1, 0.0)));
+        let t = catch_footing(Vec2::new(-0.5, 0.0), Vec2::ZERO, 0.0, dt);
+        assert!(near(t, Vec2::ZERO));
+        let t = catch_footing(Vec2::new(-5.0, 2.0), Vec2::new(3.0, 0.0), 0.0, dt);
+        assert!(near(t, Vec2::new(-FEET * dt, 0.0)));
+        let t = catch_footing(Vec2::new(5.0, 2.0), Vec2::new(3.0, 0.0), 0.0, dt);
+        assert!(near(t, Vec2::ZERO));
     }
 
     /// A man pushed at a rail on z while he climbs along x: the rail

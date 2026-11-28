@@ -77,6 +77,19 @@ fn still_weight(o_vel: Vec2, wish_dir: Vec2) -> f32 {
 /// him past the middle of them and he comes back on the next tick, every
 /// tick. 90% of an overlap is gone in 7 ticks.
 pub(super) const CORR_GAIN: f32 = 0.15;
+/// How far one tick sets him back out of a body that overlaps his by
+/// `over`, under the friction contact. A brace holds a lean, not a body
+/// that arrives at a run: the first STANCE of the overlap the two share by
+/// their braced weights (`brace`, from `brace_pairs`), so a braced soldier
+/// holds his ground against a soldier who walks into him; what is deeper
+/// they share by their masses alone (`plain`, from `mass_pairs`), so a
+/// soldier who runs into a braced back shoves it and is not thrown back
+/// off it as off a wall. Two soldiers braced alike have one weight for
+/// both parts.
+#[inline]
+fn braced_set(over: f32, brace: f32, plain: f32) -> f32 {
+    (over.min(STANCE) * brace + (over - STANCE).max(0.0) * plain) * CORR_GAIN
+}
 pub(super) const CORR_MAX: f32 = 0.1;
 /// The count an enemy close to him sets: 31 steps of four ticks, about
 /// 4 s at 30 ticks a second, before he puts the knife away.
@@ -107,8 +120,10 @@ pub(crate) const SPEAR_LINE_HALF_W: f32 = 0.35;
 /// body runs onto, which is a damage event from the spearman. One loop over
 /// his neighbours does every job: the contact between bodies (`Contact`),
 /// the crowd around him (`Crowd`), the enemy in his reach (`Reach`), the
-/// spear points (`Spear`) and the obstacles for the choice of opening
-/// (`Obstacles`).
+/// spear points (`Spear`), the obstacles for the choice of opening
+/// (`Obstacles`) and, for a walker to the fight under the arm's length
+/// rule, the bodies inside his arm's length and the comrade in his way
+/// (`Arm`).
 #[inline]
 pub(super) fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut, cands: &mut Vec<u32>) {
     let i = s.i;
@@ -132,6 +147,7 @@ pub(super) fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut
     let mut reach = Reach::new(params, *s.target);
     let mut spear = Spear::new(f, s, dying);
     let mut obstacles = Obstacles::new(f, s, st, wish_dir, widths[pose_lv].body, widths);
+    let mut arm = Arm::new(st);
     let scan_r = spear.scan_radius(params);
     gather_candidates(f.grid, p, i, my_team_bit, scan_r, spear.foe_cut(params), cands);
     let grid = f.grid;
@@ -151,6 +167,7 @@ pub(super) fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut
         reach.see(&n);
         spear.see(&n, f.yaw_snap);
         obstacles.see(&n);
+        arm.see(&n);
         let (sep_r, inv_sep, hard) = contact.rest(&n);
         if d2 < sep_r * sep_r && d2 > 1e-8 {
             let len = d2.sqrt();
@@ -170,6 +187,7 @@ pub(super) fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut
     contact.hand_on(st);
     crowd.hand_on(st);
     reach.hand_on(st);
+    arm.hand_on(st);
     st.scan.scan_r = scan_r;
     st.scan.my_team_bit = my_team_bit;
     obstacles.hand_on(s, st, widths[pose_lv].sep);
@@ -412,7 +430,7 @@ impl<'a> Contact<'a> {
                         || self.moving[crate::spatial::meta_group(o.meta)],
                     );
                     let my_brace = if cross { self.my_brace_cross } else { self.my_brace_same };
-                    (hard - len) * CORR_GAIN * braces[crate::spatial::meta_kind(o.meta)][my_brace][o_brace]
+                    braced_set(hard - len, braces[crate::spatial::meta_kind(o.meta)][my_brace][o_brace], mw)
                 }
                 None => back,
             };
@@ -511,6 +529,66 @@ impl Crowd {
         st.scan.crowd_still = self.crowd_still;
         st.scan.ahead = self.ahead;
         st.scan.press4 = self.press4;
+    }
+}
+
+/// The arm's length rule's read (`scan`, `keep_arm_length`), only for a
+/// living walker to the fight: the bodies of either team inside his arm's
+/// length, summed as `Scanned::crowding`, and how far off the comrade in
+/// his way stands (`Scanned::way_gap`): the nearest living comrade within
+/// SEP_RADIUS and 45 degrees of his way who is not walking away along it,
+/// as his look reads a comrade ahead (`look_on_his_way`). With no way it
+/// only sums the crowding. It also keeps how near his nearest living body
+/// of either team stands (`Scanned::room`).
+struct Arm {
+    on: bool,
+    way: Vec2,
+    arm: f32,
+    way_gap: f32,
+    crowding: Vec2,
+    near2: f32,
+}
+
+impl Arm {
+    #[inline]
+    fn new(st: &Step) -> Self {
+        Arm {
+            on: st.fight.joining && !st.dying,
+            way: st.fight.join_dir,
+            arm: arm_length(),
+            way_gap: f32::INFINITY,
+            crowding: Vec2::ZERO,
+            near2: f32::INFINITY,
+        }
+    }
+
+    /// A neighbour on his level (`d` points from the neighbour to him).
+    #[inline(always)]
+    fn see(&mut self, n: &Near) {
+        if !self.on || n.o_dying || n.d2 <= 1e-8 {
+            return;
+        }
+        self.near2 = self.near2.min(n.d2);
+        let arm = self.arm;
+        let inside = n.d2 < arm * arm;
+        let ahead = n.same && self.way != Vec2::ZERO && n.d2 < SEP_RADIUS * SEP_RADIUS;
+        if !(inside || ahead) {
+            return;
+        }
+        let len = n.d2.sqrt();
+        if inside {
+            self.crowding += n.d / len * ((arm - len) / arm);
+        }
+        if ahead && (-n.d).dot(self.way) > 0.707 * len && n.o_vel.dot(self.way) <= 0.5 {
+            self.way_gap = self.way_gap.min(len);
+        }
+    }
+
+    #[inline]
+    fn hand_on(&self, st: &mut Step) {
+        st.scan.way_gap = self.way_gap;
+        st.scan.crowding = self.crowding;
+        st.scan.room = self.near2.sqrt().min(self.arm);
     }
 }
 
@@ -893,6 +971,19 @@ fn draw_knife(f: &Field, s: &mut Soldier, st: &Step, best_idx: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A brace holds the first STANCE of an overlap by the braced weight
+    /// and what is deeper goes by mass; alike braced, both parts have one
+    /// weight.
+    #[test]
+    fn braced_set_holds_a_lean_and_shares_a_deep_overlap_by_mass() {
+        let near = |a: f32, b: f32| (a - b).abs() < 1e-6;
+        assert!(near(braced_set(0.05, 0.4, 1.0), 0.05 * 0.4 * CORR_GAIN));
+        assert!(near(braced_set(STANCE, 0.4, 1.0), STANCE * 0.4 * CORR_GAIN));
+        assert!(near(braced_set(0.40, 0.4, 1.0), (STANCE * 0.4 + 0.30 * 1.0) * CORR_GAIN));
+        assert!(near(braced_set(0.40, 1.6, 1.0), (STANCE * 1.6 + 0.30 * 1.0) * CORR_GAIN));
+        assert!(near(braced_set(0.40, 1.0, 1.0), 0.40 * CORR_GAIN));
+    }
 
     /// A body straight ahead, behind, left and right lies on its own side
     /// in full; one between two sides lies on both in part and on the far

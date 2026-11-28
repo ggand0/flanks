@@ -31,6 +31,15 @@ pub struct BattleSetup {
     /// Soldiers per unit.
     pub reg_size: usize,
     pub ai_enabled: bool,
+    /// Idle units attack a near enemy on their own (ai.rs
+    /// `auto_engage`); off when the file does not say.
+    #[serde(default)]
+    pub at_ease_attack: bool,
+    /// A soldier standing at his place goes for an enemy he sees within his
+    /// look, and his comrades follow him (game_state.rs
+    /// `BattleConfig::engage_near`); off when the file does not say.
+    #[serde(default)]
+    pub engage_near: bool,
     /// The player's deployment zone reaches the map's sides instead of
     /// stopping at the side margins.
     #[serde(default)]
@@ -124,6 +133,8 @@ impl BattleSetup {
             units_per_team: config.units_per_team,
             reg_size: config.reg_size,
             ai_enabled: config.ai_enabled,
+            at_ease_attack: config.at_ease_attack,
+            engage_near: config.engage_near,
             open_sides: from_env().is_some_and(|s| s.open_sides),
             units: groups
                 .list
@@ -163,11 +174,15 @@ impl BattleSetup {
     /// The battle options this setup was saved with. A listed enemy army
     /// becomes hand-picked counts, so the spawner builds exactly the saved
     /// units instead of rolling a style; an unlisted one keeps the menu's.
+    /// `FL_AT_EASE=1` keeps the automatic attack on over the file's off,
+    /// and `FL_ENGAGE_NEAR=1` the soldiers' going for a nearby enemy.
     pub fn apply_config(&self, config: &mut BattleConfig) {
         config.map = self.map;
         config.units_per_team = self.units_per_team;
         config.reg_size = self.reg_size;
         config.ai_enabled = self.ai_enabled;
+        config.at_ease_attack = self.at_ease_attack || crate::game_state::at_ease_env();
+        config.engage_near = self.engage_near || crate::game_state::engage_near_env();
         config.player_regs = self.counts(PLAYER_TEAM);
         if self.lists_team(1 - PLAYER_TEAM) {
             config.enemy = EnemyComp::Manual(self.counts(1 - PLAYER_TEAM));
@@ -418,6 +433,8 @@ fn demo_setup() -> BattleSetup {
         units_per_team: 100 * DEMO_UNIT,
         reg_size: DEMO_UNIT,
         ai_enabled: true,
+        at_ease_attack: true,
+        engage_near: false,
         open_sides: true,
         units,
         orders: Vec::new(),
@@ -592,6 +609,8 @@ mod tests {
             map: MapKind::Grassland,
             scenario: Scenario::Normal,
             enemy: EnemyComp::Style(1),
+            at_ease_attack: true,
+            engage_near: true,
             ..default()
         };
         config.player_regs = crate::regiments::frac_comp(config.n_slots());
@@ -613,6 +632,8 @@ mod tests {
 
         let mut fresh = BattleConfig { enemy: EnemyComp::Random, ..default() };
         loaded.apply_config(&mut fresh);
+        assert!(fresh.at_ease_attack, "the automatic attack comes back on");
+        assert!(fresh.engage_near, "the going for a nearby enemy comes back on");
         let (mut units2, mut groups2) = spawn(&fresh, &terrain);
         assert!(loaded.place(&mut groups2, &mut units2, &terrain).is_some());
 
@@ -820,6 +841,8 @@ mod tests {
             units_per_team: 200,
             reg_size: 100,
             ai_enabled: false,
+            at_ease_attack: false,
+            engage_near: false,
             open_sides: false,
             units: Vec::new(),
             orders: vec![
@@ -868,6 +891,8 @@ mod tests {
             units_per_team: 200,
             reg_size: 100,
             ai_enabled: false,
+            at_ease_attack: false,
+            engage_near: false,
             open_sides: false,
             units: Vec::new(),
             orders,
@@ -878,5 +903,7 @@ mod tests {
         assert_eq!(loaded, setup);
         let old: BattleSetup = serde_yaml_ng::from_str("map: Grassland\nunits_per_team: 1\nreg_size: 1\nai_enabled: false\nunits: []\n").unwrap();
         assert!(old.orders.is_empty(), "a file without orders reads");
+        assert!(!old.at_ease_attack, "a file without the automatic attack has it off");
+        assert!(!old.engage_near, "a file without the going for a nearby enemy has it off");
     }
 }

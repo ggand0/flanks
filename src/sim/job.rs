@@ -267,6 +267,10 @@ pub struct TickJob {
     pub(crate) terrain: Option<std::sync::Arc<Terrain>>,
     pub(crate) dt: f32,
     pub(crate) combat_scale: f32,
+    /// The battle's set-up turns on "Auto-engage nearby units"
+    /// (`BattleConfig::engage_near`): a soldier standing at his place goes
+    /// for an enemy he sees, and his comrades follow him.
+    pub(crate) engage_near: bool,
     pub(crate) tick_seed: u32,
     pub(crate) tick: u32,
     pub(crate) bounds_min: Vec2,
@@ -396,12 +400,14 @@ pub(crate) fn prepare_tick(
     terrain_arc: &std::sync::Arc<Terrain>,
     dt: f32,
     combat_scale: f32,
+    engage_near: bool,
     tick: u32,
 ) {
     job.generation = units.generation;
     job.pack = None;
     job.dt = dt;
     job.combat_scale = combat_scale;
+    job.engage_near = engage_near;
     job.terrain = Some(terrain_arc.clone());
     let terrain: &Terrain = terrain_arc;
 
