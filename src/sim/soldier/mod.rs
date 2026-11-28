@@ -259,9 +259,9 @@ struct Scanned {
     /// width (`Width`).
     brake: (f32, f32),
     /// How far off the comrade in his way stands, a walker to the fight
-    /// under the arm's length rule (`keep_arm`): the nearest living comrade
-    /// within SEP_RADIUS and 45 degrees of his way who is not walking away
-    /// along it; f32::INFINITY for nobody.
+    /// under the arm's length rule (`keep_arm_length`): the nearest living
+    /// comrade within SEP_RADIUS and 45 degrees of his way who is not
+    /// walking away along it; f32::INFINITY for nobody.
     way_gap: f32,
     /// The bodies inside his arm's length, a walker to the fight under the
     /// arm's length rule: the sum of the unit vectors from each to him, each
@@ -395,8 +395,8 @@ struct Fight {
     /// for the tick he comes back into formation (`decide_to_join`).
     slot_wish: Vec2,
     /// The way he walks to the fight (`join_goal`, a unit vector, zero for
-    /// none), set by `drive` under the arm's length rule (`keep_arm`) for
-    /// the scan and his look.
+    /// none), set by `drive` for a walker to the fight, for the scan and
+    /// his look.
     join_dir: Vec2,
     /// Where the swing turns him (`swing`, `face`).
     face_target: Option<Vec2>,

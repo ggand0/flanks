@@ -16,13 +16,10 @@ const SEP_PUSH_MAX: f32 = 2.5;
 /// place of the walk to his slot, so the scan reads the men ahead of him
 /// on that way, and the still men ahead stop him there (`yield_to_crowd`)
 /// as they stop every walker. He does not wait at arm's length behind a
-/// comrade and move up in hops. Under the arm's length rule (`keep_arm`)
-/// his walk shrinks to nothing as he comes to an arm's length from the
-/// comrade in his way, and he moves off any body nearer than that
-/// (`keep_arm_length`). Without it, once the men ahead have stopped him
-/// behind a comrade in his way he stands, braced, with no wish, until a
-/// short step of room opens ahead (`drive`, `steer`). Without that brake
-/// he joins through `close_in`.
+/// comrade and move up in hops. His walk shrinks to nothing as he comes to
+/// an arm's length from the comrade in his way, and he moves off any body
+/// nearer than that (`keep_arm_length`). Without that brake he joins
+/// through `close_in`.
 #[inline]
 pub(super) fn joins_as_walker() -> bool {
     still_brake()
@@ -161,29 +158,10 @@ pub(super) fn drive(f: &Field, s: &mut Soldier, st: &mut Step, asks: &mut Vec<cr
     {
         st.fight.slot_wish = desired;
         st.fight.joining = true;
-        // Under the arm's length rule (`keep_arm`) he walks to the fight
-        // every tick, and how near the comrade in his way stands shrinks
-        // that walk after the scan, to nothing at arm's length
-        // (`keep_arm_length`). Without it: arrived at the men ahead, a
-        // comrade in his way by his last look and himself standing since
-        // the still men ahead stopped him (`steer` sets his stood bit
-        // then), he stands with no wish until a step of room opens ahead
-        // (JOIN_ROOM). His own standing is read, never his speed: in a
-        // packed regiment the bodies around him move him more than a
-        // centimetre a tick, and read from his speed that push would make
-        // him a walker again, unbraced, and the ranks behind a front would
-        // shake. A joiner who kept his wish while the soldiers ahead hold
-        // him would never brace, and any creep ahead would let the rear
-        // walk into the backs ahead and drift back. Keeping his elbow room
-        // (`elbow_room`), he stops on his look alone, an arm's length
-        // behind that comrade.
-        let arrived = *s.sight & SIGHT_WAY != 0 && (*s.stood || elbow_room());
         // An opening ahead that fits him (`look_around`): he steps into it
         // at the step pace, and once there he stands.
         if join_open() && s.aim.x.is_finite() {
-            if keep_arm() {
-                st.fight.join_dir = join_goal(f, s, st).0;
-            }
+            st.fight.join_dir = join_goal(f, s, st).0;
             let to = *s.aim - p;
             let d = to.length();
             if d > 0.15 {
@@ -193,14 +171,12 @@ pub(super) fn drive(f: &Field, s: &mut Soldier, st: &mut Step, asks: &mut Vec<cr
                 *s.aim = Vec2::NAN;
                 st.desired = Vec2::ZERO;
             }
-        } else if keep_arm() {
+        } else {
             // His walk to the fight. How near the comrade in his way stands
             // shrinks it after the scan (`keep_arm_length`).
             let (way, wish) = join_goal(f, s, st);
             st.fight.join_dir = way;
             st.desired = wish;
-        } else {
-            st.desired = if arrived { Vec2::ZERO } else { join_goal(f, s, st).1 };
         }
     }
 }
@@ -245,7 +221,7 @@ fn ease_off(crowding: Vec2) -> Vec2 {
     (crowding * EASE_PACE).clamp_length_max(STEP_PACE)
 }
 
-/// The arm's length rule (`keep_arm`): a soldier walking to the fight keeps
+/// The arm's length rule: a soldier walking to the fight keeps
 /// an arm's length (`arm_length`) from the bodies round him, read every
 /// tick. Farther than an arm's length from the comrade in his way he walks
 /// up, and his pace shrinks to nothing as he comes to arm's length. Nearer
@@ -255,7 +231,7 @@ fn ease_off(crowding: Vec2) -> Vec2 {
 /// length. A step into an opening that fits him is left as it is.
 #[inline]
 pub(super) fn keep_arm_length(st: &mut Step) {
-    if !keep_arm() || !st.fight.joining || st.walk.open_step {
+    if !st.fight.joining || st.walk.open_step {
         return;
     }
     // His walk to the fight, as the crowd's brake left it, by how far the

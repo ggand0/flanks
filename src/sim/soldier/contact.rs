@@ -533,13 +533,13 @@ impl Crowd {
 }
 
 /// The arm's length rule's read (`scan`, `keep_arm_length`), only for a
-/// living walker to the fight under `keep_arm`: the bodies of either team
-/// inside his arm's length, summed as `Scanned::crowding`, and how far off
-/// the comrade in his way stands (`Scanned::way_gap`): the nearest living
-/// comrade within SEP_RADIUS and 45 degrees of his way who is not walking
-/// away along it, as his look reads a comrade ahead (`look_on_his_way`).
-/// With no way it only sums the crowding. It also keeps how near his
-/// nearest living body of either team stands (`Scanned::room`).
+/// living walker to the fight: the bodies of either team inside his arm's
+/// length, summed as `Scanned::crowding`, and how far off the comrade in
+/// his way stands (`Scanned::way_gap`): the nearest living comrade within
+/// SEP_RADIUS and 45 degrees of his way who is not walking away along it,
+/// as his look reads a comrade ahead (`look_on_his_way`). With no way it
+/// only sums the crowding. It also keeps how near his nearest living body
+/// of either team stands (`Scanned::room`).
 struct Arm {
     on: bool,
     way: Vec2,
@@ -553,7 +553,7 @@ impl Arm {
     #[inline]
     fn new(st: &Step) -> Self {
         Arm {
-            on: keep_arm() && st.fight.joining && !st.dying,
+            on: st.fight.joining && !st.dying,
             way: st.fight.join_dir,
             arm: arm_length(),
             way_gap: f32::INFINITY,

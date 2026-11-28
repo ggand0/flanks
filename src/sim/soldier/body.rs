@@ -395,14 +395,10 @@ pub(super) fn still_brake() -> bool {
     static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *S.get_or_init(|| friction_contact() && !std::env::var("FL_BRAKE").is_ok_and(|v| v == "density"))
 }
-/// A soldier walking to the fight stops by sight an arm's length
-/// (SEP_RADIUS) behind a comrade in his way, not a body and a short step
-/// behind him: he stands once his look sees that comrade, whether or not
-/// the bodies have stopped him yet, so he never walks into the back ahead.
-/// Under the arm's length rule (`keep_arm`) his stop is that rule's
-/// (`keep_arm_length`), and this one still sets how near a comrade stands
-/// to count as in his way for his look. FL_ROOM=0 turns it off; only with
-/// the still brake.
+/// A soldier walking to the fight counts a comrade as in his way for his
+/// look within an arm's length (SEP_RADIUS), not a body and a short step
+/// ahead of him (`look_around`). His stop is the arm's length rule's
+/// (`keep_arm_length`). FL_ROOM=0 turns it off; only with the still brake.
 #[inline]
 pub(super) fn elbow_room() -> bool {
     static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -416,27 +412,6 @@ pub(super) fn elbow_room() -> bool {
 pub(super) fn join_open() -> bool {
     static J: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *J.get_or_init(|| still_brake() && crate::util::env_or("FL_JOIN_OPEN", 1u32) != 0)
-}
-/// A soldier stopped behind the comrade in his way with a comrade nearer
-/// than his arm's length steps away from him, to free ground on the far
-/// side (`look_around`, `too_near`). FL_BACK_ROOM=0 turns it off; only
-/// with the still brake, and off under the arm's length rule (`keep_arm`),
-/// which moves him off the bodies round him in its place.
-#[inline]
-pub(super) fn back_room() -> bool {
-    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *S.get_or_init(|| still_brake() && !keep_arm() && crate::util::env_or("FL_BACK_ROOM", 1u32) != 0)
-}
-/// The arm's length rule. A soldier walking to the fight keeps an arm's
-/// length (`arm_length`) from the bodies round him, read every tick: he
-/// walks up to the comrade in his way and slows to nothing as he comes to
-/// arm's length, and he moves off any body nearer than that, the nearer
-/// the faster (`keep_arm_length`). FL_KEEP_ARM=0 turns it off; only with
-/// the still brake.
-#[inline]
-pub(super) fn keep_arm() -> bool {
-    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *S.get_or_init(|| still_brake() && crate::util::env_or("FL_KEEP_ARM", 1u32) != 0)
 }
 /// A soldier's arm's length (m): his body in the ready stance and half his
 /// elbow room, 1.05 m with the defaults, the same room an opening that fits
