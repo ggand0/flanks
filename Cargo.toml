@@ -46,6 +46,12 @@ tracy = ["bevy/trace_tracy"]
 # asset changes (src/game_files.rs).
 embed_assets = []
 
+# bevy_light 0.19.0 with one fix: its directional light visibility indexes
+# past a worker thread's per-cascade lists when the sun gains a cascade
+# while the game runs (vendor/bevy_light/FLANKS_PATCH.md).
+[patch.crates-io]
+bevy_light = { path = "vendor/bevy_light" }
+
 # Bevy-recommended dev profile: fast recompiles for our code, optimized deps.
 [profile.dev]
 opt-level = 1

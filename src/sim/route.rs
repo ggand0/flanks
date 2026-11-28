@@ -25,9 +25,22 @@
 //!   straight way there is open. When it is not, he follows the route
 //!   from his own place on it, never past his regiment's frame: the
 //!   farthest point along it he can walk to straight, or else the nearest
-//!   point behind; failing any, he steps around what stands in front of
-//!   him. He knows his slot, his regiment's route and the ground ahead of
-//!   him, nothing else.
+//!   point behind. A man who can walk straight to no point of it is cut
+//!   off from it (his regiment went round a wall he is still outside of,
+//!   and planned again from inside): he walks a way of his own back to
+//!   it, planned for him on the grid. While he waits for it, or where none
+//!   is found, he steps around what stands in front of him. He knows his
+//!   slot, his regiment's route, the ways planned for its cut-off men and
+//!   the ground ahead of him, nothing else.
+//! - A way of one man's own: a cut-off man asks for one (`WayAsk`), the
+//!   asks go back with the tick job, and the planner searches from where he
+//!   stands to his regiment's frame over the same grid and budget as the
+//!   regiments' routes (`nav.rs` `PlanRequest::man`), a few searches a
+//!   tick (`WAYS_PER_TICK`), each bounded (`nav::MAN_CELLS`). The ways are
+//!   kept per regiment until its route changes, and every cut-off man of
+//!   it walks the one whose point he can walk to straight that is nearest
+//!   the way's end; an ask within `ASK_NEAR` of an earlier one for the same
+//!   route starts no search.
 //! - A regiment that has arrived keeps its route while it holds at the
 //!   route's end, so a man still behind an obstacle finds his way to his
 //!   slot after the order is done, and its slots are re-sorted by where
@@ -77,6 +90,25 @@ const ATTACK_RECHECK: u32 = 15;
 /// waypoints.
 const FOLLOW_AHEAD: [f32; 5] = [48.0, 24.0, 12.0, 6.0, 3.0];
 const FOLLOW_BACK: [f32; 2] = [6.0, 20.0];
+/// Searches for cut-off men's ways one tick job carries at most, beside
+/// the regiments' `PLANS_PER_TICK`.
+const WAYS_PER_TICK: usize = 4;
+/// An ask this near (m) to one already made for the same route starts no
+/// search: two cells, so one search serves a cluster of cut-off men.
+const ASK_NEAR: f32 = 4.0;
+/// Searches one route's cut-off men may start at most, and ways kept for
+/// it at most.
+const ASKS_PER_ROUTE: usize = 32;
+const WAYS_PER_ROUTE: usize = 16;
+
+/// A cut-off man's ask for a way of his own (`man_target`): his regiment,
+/// where he stands, and the point the way leads to, his regiment's frame.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct WayAsk {
+    pub g: u32,
+    pub p: Vec2,
+    pub goal: Vec2,
+}
 
 /// One regiment's route as the kernel reads it: the points from the
 /// route's start to its current waypoint (`points[k]`; the regiment's
@@ -87,6 +119,9 @@ pub struct RouteView {
     pub k: u32,
     /// The frame is on the last leg: men slow down near their slots.
     pub last_leg: bool,
+    /// The ways planned for its cut-off men back to the route, each from a
+    /// cell near where one stood to the frame; None when there are none.
+    pub ways: Option<Arc<[Arc<[Vec2]>]>>,
 }
 
 /// The kernel's part of the routes: per regiment, its route if any, and
@@ -115,6 +150,20 @@ struct Route {
     k: usize,
 }
 
+/// The ways of a regiment's cut-off men (`WayAsk`), for one route.
+#[derive(Clone, Default)]
+struct Ways {
+    /// The route's points they were planned for: another route drops them.
+    route: Option<Arc<[Vec2]>>,
+    /// Counts the routes; a search for an older one is dropped.
+    epoch: u32,
+    list: Vec<Arc<[Vec2]>>,
+    /// The kernel's view of `list`.
+    view: Option<Arc<[Arc<[Vec2]>]>>,
+    /// Where the searches for this route started.
+    asked: Vec<Vec2>,
+}
+
 #[derive(Clone, Default)]
 struct RegRoute {
     /// The order this entry was made for: a different one is new.
@@ -130,6 +179,11 @@ pub struct Routes {
     nav: Option<Arc<NavGrid>>,
     per: Vec<RegRoute>,
     queue: VecDeque<PlanRequest>,
+    /// Per regiment, its cut-off men's ways; the searches for them waiting
+    /// to go out; the asks the last install handed back.
+    ways: Vec<Ways>,
+    way_queue: VecDeque<PlanRequest>,
+    asks: Vec<WayAsk>,
     /// The searches the next tick job takes.
     outgoing: Vec<PlanJob>,
     /// Plans handed back by the last install, and the searches it did not
@@ -179,6 +233,15 @@ pub fn frame_share() -> f32 {
 /// living or more.
 fn share_passed(past: Option<(u32, u32, u32)>, k: usize, share: f32) -> bool {
     matches!(past, Some((at, n, of)) if share > 0.0 && at as usize == k && of > 0 && n as f32 >= share * of as f32)
+}
+
+/// Whether a block of half width `w` has the room to stand at waypoint
+/// `here`: the open ground round it reaches at least that far, with the
+/// width capped as `NavGrid::band_clear` caps it. A frame waits for its
+/// unit to gather only at a waypoint with that room; at one without it, a
+/// stair, a landing or the wall walk, it passes on to the next point.
+fn room_to_gather(nav: &NavGrid, here: Vec2, w: f32) -> bool {
+    nav.clearance_at(here) >= w.min(crate::nav::CLEAR_CAP - crate::terrain::CELL)
 }
 
 impl Routes {
@@ -240,23 +303,25 @@ impl Routes {
                 State::Pending { old: Some(route), .. } => Some(route),
                 _ => None,
             };
+            let ways = self.ways.get(g).filter(|w| same_route(w, route)).and_then(|w| w.view.clone());
             views[g] = route.map(|route| RouteView {
                 points: route.points.clone(),
                 k: route.k as u32,
                 last_leg: route.k + 1 >= route.points.len(),
+                ways,
             });
         }
-        *nav = if views.iter().any(Option::is_some) || !requests.is_empty() {
-            self.nav.clone()
-        } else {
-            None
-        };
+        *nav = self.nav.clone();
     }
 
-    /// Take the plans a tick job made and the searches it did not finish.
-    pub(crate) fn hand_back(&mut self, plans: &mut Vec<Plan>, unfinished: &mut Vec<PlanJob>) {
+    /// Take the plans a tick job made, the searches it did not finish and
+    /// its cut-off men's asks, chunk by chunk.
+    pub(crate) fn hand_back(&mut self, plans: &mut Vec<Plan>, unfinished: &mut Vec<PlanJob>, asks: &mut [Vec<WayAsk>]) {
         self.incoming.append(plans);
         self.unfinished.append(unfinished);
+        for chunk in asks {
+            self.asks.append(chunk);
+        }
     }
 
     /// Each regiment's resolved frame this tick: its route's current
@@ -287,6 +352,7 @@ impl Routes {
                 points: r.points.clone(),
                 k: r.k as u32,
                 last_leg: r.k + 1 >= r.points.len(),
+                ways: self.ways.get(g).filter(|w| same_route(w, Some(r))).and_then(|w| w.view.clone()),
             }),
             _ => None,
         }
@@ -368,22 +434,36 @@ pub fn update_routes(
         routes.outgoing.clear();
         routes.incoming.clear();
         routes.unfinished.clear();
+        routes.ways.clear();
+        routes.way_queue.clear();
+        routes.asks.clear();
     }
     let n = groups.list.len();
     routes.per.resize_with(n, RegRoute::default);
+    routes.ways.resize_with(n, Ways::default);
     let Some(nav) = routes.nav.clone() else {
         return;
     };
     let tick = pipeline.tick;
 
+    // The cut-off men's asks, against the routes the last job saw.
+    take_asks(routes);
+
     // The plans the last install handed back, and the searches it did
     // not finish, which go out again first unless a newer request for
     // their regiment has replaced them.
     for plan in std::mem::take(&mut routes.incoming) {
-        adopt(routes, &mut groups, plan);
+        if plan.req.man {
+            adopt_way(routes, plan);
+        } else {
+            adopt(routes, &mut groups, plan);
+        }
     }
     let mut unfinished = std::mem::take(&mut routes.unfinished);
     unfinished.retain(|job| {
+        if job.req.man {
+            return routes.ways.get(job.req.g as usize).is_some_and(|w| w.epoch == job.req.serial);
+        }
         matches!(routes.per.get(job.req.g as usize).map(|r| &r.state),
             Some(State::Pending { serial, .. }) if *serial == job.req.serial)
     });
@@ -403,13 +483,100 @@ pub fn update_routes(
     for g in 0..n {
         advance_frame(routes, &groups, &nav, g, tick);
     }
+    // A regiment whose route changed drops its cut-off men's ways.
+    for g in 0..n {
+        sync_ways(routes, g);
+    }
 
     // The searches the next job carries: the unfinished first, then new
-    // requests up to the limit.
-    while routes.outgoing.len() < PLANS_PER_TICK {
+    // requests up to the limit, and the cut-off men's up to theirs.
+    let regiments = routes.outgoing.iter().filter(|j| !j.req.man).count();
+    let mut men = routes.outgoing.len() - regiments;
+    for _ in regiments..PLANS_PER_TICK {
         let Some(req) = routes.queue.pop_front() else { break };
         routes.outgoing.push(PlanJob { req, search: None });
     }
+    while men < WAYS_PER_TICK {
+        let Some(req) = routes.way_queue.pop_front() else { break };
+        if routes.ways.get(req.g as usize).is_some_and(|w| w.epoch == req.serial) {
+            routes.outgoing.push(PlanJob { req, search: None });
+            men += 1;
+        }
+    }
+}
+
+/// The ways `w` were planned for `route`'s points.
+#[inline]
+fn same_route(w: &Ways, route: Option<&Arc<Route>>) -> bool {
+    matches!((&w.route, route), (Some(a), Some(r)) if Arc::ptr_eq(a, &r.points))
+}
+
+/// Regiment `g`'s ways kept while its route's points are the ones they
+/// were planned for; another route, or none, drops them and the asks.
+#[inline]
+fn sync_ways(routes: &mut Routes, g: usize) {
+    let route = match &routes.per[g].state {
+        State::Ready(r) | State::Pending { old: Some(r), .. } => Some(r),
+        _ => None,
+    };
+    let w = &mut routes.ways[g];
+    if same_route(w, route) || (w.route.is_none() && route.is_none()) {
+        return;
+    }
+    w.route = route.map(|r| r.points.clone());
+    w.epoch = w.epoch.wrapping_add(1);
+    w.list.clear();
+    w.view = None;
+    w.asked.clear();
+}
+
+/// Queue a search for each cut-off man's ask, unless one was made near
+/// where he stands for the same route, or the route has had its share.
+fn take_asks(routes: &mut Routes) {
+    for ask in std::mem::take(&mut routes.asks) {
+        let Some(w) = routes.ways.get_mut(ask.g as usize) else { continue };
+        if w.route.is_none()
+            || w.asked.len() >= ASKS_PER_ROUTE
+            || w.asked.iter().any(|q| q.distance_squared(ask.p) < ASK_NEAR * ASK_NEAR)
+        {
+            continue;
+        }
+        w.asked.push(ask.p);
+        routes.way_queue.push_back(PlanRequest {
+            g: ask.g,
+            serial: w.epoch,
+            start: ask.p,
+            goal: ask.goal,
+            half_w: crate::terrain::CELL,
+            man: true,
+        });
+    }
+}
+
+/// Keep a cut-off man's way for his regiment, if it is for its route and
+/// reaches the frame.
+fn adopt_way(routes: &mut Routes, plan: Plan) {
+    let g = plan.req.g as usize;
+    let Some(w) = routes.ways.get_mut(g) else { return };
+    if w.epoch != plan.req.serial {
+        return;
+    }
+    info!(
+        "[path] way for a cut-off man of regiment {g} from ({:.1}, {:.1}): planned in {:.2} ms over {} cells in {} ticks, {:.0} m, {} points{}",
+        plan.req.start.x,
+        plan.req.start.y,
+        plan.ms,
+        plan.cells,
+        plan.ticks,
+        plan.length(),
+        plan.points.len(),
+        if plan.reached { "" } else { ", none found" }
+    );
+    if !plan.reached || plan.points.len() < 2 || w.list.len() >= WAYS_PER_ROUTE {
+        return;
+    }
+    w.list.push(plan.points.into());
+    w.view = Some(w.list.clone().into());
 }
 
 /// A new order, an arrival or a moving attack target: the route kept,
@@ -545,6 +712,11 @@ fn advance_frame(routes: &mut Routes, groups: &Groups, nav: &crate::nav::NavGrid
         if near || nav.straight_ok(gd.centroid, next, w) {
             passed = if near { "near" } else { "clear" };
             k += 1;
+        } else if !room_to_gather(nav, here, w) {
+            // The block cannot stand at the waypoint: the frame does not
+            // wait there for the men to gather, it moves on.
+            passed = "narrow";
+            k += 1;
         } else if share_passed(gd.frame_past, k, frame_share()) {
             // The regiment's centre is short of the waypoint and the
             // way on is too narrow for its block, but enough of its
@@ -598,7 +770,8 @@ pub(crate) struct FrameTest {
 
 /// The advance loop's two tests on the centre for the log, mirrored: the
 /// same `here`, `next` and half width, and the straight check from the
-/// centre. The third, the share of men past the waypoint, is not in it.
+/// centre. The share of men past the waypoint and the room at it are not
+/// in it.
 /// None once the frame is at the route's last waypoint.
 pub(crate) fn frame_test(nav: &NavGrid, gd: &GroupData, points: &[Vec2], k: usize, goal: Vec2) -> Option<FrameTest> {
     if k + 1 >= points.len() {
@@ -614,7 +787,7 @@ fn request(routes: &mut Routes, g: usize, start: Vec2, goal: Vec2, half_w: f32) 
     routes.serial = routes.serial.wrapping_add(1);
     let serial = routes.serial;
     routes.queue.retain(|q| q.g as usize != g);
-    routes.queue.push_back(PlanRequest { g: g as u32, serial, start, goal, half_w });
+    routes.queue.push_back(PlanRequest { g: g as u32, serial, start, goal, half_w, man: false });
     let r = &mut routes.per[g];
     let old = match std::mem::take(&mut r.state) {
         State::Ready(route) => Some(route),
@@ -713,30 +886,51 @@ pub(crate) fn plan_all(nav: &NavGrid, jobs: &mut Vec<PlanJob>, out: &mut Vec<Pla
     );
 }
 
-/// Where a man of a regiment on a route walks this tick, and whether he
-/// keeps his full pace (he is not yet near the end of the way).
+/// Where a man of a regiment on a route walks this tick (`at`), whether
+/// he keeps his full pace (`through`: he is not yet near the end of the
+/// way), and whether he is cut off from the route with no way of his own
+/// in sight (`ask`: he asks for one, `WayAsk`).
+pub(crate) struct ManTarget {
+    pub at: Vec2,
+    pub through: bool,
+    pub ask: bool,
+}
+
+/// Where a man of a regiment on a route walks this tick (`ManTarget`).
 ///
 /// `frame` is his regiment's frame point (its current waypoint, or the
-/// goal on the last leg) and `slot` his own slot around it. With his
-/// straight way to his slot open as far as he sees, he walks to it.
+/// goal on the last leg), `slot` his own slot around it and `kept` the
+/// point he chose at his last read. With his straight way to his slot open
+/// as far as he sees, he walks to it.
 /// Otherwise he follows the route: from his place on it (the nearest
 /// point of its legs up to the frame), the farthest of a few points ahead
 /// he can walk to straight. Failing any, a point behind his place he can
 /// walk to, or else the nearest waypoint behind it he can. Failing that
-/// too, he steps around what stands in front of him, to the side his place
-/// on the route lies.
+/// too he is cut off: he walks one of the ways planned for his regiment's
+/// cut-off men (`own_way`). With none in sight, he asks for one and steps
+/// around what stands in front of him meanwhile, to the side his place on
+/// the route lies, where the ground along the step is open.
+///
+/// A man on such a way (`kept` is one of its points) leaves it only for a
+/// slot or a point of the route he sees the whole way to, within
+/// `nav::SIGHT`: a line open only as far as he looks is no way back from
+/// outside a wall, and walking it would take him back to where he was cut
+/// off.
 #[inline]
 pub(crate) fn man_target(
     nav: &NavGrid,
-    terrain: &Terrain,
     route: &RouteView,
     frame: Vec2,
     p: Vec2,
     slot: Vec2,
+    kept: Option<Vec2>,
     i: usize,
-) -> (Vec2, bool) {
-    if nav.walk_line(p, slot) {
-        return (slot, !route.last_leg);
+) -> ManTarget {
+    let go = |at: Vec2, through: bool| ManTarget { at, through, ask: false };
+    let on_way = kept.is_some_and(|q| route.ways.as_deref().is_some_and(|ways| ways.iter().any(|w| w.contains(&q))));
+    let sees = |q: Vec2| nav.walk_line(p, q) && (!on_way || p.distance_squared(q) <= crate::nav::SIGHT * crate::nav::SIGHT);
+    if sees(slot) {
+        return go(slot, !route.last_leg);
     }
     let k = (route.k as usize).min(route.points.len() - 1);
     let point = |j: usize| if j == k { frame } else { route.points[j] };
@@ -754,8 +948,8 @@ pub(crate) fn man_target(
     }
     // The route's waypoints ahead, the farthest first.
     for j in (leg + 1..=k).rev() {
-        if nav.walk_line(p, point(j)) {
-            return (point(j), true);
+        if sees(point(j)) {
+            return go(point(j), true);
         }
     }
     // Along his leg from his place toward its end, the farthest first.
@@ -766,8 +960,8 @@ pub(crate) fn man_target(
             continue;
         }
         let q = at.lerp(end, ahead / len);
-        if nav.walk_line(p, q) {
-            return (q, true);
+        if sees(q) {
+            return go(q, true);
         }
     }
     // Back along the route from his place, then the waypoints behind it,
@@ -781,28 +975,31 @@ pub(crate) fn man_target(
             break;
         }
         let q = at.lerp(start, b / back);
-        if nav.walk_line(p, q) {
-            return (q, true);
+        if sees(q) {
+            return go(q, true);
         }
     }
     for j in (0..=leg).rev() {
-        if nav.walk_line(p, point(j)) {
-            return (point(j), true);
+        if sees(point(j)) {
+            return go(point(j), true);
         }
     }
-    // Nothing on the route in reach: step round what is in front of him,
-    // turning first to the side his place on the route lies.
+    // Nothing on the route in reach: he is cut off from it. A way planned
+    // for his regiment's cut-off men that he can walk onto leads him back.
+    if let Some(q) = route.ways.as_deref().and_then(|ways| own_way(nav, ways, p)) {
+        return go(q, true);
+    }
+    // None in sight: he asks for one, and steps round what is in front of
+    // him meanwhile, turning first to the side his place on the route
+    // lies, where the ground along the step is open.
+    let ask = |at: Vec2| ManTarget { at, through: true, ask: true };
     let dir = (end - p).normalize_or_zero();
     if dir == Vec2::ZERO {
-        return (end, true);
+        return ask(end);
     }
-    let open = |d: Vec2| {
-        let a = p + d * 1.25;
-        let b = p + d * 2.5;
-        !terrain.blocked_at(a.x, a.y) && !terrain.blocked_at(b.x, b.y)
-    };
+    let open = |d: Vec2| nav.walk_line(p, p + d * 2.5);
     if open(dir) {
-        return (end, true);
+        return ask(end);
     }
     let side = dir.perp_dot(at - p);
     let first = if side.abs() > 0.5 {
@@ -817,11 +1014,41 @@ pub(crate) fn man_target(
         for sign in [first, -first] {
             let d = Vec2::from_angle(a * sign).rotate(dir);
             if open(d) {
-                return (p + d * 4.0, true);
+                return ask(p + d * 4.0);
             }
         }
     }
-    (end, true)
+    ask(end)
+}
+
+/// The point a cut-off man at `p` walks to on his regiment's cut-off men's
+/// `ways`: of the points he can walk to straight, the one with the least
+/// way left after it to its end. A way's end he stands at (within
+/// `END_NEAR`) leads him nowhere more: the route has moved on since it was
+/// planned. A line check per point, from each way's end back, stopping
+/// where a way has more left than the best found.
+#[inline]
+fn own_way(nav: &NavGrid, ways: &[Arc<[Vec2]>], p: Vec2) -> Option<Vec2> {
+    const END_NEAR: f32 = 2.0;
+    let mut best: Option<(f32, Vec2)> = None;
+    for way in ways {
+        let mut left = 0.0;
+        for j in (0..way.len()).rev() {
+            if j + 1 < way.len() {
+                left += way[j].distance(way[j + 1]);
+            } else if p.distance_squared(way[j]) < END_NEAR * END_NEAR {
+                break;
+            }
+            if best.is_some_and(|(b, _)| left >= b) {
+                break;
+            }
+            if nav.walk_line(p, way[j]) {
+                best = Some((left, way[j]));
+                break;
+            }
+        }
+    }
+    best.map(|(_, q)| q)
 }
 
 /// `FL_NAV_VIZ=1`: draw the blocked cells' edges near the camera and every
@@ -900,6 +1127,20 @@ mod tests {
         assert_eq!(pending.frame_line(0, goal), None);
     }
 
+    /// The soldiers get the grid every tick on a map that has one, with
+    /// no route and no search out: their own walk tests read it while
+    /// every regiment stands.
+    #[test]
+    fn the_job_gets_the_grid_with_no_route_and_no_request() {
+        let terrain = crate::terrain::build_terrain(crate::terrain::MapKind::WallDebug);
+        let mut routes = Routes::default();
+        routes.prepare(&terrain);
+        let (mut requests, mut views, mut nav) = (Vec::new(), Vec::new(), None);
+        routes.fill_job(&mut requests, &mut views, &mut nav, 2);
+        assert!(requests.is_empty() && views.iter().all(Option::is_none));
+        assert!(nav.is_some());
+    }
+
     /// The frame moves on by its men once a fifth of the living are past
     /// the waypoint it waits at, and only on a count taken at that waypoint.
     #[test]
@@ -912,5 +1153,91 @@ mod tests {
         assert!(!share_passed(None, 4, FRAME_SHARE));
         // Switched off, no count moves it.
         assert!(!share_passed(Some((4, 200, 200)), 4, 0.0));
+    }
+
+    /// A 200-man block has no room to stand at the top of a stair on Wall
+    /// Debug, and has it on the open ground inside the town.
+    #[test]
+    fn a_block_has_room_to_gather_on_open_ground_and_none_atop_a_stair() {
+        let terrain = crate::terrain::build_terrain(crate::terrain::MapKind::WallDebug);
+        let nav = NavGrid::build(&terrain).expect("Wall Debug has a grid");
+        let gd = GroupData::new(0, crate::unit_types::KIND_HEAVY, Vec2::new(164.0, -162.0), 200);
+        let w = half_width(&gd, Vec2::Y);
+        let (top, open) = (Vec2::new(48.0, -136.0), Vec2::new(164.0, -162.0));
+        assert!(!room_to_gather(&nav, top, w), "room at the stair's top {top}: clearance {} for half width {w}", nav.clearance_at(top));
+        assert!(room_to_gather(&nav, open, w), "no room at {open}: clearance {} for half width {w}", nav.clearance_at(open));
+    }
+
+    /// The route a regiment inside Wall Debug's town planned from its
+    /// centre there, and the frame at its last point.
+    fn route_inside() -> RouteView {
+        let points = [Vec2::new(88.0, -141.0), Vec2::new(84.0, -152.0), Vec2::new(46.0, -152.0), Vec2::new(44.0, -150.0)];
+        RouteView { points: points.as_slice().into(), k: 3, last_leg: true, ways: None }
+    }
+
+    /// A man at the wall's outer face, his regiment's route all inside the
+    /// town, sees no point of it: he asks for a way. The way planned for him
+    /// starts where he can walk to straight, every leg of it is one he
+    /// walks straight, it goes round the wall's east end (the gate is
+    /// closed), and it ends where the route is in sight. Walking it a metre
+    /// at a time, he never asks again and comes to a point of the route.
+    #[test]
+    fn a_man_cut_off_outside_the_wall_walks_his_own_way_round_its_end() {
+        use crate::town_layout::{TOWERS_X, WALL_Z};
+        let terrain = crate::terrain::build_terrain(crate::terrain::MapKind::WallDebug);
+        let nav = NavGrid::build(&terrain).expect("Wall Debug has a grid");
+        let mut route = route_inside();
+        let frame = route.points[3];
+        let p = Vec2::new(16.0, -125.4);
+        let cut = man_target(&nav, &route, frame, p, frame, None, 0);
+        assert!(cut.ask, "the man at {p} sees the route: aims at {}", cut.at);
+        let req = PlanRequest { g: 0, serial: 0, start: p, goal: frame, half_w: crate::terrain::CELL, man: true };
+        let plan = nav.plan(&req);
+        assert!(plan.reached && plan.points.len() >= 2, "no way: {:?}", plan.points);
+        assert!(plan.cells <= crate::nav::MAN_CELLS);
+        for w in plan.points.windows(2) {
+            assert!(nav.walk_line(w[0], w[1]), "the leg {} -> {} is not walked straight", w[0], w[1]);
+        }
+        let crossing = plan.points.windows(2).find_map(|w| {
+            let (a, b) = (w[0], w[1]);
+            ((a.y - WALL_Z) * (b.y - WALL_Z) <= 0.0 && a.y != b.y).then(|| a.x + (b.x - a.x) * (WALL_Z - a.y) / (b.y - a.y))
+        });
+        let x = crossing.expect("the way crosses the wall's line");
+        assert!(x > TOWERS_X[3], "the way crosses the wall's line at x {x}, not round its east end");
+        let end = *plan.points.last().unwrap();
+        assert!(route.points.iter().any(|&q| nav.walk_line(end, q)), "the way's end {end} sees no point of the route");
+        route.ways = Some(vec![Arc::<[Vec2]>::from(plan.points.clone())].into());
+        let first = man_target(&nav, &route, frame, p, frame, None, 0);
+        assert!(!first.ask && nav.walk_line(p, first.at), "his first target {} is not in his reach", first.at);
+        let mut q = p;
+        let mut kept = Some(first.at);
+        let mut on_route = false;
+        for _ in 0..800 {
+            let aim = man_target(&nav, &route, frame, q, frame, kept, 0);
+            kept = Some(aim.at);
+            assert!(!aim.ask, "he asks again at {q}");
+            if route.points.contains(&aim.at) {
+                on_route = true;
+                break;
+            }
+            let next = q + (aim.at - q).clamp_length_max(1.0);
+            assert!(nav.walk_line(q, next), "a step from {q} to {next} crosses blocked ground");
+            q = next;
+        }
+        assert!(on_route, "he walked to {q} and never reached the route");
+    }
+
+    /// A man who can walk straight to a point of his regiment's route
+    /// follows it, with no way of his own and no ask.
+    #[test]
+    fn a_man_who_sees_his_route_asks_for_no_way() {
+        let terrain = crate::terrain::build_terrain(crate::terrain::MapKind::WallDebug);
+        let nav = NavGrid::build(&terrain).expect("Wall Debug has a grid");
+        let route = route_inside();
+        let frame = route.points[3];
+        let p = Vec2::new(70.0, -160.0);
+        let aim = man_target(&nav, &route, frame, p, frame, None, 0);
+        assert!(!aim.ask, "the man at {p} asks for a way");
+        assert!(nav.walk_line(p, aim.at));
     }
 }

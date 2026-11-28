@@ -100,10 +100,11 @@ pub(super) const CHARGE_SPEED_FRAC: f32 = 0.6;
 /// (15 m for a fighting regiment, 4 m on the approach; with his regiment
 /// focused on one target, its men, and any man within his threat distance
 /// coming at him), and a man still in formation notices a comrade of his
-/// regiment running to the fight within 6 m.
+/// regiment running to the fight within 6 m. An archer of a regiment on
+/// the wall with his bow in hand does neither.
 #[inline]
 pub(super) fn acquire(f: &Field, s: &mut Soldier, st: &mut Step) {
-    let Field { grid, press, engaged, focus, tick_seed, .. } = *f;
+    let Field { grid, press, engaged, focus, tick_seed, paths, wall_archers, .. } = *f;
     let i = s.i;
     let p = st.p;
     let gi = st.gi;
@@ -126,15 +127,29 @@ pub(super) fn acquire(f: &Field, s: &mut Soldier, st: &mut Step) {
     if far_look {
         *s.sight &= !SIGHT_GO_FAR;
     }
+    // An archer of a regiment on the wall, his bow in hand, keeps his
+    // place and shoots from it: he goes for no enemy he sees off the end
+    // of the walk or below it, nor after a comrade running. With his
+    // knife out he fights like any man.
+    let keeps_place = wall_archers[gi]
+        && st.my_kind == crate::unit_types::KIND_ARCHER as usize
+        && *s.sight & SIGHT_KNIFE == 0;
     if best_idx == u32::MAX
         && !dying
         && !routed
+        && !keeps_place
         && press[gi]
         && crowd < acquire_crowd_lim
         && far_look
     {
         let look = if engaged[gi] { seek_radius() } else { WIDE_ACQUIRE_R };
         let mut far_d2 = look * look;
+        // He goes for an enemy he can walk to straight: on a map with
+        // blocked ground not one behind a wall, on its walk above him or
+        // at its foot below, nor one across a cliff. Where nothing blocks
+        // the ground there is no grid and every enemy is one he can walk
+        // to.
+        let goes_to = |o: &crate::spatial::SortedUnit| paths.nav.is_none_or(|nav| nav.walk_line(p, o.xz()));
         if let Some(t) = focus[gi] {
             // His regiment fights one ordered target (sim/job.rs `focus`):
             // he looks for its men anywhere in his sight, and for any
@@ -154,7 +169,7 @@ pub(super) fn acquire(f: &Field, s: &mut Soldier, st: &mut Step) {
                         || (d2 < threat2
                             && closing > 0.0
                             && closing * closing > GOING_SPEED * GOING_SPEED * d2);
-                    if counts && d2 < far_d2 {
+                    if counts && d2 < far_d2 && goes_to(o) {
                         far_d2 = d2;
                         *s.target = o.idx;
                     }
@@ -166,7 +181,7 @@ pub(super) fn acquire(f: &Field, s: &mut Soldier, st: &mut Step) {
                     && (o.meta & crate::spatial::META_DYING) == 0;
                 if enemy {
                     let d2 = (p - o.xz()).length_squared();
-                    if d2 < far_d2 {
+                    if d2 < far_d2 && goes_to(o) {
                         far_d2 = d2;
                         *s.target = o.idx;
                     }
@@ -394,17 +409,15 @@ fn loose(f: &Field, s: &mut Soldier, st: &Step, out: &mut ChunkOut, shot: &crate
             + crate::arrows::AIM_HEIGHT * crate::unit_types::tallest(),
         aim.y,
     );
-    out.arrows.push(crate::arrows::ArrowSpawn {
-        pos: from,
-        vel: crate::arrows::solve_launch(
-            from,
-            to,
-            &blocks[team[i] as usize],
-            terrain,
-        ),
-        team: team[i],
-        group: group[i],
-    });
+    // No arc reaches the man without striking the ground, the wall or its
+    // battlements first: he lowers the bow and draws at another man.
+    let Some(vel) = crate::arrows::solve_launch(from, to, &blocks[team[i] as usize], terrain) else {
+        *s.quarry = u32::MAX;
+        *s.swing = crate::units::SWING_RECOVER;
+        *s.swing_t = crate::unit_types::missile::CANCEL_TICKS;
+        return;
+    };
+    out.arrows.push(crate::arrows::ArrowSpawn { pos: from, vel, team: team[i], group: group[i] });
     *s.ammo = s.ammo.saturating_sub(1);
     *s.swing = crate::units::SWING_RECOVER;
     // Reload: the M2TW volley cycle is animation-bound at
@@ -695,7 +708,8 @@ fn quarry_ok(
 /// men who keep theirs and the man still serves; else a new pick from
 /// his regiment's blocks (sim/job.rs `shoot_at`, `search_blocks`): a
 /// random living member, or in a search a random clear member, the
-/// nearest block first, a few tries a look and a look every few ticks.
+/// nearest block with such men first, a few tries a look and a look every
+/// few ticks.
 /// None: he waits with the bow down.
 #[inline]
 fn pick_quarry(
@@ -719,28 +733,52 @@ fn pick_quarry(
     };
     let keeps =
         crate::units::hash01((i as u32).wrapping_mul(0x9E37) ^ 0x1B3D) < KEEP_QUARRY_SHARE;
-    if keeps && quarry_ok(f, p, my_team, reach2, shot, blocks, *s.quarry) {
+    if keeps && quarry_ok(f, p, my_team, reach2, shot, blocks, *s.quarry) && can_hit(f, i, p, *s.quarry) {
         return Some(*s.quarry);
     }
     if !tick.wrapping_add((i as u32).wrapping_mul(7)).is_multiple_of(QUARRY_LOOK_TICKS) {
         return None;
     }
+    // His tries go round the blocks with men to try, nearest first: a
+    // block with no man left to shoot gives its tries to the next.
+    let list_of = |b: u32| -> &[u32] {
+        let b = b as usize;
+        if shot.search { &clear_members[b] } else { &target_members[b] }
+    };
+    let n_open = blocks.iter().filter(|&&b| !list_of(b).is_empty()).count();
+    if n_open == 0 {
+        return None;
+    }
     for k in 0..QUARRY_TRIES {
-        let b = blocks[k as usize % blocks.len()] as usize;
-        let list: &[u32] = if shot.search { &clear_members[b] } else { &target_members[b] };
-        if list.is_empty() {
+        let Some(list) = blocks.iter().map(|&b| list_of(b)).filter(|l| !l.is_empty()).nth(k as usize % n_open) else {
             continue;
-        }
+        };
         let h = crate::units::hash01(
             tick_seed
                 ^ (i as u32).wrapping_mul(0x7F4A_7C15).wrapping_add(k.wrapping_mul(0x2545_F491)),
         );
         let m = list[((h * list.len() as f32) as usize).min(list.len() - 1)];
-        if quarry_ok(f, p, my_team, reach2, shot, blocks, m) {
+        if quarry_ok(f, p, my_team, reach2, shot, blocks, m) && can_hit(f, i, p, m) {
             return Some(m);
         }
     }
     None
+}
+
+/// Whether archer `i` at `p` has an arc to man `m` as he stands
+/// (`arrows::solve_launch`): none for a man behind a wall, or under its
+/// battlements below him. He draws only at a man he can hit, or a slow
+/// archer in a crowd would plant his feet to draw at men he cannot reach,
+/// over and over. One launch solve a try.
+#[inline]
+fn can_hit(f: &Field, i: usize, p: Vec2, m: u32) -> bool {
+    let Field { terrain, pos_prev, kind, team, blocks, .. } = *f;
+    let m = m as usize;
+    let over = crate::unit_types::half_height(kind[i] as usize) + crate::arrows::LAUNCH_OVER_HEAD;
+    let from = Vec3::new(p.x, pos_prev[i].y + over, p.y);
+    let at = pos_prev[m].xz();
+    let to = Vec3::new(at.x, terrain.height_at(at.x, at.y) + crate::arrows::AIM_HEIGHT * crate::unit_types::tallest(), at.y);
+    crate::arrows::solve_launch(from, to, &blocks[team[i] as usize], terrain).is_some()
 }
 
 /// A waiting man's sidestep: in some one-second windows he steps toward

@@ -437,8 +437,9 @@ fn rebuild_beside_products(job: &mut TickJob) -> Instant {
             // And of every regiment under search, its clear men: no enemy in
             // his reach (soldier/mod.rs SIGHT_FOE, as of the last tick) and farther
             // than a shaft's reach from every block of the shooters' side that
-            // stands near his (job.rs `clear_blocks`). Ascending, so a kept pick
-            // is found by a binary search (soldier/fight.rs `quarry_ok`).
+            // stands near his on his level (job.rs `clear_blocks`, `ClearBlock`).
+            // Ascending, so a kept pick is found by a binary search
+            // (soldier/fight.rs `quarry_ok`).
             let clear_r = job::clear_reach();
             clear_members.resize_with(n_groups, Vec::new);
             for (g, members) in clear_members.iter_mut().enumerate() {
@@ -452,7 +453,8 @@ fn rebuild_beside_products(job: &mut TickJob) -> Instant {
                                 return false;
                             }
                             let p = Vec2::new(pos_prev[i].x, pos_prev[i].z);
-                            near.iter().all(|b| b.distance(p) > clear_r)
+                            let half = crate::unit_types::half_height(kind[i] as usize);
+                            near.iter().all(|b| b.clears(p, pos_prev[i].y - half, half, clear_r))
                         }));
                     }
                 }
@@ -495,9 +497,9 @@ fn integrate_chunks(job: &mut TickJob, terrain: &Terrain) {
         imposed_in, stood_in, quarry_in, pos_out, vel, yaw, yaw_prev, target, swing, swing_t, flash, death_t,
         ammo, out_form, sight, chain, way, pose, stuck, aim, imposed, stood, quarry, orders, anchors,
         reg_broken, press, moving, passing, stance, focus, engaged, contact, fight_point, fight_line,
-        melee_ticks, hold, threat, form_face, wall, charging, fat_speed, fat_nocharge, shoot_at, blocks,
+        melee_ticks, hold, wall_archers, threat, form_face, wall, charging, fat_speed, fat_nocharge, shoot_at, blocks,
         target_members, search_blocks, sidearm, clear_members, dead, at_edge, grid, events, arrow_spawns,
-        routes, nav, ..
+        way_asks, routes, nav, ..
     } = job;
     let team = &team[..];
     let death_t_in = &death_t_in[..];
@@ -525,6 +527,7 @@ fn integrate_chunks(job: &mut TickJob, terrain: &Terrain) {
         fight_line: &fight_line[..],
         melee_ticks: &melee_ticks[..],
         hold: &hold[..],
+        wall_archers: &wall_archers[..],
         threat: &threat[..],
         form_face: &form_face[..],
         wall: &wall[..],
@@ -584,7 +587,7 @@ fn integrate_chunks(job: &mut TickJob, terrain: &Terrain) {
             .zip(death_t.chunks_mut(CHUNK))
             .zip(events.iter_mut())
             .zip(ammo.chunks_mut(CHUNK))
-            .zip(arrow_spawns.iter_mut())
+            .zip(arrow_spawns.iter_mut().zip(way_asks.iter_mut()))
             .zip(out_form.chunks_mut(CHUNK))
             .zip(sight.chunks_mut(CHUNK))
             .zip(way.chunks_mut(CHUNK))
@@ -598,7 +601,7 @@ fn integrate_chunks(job: &mut TickJob, terrain: &Terrain) {
             .enumerate()
         {
             let (((((((((((((((((((((pos, vel), yaw), yaw_prev), target), swing), swing_t), flash),
-                death_t), events), ammo), arrows), out_form), sight), way), chain), pose), quarry), stuck), aim),
+                death_t), events), ammo), (arrows, asks)), out_form), sight), way), chain), pose), quarry), stuck), aim),
                 imposed), stood) = chunk;
             let start = ci * CHUNK;
             scope.spawn(async move {
@@ -627,7 +630,8 @@ fn integrate_chunks(job: &mut TickJob, terrain: &Terrain) {
                 };
                 ins.copy_into(&mut rows);
                 events.clear();
-                let mut out = soldier::ChunkOut { events, arrows };
+                asks.clear();
+                let mut out = soldier::ChunkOut { events, arrows, asks };
                 soldier::tick_chunk(f, rows, &mut out);
                 sweep_candidates(start, pos, death_t, team, edge_lo, edge_hi)
             });
@@ -792,7 +796,7 @@ pub fn step_sim(
     pipeline.sweep_candidates.sort_unstable();
     pipeline.sweep_candidates.dedup();
     std::mem::swap(&mut *grid, &mut job.grid);
-    routes.hand_back(&mut job.plans, &mut job.plan_requests);
+    routes.hand_back(&mut job.plans, &mut job.plan_requests, &mut job.way_asks);
     std::mem::swap(&mut damage.0, &mut job.events);
     std::mem::swap(&mut arrow_spawns.0, &mut job.arrow_spawns);
     stats.grid_ms = job.grid_ms;

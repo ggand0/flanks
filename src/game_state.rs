@@ -766,10 +766,16 @@ fn start_normal_battle(config: &mut BattleConfig, plan: &LaunchPlan, next: &mut 
 /// `LaunchPlan::autostart` a normal battle starts without a key press. A
 /// test battle from the menu leaves its scenario's env var set, and a
 /// later visit to the menu must not start it again.
+///
+/// With autostart, `FL_AUTOSTART_MAP=<name>` picks the battle's map as the
+/// menu's Map row picks it: the map is set and the terrain is rebuilt from
+/// the one the game opened on (`MapRebuild`, after this system), so a
+/// scripted run takes the path of a play that chose its map.
 fn launch_start(
     mut config: ResMut<BattleConfig>,
     plan: Res<LaunchPlan>,
     mut next: ResMut<NextState<GameState>>,
+    mut maps: MessageWriter<MapChanged>,
     mut done: Local<bool>,
 ) {
     if *done {
@@ -779,6 +785,12 @@ fn launch_start(
     if scripts_active() || Scenario::from_env() == Scenario::Demo {
         next.set(GameState::Battle);
     } else if plan.autostart {
+        if let Some(map) = std::env::var("FL_AUTOSTART_MAP").ok().and_then(|n| MapKind::named(&n))
+            && config.map != map
+        {
+            config.map = map;
+            maps.write(MapChanged(map));
+        }
         start_normal_battle(&mut config, &plan, &mut next);
     }
 }

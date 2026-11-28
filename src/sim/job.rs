@@ -53,11 +53,38 @@ pub(crate) struct ArcherScan {
     pub(crate) danger: Option<(f32, usize)>,
     pub(crate) best_free: Option<(f32, usize)>,
     pub(crate) busy: Vec<(f32, usize)>,
+    /// The search among the blocks in melee: how many of the nearest it
+    /// passes over, and the blocks it searched last (`bows_target`).
+    pub(crate) skip: usize,
+    pub(crate) window: Vec<u32>,
 }
 
 impl Default for ArcherScan {
     fn default() -> Self {
-        Self { tick: u32::MAX, danger: None, best_free: None, busy: Vec::new() }
+        Self { tick: u32::MAX, danger: None, best_free: None, busy: Vec::new(), skip: 0, window: Vec::new() }
+    }
+}
+
+/// A block of the shooters' side near a block under search
+/// (`clear_blocks_near`): its rectangle, and on a map with blocked ground
+/// its level, the ground under its men's centroid and its kind's half
+/// height. A man of the searched block is clear of it when he stands
+/// farther than a shaft's reach from the rectangle, or on another level
+/// (`soldier::levels_apart`): a shaft that comes down on a man at the
+/// foot of the wall comes down there, not on the walk above him.
+#[derive(Clone, Copy)]
+pub(crate) struct ClearBlock {
+    pub(crate) rect: crate::formation::BlockRect,
+    pub(crate) level: Option<(f32, f32)>,
+}
+
+impl ClearBlock {
+    /// A man standing at `p` on ground `ground`, `half` his half height,
+    /// is clear of this block.
+    #[inline]
+    pub(crate) fn clears(&self, p: Vec2, ground: f32, half: f32, reach: f32) -> bool {
+        self.rect.distance(p) > reach
+            || self.level.is_some_and(|(g, h)| crate::sim::soldier::levels_apart(ground - g, half, h))
     }
 }
 
@@ -168,6 +195,9 @@ pub struct TickJob {
     pub(crate) fight_line: Vec<f32>,
     pub(crate) melee_ticks: Vec<u32>,
     pub(crate) hold: Vec<bool>,
+    /// Per regiment: an archer regiment standing on the wall
+    /// (`wall_archers`): its men with their bows keep their places.
+    pub(crate) wall_archers: Vec<bool>,
     pub(crate) threat: Vec<Vec2>,
     pub(crate) form_face: Vec<Vec2>,
     pub(crate) wall: Vec<u8>,
@@ -179,7 +209,7 @@ pub struct TickJob {
     pub(crate) shoot_at: Vec<Option<ShootAt>>,
     /// Per regiment: under fire this tick (some regiment's bows aim at it).
     pub(crate) targeted: Vec<bool>,
-    pub(crate) blocks: [Vec<(Vec2, f32, f32)>; 2],
+    pub(crate) blocks: [Vec<crate::arrows::LoftBlock>; 2],
     pub(crate) faces_spearwall: [bool; 2],
     // Products of the run beyond the columns, all swapped into their
     // resources when the job is taken or installed.
@@ -193,9 +223,10 @@ pub struct TickJob {
     /// (`ShootAt::search`), so the job lists its clear men.
     pub(crate) searched: Vec<bool>,
     /// Per regiment under search: the blocks of the shooters' side
-    /// within a shaft's reach of it (`clear_reach`), as rectangles; the
-    /// clear men stand farther than that from every one of them.
-    pub(crate) clear_blocks: Vec<Vec<crate::formation::BlockRect>>,
+    /// within a shaft's reach of it (`clear_reach`), as rectangles with
+    /// their level; the clear men stand farther than that from every one
+    /// of them on their own level.
+    pub(crate) clear_blocks: Vec<Vec<ClearBlock>>,
     /// Per archer regiment: the enemy blocks its men search in, nearest
     /// first; empty when its bows have a plain target or none.
     pub(crate) search_blocks: Vec<Vec<u32>>,
@@ -230,6 +261,9 @@ pub struct TickJob {
     pub(crate) grid: SpatialGrid,
     pub(crate) events: Vec<Vec<DamageEvent>>,
     pub(crate) arrow_spawns: Vec<Vec<crate::arrows::ArrowSpawn>>,
+    /// Per chunk, its cut-off men's asks for a way (sim/route.rs `WayAsk`),
+    /// handed to the routes at the install.
+    pub(crate) way_asks: Vec<Vec<crate::sim::route::WayAsk>>,
     pub(crate) terrain: Option<std::sync::Arc<Terrain>>,
     pub(crate) dt: f32,
     pub(crate) combat_scale: f32,
@@ -341,10 +375,10 @@ struct FireSolutions {
     /// Per archer regiment: the blocks its men search in.
     search_blocks: Vec<Vec<u32>>,
     /// Per regiment under search: the shooters' blocks near it.
-    clear_blocks: Vec<Vec<crate::formation::BlockRect>>,
-    /// Friendly formed blocks per team as discs with a clearance ceiling,
+    clear_blocks: Vec<Vec<ClearBlock>>,
+    /// Friendly formed blocks per team with a clearance ceiling,
     /// for the loft-over-friendlies check.
-    blocks: [Vec<(Vec2, f32, f32)>; 2],
+    blocks: [Vec<crate::arrows::LoftBlock>; 2],
 }
 
 /// Fill `job` from the live world: the shared columns, the per-regiment
@@ -374,7 +408,9 @@ pub(crate) fn prepare_tick(
     let t0 = std::time::Instant::now();
     share_columns(job, units);
     let t1 = std::time::Instant::now();
-    skirmish_reactions(groups, tracks, terrain, tick);
+    let nav = routes.nav().cloned();
+    let on_wall = wall_archers(groups, terrain);
+    skirmish_reactions(groups, tracks, terrain, nav.as_deref(), &on_wall, tick);
     let t2 = std::time::Instant::now();
     open_for_passers(groups, terrain, tracks, tick);
     let t2b = std::time::Instant::now();
@@ -383,6 +419,8 @@ pub(crate) fn prepare_tick(
         groups,
         tracks,
         terrain,
+        &on_wall,
+        &job.searched,
         &job.clear_members,
         &mut job.archer_scans,
         kept_clear_blocks,
@@ -401,6 +439,9 @@ pub(crate) fn prepare_tick(
     if job.arrow_spawns.len() < n_chunks {
         job.arrow_spawns.resize_with(n_chunks, Vec::new);
     }
+    if job.way_asks.len() < n_chunks {
+        job.way_asks.resize_with(n_chunks, Vec::new);
+    }
     // Spawn buffers come back drained from arrows.rs. A job dropped as
     // stale never got that far.
     for buf in &mut job.arrow_spawns {
@@ -416,6 +457,7 @@ pub(crate) fn prepare_tick(
     job.blocks = fire.blocks;
     let last = std::mem::take(&mut job.sidearm);
     job.sidearm = sidearm_reasons(groups, tracks, terrain, &last, tick);
+    job.wall_archers = on_wall;
     job.field.size_to(terrain.min(), terrain.max());
     let t5 = std::time::Instant::now();
     log_prep([t1 - t0, t2 - t1, t2b - t2, t3 - t2b, t4 - t3, t5 - t4, t5 - t0]);
@@ -514,7 +556,9 @@ fn share_columns(job: &mut TickJob, units: &Units) {
 /// front rank stops this share of its range short of the target's near
 /// edge (`firing_place`), then it stands and shoots. It shoots on until
 /// the gap passes the range; the band between is the hysteresis that
-/// keeps a block from marching and halting by turns.
+/// keeps a block from marching and halting by turns. The place and the
+/// range are measured with one reach (`firing_place`), so the band is at
+/// least the rest of it, a fifth, against a target at any speed.
 const CLOSE_IN: f32 = 0.8;
 /// The time an enemy block takes to reach a regiment that counts as
 /// coming for it (seconds): the skirmish trigger and, with skirmish off,
@@ -544,6 +588,41 @@ fn gap_within(a: &GroupData, b: &GroupData, limit: f32) -> Option<f32> {
     Some(edge_gap(a, b))
 }
 
+/// Whether men of block `from` can walk straight to block `to`: the
+/// planner's straight line (`NavGrid::walk_line`) between the two blocks'
+/// nearest points is clear. Always where no ground blocks (no grid). A
+/// block at the foot of a wall cannot walk to one on its walk, though
+/// their edges may be a metre or two apart seen from above.
+fn walks_to(nav: Option<&crate::nav::NavGrid>, from: &GroupData, to: &GroupData) -> bool {
+    let Some(nav) = nav else { return true };
+    let (a, b) = (crate::formation::block_rect(from), crate::formation::block_rect(to));
+    let at = b.closest(a.centre);
+    nav.walk_line(a.closest(at), at)
+}
+
+/// How far the men of block `from` walk to block `to` (m), within `max`
+/// (`NavGrid::walk_gap` between points of the two blocks a cell apart),
+/// None beyond it. Where no ground blocks
+/// (no grid) the edge gap, when within `max`.
+fn walk_gap(nav: Option<&crate::nav::NavGrid>, from: &GroupData, to: &GroupData, max: f32) -> Option<f32> {
+    let Some(nav) = nav else { return Some(edge_gap(from, to)).filter(|&g| g <= max) };
+    let points = |gd: &GroupData| {
+        let r = crate::formation::block_rect(gd);
+        let (fwd, half_d) = if r.fwd == Vec2::ZERO { (Vec2::Y, r.half_w) } else { (r.fwd, r.half_d) };
+        let right = Vec2::new(fwd.y, -fwd.x);
+        let (nw, nd) = ((r.half_w / crate::terrain::CELL).ceil() as i32, (half_d / crate::terrain::CELL).ceil() as i32);
+        let mut out = Vec::with_capacity(((2 * nw + 1) * (2 * nd + 1)) as usize);
+        for a in -nw..=nw {
+            for b in -nd..=nd {
+                let (u, v) = (a as f32 / nw.max(1) as f32, b as f32 / nd.max(1) as f32);
+                out.push(r.centre + right * (u * r.half_w) + fwd * (v * half_d));
+            }
+        }
+        out
+    };
+    nav.walk_gap(&points(from), &points(to), max)
+}
+
 /// `edge_gap` between two blocks given as rectangles.
 fn rect_gap(a: &crate::formation::BlockRect, b: &crate::formation::BlockRect) -> f32 {
     let d = b.centre - a.centre;
@@ -565,9 +644,8 @@ fn bow_reach_standing(g: &GroupData, from: Vec2, t: &GroupData, terrain: &Terrai
 
 /// How far `g`'s bows reach toward `t` from `from` (metres): the
 /// standing reach plus three seconds of `t`'s speed toward `from` (the
-/// shafts land where the target will be). The range test's reach; the
-/// firing place does not follow the target's speed, or the regiment
-/// would walk back and forth with every change of it.
+/// shafts land where the target will be). The range test's reach, and
+/// the firing place's against a target going away (`firing_place`).
 fn bow_reach_toward(
     g: &GroupData,
     from: Vec2,
@@ -605,14 +683,22 @@ fn frame_in_bow_range(
 /// of its reach short of the target's near edge, kept inside the map.
 /// Every man walks to his slot about it, so no slot lies in the enemy
 /// and a column's head stops at the place like everyone else.
-fn firing_place(g: &GroupData, t: &GroupData, terrain: &Terrain) -> Vec2 {
+///
+/// The reach is the one the range test reads (`bow_reach_toward`) against
+/// a target going away, so the regiment closes in farther on it and the
+/// place stands the rest of that reach past CLOSE_IN, a fifth, inside the
+/// range whatever the target's speed. Against a target that stands or
+/// comes it is the standing
+/// reach: a target coming on does not move the place back through the
+/// regiment's own men.
+fn firing_place(g: &GroupData, t: &GroupData, t_vel: Vec2, terrain: &Terrain) -> Vec2 {
     let to_t = t.centroid - g.centroid;
     let dist = to_t.length();
     if dist < 1e-3 {
         return g.centroid;
     }
     let u = to_t / dist;
-    let reach = bow_reach_standing(g, g.centroid, t, terrain);
+    let reach = bow_reach_standing(g, g.centroid, t, terrain).min(bow_reach_toward(g, g.centroid, t, t_vel, terrain));
     let short = crate::formation::block_reach_along(t, -u)
         + (CLOSE_IN * reach).max(0.0)
         + crate::formation::block_rect(g).half_d;
@@ -1145,6 +1231,32 @@ pub(crate) fn end_skirmish(gd: &mut GroupData) {
     }
 }
 
+/// Per regiment: an archer regiment standing on the wall, on a map with
+/// the wall (`MapKind::has_wall`); false for every other. On the wall is
+/// on the walk's level: the ground under the centroid of its men stands
+/// over the drawn ground within a standing man's height of the walk's
+/// height (`levels_apart`), so the walk, a tower's passage, the
+/// gatehouse's top and the last metres of a stair count, and the ground,
+/// a house or a drum's roof do not. The centroid stands for the men: the
+/// walk is a strip 6 m wide, so the middle of a regiment standing on it
+/// is on it, and a regiment strung out up a stair counts once its middle
+/// is up. Two height reads per archer regiment per tick.
+fn wall_archers(groups: &Groups, terrain: &Terrain) -> Vec<bool> {
+    let walled = terrain.kind.has_wall();
+    groups
+        .list
+        .iter()
+        .map(|gd| {
+            walled && gd.kind == crate::unit_types::KIND_ARCHER && gd.count > 0 && {
+                let c = gd.centroid;
+                let over = terrain.height_at(c.x, c.y) - terrain.ground_at(c.x, c.y);
+                let half = crate::unit_types::half_height(gd.kind as usize);
+                !crate::sim::soldier::levels_apart(over - crate::town_layout::WALK, half, half)
+            }
+        })
+        .collect()
+}
+
 /// The skirmish reaction: an archer regiment in skirmish mode runs from
 /// an enemy block whose edge is on it (SKIRMISH_NEAR) or that is coming
 /// for it (`approach_hits` within the approach horizon, longer while it
@@ -1157,16 +1269,17 @@ pub(crate) fn end_skirmish(gd: &mut GroupData) {
 /// with skirmish off too, since that march is the game's own, not a
 /// point the player chose. Enemy men already in reach of the regiment's
 /// own men, with no real melee begun (the melee clock), are the block's
-/// leading men on it: a run. Hold position, skirmish off and a regiment
-/// in a real melee: no run.
+/// leading men on it: a run. Hold position, skirmish off, a regiment in a
+/// real melee and a regiment on the wall (`on_wall`): no run.
 fn skirmish_reactions(
     groups: &mut Groups,
     tracks: &crate::arrows::RegTracks,
     terrain: &Terrain,
+    nav: Option<&crate::nav::NavGrid>,
+    on_wall: &[bool],
     tick: u32,
 ) {
-    let n = groups.list.len();
-    for g in 0..n {
+    for (g, &up) in on_wall.iter().enumerate() {
         let gd = &groups.list[g];
         let bows = gd.kind == crate::unit_types::KIND_ARCHER
             && !gd.melee
@@ -1174,7 +1287,10 @@ fn skirmish_reactions(
             && !gd.state.is_broken()
             && !gd.hold
             && gd.melee_ticks == 0;
-        let able = bows && gd.skirmish;
+        // Archers on the wall (`wall_archers`) hold it: no run, whatever
+        // the skirmish switch says. The switch stays as the player set it,
+        // so the run comes back once the regiment is off the wall.
+        let able = bows && gd.skirmish && !up;
         let closing = bows
             && !gd.skirmishing
             && !gd.standoff
@@ -1200,7 +1316,7 @@ fn skirmish_reactions(
         if !tick.wrapping_add(g as u32).is_multiple_of(ARCHER_LOOK) {
             continue;
         }
-        let look = skirmish_look(groups, g, tracks, terrain, tick, able);
+        let look = skirmish_look(groups, g, tracks, terrain, nav, tick, able);
         skirmish_act(&mut groups.list[g], g, look);
     }
 }
@@ -1214,6 +1330,7 @@ fn skirmish_look(
     g: usize,
     tracks: &crate::arrows::RegTracks,
     terrain: &Terrain,
+    nav: Option<&crate::nav::NavGrid>,
     tick: u32,
     able: bool,
 ) -> SkirmishLook {
@@ -1261,12 +1378,17 @@ fn skirmish_look(
             }
             continue;
         }
-        if able && gap <= SKIRMISH_NEAR {
+        // Units on the wall do not run at all (`able`). For a unit on
+        // the ground an enemy counts as near by the way its men walk to
+        // the unit (`walk_gap`) and as coming only when it can walk to
+        // the unit straight (`walks_to`), so an enemy on the other side
+        // of a wall does not start a run.
+        if able && gap <= SKIRMISH_NEAR && walk_gap(nav, ed, gd, SKIRMISH_NEAR).is_some() {
             (run, why) = (true, "near");
             run_from = Some((gap, e as u32));
             continue;
         }
-        if able && approach_hits(gl, g, e, vel(e), horizon, cap) {
+        if able && approach_hits(gl, g, e, vel(e), horizon, cap) && walks_to(nav, ed, gd) {
             (run, why) = (true, "coming");
             run_from = Some((gap, e as u32));
             continue;
@@ -1358,28 +1480,34 @@ fn skirmish_act(gd: &mut GroupData, g: usize, look: SkirmishLook) {
 /// goes, to the firing place (`firing_place`, the march's goal through
 /// `Groups::goal`), stands when its leading men arrive there
 /// (`head_arrived`) and shoots; it marches again only when the frame it
-/// holds is out of range. Fire at will takes the nearest enemy block in range that is
+/// holds is out of range. A regiment on the wall (`on_wall`) makes no
+/// march: it keeps its places on the walk, shoots its target while that
+/// is in range, and shoots at will (when its fire at will is on) while it
+/// is not. Fire at will takes the nearest enemy block in range that is
 /// not in melee; when every block in range is in melee, or one is
 /// coming for the regiment, its men shoot the clear men of those blocks
 /// (`ShootAt::search`; the job lists them from `clear_blocks`, sim/mod.rs
 /// `clear_members`). Makes the regiment writes prep
 /// makes: the stand-off state with its anchor and march facing, the
 /// firing place, and the `firing` flag.
+#[allow(clippy::too_many_arguments)]
 fn archer_fire_solutions(
     groups: &mut Groups,
     tracks: &crate::arrows::RegTracks,
     terrain: &Terrain,
+    on_wall: &[bool],
+    last_searched: &[bool],
     clear_members: &[Vec<u32>],
     scans: &mut Vec<ArcherScan>,
-    kept_clear_blocks: Vec<Vec<crate::formation::BlockRect>>,
+    kept_clear_blocks: Vec<Vec<ClearBlock>>,
     tick: u32,
 ) -> FireSolutions {
     let n_groups = groups.list.len();
     scans.resize_with(n_groups, Default::default);
 
     // The stand-off of every archer regiment under an attack order.
-    for g in 0..n_groups {
-        stand_off(groups, g, tracks, terrain);
+    for (g, &up) in on_wall.iter().enumerate() {
+        stand_off(groups, g, tracks, terrain, up);
     }
 
     // What each archer regiment's bows shoot at this tick, and the blocks
@@ -1389,8 +1517,13 @@ fn archer_fire_solutions(
     // on the move).
     let gl: &Groups = &*groups;
     let mut search_blocks: Vec<Vec<u32>> = vec![Vec::new(); n_groups];
+    // A block whose clear men the last run listed, and found none.
+    let dry = |b: u32| {
+        let b = b as usize;
+        last_searched.get(b).copied().unwrap_or(false) && clear_members.get(b).is_none_or(|m| m.is_empty())
+    };
     let shoot_at: Vec<Option<ShootAt>> = (0..n_groups)
-        .map(|g| bows_target(gl, g, tracks, terrain, &mut scans[g], &mut search_blocks[g], tick))
+        .map(|g| bows_target(gl, g, tracks, terrain, on_wall[g], &dry, &mut scans[g], &mut search_blocks[g], tick))
         .collect();
     // The card's firing mark: a fire solution, arrows to spend on it and,
     // in a search, clear men to shoot (the lists of the last tick run).
@@ -1404,7 +1537,7 @@ fn archer_fire_solutions(
         groups.list[g].firing = has_men && groups.list[g].ammo_left > 0;
     }
     let (targeted, searched) = under_fire(&shoot_at, &search_blocks, n_groups);
-    let clear_blocks = clear_blocks_near(groups, &searched, kept_clear_blocks, tick);
+    let clear_blocks = clear_blocks_near(groups, terrain, &searched, kept_clear_blocks, tick);
     let blocks = loft_blocks(groups, terrain);
 
     FireSolutions {
@@ -1418,9 +1551,11 @@ fn archer_fire_solutions(
 }
 
 /// One regiment's stand-off: in range of its attack target it stands
-/// and shoots, out of range it marches to the firing place.
+/// and shoots, out of range it marches to the firing place. A regiment on
+/// the wall (`on_wall`) stands whatever the range: archers holding a wall
+/// keep their places on it.
 #[inline]
-fn stand_off(groups: &mut Groups, g: usize, tracks: &crate::arrows::RegTracks, terrain: &Terrain) {
+fn stand_off(groups: &mut Groups, g: usize, tracks: &crate::arrows::RegTracks, terrain: &Terrain, on_wall: bool) {
     let vel = |t: usize| tracks.vel.get(t).copied().unwrap_or(Vec2::ZERO);
     let gd = &groups.list[g];
     // With swords out the order is a charge like any infantry's.
@@ -1443,20 +1578,38 @@ fn stand_off(groups: &mut Groups, g: usize, tracks: &crate::arrows::RegTracks, t
         return;
     }
     let t_vel = vel(target as usize);
-    let place = firing_place(gd, td, terrain);
     let fresh = gd.standoff_target != Some(target);
+    if on_wall {
+        // It stands where it is, as a fresh order in range does: the
+        // frame freezes where the men stand, and nothing turns. Out of
+        // range its men shoot at will (`bows_target`).
+        if fresh || !gd.standoff {
+            info!(
+                "regiment {g} stands on the wall for its target {target} (gap {:.1} m, in range {})",
+                edge_gap(gd, td),
+                in_bow_range(gd, td, t_vel, terrain)
+            );
+        }
+        let gd = &mut groups.list[g];
+        if (fresh || !gd.standoff) && gd.anchor.distance(gd.centroid) > 2.0 {
+            gd.anchor = gd.centroid;
+        }
+        gd.standoff_target = Some(target);
+        gd.standoff = true;
+        gd.fire_place = None;
+        return;
+    }
+    let place = firing_place(gd, td, t_vel, terrain);
     let was = gd.standoff && !fresh;
     // A fresh order shoots where it stands when it can; a standing
     // regiment stands until the frame it holds is out of range; a
     // marching one halts where its leading men arrive at the firing
-    // place, which is in range by its construction.
-    let now = if fresh {
-        in_bow_range(gd, td, t_vel, terrain)
-    } else if was {
-        frame_in_bow_range(gd, gd.anchor, td, t_vel, terrain)
-    } else {
-        head_arrived(gd, place) && frame_in_bow_range(gd, place, td, t_vel, terrain)
-    };
+    // place, which is in range by its construction. A standing regiment
+    // whose frame is out of range while its leading men already stand at
+    // the place has no march to make: its frame steps on to the place.
+    let holds = was && frame_in_bow_range(gd, gd.anchor, td, t_vel, terrain);
+    let halts = !fresh && !holds && head_arrived(gd, place) && frame_in_bow_range(gd, place, td, t_vel, terrain);
+    let now = if fresh { in_bow_range(gd, td, t_vel, terrain) } else { holds || halts };
     let to_target = td.centroid - gd.centroid;
     if now != gd.standoff || fresh {
         let gap = edge_gap(gd, td);
@@ -1487,6 +1640,9 @@ fn stand_off(groups: &mut Groups, g: usize, tracks: &crate::arrows::RegTracks, t
         } else if gd.anchor.distance(gd.centroid) > 2.0 {
             gd.anchor = gd.centroid;
         }
+    } else if was && halts {
+        gd.anchor = place;
+        gd.reform = true;
     }
     if !now
         && (fresh || was)
@@ -1501,13 +1657,18 @@ fn stand_off(groups: &mut Groups, g: usize, tracks: &crate::arrows::RegTracks, t
 }
 
 /// What one archer regiment's bows shoot at this tick, and the blocks
-/// its men search in (`search_in`).
+/// its men search in (`search_in`). `on_wall`: the regiment stands on the
+/// wall (`wall_archers`). `dry`: a block the last run searched and found
+/// no clear man in.
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn bows_target(
     gl: &Groups,
     g: usize,
     tracks: &crate::arrows::RegTracks,
     terrain: &Terrain,
+    on_wall: bool,
+    dry: &impl Fn(u32) -> bool,
     scan: &mut ArcherScan,
     search_in: &mut Vec<u32>,
     tick: u32,
@@ -1537,6 +1698,11 @@ fn bows_target(
         *scan = ArcherScan::default();
     } else if scan.tick == u32::MAX || tick.wrapping_add(g as u32).is_multiple_of(ARCHER_LOOK)
     {
+        // A search whose blocks all had no clear man passes on to the
+        // next blocks in melee, farther out, at this look; one that found
+        // men keeps its blocks.
+        let window = std::mem::take(&mut scan.window);
+        let skip = if !window.is_empty() && window.iter().all(|&b| dry(b)) { scan.skip + window.len() } else { scan.skip };
         let mut danger: Option<(f32, usize)> = None;
         let mut best_free: Option<(f32, usize)> = None;
         let mut busy: Vec<(f32, usize)> = Vec::new();
@@ -1562,7 +1728,7 @@ fn bows_target(
                 best_free = Some((gap, e));
             }
         }
-        *scan = ArcherScan { tick, danger, best_free, busy };
+        *scan = ArcherScan { tick, danger, best_free, busy, skip, window };
     }
     let danger = scan.danger.filter(|&(_, e)| live(e));
     let best_free = scan.best_free.filter(|&(_, e)| live(e));
@@ -1572,6 +1738,31 @@ fn bows_target(
     // shoots that block, whatever its order and fire at will say,
     // unless a block is coming for it.
     let held = gd.skirmish_hold.map(|h| h as usize).filter(|&h| live(h));
+    // Fire at will: the block coming for the regiment, every man on it
+    // (with skirmish on, the run takes the regiment away before this);
+    // else the nearest block in range that is not in melee; else the men
+    // search the blocks in melee, nearest first, past those a search found
+    // no clear man in (`ArcherScan::skip`), from the nearest again once
+    // it has passed them all. Fire at will off (the scan is empty):
+    // nothing.
+    let mut skip = scan.skip;
+    let mut from_busy = false;
+    let mut at_will = |search_in: &mut Vec<u32>| -> Option<(usize, bool)> {
+        if let Some((_, e)) = danger {
+            Some((e, true))
+        } else if let Some((_, e)) = best_free {
+            Some((e, false))
+        } else {
+            busy.sort_by(|a, b| a.0.total_cmp(&b.0));
+            if skip >= busy.len() {
+                skip = 0;
+            }
+            let (_, e) = *busy.get(skip)?;
+            *search_in = busy.iter().skip(skip).take(SEARCH_BLOCKS).map(|&(_, e)| e as u32).collect();
+            from_busy = true;
+            Some((e, true))
+        }
+    };
     let (t, search) = match gd.order {
         _ if danger.is_none() && held.is_some() => {
             let h = held.unwrap_or_default();
@@ -1583,7 +1774,9 @@ fn bows_target(
         // The ordered target, once standing off, unless a block is
         // coming for the regiment: the men turn their bows on that
         // one first, whatever the order. At a block in melee the
-        // men shoot its clear members only.
+        // men shoot its clear members only. A regiment on the wall
+        // stands with its target out of range: its men shoot at will
+        // meanwhile.
         Some(crate::orders::Order::Attack(t))
             if gd.skirmish_hold.is_none() && danger.is_none() =>
         {
@@ -1591,30 +1784,20 @@ fn bows_target(
             if !gd.standoff || !live(t) {
                 return None;
             }
-            (t, gl.list[t].engaged)
-        }
-        // Fire at will: the block coming for the regiment, every
-        // man on it (with skirmish on, the run takes the regiment
-        // away before this); else the nearest block in range that
-        // is not in melee; else the men search the blocks in
-        // melee, nearest first. Fire at will off: nothing.
-        _ => {
-            if let Some((_, e)) = danger {
-                (e, true)
-            } else if let Some((_, e)) = best_free {
-                (e, false)
+            if on_wall && !in_bow_range(gd, &gl.list[t], vel(t), terrain) {
+                at_will(search_in)?
             } else {
-                busy.sort_by(|a, b| a.0.total_cmp(&b.0));
-                let (_, e) = *busy.first()?;
-                *search_in =
-                    busy.iter().take(SEARCH_BLOCKS).map(|&(_, e)| e as u32).collect();
-                (e, true)
+                (t, gl.list[t].engaged)
             }
         }
+        _ => at_will(search_in)?,
     };
     if search && search_in.is_empty() {
         search_in.push(t as u32);
     }
+    // The blocks in melee it searches now, for its next look.
+    scan.skip = if from_busy { skip } else { 0 };
+    scan.window = if from_busy { search_in.clone() } else { Vec::new() };
     let tg = &gl.list[t];
     Some(ShootAt {
         c: tg.centroid,
@@ -1652,10 +1835,11 @@ fn under_fire(shoot_at: &[Option<ShootAt>], search_blocks: &[Vec<u32>], n_groups
 #[inline]
 fn clear_blocks_near(
     groups: &Groups,
+    terrain: &Terrain,
     searched: &[bool],
-    kept_clear_blocks: Vec<Vec<crate::formation::BlockRect>>,
+    kept_clear_blocks: Vec<Vec<ClearBlock>>,
     tick: u32,
-) -> Vec<Vec<crate::formation::BlockRect>> {
+) -> Vec<Vec<ClearBlock>> {
     let n_groups = groups.list.len();
     // The blocks of the shooters' side within a shaft's reach of each
     // searched block, by the gap between the edges, as rectangles: a man
@@ -1666,11 +1850,14 @@ fn clear_blocks_near(
     // Broken blocks count too: the rectangle sits on the men's centroid.
     // Listed every ARCHER_LOOK ticks per searched block, staggered, and
     // kept between (the last tick's list, or none for a block newly
-    // under search).
+    // under search). On a map with blocked ground each with its level: a
+    // block on the wall above a man at its foot is not near him. One
+    // height read per block listed.
     let clear_r = clear_reach();
+    let levels = terrain.kind.has_blocked_ground();
     let mut kept = kept_clear_blocks;
     kept.resize_with(n_groups, Vec::new);
-    let clear_blocks: Vec<Vec<crate::formation::BlockRect>> = kept
+    let clear_blocks: Vec<Vec<ClearBlock>> = kept
         .into_iter()
         .enumerate()
         .map(|(e, old)| {
@@ -1689,37 +1876,44 @@ fn clear_blocks_near(
                         && fg.count > 0
                         && gap_within(fg, eg, clear_r).is_some_and(|gap| gap <= clear_r)
                 })
-                .map(crate::formation::block_rect)
+                .map(|fg| ClearBlock {
+                    rect: crate::formation::block_rect(fg),
+                    level: levels.then(|| {
+                        (
+                            terrain.height_at(fg.centroid.x, fg.centroid.y),
+                            crate::unit_types::half_height(fg.kind as usize),
+                        )
+                    }),
+                })
                 .collect()
         })
         .collect();
     clear_blocks
 }
 
-/// Each team's live formed regiments as discs with a clearance ceiling.
+/// Each team's live formed regiments as the loft test reads them.
 #[inline]
-fn loft_blocks(groups: &Groups, terrain: &Terrain) -> [Vec<(Vec2, f32, f32)>; 2] {
-    // Friendly blocks per team for the loft-over-friendlies check: every
-    // live formed regiment as a disc with a clearance ceiling. A
-    // shooter's own regiment is in here too — that is what makes rear
-    // ranks loft over their own front rank. The ceiling is 1.3 m over the
-    // heads at the disc's centre.
-    let ceiling = crate::unit_types::tallest() + 1.3;
-    let blocks: [Vec<(Vec2, f32, f32)>; 2] = [0u8, 1u8].map(|tm| {
+fn loft_blocks(groups: &Groups, terrain: &Terrain) -> [Vec<crate::arrows::LoftBlock>; 2] {
+    // Friendly blocks per team for the loft-over-friendlies check
+    // (arrows.rs `flat_clears`): every live formed regiment as the ground
+    // its men's bodies take up (its outer places and a body's hit radius
+    // past them), the ground under its centroid, its men's height and its
+    // rank pitch. A shooter's own regiment is in here too: that is what
+    // makes rear ranks loft over their own front rank, and a line one
+    // rank deep has nothing of its own before it.
+    [0u8, 1u8].map(|tm| {
         groups
             .list
             .iter()
             .filter(|g| g.team == tm && g.count > 0 && !g.state.is_broken())
-            .map(|g| {
-                (
-                    g.centroid,
-                    g.radius.max(3.0),
-                    terrain.height_at(g.centroid.x, g.centroid.y) + ceiling,
-                )
+            .map(|g| crate::arrows::LoftBlock {
+                rect: crate::formation::block_rect_with(g, g.centroid, crate::arrows::HIT_RADIUS),
+                floor: terrain.height_at(g.centroid.x, g.centroid.y),
+                head: 2.0 * crate::unit_types::half_height(g.kind as usize),
+                rank: crate::formation::grid(g).2.y,
             })
             .collect()
-    });
-    blocks
+    })
 }
 
 /// How far a shaft aimed at a man can come down from him: the corner of
@@ -1733,10 +1927,37 @@ pub(crate) fn clear_reach() -> f32 {
         + crate::arrows::STRIKE_MARGIN
 }
 
+/// Whether enemy block `e` stands on the level of archer block `a` where
+/// it comes nearest them: the ground at `e`'s point nearest `a` within a
+/// standing man's height of the ground under `a`'s men (`levels_apart`).
+/// `a`'s level is the ground under its men's centroid, since a block on
+/// the walk is drawn deeper than the walk's 6 m and its edge lies over the
+/// parapet or the air past the wall's face. `e`'s point is read where it
+/// is a floor a man stands on, else (a wall's face, a drum, a parapet,
+/// which a block pressed against the wall reaches into) the ground under
+/// `e`'s centroid answers. On a map with no blocked ground there is one
+/// level, and nothing is read. Up to three height reads per pair within
+/// the knife distance.
+fn on_level_of(terrain: &Terrain, a: &GroupData, e: &GroupData) -> bool {
+    if !terrain.kind.has_blocked_ground() {
+        return true;
+    }
+    let (ra, re) = (crate::formation::block_rect(a), crate::formation::block_rect(e));
+    let q = re.closest(ra.closest(re.centre));
+    let floor_e = if terrain.blocked_at(q.x, q.y) {
+        terrain.height_at(e.centroid.x, e.centroid.y)
+    } else {
+        terrain.height_at(q.x, q.y)
+    };
+    let floor_a = terrain.height_at(a.centroid.x, a.centroid.y);
+    let half = |gd: &GroupData| crate::unit_types::half_height(gd.kind as usize);
+    !crate::sim::soldier::levels_apart(floor_e - floor_a, half(a), half(e))
+}
+
 /// Why each archer regiment's men take their knives out this tick
 /// (`Sidearm`): its swords-out order, an enemy block in bow range for the
 /// men with empty quivers, and the unbroken enemy blocks within the knife
-/// distance of its own block. The gap between two blocks along the line
+/// distance of its own block on its level (`on_level_of`). The gap between two blocks along the line
 /// between their centres is never more than the distance between any man
 /// of one and any point of the other, so no block left out is within the
 /// knife distance of a man inside his block. A man outside it is
@@ -1778,7 +1999,10 @@ fn sidearm_reasons(
                 let Some(gap) = gap_within(gd, eg, scope) else {
                     continue;
                 };
-                if gap <= crate::sim::soldier::KNIFE_EDGE {
+                // A block on his level (`on_level_of`): an enemy at the
+                // foot of the wall he stands on cannot come at him in a bow
+                // draw, one that has climbed onto the walk can.
+                if gap <= crate::sim::soldier::KNIFE_EDGE && on_level_of(terrain, gd, eg) {
                     arm.blocks.push(crate::formation::block_rect(eg));
                 }
                 arm.foe_in_range = arm.foe_in_range
@@ -1979,7 +2203,90 @@ mod tests {
         Groups { list: vec![gd] }
     }
 
-    /// On the wall walk the block stands five ranks deep at the lane's
+    /// An archer regiment's firing place stands a fifth of the reach the
+    /// range test reads inside that range, against a target that stands
+    /// and against one going away at a walk, a run and a rout's pace: the
+    /// halt there never stands at the range's edge.
+    #[test]
+    fn the_firing_place_stands_inside_the_range_at_any_target_speed() {
+        let terrain = build_terrain(MapKind::Grassland);
+        let g = holder(Vec2::ZERO, Vec2::ZERO);
+        let mut t = GroupData::new(1, crate::unit_types::KIND_HEAVY, Vec2::new(0.0, 300.0), 200);
+        t.shape = FormShape::Rect;
+        t.files = 50;
+        t.facing = facing_of(Vec2::Y);
+        t.centroid = Vec2::new(0.0, 300.0);
+        for away in [0.0f32, 2.0, 4.0, 7.5] {
+            let t_vel = Vec2::new(0.0, away);
+            let place = firing_place(&g, &t, t_vel, &terrain);
+            let gap = rect_gap(&crate::formation::block_rect_at(&g, place), &crate::formation::block_rect(&t));
+            let reach = bow_reach_toward(&g, place, &t, t_vel, &terrain);
+            assert!(frame_in_bow_range(&g, place, &t, t_vel, &terrain), "in range at {away} m/s");
+            assert!(
+                (reach - gap - (1.0 - CLOSE_IN) * reach).abs() < 0.05 * reach,
+                "target going away at {away} m/s: gap {gap} m of a reach of {reach} m"
+            );
+        }
+        // A target coming on leaves the place where a standing one has it.
+        let still = firing_place(&g, &t, Vec2::ZERO, &terrain);
+        assert_eq!(firing_place(&g, &t, Vec2::new(0.0, -4.0), &terrain), still);
+    }
+
+    /// An enemy block at the foot of the wall below archers on its walk
+    /// is not on their level, pressed against the face or not; one that
+    /// has climbed onto the walk is.
+    #[test]
+    fn the_knife_counts_an_enemy_on_the_walk_not_one_at_its_foot() {
+        let terrain = build_terrain(MapKind::WallDebug);
+        let z = crate::town_layout::WALL_Z;
+        let archers = holder(Vec2::new(120.0, z), Vec2::new(120.0, z));
+        let enemy = |at: Vec2, men: usize, files: u32| {
+            let mut e = GroupData::new(1, crate::unit_types::KIND_HEAVY, at, men);
+            e.shape = FormShape::Rect;
+            e.files = files;
+            e.facing = facing_of(-Vec2::Y);
+            e.centroid = at;
+            e
+        };
+        for foot in [z + 18.0, z + 13.0, z + 11.0] {
+            let e = enemy(Vec2::new(120.0, foot), 300, 26);
+            assert!(!on_level_of(&terrain, &archers, &e), "an enemy about z = {foot} at the foot counts");
+        }
+        let e = enemy(Vec2::new(100.0, z), 20, 10);
+        assert!(on_level_of(&terrain, &archers, &e), "an enemy on the walk does not count");
+    }
+
+    /// A man at the foot of the wall below archers on its walk is clear of
+    /// their block, however near it on the map; a man on the walk beside
+    /// them is not, nor is one near a friendly block on the ground.
+    #[test]
+    fn a_block_on_the_wall_is_not_near_a_man_at_its_foot() {
+        let terrain = build_terrain(MapKind::WallDebug);
+        let z = crate::town_layout::WALL_Z;
+        let archers = holder(Vec2::new(120.0, z), Vec2::new(120.0, z));
+        let mut e = GroupData::new(1, crate::unit_types::KIND_HEAVY, Vec2::new(120.0, z + 15.0), 300);
+        e.shape = FormShape::Rect;
+        e.files = 26;
+        e.facing = facing_of(-Vec2::Y);
+        e.centroid = Vec2::new(120.0, z + 15.0);
+        let mut friend = GroupData::new(0, crate::unit_types::KIND_HEAVY, Vec2::new(120.0, z + 32.0), 200);
+        friend.shape = FormShape::Rect;
+        friend.files = 20;
+        friend.facing = facing_of(-Vec2::Y);
+        friend.centroid = Vec2::new(120.0, z + 32.0);
+        let groups = Groups { list: vec![archers, e, friend] };
+        let near = clear_blocks_near(&groups, &terrain, &[false, true, false], Vec::new(), 0);
+        assert_eq!(near[1].len(), 2, "both blocks of the shooters' side are within reach on the map");
+        let (r, half) = (clear_reach(), crate::unit_types::half_height(crate::unit_types::KIND_HEAVY as usize));
+        let at_foot = Vec2::new(120.0, z + 6.0);
+        let ground = terrain.height_at(at_foot.x, at_foot.y);
+        assert!(near[1][0].clears(at_foot, ground, half, r), "the archers' block on the walk is near a man at its foot");
+        assert!(!near[1][0].clears(at_foot, ground + crate::town_layout::WALK, half, r), "a man on the walk's level is clear");
+        let by_friend = Vec2::new(120.0, z + 22.0);
+        assert!(!near[1][1].clears(by_friend, terrain.height_at(by_friend.x, by_friend.y), half, r));
+    }
+
+    /// On the wall walk the block stands six ranks deep at the lane's
     /// pitch, its front face on the parapet and its rear face at the
     /// kerb: no layout that grows the block fits, wherever its men are.
     #[test]

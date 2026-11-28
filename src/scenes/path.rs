@@ -29,6 +29,44 @@
 //!   where the blocked ground begins. The archers' skirmish is off, as a
 //!   player sets it to hold a wall: the skirmish rule measures the
 //!   enemy's distance straight through the wall.
+//! - `FL_TEST_PATH=walls_rout` with `FL_MAP=walled_town` or
+//!   `FL_MAP=wall_debug`: the archers' scene, and once the archers stand
+//!   on the walk their regiment breaks: its men flee for their map edge,
+//!   off the walk by a stair. The ten-second lines count them on the walk.
+//! - `FL_TEST_PATH=walls_assault` with `FL_MAP=walled_town` or
+//!   `FL_MAP=wall_debug`: the archers' scene with their skirmish on, as a
+//!   player has it, a regiment of 200 on the ground at the wall's inner
+//!   foot, where the player's army deploys on these maps, and two enemy
+//!   regiments of 300 on the slope, given once the archers stand on the
+//!   walk the attack orders the enemy's AI gives (ai.rs `ai_think`): one
+//!   on the archers, one on the regiment at the foot. Every five seconds
+//!   the log has each enemy regiment's order and melee state, its men
+//!   within 2.5 m of the wall's outer face, how many of them stand and
+//!   the first five who do with their targets, its men with a target, and
+//!   the archers' run, stand, men on the walk and men with the knife out.
+//!   The archers' scene logs the same lines.
+//! - `FL_TEST_PATH=walls_cutoff` with `FL_MAP=walled_town` or
+//!   `FL_MAP=wall_debug`: a regiment of 120 inside the town east of the
+//!   gate given a line on the walk between the two towers east of the
+//!   stair, which it climbs by the stair at x = 108. Once its route is
+//!   planned from inside, every other man of it stands outside the wall,
+//!   2 m to 4.4 m out from its outer face between those towers' drums
+//!   (`CUTOFF_FACE`): men cut off from their regiment's route, as men left
+//!   outside when their regiment went round the wall and planned again
+//!   from inside. Every five seconds the log has the regiment's men
+//!   outside the wall, within 2.5 m of its outer face and how many of them
+//!   stand, inside the town and on the walk.
+//! - `FL_TEST_PATH=walls_tower` with `FL_MAP=walled_town` or
+//!   `FL_MAP=wall_debug`: 40 archers behind the wall given a line in the
+//!   passage of the east end tower (x 144 to 160), fire at will on; on the
+//!   ground outside, a regiment of 200 of theirs ordered to attack an
+//!   enemy regiment of 300 that holds at the tower's foot, so the two
+//!   fight pressed against the drum below the archers; and an enemy
+//!   regiment of 300 holding 40 m out, south-east of the passage's open
+//!   end. Every five seconds the log has the arrows the archers' side has
+//!   loosed so far, the archers alive and on the walk, with the knife out,
+//!   and per other regiment its men alive, and the enemy men within 3 m of
+//!   the drum's outer side with how many of them stand.
 //! - `FL_TEST_PATH=walls_place` with `FL_MAP=walled_town` or
 //!   `FL_MAP=wall_debug`: placing units on the walk from the plateau behind
 //!   the wall (through the town's streets on the walled town). 200 archers
@@ -110,6 +148,26 @@ const MANY_REGS: usize = 200;
 const WALK_MEN: usize = 40;
 /// Where the archers' target stands: on the slope 70 m out from the wall.
 const ARCHERS_TARGET: Vec2 = Vec2::new(60.0, crate::town_layout::WALL_Z + 70.0);
+/// The tower scene (`walls_tower`): the archers' start behind the wall
+/// west of the stair that climbs to the east curtain, their line in the
+/// east end tower's passage, the enemy regiment at the drum's outer foot,
+/// the archers' side's regiment that attacks it from the plain, and the
+/// enemy regiment 40 m out from the passage's open end.
+const TOWER_ARCHERS_START: Vec2 = Vec2::new(100.0, crate::town_layout::WALL_Z - 20.0);
+const TOWER_LINE: (f32, f32) = (146.0, 158.0);
+const TOWER_FOOT: Vec2 = Vec2::new(crate::town_layout::TOWERS_X[3], crate::town_layout::WALL_Z + 18.0);
+const TOWER_FRIEND: Vec2 = Vec2::new(crate::town_layout::TOWERS_X[3], crate::town_layout::WALL_Z + 42.0);
+const TOWER_FAR: Vec2 = Vec2::new(190.0, crate::town_layout::WALL_Z + 30.0);
+/// The cut-off scene (`walls_cutoff`): its regiment's start inside the
+/// town, its line on the walk (x from, x to), and the stretch of the wall's
+/// outer face (x from, x to) its cut-off half stands at.
+const CUTOFF_START: Vec2 = Vec2::new(110.0, crate::town_layout::WALL_Z - 45.0);
+const CUTOFF_LINE: (f32, f32) = (96.0, 136.0);
+const CUTOFF_FACE: (f32, f32) = (90.0, 142.0);
+const CUTOFF_MEN: usize = 120;
+/// The assault scene's ground regiment: at the wall's inner foot west of
+/// the archers' stretch, its front 10 m behind the wall's line.
+const ASSAULT_FOOT: Vec2 = Vec2::new(0.0, crate::town_layout::WALL_Z - 20.0);
 /// Seconds after the order a regiment has to arrive before it fails,
 /// on every scene but the crossing (`timeout_s`).
 const TIMEOUT_S: f32 = 180.0;
@@ -190,6 +248,12 @@ struct PathTest {
     /// The walls scene's second order, given once its regiment's first
     /// has its verdict: the regiment, the case and the line.
     then: Option<(usize, &'static str, (Vec2, Vec2))>,
+    /// The assault scene's attack order, once given.
+    assault_given: bool,
+    /// The rout scene's break has been made.
+    rout_given: bool,
+    /// The cut-off scene's half has been set outside the wall.
+    cutoff_set: bool,
 }
 
 /// The longest frame in the current second and since the orders.
@@ -238,7 +302,8 @@ pub fn spawn(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
     // The wall scenes run on either map with the wall.
     let wanted_map = match scene.as_str() {
         "river" => Some(crate::terrain::MapKind::River),
-        "walls" | "walls_archers" | "walls_place" | "walls_under" | "walls_cross" | "walls_long" | "walls_two_long" => None,
+        "walls" | "walls_archers" | "walls_assault" | "walls_cutoff" | "walls_rout" | "walls_place" | "walls_under" | "walls_cross"
+        | "walls_long" | "walls_two_long" | "walls_tower" => None,
         _ => Some(crate::terrain::MapKind::Obstacles),
     };
     match wanted_map {
@@ -304,11 +369,44 @@ pub fn spawn(units: &mut Units, terrain: &Terrain, groups: &mut Groups) {
                 list[1].skirmish = false;
             }
         }
-        "walls_archers" => {
+        "walls_archers" | "walls_rout" => {
             crate::regiments::spawn_regiment(units, terrain, &mut list, 0, KIND_ARCHER, spots::PLAZA, 60, -1.0);
             crate::regiments::spawn_regiment(units, terrain, &mut list, 1, KIND_HEAVY, ARCHERS_TARGET, 300, 1.0);
             list[0].skirmish = false;
             list[1].hold = true;
+            if scene == "walls_rout" {
+                // A regiment of the archers' army far behind the town, so
+                // the archers' break does not end the battle.
+                crate::regiments::spawn_regiment(units, terrain, &mut list, 0, KIND_HEAVY, spots::BEHIND_TOWN, 40, -1.0);
+                list[2].hold = true;
+            }
+        }
+        "walls_tower" => {
+            crate::regiments::spawn_regiment(units, terrain, &mut list, 0, KIND_ARCHER, TOWER_ARCHERS_START, 40, -1.0);
+            crate::regiments::spawn_regiment(units, terrain, &mut list, 0, KIND_HEAVY, TOWER_FRIEND, 200, -1.0);
+            crate::regiments::spawn_regiment(units, terrain, &mut list, 1, KIND_HEAVY, TOWER_FOOT, 300, 1.0);
+            crate::regiments::spawn_regiment(units, terrain, &mut list, 1, KIND_HEAVY, TOWER_FAR, 300, 1.0);
+            // The fight faces across the foot: the friend north at the
+            // enemy, the enemy south at it, its back to the drum.
+            list[1].facing = std::f32::consts::PI;
+            list[2].facing = 0.0;
+            list[2].hold = true;
+            list[3].hold = true;
+            for (g, gd) in list.iter_mut().enumerate().skip(1) {
+                crate::formation::assign_slots(units, g as u32, gd);
+            }
+        }
+        "walls_cutoff" => {
+            crate::regiments::spawn_regiment(units, terrain, &mut list, 0, KIND_HEAVY, CUTOFF_START, CUTOFF_MEN, -1.0);
+        }
+        "walls_assault" => {
+            crate::regiments::spawn_regiment(units, terrain, &mut list, 0, KIND_ARCHER, spots::PLAZA, 60, -1.0);
+            crate::regiments::spawn_regiment(units, terrain, &mut list, 1, KIND_HEAVY, ARCHERS_TARGET, 300, 1.0);
+            // A regiment on the ground at the wall's inner foot, where the
+            // player's army deploys on these maps (regiments.rs
+            // `army_lines`), and an enemy regiment for it.
+            crate::regiments::spawn_regiment(units, terrain, &mut list, 0, KIND_HEAVY, ASSAULT_FOOT, 200, -1.0);
+            crate::regiments::spawn_regiment(units, terrain, &mut list, 1, KIND_HEAVY, ARCHERS_TARGET + Vec2::new(-60.0, 0.0), 300, 1.0);
         }
         _ => {
             for case in CASES.iter().filter(|c| scene == "all" || c.name == scene) {
@@ -345,8 +443,26 @@ fn give_orders(
     mut units: ResMut<Units>,
     mut test: ResMut<PathTest>,
     terrain: Res<Terrain>,
+    routes: Res<crate::sim::route::Routes>,
 ) {
     let _tick_log = crate::frame_log::tick::time(crate::frame_log::tick::Part::PathOrders);
+    // The cut-off scene: once its regiment's route is planned from inside,
+    // every other man of it outside the wall.
+    if test.ordered && !test.cutoff_set && scene().as_deref() == Some("walls_cutoff") && routes.route_of(0).is_some() {
+        test.cutoff_set = true;
+        let half: Vec<usize> = (0..units.len()).filter(|&i| units.group[i] == 0 && units.death_t[i] == 0).step_by(2).collect();
+        let per_row = half.len().div_ceil(3);
+        let pitch = (CUTOFF_FACE.1 - CUTOFF_FACE.0) / per_row.max(1) as f32;
+        for (k, &i) in half.iter().enumerate() {
+            let x = CUTOFF_FACE.0 + (k % per_row) as f32 * pitch;
+            let z = crate::town_layout::WALL_Z + 6.0 + (k / per_row) as f32 * 1.2;
+            let y = terrain.height_at(x, z) + crate::unit_types::half_height(units.kind[i] as usize);
+            units.pos[i] = Vec3::new(x, y, z);
+            units.pos_prev[i] = units.pos[i];
+            units.vel[i] = Vec3::ZERO;
+        }
+        info!("[path-test] tick {}: {} men of regiment 0 set outside the wall", pipeline.tick, half.len());
+    }
     // The second order of a regiment whose first has its verdict.
     if let Some((g, case, line)) = test.then
         && test.subjects.iter().any(|s| s.g == g && s.reported)
@@ -355,6 +471,29 @@ fn give_orders(
         info!("[path-test] tick {}: {case} ordered", pipeline.tick);
         crate::orders::line_order(&mut groups, &terrain, &[g], line.0, line.1);
         order(&mut groups, &mut units, &terrain, &mut test, pipeline.tick, g, case, None);
+    }
+    // The assault scene's attack, once the archers' line has its verdict:
+    // the order the enemy's AI gives an idle regiment, on the nearest
+    // player regiment.
+    if test.ordered
+        && !test.assault_given
+        && scene().as_deref() == Some("walls_assault")
+        && test.subjects.iter().any(|s| s.g == 0 && s.reported)
+    {
+        test.assault_given = true;
+        groups.list[1].order = Some(Order::Attack(0));
+        groups.list[3].order = Some(Order::Attack(2));
+        info!("[path-test] tick {}: assault ordered, regiment 1 attacks regiment 0, regiment 3 regiment 2", pipeline.tick);
+    }
+    // The rout scene's break, once the archers' line has its verdict.
+    if test.ordered
+        && !test.rout_given
+        && scene().as_deref() == Some("walls_rout")
+        && test.subjects.iter().any(|s| s.g == 0 && s.reported)
+    {
+        test.rout_given = true;
+        groups.list[0].state = crate::orders::RegState::Shattered;
+        info!("[path-test] tick {}: regiment 0 breaks on the walk", pipeline.tick);
     }
     if test.ordered || pipeline.tick < ORDER_TICK || groups.list.is_empty() {
         return;
@@ -408,12 +547,26 @@ fn give_orders(
                 }
             }
         }
-        "walls_archers" => {
+        "walls_tower" => {
+            let z = crate::town_layout::WALL_Z;
+            crate::orders::line_order(&mut groups, &terrain, &[0], Vec2::new(TOWER_LINE.0, z), Vec2::new(TOWER_LINE.1, z));
+            order(&mut groups, &mut units, &terrain, &mut test, pipeline.tick, 0, "tower-archers", None);
+            groups.list[1].order = Some(Order::Attack(2));
+            info!("[path-test] tick {}: regiment 1 attacks regiment 2 at the tower's foot", pipeline.tick);
+        }
+        "walls_cutoff" => {
+            let z = crate::town_layout::WALL_Z;
+            crate::orders::line_order(&mut groups, &terrain, &[0], Vec2::new(CUTOFF_LINE.0, z), Vec2::new(CUTOFF_LINE.1, z));
+            order(&mut groups, &mut units, &terrain, &mut test, pipeline.tick, 0, "walls-cutoff", None);
+        }
+        "walls_archers" | "walls_assault" | "walls_rout" => {
             // 50 m: two ranks at the walk's pitch.
             let c = spots::WALK_EAST - Vec2::new(80.0, 0.0);
             crate::orders::line_order(&mut groups, &terrain, &[0], c - Vec2::new(25.0, 0.0), c + Vec2::new(25.0, 0.0));
             order(&mut groups, &mut units, &terrain, &mut test, pipeline.tick, 0, "walls-archers", None);
-            orders.push((1, "walls-foot", ARCHERS_TARGET.with_y(crate::town_layout::WALL_Z + 12.0)));
+            if scene != "walls_assault" {
+                orders.push((1, "walls-foot", ARCHERS_TARGET.with_y(crate::town_layout::WALL_Z + 12.0)));
+            }
         }
         "walls" => {
             // A drag along the walk: the walk's own places, facing out.
@@ -499,12 +652,14 @@ fn order(
 
 /// Every two seconds: per regiment, the share arrived and the men stuck;
 /// a verdict line when it has arrived or timed out, and a summary.
+#[allow(clippy::too_many_arguments)] // bevy system params
 fn log_progress(
     pipeline: Res<crate::sim::TickPipeline>,
     groups: Res<Groups>,
     units: Res<Units>,
     routes: Res<crate::sim::route::Routes>,
     terrain: Res<Terrain>,
+    arrow_stats: Res<crate::arrows::ArrowStats>,
     mut test: ResMut<PathTest>,
     mut frames: ResMut<FrameWatch>,
 ) {
@@ -529,6 +684,15 @@ fn log_progress(
     let walls = scene.starts_with("walls");
     let walk_lane = walls.then(|| crate::town_layout::walk_lane(terrain.body_radius()));
     let ten_s = tick.is_multiple_of(300);
+    if matches!(scene.as_str(), "walls_assault" | "walls_archers" | "walls_rout") && tick.is_multiple_of(150) && groups.list.len() > 1 {
+        log_assault(&groups, &units, &terrain, secs);
+    }
+    if scene == "walls_cutoff" && tick.is_multiple_of(150) && !groups.list.is_empty() {
+        log_cutoff(&groups, &units, &terrain, secs);
+    }
+    if scene == "walls_tower" && tick.is_multiple_of(150) && groups.list.len() > 3 {
+        log_tower(&groups, &units, &terrain, &arrow_stats, secs);
+    }
     // On the wall scenes the ten-second lines go on after the verdict, for
     // the latest subject of each regiment only (the walls scene orders its
     // first regiment twice).
@@ -728,9 +892,8 @@ fn log_progress(
                     let slot = slots_at + units.home[i];
                     let aim = match (&view, routes.nav()) {
                         (Some(r), Some(nav)) => {
-                            let (t, through) =
-                                crate::sim::route::man_target(nav, &terrain, r, slots_at, p, slot, i);
-                            format!("aims ({:.1}, {:.1}){}", t.x, t.y, if through { " fast" } else { "" })
+                            let aim = crate::sim::route::man_target(nav, r, slots_at, p, slot, None, i);
+                            format!("aims ({:.1}, {:.1}){}", aim.at.x, aim.at.y, if aim.through { " fast" } else { "" })
                         }
                         _ => "no route".into(),
                     };
@@ -811,6 +974,132 @@ struct Tally {
     stuck: usize,
     walk: usize,
     never: usize,
+}
+
+/// The assault scene's five-second lines (the module docs): one per enemy
+/// regiment of the scene (the path test's far holder, the last regiment,
+/// left out), then the archers'.
+fn log_assault(groups: &Groups, units: &Units, terrain: &Terrain, secs: f32) {
+    let face = crate::town_layout::WALL_Z + 4.0;
+    let n = groups.list.len().saturating_sub(1);
+    for g in (0..n).filter(|&g| groups.list[g].team == 1) {
+        let e = &groups.list[g];
+        let (mut at_face, mut still, mut in_reach) = (0usize, 0usize, 0usize);
+        let mut seen = Vec::new();
+        for i in (0..units.len()).filter(|&i| units.death_t[i] == 0 && units.group[i] as usize == g) {
+            let p = Vec2::new(units.pos[i].x, units.pos[i].z);
+            if p.y >= face && p.y < face + 2.5 {
+                at_face += 1;
+                let standing = Vec2::new(units.vel[i].x, units.vel[i].z).length() < 0.3;
+                still += usize::from(standing);
+                if standing && seen.len() < 5 {
+                    let t = units.target[i] as usize;
+                    let aim = if t < units.len() {
+                        format!("target {t} at ({:.1}, {:.1}) {:+.1} m up", units.pos[t].x, units.pos[t].z, units.pos[t].y - units.pos[i].y)
+                    } else {
+                        "no target".into()
+                    };
+                    seen.push(format!("({:.1}, {:.1}) out {} {aim}", p.x, p.y, units.out_form[i]));
+                }
+            }
+            in_reach += usize::from((units.target[i] as usize) < units.len());
+        }
+        info!(
+            "[assault] {secs:.0} s: enemy regiment {g}: {} men, order {}, engaged {}, melee {} ticks, centre ({:.1}, {:.1}); {at_face} men within 2.5 m of the outer face, {still} of them standing; {in_reach} men with a target",
+            e.count,
+            order_text(e.order),
+            e.engaged,
+            e.melee_ticks,
+            e.centroid.x,
+            e.centroid.y,
+        );
+        if !seen.is_empty() {
+            info!("[assault] {secs:.0} s: enemy regiment {g}, men standing at the face: {}", seen.join("; "));
+        }
+    }
+    let a = &groups.list[0];
+    let (mut on_walk, mut knives) = (0usize, 0usize);
+    for i in (0..units.len()).filter(|&i| units.death_t[i] == 0 && units.group[i] == 0) {
+        let p = Vec2::new(units.pos[i].x, units.pos[i].z);
+        on_walk += usize::from((p.y - crate::town_layout::WALL_Z).abs() <= 3.0 && units.pos[i].y > terrain.ground_at(p.x, p.y) + crate::town_layout::WALK - 0.5);
+        knives += usize::from(units.sight[i] & crate::sim::soldier::SIGHT_KNIFE != 0);
+    }
+    info!(
+        "[assault] {secs:.0} s: archers {} men, {on_walk} on the walk, {knives} with the knife out, running {}, standing to shoot at {:?}, order {}",
+        a.count,
+        a.skirmishing,
+        a.skirmish_hold,
+        order_text(a.order),
+    );
+}
+
+/// The cut-off scene's five-second line (the module docs).
+fn log_cutoff(groups: &Groups, units: &Units, terrain: &Terrain, secs: f32) {
+    let z = crate::town_layout::WALL_Z;
+    let lane = crate::town_layout::walk_lane(terrain.body_radius());
+    let (mut men, mut outside, mut at_face, mut still, mut inside, mut walk) = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+    for i in (0..units.len()).filter(|&i| units.death_t[i] == 0 && units.group[i] == 0) {
+        let p = Vec2::new(units.pos[i].x, units.pos[i].z);
+        men += 1;
+        if p.y >= z + 4.0 {
+            outside += 1;
+            if p.y < z + 6.5 {
+                at_face += 1;
+                still += usize::from(Vec2::new(units.vel[i].x, units.vel[i].z).length() < 0.3);
+            }
+        }
+        inside += usize::from(p.y < z - 4.0);
+        walk += usize::from(lane.contains(p));
+    }
+    info!(
+        "[cutoff] {secs:.0} s: regiment 0: {men} men, order {}; {outside} outside the wall, {at_face} within 2.5 m of its outer face, {still} of them standing; {inside} inside the town; {walk} on the walk",
+        order_text(groups.list[0].order),
+    );
+}
+
+/// The tower scene's five-second lines (the module docs).
+fn log_tower(groups: &Groups, units: &Units, terrain: &Terrain, stats: &crate::arrows::ArrowStats, secs: f32) {
+    use crate::town_layout::{TOWERS_X, WALL_Z};
+    let drum = Vec2::new(TOWERS_X[3], WALL_Z);
+    let n = groups.list.len().saturating_sub(1);
+    let (mut on_walk, mut knives) = (0usize, 0usize);
+    let (mut at_foot, mut standing) = (0usize, 0usize);
+    let mut alive = vec![0usize; n];
+    for i in (0..units.len()).filter(|&i| units.death_t[i] == 0) {
+        let g = units.group[i] as usize;
+        if g >= n {
+            continue;
+        }
+        alive[g] += 1;
+        let p = Vec2::new(units.pos[i].x, units.pos[i].z);
+        if g == 0 {
+            on_walk += usize::from(
+                (p.y - WALL_Z).abs() <= 4.0 && units.pos[i].y > terrain.ground_at(p.x, p.y) + crate::town_layout::WALK - 0.5,
+            );
+            knives += usize::from(units.sight[i] & crate::sim::soldier::SIGHT_KNIFE != 0);
+        } else if groups.list[g].team == 1 && p.y > WALL_Z && p.distance(drum) <= 11.0 {
+            at_foot += 1;
+            standing += usize::from(Vec2::new(units.vel[i].x, units.vel[i].z).length() < 0.3);
+        }
+    }
+    let others: Vec<String> = (1..n).map(|g| format!("regiment {g} (team {}) {} alive", groups.list[g].team, alive[g])).collect();
+    info!(
+        "[tower] {secs:.0} s: arrows loosed by the archers' side {}, archers {} alive, {on_walk} on the walk, {knives} with the knife out, order {}, firing {}; {}; enemy men within 3 m of the drum's outer side {at_foot}, {standing} of them standing",
+        stats.loosed_team[0],
+        alive[0],
+        order_text(groups.list[0].order),
+        groups.list[0].firing,
+        others.join(", "),
+    );
+}
+
+/// An order as the assault line writes it.
+fn order_text(o: Option<Order>) -> String {
+    match o {
+        None => "none".into(),
+        Some(Order::Move(p)) => format!("move to ({:.1}, {:.1})", p.x, p.y),
+        Some(Order::Attack(t)) => format!("attack {t}"),
+    }
 }
 
 /// The seconds a regiment of `scene` has to arrive, unless its route is

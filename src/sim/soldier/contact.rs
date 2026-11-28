@@ -24,9 +24,12 @@ const CUT_MARGIN: f32 = 0.01;
 /// The enemy he remembers (`target` at the tick's start) as one still to
 /// go for: a living index of the other team within his sight plus a
 /// metre, and with his regiment focused on one target, a man of it or
-/// one within his threat distance. Returns the squared distance to him
-/// (f32::MAX for an index out of range or of his own team) and whether he
-/// counts. The scan's `memo_valid` and the join in `drive` both read it.
+/// one within his threat distance, and on his own level as the scan reads
+/// levels (`Levels`): an enemy who climbed onto the wall above him, or one
+/// at its foot below a man on its walk, is out of his reach, and he lets
+/// him go. Returns the squared distance to him (f32::MAX for an index out
+/// of range or of his own team) and whether he counts. The scan's
+/// `memo_valid` and the join in `drive` both read it.
 #[inline]
 pub(super) fn remembered_foe(f: &Field, i: usize, p: Vec2, gi: usize, memo: usize) -> (f32, bool) {
     let Field { pos_prev, team, group, focus, .. } = *f;
@@ -35,7 +38,8 @@ pub(super) fn remembered_foe(f: &Field, i: usize, p: Vec2, gi: usize, memo: usiz
     }
     let d2 = pos_prev[memo].xz().distance_squared(p);
     let ok = d2 < (seek_radius() + 1.0) * (seek_radius() + 1.0)
-        && focus[gi].is_none_or(|t| group[memo] == t || d2 < threat_radius() * threat_radius());
+        && focus[gi].is_none_or(|t| group[memo] == t || d2 < threat_radius() * threat_radius())
+        && !Levels::new(f, i).apart(f, memo as u32);
     (d2, ok)
 }
 /// How deep another body is in his own, from the touch (the pair's body
@@ -132,8 +136,12 @@ pub(super) fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut
     gather_candidates(f.grid, p, i, my_team_bit, scan_r, spear.foe_cut(params), cands);
     let grid = f.grid;
     let sorted = grid.sorted();
+    let levels = Levels::new(f, i);
     for &o_rank in cands.iter() {
         let o = &sorted[o_rank as usize];
+        if levels.apart(f, o.idx) {
+            continue;
+        }
         let o_vel = grid.sorted_vel(o_rank as usize);
         let d = p - o.xz();
         let d2 = d.length_squared();
@@ -165,6 +173,46 @@ pub(super) fn scan(f: &Field, s: &mut Soldier, st: &mut Step, out: &mut ChunkOut
     st.scan.scan_r = scan_r;
     st.scan.my_team_bit = my_team_bit;
     obstacles.hand_on(s, st, widths[pose_lv].sep);
+}
+
+/// Whether two things whose ground heights differ by `dy` stand on
+/// different levels: the difference is a standing soldier's height or
+/// more, the half heights `half_a` and `half_b` of the two men standing
+/// there added. Two men on different levels do not overlap in height.
+#[inline(always)]
+pub(crate) fn levels_apart(dy: f32, half_a: f32, half_b: f32) -> bool {
+    dy.abs() >= half_a + half_b
+}
+
+/// Two men on different levels: on a map with cliffs (a wall's walk and
+/// the ground at its foot, a raised block), a neighbour close in plan may
+/// stand a storey above or below. Their bodies meet only where they
+/// overlap in height, so a man whose middle is more than the two half
+/// heights above or below his own (`levels_apart`) is no body he touches,
+/// no man in his reach and no part of the crowd round him. Where no
+/// ground blocks there is no cliff and no such pair, and nothing is read.
+pub(super) struct Levels {
+    on: bool,
+    y: f32,
+    hh: f32,
+}
+
+impl Levels {
+    #[inline]
+    pub(super) fn new(f: &Field, i: usize) -> Self {
+        let on = f.terrain.kind.has_blocked_ground();
+        let hh = if on { crate::unit_types::half_height(f.kind[i] as usize) } else { 0.0 };
+        Levels { on, y: f.pos_prev[i].y, hh }
+    }
+
+    /// Whether man `o` stands on another level from this one.
+    #[inline(always)]
+    pub(super) fn apart(&self, f: &Field, o: u32) -> bool {
+        self.on && {
+            let o = o as usize;
+            levels_apart(f.pos_prev[o].y - self.y, self.hh, crate::unit_types::half_height(f.kind[o] as usize))
+        }
+    }
 }
 
 /// One neighbour as the scan reads him: his row in the grid and his
@@ -625,6 +673,7 @@ struct Obstacles<'a> {
     body0: f32,
     widths: &'a [Width; WIDTH_LEVELS],
     orders: &'a [Option<Vec2>],
+    terrain: &'a crate::terrain::Terrain,
     row: Row,
     row_at: f32,
     side_left: bool,
@@ -654,6 +703,7 @@ impl<'a> Obstacles<'a> {
             body0,
             widths,
             orders: f.orders,
+            terrain: f.terrain,
             row: Row::default(),
             row_at: f32::INFINITY,
             side_left: false,
@@ -692,7 +742,8 @@ impl<'a> Obstacles<'a> {
     }
 
     /// His normal body and spring, whether he saw an obstacle and the
-    /// opening he found among them, and whether a body is at both sides.
+    /// opening he found among them (one his body can walk straight to,
+    /// `way_free`), and whether a body is at both sides.
     #[inline]
     fn hand_on(&self, s: &Soldier, st: &mut Step, sep0: f32) {
         st.open.open_on = self.open_on;
@@ -701,8 +752,11 @@ impl<'a> Obstacles<'a> {
         st.open.saw = self.row_at.is_finite();
         if self.open_on && st.open.saw {
             let (pref, coin) = side_pref(s.i, *s.stuck);
+            let (p, wd) = (st.p, self.wish_dir);
+            let perp = Vec2::new(-wd.y, wd.x);
+            let free = |lat: f32, along: f32| way_free(self.terrain, p, wd * along + perp * lat);
             let (aim_lat, aim_along, fit, span) =
-                openings(&self.row, self.row_at, OPEN_SEE, self.body0, SQUEEZE_DEPTH, false, pref, coin);
+                openings(&self.row, self.row_at, OPEN_SEE, self.body0, SQUEEZE_DEPTH, false, pref, coin, free);
             st.open.near = (aim_lat, aim_along, fit);
             st.open.near_span = span;
         }

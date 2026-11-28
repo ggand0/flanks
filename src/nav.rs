@@ -48,6 +48,14 @@ pub const SIGHT: f32 = 48.0;
 /// How far round an unreachable goal the planner looks for reachable
 /// ground to end the route at (m).
 const NEAR_GOAL: f32 = 400.0;
+/// How far round the goal of one man's way (a point of his regiment's
+/// route, which may lie in stone beside a rail) the planner looks for
+/// ground he can stand on and walk to the goal from straight, to end the
+/// way at (m).
+const MAN_GOAL_NEAR: f32 = 6.0;
+/// Cells one man's way may close before the search gives up: ten ticks
+/// of `PLAN_BUDGET` (sim/route.rs), a way round about a 600 m wall.
+pub const MAN_CELLS: u32 = 40_000;
 
 /// The grid. See the module docs.
 pub struct NavGrid {
@@ -73,6 +81,14 @@ pub struct NavGrid {
     /// The cost tables built so far, one per regiment width (see
     /// `Costs`). Emptied whenever the grid changes.
     costs: std::sync::Mutex<Vec<std::sync::Arc<Costs>>>,
+    /// The terrain's fine ground over the wall's pieces (town_layout.rs
+    /// `FineGround`), where a man's straight line is read: he may stand
+    /// in a 2 m cell the grid calls unwalkable, beside a rail or a kerb.
+    fine: Option<std::sync::Arc<crate::town_layout::FineGround>>,
+    /// Each army's walk to its own map edge (`flee_fields`): per cell,
+    /// metres on foot to the edge it flees to, team 0's (-z) first;
+    /// infinite where no walk reaches it.
+    flee: [Vec<f32>; 2],
 }
 
 impl Clone for NavGrid {
@@ -91,6 +107,8 @@ impl Clone for NavGrid {
             has_water: self.has_water,
             heights: self.heights.clone(),
             costs: Default::default(),
+            fine: self.fine.clone(),
+            flee: self.flee.clone(),
         }
     }
 }
@@ -114,6 +132,12 @@ pub struct PlanRequest {
     pub goal: Vec2,
     /// Half the regiment's width across its way (m).
     pub half_w: f32,
+    /// A way for one man of the regiment (sim/route.rs `man_target`), not
+    /// a route for its block: it costs only the ground, has no width, keeps
+    /// every leg one he can walk straight (`walk_line`), ends where he can
+    /// walk straight to the goal or nowhere, and gives up after `MAN_CELLS`
+    /// cells.
+    pub man: bool,
 }
 
 /// The planner's answer.
@@ -162,11 +186,14 @@ impl NavGrid {
             has_water: false,
             heights: terrain.heights().to_vec(),
             costs: Default::default(),
+            fine: terrain.fine().cloned(),
+            flee: [Vec::new(), Vec::new()],
         };
         grid.fill_cells(terrain, 0, 0, nx - 1, nz - 1);
         grid.has_water = grid.wet.iter().any(|&w| w);
         grid.clearance_window(0, 0, nx - 1, nz - 1, 0, 0, nx - 1, nz - 1);
         grid.label_regions();
+        grid.flee = grid.flee_fields();
         Some(grid)
     }
 
@@ -213,8 +240,94 @@ impl NavGrid {
         let (wx1, wz1) = ((ox1 + r).min(self.nx - 1), (oz1 + r).min(self.nz - 1));
         self.clearance_window(wx0, wz0, wx1, wz1, ox0, oz0, ox1, oz1);
         self.label_regions();
+        self.flee = self.flee_fields();
         self.costs.lock().unwrap().clear();
         true
+    }
+
+    /// Each army's walk to its own map edge: for every cell the metres on
+    /// foot, over the planner's moves (`neighbours`: its stairs, round its
+    /// walls), to the edge the army flees to (team 0 toward -z, team 1
+    /// toward +z, as `flee` in sim/soldier/motion.rs): its seeds are each
+    /// column's first walkable cell counted from that edge (the outer
+    /// rows are a margin no man walks). One search over the grid per
+    /// army.
+    fn flee_fields(&self) -> [Vec<f32>; 2] {
+        let field = |rows: Vec<usize>| {
+            let mut d = vec![f32::INFINITY; self.walk.len()];
+            let mut heap = BinaryHeap::new();
+            for x in 0..self.nx {
+                if let Some(i) = rows.iter().map(|&z| z * self.nx + x).find(|&i| self.walk[i]) {
+                    d[i] = 0.0;
+                    heap.push(Node { f: 0.0, i: i as u32 });
+                }
+            }
+            let mut nb = [(0u32, 0.0f32, 0u8); 8];
+            while let Some(Node { f, i }) = heap.pop() {
+                let i = i as usize;
+                if f > d[i] {
+                    continue;
+                }
+                let k = self.neighbours(i, &mut nb);
+                for &(j, step, _) in &nb[..k] {
+                    let nd = f + step;
+                    if nd < d[j as usize] {
+                        d[j as usize] = nd;
+                        heap.push(Node { f: nd, i: j });
+                    }
+                }
+            }
+            d
+        };
+        [field((0..self.nz).collect()), field((0..self.nz).rev().collect())]
+    }
+
+    /// The way a man of `team` at `p` runs to reach his army's map edge on
+    /// foot (`flee_fields`): straight down the slope of his walking
+    /// distance to the edge, read at his own spot from the four cells
+    /// round him. On open ground that is straight at the edge; by a wall
+    /// it bends along the wall toward its stair or its end. Where one of
+    /// those four cells is no ground to walk on, he heads for the cell
+    /// nearest the edge on foot among his own and the eight round it, from
+    /// the nearest walkable cell within 3 m where he stands in a cell the
+    /// grid calls unwalkable (beside a kerb or a rail). A unit vector;
+    /// None where no walk reaches the edge.
+    pub fn flee_dir(&self, team: u8, p: Vec2) -> Option<Vec2> {
+        let d = &self.flee[(team as usize).min(1)];
+        let g = (p - self.origin) / CELL;
+        let (x0, z0) = (g.x.floor(), g.y.floor());
+        if x0 >= 0.0 && z0 >= 0.0 && x0 + 1.0 < self.nx as f32 && z0 + 1.0 < self.nz as f32 {
+            let (tx, tz) = (g.x - x0, g.y - z0);
+            let i = z0 as usize * self.nx + x0 as usize;
+            let (a, b, c, e) = (d[i], d[i + 1], d[i + self.nx], d[i + self.nx + 1]);
+            if a.is_finite() && b.is_finite() && c.is_finite() && e.is_finite() {
+                // The distance between the four centres, bilinear: its
+                // slope at p, per cell, along x and along z.
+                let gx = (1.0 - tz) * (b - a) + tz * (e - c);
+                let gz = (1.0 - tx) * (c - a) + tx * (e - b);
+                let v = -Vec2::new(gx, gz);
+                if v.length_squared() > 1e-6 {
+                    return Some(v.normalize());
+                }
+            }
+        }
+        let i = match self.cell_at(p) {
+            Some(i) if self.walk[i] => i,
+            _ => self.nearest_walkable(p, 3.0)?,
+        };
+        if !d[i].is_finite() {
+            return None;
+        }
+        let mut nb = [(0u32, 0.0f32, 0u8); 8];
+        let k = self.neighbours(i, &mut nb);
+        let best = nb[..k].iter().map(|n| n.0 as usize).filter(|&j| d[j] < d[i]).min_by(|&a, &b| d[a].total_cmp(&d[b]));
+        let to = match best {
+            Some(j) => self.pos(j),
+            // At the edge itself: on toward it.
+            None => self.pos(i),
+        };
+        let v = to - p;
+        (v.length_squared() > 1e-6).then(|| v.normalize())
     }
 
     /// Walkable, cost and water for the cells in `[x0, x1] x [z0, z1]`.
@@ -226,7 +339,7 @@ impl NavGrid {
                 let i = z * self.nx + x;
                 let p = self.pos(i);
                 let inside = p.x >= lo.x && p.x <= hi.x && p.y >= lo.y && p.y <= hi.y;
-                self.walk[i] = inside && !terrain.blocked_at(p.x, p.y);
+                self.walk[i] = inside && !terrain.vertex_blocked_at(p.x, p.y);
                 let slope = terrain.slope_at(p.x, p.y);
                 let wade = terrain.wade_mult(p.x, p.y);
                 self.wet[i] = wade < 1.0;
@@ -386,7 +499,9 @@ impl NavGrid {
     /// as far as he looks (`SIGHT`). Marches along the line by the
     /// clearance: in open ground a few lookups cover the whole way, next
     /// to a wall it steps half a metre, so a look is at most about a
-    /// hundred lookups.
+    /// hundred lookups. Over the wall's pieces it reads the fine ground
+    /// and its clearance instead (town_layout.rs `FineGround::line_step`),
+    /// the ground his body stands on.
     pub fn walk_line(&self, a: Vec2, b: Vec2) -> bool {
         let d = b - a;
         let len = d.length();
@@ -399,6 +514,14 @@ impl NavGrid {
         let mut t = 0.0f32;
         loop {
             let q = a + dir * t.min(len);
+            if let Some(step) = self.fine.as_ref().and_then(|f| f.line_step(q)) {
+                let Some(step) = step else { return false };
+                if t >= len {
+                    return true;
+                }
+                t += step;
+                continue;
+            }
             let Some(i) = self.cell_at(q) else { return false };
             if !self.walk[i] {
                 return false;
@@ -408,6 +531,46 @@ impl NavGrid {
             }
             t += (self.clear[i] - slack).max(CELL * 0.25);
         }
+    }
+
+    /// How far a man walks from the nearest of the points `from` to the
+    /// nearest of the points `to` (m), on the grid's walkable cells by its
+    /// eight steps, None beyond `max` or with no way. A Dijkstra search
+    /// from `from`'s cells that stops at the first of `to`'s it closes or
+    /// at `max`: about (max / CELL)^2 cells at most. Points on unwalkable
+    /// cells are left out.
+    pub fn walk_gap(&self, from: &[Vec2], to: &[Vec2], max: f32) -> Option<f32> {
+        let goal: std::collections::HashSet<usize> =
+            to.iter().filter_map(|&p| self.cell_at(p)).filter(|&i| self.walk[i]).collect();
+        if goal.is_empty() {
+            return None;
+        }
+        let mut best: std::collections::HashMap<usize, f32> = std::collections::HashMap::new();
+        let mut heap = BinaryHeap::new();
+        for i in from.iter().filter_map(|&p| self.cell_at(p)).filter(|&i| self.walk[i]) {
+            if best.insert(i, 0.0).is_none() {
+                heap.push(Node { f: 0.0, i: i as u32 });
+            }
+        }
+        let mut nb = [(0u32, 0.0f32, 0u8); 8];
+        while let Some(Node { f: d, i }) = heap.pop() {
+            let i = i as usize;
+            if best.get(&i).is_some_and(|&b| d > b) {
+                continue;
+            }
+            if goal.contains(&i) {
+                return Some(d);
+            }
+            let k = self.neighbours(i, &mut nb);
+            for &(j, step, _) in &nb[..k] {
+                let nd = d + step;
+                if nd <= max && best.get(&(j as usize)).is_none_or(|&b| nd < b) {
+                    best.insert(j as usize, nd);
+                    heap.push(Node { f: nd, i: j });
+                }
+            }
+        }
+        None
     }
 
     /// Every point of the line from `a` to `b` stands at least `w` from
@@ -586,7 +749,7 @@ impl NavGrid {
     /// yet, on the pool. Returns whether any had to be built.
     pub fn prepare_costs(&self, requests: &[PlanRequest]) -> bool {
         let mut spans: Vec<Span> = Vec::new();
-        for r in requests {
+        for r in requests.iter().filter(|r| !r.man) {
             let span = Span::of(r.half_w.clamp(CELL, CLEAR_CAP - CELL));
             if !spans.iter().any(|s| s.k_axis == span.k_axis) && self.cached_costs(span).is_none() {
                 spans.push(span);
@@ -736,8 +899,8 @@ impl NavGrid {
     /// spreads over ticks and no tick waits for it.
     pub fn begin(&self, req: &PlanRequest) -> Search {
         let t0 = Instant::now();
-        let need = req.half_w.clamp(CELL, CLEAR_CAP - CELL);
-        let costs = self.costs(Span::of(need));
+        let need = if req.man { CELL } else { req.half_w.clamp(CELL, CLEAR_CAP - CELL) };
+        let costs = (!req.man).then(|| self.costs(Span::of(need)));
         let mut search = Search {
             req: *req,
             need,
@@ -748,6 +911,8 @@ impl NavGrid {
             heap: BinaryHeap::new(),
             seen: std::collections::HashMap::new(),
             cells: 0,
+            limit: if req.man { MAN_CELLS } else { u32::MAX },
+            gave_up: false,
             ticks: 0,
             ms: 0.0,
             done: false,
@@ -758,9 +923,19 @@ impl NavGrid {
             return search;
         };
         let region = self.region[start];
-        let goal_cell = self.cell_at(req.goal).filter(|&i| self.region[i] == region);
+        let goal_cell = if req.man {
+            self.nearest_where(req.goal, MAN_GOAL_NEAR, |i| self.region[i] == region && self.walk_line(self.pos(i), req.goal))
+        } else {
+            self.cell_at(req.goal).filter(|&i| self.region[i] == region)
+        };
         let (target, reached) = match goal_cell {
             Some(i) => (i, true),
+            None if req.man => {
+                // No ground he can reach by the goal: no way.
+                search.done = true;
+                search.ms = t0.elapsed().as_secs_f32() * 1000.0;
+                return search;
+            }
             None => {
                 // The nearest reachable ground where the block fits, else
                 // the nearest reachable ground at all, within `NEAR_GOAL`
@@ -802,6 +977,10 @@ impl NavGrid {
                     search.ms += t0.elapsed().as_secs_f32() * 1000.0;
                     return None;
                 }
+                if search.cells >= search.limit {
+                    search.gave_up = true;
+                    break;
+                }
                 let Some(Node { i, .. }) = search.heap.pop() else { break };
                 let seen = search.seen.get_mut(&i).expect("a heap entry was seen");
                 if seen.closed {
@@ -817,7 +996,11 @@ impl NavGrid {
                 let k = self.neighbours(i as usize, &mut nb);
                 for &(j, len, class) in &nb[..k] {
                     let class = class as usize;
-                    let gj = gi + len * 0.5 * (search.costs.w[i as usize][class] + search.costs.w[j as usize][class]);
+                    let gj = gi
+                        + len
+                            * 0.5
+                            * (self.step_cost(search.costs.as_deref(), i as usize, class)
+                                + self.step_cost(search.costs.as_deref(), j as usize, class));
                     match search.seen.get_mut(&j) {
                         Some(sj) if sj.closed => continue,
                         Some(sj) if gj >= sj.g => continue,
@@ -843,8 +1026,10 @@ impl NavGrid {
             ticks: search.ticks,
             ms: search.ms,
         };
-        if search.seen.is_empty() {
-            // No walkable ground near the start.
+        if search.seen.is_empty() || search.gave_up {
+            // No walkable ground near the start, or one man's way that ran
+            // past its cells.
+            out.reached = false;
             out.ms += t0.elapsed().as_secs_f32() * 1000.0;
             return Some(out);
         }
@@ -861,23 +1046,43 @@ impl NavGrid {
         }
         path.reverse();
         let g_of = |i: usize| search.seen.get(&(i as u32)).map_or(0.0, |sn| sn.g);
-        let kept = self.pull_straight(&path, &g_of, search.need, &search.costs);
-        out.points.push(req.start);
+        let kept = self.pull_straight(&path, &g_of, search.need, search.costs.as_deref(), req.man);
+        // A man's way runs from cell to cell, on ground he stands on at
+        // both ends; a regiment's route from its centre to its goal.
+        out.points.push(if req.man { self.pos(search.start) } else { req.start });
         if kept.len() > 2 {
             for &k in &kept[1..kept.len() - 1] {
                 out.points.push(self.pos(path[k]));
             }
         }
-        out.points.push(if search.reached { req.goal } else { self.pos(search.target) });
+        out.points.push(if search.reached && !req.man { req.goal } else { self.pos(search.target) });
         out.ms += t0.elapsed().as_secs_f32() * 1000.0;
         Some(out)
+    }
+
+    /// The cost per metre of cell `i` in step class `class`: the regiment's
+    /// table, or for one man (no table) the ground's own cost.
+    #[inline]
+    fn step_cost(&self, costs: Option<&Costs>, i: usize, class: usize) -> f32 {
+        match costs {
+            Some(c) => c.w[i][class],
+            None => self.cost[i],
+        }
     }
 
     /// The indices of `path` kept as waypoints: from each kept cell, the
     /// farthest later cell reachable by a straight segment that is
     /// walkable, keeps the clearance the grid path had between them (up to
-    /// the regiment's half width) and costs no more than that stretch.
-    fn pull_straight(&self, path: &[usize], g_of: &dyn Fn(usize) -> f32, need: f32, costs: &Costs) -> Vec<usize> {
+    /// the regiment's half width) and costs no more than that stretch; for
+    /// one man (`man`), also a segment he walks straight (`walk_line`).
+    fn pull_straight(
+        &self,
+        path: &[usize],
+        g_of: &dyn Fn(usize) -> f32,
+        need: f32,
+        costs: Option<&Costs>,
+        man: bool,
+    ) -> Vec<usize> {
         let last = path.len() - 1;
         let mut kept = vec![0];
         let mut i = 0;
@@ -888,7 +1093,8 @@ impl NavGrid {
                 min_clear = min_clear.min(self.clear[path[j]]);
                 let want = min_clear.min(need);
                 let budget = (g_of(path[j]) - g_of(path[i])) * SMOOTH_SLACK + 0.1;
-                if self.segment_fits(self.pos(path[i]), self.pos(path[j]), want, costs, budget) {
+                let (a, b) = (self.pos(path[i]), self.pos(path[j]));
+                if self.segment_fits(a, b, want, costs, budget) && (!man || self.walk_line(a, b)) {
                     best = j;
                 } else if j > best + 12 {
                     break;
@@ -902,7 +1108,7 @@ impl NavGrid {
 
     /// The straight segment from `a` to `b` is walkable, keeps clearance
     /// `want` everywhere, and costs at most `budget` by `costs`.
-    fn segment_fits(&self, a: Vec2, b: Vec2, want: f32, costs: &Costs, budget: f32) -> bool {
+    fn segment_fits(&self, a: Vec2, b: Vec2, want: f32, costs: Option<&Costs>, budget: f32) -> bool {
         let len = a.distance(b);
         let d = (b - a).abs();
         let class: usize = if d.x > 2.414 * d.y {
@@ -924,7 +1130,7 @@ impl NavGrid {
                 return false;
             }
             let wgt = if k == 0 || k == steps { 0.5 } else { 1.0 };
-            cost += costs.w[i][class] * step * wgt;
+            cost += self.step_cost(costs, i, class) * step * wgt;
             if cost > budget {
                 return false;
             }
@@ -978,6 +1184,32 @@ fn octile(a: Vec2, b: Vec2) -> f32 {
     let d = (a - b).abs();
     let (lo, hi) = if d.x < d.y { (d.x, d.y) } else { (d.y, d.x) };
     hi + (std::f32::consts::SQRT_2 - 1.0) * lo
+}
+
+/// The Euclidean distance (m) from each cell of a `w` by `h` grid of
+/// `cell`-metre cells to the nearest cell that is not `open`, capped at
+/// `cap`; cells beyond the grid count as open. The transform of
+/// `clearance_window` over a whole grid of any cell size.
+pub(crate) fn clearance(open: &[bool], w: usize, h: usize, cell: f32, cap: f32) -> Vec<f32> {
+    let big = 1e12f64;
+    let mut f: Vec<f64> = open.iter().map(|&o| if o { big } else { 0.0 }).collect();
+    let n = w.max(h);
+    let (mut col, mut out, mut v, mut zz) = (vec![0.0f64; n], vec![0.0f64; n], vec![0usize; n], vec![0.0f64; n + 1]);
+    for x in 0..w {
+        for z in 0..h {
+            col[z] = f[z * w + x];
+        }
+        edt_1d(&col[..h], &mut out[..h], &mut v, &mut zz);
+        for z in 0..h {
+            f[z * w + x] = out[z];
+        }
+    }
+    for z in 0..h {
+        col[..w].copy_from_slice(&f[z * w..z * w + w]);
+        edt_1d(&col[..w], &mut out[..w], &mut v, &mut zz);
+        f[z * w..z * w + w].copy_from_slice(&out[..w]);
+    }
+    f.iter().map(|&d2| ((d2.sqrt() as f32) * cell).min(cap)).collect()
 }
 
 /// One-dimensional squared distance transform (Felzenszwalb and
@@ -1049,13 +1281,17 @@ impl Ord for Node {
 pub struct Search {
     pub req: PlanRequest,
     need: f32,
-    costs: std::sync::Arc<Costs>,
+    /// The regiment's cost table; None for one man's way.
+    costs: Option<std::sync::Arc<Costs>>,
     start: usize,
     target: usize,
     reached: bool,
     heap: BinaryHeap<Node>,
     seen: std::collections::HashMap<u32, Seen>,
     cells: u32,
+    /// Cells it may close before it gives up (`MAN_CELLS` for one man).
+    limit: u32,
+    gave_up: bool,
     ticks: u32,
     ms: f32,
     done: bool,
@@ -1079,7 +1315,7 @@ mod tests {
     }
 
     fn req(start: Vec2, goal: Vec2) -> PlanRequest {
-        PlanRequest { g: 0, serial: 0, start, goal, half_w: 14.3 }
+        PlanRequest { g: 0, serial: 0, start, goal, half_w: 14.3, man: false }
     }
 
     /// Every segment of a route is walkable for a man.
@@ -1234,6 +1470,46 @@ mod tests {
                     assert!(x.abs() > TOWERS_X[3], "{kind:?}: the route crosses the wall line at x {x}");
                 }
             }
+        }
+    }
+
+    /// A man fleeing from the wall's walk, of either army, reaches his
+    /// own map edge on foot, every step on walkable ground: along the
+    /// walk, down a stair, round the wall.
+    #[test]
+    fn a_man_fleeing_from_the_walk_reaches_his_edge_on_foot() {
+        let terrain = crate::terrain::build_terrain(MapKind::WallDebug);
+        let g = NavGrid::build(&terrain).expect("a wall map has a grid");
+        let (lo, hi) = (terrain.min(), terrain.max());
+        for (team, edge) in [(0u8, lo.y), (1u8, hi.y)] {
+            let mut p = Vec2::new(-20.0, crate::town_layout::WALL_Z);
+            let mut reached = false;
+            for _ in 0..4000 {
+                let Some(way) = g.flee_dir(team, p) else { panic!("team {team}: no way at {p}") };
+                p += way * 0.5;
+                let i = g.cell_at(p).expect("on the field");
+                assert!(g.walk[i] || g.nearest_walkable(p, 3.0).is_some(), "team {team}: off the ground at {p}");
+                if (p.y - edge).abs() < 6.0 {
+                    reached = true;
+                    break;
+                }
+            }
+            assert!(reached, "team {team} reached {p}, not its edge at z {edge}");
+        }
+    }
+
+    /// On open ground with nothing between a man and his edge, he flees
+    /// straight at it, wherever he stands between the cell centres.
+    #[test]
+    fn a_man_fleeing_over_open_ground_runs_straight_at_his_edge() {
+        let terrain = crate::terrain::build_terrain(MapKind::WallDebug);
+        let g = NavGrid::build(&terrain).expect("a wall map has a grid");
+        for (team, p, want) in [
+            (0u8, crate::town_layout::spots::BEHIND_TOWN + Vec2::new(0.7, -0.3), Vec2::new(0.0, -1.0)),
+            (1u8, Vec2::new(0.7, 0.3), Vec2::new(0.0, 1.0)),
+        ] {
+            let way = g.flee_dir(team, p).expect("open ground has a way");
+            assert!((way - want).length() < 1e-3, "team {team} at {p}: {way}, not {want}");
         }
     }
 

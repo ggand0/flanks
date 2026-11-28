@@ -79,10 +79,6 @@ pub enum FormShape {
     Blob,
 }
 
-/// Two men on a lane whose places cross by more than this (m) along it
-/// trade places (`fill_lane_slots`).
-const LANE_CROSS: f32 = 2.0;
-
 /// A regiment coming onto a lane (town_layout.rs `Lane`) fills its run
 /// from the far end as its men arrive: `fill_lane_slots`.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -163,15 +159,36 @@ impl FormSpacing {
 }
 
 /// The slot pitch of a regiment on a lane (the wall's walk). In normal
-/// order it is the rest distance of two men at ease (sim/soldier/body.rs
-/// `sep_ease`), the closest two standing men keep without pushing each
-/// other, so the walk holds a rank more than at the field's pitch; the
-/// other spacings keep their own.
+/// order its files are the rest distance of two men at ease
+/// (sim/soldier/body.rs `sep_ease`) apart, the closest two standing men
+/// keep without pushing each other, and every other rank stands shifted
+/// half a file (`lane_stagger`), so a man stands between the two men
+/// ahead of him and the ranks come closer: the depth at which those two
+/// are at the rest distance from him too. The 6 m walk holds six such
+/// ranks, against five standing straight behind each other; the other
+/// spacings keep their own pitch, unshifted.
 pub fn lane_pitch(spacing: FormSpacing, kind: u8) -> Vec2 {
     match spacing {
-        FormSpacing::Normal => Vec2::splat(crate::sim::soldier::sep_ease()),
+        FormSpacing::Normal => {
+            let sep = crate::sim::soldier::sep_ease();
+            Vec2::new(sep, (sep * sep - 0.25 * sep * sep).sqrt())
+        }
         _ => spacing.pitch(kind),
     }
+}
+
+/// How far every other rank of a lane's block stands shifted along the
+/// rank (`lane_pitch`): half a file in normal order, none in the others.
+pub fn lane_stagger(spacing: FormSpacing, kind: u8) -> f32 {
+    match spacing {
+        FormSpacing::Normal => 0.5 * lane_pitch(spacing, kind).x,
+        _ => 0.0,
+    }
+}
+
+/// A regiment's rank shift as it stands (`lane_stagger`): none off a lane.
+pub fn stagger_of(gd: &GroupData) -> f32 {
+    if gd.lane { lane_stagger(gd.spacing, gd.kind) } else { 0.0 }
 }
 
 /// A regiment's slot pitch as it stands: its spacing's, or the lane's
@@ -411,20 +428,31 @@ pub fn facing_of(dir: Vec2) -> f32 {
 
 /// Row-major LOCAL slot offsets (x = lateral, y = forward) for `n` units
 /// in `files` columns: front rank first, left to right, partial last rank
-/// centered, block centered on the origin. The one grid used by slot
-/// assignment AND the drag-order placement preview — what you see is
-/// where they stand.
-pub fn slot_offsets(n: usize, files: usize, pitch: Vec2) -> Vec<Vec2> {
+/// centered, block centered on the origin. With a `stagger` (a lane's,
+/// `lane_stagger`) every other rank stands that far to the right of the
+/// one ahead, the block still centred, and a partial last rank keeps to
+/// its rank's files, as near the middle as they go: centred freely, it
+/// could stand a man straight behind another at the ranks' close depth.
+/// The one grid used by slot assignment AND the drag-order placement
+/// preview: what you see is where they stand.
+pub fn slot_offsets(n: usize, files: usize, pitch: Vec2, stagger: f32) -> Vec<Vec2> {
     let files = files.clamp(1, n.max(1));
     let ranks = n.div_ceil(files);
     let half_depth = (ranks - 1) as f32 / 2.0;
+    let stagger = if ranks > 1 { stagger } else { 0.0 };
+    let full = (files - 1) as f32 / 2.0;
     let mut out = Vec::with_capacity(n);
     for r in 0..ranks {
         let in_row = files.min(n - r * files);
-        let half_w = (in_row - 1) as f32 / 2.0;
         let fwd = (half_depth - r as f32) * pitch.y;
+        let (first, shift) = if stagger > 0.0 {
+            let shift = if r % 2 == 1 { 0.5 * stagger } else { -0.5 * stagger };
+            (((files - in_row) / 2) as f32 - full, shift)
+        } else {
+            (-((in_row - 1) as f32 / 2.0), 0.0)
+        };
         for c in 0..in_row {
-            out.push(Vec2::new((c as f32 - half_w) * pitch.x, fwd));
+            out.push(Vec2::new((first + c as f32) * pitch.x + shift, fwd));
         }
     }
     out
@@ -525,7 +553,7 @@ pub fn assign_slots(units: &mut Units, g: u32, gd: &mut GroupData) -> Vec<u32> {
         FormShape::Rect => {
             let files = (gd.files.max(1) as usize).min(n);
             let pitch = pitch_of(gd);
-            let slots = slot_offsets(n, files, pitch);
+            let slots = slot_offsets(n, files, pitch, stagger_of(gd));
             // Front-to-back, then left-to-right within each rank: the
             // greedy crossing-minimizer, matching the slots' row-major
             // order.
@@ -549,16 +577,28 @@ pub fn assign_slots(units: &mut Units, g: u32, gd: &mut GroupData) -> Vec<u32> {
 /// `slot_offsets`, `blob_radius`) so a density retune can't silently
 /// diverge from the clamp footprint. The block at `files` in the spacing
 /// it closes to: a new placement is a new order, and an order closes an
-/// open regiment.
-pub fn block_half_extents(gd: &GroupData, files: u32, facing: f32) -> Vec2 {
+/// open regiment. `lane`: the placement is a lane's, at the lane's pitch
+/// and rank shift, whatever the regiment stands on now.
+pub fn block_half_extents(gd: &GroupData, files: u32, facing: f32, lane: bool) -> Vec2 {
     if gd.shape == FormShape::Blob {
         return Vec2::splat(blob_radius(gd.count));
     }
     let files = (files.max(1) as usize).min(gd.count.max(1));
     let ranks = gd.count.max(1).div_ceil(files);
-    let pitch = if gd.lane { lane_pitch(gd.chosen_spacing(), gd.kind) } else { gd.chosen_spacing().pitch(gd.kind) };
-    let half_w = (files - 1) as f32 * 0.5 * pitch.x + 1.0;
+    let (pitch, stagger) = if lane {
+        (lane_pitch(gd.chosen_spacing(), gd.kind), lane_stagger(gd.chosen_spacing(), gd.kind))
+    } else {
+        (gd.chosen_spacing().pitch(gd.kind), 0.0)
+    };
+    let stagger = if ranks > 1 { stagger } else { 0.0 };
+    let half_w = (files - 1) as f32 * 0.5 * pitch.x + 0.5 * stagger + 1.0;
     let half_d = (ranks - 1) as f32 * 0.5 * pitch.y + 1.0;
+    turned_half_extents(half_w, half_d, facing)
+}
+
+/// Axis-aligned half extents (x, z) of a rectangle `half_w` wide along
+/// its ranks and `half_d` deep, turned to `facing`.
+pub fn turned_half_extents(half_w: f32, half_d: f32, facing: f32) -> Vec2 {
     let fwd = facing_dir(facing);
     let right = Vec2::new(fwd.y, -fwd.x);
     Vec2::new(
@@ -600,6 +640,46 @@ impl BlockRect {
         dir.dot(right).abs() * self.half_w + dir.dot(self.fwd).abs() * self.half_d
     }
 
+    /// The point of the block nearest `p`: `p` itself inside.
+    pub fn closest(&self, p: Vec2) -> Vec2 {
+        let d = p - self.centre;
+        if self.fwd == Vec2::ZERO {
+            let len = d.length();
+            return if len <= self.half_w { p } else { self.centre + d * (self.half_w / len) };
+        }
+        let right = Vec2::new(self.fwd.y, -self.fwd.x);
+        let across = d.dot(right).clamp(-self.half_w, self.half_w);
+        let along = d.dot(self.fwd).clamp(-self.half_d, self.half_d);
+        self.centre + right * across + self.fwd * along
+    }
+
+    /// The stretch of the line `from + dir * s` (`dir` a unit vector)
+    /// inside the block: the distances along it where it enters and where
+    /// it leaves, either below zero behind `from`; None where it misses.
+    pub fn line_span(&self, from: Vec2, dir: Vec2) -> Option<(f32, f32)> {
+        let d = from - self.centre;
+        if self.fwd == Vec2::ZERO {
+            let b = d.dot(dir);
+            let disc = b * b - (d.length_squared() - self.half_w * self.half_w);
+            return (disc >= 0.0).then(|| (-b - disc.sqrt(), -b + disc.sqrt()));
+        }
+        let right = Vec2::new(self.fwd.y, -self.fwd.x);
+        let (mut lo, mut hi) = (f32::NEG_INFINITY, f32::INFINITY);
+        for (axis, half) in [(right, self.half_w), (self.fwd, self.half_d)] {
+            let (at, along) = (d.dot(axis), dir.dot(axis));
+            if along.abs() < 1e-9 {
+                if at.abs() > half {
+                    return None;
+                }
+                continue;
+            }
+            let (a, b) = ((-half - at) / along, (half - at) / along);
+            lo = lo.max(a.min(b));
+            hi = hi.min(a.max(b));
+        }
+        (lo <= hi).then_some((lo, hi))
+    }
+
     /// The distance from `p` to the nearest point of the block, 0 inside.
     pub fn distance(&self, p: Vec2) -> f32 {
         let d = p - self.centre;
@@ -625,17 +705,31 @@ pub fn block_rect(gd: &GroupData) -> BlockRect {
 /// `centre` is its anchor, the dressed formation rather than the men's
 /// average, which stragglers drag off it.
 pub fn block_rect_at(gd: &GroupData, centre: Vec2) -> BlockRect {
+    block_rect_with(gd, centre, 1.0)
+}
+
+/// The block of a regiment as it stands about `centre`, `margin` metres
+/// past its outer places on every side (a blob's disc as it is).
+pub fn block_rect_with(gd: &GroupData, centre: Vec2, margin: f32) -> BlockRect {
     if gd.shape == FormShape::Blob || gd.files == 0 {
         let r = if gd.radius > 0.0 { gd.radius } else { blob_radius(gd.count) };
         return BlockRect { centre, fwd: Vec2::ZERO, half_w: r, half_d: r };
     }
-    let (files, _, pitch) = grid(gd);
     BlockRect {
         centre,
         fwd: facing_dir(gd.facing),
-        half_w: (files - 1) as f32 * 0.5 * pitch.x + 1.0,
-        half_d: front_offset(gd) + 1.0,
+        half_w: half_width(gd) + margin,
+        half_d: front_offset(gd) + margin,
     }
+}
+
+/// Half the width of a Rect block's places as it stands, outer centre to
+/// outer centre: its files, and a lane block's rank shift
+/// (`lane_stagger`) when it has more than one rank.
+fn half_width(gd: &GroupData) -> f32 {
+    let (files, ranks, pitch) = grid(gd);
+    let stagger = if ranks > 1 { stagger_of(gd) } else { 0.0 };
+    (files - 1) as f32 * 0.5 * pitch.x + 0.5 * stagger
 }
 
 /// A radius about the centroid that holds the whole of `block_rect`
@@ -646,8 +740,7 @@ pub fn block_bound(gd: &GroupData) -> f32 {
     if gd.shape == FormShape::Blob || gd.files == 0 {
         return if gd.radius > 0.0 { gd.radius } else { blob_radius(gd.count) };
     }
-    let (files, _, pitch) = grid(gd);
-    let half_w = (files - 1) as f32 * 0.5 * pitch.x + 1.0;
+    let half_w = half_width(gd) + 1.0;
     let half_d = front_offset(gd) + 1.0;
     (half_w * half_w + half_d * half_d).sqrt()
 }
@@ -1032,9 +1125,11 @@ pub(crate) fn stands_on_lane(gd: &GroupData, lane: &crate::town_layout::Lane) ->
 /// farthest place still held by a man behind him, and that man takes the
 /// place he had. The men already standing then always hold the far
 /// places, so nobody has to pass anybody along a walk too narrow to
-/// pass on. The men on the lane also keep their order along it. One test
-/// per man still on his way and one pass over the men there per tick,
-/// nothing once they are all there; a new order or a fight ends it.
+/// pass on. Every tick the men of a regiment whose block is the lane's
+/// who stand on the lane then share out the places they hold by the
+/// order they stand in (`deal_lane_places`). One test per man still on
+/// his way, one pass over the men and one sort of each regiment's men on
+/// the lane per tick; a new order or a fight ends the arrivals.
 fn fill_lane_slots(mut units: ResMut<Units>, mut groups: ResMut<Groups>, terrain: Res<crate::terrain::Terrain>) {
     if !terrain.kind.has_wall() {
         return;
@@ -1104,28 +1199,6 @@ fn fill_lane_slots(mut units: ResMut<Units>, mut groups: ResMut<Groups>, terrain
             }
             pending.swap_remove(k);
         }
-        // The men on the lane keep their order along it: the crowd at a
-        // stair's head shoves a man past the head, and the place he took
-        // on the far side would have him pass every man standing between.
-        // Two neighbours in that order whose places cross by more than
-        // `LANE_CROSS` swap them, one pass a tick, so the order settles
-        // without two men side by side trading places every tick.
-        pending.sort_unstable();
-        let mut on: Vec<(f32, usize)> = (0..units.len())
-            .filter(|&i| units.group[i] == g as u32 && units.death_t[i] == 0)
-            .filter(|&i| pending.binary_search(&(i as u32)).is_err())
-            .map(|i| (units.pos[i].x, i))
-            .collect();
-        on.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
-        for w in on.windows(2) {
-            let (a, b) = (w[0].1, w[1].1);
-            if units.home[a].x > units.home[b].x + LANE_CROSS {
-                let (ha, hb) = (units.home[a], units.home[b]);
-                units.home[a] = hb;
-                units.home[b] = ha;
-                dealt = true;
-            }
-        }
         if dealt {
             gd.slots_dealt = gd.slots_dealt.wrapping_add(1);
         }
@@ -1134,11 +1207,170 @@ fn fill_lane_slots(mut units: ResMut<Units>, mut groups: ResMut<Groups>, terrain
             gd.lane_fill = None;
         }
     }
+    // The living men on the lane of each regiment whose block is the
+    // lane's, in one pass over the men.
+    let dealing: Vec<bool> = groups
+        .list
+        .iter()
+        .map(|gd| {
+            gd.lane
+                && !gd.reform
+                && !gd.engaged
+                && gd.count > 0
+                && !gd.state.is_broken()
+                && gd.shape == FormShape::Rect
+                && gd.spacing != FormSpacing::Open
+        })
+        .collect();
+    if !dealing.contains(&true) {
+        return;
+    }
+    let mut on_lane: Vec<Vec<usize>> = vec![Vec::new(); groups.list.len()];
+    for i in 0..units.len() {
+        let g = units.group[i] as usize;
+        if g < dealing.len()
+            && dealing[g]
+            && units.death_t[i] == 0
+            && lane.contains(Vec2::new(units.pos[i].x, units.pos[i].z))
+        {
+            on_lane[g].push(i);
+        }
+    }
+    for (g, men) in on_lane.iter_mut().enumerate() {
+        if men.len() < 2 {
+            continue;
+        }
+        let gd = &mut groups.list[g];
+        let files = (gd.files.max(1) as usize).min(gd.count.max(1));
+        if deal_lane_places(&mut units, men, pitch_of(gd).x, files) {
+            gd.slots_dealt = gd.slots_dealt.wrapping_add(1);
+        }
+    }
+}
+
+/// Shares out the places the men `men` of one regiment on a lane hold
+/// among them by the order they stand in. The places go file by file
+/// along the lane (x), a file being the places of one column of the
+/// block's grid (`slot_offsets`, `files` files `pitch_x` apart; every
+/// other rank's shift is a quarter of a file either way, so it keeps to
+/// its file), and the men go by how far along the lane they stand: the
+/// first file's k places go to the k men farthest back, and so on, and
+/// in each file the men take its places in the order they stand across
+/// the lane. So the man farthest along holds the farthest place, men side
+/// by side hold places side by side, a man who lags takes a nearer place
+/// than the men ahead of him, and a man beside an empty place farther on
+/// takes it. The files hold fixed numbers of places, so the same men
+/// fall into each file whichever end the count starts from. Whether any
+/// place changed hands.
+fn deal_lane_places(units: &mut Units, men: &mut [usize], pitch_x: f32, files: usize) -> bool {
+    let full = (files.max(1) - 1) as f32 * 0.5;
+    let file_of = |h: Vec2| (h.x / pitch_x + full).round() as i32;
+    let mut places: Vec<Vec2> = men.iter().map(|&i| units.home[i]).collect();
+    places.sort_unstable_by(|a, b| file_of(*a).cmp(&file_of(*b)).then(a.y.total_cmp(&b.y)));
+    men.sort_unstable_by(|&a, &b| units.pos[a].x.total_cmp(&units.pos[b].x));
+    let mut dealt = false;
+    let mut k = 0;
+    while k < places.len() {
+        let f = file_of(places[k]);
+        let end = k + places[k..].iter().take_while(|h| file_of(**h) == f).count();
+        let file_men = &mut men[k..end];
+        file_men.sort_unstable_by(|&a, &b| units.pos[a].z.total_cmp(&units.pos[b].z));
+        for (&i, &h) in file_men.iter().zip(&places[k..end]) {
+            if units.home[i] != h {
+                units.home[i] = h;
+                dealt = true;
+            }
+        }
+        k = end;
+    }
+    dealt
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A regiment of archers on the walk at `at`, man k holding `homes[k]`
+    /// and standing at `stands[k]` (offsets from `at`).
+    fn on_walk(at: Vec2, homes: &[Vec2], stands: &[Vec2]) -> Units {
+        let terrain = crate::terrain::build_terrain(crate::terrain::MapKind::WallDebug);
+        let mut units = Units::default();
+        for (k, p) in stands.iter().enumerate() {
+            let p = at + *p;
+            crate::units::push_unit(&mut units, &terrain, k as u32, 0, crate::unit_types::KIND_ARCHER, 0, p.x, p.y, at);
+        }
+        for (k, h) in homes.iter().enumerate() {
+            units.home[k] = *h;
+        }
+        units
+    }
+
+    /// The places the men on the walk hold, dealt by the order they stand
+    /// in: men on their places keep them, with the rank shift or without
+    /// it and with a short last rank, and two men of one file two ranks
+    /// apart who stand at each other's places each take the one he stands
+    /// at.
+    #[test]
+    fn men_on_a_lane_take_the_places_in_the_order_they_stand() {
+        let at = Vec2::new(80.0, crate::town_layout::WALL_Z);
+        let pitch = lane_pitch(FormSpacing::Normal, crate::unit_types::KIND_ARCHER);
+        let stagger = lane_stagger(FormSpacing::Normal, crate::unit_types::KIND_ARCHER);
+        for (n, files, stagger) in [(24, 4, stagger), (22, 4, stagger), (22, 4, 0.0), (21, 6, 0.0)] {
+            let slots = slot_offsets(n, files, pitch, stagger);
+            let mut units = on_walk(at, &slots, &slots);
+            let mut men: Vec<usize> = (0..n).collect();
+            assert!(!deal_lane_places(&mut units, &mut men, pitch.x, files), "{n} in {files} files on their places");
+            assert!((0..n).all(|k| units.home[k] == slots[k]));
+        }
+        // Files run along the ranks: in 4 files, man 1 stands in the front
+        // rank and man 9 two ranks behind him in the same file.
+        let slots = slot_offsets(24, 4, pitch, stagger);
+        let mut homes = slots.clone();
+        homes.swap(1, 9);
+        let mut units = on_walk(at, &homes, &slots);
+        let mut men: Vec<usize> = (0..24).collect();
+        assert!(deal_lane_places(&mut units, &mut men, pitch.x, 4));
+        assert!((0..24).all(|k| units.home[k] == slots[k]), "each takes the place he stands at");
+    }
+
+    /// One rank on the walk: the man holding the farthest place lags
+    /// behind the others, so they take the farther places, each one on,
+    /// and he the nearest.
+    #[test]
+    fn a_man_who_lags_takes_a_nearer_place() {
+        let at = Vec2::new(80.0, crate::town_layout::WALL_Z);
+        let pitch = lane_pitch(FormSpacing::Normal, crate::unit_types::KIND_ARCHER);
+        let slots = slot_offsets(4, 4, pitch, 0.0);
+        // Man 0 holds the farthest place and stands a file behind the
+        // nearest; men 1 to 3 stand at the three nearer places they hold.
+        let homes = [slots[3], slots[0], slots[1], slots[2]];
+        let stands = [slots[0] - Vec2::new(pitch.x, 0.0), slots[0], slots[1], slots[2]];
+        let mut units = on_walk(at, &homes, &stands);
+        let mut men: Vec<usize> = (0..4).collect();
+        assert!(deal_lane_places(&mut units, &mut men, pitch.x, 4));
+        assert_eq!([units.home[0], units.home[1], units.home[2], units.home[3]], [slots[0], slots[1], slots[2], slots[3]]);
+    }
+
+    /// Three files by two ranks with the rank shift: the man holding the
+    /// far file's rear place stands behind the block, so the man beside
+    /// that empty place, at the middle file's rear, takes it, the man at
+    /// the near file's rear takes his, and the man behind the block the
+    /// near file's rear; the front rank keeps its places.
+    #[test]
+    fn a_man_beside_an_empty_place_farther_on_takes_it() {
+        let at = Vec2::new(80.0, crate::town_layout::WALL_Z);
+        let pitch = lane_pitch(FormSpacing::Normal, crate::unit_types::KIND_ARCHER);
+        let stagger = lane_stagger(FormSpacing::Normal, crate::unit_types::KIND_ARCHER);
+        // Front rank 0, 1, 2; rear rank 3, 4, 5, from the near end.
+        let slots = slot_offsets(6, 3, pitch, stagger);
+        let mut stands = slots.clone();
+        stands[5] = slots[3] - Vec2::new(pitch.x, 0.0);
+        let mut units = on_walk(at, &slots, &stands);
+        let mut men: Vec<usize> = (0..6).collect();
+        assert!(deal_lane_places(&mut units, &mut men, pitch.x, 3));
+        let homes: Vec<Vec2> = (0..6).map(|k| units.home[k]).collect();
+        assert_eq!(homes, vec![slots[0], slots[1], slots[2], slots[4], slots[5], slots[3]]);
+    }
 
     /// 200 archers in 50 files by 4 ranks, closed, facing +z.
     fn holder() -> GroupData {
@@ -1168,8 +1400,9 @@ mod tests {
     }
 
     /// On the wall's walk a regiment in normal order stands at the rest
-    /// distance of men at ease, five ranks on the walk; ordered off the
-    /// walk it is back at its field pitch.
+    /// distance of men at ease, every other rank shifted half a file, six
+    /// ranks on the walk; ordered off the walk it is back at its field
+    /// pitch.
     #[test]
     fn a_regiment_stands_tighter_on_a_lane_and_only_there() {
         let lane = crate::town_layout::walk_lane(0.6);
@@ -1179,9 +1412,13 @@ mod tests {
         assert!(stands_on_lane(&gd, &lane));
         gd.lane = true;
         let tight = crate::sim::soldier::sep_ease();
-        assert_eq!(pitch_of(&gd), Vec2::splat(tight));
-        assert_eq!(grid(&gd).2, Vec2::splat(tight));
-        assert!(((lane.across.1 - lane.across.0) / tight).floor() as u32 + 1 == 5, "ranks the walk holds");
+        let pitch = pitch_of(&gd);
+        assert_eq!(pitch.x, tight);
+        assert_eq!(grid(&gd).2, pitch);
+        assert_eq!(stagger_of(&gd), 0.5 * tight);
+        // A man and either of the two men ahead of him: the rest distance.
+        assert!((Vec2::new(0.5 * tight, pitch.y).length() - tight).abs() < 1e-5);
+        assert!(((lane.across.1 - lane.across.0) / pitch.y + 1e-4).floor() as u32 + 1 == 6, "ranks the walk holds");
         // Holding there, and told to shoot from there with its men on it.
         gd.order = None;
         gd.anchor = on_walk;
@@ -1198,6 +1435,29 @@ mod tests {
         gd.lane = true;
         gd.spacing = FormSpacing::Wall;
         assert_eq!(pitch_of(&gd), FormSpacing::Wall.pitch(gd.kind));
+        assert_eq!(stagger_of(&gd), 0.0);
+    }
+
+    /// The lane's grid with its rank shift: every pair of places at least
+    /// the rest distance apart, the partial last rank too, and the block
+    /// centred.
+    #[test]
+    fn the_shifted_ranks_keep_every_man_at_the_rest_distance() {
+        let pitch = lane_pitch(FormSpacing::Normal, crate::unit_types::KIND_ARCHER);
+        let stagger = lane_stagger(FormSpacing::Normal, crate::unit_types::KIND_ARCHER);
+        for (n, files) in [(500, 84), (60, 10), (61, 10), (67, 10), (7, 4), (5, 5)] {
+            let slots = slot_offsets(n, files, pitch, stagger);
+            assert_eq!(slots.len(), n);
+            for (i, a) in slots.iter().enumerate() {
+                for b in &slots[i + 1..] {
+                    assert!(a.distance(*b) >= pitch.x - 1e-4, "{n} in {files} files: {a} and {b}");
+                }
+            }
+            let (lo, hi) = slots.iter().fold((f32::MAX, f32::MIN), |(lo, hi), s| (lo.min(s.x), hi.max(s.x)));
+            if n >= 2 * files {
+                assert!((lo + hi).abs() < 1e-4, "{n} in {files} files centred: {lo} to {hi}");
+            }
+        }
     }
 
     /// A block that opens 3.9 m behind and nothing ahead moves its anchor

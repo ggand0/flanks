@@ -25,6 +25,7 @@ mod obstacle_map;
 mod orders;
 mod overlay;
 mod picker;
+mod play_log;
 mod regiments;
 mod render_units;
 mod render_units_gpu;
@@ -224,7 +225,8 @@ fn with_view(app: &mut App, window: bool) {
             focused_mode: bevy::winit::UpdateMode::Continuous,
             unfocused_mode: bevy::winit::UpdateMode::Continuous,
         })
-        .add_systems(Startup, (setup_world, log_task_pools, cli::apply_speed));
+        .add_systems(Startup, (setup_world, log_task_pools, cli::apply_speed))
+        .add_systems(Update, fit_sun_shadows.after(terrain::MapRebuild));
 }
 
 fn log_task_pools() {
@@ -243,8 +245,15 @@ pub(crate) fn sun_rotation() -> Quat {
     Quat::from_euler(EulerRot::YXZ, 0.7, -0.75, 0.0)
 }
 
-/// Sun; terrain chunks come from TerrainPlugin.
-fn setup_world(mut commands: Commands, settings: Res<settings::Settings>) {
+/// Sun; terrain chunks come from TerrainPlugin. The map is set before
+/// Startup (`terrain::generate_terrain`), so the sun starts with that
+/// map's cascades.
+fn setup_world(
+    mut commands: Commands,
+    settings: Res<settings::Settings>,
+    terrain: Option<Res<terrain::Terrain>>,
+) {
+    let wall = terrain.is_some_and(|t| t.kind.has_wall());
     commands.spawn((
         DirectionalLight {
             illuminance: 8_000.0,
@@ -257,21 +266,63 @@ fn setup_world(mut commands: Commands, settings: Res<settings::Settings>) {
         },
         // Lowish sun: flat-shaded relief needs directional contrast.
         Transform::from_rotation(sun_rotation()),
-        // Three cascades out to 280 m, split at 40 and 106 m. The first
-        // covers the close-up, where a soldier's shadow at his feet needs
-        // the finest texels. Soldiers stop casting at about 100 m, where
-        // the camera draws them at L2, so the third holds trees and
-        // terrain: it gives trees their ground shadow and shaded canopy
-        // to mid distance, where without it they read pale. Every cascade
-        // is one more view Bevy walks every mesh for each frame, plus a
-        // pass, about 0.2 ms of render thread whatever it holds.
-        // FL_SHADOW_CASCADES=2 FL_SHADOW_DIST=110 drops the third.
-        bevy::light::CascadeShadowConfigBuilder {
-            num_cascades: crate::util::env_or("FL_SHADOW_CASCADES", 3_usize).clamp(1, 4),
-            first_cascade_far_bound: 40.0,
-            maximum_distance: crate::util::env_or("FL_SHADOW_DIST", 280.0_f32).max(41.0),
-            ..default()
-        }
-        .build(),
+        sun_cascades(wall),
     ));
+}
+
+/// The sun's shadow cascades: three, ending at 40, 106 and 280 m, and on
+/// a map with a wall (`wall`) a fourth ending at 800 m. The first covers
+/// the close-up, where a soldier's shadow at his feet needs the finest
+/// texels. Soldiers stop casting at about 100 m, where the camera draws
+/// them at L2, so the third holds trees and terrain: it gives trees their
+/// ground shadow and shaded canopy to mid distance, where without it they
+/// read pale. The fourth carries the shadows of the wall and its towers
+/// seen from a camera farther off: with nothing past 280 m the wall casts
+/// none and a drum's shadow ends in a straight line. The near three end
+/// at the same distances with or without it, so the near shadows are the
+/// same on every map. Every cascade is one more view Bevy walks every
+/// mesh for each frame, plus a pass, about 0.2 ms of render thread
+/// whatever it holds. FL_SHADOW_CASCADES and FL_SHADOW_DIST, given at
+/// launch, set them instead on every map, the one left unset taking the
+/// map's count or distance (FL_SHADOW_CASCADES=2 FL_SHADOW_DIST=110 keeps
+/// only the first two).
+fn sun_cascades(wall: bool) -> bevy::light::CascadeShadowConfig {
+    let (cascades, dist): (usize, f32) = if wall { (4, 800.0) } else { (3, 280.0) };
+    if std::env::var("FL_SHADOW_CASCADES").is_err() && std::env::var("FL_SHADOW_DIST").is_err() {
+        let mut bounds = vec![40.0, 106.0, 280.0];
+        if wall {
+            bounds.push(800.0);
+        }
+        return bevy::light::CascadeShadowConfig {
+            bounds,
+            ..bevy::light::CascadeShadowConfigBuilder::default().build()
+        };
+    }
+    bevy::light::CascadeShadowConfigBuilder {
+        num_cascades: crate::util::env_or("FL_SHADOW_CASCADES", cascades).clamp(1, 4),
+        first_cascade_far_bound: 40.0,
+        maximum_distance: crate::util::env_or("FL_SHADOW_DIST", dist).max(41.0),
+        ..default()
+    }
+    .build()
+}
+
+/// The sun's cascades follow the map (`sun_cascades`): checked whenever
+/// the terrain changes, which a map picked in the menu does in
+/// `MapRebuild`, and written only when the map needs other bounds, so a
+/// crater dug in the ground leaves them alone.
+fn fit_sun_shadows(
+    terrain: Option<Res<terrain::Terrain>>,
+    mut sun: Query<&mut bevy::light::CascadeShadowConfig, With<DirectionalLight>>,
+) {
+    let Some(terrain) = terrain else { return };
+    if !terrain.is_changed() {
+        return;
+    }
+    let wanted = sun_cascades(terrain.kind.has_wall());
+    for mut config in &mut sun {
+        if config.bounds != wanted.bounds {
+            *config = wanted.clone();
+        }
+    }
 }

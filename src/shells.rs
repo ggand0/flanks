@@ -65,6 +65,7 @@ impl PluginGroup for ViewPlugins {
             .add(crate::balance::BalancePlugin)
             .add(crate::picker::PickerPlugin)
             .add(crate::frame_log::FrameLogPlugin)
+            .add(crate::play_log::PlayLogPlugin)
             .add(crate::sprite_bake::SpriteBakePlugin)
             .add(crate::shots::ShotsPlugin)
     }

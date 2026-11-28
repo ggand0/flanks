@@ -27,7 +27,7 @@ pub(crate) use body::{
     body_distance, crowd_brake, friction_contact, pose_level, ready_body, sep_ease, turn_level, width_level, widths,
     POSE_READY, SEP_RADIUS, STANCE_EASE, STANCE_FIGHT, STANCE_READY,
 };
-pub(crate) use contact::KNIFE_EDGE;
+pub(crate) use contact::{levels_apart, KNIFE_EDGE};
 pub(crate) use fight::{GOING_SPEED, STEP_BACK_TICKS};
 pub(crate) use motion::{ADVANCE_PACE, HOLD_DEADZONE, STEP_PACE, STEP_STOP};
 pub(crate) use passing::{squeezing, stuck_count, stuck_trying, RING_AIMS, STUCK_LEFT};
@@ -97,6 +97,9 @@ pub(crate) struct Field<'a> {
     pub fight_line: &'a [f32],
     pub melee_ticks: &'a [u32],
     pub hold: &'a [bool],
+    /// Per regiment: an archer regiment standing on the wall (sim/job.rs
+    /// `wall_archers`): its men with their bows take no far target.
+    pub wall_archers: &'a [bool],
     pub threat: &'a [Vec2],
     pub form_face: &'a [Vec2],
     pub wall: &'a [u8],
@@ -115,7 +118,7 @@ pub(crate) struct Field<'a> {
     /// The death column at the tick's start: another man's life, read
     /// by the archer who picks him.
     pub death_snap: &'a [u8],
-    pub blocks: &'a [Vec<(Vec2, f32, f32)>; 2],
+    pub blocks: &'a [Vec<crate::arrows::LoftBlock>; 2],
     pub faces_spearwall: [bool; 2],
     pub dt: f32,
     pub tick_seed: u32,
@@ -178,10 +181,13 @@ pub(crate) struct Rows<'a> {
     pub stood: &'a mut [bool],
 }
 
-/// What a chunk emits beside its rows: landed swings and loosed arrows.
+/// What a chunk emits beside its rows: landed swings, loosed arrows, and
+/// the asks of men cut off from their regiment's route for a way back
+/// (sim/route.rs `WayAsk`).
 pub(crate) struct ChunkOut<'a> {
     pub events: &'a mut Vec<DamageEvent>,
     pub arrows: &'a mut Vec<crate::arrows::ArrowSpawn>,
+    pub asks: &'a mut Vec<crate::sim::route::WayAsk>,
 }
 
 /// What one stage of a soldier's tick hands the next: who he is and his
@@ -381,6 +387,9 @@ struct Walk {
     /// parked, he has arrived (`steer`).
     place_dist: f32,
     parked: bool,
+    /// His wish is the way round blocked ground on his regiment's route
+    /// (`follow_route`), not the straight way to his place.
+    rounding: bool,
     jam: f32,
     /// The press's hold on his body this tick (`steer`): the brake's value
     /// before a charge takes his own stopping away.
@@ -397,6 +406,7 @@ impl Walk {
         side: Vec2::ZERO,
         place_dist: f32::INFINITY,
         parked: false,
+        rounding: false,
         jam: 0.0,
         body_jam: 0.0,
         new_v: Vec2::ZERO,
@@ -433,7 +443,7 @@ pub(crate) fn tick_chunk(f: &Field, rows: Rows, out: &mut ChunkOut) {
             stood: &mut rows.stood[j],
         };
         let mut st = begin(f, &mut s);
-        drive(f, &mut s, &mut st);
+        drive(f, &mut s, &mut st, out.asks);
         scan(f, &mut s, &mut st, out, &mut cands);
         look_around(f, &mut s, &mut st);
         choose_opening(f, &mut s, &mut st);

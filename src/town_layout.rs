@@ -55,6 +55,8 @@ use crate::terrain::{MapKind, CELL};
 /// The wall's centre line (z, m): its outer face at +4 looks south down
 /// the climb, the town lies north of its inner face at -4.
 pub const WALL_Z: f32 = -130.0;
+/// Half the wall's thickness (m): its faces at `WALL_Z` -4 and +4.
+pub const WALL_HALF: f32 = 4.0;
 /// The walk's height over the levelled ground (m).
 pub const WALK: f32 = 8.0;
 /// The drum roofs' height over the levelled ground (m).
@@ -70,6 +72,42 @@ pub const STAIR_W: f32 = 4.0;
 /// The stair's rail: this thick, along the flight's open side and across
 /// the platform's far end.
 const RAIL: f32 = 0.5;
+/// How far the stair's rail, the walk's inner kerb and its outer parapet
+/// rise over the floor beside them (m), and the merlons' tips over the
+/// walk: one merlon 1 m wide at the middle of each 2 m wall unit, 1 m
+/// gaps between, as in the wall's models. A drum's roof has the
+/// same parapet and merlons around its rim.
+const KERB: f32 = 0.5;
+const MERLON: f32 = 1.5;
+/// Half a merlon's width along the wall and the gatehouse's bridge (m).
+const MERLON_HALF: f32 = 0.5;
+/// How deep the wall's edge strips are, the parapet with its merlons and
+/// the kerb, and a drum roof's rim (m).
+const EDGE: f32 = 1.0;
+/// Half the walk's clear width between the strips (m).
+const WALK_HALF: f32 = WALL_HALF - EDGE;
+/// The highest any piece reaches over its ground (m): the merlons on a
+/// drum's roof.
+pub const TALLEST: f32 = ROOF + MERLON;
+/// A drum tower's radius (m) and the merlons around its roof's rim.
+const TOWER_R: f32 = 8.0;
+const TOWER_MERLONS: f32 = 24.0;
+/// Half the width of a drum's passage at the walk's height, the towers'
+/// and the gatehouse drums', and of the gatehouse's bridge (m).
+const PASSAGE_HALF: f32 = 4.0;
+/// The gatehouse's drums: their centres either side of the gate (x, m),
+/// their radius (m) and the merlons around each roof's rim.
+const GATE_DRUM_X: f32 = 10.0;
+const GATE_DRUM_R: f32 = 6.0;
+const GATE_DRUM_MERLONS: f32 = 18.0;
+/// Half the gatehouse's gate block (m): it reaches 7 m either side of the
+/// gate into the drums and 5 m out from the wall's line on both sides,
+/// its edge strips past the bridge's 8 m.
+const GATE_BLOCK: Vec2 = Vec2::new(7.0, 5.0);
+/// The merlons on the gate block's outer strip (x, m).
+const GATE_MERLONS_X: [f32; 4] = [-3.0, -1.0, 1.0, 3.0];
+/// The stair's flight along its length (m), its platform after it.
+const FLIGHT: f32 = 12.0;
 /// The house grid: columns and rows of centres on a 30 m pitch.
 const HOUSE_PITCH: f32 = 30.0;
 const HOUSE_COLS: i32 = 10;
@@ -172,26 +210,92 @@ impl Piece {
         if l.x < lo.x - E || l.x > hi.x + E || l.y < lo.y - E || l.y > hi.y + E {
             return None;
         }
+        self.raise_local(l)
+    }
+
+    /// `raise` at the point of the footprint nearest `p`: the height of a
+    /// part that reaches past the footprint, the stair's return rail over
+    /// the wall's strip. Nothing where even that point is off the piece
+    /// (a tower's square corner outside its disc).
+    pub fn raise_clamped(&self, p: Vec2) -> f32 {
+        let (lo, hi) = self.local_bounds();
+        self.raise_local(self.local(p).clamp(lo, hi)).unwrap_or(0.0)
+    }
+
+    /// The top of the piece's solid part at `p` over the ground: the walk's
+    /// inner kerb and outer parapet, the merlons, the stair's rail, a
+    /// drum's roof and the parapet and merlons around its rim, the gate
+    /// block's kerb, parapet and merlons, a house's eaves. What an arrow
+    /// meets there (arrows.rs `arc_clears`).
+    pub fn top(&self, p: Vec2) -> f32 {
+        let (lo, hi) = self.local_bounds();
+        let l = self.local(p).clamp(lo, hi);
+        match self.kind {
+            Kind::Wall | Kind::Landing if l.y > WALK_HALF => {
+                WALK + if l.x.abs() <= MERLON_HALF { MERLON } else { KERB }
+            }
+            Kind::Wall | Kind::Landing => WALK + KERB,
+            Kind::Stair => WALK * (l.x / FLIGHT).clamp(0.0, 1.0) + KERB,
+            Kind::Tower if l.y.abs() > PASSAGE_HALF && l.length() <= TOWER_R => drum_top(l, TOWER_R, TOWER_MERLONS),
+            Kind::Gatehouse => {
+                let drum = |cx: f32| {
+                    let d = l - Vec2::new(cx, 0.0);
+                    (l.y.abs() > PASSAGE_HALF && d.length() <= GATE_DRUM_R).then(|| drum_top(d, GATE_DRUM_R, GATE_DRUM_MERLONS))
+                };
+                if let Some(h) = drum(-GATE_DRUM_X).or_else(|| drum(GATE_DRUM_X)) {
+                    h
+                } else if l.y > PASSAGE_HALF && l.x.abs() <= GATE_BLOCK.x {
+                    // The outer strip: the parapet and its merlons.
+                    let merlon = GATE_MERLONS_X.iter().any(|&x| (l.x - x).abs() <= MERLON_HALF);
+                    WALK + if merlon { MERLON } else { KERB }
+                } else if l.y < -PASSAGE_HALF && l.x.abs() <= GATE_BLOCK.x {
+                    WALK + KERB
+                } else {
+                    self.raise_clamped(p)
+                }
+            }
+            _ => self.raise_clamped(p),
+        }
+    }
+
+    /// The rise per metre of the piece's floor at `p`, as a world vector:
+    /// up the stair's flight, nothing on every level floor.
+    pub fn rise(&self, p: Vec2) -> Vec2 {
+        let l = self.local(p);
+        if self.kind == Kind::Stair && (0.0..FLIGHT).contains(&l.x) {
+            let (c, s) = self.rot();
+            Vec2::new(c, -s) * (WALK / FLIGHT)
+        } else {
+            Vec2::ZERO
+        }
+    }
+
+    /// `raise` at the local point `l`, which is on the footprint.
+    fn raise_local(&self, l: Vec2) -> Option<f32> {
+        const E: f32 = 0.01;
         match self.kind {
             Kind::Wall | Kind::Landing => Some(WALK),
             Kind::House(_) => Some(EAVES),
             // The flight, then the platform from 12 m on.
-            Kind::Stair => Some(WALK * (l.x / 12.0).clamp(0.0, 1.0)),
+            Kind::Stair => Some(WALK * (l.x / FLIGHT).clamp(0.0, 1.0)),
             Kind::Tower => {
-                if l.y.abs() <= 4.0 + E {
+                if l.y.abs() <= PASSAGE_HALF + E {
                     Some(WALK)
-                } else if l.length() <= 8.0 + E {
+                } else if l.length() <= TOWER_R + E {
                     Some(ROOF)
                 } else {
                     None
                 }
             }
             Kind::Gatehouse => {
-                let drum = |cx: f32| (l - Vec2::new(cx, 0.0)).length() <= 6.0 + E;
-                if l.y.abs() <= 4.0 + E {
+                let drum = |cx: f32| (l - Vec2::new(cx, 0.0)).length() <= GATE_DRUM_R + E;
+                if l.y.abs() <= PASSAGE_HALF + E {
                     Some(WALK)
-                } else if drum(-10.0) || drum(10.0) {
+                } else if drum(-GATE_DRUM_X) || drum(GATE_DRUM_X) {
                     Some(ROOF)
+                } else if l.x.abs() <= GATE_BLOCK.x + E && l.y.abs() <= GATE_BLOCK.y + E {
+                    // The gate block's edge strips, at the walk's height.
+                    Some(WALK)
                 } else {
                     None
                 }
@@ -208,8 +312,8 @@ impl Piece {
         let (lo, hi) = self.local_bounds();
         let inside = l.x >= lo.x && l.x <= hi.x && l.y >= lo.y && l.y <= hi.y;
         match self.kind {
-            Kind::Wall => inside.then_some(if l.y.abs() <= 3.0 { Surface::Clear } else { Surface::Solid }),
-            Kind::Landing => inside.then_some(if l.y <= 3.0 { Surface::Clear } else { Surface::Solid }),
+            Kind::Wall => inside.then_some(if l.y.abs() <= WALK_HALF { Surface::Clear } else { Surface::Solid }),
+            Kind::Landing => inside.then_some(if l.y <= WALK_HALF { Surface::Clear } else { Surface::Solid }),
             Kind::House(_) => inside.then_some(Surface::Solid),
             Kind::Stair => {
                 // The return rail across the far end reaches a metre over
@@ -224,21 +328,21 @@ impl Piece {
                 Some(if rail { Surface::Solid } else { Surface::Clear })
             }
             Kind::Tower => {
-                if l.length() > 8.0 {
+                if l.length() > TOWER_R {
                     None
-                } else if l.y.abs() <= 4.0 {
+                } else if l.y.abs() <= PASSAGE_HALF {
                     Some(Surface::Clear)
                 } else {
                     Some(Surface::Solid)
                 }
             }
             Kind::Gatehouse => {
-                let drum = |cx: f32| (l - Vec2::new(cx, 0.0)).length() <= 6.0;
-                let strip = inside && l.y.abs() <= 4.0;
-                let block = l.x.abs() <= 5.0 && l.y.abs() <= 5.0;
+                let drum = |cx: f32| (l - Vec2::new(cx, 0.0)).length() <= GATE_DRUM_R;
+                let strip = inside && l.y.abs() <= PASSAGE_HALF;
+                let block = l.x.abs() <= GATE_BLOCK.x && l.y.abs() <= GATE_BLOCK.y;
                 if strip {
                     Some(Surface::Clear)
-                } else if drum(-10.0) || drum(10.0) || block {
+                } else if drum(-GATE_DRUM_X) || drum(GATE_DRUM_X) || block {
                     Some(Surface::Solid)
                 } else {
                     None
@@ -246,6 +350,19 @@ impl Piece {
             }
         }
     }
+}
+
+/// The top of a drum's roof at `d` from its centre, inside its radius `r`:
+/// the roof, and on the rim's outer `EDGE` the parapet with `merlons`
+/// merlons, the first toward +x, each as wide as the gap after it (the
+/// models' battlement, 24 merlons on a tower and 18 on a gatehouse drum).
+fn drum_top(d: Vec2, r: f32, merlons: f32) -> f32 {
+    if d.length() < r - EDGE {
+        return ROOF;
+    }
+    let pitch = std::f32::consts::TAU / merlons;
+    let off = (d.y.atan2(d.x) / pitch).round() * pitch - d.y.atan2(d.x);
+    ROOF + if off.abs() <= pitch * 0.25 { MERLON } else { KERB }
 }
 
 /// The wall units of one curtain: centres every 2 m from `a` to `b`.
@@ -501,6 +618,325 @@ pub fn sim_ground(ground: &[f32], origin: Vec2, dims: (usize, usize), pieces: &[
     SimGround { heights, open }
 }
 
+/// The fine ground's cell (m): a quarter of a metre, so a man's body
+/// stops within an eighth of a metre of a rail, a kerb or a face.
+pub const FINE: f32 = 0.25;
+/// The highest step a man takes from one floor onto the next (m): two of
+/// the stair model's 0.2 m risers. Between two fine cells a man could
+/// stand on, a rise this high or more is a cliff.
+const STEP: f32 = 0.5;
+/// A fine cell on no piece.
+const NO_PIECE: u16 = u16::MAX;
+/// A fine cell's flags: no man stands there; a piece's solid part.
+const F_BLOCKED: u8 = 1;
+const F_SOLID: u8 = 2;
+
+/// The ground over the pieces as the sim reads it, on a `FINE` grid: per
+/// cell, whether a man may stand there and which piece's surface it is.
+/// The 2 m vertex grid can open only whole 2 m squares, so on a stair
+/// whose clear tread is 3.5 m wide it opens one row of vertices and gives
+/// a man's centre 0.75 m of it, and a point beside a face blends the two
+/// levels across the cell. Read here, a man stands where the model's
+/// floor is, at the floor's own height.
+///
+/// A cell is solid where its centre is on a piece's solid part, clear
+/// where it is on a piece's clear surface and on no solid part, and
+/// otherwise off the pieces, where the drawn ground's own step rule
+/// (`natural_blocked`) decides. A clear or natural cell is also blocked
+/// where it lies a `STEP` or more above or below a 4-neighbour that is
+/// not solid: an end tower's passage onto air. Its height is the drawn
+/// ground plus the piece's (`Piece::raise`), exact at any point, so the
+/// stair is one slope from its foot to its platform.
+#[derive(Clone)]
+pub struct FineGround {
+    origin: Vec2,
+    nx: usize,
+    nz: usize,
+    piece: Vec<u16>,
+    flags: Vec<u8>,
+    /// Per cell, the distance to the nearest blocked cell (m), capped at
+    /// `CLEAR_CAP`: how far a straight line steps from it.
+    clear: Vec<f32>,
+    pieces: Vec<Piece>,
+    /// Per `BLOCK` of cells, row-major `bx` wide: whether a piece's bounds,
+    /// a metre and a cell more, reach into it.
+    by_piece: Vec<bool>,
+    bx: usize,
+    bz: usize,
+}
+
+/// The fine ground's clearance cap (m).
+const CLEAR_CAP: f32 = 8.0;
+/// The side of the fine ground's square blocks of cells (cells): 4 m.
+const BLOCK: usize = 16;
+
+impl FineGround {
+    /// The cell holding `(x, z)`, None off the grid.
+    #[inline]
+    fn index(&self, x: f32, z: f32) -> Option<usize> {
+        let g = (Vec2::new(x, z) - self.origin) / FINE;
+        if g.x < 0.0 || g.y < 0.0 {
+            return None;
+        }
+        let (i, k) = (g.x as usize, g.y as usize);
+        (i < self.nx && k < self.nz).then(|| k * self.nx + i)
+    }
+
+    /// Whether `(x, z)` is on the grid, and if so whether a man may not
+    /// stand there.
+    #[inline]
+    pub fn blocked(&self, x: f32, z: f32) -> Option<bool> {
+        self.index(x, z).map(|i| self.flags[i] & F_BLOCKED != 0)
+    }
+
+    /// Whether `(x, z)` is in a block a piece reaches into (false off the
+    /// grid): where a reader of the pieces' heights reads every cell.
+    #[inline]
+    pub fn by_a_piece(&self, x: f32, z: f32) -> bool {
+        self.index(x, z).is_some_and(|_| {
+            let b = ((Vec2::new(x, z) - self.origin) / (FINE * BLOCK as f32)).floor();
+            self.by_piece[b.y as usize * self.bx + b.x as usize]
+        })
+    }
+
+    /// How far along `dir` (a unit vector) from `p` the line reaches the
+    /// first block a piece reaches into (`by_a_piece`), within `max` m: 0
+    /// where `p` is in one, None where the line meets none by then. A
+    /// reader that strides over open ground stops there, so no stride
+    /// steps over a piece. Walks the line block by block: one or two
+    /// blocks per 4 m of `max`.
+    pub fn to_piece(&self, p: Vec2, dir: Vec2, max: f32) -> Option<f32> {
+        let size = FINE * BLOCK as f32;
+        let mut t = if self.index(p.x, p.y).is_some() { 0.0 } else { self.entry(p, dir)? };
+        if t > max {
+            return None;
+        }
+        let g = (p + dir * t - self.origin) / size;
+        let (mut bx, mut bz) = ((g.x.floor().max(0.0) as usize).min(self.bx - 1), (g.y.floor().max(0.0) as usize).min(self.bz - 1));
+        // Per axis: the distance along the line to the block's next edge,
+        // and between edges; infinite along an axis the line keeps to.
+        let axis = |p: f32, d: f32, o: f32, b: usize| {
+            if d.abs() < 1e-9 {
+                (f32::INFINITY, f32::INFINITY)
+            } else {
+                let edge = o + (b as f32 + if d > 0.0 { 1.0 } else { 0.0 }) * size;
+                ((edge - p) / d, size / d.abs())
+            }
+        };
+        let (mut next_x, step_x) = axis(p.x, dir.x, self.origin.x, bx);
+        let (mut next_z, step_z) = axis(p.y, dir.y, self.origin.y, bz);
+        loop {
+            if self.by_piece[bz * self.bx + bx] {
+                return Some(t);
+            }
+            t = next_x.min(next_z);
+            if t > max {
+                return None;
+            }
+            // Into the neighbouring block, None past the grid's.
+            let (b, n, d, step, next) =
+                if next_x < next_z { (&mut bx, self.bx, dir.x, step_x, &mut next_x) } else { (&mut bz, self.bz, dir.y, step_z, &mut next_z) };
+            *next += step;
+            if d > 0.0 {
+                *b += 1;
+                if *b >= n {
+                    return None;
+                }
+            } else if *b == 0 {
+                return None;
+            } else {
+                *b -= 1;
+            }
+        }
+    }
+
+    /// How far along `dir` (a unit vector) from `p` the grid begins: None
+    /// where `p` is on it already or the line never meets it.
+    fn entry(&self, p: Vec2, dir: Vec2) -> Option<f32> {
+        let (lo, hi) = (self.origin, self.origin + Vec2::new(self.nx as f32, self.nz as f32) * FINE);
+        let (mut t0, mut t1) = (0.0f32, f32::INFINITY);
+        for (p, d, lo, hi) in [(p.x, dir.x, lo.x, hi.x), (p.y, dir.y, lo.y, hi.y)] {
+            if d.abs() < 1e-9 {
+                if p < lo || p >= hi {
+                    return None;
+                }
+                continue;
+            }
+            let (a, b) = ((lo - p) / d, (hi - p) / d);
+            t0 = t0.max(a.min(b));
+            t1 = t1.min(a.max(b));
+        }
+        (t0 > 0.0 && t0 <= t1).then_some(t0)
+    }
+
+    /// Whether `(x, z)` is on a piece's solid part (false off the grid).
+    #[inline]
+    pub fn solid(&self, x: f32, z: f32) -> bool {
+        self.index(x, z).is_some_and(|i| self.flags[i] & F_SOLID != 0)
+    }
+
+    /// On the grid: the height the pieces add over the drawn ground at
+    /// `(x, z)`, nothing off them: a floor's height on a clear cell, the
+    /// top of the solid part on a solid one (`Piece::top`).
+    #[inline]
+    pub fn raise(&self, x: f32, z: f32) -> Option<f32> {
+        let i = self.index(x, z)?;
+        let k = self.piece[i];
+        Some(if k == NO_PIECE {
+            0.0
+        } else if self.flags[i] & F_SOLID != 0 {
+            self.pieces[k as usize].top(Vec2::new(x, z))
+        } else {
+            self.pieces[k as usize].raise_clamped(Vec2::new(x, z))
+        })
+    }
+
+    /// On the grid: the rise per metre the pieces add at `(x, z)`, as a
+    /// world vector: the stair's flight, nothing elsewhere.
+    #[inline]
+    pub fn rise(&self, x: f32, z: f32) -> Option<Vec2> {
+        let i = self.index(x, z)?;
+        let k = self.piece[i];
+        Some(if k == NO_PIECE || self.flags[i] & F_SOLID != 0 {
+            Vec2::ZERO
+        } else {
+            self.pieces[k as usize].rise(Vec2::new(x, z))
+        })
+    }
+
+    /// On the grid: None where `p` is blocked, else how far a straight
+    /// line from `p` may step before it can meet a blocked cell (its
+    /// cell's clearance less a cell's diagonal, at least a quarter cell).
+    #[inline]
+    pub fn line_step(&self, p: Vec2) -> Option<Option<f32>> {
+        let i = self.index(p.x, p.y)?;
+        Some((self.flags[i] & F_BLOCKED == 0).then(|| (self.clear[i] - FINE * std::f32::consts::SQRT_2).max(FINE * 0.25)))
+    }
+
+    /// The cell's edges along `axis` (0 for x, 1 for z) at `(x, z)`, None
+    /// off the grid: where a body stops at a blocked cell.
+    #[inline]
+    pub fn edges(&self, x: f32, z: f32, axis: usize) -> Option<(f32, f32)> {
+        self.index(x, z)?;
+        let (p, o) = if axis == 0 { (x, self.origin.x) } else { (z, self.origin.y) };
+        let lo = o + ((p - o) / FINE).floor() * FINE;
+        Some((lo, lo + FINE))
+    }
+}
+
+/// The fine ground over `pieces` (`FineGround`). `ground` is the drawn
+/// ground's height at a point and `natural_blocked` its step rule there,
+/// for the cells off the pieces.
+pub fn fine_ground(
+    pieces: &[Piece],
+    ground: impl Fn(Vec2) -> f32,
+    natural_blocked: impl Fn(Vec2) -> bool,
+) -> FineGround {
+    // The pieces' bounds and two vertex cells more on every side. The
+    // vertex grid's piece rules (`sim_ground`) block a vertex up to a cell
+    // past a piece's bounds, and a point reads its nearest vertex, so off
+    // this grid such a vertex's square would block ground up to a cell
+    // and a half out: past an end tower's tip, the grass beside its
+    // passage's cliff. On the grid a cell is decided by its own rules. The
+    // stair's return rail, a metre past the stair's bounds, is on it too.
+    let (mut lo, mut hi) = (Vec2::splat(f32::INFINITY), Vec2::splat(f32::NEG_INFINITY));
+    for p in pieces {
+        let (a, b) = p.bounds();
+        lo = lo.min(a);
+        hi = hi.max(b);
+    }
+    let margin = 2.0 * CELL;
+    let origin = lo - Vec2::splat(margin);
+    let (nx, nz) =
+        (((hi.x - origin.x + margin) / FINE).ceil() as usize, ((hi.y - origin.y + margin) / FINE).ceil() as usize);
+    let centre = |i: usize, k: usize| origin + (Vec2::new(i as f32, k as f32) + 0.5) * FINE;
+    // The pieces near each 4 m block of cells, so a cell asks a few.
+    let (bx, bz) = (nx.div_ceil(BLOCK), nz.div_ceil(BLOCK));
+    let mut near: Vec<Vec<u16>> = vec![Vec::new(); bx * bz];
+    for (k, p) in pieces.iter().enumerate() {
+        let (a, b) = p.bounds();
+        let (a, b) = (a - Vec2::splat(1.0 + FINE), b + Vec2::splat(1.0 + FINE));
+        let to = |v: Vec2| (((v - origin) / (FINE * BLOCK as f32)).max(Vec2::ZERO)).floor();
+        let (ia, ib) = (to(a), to(b));
+        for zb in ia.y as usize..=(ib.y as usize).min(bz - 1) {
+            for xb in ia.x as usize..=(ib.x as usize).min(bx - 1) {
+                near[zb * bx + xb].push(k as u16);
+            }
+        }
+    }
+    let mut piece = vec![NO_PIECE; nx * nz];
+    let mut flags = vec![0u8; nx * nz];
+    for k in 0..nz {
+        for i in 0..nx {
+            let c = centre(i, k);
+            // The highest solid part and the highest clear surface there.
+            let (mut solid, mut clear) = (None::<(f32, u16)>, None::<(f32, u16)>);
+            for &j in &near[(k / BLOCK) * bx + i / BLOCK] {
+                let p = &pieces[j as usize];
+                let h = p.raise_clamped(c);
+                let best = |b: Option<(f32, u16)>| if b.is_none_or(|(bh, _)| h > bh) { Some((h, j)) } else { b };
+                match p.surface(c) {
+                    Some(Surface::Solid) => solid = best(solid),
+                    Some(Surface::Clear) => clear = best(clear),
+                    None => {}
+                }
+            }
+            let at = k * nx + i;
+            if let Some((_, j)) = solid {
+                piece[at] = j;
+                flags[at] = F_SOLID | F_BLOCKED;
+            } else if let Some((_, j)) = clear {
+                piece[at] = j;
+            } else if natural_blocked(c) {
+                flags[at] = F_BLOCKED;
+            }
+        }
+    }
+    // A cliff between two cells a man could stand on blocks both: the side
+    // of the flight's top beside the landing, a tower's passage onto air.
+    let height = |i: usize, k: usize| {
+        let c = centre(i, k);
+        let j = piece[k * nx + i];
+        ground(c) + if j == NO_PIECE { 0.0 } else { pieces[j as usize].raise_clamped(c) }
+    };
+    let cliff = STEP;
+    let mut drop = vec![false; nx * nz];
+    for k in 0..nz {
+        for i in 0..nx {
+            if flags[k * nx + i] & F_SOLID != 0 {
+                continue;
+            }
+            let h = height(i, k);
+            let mut look = |i2: usize, k2: usize| {
+                if flags[k2 * nx + i2] & F_SOLID == 0 && (height(i2, k2) - h).abs() >= cliff {
+                    drop[k * nx + i] = true;
+                }
+            };
+            if i > 0 {
+                look(i - 1, k);
+            }
+            if i + 1 < nx {
+                look(i + 1, k);
+            }
+            if k > 0 {
+                look(i, k - 1);
+            }
+            if k + 1 < nz {
+                look(i, k + 1);
+            }
+        }
+    }
+    for (f, d) in flags.iter_mut().zip(&drop) {
+        if *d {
+            *f |= F_BLOCKED;
+        }
+    }
+    let open: Vec<bool> = flags.iter().map(|f| f & F_BLOCKED == 0).collect();
+    let clear = crate::nav::clearance(&open, nx, nz, FINE, CLEAR_CAP);
+    let by_piece = near.iter().map(|n| !n.is_empty()).collect();
+    FineGround { origin, nx, nz, piece, flags, clear, pieces: pieces.to_vec(), by_piece, bx, bz }
+}
+
 /// A straight stretch of ground with fixed rows a unit stands in: the
 /// wall's walk. Along x, facing +z.
 #[derive(Clone, Copy, Debug)]
@@ -595,6 +1031,73 @@ mod tests {
         assert_eq!(count(Kind::Gatehouse), 1);
     }
 
+    /// A stair's floor is one slope from its foot to its platform at
+    /// every point across its tread: the drawn ground plus 8 m over the
+    /// 12 m flight, with no step where the 2 m grid's cells meet.
+    #[test]
+    fn a_stairs_floor_is_one_slope_across_its_whole_tread() {
+        let t = build_terrain(MapKind::WallDebug);
+        for &s in &STAIRS_X {
+            let foot = WALL_Z - 4.0;
+            let mut z = foot - STAIR_W + RAIL + 0.05;
+            while z < foot {
+                let mut lx = 0.05f32;
+                while lx < 12.0 {
+                    let (x, h) = (s + lx, t.height_at(s + lx, z));
+                    let want = t.ground_at(x, z) + WALK * lx / 12.0;
+                    assert!((h - want).abs() < 1e-3, "stair at {s}: height {h} at ({x}, {z}), the slope gives {want}");
+                    lx += 0.05;
+                }
+                z += 0.1;
+            }
+        }
+    }
+
+    /// On a stair a man's centre may stand anywhere on the tread less his
+    /// body's radius on either side: from the rail to the wall's face, as
+    /// wide as the model's 3.5 m tread, to within a fine cell.
+    #[test]
+    fn a_man_stands_across_a_stairs_whole_tread() {
+        let t = build_terrain(MapKind::WallDebug);
+        let r = t.body_radius();
+        let foot = WALL_Z - 4.0;
+        for &s in &STAIRS_X {
+            for lx in [1.0f32, 4.0, 8.0] {
+                let free = |z: f32| t.body_free(s + lx, z, r, 0.0, 1.0) && t.body_free(s + lx, z, r, 0.0, -1.0);
+                let (mut lo, mut hi) = (foot - 2.0, foot - 2.0);
+                assert!(free(lo), "stair at {s}: the tread's middle at {lx} m is not free");
+                while free(lo - 0.01) {
+                    lo -= 0.01;
+                }
+                while free(hi + 0.01) {
+                    hi += 0.01;
+                }
+                let (want_lo, want_hi) = (foot - STAIR_W + RAIL + r, foot - r);
+                assert!((lo - want_lo).abs() <= FINE && (hi - want_hi).abs() <= FINE,
+                    "stair at {s}, {lx} m up: centres from {lo} to {hi}, the tread gives {want_lo} to {want_hi}");
+            }
+        }
+    }
+
+    /// A man pushed at a stair's rail stops with his body's edge at the
+    /// rail, not with his edge past it on the ground beyond: the rail is
+    /// thinner than his radius.
+    #[test]
+    fn a_man_pushed_at_a_rail_stops_at_the_rail() {
+        let t = build_terrain(MapKind::WallDebug);
+        let r = t.body_radius();
+        let rail = WALL_Z - 4.0 - STAIR_W + RAIL;
+        for &s in &STAIRS_X {
+            for lx in [3.0f32, 9.0, 14.0] {
+                let x = s + lx;
+                assert!(!t.body_free(x, rail + r - 0.05, r, 0.0, -1.0), "stair at {s}, {lx} m: a body steps into the rail");
+                assert!(t.body_free(x, rail + r + 0.05, r, 0.0, -1.0), "stair at {s}, {lx} m: a body stops short of the rail");
+                let off = t.body_overlap(x, rail + r - 0.2, r);
+                assert!((off.y - 0.2).abs() < 1e-3, "stair at {s}, {lx} m: a body 0.2 m into the rail moves {off}");
+            }
+        }
+    }
+
     /// The wall's terrace is levelled before the house pads, so the wall
     /// stands at the same height on both maps: the walk, the bridge, a
     /// tower's passage and the stairs, in the sim's ground and the drawn.
@@ -608,6 +1111,82 @@ mod tests {
             assert_eq!(town.height_at(p.x, p.y), debug.height_at(p.x, p.y), "the sim's height at {p}");
             assert_eq!(town.ground_at(p.x, p.y), debug.ground_at(p.x, p.y), "the drawn ground at {p}");
             assert_eq!(town.blocked_at(p.x, p.y), debug.blocked_at(p.x, p.y), "blocked at {p}");
+        }
+    }
+
+    /// Past an end tower's tip, where its passage ends in air 8 m up, the
+    /// grass is open: on both maps a man stands and walks every way at
+    /// every point from 2 to 3 m past the tower, across the passage's
+    /// width and more.
+    #[test]
+    fn a_man_walks_on_the_grass_past_an_end_towers_tip() {
+        for map in [MapKind::WallDebug, MapKind::WalledTown] {
+            let t = build_terrain(map);
+            let r = t.body_radius();
+            let towers: Vec<_> = pieces(map).into_iter().filter(|p| p.kind == Kind::Tower).map(|p| p.bounds()).collect();
+            let west = towers.iter().map(|b| b.0.x).fold(f32::INFINITY, f32::min);
+            let east = towers.iter().map(|b| b.1.x).fold(f32::NEG_INFINITY, f32::max);
+            for (tip, out) in [(west, -1.0f32), (east, 1.0)] {
+                let mut d = 2.0f32;
+                while d <= 3.0 {
+                    let x = tip + out * d;
+                    let mut z = WALL_Z - 5.0;
+                    while z <= WALL_Z + 5.0 {
+                        let walks = [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)].iter().all(|&(dx, dz)| t.body_free(x, z, r, dx, dz));
+                        assert!(walks && t.body_overlap(x, z, r) == Vec2::ZERO, "{map:?}: a man cannot stand and walk at ({x}, {z}), {d} m past the tower");
+                        z += 0.05;
+                    }
+                    d += 0.05;
+                }
+            }
+        }
+    }
+
+    /// Within two vertex cells of any piece's bounds every point is on the
+    /// fine ground, and it is blocked exactly where the fine ground's own
+    /// rules block it: on a solid part, at a cliff of a `STEP` or more to
+    /// a 4-neighbour that is not solid, or off the pieces by the drawn
+    /// ground's step rule. The vertex grid never answers there.
+    #[test]
+    fn near_the_pieces_the_fine_grounds_own_rules_block() {
+        for map in [MapKind::WallDebug, MapKind::WalledTown] {
+            let t = build_terrain(map);
+            let f = t.fine().expect("the fine ground");
+            let dims = t.grid_verts();
+            let natural = |c: Vec2| {
+                let g = ((c - t.min()) / CELL).round();
+                let (x, z) = ((g.x.max(0.0) as usize).min(dims.0 - 1), (g.y.max(0.0) as usize).min(dims.1 - 1));
+                crate::terrain::vertex_blocked(t.ground_heights(), dims, x, z)
+            };
+            let mut seen = vec![false; f.nx * f.nz];
+            for p in pieces(map) {
+                let (a, b) = p.bounds();
+                let (a, b) = (a - Vec2::splat(2.0 * CELL), b + Vec2::splat(2.0 * CELL));
+                let (i0, k0) = (((a.x - f.origin.x) / FINE).floor() as i64, ((a.y - f.origin.y) / FINE).floor() as i64);
+                let (i1, k1) = (((b.x - f.origin.x) / FINE).ceil() as i64, ((b.y - f.origin.y) / FINE).ceil() as i64);
+                for k in k0..k1 {
+                    for i in i0..i1 {
+                        let c = f.origin + (Vec2::new(i as f32, k as f32) + 0.5) * FINE;
+                        if c.x < a.x || c.x > b.x || c.y < a.y || c.y > b.y {
+                            continue;
+                        }
+                        let at = f.index(c.x, c.y).unwrap_or_else(|| panic!("{map:?}: ({c}) is off the fine ground"));
+                        if std::mem::replace(&mut seen[at], true) {
+                            continue;
+                        }
+                        let solid = f.solid(c.x, c.y);
+                        let h = t.height_at(c.x, c.y);
+                        let cliff = !solid
+                            && [(FINE, 0.0), (-FINE, 0.0), (0.0, FINE), (0.0, -FINE)].iter().any(|&(dx, dz)| {
+                                let n = c + Vec2::new(dx, dz);
+                                f.index(n.x, n.y).is_some() && !f.solid(n.x, n.y) && (t.height_at(n.x, n.y) - h).abs() >= STEP
+                            });
+                        let off = f.piece[at] == NO_PIECE && natural(c);
+                        assert_eq!(t.blocked_at(c.x, c.y), solid || cliff || off,
+                            "{map:?}: ({c}) solid {solid}, cliff {cliff}, natural {off}");
+                    }
+                }
+            }
         }
     }
 }

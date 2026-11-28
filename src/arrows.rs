@@ -47,7 +47,14 @@ const LITTER_CAP_DEFAULT: usize = 50_000;
 /// Body-hit lateral radius (m): the shaft passes within this of a
 /// soldier's axis to strike him. A man is about 0.5 m across the torso
 /// and 0.8 m with his arms.
-const HIT_RADIUS: f32 = 0.35;
+pub(crate) const HIT_RADIUS: f32 = 0.35;
+/// How far over a man's head a shaft still strikes him (m): the top of
+/// his hit band, below the launch height (LAUNCH_OVER_HEAD) or shooters
+/// hit themselves.
+pub(crate) const HIT_OVER_HEAD: f32 = 0.05;
+/// The last metres before the man aimed at, where the flat shot comes
+/// down on him: a friendly block there is not read by the loft test.
+const LOFT_NEAR_TARGET: f32 = 2.0;
 /// FL_WOUND=<share> overrides `missile::WOUND_SHARE` for calibration.
 fn wound_share() -> f32 {
     static W: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
@@ -94,6 +101,12 @@ pub struct Arrows {
     /// the attached fly-loop sounds (audio.rs) — tracks this instead.
     pub id: Vec<u32>,
     next_id: u32,
+    /// Where and how fast it left the bow, and the ticks it has flown:
+    /// its path so far for the arrow view (`FL_ARROW_VIZ`), exact from
+    /// these three since the flight is a fixed sum of steps.
+    pub launch: Vec<Vec3>,
+    pub launch_vel: Vec<Vec3>,
+    pub age: Vec<u16>,
 }
 
 impl Arrows {
@@ -110,6 +123,9 @@ impl Arrows {
         self.team.swap_remove(i);
         self.group.swap_remove(i);
         self.id.swap_remove(i);
+        self.launch.swap_remove(i);
+        self.launch_vel.swap_remove(i);
+        self.age.swap_remove(i);
     }
 
     fn clear(&mut self) {
@@ -121,6 +137,9 @@ impl Arrows {
         self.team.clear();
         self.group.clear();
         self.id.clear();
+        self.launch.clear();
+        self.launch_vel.clear();
+        self.age.clear();
     }
 }
 
@@ -147,6 +166,8 @@ pub struct ArrowStats {
     /// Since the start, for the archery tally: arrows loosed, and by the
     /// victim's team and kind the men struck, wounded and killed.
     pub loosed_total: u64,
+    /// Arrows loosed since the start, by the shooters' team.
+    pub loosed_team: [u64; 2],
     pub struck: [[u32; crate::unit_types::NUM_KINDS]; 2],
     pub wounded: [[u32; crate::unit_types::NUM_KINDS]; 2],
     pub killed: [[u32; crate::unit_types::NUM_KINDS]; 2],
@@ -210,6 +231,7 @@ impl Plugin for ArrowsPlugin {
             .init_resource::<RegTracks>()
             .init_resource::<ArrowStats>()
             .init_resource::<StuckArrows>()
+            .init_resource::<ArrowMarks>()
             .add_systems(
                 FixedUpdate,
                 (
@@ -225,13 +247,14 @@ impl Plugin for ArrowsPlugin {
     }
 }
 
-/// The arrows on screen: the flying shafts and the ground litter.
+/// The arrows on screen: the flying shafts, the ground litter and the
+/// arrow view (`FL_ARROW_VIZ`).
 pub struct ArrowsViewPlugin;
 
 impl Plugin for ArrowsViewPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(Startup, setup_arrow_buckets)
-            .add_systems(Update, (sync_arrow_instances, sync_stuck_instances));
+            .add_systems(Update, (sync_arrow_instances, sync_stuck_instances, draw_arrow_viz));
     }
 }
 
@@ -257,91 +280,169 @@ fn setup_arrow_buckets(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>)
     ));
 }
 
-/// Solve a launch velocity from `from` to `to` (M2TW model: the engine
-/// picks a speed in the 20..48 m/s band and an arc that fits). The flat
+/// A friendly regiment as the loft test reads it (sim/job.rs
+/// `loft_blocks`): its block as its men's bodies take it up (`rect`: its
+/// outer places and a body's hit radius past them), the ground under its
+/// men's centroid (`floor`), its men's height (`head`) and its rank pitch
+/// (`rank`).
+#[derive(Clone, Copy)]
+pub struct LoftBlock {
+    pub rect: crate::formation::BlockRect,
+    pub floor: f32,
+    pub head: f32,
+    pub rank: f32,
+}
+
+/// Solve a launch velocity from `from` to `to`: a speed in the 20..48 m/s
+/// band and an arc that fits. The flat
 /// low-root solution at full draw when the path clears every friendly
-/// block AND the terrain en route; otherwise the slowest lofted arc
-/// that reaches — a high lob just over the crowd (M2TW's
-/// loft-over-friendlies; the ~65 degree max angle emerges from the
-/// speed floor). `blocks` = friendly regiment discs as
-/// (centroid, radius, clearance top y).
-pub fn solve_launch(
-    from: Vec3,
-    to: Vec3,
-    blocks: &[(Vec2, f32, f32)],
-    terrain: &crate::terrain::Terrain,
-) -> Vec3 {
+/// block and the ground en route; otherwise the slowest lofted arc that
+/// reaches, a high lob just over the crowd (the loft over friendlies;
+/// the ~65 degree max angle emerges from the speed floor), when that arc
+/// clears the ground; otherwise None: no arc reaches the man without
+/// striking the ground, a wall, its parapet or its merlons first, and
+/// the archer does not loose at him. `blocks` are the shooter's side's
+/// regiments (`LoftBlock`): the flat arc lofts over a block it passes over
+/// low enough to strike a man of it (`flat_clears`), so a one-rank line
+/// shooting out over nothing of its own shoots flat.
+pub fn solve_launch(from: Vec3, to: Vec3, blocks: &[LoftBlock], terrain: &crate::terrain::Terrain) -> Option<Vec3> {
     let flat = to.xz() - from.xz();
     let d = flat.length().max(0.5);
     let dir = flat / d;
     let dy = to.y - from.y;
     let g = missile::GRAVITY;
+    let arc_y = |s: f32, tan: f32, vv: f32| from.y + s * tan - g * s * s * (1.0 + tan * tan) / (2.0 * vv);
 
     let mut vv = missile::SPEED_MAX * missile::SPEED_MAX;
     let disc = vv * vv - g * (g * d * d + 2.0 * dy * vv);
-    let mut tan = f32::MAX;
     let mut lofted = disc <= 0.0;
+    let mut tan = f32::MAX;
     if !lofted {
         tan = (vv - disc.sqrt()) / (g * d);
-        // Does the flat arc clear the friendlies under it? Height of the
-        // parabola at forward distance x: x*tan - g*x^2*(1+tan^2)/(2*vv).
-        for &(c, r, top) in blocks {
-            let s = (c - from.xz()).dot(dir);
-            if s < 2.0 || s > d - 2.0 {
-                continue;
-            }
-            let lat = (c - from.xz()).perp_dot(dir).abs();
-            if lat > r {
-                continue;
-            }
-            let y = from.y + s * tan - g * s * s * (1.0 + tan * tan) / (2.0 * vv);
-            if y < top {
-                lofted = true;
-                break;
-            }
-        }
+        lofted = !flat_clears(from, dir, d, blocks, |s| arc_y(s, tan, vv), terrain);
     }
-    if !lofted {
-        // Terrain line of sight: ground RISING above the shooter's feet
-        // blocks the flat shot — firing up a slope, the flat arc threads
-        // exactly where the uphill front rank's heads are (rear archers
-        // shot their own front rows), or straight into the hillside.
-        // Only raised ground counts: flat fields keep their flat
-        // volleys, downhill stays a sniping shot, and the last meters
-        // are exempt (the arrow has to come down on the target). The
-        // arc must clear a head standing on any such rise.
-        let from_ground = terrain.height_at(from.x, from.z);
-        let head = crate::unit_types::tallest() + 0.2;
-        let step = (d / 24.0).max(4.0);
-        let mut s = 2.0_f32;
-        while s < d - 4.0 {
-            let p = from.xz() + dir * s;
-            let g_s = terrain.height_at(p.x, p.y);
-            if g_s > from_ground + 0.35 {
-                let y = from.y + s * tan - g * s * s * (1.0 + tan * tan) / (2.0 * vv);
-                if y < g_s + head {
-                    lofted = true;
-                    break;
-                }
-            }
-            s += step;
-        }
+    // Ground RISING above the shooter's feet blocks the flat shot where
+    // the arc passes under a head standing on it: firing up a slope, the
+    // flat arc threads exactly where the uphill front rank's heads are
+    // (rear archers shot their own front rows), or into the hillside.
+    // Only ground a man stands on counts; flat fields keep their flat
+    // volleys and downhill stays a sniping shot.
+    let to_ground = terrain.height_at(to.x, to.z);
+    if !lofted && !arc_clears(from, dir, d, to_ground, |s| arc_y(s, tan, vv), terrain, true) {
+        lofted = true;
     }
     if lofted {
         // Slowest speed that still reaches -> the high root sits near
         // the minimum-energy 45 degrees, +15% keeps it a clean lob
         // instead of a grazing edge case.
         let vmin2 = g * (dy + (dy * dy + d * d).sqrt());
-        vv = (vmin2 * 1.15).clamp(
-            missile::SPEED_MIN * missile::SPEED_MIN,
-            missile::SPEED_MAX * missile::SPEED_MAX,
-        );
+        vv = (vmin2 * 1.15).clamp(missile::SPEED_MIN * missile::SPEED_MIN, missile::SPEED_MAX * missile::SPEED_MAX);
         let disc = vv * vv - g * (g * d * d + 2.0 * dy * vv);
         tan = (vv + disc.max(0.0).sqrt()) / (g * d);
+        if !arc_clears(from, dir, d, to_ground, |s| arc_y(s, tan, vv), terrain, false) {
+            return None;
+        }
     }
     let cos = 1.0 / (1.0 + tan * tan).sqrt();
     let speed = vv.sqrt();
-    Vec3::new(dir.x * speed * cos, speed * tan * cos, dir.y * speed * cos)
+    Some(Vec3::new(dir.x * speed * cos, speed * tan * cos, dir.y * speed * cos))
+}
+
+/// The flat arc `arc_y` (height at distance s along the line) from `from`
+/// along `dir` for `d` metres passes over every friendly block in `blocks`
+/// too high to strike a man of it. An arc is a curve with its top between
+/// its ends, so over the stretch of the line inside a block it is lowest
+/// at the stretch's ends: there it must be over the heads of the men
+/// standing on the ground below by more than a shaft's hit band
+/// (`HIT_OVER_HEAD`, the test `update_arrows` strikes a man by). In a block
+/// the shooter stands in, his own, the stretch begins at the near edge of
+/// the body of the man a rank ahead of him; it ends LOFT_NEAR_TARGET short
+/// of the man aimed at, where the shaft comes down on him. On a map with
+/// blocked ground an end over ground on another level than the block's
+/// own (past the wall's face, over its parapet) reads the block's ground,
+/// where its men stand. Per block a slab test, and for a block the line
+/// crosses two heights read.
+fn flat_clears(
+    from: Vec3,
+    dir: Vec2,
+    d: f32,
+    blocks: &[LoftBlock],
+    arc_y: impl Fn(f32) -> f32,
+    terrain: &crate::terrain::Terrain,
+) -> bool {
+    let levels = terrain.kind.has_blocked_ground();
+    let end = d - LOFT_NEAR_TARGET;
+    blocks.iter().all(|b| {
+        let Some((s0, s1)) = b.rect.line_span(from.xz(), dir) else { return true };
+        let s0 = if s0 <= 0.0 { b.rank - HIT_RADIUS } else { s0 };
+        let s1 = s1.min(end);
+        if s0 > s1 {
+            return true;
+        }
+        [s0, s1].into_iter().all(|s| {
+            let q = from.xz() + dir * s;
+            let ground = terrain.height_at(q.x, q.y);
+            let half = 0.5 * b.head;
+            let floor = if levels && crate::sim::soldier::levels_apart(ground - b.floor, half, half) { b.floor } else { ground };
+            arc_y(s) > floor + b.head + HIT_OVER_HEAD
+        })
+    })
+}
+
+/// The arc `arc_y` (height at distance s along the line) from `from`
+/// along `dir` for `d` metres to a man standing on ground `to_ground`
+/// stays above the ground under it, and with `heads` above a head
+/// standing on ground that rises above the shooter's feet. Over the last
+/// `NEAR_TARGET` metres the shaft comes down on the man, so ground there
+/// no higher than his own does not count; a wall or its battlements
+/// before him do. Read every `d / 24` metres, never closer than 4, and
+/// near a piece every fine cell (terrain.rs `fine`), so a parapet, a
+/// merlon, a wall's face or a house in the way is met.
+fn arc_clears(
+    from: Vec3,
+    dir: Vec2,
+    d: f32,
+    to_ground: f32,
+    arc_y: impl Fn(f32) -> f32,
+    terrain: &crate::terrain::Terrain,
+    heads: bool,
+) -> bool {
+    /// The stretch before the man where the shaft comes down on him.
+    const NEAR_TARGET: f32 = 4.0;
+    let from_ground = terrain.height_at(from.x, from.z);
+    let head = crate::unit_types::tallest() + 0.2;
+    let coarse = (d / 24.0).max(4.0);
+    let fine = terrain.fine();
+    // On a map with the wall's pieces, from just past his own body: the
+    // parapet or the merlon he stands behind is less than a metre before
+    // him. The vertex grid has nothing that near, and its reads start 2 m
+    // out. His own rank's heads count from 2 m.
+    let mut s = if fine.is_some() { crate::town_layout::FINE } else { 2.0 };
+    while s < d {
+        let p = from.xz() + dir * s;
+        let g_s = terrain.height_at(p.x, p.y);
+        let y = arc_y(s);
+        let near = s >= d - NEAR_TARGET;
+        if near && g_s <= to_ground + 0.35 {
+            // His own ground: the shaft lands on him there.
+        } else if y < g_s {
+            return false;
+        }
+        if !near && heads && s >= 2.0 && g_s > from_ground + 0.35 && y < g_s + head && !terrain.blocked_at(p.x, p.y) {
+            return false;
+        }
+        let by_a_piece = fine.is_some_and(|f| f.by_a_piece(p.x, p.y));
+        s += if by_a_piece {
+            crate::town_layout::FINE
+        } else {
+            // A stride over open ground ends where a piece's block begins:
+            // a whole one could land past the parapet and the merlons on a
+            // wall's near face, or through a house.
+            let to_piece = fine.and_then(|f| f.to_piece(p, dir, coarse)).map_or(f32::INFINITY, |e| e + 0.5 * crate::town_layout::FINE);
+            coarse.min(to_piece)
+        };
+    }
+    true
 }
 
 #[allow(clippy::too_many_arguments)] // bevy system params
@@ -359,6 +460,7 @@ fn update_arrows(
     mut tracks: ResMut<RegTracks>,
     time: Res<Time>,
     mut sounds: Option<ResMut<crate::audio::SoundEvents>>,
+    mut marks: ResMut<ArrowMarks>,
     mut tick: Local<u32>,
 ) {
     let _timed = Timed(&ARROW_UPDATE_NS, std::time::Instant::now());
@@ -389,6 +491,7 @@ fn update_arrows(
             }
             stats.loosed += 1;
             stats.loosed_total += 1;
+            stats.loosed_team[(s.team as usize).min(1)] += 1;
             if let Some(se) = sounds.as_deref_mut() {
                 se.push_loose(s.group, s.pos);
             }
@@ -402,6 +505,9 @@ fn update_arrows(
             arrows.group.push(s.group);
             let id = arrows.next_id;
             arrows.id.push(id);
+            arrows.launch.push(s.pos);
+            arrows.launch_vel.push(s.vel);
+            arrows.age.push(0);
             arrows.next_id = arrows.next_id.wrapping_add(1);
         }
     }
@@ -423,6 +529,11 @@ fn update_arrows(
     }
     let mut hits: Vec<Hit> = Vec::new();
     let strike_band = crate::unit_types::tallest() + STRIKE_MARGIN;
+    let viz = arrow_viz();
+    let now = time.elapsed_secs();
+    if viz {
+        marks.0.retain(|&(_, _, t)| now - t < MARK_S);
+    }
     let mut i = 0;
     while i < arrows.len() {
         let prev = arrows.pos[i];
@@ -434,9 +545,13 @@ fn update_arrows(
         arrows.pos[i] = p;
         arrows.vel[i] = v;
         (arrows.yaw[i], arrows.pitch[i]) = flight_angles(v);
+        arrows.age[i] = arrows.age[i].saturating_add(1);
 
+        // Near a piece the whole step is read, not its end: a merlon or a
+        // rail is thinner than an arrow's step.
+        let wall_t = flight_hit(&terrain, prev, p);
         let ground = terrain.height_at(p.x, p.z);
-        if p.y.min(prev.y) > ground + strike_band {
+        if wall_t.is_none() && p.y.min(prev.y) > ground + strike_band {
             i += 1;
             continue;
         }
@@ -456,15 +571,19 @@ fn update_arrows(
             }
             let u = o.idx as usize;
             let t = ((o.xz() - a).dot(ab) / len2).clamp(0.0, 1.0);
+            // A man behind the stone the shaft strikes first is not hit.
+            if wall_t.is_some_and(|w| t > w) {
+                return;
+            }
             if o.xz().distance_squared(a + ab * t) > HIT_RADIUS * HIT_RADIUS {
                 return;
             }
             let arrow_y = prev.y + (p.y - prev.y) * t;
             let hh = crate::unit_types::half_height(units.kind[u] as usize);
             let uy = units.pos[u].y;
-            // The top margin stays below the launch height
+            // The top margin (HIT_OVER_HEAD) stays below the launch height
             // (LAUNCH_OVER_HEAD) or shooters hit themselves.
-            if arrow_y < uy - hh || arrow_y > uy + hh + 0.05 {
+            if arrow_y < uy - hh || arrow_y > uy + hh + HIT_OVER_HEAD {
                 return;
             }
             if best.is_none_or(|(bt, _)| t < bt) {
@@ -489,9 +608,38 @@ fn update_arrows(
                 });
                 stats.hits += 1;
                 stats.landed += 1;
+                if viz {
+                    marks.push(units.pos[u], Mark::Man, now);
+                }
                 arrows.swap_remove(i);
                 continue;
             }
+        }
+
+        // Stone or ground near a piece, struck inside the step:
+        // planted where it struck.
+        if let Some(t) = wall_t {
+            let q = prev.lerp(p, t);
+            let dir = v.normalize_or_zero();
+            let yaw = dir.x.atan2(dir.z);
+            let pitch = dir.y.atan2(dir.xz().length());
+            stuck.push(InstanceData {
+                position: q - dir * 0.16,
+                w: 1.0,
+                color: [1.0, 1.0, 1.0, 0.0],
+                anim: [yaw, 0.0, 0.0, 0.0],
+                anim2: [0.0, 0.0, pitch, 0.0],
+            });
+            stats.landed += 1;
+            if let Some(se) = sounds.as_deref_mut() {
+                se.push_arrow_ground(q);
+            }
+            if viz {
+                let stone = terrain.fine().is_some_and(|f| f.solid(q.x, q.z));
+                marks.push(q, if stone { Mark::Stone } else { Mark::Ground }, now);
+            }
+            arrows.swap_remove(i);
+            continue;
         }
 
         // Ground: plant the shaft where it struck, angled as it flew.
@@ -512,6 +660,9 @@ fn update_arrows(
             stats.landed += 1;
             if let Some(se) = sounds.as_deref_mut() {
                 se.push_arrow_ground(Vec3::new(p.x, ground, p.z));
+            }
+            if viz {
+                marks.push(Vec3::new(p.x, ground, p.z), Mark::Ground, now);
             }
             arrows.swap_remove(i);
             continue;
@@ -707,6 +858,95 @@ fn sync_arrow_instances(
     }
 }
 
+/// Where in its step `a` to `b` an arrow by a piece strikes the floor or
+/// the stone under it, as the share of the step (0 to 1), None where it
+/// strikes nothing there or the step passes no block a piece reaches
+/// into (town_layout.rs `FineGround::to_piece`). Read every fine cell
+/// (terrain.rs `fine`), so a merlon, a parapet or a rail in the step is
+/// met; skipped for an arrow above the tallest piece.
+fn flight_hit(terrain: &crate::terrain::Terrain, a: Vec3, b: Vec3) -> Option<f32> {
+    let f = terrain.fine()?;
+    let (flat, len) = ((b - a).xz(), (b - a).xz().length());
+    let by_a_piece = if len > 1e-6 { f.to_piece(a.xz(), flat / len, len).is_some() } else { f.by_a_piece(a.x, a.z) };
+    if !by_a_piece {
+        return None;
+    }
+    if a.y.min(b.y) > terrain.ground_at(b.x, b.z) + crate::town_layout::TALLEST {
+        return None;
+    }
+    let n = ((b - a).xz().length() / crate::town_layout::FINE).ceil().max(1.0) as usize;
+    (1..=n).map(|k| k as f32 / n as f32).find(|&t| {
+        let q = a.lerp(b, t);
+        q.y <= terrain.height_at(q.x, q.z)
+    })
+}
+
+/// FL_ARROW_VIZ=1: the arrow view. Each flying arrow's path from its bow
+/// to where it is, green for a flat shot and orange for a lob (launched
+/// steeper than 30 degrees), and for four seconds a mark where each one
+/// ended: red on the wall's stone, white on the ground, yellow on a man.
+/// Drawn only; the flight is the same with it off.
+fn arrow_viz() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FL_ARROW_VIZ").is_ok_and(|v| v == "1"))
+}
+
+/// Where an arrow ended, for the arrow view.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mark {
+    Ground,
+    Stone,
+    Man,
+}
+
+/// The arrow view's marks: where each arrow ended and when (s).
+#[derive(Resource, Default)]
+struct ArrowMarks(Vec<(Vec3, Mark, f32)>);
+
+impl ArrowMarks {
+    fn push(&mut self, at: Vec3, mark: Mark, now: f32) {
+        self.0.push((at, mark, now));
+    }
+}
+
+/// How long the arrow view shows where an arrow ended (s).
+const MARK_S: f32 = 4.0;
+
+/// The arrow view (`arrow_viz`), drawn every frame. The marks are kept
+/// and aged out on the tick (`update_arrows`).
+fn draw_arrow_viz(
+    arrows: Res<Arrows>,
+    marks: Res<ArrowMarks>,
+    fixed: Res<Time<Fixed>>,
+    mut gizmos: Gizmos,
+) {
+    if !arrow_viz() {
+        return;
+    }
+    let dt = fixed.timestep().as_secs_f32();
+    let g = missile::GRAVITY;
+    for i in 0..arrows.len() {
+        let (p0, v0, n) = (arrows.launch[i], arrows.launch_vel[i], arrows.age[i] as f32);
+        let lob = v0.y > 0.577 * v0.xz().length();
+        let color = if lob { Color::srgb(1.0, 0.55, 0.1) } else { Color::srgb(0.2, 1.0, 0.3) };
+        // The flight's own sum: after m steps of v.y -= g dt, p += v dt.
+        let at = |m: f32| p0 + v0 * (m * dt) - Vec3::Y * (g * dt * dt * m * (m + 1.0) * 0.5);
+        const K: usize = 16;
+        gizmos.linestrip((0..=K).map(|j| at(n * j as f32 / K as f32)), color);
+    }
+    for &(at, mark, _) in &marks.0 {
+        let color = match mark {
+            Mark::Ground => Color::srgb(1.0, 1.0, 1.0),
+            Mark::Stone => Color::srgb(1.0, 0.1, 0.1),
+            Mark::Man => Color::srgb(1.0, 0.95, 0.1),
+        };
+        let r = 0.35;
+        gizmos.line(at - Vec3::X * r, at + Vec3::X * r, color);
+        gizmos.line(at - Vec3::Z * r, at + Vec3::Z * r, color);
+        gizmos.line(at, at + Vec3::Y * 0.8, color);
+    }
+}
+
 /// A shaft's heading and climb (radians) from its velocity.
 #[inline]
 fn flight_angles(v: Vec3) -> (f32, f32) {
@@ -727,4 +967,184 @@ fn sync_stuck_instances(
     stuck.dirty = false;
     data.0.clear();
     data.0.extend_from_slice(&stuck.data);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::terrain::{build_terrain, MapKind};
+    use crate::town_layout::{WALK, WALL_Z};
+
+    /// The pitch of a launch above the flat: rise over run.
+    fn climb(v: Vec3) -> f32 {
+        v.y / v.xz().length()
+    }
+
+    /// A flat shot over a friendly block that stands up to the man aimed
+    /// at clears the block's middle, where its arc is highest, with room
+    /// to spare, and comes down into the heads of its far ranks: it is
+    /// lofted. With nothing in the way the same shot is flat.
+    #[test]
+    fn a_flat_arc_over_a_block_is_read_where_it_leaves_the_block() {
+        let terrain = build_terrain(MapKind::Grassland);
+        let h = |p: Vec2| terrain.height_at(p.x, p.y);
+        let tallest = crate::unit_types::tallest();
+        let (a, b) = (Vec2::ZERO, Vec2::new(0.0, 100.0));
+        let from = Vec3::new(a.x, h(a) + tallest + LAUNCH_OVER_HEAD, a.y);
+        let to = Vec3::new(b.x, h(b) + AIM_HEIGHT * tallest, b.y);
+        let flat = solve_launch(from, to, &[], &terrain).expect("a shot");
+        assert!(climb(flat) < 0.4, "the open shot is flat: {}", climb(flat));
+        let centre = Vec2::new(0.0, 50.0);
+        let block = LoftBlock {
+            rect: crate::formation::BlockRect { centre, fwd: Vec2::Y, half_w: 5.0, half_d: 48.0 },
+            floor: h(centre),
+            head: tallest,
+            rank: 1.5,
+        };
+        // The flat arc at the block's middle, 1.3 m over its heads and more.
+        let (vh, tan) = (flat.xz().length(), climb(flat));
+        let arc = |s: f32| from.y + s * tan - missile::GRAVITY * s * s / (2.0 * vh * vh);
+        assert!(arc(50.0) > block.floor + tallest + 1.3);
+        let shot = solve_launch(from, to, &[block], &terrain).expect("a shot");
+        assert!(climb(shot) > 0.7, "the shot over the block is lofted: {}", climb(shot));
+    }
+
+    /// Archers four ranks deep on the walk shooting down at a man 30 m out
+    /// at the wall's foot: the flat shot of a man of the rear rank comes
+    /// down through the heads of the ranks before him, so he lofts; a man
+    /// of the front rank has nobody of his before him and shoots flat.
+    #[test]
+    fn a_rear_rank_on_the_walk_lofts_over_its_front_ranks() {
+        let terrain = build_terrain(MapKind::WallDebug);
+        let tallest = crate::unit_types::tallest();
+        let rank = 1.1;
+        let centre = Vec2::new(120.0, WALL_Z);
+        let block = LoftBlock {
+            rect: crate::formation::BlockRect { centre, fwd: Vec2::Y, half_w: 10.0, half_d: 1.5 * rank + HIT_RADIUS },
+            floor: terrain.height_at(centre.x, centre.y),
+            head: tallest,
+            rank,
+        };
+        let man = Vec2::new(120.0, WALL_Z + 30.0);
+        let to = Vec3::new(man.x, terrain.height_at(man.x, man.y) + AIM_HEIGHT * tallest, man.y);
+        let launch = |z: f32| Vec3::new(centre.x, block.floor + tallest + LAUNCH_OVER_HEAD, z);
+        let rear = solve_launch(launch(WALL_Z - 1.5 * rank), to, &[block], &terrain).expect("a shot");
+        assert!(climb(rear) > 0.7, "the rear rank's shot is lofted: {}", climb(rear));
+        let front = solve_launch(launch(WALL_Z + 1.5 * rank), to, &[block], &terrain).expect("a shot");
+        assert!(climb(front) < 0.4, "the front rank's shot is flat: {}", climb(front));
+    }
+
+    /// A straight shot from the slope at a man standing on the walk
+    /// behind a merlon meets the merlon, from every distance: the read
+    /// over open ground ends where the wall's pieces begin, so no stride
+    /// lands past the stone on the wall's outer face.
+    #[test]
+    fn a_shot_at_a_man_behind_a_merlon_meets_the_merlon_from_any_distance() {
+        let terrain = build_terrain(MapKind::WallDebug);
+        // The merlons' row on the outer face, and a merlon's middle on it,
+        // on the curtain east of the gatehouse (x 16 m on either side of
+        // 0), past the stair's platform and short of the tower at x 80.
+        let row = WALL_Z + 3.5;
+        let stone = |x: f32| terrain.height_at(x, row) - terrain.ground_at(x, row);
+        let x = (0..80).map(|k| 60.0 + k as f32 * 0.05).find(|&x| stone(x) > WALK + 1.4 && stone(x + 0.3) > WALK + 1.4);
+        let x = x.expect("a merlon on the outer face") + 0.15;
+        let man = Vec2::new(x, row - 1.5);
+        let floor = terrain.height_at(man.x, man.y);
+        assert!((floor - terrain.ground_at(man.x, man.y) - WALK).abs() < 1e-3, "the man stands on the walk");
+        let to = Vec3::new(man.x, floor + AIM_HEIGHT * crate::unit_types::tallest(), man.y);
+        // Out to the bow's flat reach at its top speed (48 m/s, 235 m),
+        // where a stride over open ground is near 10 m: it ends where the
+        // first block a wall unit reaches into begins, at least 1.25 m
+        // before the unit's outer face.
+        let mut out = 12.0f32;
+        while out < 240.0 {
+            let z = row + out;
+            let from = Vec3::new(x, terrain.height_at(x, z) + 1.5, z);
+            let d = (to.xz() - from.xz()).length();
+            let line = |s: f32| from.y + (to.y - from.y) * s / d;
+            assert!(
+                !arc_clears(from, Vec2::NEG_Y, d, floor, line, &terrain, false),
+                "a straight shot from {out} m out passes the merlon"
+            );
+            out += 0.37;
+        }
+    }
+
+    /// A straight shot from the open ground east of the walled town at a
+    /// man standing behind a house meets the house from 20 to 200 m out,
+    /// though the stride over the open ground between the houses is
+    /// coarse; and the same shot at a man beside the house reaches him.
+    #[test]
+    fn a_shot_at_a_man_behind_a_house_meets_the_house_from_any_distance() {
+        let terrain = build_terrain(MapKind::WalledTown);
+        let houses: Vec<_> = crate::town_layout::pieces(MapKind::WalledTown)
+            .into_iter()
+            .filter(|p| matches!(p.kind, crate::town_layout::Kind::House(_)))
+            .collect();
+        // The first house of the easternmost column: nothing stands east
+        // of it.
+        let east = houses.iter().map(|p| p.pos.x).fold(f32::MIN, f32::max);
+        let house = houses.iter().find(|p| p.pos.x == east).expect("a house");
+        let (lo, hi) = house.bounds();
+        let shot = |man: Vec2, out: f32| {
+            let floor = terrain.height_at(man.x, man.y);
+            let to = Vec3::new(man.x, floor + AIM_HEIGHT * crate::unit_types::tallest(), man.y);
+            let x = man.x + out;
+            let from = Vec3::new(x, terrain.height_at(x, man.y) + 1.5, man.y);
+            let d = (to.xz() - from.xz()).length();
+            let line = |s: f32| from.y + (to.y - from.y) * s / d;
+            arc_clears(from, Vec2::NEG_X, d, floor, line, &terrain, false)
+        };
+        let (behind, beside) = (Vec2::new(lo.x - 1.0, house.pos.y), Vec2::new(lo.x - 1.0, hi.y + 2.0));
+        let mut out = 20.0f32;
+        while out <= 200.0 {
+            assert!(!shot(behind, out), "a straight shot from {out} m out passes the house at {}", house.pos);
+            assert!(shot(beside, out), "a straight shot from {out} m out misses the man beside the house at {}", house.pos);
+            out += 0.37;
+        }
+    }
+
+    /// An arrow at chest height through the gatehouse's gate block, on its
+    /// edge strips outside the bridge, strikes the block: it stands at the
+    /// walk's height with its kerb, parapet and merlons, out to the drums.
+    #[test]
+    fn an_arrow_through_the_gate_blocks_edge_strips_strikes_the_block() {
+        let terrain = build_terrain(MapKind::WallDebug);
+        for z in [WALL_Z - 4.5, WALL_Z + 4.5] {
+            let mut x = -5.75f32;
+            while x < 5.5 {
+                let at = |x: f32| Vec3::new(x, terrain.ground_at(x, z) + 1.2, z);
+                assert!(flight_hit(&terrain, at(x), at(x + 0.5)).is_some(), "an arrow from ({x}, {z}) at chest height flies through the block");
+                x += 0.5;
+            }
+        }
+    }
+
+    /// An arrow over a drum's roof just under the merlons' tips strikes a
+    /// merlon on the rim and passes a gap between two, and just over the
+    /// parapet in a gap it strikes the parapet: a tower's 24 merlons and a
+    /// gatehouse drum's 18, the first toward +x.
+    #[test]
+    fn an_arrow_over_a_drums_rim_meets_its_merlons_and_its_parapet() {
+        let terrain = build_terrain(MapKind::WallDebug);
+        let tower = Vec2::new(crate::town_layout::TOWERS_X[1], WALL_Z);
+        let gate_drum = Vec2::new(10.0, WALL_Z);
+        for (centre, r, merlons) in [(tower, 7.5f32, 24.0f32), (gate_drum, 5.5, 18.0)] {
+            let pitch = std::f32::consts::TAU / merlons;
+            // Beside the passage: the rim's quarter on either side.
+            for k in [(merlons / 4.0).floor(), (merlons * 3.0 / 4.0).floor()] {
+                for (angle, merlon) in [(k * pitch, true), ((k + 0.5) * pitch, false)] {
+                    let c = centre + Vec2::new(angle.cos(), angle.sin()) * r;
+                    let tangent = Vec2::new(-angle.sin(), angle.cos()) * 0.1;
+                    let at = |h: f32, side: f32| {
+                        let p = c + tangent * side;
+                        Vec3::new(p.x, terrain.ground_at(p.x, p.y) + h, p.y)
+                    };
+                    let step = |h: f32| flight_hit(&terrain, at(h, -1.0), at(h, 1.0)).is_some();
+                    assert_eq!(step(13.2), merlon, "an arrow 13.2 m up over the rim at {c}, the merlon's middle: {merlon}");
+                    assert!(step(12.3), "an arrow 12.3 m up over the rim at {c} passes the parapet");
+                }
+            }
+        }
+    }
 }
