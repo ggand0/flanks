@@ -3,22 +3,26 @@
 
 use bevy::prelude::*;
 
+use crate::game_state::{BattleClock, PerBattle};
 use crate::orders::Groups;
+
+/// The front test's stage, its next reorder time and the regiment held
+/// near the front with where it stood.
+type FrontTest = (u32, f32, Option<(u32, Vec2)>);
 
 /// FL_TEST_FRONT=1: march both armies of regiments into contact to form a
 /// battle line, hold one regiment unordered near the front (drift watch),
 /// then push it through the line as a salient.
 pub(super) fn test_front_script(
-    time: Res<Time>,
+    clock: Res<BattleClock>,
     mut groups: ResMut<Groups>,
-    mut stage: Local<u32>,
-    mut next_reorder: Local<f32>,
-    mut watch: Local<Option<(u32, Vec2)>>,
+    mut state: Local<PerBattle<FrontTest>>,
 ) {
     if std::env::var("FL_TEST_FRONT").is_err() {
         return;
     }
-    let t = time.elapsed_secs();
+    let (stage, next_reorder, watch) = state.of(&clock);
+    let t = clock.secs();
 
     // Stand-in for player/AI: idle unengaged regiments ATTACK their
     // nearest enemy regiment every 15 s so remnant pockets hunt each

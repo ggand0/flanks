@@ -582,8 +582,25 @@ impl Plugin for OrdersPlugin {
         // Groups start empty; the regiment spawn (regiments.rs) fills the
         // list once at startup and it stays FIXED for the whole battle —
         // stable indices are what make `units.group` a permanent regiment id.
+        // The selection is plain data the scripts and the battle setup
+        // touch too, so it lives with the regiments.
         app.init_resource::<Groups>()
-            .init_resource::<OrderDrag>()
+            .init_resource::<crate::selection::Selection>()
+            .add_systems(
+                FixedUpdate,
+                clear_arrived_orders
+                    .after(crate::sim::step_sim)
+                    .in_set(crate::game_state::SimSet),
+            );
+    }
+}
+
+/// The player's orders: the mouse and the keys, and their drawing.
+pub struct OrdersViewPlugin;
+
+impl Plugin for OrdersViewPlugin {
+    fn build(&self, app: &mut App) {
+        app.init_resource::<OrderDrag>()
             .add_systems(
                 Update,
                 (
@@ -597,12 +614,6 @@ impl Plugin for OrdersPlugin {
                     ),
                     draw_order_gizmos,
                 ),
-            )
-            .add_systems(
-                FixedUpdate,
-                clear_arrived_orders
-                    .after(crate::sim::step_sim)
-                    .in_set(crate::game_state::SimSet),
             );
     }
 }

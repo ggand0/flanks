@@ -4,6 +4,7 @@
 
 use bevy::prelude::*;
 
+use crate::game_state::{BattleClock, PerBattle};
 use crate::orders::Groups;
 use crate::regiments::{REG_GAP, spawn_regiment};
 use crate::terrain::Terrain;
@@ -185,10 +186,11 @@ pub(crate) fn spawn_routpass_test(units: &mut Units, terrain: &Terrain, groups: 
 /// letting friends through costs.
 pub(super) fn pass_line_script(
     mut groups: ResMut<crate::orders::Groups>,
-    time: Res<Time>,
-    mut sent: Local<bool>,
+    clock: Res<BattleClock>,
+    mut sent: Local<PerBattle<bool>>,
 ) {
-    if *sent || std::env::var("FL_PASS_LINE").is_err() || time.elapsed_secs() < 10.0 {
+    let sent = sent.of(&clock);
+    if *sent || std::env::var("FL_PASS_LINE").is_err() || clock.secs() < 10.0 {
         return;
     }
     *sent = true;
@@ -219,6 +221,10 @@ pub(super) fn pass_line_script(
     info!("[pass-line] {n} rear regiments ordered 120 m through the line in front");
 }
 
+/// The routpass log's next time, the passer's and the crossing
+/// regiment's times in and out of A, and whether the passer was sent on.
+type RoutpassTest = (f32, [(Option<f32>, Option<f32>); 2], bool);
+
 /// FL_TEST_ROUTPASS bookkeeping every 2 s: A's shape while the passer
 /// walks through it, the overlap floor, the passers inside A's
 /// rectangle (its frame about its anchor), and A's men off their file
@@ -228,10 +234,8 @@ pub(super) fn routpass_test_log(
     units: Res<Units>,
     mut groups: ResMut<crate::orders::Groups>,
     stats: Res<crate::sim::SimStats>,
-    time: Res<Time>,
-    mut next: Local<f32>,
-    mut passes: Local<[(Option<f32>, Option<f32>); 2]>,
-    mut sent_on: Local<bool>,
+    clock: Res<BattleClock>,
+    mut state: Local<PerBattle<RoutpassTest>>,
 ) {
     if std::env::var("FL_TEST_ROUTPASS").is_err() || groups.list.len() < 2 {
         return;
@@ -241,7 +245,8 @@ pub(super) fn routpass_test_log(
         .ok()
         .and_then(|_| groups.list.iter().rposition(|gd| gd.team == 0))
         .filter(|&g| g > 1);
-    let t = time.elapsed_secs();
+    let (next, passes, sent_on) = state.of(&clock);
+    let t = clock.secs();
     if std::env::var("FL_ROUTPASS_STOP").is_ok() && t >= 30.0 && !*sent_on {
         *sent_on = true;
         let p = &mut groups.list[1];
@@ -286,7 +291,7 @@ pub(super) fn routpass_test_log(
             info!("[routpass-test] {name}: first in t={t0:.1}s, last out t={t:.1}s, {:.1} s", t - t0);
         }
     };
-    let [pass, cross_pass] = &mut *passes;
+    let [pass, cross_pass] = passes;
     time_the_pass(pass, inside, "pass");
     if cross_g.is_some() {
         time_the_pass(cross_pass, cross_in, "cross pass");

@@ -2,6 +2,7 @@
 
 use bevy::prelude::*;
 
+use crate::game_state::{BattleClock, PerBattle};
 use crate::orders::Groups;
 use crate::regiments::spawn_regiment;
 use crate::terrain::Terrain;
@@ -84,11 +85,12 @@ pub(crate) fn spawn_pile_test(units: &mut Units, terrain: &Terrain, groups: &mut
 
 /// FL_TEST_PILE bookkeeping every 4 s: victim strength + how many of
 /// the six attackers are actually fighting.
-pub(super) fn pile_test_log(groups: Res<Groups>, units: Res<Units>, time: Res<Time>, mut next: Local<f32>) {
+pub(super) fn pile_test_log(groups: Res<Groups>, units: Res<Units>, clock: Res<BattleClock>, mut next: Local<PerBattle<f32>>) {
     if std::env::var("FL_TEST_PILE").is_err() || groups.list.len() < 2 {
         return;
     }
-    let t = time.elapsed_secs();
+    let next = next.of(&clock);
+    let t = clock.secs();
     if t < *next {
         return;
     }

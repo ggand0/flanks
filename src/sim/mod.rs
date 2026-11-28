@@ -98,7 +98,6 @@ impl Plugin for SimPlugin {
             .init_resource::<CombatScale>()
             .init_resource::<DamageBuffers>()
             .init_resource::<DirTestStats>()
-            .insert_resource(DebugViz(true))
             .init_resource::<SpatialGrid>()
             .init_resource::<TickPipeline>()
             .init_resource::<SharedTerrain>()
@@ -112,7 +111,17 @@ impl Plugin for SimPlugin {
                     kick_tick.after(route::update_routes),
                 )
                     .in_set(crate::game_state::SimSet),
-            )
+            );
+    }
+}
+
+/// The sim's debug drawing: the debug gizmos' toggle, the routes and the
+/// contact view.
+pub struct SimViewPlugin;
+
+impl Plugin for SimViewPlugin {
+    fn build(&self, app: &mut App) {
+        app.insert_resource(DebugViz(true))
             .init_resource::<contact_viz::ContactViz>()
             .add_systems(
                 Update,
@@ -274,7 +283,7 @@ pub fn take_tick(
 
 /// FL_PIPELINE=0 computes every tick inline inside FixedUpdate, exactly
 /// as the sim ran before the tick left the frame path: the fallback and
-/// the A/B knob, bit-identical by FL_HASH.
+/// the A/B switch.
 fn pipeline_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| !std::env::var("FL_PIPELINE").is_ok_and(|v| v == "0"))
@@ -735,6 +744,7 @@ pub fn step_sim(
     mut dir_stats: ResMut<DirTestStats>,
     mut sounds: Option<ResMut<crate::audio::SoundEvents>>,
     mut routes: ResMut<route::Routes>,
+    (clock, outcome): (Res<crate::game_state::BattleClock>, Res<crate::ai::BattleOutcome>),
 ) {
     let _frame_log = crate::frame_log::time_step();
     let _tick_log = crate::frame_log::tick::time(crate::frame_log::tick::Part::Step);
@@ -817,7 +827,8 @@ pub fn step_sim(
     pipeline.tick = pipeline.tick.wrapping_add(1);
     let tick = pipeline.tick;
     let audit = job.audit.take();
-    audit_and_log(audit, tick, &units, &grid, &mut stats);
+    // A `--ticks` run's last tick prints its hash whether FL_HASH is set or not.
+    audit_and_log(audit, tick, crate::cli::last_tick(&clock, &outcome), &units, &grid, &mut stats);
 
     pipeline.scratch = Some(job);
 }
@@ -848,11 +859,12 @@ fn install_job(job: &mut TickJob, u: &mut Units) {
 }
 
 /// The installed tick's numbers: the neighbour audit on its ticks, the
-/// FL_HASH fingerprint and the spike line.
+/// FL_HASH fingerprint (on its cadence, or `hash_now`) and the spike line.
 #[inline]
 fn audit_and_log(
     audit: Option<diag::NeighbourSums>,
     tick: u32,
+    hash_now: bool,
     units: &Units,
     grid: &SpatialGrid,
     stats: &mut SimStats,
@@ -869,7 +881,7 @@ fn audit_and_log(
             .unwrap_or_else(|| diag::neighbour_sums(grid, &units.pos_prev[..]));
         diag::audit_stats(stats, &sums, &units.pos[..], &units.pos_prev[..]);
     }
-    diag::fingerprint(tick, units);
+    diag::fingerprint(tick, hash_now, units);
     diag::spike_line(stats, tick, units.pos.len());
 }
 
@@ -893,7 +905,7 @@ pub fn kick_tick(
     mut pipeline: ResMut<TickPipeline>,
     (handoff, settings): (
         Option<ResMut<crate::render_units_gpu::SnapshotHandoff>>,
-        Res<crate::settings::Settings>,
+        Option<Res<crate::settings::Settings>>,
     ),
     mut routes: ResMut<route::Routes>,
 ) {
@@ -929,7 +941,7 @@ pub fn kick_tick(
     // the same columns after Update (render_units_gpu.rs).
     if let Some(mut handoff) = handoff.filter(|_| crate::render_units_gpu::job_packs_snapshot()) {
         job.pack = Some(handoff.expect((units.generation, pipeline.tick), units.last_changed()));
-        job.hit_flash = settings.interface.hit_flash;
+        job.hit_flash = settings.is_some_and(|s| s.interface.hit_flash);
     }
     let worker = pipeline.worker.get_or_insert_with(TickWorker::default);
     worker.to_worker.lock().unwrap().send(job).expect("sim tick worker alive");

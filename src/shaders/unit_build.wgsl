@@ -202,6 +202,16 @@ struct Params {
     // and way he fell ((kind * 4 + fall) * 2): forward, back, right, left,
     // then up and down (`fall_way`).
     bound_settled: array<vec4<f32>, 32>,
+    // FL_SPRITE (render_units_gpu.rs `BuildParams::sprite`): x 1 when the
+    // last level is a card, y 1 when the cards cast (FL_SPRITE_SHADOW). Per
+    // kind, the dying and fallen draw at that level: corners per soldier,
+    // soldiers per instance, vertices per soldier; and the level a card
+    // that casts is posed for.
+    sprite: vec4<u32>,
+    sprite_corners: vec4<u32>,
+    sprite_groups: vec4<u32>,
+    sprite_verts: vec4<u32>,
+    sprite_cast_lod: vec4<u32>,
 };
 
 struct DrawArgs {
@@ -239,8 +249,10 @@ struct DrawArgs {
 // Per pose slot, the record it poses, in one region per kind.
 @group(0) @binding(9) var<storage, read_write> pose_src: array<u32>;
 // Five words per list, 0..16 the camera's buckets and 16..32 the casters as
-// in `counts`: the arguments of its draw when its level is indexed.
-@group(0) @binding(10) var<storage, read_write> indexed_args: array<u32, 160>;
+// in `counts`: the arguments of its draw when its level is indexed. Then
+// 32..36 per kind, under FL_SPRITE, the dying and fallen draw at the card's
+// level (`finish_sprite`).
+@group(0) @binding(10) var<storage, read_write> indexed_args: array<u32, 180>;
 
 // Where a build thread's soldier or body goes on the camera's lists, for
 // `scatter` to place once `finalize` knows where every bin starts.
@@ -555,11 +567,17 @@ fn lod_jitter(seed: f32) -> f32 {
 // The bins run near to far on the levels below ORDERED_LODS; a farther
 // level keeps one bin. The entry carries his level in its top two bits and
 // the occlusion check's mark in the bit below (`occlusion`).
-fn queue_draw(t: u32, bucket: u32, entry: u32, lod: u32, dist2: f32, marked: bool) {
+//
+// FL_SPRITE: at the card's level the standing go in bin 0 and the dying and
+// the fallen (`down`) in bin 1, so the cards fill the front of the list and
+// the meshes its back (`finish_sprite`).
+fn queue_draw(t: u32, bucket: u32, entry: u32, lod: u32, dist2: f32, marked: bool, down: bool) {
     atomicAdd(&counts[bucket], 1u);
     var bin = 0u;
     if lod < ORDERED_LODS {
         bin = u32(clamp(log2(max(dist2, 1.0)) * params.order, 0.0, f32(DEPTH_BINS - 1u)));
+    } else if params.sprite.x != 0u && lod == NUM_LODS - 1u && down {
+        bin = 1u;
     }
     let cell = bucket * DEPTH_BINS + bin;
     let slot = atomicAdd(&counts[BIN_COUNTER + cell], 1u);
@@ -883,8 +901,11 @@ fn build_soldier(i: u32) {
         sm.lod &= LOD_MASK;
     }
     let visible = in_view && occl != HIDDEN;
+    // FL_SPRITE_SHADOW: a standing soldier held at the card's level casts
+    // as well.
+    let card_casts = params.sprite.y != 0u && lod == NUM_LODS - 1u && death_t == 0.0;
     var casts = 0u;
-    if lod < params.cast_lods {
+    if lod < params.cast_lods || card_casts {
         casts = cascade_mask(position);
     }
     if !in_view && casts == 0u {
@@ -956,9 +977,28 @@ fn build_soldier(i: u32) {
     // needs; it holds his part pose at every level, so a coarser draw reads
     // it as well. A soldier who casts nothing is posed for the level he
     // draws at, which spares the skeleton of a near soldier drawn far.
+    // FL_SPRITE: a standing soldier drawn as a card reads his record, not a
+    // pose: the card needs his position, team colour and flash alone
+    // (unit_instancing.wgsl `sprite_output`). At the last level he casts
+    // nothing (render_units_shadow.rs CAST_LODS), and takes no pose slot,
+    // unless the cards cast (FL_SPRITE_SHADOW): then his shadow is his
+    // body's, posed for the finest level a cascade casts his kind with and
+    // put on the caster lists as a near soldier's is.
+    if params.sprite.x != 0u && draw_lod == NUM_LODS - 1u && death_t == 0.0 {
+        if visible {
+            queue_draw(i, kind * NUM_LODS + draw_lod, i, draw_lod, dot(d, d), occl == MARKED, false);
+            if draw_lod != lod {
+                atomicAdd(&counts[COARSER_COUNTER + kind * NUM_LODS + lod], 1u);
+            }
+        }
+        if casts != 0u {
+            append_casters(casts, kind, list_entry(kind, i, params.sprite_cast_lod[kind]));
+        }
+        return;
+    }
     let entry = list_entry(kind, i, select(draw_lod, lod, casts != 0u));
     if visible {
-        queue_draw(i, kind * NUM_LODS + draw_lod, entry, draw_lod, dot(d, d), occl == MARKED);
+        queue_draw(i, kind * NUM_LODS + draw_lod, entry, draw_lod, dot(d, d), occl == MARKED, death_t > 0.0);
         if draw_lod != lod {
             atomicAdd(&counts[COARSER_COUNTER + kind * NUM_LODS + lod], 1u);
         }
@@ -1032,7 +1072,7 @@ fn build_corpse(j: u32, t: u32) {
     if visible {
         let bucket = kind * NUM_LODS + draw_lod;
         atomicAdd(&counts[16u + bucket], 1u);
-        queue_draw(t, bucket, entry, draw_lod, dot(d, d), occl == MARKED);
+        queue_draw(t, bucket, entry, draw_lod, dot(d, d), occl == MARKED, true);
     }
     append_casters(casts, kind, entry);
 }
@@ -1092,6 +1132,31 @@ fn finish_indexed(b: u32, first: u32, count: u32, corners: u32, group: u32) {
     }
 }
 
+// FL_SPRITE, the card's level of kind `b / NUM_LODS`: its list holds the
+// `standing` cards, then the dying and the fallen (`queue_draw`). The cards
+// draw expanded over the front; the rest draw indexed with the file's last
+// level, its groups started past the cards by the base vertex, so soldier k
+// of the draw reads list slot `standing + k` (unit_instancing.wgsl
+// `vertex_pull`). The slots past the list's end to the end of the last
+// group get the empty mark.
+fn finish_sprite(b: u32, bucket: vec4<u32>, count: u32, standing: u32) {
+    args[b] = DrawArgs(standing * bucket.y, 1u, 0u, 0u);
+    let kind = b / NUM_LODS;
+    let corners = params.sprite_corners[kind];
+    let group = max(params.sprite_groups[kind], 1u);
+    let down = count - standing;
+    let instances = (down + group - 1u) / group;
+    let a = (32u + kind) * 5u;
+    indexed_args[a] = corners * group;
+    indexed_args[a + 1u] = instances;
+    indexed_args[a + 2u] = 0u;
+    indexed_args[a + 3u] = standing * params.sprite_verts[kind];
+    indexed_args[a + 4u] = 0u;
+    for (var k = count; k < standing + instances * group; k++) {
+        index_list[bucket.x + k] = EMPTY_SLOT;
+    }
+}
+
 // One thread per list: the list count becomes the arguments of its draw,
 // the corner count of the expanded draw and the groups of the indexed one.
 // A camera bucket's thread also turns its depth bin counts into the first
@@ -1110,6 +1175,7 @@ fn finalize(@builtin(local_invocation_index) b: u32) {
     }
     let count = atomicLoad(&counts[b]);
     let fallen = atomicLoad(&counts[16u + b]);
+    let standing = atomicLoad(&counts[BIN_COUNTER + b * DEPTH_BINS]);
     var first = 0u;
     for (var k = b * DEPTH_BINS; k < (b + 1u) * DEPTH_BINS; k++) {
         let in_bin = atomicLoad(&counts[BIN_COUNTER + k]);
@@ -1117,8 +1183,12 @@ fn finalize(@builtin(local_invocation_index) b: u32) {
         first += in_bin;
     }
     let bucket = params.buckets[b];
-    args[b] = DrawArgs(count * bucket.y, 1u, 0u, 0u);
-    finish_indexed(b, bucket.x, count, bucket.y, bucket.w);
+    if params.sprite.x != 0u && b % NUM_LODS == NUM_LODS - 1u {
+        finish_sprite(b, bucket, count, standing);
+    } else {
+        args[b] = DrawArgs(count * bucket.y, 1u, 0u, 0u);
+        finish_indexed(b, bucket.x, count, bucket.y, bucket.w);
+    }
     readback[b] = count;
     readback[16u + b] = fallen;
     readback[52u + b] = atomicLoad(&counts[HIDDEN_COUNTER + b]);

@@ -68,7 +68,11 @@ impl Plugin for RtsCameraPlugin {
     }
 }
 
-fn spawn_camera(mut commands: Commands) {
+fn spawn_camera(
+    mut commands: Commands,
+    window: Query<(), With<PrimaryWindow>>,
+    mut images: ResMut<Assets<Image>>,
+) {
     // The unit occlusion test reads the depth buffer in a compute pass
     // (render_units_occlusion.rs).
     let mut depth_usage = bevy::render::render_resource::TextureUsages::RENDER_ATTACHMENT;
@@ -101,6 +105,23 @@ fn spawn_camera(mut commands: Commands) {
     ));
     if !bevy_clusters() {
         camera.insert(bevy::light::cluster::ClusterConfig::None);
+    }
+    // With no window (the headless renderer of `--headless --shots`) the
+    // camera draws into an image of FL_WINDOW's size, which the pictures
+    // are taken from.
+    if window.is_empty() {
+        let size = crate::shots::offscreen_size();
+        let mut image = Image::new_target_texture(
+            size.x,
+            size.y,
+            bevy::render::render_resource::TextureFormat::Rgba8UnormSrgb,
+            None,
+        );
+        image.texture_descriptor.usage |= bevy::render::render_resource::TextureUsages::COPY_SRC;
+        let image = images.add(image);
+        camera.insert(bevy::camera::RenderTarget::Image(image.clone().into()));
+        camera.commands().insert_resource(crate::shots::OffscreenTarget(image));
+        info!("no window: the camera draws into a {}x{} image", size.x, size.y);
     }
     match aa {
         PostAa::None => {}

@@ -22,8 +22,10 @@ impl Plugin for FatiguePlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(
             FixedUpdate,
+            // After the death sweep, which reads the regiments' broken
+            // state as morale left it on the tick before.
             update_fatigue
-                .after(crate::sim::step_sim)
+                .after(crate::combat::process_deaths)
                 .before(crate::morale::update_morale)
                 .in_set(crate::game_state::SimSet),
         );

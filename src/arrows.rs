@@ -232,7 +232,6 @@ impl Plugin for ArrowsPlugin {
             .init_resource::<ArrowStats>()
             .init_resource::<StuckArrows>()
             .init_resource::<ArrowMarks>()
-            .add_systems(Startup, setup_arrow_buckets)
             .add_systems(
                 FixedUpdate,
                 (
@@ -244,7 +243,17 @@ impl Plugin for ArrowsPlugin {
                         .before(crate::combat::process_deaths),
                 )
                     .in_set(crate::game_state::SimSet),
-            )
+            );
+    }
+}
+
+/// The arrows on screen: the flying shafts, the ground litter and the
+/// arrow view (`FL_ARROW_VIZ`).
+pub struct ArrowsViewPlugin;
+
+impl Plugin for ArrowsViewPlugin {
+    fn build(&self, app: &mut App) {
+        app.add_systems(Startup, setup_arrow_buckets)
             .add_systems(Update, (sync_arrow_instances, sync_stuck_instances, draw_arrow_viz));
     }
 }
@@ -522,6 +531,9 @@ fn update_arrows(
     let strike_band = crate::unit_types::tallest() + STRIKE_MARGIN;
     let viz = arrow_viz();
     let now = time.elapsed_secs();
+    if viz {
+        marks.0.retain(|&(_, _, t)| now - t < MARK_S);
+    }
     let mut i = 0;
     while i < arrows.len() {
         let prev = arrows.pos[i];
@@ -787,7 +799,7 @@ fn log_tally(tick: u32, stats: &ArrowStats, in_flight: usize) {
 /// Archer regiment upkeep, before the tick: the regiment ammo pools for
 /// the HUD, summed over the archer regiments' own men. The skirmish run
 /// is a reaction of the tick's prep (sim/job.rs `skirmish_reactions`).
-fn ammo_tally(
+pub(crate) fn ammo_tally(
     mut groups: ResMut<crate::orders::Groups>,
     units: Res<crate::units::Units>,
     runs: Res<crate::sim::RegimentRuns>,
@@ -822,13 +834,14 @@ pub fn reset(arrows: &mut Arrows, spawns: &mut ArrowSpawns, stuck: &mut StuckArr
 fn sync_arrow_instances(
     arrows: Res<Arrows>,
     fixed: Res<Time<Fixed>>,
+    shots: Option<Res<crate::shots::Shots>>,
     mut query: Query<&mut InstanceMaterialData, With<ArrowBucket>>,
 ) {
     let _timed = Timed(&ARROW_PACK_NS, std::time::Instant::now());
     let Ok(mut data) = query.single_mut() else {
         return;
     };
-    let alpha = fixed.overstep_fraction();
+    let alpha = crate::shots::Shots::render_alpha(shots.as_deref(), &fixed);
     data.0.clear();
     data.0.reserve(arrows.len());
     for i in 0..arrows.len() {
@@ -899,11 +912,11 @@ impl ArrowMarks {
 /// How long the arrow view shows where an arrow ended (s).
 const MARK_S: f32 = 4.0;
 
-/// The arrow view (`arrow_viz`), drawn every frame.
+/// The arrow view (`arrow_viz`), drawn every frame. The marks are kept
+/// and aged out on the tick (`update_arrows`).
 fn draw_arrow_viz(
     arrows: Res<Arrows>,
-    mut marks: ResMut<ArrowMarks>,
-    time: Res<Time>,
+    marks: Res<ArrowMarks>,
     fixed: Res<Time<Fixed>>,
     mut gizmos: Gizmos,
 ) {
@@ -921,8 +934,6 @@ fn draw_arrow_viz(
         const K: usize = 16;
         gizmos.linestrip((0..=K).map(|j| at(n * j as f32 / K as f32)), color);
     }
-    let now = time.elapsed_secs();
-    marks.0.retain(|&(_, _, t)| now - t < MARK_S);
     for &(at, mark, _) in &marks.0 {
         let color = match mark {
             Mark::Ground => Color::srgb(1.0, 1.0, 1.0),

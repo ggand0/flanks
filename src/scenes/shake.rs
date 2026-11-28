@@ -51,10 +51,14 @@ pub(super) fn shake_log(
     groups: Res<Groups>,
     grid: Res<crate::spatial::SpatialGrid>,
     pipe: Res<crate::sim::TickPipeline>,
-    time: Res<Time>,
-    mut sh: Local<Shake>,
+    clock: Res<crate::game_state::BattleClock>,
+    mut sh: Local<crate::game_state::PerBattle<Shake>>,
 ) {
-    if std::env::var("FL_LOG_SHAKE").is_err() || pipe.tick == sh.tick {
+    if std::env::var("FL_LOG_SHAKE").is_err() {
+        return;
+    }
+    let sh = sh.of(&clock);
+    if pipe.tick == sh.tick {
         return;
     }
     sh.tick = pipe.tick;
@@ -81,7 +85,7 @@ pub(super) fn shake_log(
         }
         sh.last[i] = d;
     }
-    let t = time.elapsed_secs();
+    let t = clock.secs();
     if t < sh.next {
         return;
     }

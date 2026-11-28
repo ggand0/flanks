@@ -3,6 +3,7 @@
 
 use bevy::prelude::*;
 
+use crate::game_state::{BattleClock, PerBattle};
 use crate::orders::Groups;
 use crate::regiments::spawn_regiment;
 use crate::terrain::Terrain;
@@ -50,13 +51,14 @@ pub(crate) fn spawn_charge_test(units: &mut Units, terrain: &Terrain, groups: &m
 pub(super) fn charge_test_log(
     groups: Res<Groups>,
     units: Res<Units>,
-    time: Res<Time>,
-    mut next: Local<f32>,
+    clock: Res<BattleClock>,
+    mut next: Local<PerBattle<f32>>,
 ) {
     if std::env::var("FL_TEST_CHARGE").is_err() || groups.list.len() < 4 {
         return;
     }
-    let t = time.elapsed_secs();
+    let next = next.of(&clock);
+    let t = clock.secs();
     if t < *next {
         return;
     }

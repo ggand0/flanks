@@ -3,6 +3,7 @@
 
 use bevy::prelude::*;
 
+use crate::game_state::{BattleClock, PerBattle};
 use crate::orders::Groups;
 use crate::units::Units;
 
@@ -14,11 +15,12 @@ use crate::units::Units;
 /// turn levels, and his six nearest neighbours with their regiments,
 /// distances and how far each stands from his own place. It shows why
 /// a man is left behind in play.
-pub(super) fn straggler_log(units: Res<Units>, groups: Res<crate::orders::Groups>, time: Res<Time>, mut next: Local<f32>) {
+pub(super) fn straggler_log(units: Res<Units>, groups: Res<crate::orders::Groups>, clock: Res<BattleClock>, mut next: Local<PerBattle<f32>>) {
     if std::env::var("FL_LOG_STRAGGLER").is_err() {
         return;
     }
-    let t = time.elapsed_secs();
+    let next = next.of(&clock);
+    let t = clock.secs();
     if t < *next {
         return;
     }
@@ -128,13 +130,14 @@ pub(super) fn melee_diag_log(
     units: Res<Units>,
     groups: Res<crate::orders::Groups>,
     grid: Res<crate::spatial::SpatialGrid>,
-    time: Res<Time>,
-    mut next: Local<f32>,
+    clock: Res<BattleClock>,
+    mut next: Local<PerBattle<f32>>,
 ) {
     if std::env::var("FL_DIAG_MELEE").is_err() {
         return;
     }
-    let t = time.elapsed_secs();
+    let next = next.of(&clock);
+    let t = clock.secs();
     if t < *next {
         return;
     }
@@ -227,13 +230,14 @@ pub(super) fn room_log(
     units: Res<Units>,
     groups: Res<Groups>,
     grid: Res<crate::spatial::SpatialGrid>,
-    time: Res<Time>,
-    mut next: Local<f32>,
+    clock: Res<BattleClock>,
+    mut next: Local<PerBattle<f32>>,
 ) {
     if std::env::var("FL_LOG_ROOM").is_err() {
         return;
     }
-    let t = time.elapsed_secs();
+    let next = next.of(&clock);
+    let t = clock.secs();
     if t < *next {
         return;
     }
@@ -377,11 +381,12 @@ pub(super) fn room_log(
 /// FL_LOG_DISORDER=1: every 4 s while anyone fights, the mean
 /// disorder (m off the slots) of engaged regiments — the
 /// blocks-stay-blocks number.
-pub(super) fn disorder_log(groups: Res<Groups>, time: Res<Time>, mut next: Local<f32>) {
+pub(super) fn disorder_log(groups: Res<Groups>, clock: Res<BattleClock>, mut next: Local<PerBattle<f32>>) {
     if std::env::var("FL_LOG_DISORDER").is_err() {
         return;
     }
-    let t = time.elapsed_secs();
+    let next = next.of(&clock);
+    let t = clock.secs();
     if t < *next {
         return;
     }

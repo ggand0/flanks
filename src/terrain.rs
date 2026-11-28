@@ -652,13 +652,16 @@ pub(crate) fn vertex_blocked(heights: &[f32], (verts_x, verts_z): (usize, usize)
 
 /// Original heights identify exposed crater soil without changing the sim surface.
 #[derive(Resource, Default)]
-struct TerrainChunks {
+pub(crate) struct TerrainChunks {
     meshes: Vec<Handle<Mesh>>,
     original_heights: Vec<f32>,
     material: Option<Handle<GroundMaterial>>,
     band_material: Option<Handle<StandardMaterial>>,
     /// Every map's textures, held so a map switch finds them loaded.
     warm: Vec<Handle<Image>>,
+    /// The map the chunks show; the chunks are rebuilt when the terrain
+    /// becomes another.
+    built_for: Option<MapKind>,
 }
 
 const GROUND_TEXTURES: [&str; 9] = [
@@ -714,21 +717,51 @@ pub struct TerrainPlugin;
 impl Plugin for TerrainPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<TerrainChunks>()
-            .add_message::<MapChanged>()
             .add_plugins(MaterialPlugin::<GroundMaterial>::default())
-            .add_systems(PreStartup, generate_terrain)
             .add_systems(Startup, spawn_chunks)
             .add_systems(
                 Update,
-                (
-                    rebuild_map.in_set(MapRebuild),
-                    crater_tool,
-                    auto_test_craters,
-                    remesh_dirty,
-                    decide_terrain_casting,
-                )
-                    .chain(),
+                (rebuild_chunks.after(MapRebuild), crater_tool, remesh_dirty, decide_terrain_casting).chain(),
             );
+    }
+}
+
+/// The headless renderer's start: the launch's start waits
+/// (`StartHold`) until every ground texture is loaded, then a few frames
+/// more for the pipelines that draw them.
+pub(crate) fn release_start_when_ground_loaded(
+    mut commands: Commands,
+    chunks: Res<TerrainChunks>,
+    assets: Res<AssetServer>,
+    mut frames_since: Local<u32>,
+) {
+    let loaded = chunks.warm.iter().all(|h| assets.is_loaded_with_dependencies(h.id()))
+        && chunks.material.is_some();
+    if !loaded {
+        *frames_since = 0;
+        return;
+    }
+    *frames_since += 1;
+    if *frames_since == WARM_FRAMES {
+        commands.remove_resource::<crate::game_state::StartHold>();
+        info!("ground loaded: the battle starts");
+    }
+}
+
+/// Frames drawn after the ground is loaded before the headless renderer's
+/// battle starts.
+const WARM_FRAMES: u32 = 30;
+
+/// The terrain the sim walks on: built at launch from the chosen map and
+/// built again when the map changes (`MapRebuild`). The ground's meshes
+/// are `TerrainPlugin`'s.
+pub struct TerrainDataPlugin;
+
+impl Plugin for TerrainDataPlugin {
+    fn build(&self, app: &mut App) {
+        app.add_message::<MapChanged>()
+            .add_systems(PreStartup, generate_terrain)
+            .add_systems(Update, rebuild_terrain.in_set(MapRebuild));
     }
 }
 
@@ -1218,20 +1251,10 @@ fn ground_layers(assets: &AssetServer, images: &mut Assets<Image>, terrain: &Ter
     }
 }
 
-/// Replace the field and its chunk entities together so switching map sizes
-/// leaves neither missing ground nor chunks from the previous field.
-#[allow(clippy::too_many_arguments)]
-fn rebuild_map(
-    mut changes: MessageReader<MapChanged>,
-    mut terrain: ResMut<Terrain>,
-    mut chunks: ResMut<TerrainChunks>,
-    mut materials: ResMut<Assets<GroundMaterial>>,
-    assets: Res<AssetServer>,
-    mut images: ResMut<Assets<Image>>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut commands: Commands,
-    chunk_entities: Query<Entity, With<GroundChunk>>,
-) {
+/// A map change builds the new map's field. The ground's chunks follow it
+/// (`rebuild_chunks`), so switching map sizes leaves neither missing
+/// ground nor chunks from the previous field.
+fn rebuild_terrain(mut changes: MessageReader<MapChanged>, mut terrain: ResMut<Terrain>) {
     let Some(MapChanged(kind)) = changes.read().last().copied() else {
         return;
     };
@@ -1240,6 +1263,27 @@ fn rebuild_map(
     }
     let t0 = Instant::now();
     *terrain = build_terrain(kind);
+    debug!("terrain rebuilt as {} in {:.2} ms", kind.label(), t0.elapsed().as_secs_f32() * 1000.0);
+}
+
+/// The ground's chunks for a terrain that became another map.
+#[allow(clippy::too_many_arguments)]
+fn rebuild_chunks(
+    terrain: Res<Terrain>,
+    mut chunks: ResMut<TerrainChunks>,
+    mut materials: ResMut<Assets<GroundMaterial>>,
+    assets: Res<AssetServer>,
+    mut images: ResMut<Assets<Image>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut commands: Commands,
+    chunk_entities: Query<Entity, With<GroundChunk>>,
+) {
+    if chunks.built_for == Some(terrain.kind) {
+        return;
+    }
+    let kind = terrain.kind;
+    let t0 = Instant::now();
+    chunks.built_for = Some(kind);
     chunks.original_heights = terrain.ground_heights().to_vec();
     let material = materials.add(GroundMaterial {
         base: ground_base(),
@@ -1252,7 +1296,7 @@ fn rebuild_map(
     chunks.material = Some(material);
     spawn_chunk_meshes(&mut commands, &terrain, &mut meshes, &mut chunks);
     debug!(
-        "map rebuilt as {} in {:.2} ms",
+        "ground rebuilt as {} in {:.2} ms",
         kind.label(),
         t0.elapsed().as_secs_f32() * 1000.0
     );
@@ -1289,6 +1333,7 @@ fn spawn_chunks(
         .map(|path| ground_texture(&assets, path))
         .collect();
     chunks.original_heights = terrain.ground_heights().to_vec();
+    chunks.built_for = Some(terrain.kind);
     spawn_chunk_meshes(&mut commands, &terrain, &mut meshes, &mut chunks);
 }
 
@@ -1716,21 +1761,25 @@ fn crater_tool(
     }
 }
 
-/// FL_TEST_CRATERS=1: carve a crater near the field center every 2 s
-/// (screenshot/perf verification without input injection).
-fn auto_test_craters(
+/// FL_TEST_CRATERS=1: carve a crater near the field center every 2 s of
+/// the battle (screenshot/perf verification without input injection). It
+/// runs on the sim tick (scenes/mod.rs registers it), so the next tick's
+/// terrain snapshot carries the crater.
+pub(crate) fn auto_test_craters(
     mut terrain: ResMut<Terrain>,
-    time: Res<Time>,
-    mut next: Local<f32>,
-    mut n: Local<u32>,
+    clock: Res<crate::game_state::BattleClock>,
+    mut state: Local<crate::game_state::PerBattle<(f32, u32)>>,
 ) {
     if std::env::var("FL_TEST_CRATERS").is_err() {
         return;
     }
-    if time.elapsed_secs() < *next {
+    // The next crater's time and the craters carved this battle.
+    let (next, n) = state.of(&clock);
+    let t = clock.secs();
+    if t < *next {
         return;
     }
-    *next = time.elapsed_secs() + 2.0;
+    *next = t + 2.0;
     *n += 1;
     let a = hash01(*n * 7 + 1) * std::f32::consts::TAU;
     let r = hash01(*n * 7 + 2).sqrt() * 140.0;
@@ -2105,7 +2154,7 @@ mod tests {
             .insert_resource(build_terrain(MapKind::Grassland))
             .add_message::<MapChanged>()
             .add_systems(Startup, spawn_chunks)
-            .add_systems(Update, (rebuild_map, remesh_dirty).chain());
+            .add_systems(Update, (rebuild_terrain, rebuild_chunks, remesh_dirty).chain());
         app.update();
         for kind in [
             MapKind::BigGrassland,
